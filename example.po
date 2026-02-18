@@ -1,0 +1,8 @@
+msgid "System Ready"
+msgstr "系统就绪"
+
+msgid "Initializing Glossary Engine"
+msgstr "正在初始化术语表引擎"
+
+msgid "No Match Here"
+msgstr "此处无匹配"

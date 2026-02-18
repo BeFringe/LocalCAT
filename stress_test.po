@@ -1,0 +1,9 @@
+msgid "Glossary Engine Ready"
+msgstr "术语表引擎就绪"
+
+msgid "A high performance Glossary Engine"
+msgstr "一个高性能术语表引擎"
+
+msgctxt "button"
+msgid "Submit"
+msgstr "提交"
