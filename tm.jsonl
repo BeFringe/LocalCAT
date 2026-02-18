@@ -1,0 +1,2 @@
+{"source": "Hello World", "target": "你好，世界", "similarity": 1.0, "match_type": "EXACT", "tm_source": "legacy_tm", "usage_count": 5, "last_used": "2024-01-01T12:00:00"}
+{"source": "System Ready", "target": "系统就绪", "similarity": 1.0, "match_type": "EXACT", "tm_source": "legacy_tm", "usage_count": 2, "last_used": "2024-01-02T10:00:00"}
