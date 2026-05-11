@@ -4,40 +4,53 @@
 
 本系统采用 **四层架构** 设计，旨在实现核心逻辑与用户界面的完全解耦，确保从 Excel 插件形态向独立 QT 桌面应用形态的平滑迁移。
 
-### 1.1 Data Storage Layer (数据持久层)
-- **职责**: 负责所有持久化数据的读写操作。
-- **技术边界**:
-  - 管理 **Glossary (术语表)**: 支持 CSV, XLSX, TBX 格式读取。建议使用 SQLite 或内存 Trie 结构加速查询。
-  - 管理 **Translation Memory (TM, 记忆库)**: 采用 **Append-only (追加式)** 策略，推荐使用 JSONL (便于流式读写与版本控制) 或 SQLite。
-  - 负责 **Project Settings**: 存储项目配置、用户偏好。
-- **关键特性**:
-  - **流式 I/O**: 针对超大文件 (GB级)，必须提供迭代器 (Iterator) 接口，严禁一次性加载全量文本到内存。
+### Layer 1: Storage (持久层)
+**职责**: 负责所有持久化数据的读写操作
 
-### 1.2 Core Engine Layer (核心引擎层)
-- **职责**: 纯粹的业务逻辑与算法实现。
-- **技术边界**:
-  - **Term Extraction**: 实现高效的多模式匹配算法 (如 Aho-Corasick)，从 `SourceUnit` 中识别术语。
-  - **TM Matching**: 实现模糊匹配 (Levenshtein/Dice coefficient) 和精确匹配逻辑。
-  - **无状态 (Stateless)**: 引擎层不应持有 UI 状态，只处理输入并返回结果。
-- **依赖约束**: 严禁引用 `xlwings`, `PySide6` 或任何 UI 相关库。
+**技术边界**:
+- 管理 **Glossary (术语表)**: 支持 CSV, XLSX, TBX 格式读取。建议使用 SQLite 或内存 Trie 结构加速查询。
+- 管理 **Translation Memory (TM, 记忆库)**: 采用 **Append-only (追加式)** 策略，推荐使用 JSONL (便于流式读写与版本控制) 或 SQLite。
+- 负责 **Project Settings**: 存储项目配置、用户偏好。
 
-### 1.3 Logic UI Layer (交互逻辑层 / 胶水层)
-- **职责**: 作为 "Glue" (胶水)，连接 Engine 与 Frontend，维护应用状态。
-- **核心作用**:
-  - **状态管理 (State Management)**: 维护当前活跃的项目、当前处理的 `SourceUnit`、用户的临时修改。
-  - **适配器 (Adapter)**: 将 Engine 返回的通用数据结构 (`TermHit`, `TMMatch`) 转换为前端友好的格式。
-    - *Excel 场景*: 将匹配结果格式化为单元格批注或右侧窗格的 HTML 内容。
-    - *QT 场景*: 将匹配结果转换为 `QStandardItemModel` 或供组件渲染的信号。
-  - **解耦策略**: 定义统一的 `IFrontendController` 接口，Excel 和 QT 分别实现该接口的后端逻辑。
+**关键特性**:
+- **流式 I/O**: 针对超大文件 (GB级)，必须提供迭代器 (Iterator) 接口，严禁一次性加载全量文本到内存。
 
-### 1.4 Frontend Layer (表示层)
-- **职责**: 用户交互与数据展示。
-- **Phase 1-3 (Excel)**:
-  - 利用 Excel 作为宿主，通过 `xlwings` 或 COM 接口与 Python 通信。
-  - 侧重于利用 Excel 的网格编辑能力。
-- **Phase 4+ (QT/PySide6)**:
-  - 独立的桌面窗口应用。
-  - 提供更专业的 CAT 界面 (双栏对照、标签处理、快捷键)。
+### Layer 2: Core Engine (核心引擎层)
+**职责**: 纯粹的业务逻辑与算法实现
+
+**技术边界**:
+- **GlossaryEngine**: 实现高效的多模式匹配算法 (Trie/Aho-Corasick)，从 `SourceUnit` 中识别术语，O(n+m+z) 复杂度
+- **TMEngine**: 实现精确匹配（已完成）和模糊匹配（计划中，Levenshtein/Dice coefficient）
+- **无状态 (Stateless)**: 引擎层不应持有 UI 状态，只处理输入并返回结果
+
+**依赖约束**: 严禁引用 `xlwings`, `PySide6` 或任何 UI 相关库
+
+### Layer 3: Logic UI (交互逻辑层)
+**职责**: 作为 "Glue" (胶水)，连接 Engine 与 Frontend 的无状态转发层
+
+**核心作用**:
+- **LogicController**: 请求-响应转发，不持有状态
+- **策略**: TM 优先 > Glossary 兜底
+- **输出**: 标准化字典结构 (status/tm_match/terms)
+- **适配器模式**: 将 Engine 返回的通用数据结构转换为前端友好的格式
+  - *Excel 场景*: 格式化为单元格文本 `[TM] 译文` 或 `[Terms] 术语列表`
+  - *QT 场景*: 转换为 `QStandardItemModel` 或供组件渲染的信号
+
+**解耦策略**: 定义统一的接口，Excel 和 QT 分别实现各自的前端适配器
+
+### Layer 4: Frontend (表示层)
+**职责**: 用户交互与数据展示
+
+**实现方案**:
+- **Excel Adapter**: 
+  - `excel_adapter.py` - xlwings 交互式适配器（手动触发）
+  - `excel_adapter_openpyxl.py` - openpyxl 文件模式（批处理）
+  - 侧重于利用 Excel 的网格编辑能力
+- **QT Desktop** (计划中):
+  - 独立的桌面窗口应用 (PySide6)
+  - 提供更专业的 CAT 界面 (双栏对照、标签处理、快捷键)
+
+**设计原则**: 多前端共存，通过 Layer 3 统一调用引擎
 
 ---
 
