@@ -1,0 +1,68 @@
+{
+  "runtime_schema_source": {
+    "controller_method": "LogicController.get_suggestions",
+    "adapter_usage_file": "excel_adapter.py",
+    "statuses": [
+      "TM_HIT",
+      "TERMS_FOUND",
+      "NO_MATCH"
+    ],
+    "payload_keys_by_status": {
+      "TM_HIT": {
+        "required_top_level": [
+          "status",
+          "tm_match"
+        ],
+        "required_tm_match_keys": [
+          "source",
+          "target",
+          "match_type",
+          "similarity"
+        ]
+      },
+      "TERMS_FOUND": {
+        "required_top_level": [
+          "status",
+          "terms"
+        ],
+        "required_term_item_keys": [
+          "source_term",
+          "target_term",
+          "start_index",
+          "end_index",
+          "glossary_source"
+        ]
+      },
+      "NO_MATCH": {
+        "required_top_level": [
+          "status"
+        ]
+      }
+    }
+  },
+  "benchmark_config": {
+    "groups": [
+      5,
+      50,
+      200,
+      800
+    ],
+    "repeats": 5,
+    "warmup": 1,
+    "warm_cold_modes": [
+      "cold",
+      "warm"
+    ],
+    "status_mix": {
+      "TM_HIT": 60,
+      "TERMS_FOUND": 25,
+      "NO_MATCH": 15
+    }
+  },
+  "required_metrics": [
+    "init_ms",
+    "total_ms",
+    "per_row_us_median",
+    "throughput_rows_s"
+  ]
+}
