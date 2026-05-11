@@ -22,8 +22,8 @@ LocalCAT 遵循严格的四层架构设计：
 
 | Feature | 架构层次 | 状态 | Git 标签 | 核心文件 |
 |---------|---------|------|---------|---------|
-| **Feature 1: 术语表引擎** | Layer 2 | ✅ 已完成 | v0.1.0-phase1 | `glossary_engine.py` |
-| **Feature 2: 翻译记忆库引擎** | Layer 1 + Layer 2 | ✅ 已完成 | v0.2.0-phase2 | `tm_engine.py`, `tm.jsonl` |
+| **Feature 1: 术语表引擎** | Layer 2 | ✅ 已完成 | v0.1.0-feature1 | `glossary_engine.py` |
+| **Feature 2: 翻译记忆库引擎** | Layer 1 + Layer 2 | ✅ 已完成 | v0.2.0-feature2 | `tm_engine.py`, `tm.jsonl` |
 | **Feature 3: 逻辑层与 Excel 适配器** | Layer 3 + Layer 4 (Excel) | ✅ 已完成 | v0.3.0-feature3 | `logic_controller.py`, `excel_adapter.py` |
 | **Feature 4: QT 专业编辑器** | Layer 4 (QT) | 🔮 计划中 | - | - |
 | **Feature 5: 模糊匹配与自动化** | Layer 2 增强 | 🔮 计划中 | - | - |
@@ -34,7 +34,7 @@ LocalCAT 遵循严格的四层架构设计：
   - 基于 Trie 的高性能术语提取逻辑
   - 支持重叠匹配与长词优先策略
 - **核心文件**: `glossary_engine.py`
-- **Git 信息**: 分支 `feature/tm-engine`, 标签 `v0.1.0-phase1`
+- **Git 信息**: 分支 `feature/tm-engine`, 标签 `v0.1.0-feature1`
 
 ### Feature 2: 翻译记忆库引擎 (TM Engine)
 - **架构层次**: Layer 1 (Storage) + Layer 2 (Core Engine)
@@ -43,7 +43,7 @@ LocalCAT 遵循严格的四层架构设计：
   - 支持 PO/JSON 文件导入
   - 系统集成压力测试验证
 - **核心文件**: `tm_engine.py`, `tm.jsonl`, `stress_runner.py`
-- **Git 信息**: 分支 `feature/tm-engine`, 标签 `v0.2.0-phase2`
+- **Git 信息**: 分支 `feature/tm-engine`, 标签 `v0.2.0-feature2`
 
 ### Feature 3: 逻辑层与 Excel 适配器 (Logic Layer & Excel Adapter)
 - **架构层次**: Layer 3 (Logic UI) + Layer 4 (Frontend - Excel)
