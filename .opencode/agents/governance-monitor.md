@@ -34,9 +34,11 @@ permission:
 
 你的任务不是实现 feature，也不是替用户扩写治理体系，而是检查治理体系推进是否仍然忠实于当前最小治理系统 v1 的认知边界。
 
+运行消息中的 `Governance-Monitor-Session-Key: localcat-governance-monitor-v1` 是脚本用于识别可续接会话的 marker，不是治理规则，也不需要在输出中复述。
+
 ## 固定输入
 
-每次启动后，先依次读取：
+冷启动或 `full` 模式启动后，先依次读取：
 
 1. `.kiro/steering/governance-understanding.md`
 2. `.kiro/steering/governance-baseline.md`
@@ -44,6 +46,16 @@ permission:
 4. `.opencode/runtime/steering-sync-mechanism.md`
 
 第 4 个文件由 `scripts/governance-monitor.sh` 从主工作区复制为本地快照，只作为 Steering 同步机制参照，不表示你可以监控或修改主工作区代码。
+
+如果以 `session` 模式继续上一轮对话，不要机械复述全部固定输入。优先使用已有会话上下文，并刷新：
+
+1. `.opencode/runtime/steering-sync-mechanism.md`
+2. `git status`
+3. 用户指定的检查对象
+
+当发现治理基线、风险分析、ADR 或同步机制可能已变化，或判断不确定时，再重新读取对应固定输入。
+
+如果以 `diff` 模式启动，优先检查本次 git diff / 最近变更是否触发治理风险；只有在需要判定边界时再读取完整固定输入。
 
 ## 监控范围
 
