@@ -1,0 +1,1 @@
+"""LocalCAT automated test package."""
