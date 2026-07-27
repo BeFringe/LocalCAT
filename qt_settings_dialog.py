@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from pathlib import Path
+
+from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -25,14 +29,42 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from editor_contracts import ResourceConfig, ResourceKind
+from editor_contracts import ImportReport, ImportRequest, ResourceConfig, ResourceKind
 from editor_controller import EditorController, EditorControllerError
+
+
+TMX_FILE_FILTER = "TMX files (*.tmx)"
+TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+
+
+class ImportWorker(QThread):
+    """Run one controller import away from the GUI thread."""
+
+    report_ready = Signal(object)
+
+    def __init__(
+        self,
+        controller: EditorController,
+        request: ImportRequest,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.request = request
+
+    def run(self) -> None:
+        try:
+            report = self.controller.import_resource(self.request)
+        except Exception as exc:
+            report = ImportReport(errors=(str(exc),))
+        self.report_ready.emit(report)
 
 
 class QtSettingsDialog(QDialog):
     """Manage local TM and termbase configuration through EditorController only."""
 
     resources_changed = Signal()
+    import_completed = Signal(object)
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,6 +74,9 @@ class QtSettingsDialog(QDialog):
         self.setMinimumSize(860, 560)
         self.resize(1040, 680)
         self.setModal(True)
+        self.import_worker: ImportWorker | None = None
+        self._import_busy = False
+        self.last_import_report: ImportReport | None = None
         self._build_ui()
         self.refresh_resources()
 
@@ -105,12 +140,26 @@ class QtSettingsDialog(QDialog):
         content_layout.addWidget(inactive_group, 1)
 
         footer = QHBoxLayout()
+        feedback = QVBoxLayout()
         self.status_label = QLabel("资源配置会自动保存。")
         self.status_label.setObjectName("settingsStatus")
-        footer.addWidget(self.status_label)
+        self.import_feedback = QLabel("")
+        self.import_feedback.setObjectName("importFeedback")
+        self.import_feedback.setWordWrap(True)
+        self.import_feedback.hide()
+        self.import_progress = QProgressBar()
+        self.import_progress.setObjectName("importProgress")
+        self.import_progress.setRange(0, 0)
+        self.import_progress.setMaximumWidth(180)
+        self.import_progress.hide()
+        feedback.addWidget(self.status_label)
+        feedback.addWidget(self.import_feedback)
+        footer.addLayout(feedback, 1)
+        footer.addWidget(self.import_progress)
         footer.addStretch()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.button(QDialogButtonBox.StandardButton.Close).setText("完成")
+        self.close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        self.close_button.setText("完成")
         buttons.rejected.connect(self.reject)
         footer.addWidget(buttons)
         content_layout.addLayout(footer)
@@ -120,9 +169,11 @@ class QtSettingsDialog(QDialog):
 
     @staticmethod
     def _make_table(object_name: str) -> QTableWidget:
-        table = QTableWidget(0, 6)
+        table = QTableWidget(0, 7)
         table.setObjectName(object_name)
-        table.setHorizontalHeaderLabels(["Active", "Lookup", "Update", "名称", "类型", "本地路径"])
+        table.setHorizontalHeaderLabels(
+            ["Active", "Lookup", "Update", "名称", "类型", "本地路径", "导入"]
+        )
         table.verticalHeader().setVisible(False)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -133,6 +184,7 @@ class QtSettingsDialog(QDialog):
         for column in range(5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         return table
 
     def refresh_resources(self) -> None:
@@ -185,6 +237,17 @@ class QtSettingsDialog(QDialog):
             path_item = QTableWidgetItem(str(resource.path))
             path_item.setToolTip(str(resource.path))
             table.setItem(row, 5, path_item)
+            import_button = QPushButton(
+                "导入 TMX"
+                if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                else "导入术语表"
+            )
+            import_button.setObjectName(f"import_{resource.id}")
+            import_button.setProperty("resource_id", resource.id)
+            import_button.clicked.connect(
+                lambda _checked=False, configured=resource: self._prompt_import(configured)
+            )
+            table.setCellWidget(row, 6, import_button)
         table.resizeRowsToContents()
 
     def _set_state(self, resource_id: str, field: str, checked: bool) -> None:
@@ -241,6 +304,144 @@ class QtSettingsDialog(QDialog):
         except EditorControllerError as exc:
             QMessageBox.critical(self, "无法创建资源", str(exc))
 
+    @property
+    def is_importing(self) -> bool:
+        return self._import_busy
+
+    def _prompt_import(self, resource: ResourceConfig) -> None:
+        file_filter = (
+            TMX_FILE_FILTER
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY
+            else TERMBASE_FILE_FILTER
+        )
+        title = "选择 TMX 文件" if resource.kind is ResourceKind.TRANSLATION_MEMORY else "选择术语表"
+        selected, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
+        if not selected:
+            return
+        source_locale = ""
+        target_locale = ""
+        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+            try:
+                default_source = self.controller.project.source_locale
+                default_target = self.controller.project.target_locale
+            except EditorControllerError:
+                default_source = "en-US"
+                default_target = "zh-CN"
+            locale_dialog = QDialog(self)
+            locale_dialog.setWindowTitle("选择 TMX 语言对")
+            locale_layout = QVBoxLayout(locale_dialog)
+            locale_layout.addWidget(QLabel("源语言 locale"))
+            source_input = QLineEdit(default_source)
+            source_input.setObjectName("tmxSourceLocale")
+            locale_layout.addWidget(source_input)
+            locale_layout.addWidget(QLabel("目标语言 locale"))
+            target_input = QLineEdit(default_target)
+            target_input.setObjectName("tmxTargetLocale")
+            locale_layout.addWidget(target_input)
+            locale_buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+            )
+            locale_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
+            locale_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+            locale_buttons.accepted.connect(locale_dialog.accept)
+            locale_buttons.rejected.connect(locale_dialog.reject)
+            locale_layout.addWidget(locale_buttons)
+            if locale_dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            source_locale = source_input.text()
+            target_locale = target_input.text()
+        self.start_import(resource.id, Path(selected), source_locale, target_locale)
+
+    def start_import(
+        self,
+        resource_id: str,
+        input_path: Path,
+        source_locale: str = "",
+        target_locale: str = "",
+    ) -> bool:
+        """Start a non-blocking import; return False when another import is active."""
+
+        if self.is_importing:
+            self._show_import_feedback("已有导入任务正在运行，请等待完成。", failed=True)
+            return False
+        try:
+            resource = next(
+                configured
+                for configured in self.controller.list_resources()
+                if configured.id == resource_id
+            )
+        except StopIteration:
+            self._show_import_feedback(f"找不到资源：{resource_id}", failed=True)
+            return False
+        if resource.kind is ResourceKind.TRANSLATION_MEMORY and (
+            not source_locale.strip() or not target_locale.strip()
+        ):
+            self._show_import_feedback("TMX 导入需要源语言和目标语言 locale。", failed=True)
+            return False
+        try:
+            request = ImportRequest(
+                resource_id=resource_id,
+                input_path=input_path.expanduser().resolve(),
+                source_locale=source_locale,
+                target_locale=target_locale,
+            )
+        except (TypeError, ValueError) as exc:
+            self._show_import_feedback(str(exc), failed=True)
+            return False
+
+        self.last_import_report = None
+        self._import_busy = True
+        self._set_import_busy(True, f"正在导入 {resource.name}…")
+        worker = ImportWorker(self.controller, request, self)
+        self.import_worker = worker
+        worker.report_ready.connect(self._on_import_finished)
+        worker.finished.connect(lambda current=worker: self._release_worker(current))
+        worker.start()
+        return True
+
+    def _set_import_busy(self, busy: bool, message: str = "") -> None:
+        self.active_table.setEnabled(not busy)
+        self.inactive_table.setEnabled(not busy)
+        self.findChild(QPushButton, "newResourceButton").setEnabled(not busy)
+        self.close_button.setEnabled(not busy)
+        self.import_progress.setVisible(busy)
+        if message:
+            self.status_label.setText(message)
+
+    def _on_import_finished(self, report: ImportReport) -> None:
+        self.last_import_report = report
+        self._import_busy = False
+        self._set_import_busy(False)
+        details = (
+            f"已导入 {report.imported} · 已跳过 {report.skipped} · "
+            f"已覆盖 {report.overwritten} · 错误 {len(report.errors)}"
+        )
+        if report.errors:
+            details += "\n" + "\n".join(report.errors[:4])
+        self._show_import_feedback(details, failed=bool(report.errors and not report.imported))
+        self.refresh_resources()
+        if report.imported:
+            self.resources_changed.emit()
+        self.import_completed.emit(report)
+
+    def _show_import_feedback(self, message: str, *, failed: bool) -> None:
+        self.import_feedback.setText(message)
+        self.import_feedback.setProperty("failed", failed)
+        self.import_feedback.style().unpolish(self.import_feedback)
+        self.import_feedback.style().polish(self.import_feedback)
+        self.import_feedback.show()
+
+    def _release_worker(self, worker: ImportWorker) -> None:
+        if self.import_worker is worker:
+            self.import_worker = None
+        worker.deleteLater()
+
+    def reject(self) -> None:
+        if self.is_importing:
+            self._show_import_feedback("导入完成前无法关闭设置。", failed=True)
+            return
+        super().reject()
+
 
 _SETTINGS_STYLE = """
 QDialog#settingsDialog {
@@ -281,6 +482,23 @@ QLabel#resourceSectionTitle {
 }
 QLabel#resourceSectionHint, QLabel#settingsStatus {
     color: #66758a;
+}
+QLabel#importFeedback {
+    color: #2f6b50;
+    font-size: 12px;
+}
+QLabel#importFeedback[failed="true"] {
+    color: #b34242;
+}
+QProgressBar {
+    border: 1px solid #bfd0df;
+    border-radius: 4px;
+    background: #edf3f8;
+    min-height: 8px;
+    max-height: 8px;
+}
+QProgressBar::chunk {
+    background: #08a0c9;
 }
 QGroupBox {
     background: #ffffff;

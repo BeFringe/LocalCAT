@@ -92,7 +92,7 @@
   - _Boundary: QtSettingsDialog Resource Management_
   - _Depends: 3.3_
 
-- [ ] 4.2 实现设置中的 TMX/术语表选择与后台导入反馈
+- [x] 4.2 实现设置中的 TMX/术语表选择与后台导入反馈
   - TM 资源提供精确 TMX 过滤器与源/目标语言输入，术语资源只展示 CSV/XLSX 过滤器
   - worker 线程调用 EditorController 导入接口，主线程只更新忙碌、禁用和统计状态
   - 成功显示 imported/skipped/overwritten/errors；失败显示可操作原因且允许重试
