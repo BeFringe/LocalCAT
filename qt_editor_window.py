@@ -196,9 +196,9 @@ class QtEditorWindow(QMainWindow):
         layout.addWidget(self.save_button)
         self.settings_button = QToolButton()
         self.settings_button.setObjectName("settingsButton")
-        self.settings_button.setText("⚙")
+        self.settings_button.setText("⚙ 设置")
         self.settings_button.setToolTip("语言资源设置 (Ctrl+,)")
-        self.settings_button.setFixedSize(QSize(38, 34))
+        self.settings_button.setFixedSize(QSize(72, 34))
         layout.addWidget(self.settings_button)
         return top_bar
 

@@ -1,6 +1,6 @@
 # 实施计划
 
-- [ ] 1. 建立编辑器基础契约与项目能力
+- [x] 1. 建立编辑器基础契约与项目能力
 
 - [x] 1.1 建立 UI 依赖清单、不可变编辑契约和测试入口
   - 定义段落、项目、语言资源、TM/术语建议、导入统计和写回结果的数据契约，并保证跨层值对象不可变
@@ -29,7 +29,7 @@
   - _Boundary: LogicController Regression Fixture, Excel Adapter Contract_
   - _Depends: 1.1_
 
-- [ ] 2. 构建本地语言资源持久化与导入
+- [x] 2. 构建本地语言资源持久化与导入
 
 - [x] 2.1 实现资源清单、默认资源引导和状态持久化
   - 使用带 schema 版本的本地清单保存资源名称、类型、绝对路径、Active、Lookup 和 Update
@@ -51,7 +51,7 @@
   - _Boundary: ResourceImporter_
   - _Depends: 1.1_
 
-- [ ] 3. 实现编辑会话与资源协调逻辑
+- [x] 3. 实现编辑会话与资源协调逻辑
 
 - [x] 3.1 实现项目会话、段落编辑导航和并列建议查询
   - EditorController 打开项目或示例后维护当前段、未保存状态、确认状态和完成进度
@@ -81,7 +81,7 @@
   - _Boundary: EditorController Resource Operations and Reload_
   - _Depends: 2.2, 3.2_
 
-- [ ] 4. 构建语言资源设置前端
+- [x] 4. 构建语言资源设置前端
 
 - [x] 4.1 实现活动/非活动资源表、新建资源和状态编辑
   - 齿轮设置按活动与非活动分组显示名称、类型、本地路径和 Active/Lookup/Update 控件
@@ -101,7 +101,7 @@
   - _Boundary: QtSettingsDialog Import Worker_
   - _Depends: 4.1_
 
-- [ ] 5. 构建双栏主编辑器
+- [x] 5. 构建双栏主编辑器
 
 - [x] 5.1 实现专业窗口骨架、空状态、项目打开保存和响应分栏
   - 构建深蓝顶栏、项目/语言信息、段落导航、双栏当前段、右侧页签、进度和状态栏
@@ -142,7 +142,7 @@
   - _Boundary: Qt Frontend to EditorController Integration_
   - _Depends: 4.2, 5.3_
 
-- [ ] 6. 完成运行时闭环与项目同步
+- [x] 6. 完成运行时闭环与项目同步
 
 - [x] 6.1 实现无 Qt bootstrap、依赖诊断和 offscreen 冒烟入口
   - `qt_editor.py` 只使用 stdlib 解析参数并延迟导入 Qt 窗口模块
@@ -164,7 +164,7 @@
   - _Boundary: GUI Verification, LogicController Regression Fixture_
   - _Depends: 6.1_
 
-- [ ] 6.3 更新 steering 与 README 并执行端到端资源闭环
+- [x] 6.3 更新 steering 与 README 并执行端到端资源闭环
   - 按用户明确要求与 steering 同步机制的例外，更新 structure/tech/product 和 README
   - 保留用户已有 Feature 3 标签和已推送状态修改，再补充 Qt MVP 架构、依赖、启动、格式、限制、验证和 `ui-mvp` 分支
   - 使用临时项目与真实临时 TMX/CSV/XLSX 完成“设置导入 → 当前段建议 → 确认写回 → 保存 → 重载查询”闭环

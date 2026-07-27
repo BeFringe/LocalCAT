@@ -1,114 +1,71 @@
-# Technology Stack
+# 技术栈
 
-## Architecture
+## 架构
 
-Strict 4-layer architecture with zero upward dependencies. Each layer only calls the layer directly below it.
+依赖方向保持由前端向逻辑、解析/引擎和存储单向流动。
 
-| Layer | Name | Responsibility | Key Files |
-|-------|------|---------------|-----------|
-| Layer 1 | Storage | JSONL/CSV/PO data persistence, streaming I/O | `tm_engine.py` (TMEngine), `tm_json_importer.py` |
-| Layer 2 | Core Engine | Pure business logic, stateless algorithms | `glossary_engine.py` (Trie), `tm_engine.py` (TMEngine, POHandler) |
-| Layer 3 | Logic UI | Stateless request-response forwarder, TM > Glossary priority | `logic_controller.py` |
-| Layer 4 | Frontend | User interaction, data display | `excel_adapter.py` (xlwings), `excel_adapter_openpyxl.py` (openpyxl) |
+| 层 | 职责 | 当前关键文件 |
+|----|------|-------------|
+| Layer 1 Storage | JSONL/CSV、版本化资源清单、原子替换 | `resource_repository.py`, `tm_engine.py` |
+| Layer 2 Engine / Parser | 精确 TM、Trie 术语、项目与语言资源解析 | `glossary_engine.py`, `editor_project.py`, `resource_importer.py` |
+| Layer 3 Logic | Excel 无状态三态入口；Qt 有状态会话协调 | `logic_controller.py`, `editor_controller.py` |
+| Layer 4 Frontend | Excel 与 PySide6 桌面交互 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_settings_dialog.py` |
 
-**Critical constraint**: Layer 1-2 has a hard dependency wall — no `xlwings`, `PySide6`, or any UI library allowed. `logic_controller.py` contains zero state variables.
+关键约束：
 
-## Core Technologies
+- Engine、Parser、Repository 不得导入 PySide6 或 xlwings。
+- Qt 模块只调用 `EditorController`，不得直接导入 `ResourceRepository`、`TMEngine`、`GlossaryEngine` 或 `LogicController`。
+- `LogicController` 的三态与 TM 优先规则保持不变；`EditorController` 同时返回 TM 与术语建议并持有当前编辑会话。
 
-- **Language**: Python 3.14+ (currently running on 3.14.3)
-- **No package config** — No pyproject.toml, setup.py, or requirements.txt currently exists
-- **Runtime**: Local-only, no server component
+## 运行环境与依赖
 
-## Key Libraries
+- Python：当前在 3.14 上开发与验证。
+- 核心与无头入口：标准库为主。
+- Qt MVP：`PySide6==6.11.1`。
+- XLSX：`openpyxl>=3.1,<4`。
+- 交互式 Excel：xlwings，可选且只属于 Excel Layer 4。
+- Qt 依赖入口：`requirements-ui.txt`。
 
-**Stdlib-only core (Layer 1-3)** — No external dependencies for core engine layers:
-- `dataclasses` (`frozen=True`) — Immutable cross-layer data contracts
-- `json` / `pathlib` — JSONL read/write, file system operations
-- `csv` — Glossary CSV loading
-- `collections` (Counter, OrderedDict) — Deduplication, counting
-- `time` (`perf_counter_ns`) — High-resolution timing for benchmarks
-
-**External (Layer 4 only)**:
-- `openpyxl` — File-mode Excel read/write in batch adapter
-- `xlwings` — Interactive Excel adapter. > 📎 导入隔离策略详见 ADR-003
-
-**Planned (not yet implemented)**:
-- `PySide6` — QT Desktop editor (Feature 4)
-- Levenshtein/Dice coefficient libraries — Fuzzy matching (Feature 5)
-
-## Development Standards
-
-### Type Safety
-- `@dataclass(frozen=True)` for all cross-layer data contracts — immutability is mandatory
-- `from __future__ import annotations` in newer files (PEP 604 union syntax `X | Y`)
-- `typing.cast()` for explicit type narrowing in benchmark tooling
-- **No type-checking config files** (no mypy.ini, pyrightconfig.json)
-- Inline pyright directives in a few benchmark tooling files
-
-### Code Quality
-- No formal linter/formatter config (no .flake8, .pylintrc, tox.ini, pre-commit)
-- Enforced through spec contracts and code review convention
-- Section headers (`# ===...`) for internal file structure
-
-### Testing
-- **Self-test pattern**: Every core module has `if __name__ == "__main__":` block with assert-based tests
-- **Benchmark contract system**: JSON schema (`benchmark_contract.json`) defines runtime expectations; multiple validators enforce compliance
-- **Integration runners**: `stress_runner.py` (structural integrity), `translation_runner.py` (end-to-end data flow)
-- **Scaling gate**: Linearity threshold checks (p95 growth ratio ≤ 2.5, median ≤ 2.0)
-- No formal test framework (no pytest, unittest)
-
-## Development Environment
-
-### Required Tools
-- Python 3.14+
-- openpyxl (for Excel batch adapter)
-- xlwings (optional, for interactive Excel adapter)
-
-### Common Commands
 ```bash
-# Self-tests (each module is self-validating)
-python glossary_engine.py          # Glossary engine self-tests
-python tm_engine.py                # TM engine self-tests
-python logic_controller.py         # Logic controller self-tests
-
-# Integration testing
-python stress_runner.py            # Structural integrity stress test
-python translation_runner.py       # End-to-end integration verification
-
-# Excel adapters
-python excel_adapter_openpyxl.py --input-xlsx <file> [options]  # Batch mode
-
-# Benchmark pipeline
-python deterministic_workload.py generate [options]     # Generate workloads
-python backend_throughput_harness.py [options]          # Run throughput benchmark
-python backend_scaling_gate.py --backend-artifact <path>  # Scaling linearity gate
-python validate_benchmark_contract.py <contract_path>   # Validate contract schema
+python -m pip install --user -r requirements-ui.txt
+python qt_editor.py --sample
 ```
 
-## Key Technical Decisions
+`qt_editor.py` 顶层只导入标准库，完成参数解析后才加载 PySide6 和窗口模块。缺 Qt 时输出安装提示并返回非零；缺 openpyxl 时只有 XLSX 导入失败。
 
-| Decision | Rationale |
-|----------|-----------|
-| **Glossary matching backend** | > 📎 详见 ADR-001 |
-| **TM storage backend** | > 📎 详见 ADR-002 |
-| **Frozen dataclasses for cross-layer data** | Prevents accidental mutation, explicit data flow |
-| **Stateless LogicController** | No history/state variables; any frontend calls it identically |
-| **TM-priority strategy** (TM > Glossary) | Exact match skips glossary extraction; avoids redundant noise |
-| **Dual Excel adapters** | xlwings (interactive) + openpyxl (headless). > 📎 xlwings 隔离策略详见 ADR-003 |
-| **Conditional openpyxl import** | Core engine degrades gracefully if openpyxl not installed |
-| **No external deps for core** | Layer 1-3 use only stdlib; zero install friction |
-| **Benchmark contract as schema enforcer** | Single source of truth for runtime expectations; prevents regressions |
-| **Deterministic seeded workloads** | `random.Random(seed=1337)` for reproducible cross-run comparison |
+## 数据与安全规则
 
-## Data Formats
+| 格式 | 用途与规则 |
+|------|------------|
+| JSONL | TM；精确匹配、最后写入胜出 |
+| UTF-8-SIG CSV | 本地两列术语表 |
+| JSON / TXT | 编辑项目输入；项目保存为版本化 JSON |
+| TMX | Level 1 导入；最大 100 MB；拒绝 DTD/ENTITY；行内 XML 单元跳过 |
+| XLSX | 术语导入前两列；依赖 openpyxl |
 
-| Format | Purpose |
-|--------|---------|
-| CSV (utf-8-sig) | Glossary term lists |
-| JSONL (append-only) | Translation Memory storage, benchmark workloads |
-| PO (gettext) | Source translation units |
-| JSON | Benchmark artifacts, contracts, reports |
-| XLSX/XLS | Excel glossary input and output workbooks |
+项目保存、资源清单与导入均使用同目录临时文件加 `os.replace`。整体解析失败不得改变目标字节。
 
----
-_Document standards and patterns, not every dependency_
+## 开发与测试标准
+
+- 跨层契约使用 `@dataclass(frozen=True)` 和 tuple 集合。
+- 新代码使用 `pathlib.Path`、现代类型语法和显式异常/结构化报告。
+- 正式测试使用 stdlib `unittest`；Qt 使用 offscreen 与 QtTest；旧核心继续保留模块自检。
+- `.kiro/specs/` 保存需求、设计和任务；`.kiro/steering/` 保存当前项目级事实。
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
+QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
+python glossary_engine.py
+python tm_engine.py
+python logic_controller.py
+python stress_runner.py
+python translation_runner.py
+```
+
+## 关键技术决策
+
+- Qt 会话状态属于 `EditorController`，不塞回旧无状态 `LogicController`。
+- 资源状态由 `ResourceRepository` 原子持久化，设置对话框不直接写文件。
+- Active + Lookup 决定查询集合；Active + Update 决定确认写回集合。
+- 导入后先构建完整新引擎集合，成功后一次替换；失败保留上一组可用实例。
+- 当前只提供精确 TM，不伪装模糊匹配或云端能力。

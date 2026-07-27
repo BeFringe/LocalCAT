@@ -10,11 +10,11 @@
 
 | 步骤 | 硬性要求 | 验证锚定句 | 当前状态 |
 |------|---------|-----------|---------|
-| Step 1 | Qt 无关的数据契约、项目读写、资源注册和原子导入 | 完成后应能在无 Qt 环境中打开/保存项目并导入 TMX、CSV/XLSX，失败不损坏原资源 | 待实现 |
-| Step 2 | 独立 EditorController 维护会话并协调现有引擎，旧 LogicController 三态不变 | 完成后应能通过 Logic 层查询 TM/术语、确认段落并按 Lookup/Update 配置读写资源 | 待实现 |
-| Step 3 | PySide6 主编辑器具备双栏当前段、段落导航、建议页签、确认与保存 | 完成后应能从示例或真实 JSON/TXT 项目完成至少一个段落的编辑与确认 | 待实现 |
-| Step 4 | 齿轮设置具备资源列表、新建、启停、Lookup/Update、TMX 和术语表导入 | 完成后应能从设置导入资源，回到编辑器后立即得到新建议 | 待实现 |
-| Step 5 | 回归、offscreen GUI、真实导入与确认闭环验证 | 完成后应看到核心自检全绿、主窗口可启动、导入资源能被查询、确认译文能持久化 | 待实现 |
+| Step 1 | Qt 无关的数据契约、项目读写、资源注册和原子导入 | 完成后应能在无 Qt 环境中打开/保存项目并导入 TMX、CSV/XLSX，失败不损坏原资源 | 已验证 |
+| Step 2 | 独立 EditorController 维护会话并协调现有引擎，旧 LogicController 三态不变 | 完成后应能通过 Logic 层查询 TM/术语、确认段落并按 Lookup/Update 配置读写资源 | 已验证 |
+| Step 3 | PySide6 主编辑器具备双栏当前段、段落导航、建议页签、确认与保存 | 完成后应能从示例或真实 JSON/TXT 项目完成至少一个段落的编辑与确认 | 已验证 |
+| Step 4 | 齿轮设置具备资源列表、新建、启停、Lookup/Update、TMX 和术语表导入 | 完成后应能从设置导入资源，回到编辑器后立即得到新建议 | 已验证 |
+| Step 5 | 回归、offscreen GUI、真实导入与确认闭环验证 | 完成后应看到核心自检全绿、主窗口可启动、导入资源能被查询、确认译文能持久化 | 已验证 |
 
 ## 依赖
 
@@ -48,12 +48,12 @@
 
 ## 集成层验收检查
 
-- [ ] 使用 EditorController 的真实查询、确认、导入与热重载接口验收，而非只构造窗口
-- [ ] 使用真实临时 TMX/CSV/XLSX 与 JSON/TXT 项目完成闭环
-- [ ] 修正并运行旧 LogicController 自检，确认 Excel 依赖的三态契约未回归
+- [x] 使用 EditorController 的真实查询、确认、导入与热重载接口验收，而非只构造窗口
+- [x] 使用真实临时 TMX/CSV/XLSX 与 JSON/TXT 项目完成闭环
+- [x] 修正并运行旧 LogicController 自检，确认 Excel 依赖的三态契约未回归
 
 ## Steering 同步检查需求
 
-- 设计通过后检查 `structure.md`：新增 Editor Logic、资源导入与 Qt Frontend 组件。
-- 设计通过后检查 `tech.md`：PySide6 6.11.1 与 UI 测试/启动命令。
-- 实现完成后检查 `product.md`：Feature 4 从计划中更新为 MVP 已交付。
+- [x] `structure.md`：已新增 Editor Logic、资源导入与 Qt Frontend 组件。
+- [x] `tech.md`：已记录 PySide6 6.11.1、依赖诊断和 UI 测试/启动命令。
+- [x] `product.md`：Feature 4 已从计划更新为 MVP 已交付。

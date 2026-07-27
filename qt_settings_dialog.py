@@ -179,10 +179,15 @@ class QtSettingsDialog(QDialog):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.setShowGrid(False)
+        table.setWordWrap(False)
         table.setMinimumHeight(128)
         header = table.horizontalHeader()
-        for column in range(5):
+        for column in range(3):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(3, 140)
+        table.setColumnWidth(4, 112)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         return table
@@ -519,6 +524,9 @@ QTableWidget {
     alternate-background-color: #f7f9fc;
     border: none;
     color: #26384b;
+}
+QTableWidget::item {
+    padding: 5px 8px;
 }
 QHeaderView::section {
     background: #eaf0f6;
