@@ -95,21 +95,21 @@ if __name__ == "__main__":
     
     controller = LogicController()
     
-    # Test Case 1: TM Hit (Priority Conflict)
-    # Input: "Glossary Engine Ready"
+    # Test Case 1: TM Hit (default tm.jsonl fixture)
+    # Input: "System Ready"
     # Expected: TM_HIT, no terms
-    res1 = controller.get_suggestions("Glossary Engine Ready")
+    res1 = controller.get_suggestions("System Ready")
     print(f"Case 1 (TM Hit): {res1}")
     assert res1["status"] == "TM_HIT"
-    assert res1["tm_match"]["target"] == "术语表引擎就绪"
+    assert res1["tm_match"]["target"] == "系统就绪"
     
     # Test Case 2: Nested Terms
     # Input: "A high performance Glossary Engine"
-    # Expected: TERMS_FOUND, 3 terms
+    # Expected: TERMS_FOUND for the two terms in default terms.csv
     res2 = controller.get_suggestions("A high performance Glossary Engine")
     print(f"Case 2 (Terms): {res2}")
     assert res2["status"] == "TERMS_FOUND"
-    assert len(res2["terms"]) == 3
+    assert len(res2["terms"]) == 2
     
     # Test Case 3: No Match
     # Input: "Submit"

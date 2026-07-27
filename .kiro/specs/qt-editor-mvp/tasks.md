@@ -20,7 +20,7 @@
   - _Boundary: EditorProjectCodec_
   - _Depends: 1.1_
 
-- [ ] 1.3 修复已知逻辑自检漂移并建立 Excel 适配器绿色基线
+- [x] 1.3 修复已知逻辑自检漂移并建立 Excel 适配器绿色基线
   - 只把 `logic_controller.py` 自检输入修正为当前默认 TM 中真实存在的句子，不改变业务方法、三态字段或 TM 优先规则
   - 用临时 XLSX 执行 `excel_adapter_openpyxl.run_file_mode_benchmark`，验证 TM_HIT、TERMS_FOUND 和 NO_MATCH 格式仍可写入结果工作簿
   - 对交互式 `excel_adapter.py` 做编译/import 边界检查，确认没有 Qt 依赖且仍只通过 LogicController 访问 Engine
