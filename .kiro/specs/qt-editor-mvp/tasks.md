@@ -41,7 +41,7 @@
   - _Boundary: ResourceRepository_
   - _Depends: 1.1_
 
-- [ ] 2.2 实现安全的 TMX 与 CSV/XLSX 术语表原子导入
+- [x] 2.2 实现安全的 TMX 与 CSV/XLSX 术语表原子导入
   - TMX 导入支持用户指定语言对、locale 规范化、重复 source 后写胜出和结构化统计
   - 拒绝超过 100 MB、DTD/ENTITY、缺少语言对或整体无效的 TMX；带行内标签单元明确跳过并记录
   - 术语表导入读取 CSV/XLSX 前两列、识别常见表头、跳过空行并按源术语后写胜出
