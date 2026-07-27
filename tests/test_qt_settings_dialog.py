@@ -8,7 +8,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QCheckBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox
 
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
 from editor_controller import EditorController
@@ -87,6 +87,50 @@ class QtSettingsDialogTest(unittest.TestCase):
             self.assertFalse(
                 next(item for item in controller.list_resources() if item.id == resource.id).active
             )
+            dialog.close()
+
+    def test_qcombobox_payload_creates_both_resource_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            kind_input = QComboBox()
+            kind_input.addItem("翻译记忆库", ResourceKind.TRANSLATION_MEMORY)
+            kind_input.addItem("术语表", ResourceKind.TERMBASE)
+
+            tm_payload = kind_input.itemData(0)
+            terms_payload = kind_input.itemData(1)
+            self.assertIsInstance(tm_payload, str)
+            self.assertIsInstance(terms_payload, str)
+
+            tm = dialog.create_resource("UI TM", tm_payload)
+            terms = dialog.create_resource("UI terms", terms_payload)
+
+            self.assertIs(tm.kind, ResourceKind.TRANSLATION_MEMORY)
+            self.assertEqual(tm.path.suffix, ".jsonl")
+            self.assertIs(terms.kind, ResourceKind.TERMBASE)
+            self.assertEqual(terms.path.suffix, ".csv")
+            dialog.close()
+
+    def test_resource_columns_preserve_chinese_actions_and_share_extra_width(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            dialog.resize(900, 560)
+            dialog.show()
+            self.app.processEvents()
+            table = dialog.active_table
+            import_button = table.cellWidget(0, 6)
+            small_name_width = table.columnWidth(3)
+            small_path_width = table.columnWidth(5)
+
+            self.assertGreaterEqual(table.columnWidth(4), 128)
+            self.assertGreaterEqual(import_button.width(), import_button.sizeHint().width())
+
+            dialog.resize(1300, 560)
+            self.app.processEvents()
+
+            self.assertGreater(table.columnWidth(3), small_name_width)
+            self.assertGreater(table.columnWidth(5), small_path_width)
             dialog.close()
 
 

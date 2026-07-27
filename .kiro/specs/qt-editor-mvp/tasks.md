@@ -174,7 +174,73 @@
   - _Boundary: Integration Validation, Steering, README_
   - _Depends: 6.2_
 
+- [x] 7. 修复真实语言资源设置回归
+
+- [x] 7.1 归一化界面资源类型并覆盖两种真实创建路径
+  - 在语言资源创建的受控输入边界接受 ResourceKind 或其受支持字符串值，未知值仍明确拒绝
+  - 用 PySide6 QComboBox 的真实 currentData 返回值覆盖 TM 与术语表创建，避免只直传 Enum 的假阳性
+  - 完成后，从新建对话框选择任一种资源都能创建正确扩展名的活动资源且立即加载
+  - _Requirements: 6.3, 6.7_
+  - _Boundary: ResourceRepository, EditorController Resource Creation_
+
+- [x] 7.2 让设置表格在中文内容和窗口拉伸下保持可读
+  - 类型与导入列提供覆盖中文按钮和单元格内容的最小宽度
+  - 名称与本地路径作为弹性列分配窗口新增空间，Active/Lookup/Update 保持紧凑
+  - 完成后，“翻译记忆库”和“导入术语表”完整显示，放大对话框时名称/路径列宽之和增加
+  - _Requirements: 6.2, 6.8_
+  - _Boundary: QtSettingsDialog Resource Table_
+  - _Depends: 7.1_
+
+- [ ] 8. 建立桌面启动和可恢复项目生命周期
+
+- [ ] 8.1 持久化最近项目、最后段落和显示偏好
+  - 使用版本化本地 JSON 原子保存最多十个最近项目、稳定 segment id、索引回退和显示偏好
+  - EditorController 在打开、导航、确认、保存和退出项目时协调断点，不把工作区状态写进翻译项目
+  - 无效断点回到首段，损坏或失效最近记录不阻止应用启动
+  - 完成后，新控制器实例重新打开同一路径时恢复上次段落，最近顺序与偏好均可重建
+  - _Requirements: 9.2, 9.3, 9.4, 9.6, 10.7_
+  - _Boundary: WorkspaceStateRepository, EditorController Project State_
+
+- [ ] 8.2 提供项目菜单、最近项目、退出项目和桌面启动入口
+  - 顶栏项目入口包含打开、最近项目、退出当前项目和退出应用，切换与退出统一经过未保存保护
+  - 退出当前项目后返回可操作空状态；最近项目动作可恢复项目和段落
+  - stdlib bootstrap 支持安装 Linux 用户应用菜单入口，不要求启动器先导入 PySide6
+  - 完成后，用户可从应用菜单启动 LocalCAT，并在 GUI 内完成项目切换、退出项目与最近项目重开
+  - _Requirements: 2.5, 8.3, 8.6, 9.1, 9.2, 9.4, 9.5, 9.6, 9.7_
+  - _Boundary: QtBootstrap, QtEditorWindow Project Lifecycle_
+  - _Depends: 8.1_
+
+- [ ] 9. 实现段落密度和浏览校对工作区
+
+- [ ] 9.1 实现左栏紧凑等高与自动换行切换
+  - 紧凑模式保持稳定单行高度、摘要省略和完整源文悬停提示
+  - 自动换行模式展示完整源文并在栏宽变化后重算可读行高
+  - 切换密度不改变当前段、当前译文或确认状态，并保存偏好
+  - 完成后，同一长段在两种模式呈现不同高度，当前会话内容保持一致
+  - _Requirements: 10.1, 10.2, 10.3, 10.7_
+  - _Boundary: QtEditorWindow Segment Navigation_
+  - _Depends: 8.2_
+
+- [ ] 9.2 实现只读双语浏览校对页和同段返回编辑
+  - 浏览校对页按段显示完整源文、最新译文和确认状态并自动换行
+  - 编辑/浏览切换共享同一个 EditorController 会话，不复制或覆盖项目状态
+  - 双击浏览行回到编辑模式并定位同一段；编辑或确认后再次浏览显示最新值
+  - 完成后，长篇项目可连续浏览双语全文，并从任意浏览行精确回到编辑器
+  - _Requirements: 10.4, 10.5, 10.6, 10.7_
+  - _Boundary: QtEditorWindow Browse Review_
+  - _Depends: 9.1_
+
+- [ ] 9.3 用真实长篇项目和 OWNattempt 记忆库完成增量验收
+  - 使用 `po/卷一_引.json` 与 `RpySeriesExtract/OWNattempt.tmx` 验证创建 TM、导入 en-US → zh-CN、当前项目精确命中和应用建议
+  - 覆盖项目断点恢复、最近项目、退出项目、两种段落密度、浏览校对双击返回和设置列宽
+  - 运行完整 unittest、offscreen smoke、五个既有入口并更新 README、steering、border 与验收报告
+  - 完成后，真实 TMX 导入 165 条且对真实项目产生 112 个精确命中，新增 UI 旅程和既有契约全部通过
+  - _Requirements: 6.7, 6.8, 7.2, 7.6, 8.4, 8.5, 8.7, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7_
+  - _Boundary: Integration Validation, README, Steering_
+  - _Depends: 9.2_
+
 ## Implementation Notes
 
 - 基线记录：实施前 `logic_controller.py` 自检因夹具句子不在当前 `tm.jsonl` 中失败；其他核心脚本通过。
 - 权威顺序：当前用户要求 → 最新 steering → 当前分支可运行契约 → 本规格；遗留 MCA playbook 仅作历史参考。
+- 真实 UI 根因：PySide6 QComboBox 把 str Enum 的 itemData 还原为普通 str，资源创建边界必须显式归一化。

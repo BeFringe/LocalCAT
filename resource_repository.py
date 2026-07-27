@@ -60,18 +60,24 @@ class ResourceRepository:
                 return resource
         raise ResourceError(f"unknown resource: {resource_id}")
 
-    def create_resource(self, name: str, kind: ResourceKind) -> ResourceConfig:
+    def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create an empty TM or termbase under the managed application directory."""
 
         clean_name = name.strip()
         if not clean_name:
             raise ResourceError("resource name must not be empty")
-        if not isinstance(kind, ResourceKind):
-            raise ResourceError(f"unsupported resource kind: {kind}")
+        try:
+            normalized_kind = kind if isinstance(kind, ResourceKind) else ResourceKind(kind)
+        except (TypeError, ValueError) as exc:
+            raise ResourceError(f"unsupported resource kind: {kind}") from exc
 
         resource_id = uuid4().hex
-        suffix = ".jsonl" if kind is ResourceKind.TRANSLATION_MEMORY else ".csv"
-        stem = _safe_stem(clean_name) or kind.value
+        suffix = (
+            ".jsonl"
+            if normalized_kind is ResourceKind.TRANSLATION_MEMORY
+            else ".csv"
+        )
+        stem = _safe_stem(clean_name) or normalized_kind.value
         path = (self.managed_dir / f"{stem}-{resource_id[:8]}{suffix}").resolve()
         if not path.is_relative_to(self.managed_dir):
             raise ResourceError("managed resource path escaped the application directory")
@@ -79,11 +85,15 @@ class ResourceRepository:
         resource = ResourceConfig(
             id=resource_id,
             name=clean_name,
-            kind=kind,
+            kind=normalized_kind,
             path=path,
         )
         try:
-            encoding = "utf-8" if kind is ResourceKind.TRANSLATION_MEMORY else "utf-8-sig"
+            encoding = (
+                "utf-8"
+                if normalized_kind is ResourceKind.TRANSLATION_MEMORY
+                else "utf-8-sig"
+            )
             path.write_text("", encoding=encoding)
             updated = [*self._resources, resource]
             self._write_registry(updated)
@@ -91,7 +101,7 @@ class ResourceRepository:
             path.unlink(missing_ok=True)
             raise
         self._resources = updated
-        LOGGER.info("Created managed %s resource %s", kind.value, resource_id)
+        LOGGER.info("Created managed %s resource %s", normalized_kind.value, resource_id)
         return resource
 
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig:

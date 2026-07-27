@@ -10,6 +10,7 @@ Qt 专业编辑器 MVP 为 LocalCAT 增加 Layer 4 桌面前端，并新增一�
 
 - 闭合个人翻译的打开、编辑、建议、确认、回写和保存流程。
 - 提供 MateCat 风格但适合桌面的专业信息层级与键盘节奏。
+- 提供最近项目、最后段落恢复、紧凑/换行导航和双语浏览校对。
 - 保持四层依赖方向和旧 LogicController/Excel 契约。
 - 对语言资源 I/O 提供结构化结果、原子写入和可重复验证。
 
@@ -26,6 +27,7 @@ Qt 专业编辑器 MVP 为 LocalCAT 增加 Layer 4 桌面前端，并新增一�
 
 - 编辑器项目与段落的会话契约和 JSON/TXT 编解码。
 - 本地资源清单、活动/Lookup/Update 状态和默认资源引导。
+- 本地最近项目、段落断点和工作区显示偏好。
 - TMX Level 1、两列 CSV/XLSX 的安全原子导入。
 - EditorController 的项目、建议、确认、术语添加和资源热重载接口。
 - PySide6 主窗口、设置对话框、快捷键与 offscreen GUI 验证。
@@ -36,6 +38,7 @@ Qt 专业编辑器 MVP 为 LocalCAT 增加 Layer 4 桌面前端，并新增一�
 - 不改变 `LogicController.get_suggestions()` 三态契约。
 - 不实现通用 ParserRegistry；仅提供编辑器 MVP 所需的明确格式适配。
 - 不承担模糊匹配、多人协作、网络资源和复杂格式标签保真。
+- 浏览校对模式不直接编辑表格单元格；双击进入同段编辑模式完成修改。
 
 ### 允许依赖
 
@@ -69,6 +72,7 @@ graph LR
     Contracts --> ResourceImporter[Resource importer]
     ProjectCodec --> EditorController[Editor controller]
     ResourceRepo --> EditorController
+    WorkspaceState --> EditorController
     ResourceImporter --> EditorController
     TMEngine[TM engine] --> EditorController
     GlossaryEngine[Glossary engine] --> EditorController
@@ -81,6 +85,7 @@ graph LR
 - **选定模式**：薄前端 + 编辑会话控制器 + 文件资源仓库。
 - **保留模式**：根目录平铺、frozen dataclass、JSONL append-only、Trie 查询。
 - **新增组件理由**：编辑状态与多资源语义不能安全塞入旧 LogicController。
+- **增量组件理由**：最近项目与显示偏好不能写入可交换项目文件，使用独立 WorkspaceStateRepository。
 - **Steering 合规**：Qt 仅 Layer 4，核心引擎零 UI 依赖，所有 I/O 返回结构化结果。
 
 ### 技术栈
@@ -102,6 +107,7 @@ graph LR
 ├── editor_project.py            # JSON/TXT 项目读取、示例项目与原子 JSON 保存
 ├── resource_repository.py       # 本地资源清单、默认资源与状态持久化
 ├── resource_importer.py         # 安全 TMX 与 CSV/XLSX 解析、合并和原子写入
+├── workspace_state.py           # 最近项目、段落断点和显示偏好原子持久化
 ├── editor_controller.py         # Layer 3 编辑会话、查询、确认、热重载与资源操作
 ├── qt_settings_dialog.py        # Layer 4 资源设置、导入 worker 和状态反馈
 ├── qt_editor_window.py          # Layer 4 主窗口、样式、快捷键与交互
@@ -111,8 +117,10 @@ graph LR
 └── tests/
     ├── test_editor_project.py
     ├── test_resource_importer.py
+    ├── test_workspace_state.py
     ├── test_editor_controller.py
-    └── test_qt_editor.py
+    ├── test_qt_editor.py
+    └── test_qt_browse_mode.py
 ```
 
 ### 修改文件
@@ -122,6 +130,27 @@ graph LR
 - `.kiro/steering/tech.md` — 记录 PySide6 版本、依赖安装、测试与启动命令。
 - `.kiro/steering/product.md` — 实现验收后把 Feature 4 标记为 MVP 已交付。
 - `README.md` — 在保留用户现有 Feature 3 状态修订的基础上，更新 Qt MVP 的实际架构、依赖、启动与验证说明。
+
+### 最近项目与浏览校对
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant QtEditor
+    participant EditorController
+    participant WorkspaceState
+    User->>QtEditor: 打开或选择最近项目
+    QtEditor->>EditorController: open project
+    EditorController->>WorkspaceState: load last segment
+    EditorController-->>QtEditor: project and restored index
+    User->>QtEditor: switch browse review
+    QtEditor-->>User: bilingual wrapped rows
+    User->>QtEditor: double click row
+    QtEditor->>EditorController: go to row
+    QtEditor-->>User: edit mode at same segment
+```
+
+工作区状态只保存绝对项目路径、稳定 segment id、索引回退和显示偏好。项目文件不存在时不阻止应用启动。
 
 ## 系统流程
 
@@ -173,9 +202,11 @@ sequenceDiagram
 | 3.1, 3.2, 3.3, 3.4, 3.5, 3.6 | 编辑、确认、导航和 TM 回写 | EditorController, QtEditorWindow | update_target/confirm/navigation |
 | 4.1, 4.2, 4.3, 4.4, 4.5 | 精确 TM 建议 | EditorController, TMEngine, QtEditorWindow | suggestions/apply |
 | 5.1, 5.2, 5.3, 5.4, 5.5, 5.6 | 术语建议、突出和添加 | EditorController, GlossaryEngine, QtEditorWindow | suggestions/add_term |
-| 6.1, 6.2, 6.3, 6.4, 6.5, 6.6 | 资源设置和持久化 | ResourceRepository, QtSettingsDialog | list/create/update |
+| 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8 | 资源设置和持久化 | ResourceRepository, QtSettingsDialog | normalize/list/create/update/resize |
 | 7.1, 7.2, 7.3, 7.4, 7.5, 7.6 | TMX/术语导入与热重载 | ResourceImporter, EditorController, ImportWorker | import resource flow |
 | 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7 | 本地性、依赖、回归、快捷键和 README | 全部组件、README | bootstrap/full suite/offscreen/docs |
+| 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7 | 桌面启动、最近项目与段落恢复 | QtBootstrap, WorkspaceStateRepository, EditorController, QtEditorWindow | install/remember/open/close/quit |
+| 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7 | 紧凑/换行段落与浏览校对 | QtEditorWindow, WorkspaceStateRepository | density/workspace mode/browse activation |
 
 ## 组件与接口
 
@@ -184,11 +215,12 @@ sequenceDiagram
 | EditorContracts | Shared | 冻结跨层数据形状 | 2–7 | 无 | State |
 | EditorProjectCodec | Layer 2B | JSON/TXT 项目 I/O | 2 | Contracts | Batch |
 | ResourceRepository | Layer 1 | 资源清单与状态 | 6 | Contracts | State |
+| WorkspaceStateRepository | Layer 1 | 最近项目、段落断点与显示偏好 | 9, 10 | stdlib | State |
 | ResourceImporter | Layer 2B | 安全原子语言资产导入 | 7, 8 | Contracts, openpyxl | Batch |
-| EditorController | Layer 3 | 会话、查询与写回协调 | 2–7 | Project, Repository, Importer, Engines | Service, State |
+| EditorController | Layer 3 | 会话、查询、写回和工作区恢复协调 | 2–7, 9 | Project, Repositories, Importer, Engines | Service, State |
 | QtSettingsDialog | Layer 4 | 资源管理与导入交互 | 6, 7 | EditorController | UI |
-| QtEditorWindow | Layer 4 | 主翻译工作区 | 1–5, 8 | EditorController, SettingsDialog | UI |
-| QtBootstrap | Runtime | 依赖诊断、启动与 smoke 分派 | 8 | stdlib, QtEditorWindow | CLI |
+| QtEditorWindow | Layer 4 | 编辑、项目菜单与浏览校对工作区 | 1–5, 8–10 | EditorController, SettingsDialog | UI |
+| QtBootstrap | Runtime | 依赖诊断、桌面入口安装、启动与 smoke 分派 | 8, 9 | stdlib, QtEditorWindow | CLI |
 
 ### Shared Contracts
 
@@ -253,6 +285,26 @@ class ResourceRepository:
     def get(self, resource_id: str) -> ResourceConfig: ...
 ```
 
+公开创建边界接受 `ResourceKind` 或其受支持字符串值并立即归一化；其他对象和未知字符串继续返回 `ResourceError`。
+
+### WorkspaceStateRepository
+
+**职责与约束**
+
+- 使用 schema v1 JSON 原子保存最多 10 个最近项目。
+- 每个项目保存绝对路径、最近访问的 segment id 与索引回退。
+- 保存 `compact/wrapped` 段落密度和 `edit/browse` 工作区模式。
+- 无效状态文件不覆盖用户文件，应用以空状态继续运行并在后续有效操作时重建。
+
+```python
+class WorkspaceStateRepository:
+    def recent_projects(self) -> tuple[RecentProject, ...]: ...
+    def remember_project(self, path: Path, segment_id: str, index: int) -> None: ...
+    def remove_recent(self, path: Path) -> None: ...
+    def display_preferences(self) -> DisplayPreferences: ...
+    def update_display_preferences(self, preferences: DisplayPreferences) -> None: ...
+```
+
 ### ResourceImporter
 
 **职责与约束**
@@ -279,6 +331,8 @@ def import_termbase(input_path: Path, target_path: Path) -> ImportReport: ...
 **职责与约束**
 
 - 持有当前 `EditorProject` 与当前索引，Engine 不持有 UI 状态。
+- 打开真实路径项目时恢复有效段落；导航、确认、保存和退出项目时更新本地断点。
+- 提供最近项目、退出当前项目和显示偏好的控制器入口，Qt 不直接访问 WorkspaceStateRepository。
 - 活动 Lookup 资源决定查询集合，活动 Update 资源决定写回集合。
 - 资源变动和成功导入后重建内存引擎；重建失败时保留上一组可用引擎。
 - 任何公开方法返回 frozen contract 或显式异常，不返回展示字符串。
@@ -286,6 +340,8 @@ def import_termbase(input_path: Path, target_path: Path) -> ImportReport: ...
 ```python
 class EditorController:
     def open_project(self, path: Path) -> EditorProject: ...
+    def close_project(self) -> None: ...
+    def recent_projects(self) -> tuple[RecentProject, ...]: ...
     def load_sample(self) -> EditorProject: ...
     def update_target(self, target: str) -> EditorProject: ...
     def confirm_current(self) -> ConfirmResult: ...
@@ -302,6 +358,8 @@ class EditorController:
 
 - 使用资源表显示 Active、Lookup、Update、名称、类型和路径。
 - 新建资源仅要求名称与类型；创建后立即刷新表。
+- QVariant 返回的资源类型字符串在受控边界归一化；TM 与术语表真实创建路径均有回归。
+- 名称和路径列随窗口伸缩，类型与导入操作保持完整可见。
 - TM 资源提供“导入 TMX”，术语资源提供“导入术语表”。
 - 导入 worker 在后台调用控制器；对话框禁用冲突操作并显示忙碌状态。
 - 完成时显示 ImportReport，发出 `resources_changed` 信号。
@@ -309,16 +367,19 @@ class EditorController:
 
 ### QtEditorWindow
 
-- 顶栏：LocalCAT 标识、项目名、语言方向、进度、打开/保存/设置。
-- 左栏：段号、源文摘要、确认状态和未确认过滤。
+- 顶栏：LocalCAT 标识、项目名、语言方向、进度、项目菜单、保存、设置和编辑/浏览校对切换。
+- 项目菜单：打开、最近项目、退出当前项目与退出应用；全部复用未保存保护。
+- 左栏：段号、确认状态、未确认过滤，以及紧凑等高/自动换行密度切换。
 - 中栏：源文只读卡、译文编辑器、上一段/下一段/确认按钮。
 - 右栏：Translation Matches 与 Termbase 页签；双击或按钮应用建议。
+- 浏览校对页：源文/译文双栏只读表、长文本自动换行、确认状态；双击回到同段编辑。
 - 源文 HTML 使用转义后再注入高亮 span，避免项目文本形成 HTML。
 - 快捷键：`Ctrl+O`、`Ctrl+S`、`Ctrl+Enter`、`Alt+Up`、`Alt+Down`、`Ctrl+,`。
 
 ### QtBootstrap
 
 - `qt_editor.py` 只使用 stdlib 解析参数并延迟导入 `qt_editor_window`。
+- `--install-desktop-launcher` 在 Linux 用户应用目录生成指向当前解释器与脚本绝对路径的 `.desktop` 文件，安装过程不导入 Qt。
 - 缺少 PySide6 时向 stderr 输出 `python -m pip install -r requirements-ui.txt` 并返回非零退出码。
 - XLSX 导入缺少 openpyxl 时由 ResourceImporter 返回同样可操作的依赖错误；CSV/TMX 和核心功能仍可运行。
 - `--smoke-test` 在依赖可用时委派给窗口模块，缺依赖时走与普通启动相同的诊断路径。
@@ -352,6 +413,7 @@ erDiagram
 ### 物理数据
 
 - `resources.json`：`{"schema_version": 1, "resources": [...]}`。
+- `workspace.json`：schema v1、最近项目、最后段落和显示偏好。
 - TM：沿用每行一个对象的 JSONL。
 - Termbase：沿用 UTF-8-SIG 两列 CSV。
 - Project save：`{"schema_version": 1, "name": "...", "segments": [...]}`。
@@ -363,6 +425,7 @@ erDiagram
 | 用户输入 | 空资源名、空译文、无可写术语表 | 保持状态并显示具体原因 |
 | 文件错误 | 无效 JSON/TMX、缺语言对、不可读 XLSX | 不替换目标文件，显示路径与可操作提示 |
 | 资源错误 | 单个 TM 写入失败 | ConfirmResult 列出失败资源，不自动前进 |
+| 工作区错误 | 最近文件消失、状态 JSON 损坏 | 忽略失效断点并保持应用可启动，显示可操作项目错误 |
 | 依赖错误 | 未安装 PySide6/openpyxl | 启动或导入入口显示安装方法 |
 | 运行错误 | 引擎热重载失败 | 保留上一组可用实例并记录日志 |
 
@@ -374,6 +437,7 @@ erDiagram
 
 - ProjectCodec：JSON/TXT、已有 target/speaker/confirmed、无效输入、原子保存。
 - ResourceRepository：默认资源、创建、状态持久化、非活动保留。
+- WorkspaceStateRepository：最近顺序、十项上限、段落恢复、显示偏好、无效文件降级。
 - ResourceImporter：多语言 TMX、缺语言对、DTD、带标签、重复覆盖、CSV/XLSX、失败不损坏。
 - EditorController：查询集合、确认回写、修改已确认段、导航、添加术语、导入热重载。
 - Bootstrap：模拟缺少 PySide6 与缺少 openpyxl，验证错误信息包含精确安装命令且不出现 traceback。
@@ -393,6 +457,9 @@ erDiagram
 - 点击齿轮打开设置；创建资源；验证设置刷新信号。
 - 应用 TM/术语建议并检查译文编辑器。
 - 缩小与放大主窗口，验证主要 splitter 面板仍可见且具有最小可读尺寸。
+- 从 QVariant 字符串创建两种资源；设置窗口伸缩后类型/导入文字完整且弹性列增长。
+- 切换紧凑/换行后当前段不变；浏览校对展示最新双语内容，双击回到同段编辑。
+- 关闭并重新打开长篇项目，恢复最后段落和最近项目顺序。
 - 从设置添加术语后，回到当前段立即显示该术语建议。
 
 ### 冒烟
@@ -426,6 +493,7 @@ QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
 - TMX 使用 `iterparse` 并在处理后清理元素。
 - 当前精确 TM 仍使用内存索引；几十万条以上或引入模糊查询时触发 SQLite/索引规格。
 - 段落导航仅渲染当前段与轻量摘要，不为每段创建完整编辑器控件。
+- 浏览校对页使用表格项而非每段嵌套编辑器；只在进入浏览页或项目内容变化后刷新双语快照。
 
 ---
 

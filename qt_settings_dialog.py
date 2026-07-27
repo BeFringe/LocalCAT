@@ -182,14 +182,15 @@ class QtSettingsDialog(QDialog):
         table.setWordWrap(False)
         table.setMinimumHeight(128)
         header = table.horizontalHeader()
+        header.setMinimumSectionSize(54)
         for column in range(3):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        table.setColumnWidth(3, 140)
-        table.setColumnWidth(4, 112)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(4, 128)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(6, 154)
         return table
 
     def refresh_resources(self) -> None:
@@ -249,6 +250,7 @@ class QtSettingsDialog(QDialog):
             )
             import_button.setObjectName(f"import_{resource.id}")
             import_button.setProperty("resource_id", resource.id)
+            import_button.setMinimumWidth(126)
             import_button.clicked.connect(
                 lambda _checked=False, configured=resource: self._prompt_import(configured)
             )
@@ -271,7 +273,7 @@ class QtSettingsDialog(QDialog):
         self.resources_changed.emit()
         QTimer.singleShot(0, self.refresh_resources)
 
-    def create_resource(self, name: str, kind: ResourceKind) -> ResourceConfig:
+    def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create through the controller; exposed for the prompt and GUI tests."""
 
         resource = self.controller.create_resource(name, kind)

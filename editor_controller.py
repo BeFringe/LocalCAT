@@ -298,7 +298,7 @@ class EditorController:
 
         return self.repository.list_resources()
 
-    def create_resource(self, name: str, kind: ResourceKind) -> ResourceConfig:
+    def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create a managed resource and make it available immediately."""
 
         try:

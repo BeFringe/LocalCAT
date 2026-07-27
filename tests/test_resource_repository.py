@@ -52,6 +52,26 @@ class ResourceRepositoryTest(unittest.TestCase):
             self.assertEqual(tm.path.read_text(encoding="utf-8"), "")
             self.assertEqual(terms.path.read_text(encoding="utf-8-sig"), "")
 
+    def test_create_normalizes_supported_serialized_resource_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = ResourceRepository(Path(temp_dir) / "app-data")
+
+            tm = repository.create_resource(
+                "Serialized TM",
+                ResourceKind.TRANSLATION_MEMORY.value,
+            )
+            terms = repository.create_resource(
+                "Serialized terms",
+                ResourceKind.TERMBASE.value,
+            )
+
+            self.assertIs(tm.kind, ResourceKind.TRANSLATION_MEMORY)
+            self.assertEqual(tm.path.suffix, ".jsonl")
+            self.assertIs(terms.kind, ResourceKind.TERMBASE)
+            self.assertEqual(terms.path.suffix, ".csv")
+            with self.assertRaisesRegex(ResourceError, "unsupported resource kind"):
+                repository.create_resource("Unknown", "not-a-resource")
+
     def test_updates_state_atomically_and_restores_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
