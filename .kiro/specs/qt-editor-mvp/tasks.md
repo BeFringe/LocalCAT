@@ -10,7 +10,7 @@
   - _Requirements: 2.1, 2.3, 3.2, 4.2, 5.2, 6.2, 7.2, 8.2, 8.3_
   - _Boundary: EditorContracts, UI Runtime Prerequisites_
 
-- [ ] 1.2 实现 JSON/TXT 项目读取、示例项目和原子保存
+- [x] 1.2 实现 JSON/TXT 项目读取、示例项目和原子保存
   - 支持对象数组与带 segments 根对象的 JSON 项目，保留 source、target、speaker 和 confirmed
   - 将 TXT 每个非空行转换为待翻译段落，并生成稳定且唯一的段落 ID
   - 提供内置示例项目，保证首次启动可立即体验真实编辑流程
