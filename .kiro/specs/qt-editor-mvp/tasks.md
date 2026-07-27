@@ -144,7 +144,7 @@
 
 - [ ] 6. 完成运行时闭环与项目同步
 
-- [ ] 6.1 实现无 Qt bootstrap、依赖诊断和 offscreen 冒烟入口
+- [x] 6.1 实现无 Qt bootstrap、依赖诊断和 offscreen 冒烟入口
   - `qt_editor.py` 只使用 stdlib 解析参数并延迟导入 Qt 窗口模块
   - 模拟缺少 PySide6 时返回非零并输出 `python -m pip install -r requirements-ui.txt`，不输出未处理 traceback
   - 模拟 XLSX 导入缺少 openpyxl 时返回可操作错误，同时 CSV/TMX 路径不受影响
