@@ -671,9 +671,21 @@ class QtEditorWindow(QMainWindow):
         return True
 
     def _open_settings(self) -> None:
-        dialog = QtSettingsDialog(self.controller, self)
-        self.settings_dialog = dialog
+        dialog = self.create_settings_dialog()
         dialog.exec()
+
+    def create_settings_dialog(self) -> QtSettingsDialog:
+        """Create the controller-only settings seam and connect resource refresh."""
+
+        dialog = QtSettingsDialog(self.controller, self)
+        dialog.resources_changed.connect(self._resources_changed)
+        self.settings_dialog = dialog
+        return dialog
+
+    def _resources_changed(self) -> None:
+        if self.controller.has_project:
+            self.refresh_suggestions()
+        self.statusBar().showMessage("语言资源已更新，当前段建议已刷新。", 6000)
 
     def refresh_suggestions(self) -> SuggestionBundle:
         """Render the current controller bundle as safe, actionable cards."""

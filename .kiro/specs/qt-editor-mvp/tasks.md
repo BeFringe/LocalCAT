@@ -133,7 +133,7 @@
   - _Boundary: QtEditorWindow Editing Workflow_
   - _Depends: 5.2_
 
-- [ ] 5.4 显式接通设置变更、控制器热重载和当前段建议刷新
+- [x] 5.4 显式接通设置变更、控制器热重载和当前段建议刷新
   - 资源状态或导入完成后由对话框发出 resources_changed，主窗口重新请求 SuggestionBundle
   - 验证 Qt 层不直接访问 ResourceRepository、TMEngine 或 GlossaryEngine
   - 关闭设置后恢复当前段与未保存译文，新导入内容立即出现在对应建议页
