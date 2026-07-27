@@ -128,6 +128,65 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertEqual(window.main_splitter.stretchFactor(2), 3)
             window.close()
 
+    def test_project_menu_lists_recent_and_can_exit_to_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_path = root / "recent.json"
+            project_path.write_text(
+                json.dumps(
+                    {
+                        "name": "Recent",
+                        "segments": [
+                            {"id": "1", "source": "First"},
+                            {"id": "2", "source": "Second"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = self._window(root)
+            self.assertTrue(window.open_project_path(project_path))
+            window.controller.go_to(1)
+            window.refresh_recent_projects()
+
+            actions = window.recent_projects_menu.actions()
+            self.assertEqual(len(actions), 1)
+            self.assertIn("recent.json", actions[0].text())
+            self.assertEqual(Path(actions[0].data()), project_path.resolve())
+
+            window.target_editor.setPlainText("未保存")
+            self._events()
+            window._confirm_unsaved = lambda: False
+            self.assertFalse(window.close_current_project())
+            self.assertTrue(window.controller.has_project)
+            window._confirm_unsaved = lambda: True
+            self.assertTrue(window.close_current_project())
+
+            self.assertFalse(window.controller.has_project)
+            self.assertEqual(window.pages.currentWidget().objectName(), "emptyPage")
+            self.assertFalse(window.save_button.isEnabled())
+            self.assertFalse(window.close_project_action.isEnabled())
+            window.close()
+
+    def test_missing_recent_project_is_pruned_with_actionable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_path = root / "gone.txt"
+            project_path.write_text("Temporary project\n", encoding="utf-8")
+            window = self._window(root)
+            self.assertTrue(window.open_project_path(project_path))
+            self.assertTrue(window.close_current_project())
+            project_path.unlink()
+            errors: list[str] = []
+            window._show_error = lambda _title, message: errors.append(message)
+
+            self.assertFalse(window.open_recent_project(project_path))
+
+            self.assertTrue(errors)
+            self.assertIn("不存在", errors[0])
+            self.assertEqual(window.recent_projects_menu.actions()[0].text(), "暂无最近项目")
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

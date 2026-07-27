@@ -141,6 +141,52 @@ class EditorControllerSessionTest(unittest.TestCase):
         self.assertEqual(suggestions.tm_matches, ())
         self.assertEqual(suggestions.terms, ())
 
+    def test_reopens_project_at_stable_segment_and_can_exit_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "app-data"
+            project_path = root / "project.json"
+            project_path.write_text(
+                json.dumps(
+                    {
+                        "name": "Resume",
+                        "segments": [
+                            {"id": "a", "source": "Alpha"},
+                            {"id": "b", "source": "Beta"},
+                            {"id": "c", "source": "Gamma"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            first = EditorController(ResourceRepository(config_dir))
+            first.open_project(project_path)
+            first.go_to(1)
+
+            project_path.write_text(
+                json.dumps(
+                    {
+                        "name": "Resume",
+                        "segments": [
+                            {"id": "a", "source": "Alpha"},
+                            {"id": "c", "source": "Gamma"},
+                            {"id": "b", "source": "Beta"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            restored = EditorController(ResourceRepository(config_dir))
+            restored.open_project(project_path)
+
+            self.assertEqual(restored.current_index, 2)
+            self.assertEqual(restored.current_segment.id, "b")
+            self.assertEqual(restored.recent_projects()[0].path, project_path.resolve())
+
+            restored.close_project()
+            self.assertFalse(restored.has_project)
+            self.assertEqual(restored.current_index, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

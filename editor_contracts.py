@@ -14,6 +14,51 @@ class ResourceKind(str, Enum):
     TERMBASE = "termbase"
 
 
+class SegmentDensity(str, Enum):
+    """Supported segment-navigation density modes."""
+
+    COMPACT = "compact"
+    WRAPPED = "wrapped"
+
+
+class WorkspaceMode(str, Enum):
+    """Supported desktop workspace pages."""
+
+    EDIT = "edit"
+    BROWSE = "browse"
+
+
+@dataclass(frozen=True)
+class RecentProject:
+    """One locally remembered project and its last visited segment."""
+
+    path: Path
+    segment_id: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if not self.path.is_absolute():
+            raise ValueError("recent project path must be absolute")
+        if not self.segment_id.strip():
+            raise ValueError("recent project segment id must not be empty")
+        if self.index < 0:
+            raise ValueError("recent project index must not be negative")
+
+
+@dataclass(frozen=True)
+class DisplayPreferences:
+    """Persistent local display preferences for the editor workspace."""
+
+    segment_density: SegmentDensity = SegmentDensity.COMPACT
+    workspace_mode: WorkspaceMode = WorkspaceMode.EDIT
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segment_density, SegmentDensity):
+            raise TypeError("segment density must be a SegmentDensity")
+        if not isinstance(self.workspace_mode, WorkspaceMode):
+            raise TypeError("workspace mode must be a WorkspaceMode")
+
+
 @dataclass(frozen=True)
 class EditorSegment:
     """One editable bilingual segment."""

@@ -191,9 +191,9 @@
   - _Boundary: QtSettingsDialog Resource Table_
   - _Depends: 7.1_
 
-- [ ] 8. 建立桌面启动和可恢复项目生命周期
+- [x] 8. 建立桌面启动和可恢复项目生命周期
 
-- [ ] 8.1 持久化最近项目、最后段落和显示偏好
+- [x] 8.1 持久化最近项目、最后段落和显示偏好
   - 使用版本化本地 JSON 原子保存最多十个最近项目、稳定 segment id、索引回退和显示偏好
   - EditorController 在打开、导航、确认、保存和退出项目时协调断点，不把工作区状态写进翻译项目
   - 无效断点回到首段，损坏或失效最近记录不阻止应用启动
@@ -201,7 +201,7 @@
   - _Requirements: 9.2, 9.3, 9.4, 9.6, 10.7_
   - _Boundary: WorkspaceStateRepository, EditorController Project State_
 
-- [ ] 8.2 提供项目菜单、最近项目、退出项目和桌面启动入口
+- [x] 8.2 提供项目菜单、最近项目、退出项目和桌面启动入口
   - 顶栏项目入口包含打开、最近项目、退出当前项目和退出应用，切换与退出统一经过未保存保护
   - 退出当前项目后返回可操作空状态；最近项目动作可恢复项目和段落
   - stdlib bootstrap 支持安装 Linux 用户应用菜单入口，不要求启动器先导入 PySide6
@@ -210,9 +210,9 @@
   - _Boundary: QtBootstrap, QtEditorWindow Project Lifecycle_
   - _Depends: 8.1_
 
-- [ ] 9. 实现段落密度和浏览校对工作区
+- [x] 9. 实现段落密度和浏览校对工作区
 
-- [ ] 9.1 实现左栏紧凑等高与自动换行切换
+- [x] 9.1 实现左栏紧凑等高与自动换行切换
   - 紧凑模式保持稳定单行高度、摘要省略和完整源文悬停提示
   - 自动换行模式展示完整源文并在栏宽变化后重算可读行高
   - 切换密度不改变当前段、当前译文或确认状态，并保存偏好
@@ -221,7 +221,7 @@
   - _Boundary: QtEditorWindow Segment Navigation_
   - _Depends: 8.2_
 
-- [ ] 9.2 实现只读双语浏览校对页和同段返回编辑
+- [x] 9.2 实现只读双语浏览校对页和同段返回编辑
   - 浏览校对页按段显示完整源文、最新译文和确认状态并自动换行
   - 编辑/浏览切换共享同一个 EditorController 会话，不复制或覆盖项目状态
   - 双击浏览行回到编辑模式并定位同一段；编辑或确认后再次浏览显示最新值
@@ -230,7 +230,7 @@
   - _Boundary: QtEditorWindow Browse Review_
   - _Depends: 9.1_
 
-- [ ] 9.3 用真实长篇项目和 OWNattempt 记忆库完成增量验收
+- [x] 9.3 用真实长篇项目和 OWNattempt 记忆库完成增量验收
   - 使用 `po/卷一_引.json` 与 `RpySeriesExtract/OWNattempt.tmx` 验证创建 TM、导入 en-US → zh-CN、当前项目精确命中和应用建议
   - 覆盖项目断点恢复、最近项目、退出项目、两种段落密度、浏览校对双击返回和设置列宽
   - 运行完整 unittest、offscreen smoke、五个既有入口并更新 README、steering、border 与验收报告

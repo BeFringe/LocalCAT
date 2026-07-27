@@ -62,10 +62,13 @@ Qt 前端只能调用 `EditorController`，不得直接调用资源仓储、TM �
 - **已实现内容**:
   - MateCat 风格的本地三栏编辑器：段落列表、源文/译文、Translation Matches 与 Termbase
   - JSON/TXT 项目打开、版本化 JSON 原子保存、未保存保护、确认进度与未确认导航
+  - 项目菜单、最近项目、退出当前项目，以及按稳定段落 ID 恢复上次翻译位置
+  - 左栏紧凑等高/完整自动换行切换，以及双语全文浏览/校对页
   - 精确 TM 与术语并列建议、安全源文高亮、建议应用、术语插入与新增术语
   - 齿轮设置：资源新建、Active/Lookup/Update、后台 TMX/CSV/XLSX 导入与热重载
+  - Linux 用户应用菜单启动器，以及 `Ctrl+Shift+W` 退出项目、`Ctrl+Q` 退出应用
   - `Ctrl+O`、`Ctrl+S`、`Ctrl+Enter`、`Alt+Up`、`Alt+Down`、`Ctrl+,`
-- **核心文件**: `qt_editor.py`, `qt_editor_window.py`, `qt_settings_dialog.py`, `editor_controller.py`
+- **核心文件**: `qt_editor.py`, `qt_editor_window.py`, `qt_settings_dialog.py`, `editor_controller.py`, `workspace_state.py`
 - **Git 信息**: 分支 `ui-mvp`
 
 ### Feature 5: 模糊匹配与自动化 (Fuzzy Matching & Automation) 🔮
@@ -80,7 +83,7 @@ Qt 前端只能调用 `EditorController`，不得直接调用资源仓储、TM �
 - **开发分支**: Feature 3 (feature/logic-excel-adapter) - 逻辑层与 Excel 适配器已完成，已推送
 - **最新版本**: Feature 3 (v0.3.0-feature3) - 逻辑层与 Excel 适配器 + 性能基准测试
 - **Qt MVP 分支**: `ui-mvp` - Feature 4 已实现并通过本地回归，尚未推送
-- **下一步**: 在真实个人项目上试用 MVP；模糊匹配、MT、QA 和协作仍不在当前范围
+- **下一步**: 继续真实项目试用与交互打磨；模糊匹配、MT、QA 和协作仍不在当前范围
 
 ## 🛠 开发方法论
 
@@ -89,7 +92,7 @@ Qt 前端只能调用 `EditorController`，不得直接调用资源仓储、TM �
 - 每次开发会话从仓库中的 `AGENTS.md`、`.kiro/steering/` 与 `.kiro/specs/` 恢复上下文；文件是持久事实来源。
 - 需求、设计、任务、实现和验证按阶段留痕；Qt MVP 的规格位于 `.kiro/specs/qt-editor-mvp/`。
 - `plugins/modular-cat-architect/` 是早期配合旧 `main` README 的遗留材料，已过时，不再作为现行方法论或架构裁决来源。
-- 运行时也区分两种状态语义：旧 `LogicController` 继续保持无状态三态转发；Qt 的 `EditorController` 仅在进程内持有当前编辑会话，项目与资源仍落在本地文件。
+- 运行时也区分两种状态语义：旧 `LogicController` 继续保持无状态三态转发；Qt 的 `EditorController` 在进程内持有当前编辑会话，`WorkspaceStateRepository` 只把最近项目、段落断点和显示偏好原子保存在本地。
 
 ## 🖥️ 安装与启动 Qt MVP
 
@@ -106,9 +109,12 @@ python qt_editor.py --sample
 
 # 打开项目
 python qt_editor.py --project path/to/project.json
+
+# Linux：安装到用户应用菜单，之后可像普通桌面应用一样启动
+python qt_editor.py --install-desktop-launcher
 ```
 
-缺少 PySide6 时，启动器会输出上述安装命令而不会显示未处理 traceback。应用数据默认写入操作系统的本地应用数据目录，也可用 `--data-dir PATH` 覆盖。
+缺少 PySide6 时，启动器会输出上述安装命令而不会显示未处理 traceback。应用数据默认写入操作系统的本地应用数据目录，也可用 `--data-dir PATH` 覆盖。进入项目后可从顶栏“项目”菜单打开或切换最近项目、退出当前项目；再次打开同一项目会恢复最后段落。
 
 ## 📁 MVP 支持范围
 
@@ -125,7 +131,7 @@ python qt_editor.py --project path/to/project.json
 
 同级目录中的 `RpySeriesExtract` 与 `RpyExtended` 是外部辅助 Python 项目，不是 LocalCAT 的运行依赖。两者都带 TMX 与 `tmx_extract_tool.py`；从现有代码看，`RpyExtended` 版本功能更完整（locale 规范化、回退、批处理和过滤），但仓库不假定二者的正式版本关系，也不复制其实现。
 
-- MateCat 导出的无 DTD TMX（如 `OWNattempt.tmx`）可由设置导入；本地兼容烟测导入 165 条、跳过 67 个缺少语言对的 TU。
+- MateCat 导出的无 DTD TMX（如 `OWNattempt.tmx`）可由设置导入；以 `en-US → zh-CN` 导入 165 条、跳过 67 个缺少语言对的 TU、覆盖 30 个重复源文。在 `po/卷一_引.json` 的 2942 段中产生 112 个精确命中。
 - `chinese__english.tmx` 含外部 DOCTYPE，按 LocalCAT 的安全边界会被拒绝。若需要使用，应先在受信环境中生成不含 DTD/ENTITY 的 TMX，而不是降低编辑器的 XML 安全策略。
 
 ## ✅ 验证

@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import html
+from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QFontMetrics,
+    QKeySequence,
+    QResizeEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -18,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -25,6 +36,9 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
     QTextBrowser,
     QTextEdit,
     QToolButton,
@@ -34,7 +48,15 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-from editor_contracts import SuggestionBundle, TMSuggestion, TermSuggestion
+from editor_contracts import (
+    DisplayPreferences,
+    EditorSegment,
+    SegmentDensity,
+    SuggestionBundle,
+    TMSuggestion,
+    TermSuggestion,
+    WorkspaceMode,
+)
 from editor_controller import EditorController, EditorControllerError
 from editor_project import ProjectError
 from qt_settings_dialog import QtSettingsDialog
@@ -101,6 +123,9 @@ class QtEditorWindow(QMainWindow):
         super().__init__()
         self.controller = controller
         self._refreshing = False
+        self._display_preferences: DisplayPreferences = controller.display_preferences()
+        self.segment_density = self._display_preferences.segment_density
+        self.workspace_mode = self._display_preferences.workspace_mode
         self.settings_dialog: QtSettingsDialog | None = None
         self.current_suggestions = SuggestionBundle()
         self.setObjectName("editorWindow")
@@ -110,6 +135,8 @@ class QtEditorWindow(QMainWindow):
         self._build_ui()
         self._wire_actions()
         self._install_shortcuts()
+        self.set_segment_density(self.segment_density, persist=False)
+        self.refresh_recent_projects()
         if controller.has_project:
             self._render_project()
         else:
@@ -182,11 +209,32 @@ class QtEditorWindow(QMainWindow):
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
 
+        self.workspace_mode_combo = QComboBox()
+        self.workspace_mode_combo.setObjectName("workspaceModeCombo")
+        self.workspace_mode_combo.setToolTip("切换编辑或双语浏览校对模式")
+        self.workspace_mode_combo.addItem("编辑", WorkspaceMode.EDIT.value)
+        self.workspace_mode_combo.addItem("浏览 / 校对", WorkspaceMode.BROWSE.value)
+        self.workspace_mode_combo.setCurrentIndex(
+            0 if self.workspace_mode is WorkspaceMode.EDIT else 1
+        )
+        layout.addWidget(self.workspace_mode_combo)
+
         self.open_button = QToolButton()
         self.open_button.setObjectName("openProjectButton")
-        self.open_button.setText("打开")
-        self.open_button.setToolTip("打开项目 (Ctrl+O)")
+        self.open_button.setText("项目")
+        self.open_button.setToolTip("打开或切换项目 (Ctrl+O)")
         self.open_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.open_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.project_menu = QMenu(self)
+        self.project_menu.setObjectName("projectMenu")
+        self.open_project_action = self.project_menu.addAction("打开项目…")
+        self.recent_projects_menu = self.project_menu.addMenu("最近项目")
+        self.recent_projects_menu.setObjectName("recentProjectsMenu")
+        self.project_menu.addSeparator()
+        self.close_project_action = self.project_menu.addAction("退出当前项目")
+        self.project_menu.addSeparator()
+        self.quit_action = self.project_menu.addAction("退出 LocalCAT")
+        self.open_button.setMenu(self.project_menu)
         layout.addWidget(self.open_button)
         self.save_button = QToolButton()
         self.save_button.setObjectName("saveProjectButton")
@@ -266,7 +314,15 @@ class QtEditorWindow(QMainWindow):
         self.main_splitter.setStretchFactor(1, 5)
         self.main_splitter.setStretchFactor(2, 3)
         self.main_splitter.setSizes([240, 600, 360])
-        layout.addWidget(self.main_splitter)
+        self.main_splitter.splitterMoved.connect(
+            lambda _position, _index: self._schedule_layout_refresh()
+        )
+
+        self.workspace_pages = QStackedWidget()
+        self.workspace_pages.setObjectName("editorWorkspacePages")
+        self.workspace_pages.addWidget(self.main_splitter)
+        self.workspace_pages.addWidget(self._build_browse_panel())
+        layout.addWidget(self.workspace_pages)
         return page
 
     def _build_segment_panel(self) -> QWidget:
@@ -283,6 +339,15 @@ class QtEditorWindow(QMainWindow):
         header.addWidget(title)
         header.addWidget(self.segment_count_label)
         header.addStretch()
+        self.segment_density_combo = QComboBox()
+        self.segment_density_combo.setObjectName("segmentDensityCombo")
+        self.segment_density_combo.setToolTip("段落列表：紧凑等高或完整自动换行")
+        self.segment_density_combo.addItem("紧凑", SegmentDensity.COMPACT.value)
+        self.segment_density_combo.addItem("自动换行", SegmentDensity.WRAPPED.value)
+        self.segment_density_combo.setCurrentIndex(
+            0 if self.segment_density is SegmentDensity.COMPACT else 1
+        )
+        header.addWidget(self.segment_density_combo)
         layout.addLayout(header)
         self.unconfirmed_filter = QCheckBox("仅显示未确认")
         self.unconfirmed_filter.setObjectName("unconfirmedFilter")
@@ -291,6 +356,46 @@ class QtEditorWindow(QMainWindow):
         self.segment_list.setObjectName("segmentList")
         self.segment_list.setSpacing(3)
         layout.addWidget(self.segment_list, 1)
+        return panel
+
+    def _build_browse_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("browsePanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("浏览 / 校对")
+        title.setObjectName("panelTitle")
+        hint = QLabel("双语全文只读浏览 · 双击任一行返回同段编辑")
+        hint.setObjectName("browseHint")
+        header.addWidget(title)
+        header.addSpacing(10)
+        header.addWidget(hint)
+        header.addStretch()
+        layout.addLayout(header)
+
+        self.browse_table = QTableWidget(0, 4)
+        self.browse_table.setObjectName("browseTable")
+        self.browse_table.setHorizontalHeaderLabels(["段落", "SOURCE", "TARGET", "状态"])
+        self.browse_table.setWordWrap(True)
+        self.browse_table.setShowGrid(False)
+        self.browse_table.setAlternatingRowColors(True)
+        self.browse_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.browse_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.browse_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.browse_table.verticalHeader().setVisible(False)
+        browse_header = self.browse_table.horizontalHeader()
+        browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        browse_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        browse_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        browse_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.browse_table, 1)
         return panel
 
     def _build_edit_panel(self) -> QWidget:
@@ -398,6 +503,9 @@ class QtEditorWindow(QMainWindow):
 
     def _wire_actions(self) -> None:
         self.open_button.clicked.connect(self._choose_open)
+        self.open_project_action.triggered.connect(self._choose_open)
+        self.close_project_action.triggered.connect(self.close_current_project)
+        self.quit_action.triggered.connect(self.close)
         self.empty_open_button.clicked.connect(self._choose_open)
         self.sample_button.clicked.connect(self.load_sample)
         self.save_button.clicked.connect(self._choose_save)
@@ -409,6 +517,13 @@ class QtEditorWindow(QMainWindow):
         self.confirm_button.clicked.connect(self.confirm_current)
         self.add_term_button.clicked.connect(self._prompt_add_term)
         self.unconfirmed_filter.toggled.connect(self._filter_changed)
+        self.segment_density_combo.currentIndexChanged.connect(
+            self._segment_density_changed
+        )
+        self.workspace_mode_combo.currentIndexChanged.connect(
+            self._workspace_mode_changed
+        )
+        self.browse_table.cellDoubleClicked.connect(self._activate_browse_row)
 
     def _install_shortcuts(self) -> None:
         bindings = (
@@ -418,6 +533,8 @@ class QtEditorWindow(QMainWindow):
             ("previous", "Alt+Up", lambda: self._navigate(-1)),
             ("next", "Alt+Down", lambda: self._navigate(1)),
             ("settings", "Ctrl+,", self._open_settings),
+            ("close_project", "Ctrl+Shift+W", self.close_current_project),
+            ("quit", "Ctrl+Q", self.close),
         )
         self.shortcuts: dict[str, QShortcut] = {}
         for name, sequence, callback in bindings:
@@ -434,6 +551,9 @@ class QtEditorWindow(QMainWindow):
         self.language_label.setText("—")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
+        self.close_project_action.setEnabled(False)
+        self.workspace_mode_combo.setEnabled(False)
+        self.segment_density_combo.setEnabled(False)
         self.statusBar().showMessage("打开本地项目或载入示例以开始。")
 
     def load_sample(self) -> bool:
@@ -454,6 +574,7 @@ class QtEditorWindow(QMainWindow):
             self.statusBar().showMessage("项目打开失败；当前会话保持不变。", 7000)
             return False
         self._render_project()
+        self.refresh_recent_projects()
         self.statusBar().showMessage(f"已打开：{path}", 5000)
         return True
 
@@ -465,7 +586,64 @@ class QtEditorWindow(QMainWindow):
             self.statusBar().showMessage("保存失败。", 7000)
             return False
         self._update_title()
+        self.refresh_recent_projects()
         self.statusBar().showMessage(f"已保存：{path}", 7000)
+        return True
+
+    def refresh_recent_projects(self) -> None:
+        """Rebuild the project menu from controller-owned local workspace state."""
+
+        self.recent_projects_menu.clear()
+        recent = self.controller.recent_projects()
+        if not recent:
+            empty = self.recent_projects_menu.addAction("暂无最近项目")
+            empty.setEnabled(False)
+            return
+        for project in recent:
+            action = self.recent_projects_menu.addAction(
+                f"{project.path.name}  —  {project.path.parent}"
+            )
+            action.setData(str(project.path))
+            action.setToolTip(str(project.path))
+            action.triggered.connect(
+                lambda _checked=False, path=project.path: self.open_recent_project(path)
+            )
+
+    def open_recent_project(self, path: Path) -> bool:
+        """Open a remembered project, pruning entries that no longer exist."""
+
+        normalized = path.expanduser().resolve()
+        if not normalized.is_file():
+            try:
+                self.controller.remove_recent_project(normalized)
+            except EditorControllerError:
+                pass
+            self.refresh_recent_projects()
+            self._show_error("最近项目不可用", f"项目文件不存在：{normalized}")
+            return False
+        return self.open_project_path(normalized)
+
+    def close_current_project(self) -> bool:
+        """Return to the empty workspace after applying the unsaved guard."""
+
+        if not self.controller.has_project:
+            return True
+        if not self._confirm_unsaved():
+            return False
+        self.controller.close_project()
+        self._refreshing = True
+        try:
+            self.segment_list.clear()
+            self.source_display.clear()
+            self.target_editor.clear()
+            self.browse_table.clearContents()
+            self.browse_table.setRowCount(0)
+        finally:
+            self._refreshing = False
+        self.current_suggestions = SuggestionBundle()
+        self._show_empty_state()
+        self.refresh_recent_projects()
+        self._update_title()
         return True
 
     def _choose_open(self) -> bool:
@@ -499,6 +677,9 @@ class QtEditorWindow(QMainWindow):
     def _render_project(self) -> None:
         self.pages.setCurrentIndex(1)
         self.save_button.setEnabled(True)
+        self.close_project_action.setEnabled(True)
+        self.workspace_mode_combo.setEnabled(True)
+        self.segment_density_combo.setEnabled(True)
         self._refreshing = True
         try:
             project = self.controller.project
@@ -511,6 +692,7 @@ class QtEditorWindow(QMainWindow):
             self._render_current_segment()
         finally:
             self._refreshing = False
+        self.set_workspace_mode(self.workspace_mode, persist=False)
         self._update_title()
 
     def _render_current_segment(self) -> None:
@@ -558,12 +740,8 @@ class QtEditorWindow(QMainWindow):
             if item.data(Qt.ItemDataRole.UserRole) != project_index:
                 continue
             segment = self.controller.project.segments[project_index]
-            summary = " ".join(segment.source.split())
-            if len(summary) > 72:
-                summary = summary[:69] + "…"
-            item.setText(
-                f"{'✓' if segment.confirmed else '○'}  {project_index + 1:03d}   {summary}"
-            )
+            item.setText(self._segment_item_text(project_index, segment))
+            item.setSizeHint(self._segment_item_size_hint(item.text()))
             break
 
     def _populate_segment_list(self) -> None:
@@ -574,17 +752,210 @@ class QtEditorWindow(QMainWindow):
         for index, segment in enumerate(project.segments):
             if unconfirmed_only and segment.confirmed:
                 continue
-            summary = " ".join(segment.source.split())
-            if len(summary) > 72:
-                summary = summary[:69] + "…"
-            prefix = "✓" if segment.confirmed else "○"
-            item = QListWidgetItem(f"{prefix}  {index + 1:03d}   {summary}")
+            item = QListWidgetItem(self._segment_item_text(index, segment))
             item.setData(Qt.ItemDataRole.UserRole, index)
             item.setToolTip(segment.source)
+            item.setSizeHint(self._segment_item_size_hint(item.text()))
             self.segment_list.addItem(item)
             if index == self.controller.current_index:
                 selected_row = self.segment_list.count() - 1
         self.segment_list.setCurrentRow(selected_row)
+
+    def _segment_item_text(self, index: int, segment: EditorSegment) -> str:
+        prefix = "✓" if segment.confirmed else "○"
+        if self.segment_density is SegmentDensity.WRAPPED:
+            source = segment.source.strip()
+        else:
+            source = " ".join(segment.source.split())
+            if len(source) > 72:
+                source = source[:69] + "…"
+        return f"{prefix}  {index + 1:03d}   {source}"
+
+    def _segment_item_size_hint(self, text: str) -> QSize:
+        if self.segment_density is SegmentDensity.COMPACT:
+            return QSize(0, 44)
+        available_width = max(150, self.segment_list.viewport().width() - 28)
+        metrics = QFontMetrics(self.segment_list.font())
+        bounds = metrics.boundingRect(
+            QRect(0, 0, available_width, 10000),
+            Qt.TextFlag.TextWordWrap,
+            text,
+        )
+        return QSize(available_width, max(44, bounds.height() + 22))
+
+    def _refresh_segment_item_sizes(self) -> None:
+        if (
+            not self.controller.has_project
+            or self.segment_density is SegmentDensity.COMPACT
+        ):
+            return
+        for row in range(self.segment_list.count()):
+            item = self.segment_list.item(row)
+            if item is not None:
+                item.setSizeHint(self._segment_item_size_hint(item.text()))
+        self.segment_list.doItemsLayout()
+
+    def _segment_density_changed(self, _index: int) -> None:
+        if self._refreshing:
+            return
+        try:
+            density = SegmentDensity(str(self.segment_density_combo.currentData()))
+        except ValueError:
+            return
+        self.set_segment_density(density)
+
+    def set_segment_density(
+        self,
+        density: SegmentDensity,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Switch between equal-height summaries and full wrapped source rows."""
+
+        try:
+            normalized = (
+                density
+                if isinstance(density, SegmentDensity)
+                else SegmentDensity(density)
+            )
+            preferences = replace(
+                self._display_preferences,
+                segment_density=normalized,
+            )
+            if persist:
+                preferences = self.controller.update_display_preferences(preferences)
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self._show_error("无法切换段落显示", str(exc))
+            return False
+        self._display_preferences = preferences
+        self.segment_density = normalized
+        self._refreshing = True
+        try:
+            self.segment_density_combo.setCurrentIndex(
+                0 if normalized is SegmentDensity.COMPACT else 1
+            )
+            self.segment_list.setWordWrap(normalized is SegmentDensity.WRAPPED)
+            self.segment_list.setUniformItemSizes(
+                normalized is SegmentDensity.COMPACT
+            )
+            self.segment_list.setTextElideMode(
+                Qt.TextElideMode.ElideRight
+                if normalized is SegmentDensity.COMPACT
+                else Qt.TextElideMode.ElideNone
+            )
+            if self.controller.has_project:
+                self._populate_segment_list()
+        finally:
+            self._refreshing = False
+        return True
+
+    def _workspace_mode_changed(self, _index: int) -> None:
+        if self._refreshing:
+            return
+        try:
+            mode = WorkspaceMode(str(self.workspace_mode_combo.currentData()))
+        except ValueError:
+            return
+        self.set_workspace_mode(mode)
+
+    def set_workspace_mode(
+        self,
+        mode: WorkspaceMode,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Switch between the focused editor and the bilingual browse page."""
+
+        try:
+            normalized = (
+                mode if isinstance(mode, WorkspaceMode) else WorkspaceMode(mode)
+            )
+            preferences = replace(
+                self._display_preferences,
+                workspace_mode=normalized,
+            )
+            if persist:
+                preferences = self.controller.update_display_preferences(preferences)
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self._show_error("无法切换工作区", str(exc))
+            return False
+        self._display_preferences = preferences
+        self.workspace_mode = normalized
+        self._refreshing = True
+        try:
+            self.workspace_mode_combo.setCurrentIndex(
+                0 if normalized is WorkspaceMode.EDIT else 1
+            )
+            if self.controller.has_project:
+                if normalized is WorkspaceMode.BROWSE:
+                    self._refresh_browse_table()
+                    self.workspace_pages.setCurrentIndex(1)
+                else:
+                    self.workspace_pages.setCurrentIndex(0)
+                    self._select_project_index(self.controller.current_index)
+        finally:
+            self._refreshing = False
+        return True
+
+    def _refresh_browse_table(self) -> None:
+        if not self.controller.has_project:
+            self.browse_table.clearContents()
+            self.browse_table.setRowCount(0)
+            return
+        project = self.controller.project
+        self.browse_table.setUpdatesEnabled(False)
+        try:
+            self.browse_table.clearContents()
+            self.browse_table.setRowCount(len(project.segments))
+            for index, segment in enumerate(project.segments):
+                values = (
+                    f"{index + 1:03d}",
+                    segment.source,
+                    segment.target or "—",
+                    "已确认" if segment.confirmed else "待确认",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, index)
+                    item.setToolTip(value)
+                    self.browse_table.setItem(index, column, item)
+        finally:
+            self.browse_table.setUpdatesEnabled(True)
+        self.browse_table.resizeRowsToContents()
+        self.browse_table.setCurrentCell(self.controller.current_index, 1)
+        current = self.browse_table.item(self.controller.current_index, 1)
+        if current is not None:
+            self.browse_table.scrollToItem(
+                current,
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+
+    def _activate_browse_row(self, row: int, _column: int) -> None:
+        item = self.browse_table.item(row, 0)
+        if item is None:
+            return
+        try:
+            self.controller.go_to(int(item.data(Qt.ItemDataRole.UserRole)))
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self._show_error("无法打开浏览段落", str(exc))
+            return
+        if not self.set_workspace_mode(WorkspaceMode.EDIT):
+            return
+        self._refreshing = True
+        try:
+            self._select_project_index(self.controller.current_index)
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+
+    def _schedule_layout_refresh(self) -> None:
+        if self.segment_density is SegmentDensity.WRAPPED:
+            QTimer.singleShot(0, self._refresh_segment_item_sizes)
+        if (
+            self.controller.has_project
+            and self.workspace_mode is WorkspaceMode.BROWSE
+        ):
+            QTimer.singleShot(0, self.browse_table.resizeRowsToContents)
 
     def _select_visible_row(self, row: int) -> None:
         if self._refreshing or row < 0:
@@ -887,6 +1258,10 @@ class QtEditorWindow(QMainWindow):
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._schedule_layout_refresh()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._confirm_unsaved():
             event.accept()
@@ -954,6 +1329,19 @@ QToolButton:disabled {
     color: #6686a1;
     border-color: #244c70;
 }
+QComboBox#workspaceModeCombo {
+    min-height: 30px;
+    min-width: 104px;
+    padding: 0 9px;
+    color: #d6e7f4;
+    background: #0b3e6a;
+    border: 1px solid #315f86;
+    border-radius: 5px;
+}
+QComboBox#workspaceModeCombo::drop-down {
+    border: none;
+    width: 22px;
+}
 QProgressBar#projectProgress {
     min-height: 17px;
     max-height: 17px;
@@ -1003,6 +1391,24 @@ QFrame#segmentPanel, QFrame#editPanel, QFrame#suggestionPanel {
     border-radius: 8px;
     padding: 12px;
 }
+QFrame#browsePanel {
+    background: #ffffff;
+    border: 1px solid #d6e0ea;
+    border-radius: 8px;
+}
+QLabel#browseHint {
+    color: #74869a;
+    font-size: 11px;
+}
+QComboBox#segmentDensityCombo {
+    min-height: 26px;
+    min-width: 88px;
+    color: #405367;
+    background: #f7f9fc;
+    border: 1px solid #ced9e4;
+    border-radius: 4px;
+    padding: 0 7px;
+}
 QLabel#panelTitle {
     color: #17314b;
     font-size: 15px;
@@ -1036,6 +1442,30 @@ QListWidget#segmentList::item:selected {
     background: #e1f3f8;
     border-left-color: #069fc8;
     font-weight: 650;
+}
+QTableWidget#browseTable {
+    color: #26384b;
+    background: #fbfcfe;
+    alternate-background-color: #f1f5f9;
+    border: 1px solid #d5dfe9;
+    border-radius: 6px;
+    outline: none;
+}
+QTableWidget#browseTable::item {
+    padding: 10px 12px;
+    border-bottom: 1px solid #dce5ed;
+}
+QTableWidget#browseTable::item:selected {
+    color: #17314b;
+    background: #e1f3f8;
+}
+QTableWidget#browseTable QHeaderView::section {
+    color: #53677b;
+    background: #e9eff5;
+    border: none;
+    border-right: 1px solid #d5dfe9;
+    padding: 8px;
+    font-weight: 700;
 }
 QLabel#sectionEyebrow {
     color: #0b8eb4;

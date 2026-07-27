@@ -6,7 +6,7 @@
 
 | 层 | 职责 | 当前关键文件 |
 |----|------|-------------|
-| Layer 1 Storage | JSONL/CSV、版本化资源清单、原子替换 | `resource_repository.py`, `tm_engine.py` |
+| Layer 1 Storage | JSONL/CSV、版本化资源/工作区状态、原子替换 | `resource_repository.py`, `workspace_state.py`, `tm_engine.py` |
 | Layer 2 Engine / Parser | 精确 TM、Trie 术语、项目与语言资源解析 | `glossary_engine.py`, `editor_project.py`, `resource_importer.py` |
 | Layer 3 Logic | Excel 无状态三态入口；Qt 有状态会话协调 | `logic_controller.py`, `editor_controller.py` |
 | Layer 4 Frontend | Excel 与 PySide6 桌面交互 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_settings_dialog.py` |
@@ -29,6 +29,7 @@
 ```bash
 python -m pip install --user -r requirements-ui.txt
 python qt_editor.py --sample
+python qt_editor.py --install-desktop-launcher
 ```
 
 `qt_editor.py` 顶层只导入标准库，完成参数解析后才加载 PySide6 和窗口模块。缺 Qt 时输出安装提示并返回非零；缺 openpyxl 时只有 XLSX 导入失败。
@@ -42,6 +43,7 @@ python qt_editor.py --sample
 | JSON / TXT | 编辑项目输入；项目保存为版本化 JSON |
 | TMX | Level 1 导入；最大 100 MB；拒绝 DTD/ENTITY；行内 XML 单元跳过 |
 | XLSX | 术语导入前两列；依赖 openpyxl |
+| workspace.json | 最近十个项目、稳定段落 ID/索引回退、列表密度和工作区模式；不写入翻译项目 |
 
 项目保存、资源清单与导入均使用同目录临时文件加 `os.replace`。整体解析失败不得改变目标字节。
 
@@ -65,7 +67,9 @@ python translation_runner.py
 ## 关键技术决策
 
 - Qt 会话状态属于 `EditorController`，不塞回旧无状态 `LogicController`。
+- 最近项目、最后段落与显示偏好由 Qt 无关的 `WorkspaceStateRepository` 原子保存；前端仍只通过 `EditorController` 访问。
 - 资源状态由 `ResourceRepository` 原子持久化，设置对话框不直接写文件。
 - Active + Lookup 决定查询集合；Active + Update 决定确认写回集合。
 - 导入后先构建完整新引擎集合，成功后一次替换；失败保留上一组可用实例。
+- 浏览/校对页与三栏编辑器共享同一个 `EditorProject` 会话，只读表格不复制或覆盖未保存译文。
 - 当前只提供精确 TM，不伪装模糊匹配或云端能力。

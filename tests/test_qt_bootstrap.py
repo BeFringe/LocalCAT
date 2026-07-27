@@ -99,6 +99,19 @@ class QtBootstrapTest(unittest.TestCase):
             self.assertIn("openpyxl", report.errors[0])
             self.assertEqual(target.read_bytes(), b"keep")
 
+    def test_installs_linux_desktop_launcher_without_loading_qt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            launcher = qt_editor.install_desktop_launcher(Path(temp_dir))
+            rendered = launcher.read_text(encoding="utf-8")
+
+            self.assertEqual(launcher.name, "localcat.desktop")
+            self.assertIn("[Desktop Entry]", rendered)
+            self.assertIn("Name=LocalCAT", rendered)
+            self.assertIn(str(Path(qt_editor.__file__).resolve()), rendered)
+            self.assertIn(str(Path(sys.executable).resolve()), rendered)
+            self.assertFalse(rendered.startswith("Traceback"))
+            self.assertTrue(launcher.stat().st_mode & 0o111)
+
 
 if __name__ == "__main__":
     unittest.main()

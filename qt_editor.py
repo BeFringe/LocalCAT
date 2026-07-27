@@ -17,6 +17,11 @@ def build_parser() -> argparse.ArgumentParser:
     project = parser.add_mutually_exclusive_group()
     project.add_argument("--project", type=Path, help="Open a JSON or TXT translation project.")
     project.add_argument("--sample", action="store_true", help="Open the bundled sample project.")
+    project.add_argument(
+        "--install-desktop-launcher",
+        action="store_true",
+        help="Install a Linux application-menu launcher, then exit.",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -42,8 +47,62 @@ def default_data_dir() -> Path:
     return base / "LocalCAT"
 
 
+def _desktop_exec_argument(value: Path) -> str:
+    rendered = str(value)
+    for source, replacement in (
+        ("\\", "\\\\"),
+        ('"', '\\"'),
+        ("`", "\\`"),
+        ("$", "\\$"),
+    ):
+        rendered = rendered.replace(source, replacement)
+    return f'"{rendered}"'
+
+
+def install_desktop_launcher(target_dir: Path | None = None) -> Path:
+    """Install an application-menu entry pointing at this checkout."""
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("desktop launcher installation is currently supported on Linux")
+    applications_dir = (
+        target_dir
+        if target_dir is not None
+        else Path.home() / ".local" / "share" / "applications"
+    ).expanduser().resolve()
+    applications_dir.mkdir(parents=True, exist_ok=True)
+    launcher_path = applications_dir / "localcat.desktop"
+    temporary_path = applications_dir / ".localcat.desktop.tmp"
+    python_path = Path(sys.executable).resolve()
+    script_path = Path(__file__).resolve()
+    rendered = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=LocalCAT\n"
+        "Comment=Local-first translation editor\n"
+        f"Exec={_desktop_exec_argument(python_path)} "
+        f"{_desktop_exec_argument(script_path)}\n"
+        "Icon=accessories-text-editor\n"
+        "Terminal=false\n"
+        "Categories=Office;Translation;\n"
+        "StartupNotify=true\n"
+    )
+    temporary_path.write_text(rendered, encoding="utf-8")
+    os.replace(temporary_path, launcher_path)
+    launcher_path.chmod(0o755)
+    return launcher_path
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.install_desktop_launcher:
+        try:
+            launcher = install_desktop_launcher()
+        except (OSError, RuntimeError) as exc:
+            print(f"Unable to install LocalCAT desktop launcher: {exc}", file=sys.stderr)
+            return 1
+        print(f"Installed LocalCAT desktop launcher: {launcher}")
+        return 0
     try:
         from PySide6.QtWidgets import QApplication
     except ModuleNotFoundError as exc:

@@ -144,6 +144,8 @@ class QtEditorWorkflowTest(unittest.TestCase):
                     "previous": "Alt+Up",
                     "next": "Alt+Down",
                     "settings": "Ctrl+,",
+                    "close_project": "Ctrl+Shift+W",
+                    "quit": "Ctrl+Q",
                 },
             )
             self.assertIn("Ctrl+O", window.open_button.toolTip())

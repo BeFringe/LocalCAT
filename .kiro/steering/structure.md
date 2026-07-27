@@ -23,8 +23,9 @@ Layer 1 Storage
 ├── editor_contracts.py          # Qt 编辑器 frozen 跨层契约
 ├── editor_project.py            # JSON/TXT 项目与原子保存
 ├── resource_repository.py       # 资源清单和受控本地文件
+├── workspace_state.py           # 最近项目、段落断点与显示偏好
 ├── resource_importer.py         # TMX/CSV/XLSX 安全原子导入
-├── editor_controller.py         # Qt 会话、查询、写回、热重载
+├── editor_controller.py         # Qt 会话、项目断点、查询、写回、热重载
 ├── qt_editor.py                 # 标准库 bootstrap
 ├── qt_editor_window.py          # Layer 4 主编辑器
 ├── qt_settings_dialog.py        # Layer 4 语言资源设置
@@ -43,6 +44,7 @@ Layer 1 Storage
 
 - `qt_editor_window.py`、`qt_settings_dialog.py` 只可导入 `EditorController` 与 frozen contracts，不可导入仓储或引擎。
 - `editor_controller.py` 可协调项目编解码、资源仓储、导入器和现有引擎，不导入 PySide6。
+- `workspace_state.py` 只保存 Qt 无关的本地工作区状态；Qt 前端不得直接访问它。
 - `logic_controller.py` 不导入 Qt/xlwings，保持无历史状态的三态接口。
 - `resource_importer.py` 不导入 PySide6；openpyxl 仅在 XLSX 路径中条件导入。
 - 核心 Engine 不向上导入 Controller 或 Frontend。
@@ -60,8 +62,9 @@ Layer 1 Storage
 ## 测试布局
 
 - `tests/test_editor_*`：纯逻辑、项目和资源协调。
+- `tests/test_workspace_state.py`：最近项目、段落断点和显示偏好持久化。
 - `tests/test_resource_*`：清单、TMX/CSV/XLSX、原子失败语义。
-- `tests/test_qt_*`：offscreen 组件、后台导入、窗口工作流、真实鼠标/键盘旅程。
+- `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
 - 五个旧脚本自检仍是发布前回归矩阵的一部分。
 

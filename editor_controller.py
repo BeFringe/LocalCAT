@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 
 from editor_contracts import (
     ConfirmResult,
+    DisplayPreferences,
     EditorProject,
     EditorSegment,
     ImportReport,
     ImportRequest,
     ResourceConfig,
     ResourceKind,
+    RecentProject,
     SuggestionBundle,
     TMSuggestion,
     TermSuggestion,
@@ -25,6 +28,10 @@ from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
 from tm_engine import SourceUnit, TMEngine
+from workspace_state import WorkspaceStateError, WorkspaceStateRepository
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EditorControllerError(RuntimeError):
@@ -34,8 +41,15 @@ class EditorControllerError(RuntimeError):
 class EditorController:
     """Own one immutable editor session while engines remain UI-state free."""
 
-    def __init__(self, repository: ResourceRepository) -> None:
+    def __init__(
+        self,
+        repository: ResourceRepository,
+        workspace_state: WorkspaceStateRepository | None = None,
+    ) -> None:
         self.repository = repository
+        self.workspace_state = workspace_state or WorkspaceStateRepository(
+            repository.config_dir
+        )
         self._project: EditorProject | None = None
         self._current_index = 0
         self._dirty = False
@@ -78,7 +92,22 @@ class EditorController:
         """Load a local JSON/TXT project and reset navigation only after success."""
 
         project = load_project(path)
-        return self.set_project(project)
+        self.set_project(project)
+        remembered = self.workspace_state.find_project(project.path or path)
+        if remembered is not None:
+            restored_index = next(
+                (
+                    index
+                    for index, segment in enumerate(project.segments)
+                    if segment.id == remembered.segment_id
+                ),
+                remembered.index
+                if remembered.index < len(project.segments)
+                else 0,
+            )
+            self._current_index = restored_index
+        self._remember_current_position()
+        return self.project
 
     def load_sample(self) -> EditorProject:
         """Open the bundled original sample project."""
@@ -129,6 +158,7 @@ class EditorController:
         else:
             destination = min(max(self._current_index + step, 0), len(segments) - 1)
         self._current_index = destination
+        self._remember_current_position()
         return self.project
 
     def go_to(self, index: int) -> EditorProject:
@@ -137,6 +167,7 @@ class EditorController:
         if index < 0 or index >= len(self.project.segments):
             raise EditorControllerError(f"segment index is out of range: {index}")
         self._current_index = index
+        self._remember_current_position()
         return self.project
 
     def save_project(self, path: Path) -> EditorProject:
@@ -145,7 +176,46 @@ class EditorController:
         saved_path = save_project_file(self.project, path)
         self._project = replace(self.project, path=saved_path)
         self._dirty = False
+        self._remember_current_position()
         return self.project
+
+    def close_project(self) -> None:
+        """Leave the current project after the frontend has handled unsaved changes."""
+
+        if self._project is not None:
+            self._remember_current_position()
+        self._project = None
+        self._current_index = 0
+        self._dirty = False
+
+    def recent_projects(self) -> tuple[RecentProject, ...]:
+        """Return locally remembered projects in most-recent-first order."""
+
+        return self.workspace_state.recent_projects()
+
+    def remove_recent_project(self, path: Path) -> None:
+        """Forget a stale recent-project entry without touching its file."""
+
+        try:
+            self.workspace_state.remove_recent(path)
+        except WorkspaceStateError as exc:
+            raise EditorControllerError(str(exc)) from exc
+
+    def display_preferences(self) -> DisplayPreferences:
+        """Return local segment-density and workspace-mode preferences."""
+
+        return self.workspace_state.display_preferences()
+
+    def update_display_preferences(
+        self,
+        preferences: DisplayPreferences,
+    ) -> DisplayPreferences:
+        """Persist editor-only display preferences."""
+
+        try:
+            return self.workspace_state.update_display_preferences(preferences)
+        except WorkspaceStateError as exc:
+            raise EditorControllerError(str(exc)) from exc
 
     def suggestions(self) -> SuggestionBundle:
         """Query every currently active Lookup resource for the current source."""
@@ -239,11 +309,25 @@ class EditorController:
             current_index,
         )
         self._current_index = next_index
+        self._remember_current_position()
         return ConfirmResult(
             project=self.project,
             current_index=next_index,
             write_report=report,
         )
+
+    def _remember_current_position(self) -> None:
+        if self._project is None or self._project.path is None:
+            return
+        segment = self._project.segments[self._current_index]
+        try:
+            self.workspace_state.remember_project(
+                self._project.path,
+                segment.id,
+                self._current_index,
+            )
+        except WorkspaceStateError as exc:
+            LOGGER.warning("Unable to remember project position: %s", exc)
 
     def apply_tm_suggestion(self, suggestion: TMSuggestion) -> EditorProject:
         """Apply one typed TM suggestion without confirming the segment."""
