@@ -20,7 +20,7 @@ from editor_contracts import (
     TermSuggestion,
     WriteReport,
 )
-from editor_project import load_project, sample_project
+from editor_project import load_project, sample_project, save_project as save_project_file
 from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
@@ -60,6 +60,10 @@ class EditorController:
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    @property
+    def has_project(self) -> bool:
+        return self._project is not None
 
     @property
     def confirmed_count(self) -> int:
@@ -125,6 +129,22 @@ class EditorController:
         else:
             destination = min(max(self._current_index + step, 0), len(segments) - 1)
         self._current_index = destination
+        return self.project
+
+    def go_to(self, index: int) -> EditorProject:
+        """Select one segment by index while preserving all current edits."""
+
+        if index < 0 or index >= len(self.project.segments):
+            raise EditorControllerError(f"segment index is out of range: {index}")
+        self._current_index = index
+        return self.project
+
+    def save_project(self, path: Path) -> EditorProject:
+        """Atomically save the current project and clear the session dirty flag."""
+
+        saved_path = save_project_file(self.project, path)
+        self._project = replace(self.project, path=saved_path)
+        self._dirty = False
         return self.project
 
     def suggestions(self) -> SuggestionBundle:

@@ -1,0 +1,765 @@
+"""Professional three-column PySide6 editor window for LocalCAT."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
+    QTabWidget,
+    QTextBrowser,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from editor_controller import EditorController, EditorControllerError
+from editor_project import ProjectError
+from qt_settings_dialog import QtSettingsDialog
+
+
+class ResponsiveSplitter(QSplitter):
+    """QSplitter with inspectable stretch metadata for layout verification."""
+
+    def __init__(self, orientation: Qt.Orientation, parent: QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self._stretch_factors: dict[int, int] = {}
+
+    def setStretchFactor(self, index: int, stretch: int) -> None:
+        super().setStretchFactor(index, stretch)
+        self._stretch_factors[index] = stretch
+
+    def stretchFactor(self, index: int) -> int:
+        return self._stretch_factors.get(index, 0)
+
+
+class QtEditorWindow(QMainWindow):
+    """LocalCAT desktop shell; all domain operations go through EditorController."""
+
+    def __init__(self, controller: EditorController) -> None:
+        super().__init__()
+        self.controller = controller
+        self._refreshing = False
+        self.settings_dialog: QtSettingsDialog | None = None
+        self.setObjectName("editorWindow")
+        self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
+        self.setMinimumSize(1080, 700)
+        self.resize(1440, 880)
+        self._build_ui()
+        self._wire_actions()
+        if controller.has_project:
+            self._render_project()
+        else:
+            self._show_empty_state()
+
+    def _build_ui(self) -> None:
+        shell = QWidget()
+        shell.setObjectName("windowShell")
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self._build_top_bar())
+
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("workspacePages")
+        self.pages.addWidget(self._build_empty_page())
+        self.pages.addWidget(self._build_editor_page())
+        shell_layout.addWidget(self.pages, 1)
+        self.setCentralWidget(shell)
+
+        status = QStatusBar()
+        status.setObjectName("editorStatusBar")
+        status.setSizeGripEnabled(False)
+        self.setStatusBar(status)
+        self.setStyleSheet(_EDITOR_STYLE)
+
+    def _build_top_bar(self) -> QWidget:
+        top_bar = QFrame()
+        top_bar.setObjectName("topBar")
+        layout = QHBoxLayout(top_bar)
+        layout.setContentsMargins(22, 12, 20, 12)
+        layout.setSpacing(12)
+
+        mark = QLabel("L")
+        mark.setObjectName("brandMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(QSize(34, 34))
+        layout.addWidget(mark)
+        brand = QVBoxLayout()
+        brand.setSpacing(0)
+        name = QLabel("LocalCAT")
+        name.setObjectName("brandName")
+        tagline = QLabel("LOCAL TRANSLATION WORKSPACE")
+        tagline.setObjectName("brandTagline")
+        brand.addWidget(name)
+        brand.addWidget(tagline)
+        layout.addLayout(brand)
+
+        separator = QFrame()
+        separator.setObjectName("topSeparator")
+        separator.setFrameShape(QFrame.Shape.VLine)
+        layout.addWidget(separator)
+
+        project_info = QVBoxLayout()
+        project_info.setSpacing(1)
+        self.project_name_label = QLabel("未打开项目")
+        self.project_name_label.setObjectName("projectName")
+        self.language_label = QLabel("—")
+        self.language_label.setObjectName("languageDirection")
+        project_info.addWidget(self.project_name_label)
+        project_info.addWidget(self.language_label)
+        layout.addLayout(project_info)
+        layout.addStretch()
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("projectProgress")
+        self.progress_bar.setFormat("%v / %m · %p%")
+        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.open_button = QToolButton()
+        self.open_button.setObjectName("openProjectButton")
+        self.open_button.setText("打开")
+        self.open_button.setToolTip("打开项目 (Ctrl+O)")
+        self.open_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        layout.addWidget(self.open_button)
+        self.save_button = QToolButton()
+        self.save_button.setObjectName("saveProjectButton")
+        self.save_button.setText("保存")
+        self.save_button.setToolTip("保存项目 (Ctrl+S)")
+        self.save_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        layout.addWidget(self.save_button)
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setText("⚙")
+        self.settings_button.setToolTip("语言资源设置 (Ctrl+,)")
+        self.settings_button.setFixedSize(QSize(38, 34))
+        layout.addWidget(self.settings_button)
+        return top_bar
+
+    def _build_empty_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("emptyPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(80, 60, 80, 80)
+        layout.addStretch()
+        card = QFrame()
+        card.setObjectName("emptyCard")
+        card.setMaximumWidth(680)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(48, 42, 48, 42)
+        card_layout.setSpacing(14)
+        icon = QLabel("文")
+        icon.setObjectName("emptyIcon")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setFixedSize(58, 58)
+        title = QLabel("开始本地翻译")
+        title.setObjectName("emptyTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint = QLabel(
+            "打开 JSON/TXT 项目，或载入内置示例体验双栏编辑、翻译记忆与术语建议。"
+        )
+        hint.setObjectName("emptyHint")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.empty_open_button = QPushButton("打开本地项目")
+        self.empty_open_button.setObjectName("emptyOpenButton")
+        self.sample_button = QPushButton("载入示例")
+        self.sample_button.setObjectName("loadSampleButton")
+        actions.addWidget(self.empty_open_button)
+        actions.addWidget(self.sample_button)
+        actions.addStretch()
+        privacy = QLabel("离线优先 · 不发送项目或语言资源到网络")
+        privacy.setObjectName("privacyHint")
+        privacy.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        card_layout.addWidget(title)
+        card_layout.addWidget(hint)
+        card_layout.addSpacing(8)
+        card_layout.addLayout(actions)
+        card_layout.addWidget(privacy)
+        layout.addWidget(card, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch()
+        return page
+
+    def _build_editor_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("editorPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        self.main_splitter = ResponsiveSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("mainWorkspaceSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(7)
+        self.main_splitter.addWidget(self._build_segment_panel())
+        self.main_splitter.addWidget(self._build_edit_panel())
+        self.main_splitter.addWidget(self._build_suggestion_panel())
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setStretchFactor(2, 3)
+        self.main_splitter.setSizes([240, 600, 360])
+        layout.addWidget(self.main_splitter)
+        return page
+
+    def _build_segment_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("segmentPanel")
+        panel.setMinimumWidth(210)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        title = QLabel("段落")
+        title.setObjectName("panelTitle")
+        self.segment_count_label = QLabel("0")
+        self.segment_count_label.setObjectName("countBadge")
+        header.addWidget(title)
+        header.addWidget(self.segment_count_label)
+        header.addStretch()
+        layout.addLayout(header)
+        self.unconfirmed_filter = QCheckBox("仅显示未确认")
+        self.unconfirmed_filter.setObjectName("unconfirmedFilter")
+        layout.addWidget(self.unconfirmed_filter)
+        self.segment_list = QListWidget()
+        self.segment_list.setObjectName("segmentList")
+        self.segment_list.setSpacing(3)
+        layout.addWidget(self.segment_list, 1)
+        return panel
+
+    def _build_edit_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("editPanel")
+        panel.setMinimumWidth(380)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        source_header = QHBoxLayout()
+        source_title = QLabel("SOURCE")
+        source_title.setObjectName("sectionEyebrow")
+        self.segment_position_label = QLabel("—")
+        self.segment_position_label.setObjectName("segmentPosition")
+        source_header.addWidget(source_title)
+        source_header.addStretch()
+        source_header.addWidget(self.segment_position_label)
+        layout.addLayout(source_header)
+        self.source_display = QTextBrowser()
+        self.source_display.setObjectName("sourceDisplay")
+        self.source_display.setOpenExternalLinks(False)
+        self.source_display.setMinimumHeight(155)
+        layout.addWidget(self.source_display, 2)
+
+        target_header = QHBoxLayout()
+        target_title = QLabel("TARGET")
+        target_title.setObjectName("sectionEyebrow")
+        self.confirmation_label = QLabel("待确认")
+        self.confirmation_label.setObjectName("confirmationState")
+        target_header.addWidget(target_title)
+        target_header.addStretch()
+        target_header.addWidget(self.confirmation_label)
+        layout.addLayout(target_header)
+        self.target_editor = QTextEdit()
+        self.target_editor.setObjectName("targetEditor")
+        self.target_editor.setPlaceholderText("在此输入译文…")
+        self.target_editor.setMinimumHeight(190)
+        layout.addWidget(self.target_editor, 3)
+
+        actions = QHBoxLayout()
+        self.previous_button = QPushButton("← 上一段")
+        self.previous_button.setObjectName("previousSegmentButton")
+        self.next_button = QPushButton("下一段 →")
+        self.next_button.setObjectName("nextSegmentButton")
+        self.confirm_button = QPushButton("确认译文")
+        self.confirm_button.setObjectName("confirmTranslationButton")
+        actions.addWidget(self.previous_button)
+        actions.addWidget(self.next_button)
+        actions.addStretch()
+        actions.addWidget(self.confirm_button)
+        layout.addLayout(actions)
+        return panel
+
+    def _build_suggestion_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("suggestionPanel")
+        panel.setMinimumWidth(270)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("语言资源")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+        self.suggestion_tabs = QTabWidget()
+        self.suggestion_tabs.setObjectName("suggestionTabs")
+        self.translation_matches_page = QTextBrowser()
+        self.translation_matches_page.setObjectName("translationMatchesPage")
+        self.translation_matches_page.setPlainText("当前段暂无翻译记忆建议。")
+        self.termbase_page = QTextBrowser()
+        self.termbase_page.setObjectName("termbasePage")
+        self.termbase_page.setPlainText("当前段暂无术语建议。")
+        self.suggestion_tabs.addTab(self.translation_matches_page, "Translation Matches")
+        self.suggestion_tabs.addTab(self.termbase_page, "Termbase")
+        layout.addWidget(self.suggestion_tabs, 1)
+        return panel
+
+    def _wire_actions(self) -> None:
+        self.open_button.clicked.connect(self._choose_open)
+        self.empty_open_button.clicked.connect(self._choose_open)
+        self.sample_button.clicked.connect(self.load_sample)
+        self.save_button.clicked.connect(self._choose_save)
+        self.settings_button.clicked.connect(self._open_settings)
+        self.segment_list.currentRowChanged.connect(self._select_visible_row)
+        self.target_editor.textChanged.connect(self._target_changed)
+        self.previous_button.clicked.connect(lambda: self._navigate(-1))
+        self.next_button.clicked.connect(lambda: self._navigate(1))
+
+    def _show_empty_state(self) -> None:
+        self.pages.setCurrentIndex(0)
+        self.save_button.setEnabled(False)
+        self.project_name_label.setText("未打开项目")
+        self.language_label.setText("—")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage("打开本地项目或载入示例以开始。")
+
+    def load_sample(self) -> bool:
+        if not self._confirm_unsaved():
+            return False
+        self.controller.load_sample()
+        self._render_project()
+        self.statusBar().showMessage("已载入 LocalCAT 示例项目。", 5000)
+        return True
+
+    def open_project_path(self, path: Path) -> bool:
+        if not self._confirm_unsaved():
+            return False
+        try:
+            self.controller.open_project(path)
+        except (ProjectError, EditorControllerError, OSError, ValueError) as exc:
+            self._show_error("无法打开项目", str(exc))
+            self.statusBar().showMessage("项目打开失败；当前会话保持不变。", 7000)
+            return False
+        self._render_project()
+        self.statusBar().showMessage(f"已打开：{path}", 5000)
+        return True
+
+    def save_project_path(self, path: Path) -> bool:
+        try:
+            self.controller.save_project(path)
+        except (ProjectError, EditorControllerError, OSError, ValueError) as exc:
+            self._show_error("无法保存项目", str(exc))
+            self.statusBar().showMessage("保存失败。", 7000)
+            return False
+        self._update_title()
+        self.statusBar().showMessage(f"已保存：{path}", 7000)
+        return True
+
+    def _choose_open(self) -> bool:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "打开 LocalCAT 项目",
+            "",
+            "LocalCAT projects (*.json *.txt)",
+        )
+        return bool(selected) and self.open_project_path(Path(selected))
+
+    def _choose_save(self) -> bool:
+        if not self.controller.has_project:
+            return False
+        current_path = self.controller.project.path
+        if current_path is not None and current_path.suffix.lower() == ".json":
+            return self.save_project_path(current_path)
+        suggested = (
+            str(current_path.with_suffix(".json"))
+            if current_path is not None
+            else f"{self.controller.project.name}.json"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存 LocalCAT 项目",
+            suggested,
+            "LocalCAT JSON project (*.json)",
+        )
+        return bool(selected) and self.save_project_path(Path(selected))
+
+    def _render_project(self) -> None:
+        self.pages.setCurrentIndex(1)
+        self.save_button.setEnabled(True)
+        self._refreshing = True
+        try:
+            project = self.controller.project
+            self.project_name_label.setText(project.name)
+            self.language_label.setText(
+                f"{project.source_locale}  →  {project.target_locale}"
+            )
+            self.segment_count_label.setText(str(len(project.segments)))
+            self.segment_list.clear()
+            for index, segment in enumerate(project.segments):
+                summary = " ".join(segment.source.split())
+                if len(summary) > 72:
+                    summary = summary[:69] + "…"
+                prefix = "✓" if segment.confirmed else "○"
+                item = QListWidgetItem(f"{prefix}  {index + 1:03d}   {summary}")
+                item.setData(Qt.ItemDataRole.UserRole, index)
+                item.setToolTip(segment.source)
+                self.segment_list.addItem(item)
+            self.segment_list.setCurrentRow(self.controller.current_index)
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+        self._update_title()
+
+    def _render_current_segment(self) -> None:
+        segment = self.controller.current_segment
+        project = self.controller.project
+        self.source_display.setPlainText(segment.source)
+        self.target_editor.setPlainText(segment.target)
+        self.segment_position_label.setText(
+            f"{self.controller.current_index + 1} / {len(project.segments)}"
+        )
+        self.confirmation_label.setText("已确认" if segment.confirmed else "待确认")
+        self.confirmation_label.setProperty("confirmed", segment.confirmed)
+        self.confirmation_label.style().unpolish(self.confirmation_label)
+        self.confirmation_label.style().polish(self.confirmation_label)
+        self.progress_bar.setRange(0, len(project.segments))
+        self.progress_bar.setValue(self.controller.confirmed_count)
+
+    def _target_changed(self) -> None:
+        if self._refreshing or not self.controller.has_project:
+            return
+        self.controller.update_target(self.target_editor.toPlainText())
+        self._update_segment_item(self.controller.current_index)
+        self._render_progress_state()
+        self._update_title()
+
+    def _render_progress_state(self) -> None:
+        segment = self.controller.current_segment
+        self.confirmation_label.setText("已确认" if segment.confirmed else "待确认")
+        self.confirmation_label.setProperty("confirmed", segment.confirmed)
+        self.progress_bar.setValue(self.controller.confirmed_count)
+
+    def _update_segment_item(self, project_index: int) -> None:
+        for row in range(self.segment_list.count()):
+            item = self.segment_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) != project_index:
+                continue
+            segment = self.controller.project.segments[project_index]
+            summary = " ".join(segment.source.split())
+            if len(summary) > 72:
+                summary = summary[:69] + "…"
+            item.setText(
+                f"{'✓' if segment.confirmed else '○'}  {project_index + 1:03d}   {summary}"
+            )
+            break
+
+    def _select_visible_row(self, row: int) -> None:
+        if self._refreshing or row < 0:
+            return
+        item = self.segment_list.item(row)
+        if item is None:
+            return
+        index = int(item.data(Qt.ItemDataRole.UserRole))
+        try:
+            self.controller.go_to(index)
+        except EditorControllerError as exc:
+            self._show_error("无法切换段落", str(exc))
+            return
+        self._refreshing = True
+        try:
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+
+    def _navigate(self, direction: int) -> None:
+        if not self.controller.has_project:
+            return
+        self.controller.move(direction)
+        self._refreshing = True
+        try:
+            self.segment_list.setCurrentRow(self.controller.current_index)
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+
+    def _open_settings(self) -> None:
+        dialog = QtSettingsDialog(self.controller, self)
+        self.settings_dialog = dialog
+        dialog.exec()
+
+    def _confirm_unsaved(self) -> bool:
+        if not self.controller.has_project or not self.controller.dirty:
+            return True
+        decision = QMessageBox.question(
+            self,
+            "存在未保存修改",
+            "当前项目有未保存修改。保存后继续吗？",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if decision is QMessageBox.StandardButton.Save:
+            return self._choose_save()
+        return decision is QMessageBox.StandardButton.Discard
+
+    def _update_title(self) -> None:
+        if not self.controller.has_project:
+            self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
+            return
+        dirty = " *" if self.controller.dirty else ""
+        self.setWindowTitle(f"{self.controller.project.name}{dirty} · LocalCAT")
+
+    def _show_error(self, title: str, message: str) -> None:
+        QMessageBox.critical(self, title, message)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._confirm_unsaved():
+            event.accept()
+        else:
+            event.ignore()
+
+
+_EDITOR_STYLE = """
+QMainWindow#editorWindow, QWidget#windowShell {
+    background: #eef2f7;
+    color: #1a2a3c;
+    font-family: "Inter", "Noto Sans CJK SC", sans-serif;
+    font-size: 13px;
+}
+QFrame#topBar {
+    background: #062f5c;
+    border: none;
+}
+QLabel#brandMark {
+    background: #0aa0c8;
+    color: white;
+    border-radius: 17px;
+    font-size: 18px;
+    font-weight: 800;
+}
+QLabel#brandName {
+    color: white;
+    font-size: 18px;
+    font-weight: 750;
+}
+QLabel#brandTagline {
+    color: #8eb5d2;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QFrame#topSeparator {
+    color: #31577d;
+    margin: 2px 8px;
+}
+QLabel#projectName {
+    color: #f7fbff;
+    font-weight: 650;
+}
+QLabel#languageDirection {
+    color: #93b8d4;
+    font-size: 11px;
+}
+QToolButton {
+    min-width: 52px;
+    min-height: 32px;
+    padding: 0 8px;
+    color: #d6e7f4;
+    background: transparent;
+    border: 1px solid #31577d;
+    border-radius: 5px;
+    font-weight: 650;
+}
+QToolButton:hover {
+    color: white;
+    background: #124875;
+    border-color: #4a789e;
+}
+QToolButton:disabled {
+    color: #6686a1;
+    border-color: #244c70;
+}
+QProgressBar#projectProgress {
+    min-height: 17px;
+    max-height: 17px;
+    color: #dff5fb;
+    background: #0b3e6a;
+    border: 1px solid #315f86;
+    border-radius: 8px;
+    text-align: center;
+    font-size: 9px;
+    font-weight: 700;
+}
+QProgressBar#projectProgress::chunk {
+    border-radius: 7px;
+    background: #0aa4cd;
+}
+QWidget#emptyPage {
+    background: #eef2f7;
+}
+QFrame#emptyCard {
+    background: white;
+    border: 1px solid #d3dde8;
+    border-radius: 13px;
+}
+QLabel#emptyIcon {
+    color: white;
+    background: #0a99c2;
+    border-radius: 12px;
+    font-size: 25px;
+    font-weight: 750;
+}
+QLabel#emptyTitle {
+    color: #102943;
+    font-size: 25px;
+    font-weight: 750;
+}
+QLabel#emptyHint {
+    color: #64778b;
+    font-size: 14px;
+}
+QLabel#privacyHint {
+    color: #77908a;
+    font-size: 11px;
+}
+QFrame#segmentPanel, QFrame#editPanel, QFrame#suggestionPanel {
+    background: #ffffff;
+    border: 1px solid #d6e0ea;
+    border-radius: 8px;
+    padding: 12px;
+}
+QLabel#panelTitle {
+    color: #17314b;
+    font-size: 15px;
+    font-weight: 750;
+}
+QLabel#countBadge {
+    color: #087d9f;
+    background: #e4f5fa;
+    border-radius: 9px;
+    padding: 2px 7px;
+    font-weight: 700;
+}
+QCheckBox#unconfirmedFilter {
+    color: #607387;
+    padding: 4px 0 7px;
+}
+QListWidget#segmentList {
+    border: none;
+    background: #f7f9fc;
+    outline: none;
+}
+QListWidget#segmentList::item {
+    color: #405367;
+    min-height: 38px;
+    padding: 5px 8px;
+    border-left: 3px solid transparent;
+    border-bottom: 1px solid #e9eef4;
+}
+QListWidget#segmentList::item:selected {
+    color: #123b58;
+    background: #e1f3f8;
+    border-left-color: #069fc8;
+    font-weight: 650;
+}
+QLabel#sectionEyebrow {
+    color: #0b8eb4;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+QLabel#segmentPosition {
+    color: #78899a;
+    font-size: 11px;
+}
+QLabel#confirmationState {
+    color: #a56c19;
+    background: #fff2d9;
+    border-radius: 9px;
+    padding: 3px 9px;
+    font-size: 10px;
+    font-weight: 700;
+}
+QLabel#confirmationState[confirmed="true"] {
+    color: #27744e;
+    background: #e1f3e9;
+}
+QTextBrowser#sourceDisplay, QTextEdit#targetEditor {
+    color: #1c2b3a;
+    background: #fbfcfe;
+    border: 1px solid #ced9e4;
+    border-radius: 7px;
+    padding: 12px;
+    selection-background-color: #87d8eb;
+    font-size: 15px;
+    line-height: 1.45;
+}
+QTextEdit#targetEditor:focus {
+    border: 2px solid #0a9ec7;
+    background: #ffffff;
+}
+QPushButton {
+    min-height: 32px;
+    padding: 2px 14px;
+    border: 1px solid #c5d1dd;
+    border-radius: 5px;
+    background: #ffffff;
+    color: #29445d;
+    font-weight: 650;
+}
+QPushButton:hover {
+    color: #087fa3;
+    border-color: #079bc4;
+}
+QPushButton#confirmTranslationButton, QPushButton#emptyOpenButton {
+    color: white;
+    background: #079fc9;
+    border-color: #079fc9;
+}
+QPushButton#confirmTranslationButton:hover, QPushButton#emptyOpenButton:hover {
+    background: #078bb2;
+}
+QTabWidget#suggestionTabs::pane {
+    background: #fbfcfe;
+    border: 1px solid #d2dce6;
+    border-radius: 6px;
+}
+QTabBar::tab {
+    color: #65798d;
+    background: #eaf0f6;
+    border: 1px solid #d2dce6;
+    padding: 9px 12px;
+}
+QTabBar::tab:selected {
+    color: #087f9f;
+    background: #ffffff;
+    border-bottom-color: #ffffff;
+    font-weight: 700;
+}
+QSplitter::handle {
+    background: #eef2f7;
+}
+QStatusBar#editorStatusBar {
+    color: #607287;
+    background: #f7f9fc;
+    border-top: 1px solid #d8e1ea;
+    font-size: 11px;
+}
+"""
