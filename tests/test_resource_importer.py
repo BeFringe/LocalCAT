@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from resource_importer import import_termbase, import_tmx
+from resource_importer import import_termbase, import_tmx, upsert_term
 
 
 class ResourceImporterTest(unittest.TestCase):
@@ -265,6 +265,24 @@ class ResourceImporterTest(unittest.TestCase):
             report = import_termbase(source, target)
 
             self.assertTrue(report.errors)
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_upsert_term_is_atomic_and_rejects_invalid_existing_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "terms.csv"
+            target.write_text("office,旧译\n", encoding="utf-8-sig")
+
+            report = upsert_term(target, "office", "办公室")
+            rows = self._read_terms(target)
+            target.write_bytes(b"broken-row")
+            original = target.read_bytes()
+            failed = upsert_term(target, "memory", "记忆库")
+
+            self.assertEqual(report.imported, 1)
+            self.assertEqual(report.overwritten, 1)
+            self.assertEqual(rows, [["office", "办公室"]])
+            self.assertTrue(failed.errors)
             self.assertEqual(target.read_bytes(), original)
 
 

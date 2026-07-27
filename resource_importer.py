@@ -83,22 +83,39 @@ def import_termbase(input_path: Path, target_path: Path) -> ImportReport:
         incoming, skipped, duplicate_count = _collect_terms(rows)
         if not incoming:
             raise ImportFailure("termbase contains no valid source/target rows")
-        existing_rows = _read_csv_rows(target) if target.exists() else []
-        existing, _, _ = _collect_terms(existing_rows)
+        existing = _read_existing_terms(target)
         overwritten = duplicate_count + sum(key in existing for key in incoming)
         merged = dict(existing)
         merged.update(incoming)
 
-        buffer = io.StringIO(newline="")
-        writer = csv.writer(buffer)
-        writer.writerows(merged.items())
-        _atomic_write_text(target, buffer.getvalue(), "utf-8-sig")
+        _atomic_write_text(target, _render_terms(merged), "utf-8-sig")
         LOGGER.info("Imported %d terms from %s", len(incoming), source)
         return ImportReport(
             imported=len(incoming),
             skipped=skipped,
             overwritten=overwritten,
         )
+    except (ImportFailure, OSError, UnicodeError, csv.Error, ValueError) as exc:
+        return ImportReport(errors=(str(exc),))
+
+
+def upsert_term(target_path: Path, source_term: str, target_term: str) -> ImportReport:
+    """Atomically add or replace one term in an existing managed termbase."""
+
+    source = source_term.strip()
+    target_text = target_term.strip()
+    if not source or not target_text:
+        return ImportReport(errors=("source and target terms must not be empty",))
+    target = target_path.expanduser().resolve()
+    if target.suffix.lower() != ".csv":
+        return ImportReport(errors=("managed termbase must use the .csv format",))
+    try:
+        existing = _read_existing_terms(target)
+        overwritten = int(source in existing)
+        updated = dict(existing)
+        updated[source] = target_text
+        _atomic_write_text(target, _render_terms(updated), "utf-8-sig")
+        return ImportReport(imported=1, overwritten=overwritten)
     except (ImportFailure, OSError, UnicodeError, csv.Error, ValueError) as exc:
         return ImportReport(errors=(str(exc),))
 
@@ -289,6 +306,25 @@ def _read_csv_rows(path: Path) -> list[tuple[str, ...]]:
         raise ImportFailure(f"unable to read CSV termbase: {exc}") from exc
 
 
+def _read_existing_terms(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    terms: dict[str, str] = {}
+    for line_number, row in enumerate(_read_csv_rows(path), start=1):
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        if len(row) < 2:
+            raise ImportFailure(f"target termbase row {line_number} has fewer than two columns")
+        source = row[0].strip()
+        target = row[1].strip()
+        if _is_header(source, target):
+            continue
+        if not source or not target:
+            raise ImportFailure(f"target termbase row {line_number} has an empty term")
+        terms[source] = target
+    return terms
+
+
 def _collect_terms(
     rows: Iterable[tuple[object, ...] | list[object]],
 ) -> tuple[dict[str, str], int, int]:
@@ -315,6 +351,13 @@ def _collect_terms(
 
 def _is_header(source: str, target: str) -> bool:
     return source.casefold() in SOURCE_HEADERS and target.casefold() in TARGET_HEADERS
+
+
+def _render_terms(terms: dict[str, str]) -> str:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerows(terms.items())
+    return buffer.getvalue()
 
 
 def _atomic_write_text(path: Path, content: str, encoding: str) -> None:

@@ -6,17 +6,21 @@ from dataclasses import replace
 from pathlib import Path
 
 from editor_contracts import (
+    ConfirmResult,
     EditorProject,
     EditorSegment,
+    ResourceConfig,
     ResourceKind,
     SuggestionBundle,
     TMSuggestion,
     TermSuggestion,
+    WriteReport,
 )
 from editor_project import load_project, sample_project
 from glossary_engine import GlossaryEngine, GlossaryLoader
+from resource_importer import upsert_term
 from resource_repository import ResourceRepository
-from tm_engine import TMEngine
+from tm_engine import SourceUnit, TMEngine
 
 
 class EditorControllerError(RuntimeError):
@@ -160,6 +164,111 @@ class EditorController:
                     )
         return SuggestionBundle(tm_matches=tuple(tm_matches), terms=tuple(terms))
 
+    def confirm_current(self) -> ConfirmResult:
+        """Write the current translation to every writable TM before confirmation."""
+
+        current = self.current_segment
+        if not current.target.strip():
+            raise EditorControllerError("target text must not be empty before confirmation")
+        unit = SourceUnit(
+            id=current.id,
+            text=current.source,
+            speaker=current.speaker or None,
+            file_source=self.project.name,
+        )
+        written: list[str] = []
+        errors: list[str] = []
+        for resource in self.repository.list_resources():
+            if (
+                resource.kind is not ResourceKind.TRANSLATION_MEMORY
+                or not resource.active
+                or not resource.update
+            ):
+                continue
+            engine = self._tm_engines.get(resource.id)
+            if engine is None:
+                errors.append(f"{resource.name}: translation memory is not loaded")
+            elif engine.save_record(unit, current.target):
+                written.append(resource.id)
+            else:
+                errors.append(f"{resource.name}: unable to write translation memory")
+
+        report = WriteReport(written_resource_ids=tuple(written), errors=tuple(errors))
+        if errors:
+            return ConfirmResult(
+                project=self.project,
+                current_index=self._current_index,
+                write_report=report,
+            )
+
+        segments = list(self.project.segments)
+        segments[self._current_index] = replace(current, confirmed=True)
+        self._project = replace(self.project, segments=tuple(segments))
+        self._dirty = True
+        current_index = self._current_index
+        next_index = next(
+            (
+                index
+                for index in range(current_index + 1, len(segments))
+                if not segments[index].confirmed
+            ),
+            current_index,
+        )
+        self._current_index = next_index
+        return ConfirmResult(
+            project=self.project,
+            current_index=next_index,
+            write_report=report,
+        )
+
+    def apply_tm_suggestion(self, suggestion: TMSuggestion) -> EditorProject:
+        """Apply one typed TM suggestion without confirming the segment."""
+
+        if not isinstance(suggestion, TMSuggestion):
+            raise EditorControllerError("a TM suggestion contract is required")
+        if suggestion.source != self.current_segment.source:
+            raise EditorControllerError("TM suggestion does not belong to the current segment")
+        return self.update_target(suggestion.target)
+
+    def insert_term_suggestion(
+        self,
+        suggestion: TermSuggestion,
+        position: int | None = None,
+    ) -> EditorProject:
+        """Insert one term target at an editor cursor position without confirmation."""
+
+        if not isinstance(suggestion, TermSuggestion):
+            raise EditorControllerError("a term suggestion contract is required")
+        target = self.current_segment.target
+        insertion_point = len(target) if position is None else position
+        if insertion_point < 0 or insertion_point > len(target):
+            raise EditorControllerError("term insertion position is outside the target text")
+        updated = target[:insertion_point] + suggestion.target_term + target[insertion_point:]
+        return self.update_target(updated)
+
+    def add_term(self, source: str, target: str) -> ResourceConfig:
+        """Persist a term in the first active Update termbase and reload it."""
+
+        if not source.strip() or not target.strip():
+            raise EditorControllerError("source and target terms must not be empty")
+        resource = next(
+            (
+                configured
+                for configured in self.repository.list_resources()
+                if configured.kind is ResourceKind.TERMBASE
+                and configured.active
+                and configured.update
+            ),
+            None,
+        )
+        if resource is None:
+            raise EditorControllerError("no active writable termbase is available")
+        report = upsert_term(resource.path, source, target)
+        if not report.succeeded:
+            raise EditorControllerError("; ".join(report.errors))
+        self._glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
+        return resource
+
     def _rebuild_engines(self) -> None:
         tm_engines: dict[str, TMEngine] = {}
         glossary_engines: dict[str, GlossaryEngine] = {}
@@ -167,12 +276,16 @@ class EditorController:
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 tm_engines[resource.id] = TMEngine(str(resource.path))
             else:
-                engine = GlossaryEngine()
-                if resource.path.exists():
-                    GlossaryLoader(engine).load_file(str(resource.path))
-                glossary_engines[resource.id] = engine
+                glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
         self._tm_engines = tm_engines
         self._glossary_engines = glossary_engines
+
+    @staticmethod
+    def _load_glossary_engine(path: Path) -> GlossaryEngine:
+        engine = GlossaryEngine()
+        if path.exists():
+            GlossaryLoader(engine).load_file(str(path))
+        return engine
 
 
 if __name__ == "__main__":
