@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import html
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -27,8 +30,11 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QLineEdit,
+    QScrollArea,
 )
 
+from editor_contracts import SuggestionBundle, TMSuggestion, TermSuggestion
 from editor_controller import EditorController, EditorControllerError
 from editor_project import ProjectError
 from qt_settings_dialog import QtSettingsDialog
@@ -49,6 +55,45 @@ class ResponsiveSplitter(QSplitter):
         return self._stretch_factors.get(index, 0)
 
 
+def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> str:
+    """Escape project text, then add spans for longest non-overlapping term ranges."""
+
+    occupied = [False] * len(text)
+    selected: list[TermSuggestion] = []
+    for term in sorted(
+        terms,
+        key=lambda item: (-(item.end_index - item.start_index), item.start_index),
+    ):
+        start = max(0, min(term.start_index, len(text)))
+        end = max(start, min(term.end_index, len(text)))
+        if start == end or any(occupied[start:end]):
+            continue
+        selected.append(term)
+        for index in range(start, end):
+            occupied[index] = True
+    selected.sort(key=lambda item: item.start_index)
+
+    pieces: list[str] = []
+    cursor = 0
+    for term in selected:
+        start = max(cursor, term.start_index)
+        end = min(len(text), term.end_index)
+        pieces.append(html.escape(text[cursor:start]).replace("\n", "<br>"))
+        highlighted = html.escape(text[start:end]).replace("\n", "<br>")
+        tooltip = html.escape(f"{term.target_term} · {term.resource_name}", quote=True)
+        pieces.append(
+            '<span style="background-color:#fff0ad; color:#26384b; '
+            f'font-weight:600;" title="{tooltip}">{highlighted}</span>'
+        )
+        cursor = end
+    pieces.append(html.escape(text[cursor:]).replace("\n", "<br>"))
+    return (
+        '<div style="white-space:pre-wrap; font-size:15px; color:#1c2b3a;">'
+        + "".join(pieces)
+        + "</div>"
+    )
+
+
 class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
@@ -57,6 +102,7 @@ class QtEditorWindow(QMainWindow):
         self.controller = controller
         self._refreshing = False
         self.settings_dialog: QtSettingsDialog | None = None
+        self.current_suggestions = SuggestionBundle()
         self.setObjectName("editorWindow")
         self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
         self.setMinimumSize(1080, 700)
@@ -308,12 +354,39 @@ class QtEditorWindow(QMainWindow):
         layout.addWidget(title)
         self.suggestion_tabs = QTabWidget()
         self.suggestion_tabs.setObjectName("suggestionTabs")
-        self.translation_matches_page = QTextBrowser()
+        self.translation_matches_page = QWidget()
         self.translation_matches_page.setObjectName("translationMatchesPage")
-        self.translation_matches_page.setPlainText("当前段暂无翻译记忆建议。")
-        self.termbase_page = QTextBrowser()
+        matches_layout = QVBoxLayout(self.translation_matches_page)
+        matches_layout.setContentsMargins(0, 0, 0, 0)
+        self.tm_scroll = QScrollArea()
+        self.tm_scroll.setObjectName("tmSuggestionsScroll")
+        self.tm_scroll.setWidgetResizable(True)
+        self.tm_container = QWidget()
+        self.tm_cards_layout = QVBoxLayout(self.tm_container)
+        self.tm_cards_layout.setContentsMargins(10, 10, 10, 10)
+        self.tm_cards_layout.setSpacing(9)
+        self.tm_scroll.setWidget(self.tm_container)
+        matches_layout.addWidget(self.tm_scroll)
+
+        self.termbase_page = QWidget()
         self.termbase_page.setObjectName("termbasePage")
-        self.termbase_page.setPlainText("当前段暂无术语建议。")
+        terms_layout = QVBoxLayout(self.termbase_page)
+        terms_layout.setContentsMargins(0, 0, 0, 0)
+        term_toolbar = QHBoxLayout()
+        term_toolbar.addStretch()
+        self.add_term_button = QPushButton("＋ 添加术语")
+        self.add_term_button.setObjectName("addTermButton")
+        term_toolbar.addWidget(self.add_term_button)
+        terms_layout.addLayout(term_toolbar)
+        self.term_scroll = QScrollArea()
+        self.term_scroll.setObjectName("termSuggestionsScroll")
+        self.term_scroll.setWidgetResizable(True)
+        self.term_container = QWidget()
+        self.term_cards_layout = QVBoxLayout(self.term_container)
+        self.term_cards_layout.setContentsMargins(10, 10, 10, 10)
+        self.term_cards_layout.setSpacing(9)
+        self.term_scroll.setWidget(self.term_container)
+        terms_layout.addWidget(self.term_scroll, 1)
         self.suggestion_tabs.addTab(self.translation_matches_page, "Translation Matches")
         self.suggestion_tabs.addTab(self.termbase_page, "Termbase")
         layout.addWidget(self.suggestion_tabs, 1)
@@ -329,6 +402,7 @@ class QtEditorWindow(QMainWindow):
         self.target_editor.textChanged.connect(self._target_changed)
         self.previous_button.clicked.connect(lambda: self._navigate(-1))
         self.next_button.clicked.connect(lambda: self._navigate(1))
+        self.add_term_button.clicked.connect(self._prompt_add_term)
 
     def _show_empty_state(self) -> None:
         self.pages.setCurrentIndex(0)
@@ -440,6 +514,7 @@ class QtEditorWindow(QMainWindow):
         self.confirmation_label.style().polish(self.confirmation_label)
         self.progress_bar.setRange(0, len(project.segments))
         self.progress_bar.setValue(self.controller.confirmed_count)
+        self.refresh_suggestions()
 
     def _target_changed(self) -> None:
         if self._refreshing or not self.controller.has_project:
@@ -502,6 +577,180 @@ class QtEditorWindow(QMainWindow):
         dialog = QtSettingsDialog(self.controller, self)
         self.settings_dialog = dialog
         dialog.exec()
+
+    def refresh_suggestions(self) -> SuggestionBundle:
+        """Render the current controller bundle as safe, actionable cards."""
+
+        if not self.controller.has_project:
+            self.current_suggestions = SuggestionBundle()
+            return self.current_suggestions
+        bundle = self.controller.suggestions()
+        self.current_suggestions = bundle
+        self.source_display.setHtml(
+            render_highlighted_source(self.controller.current_segment.source, bundle.terms)
+        )
+        self._clear_layout(self.tm_cards_layout)
+        self._clear_layout(self.term_cards_layout)
+
+        if bundle.tm_matches:
+            for index, suggestion in enumerate(bundle.tm_matches):
+                self.tm_cards_layout.addWidget(self._tm_card(index, suggestion))
+        else:
+            self.tm_cards_layout.addWidget(self._empty_suggestion("当前段暂无翻译记忆建议。"))
+        self.tm_cards_layout.addStretch()
+
+        if bundle.terms:
+            for index, suggestion in enumerate(bundle.terms):
+                self.term_cards_layout.addWidget(self._term_card(index, suggestion))
+        else:
+            self.term_cards_layout.addWidget(self._empty_suggestion("当前段暂无术语建议。"))
+        self.term_cards_layout.addStretch()
+        return bundle
+
+    @staticmethod
+    def _clear_layout(layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    @staticmethod
+    def _plain_label(text: str, object_name: str = "") -> QLabel:
+        label = QLabel(text)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        if object_name:
+            label.setObjectName(object_name)
+        return label
+
+    def _tm_card(self, index: int, suggestion: TMSuggestion) -> QWidget:
+        card = QFrame()
+        card.setObjectName(f"tmCard_{index}")
+        card.setProperty("suggestionCard", True)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 11, 12, 11)
+        heading = QHBoxLayout()
+        source = self._plain_label(suggestion.source, "suggestionSource")
+        badge = QLabel(f"{round(suggestion.similarity * 100)}%")
+        badge.setObjectName("matchBadge")
+        heading.addWidget(source, 1)
+        heading.addWidget(badge, alignment=Qt.AlignmentFlag.AlignTop)
+        target = self._plain_label(suggestion.target, "suggestionTarget")
+        footer = QHBoxLayout()
+        provenance = self._plain_label(
+            f"{suggestion.resource_name} · {suggestion.match_type}",
+            "suggestionProvenance",
+        )
+        apply_button = QPushButton("应用译文")
+        apply_button.setObjectName(f"applyTm_{index}")
+        apply_button.clicked.connect(
+            lambda _checked=False, current=suggestion: self.apply_tm_suggestion(current)
+        )
+        footer.addWidget(provenance, 1)
+        footer.addWidget(apply_button)
+        layout.addLayout(heading)
+        layout.addWidget(target)
+        layout.addLayout(footer)
+        return card
+
+    def _term_card(self, index: int, suggestion: TermSuggestion) -> QWidget:
+        card = QFrame()
+        card.setObjectName(f"termCard_{index}")
+        card.setProperty("suggestionCard", True)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 11, 12, 11)
+        pair = QHBoxLayout()
+        source = self._plain_label(suggestion.source_term, "termSource")
+        arrow = QLabel("→")
+        arrow.setObjectName("termArrow")
+        target = self._plain_label(suggestion.target_term, "termTarget")
+        pair.addWidget(source, 1)
+        pair.addWidget(arrow)
+        pair.addWidget(target, 1)
+        footer = QHBoxLayout()
+        provenance = self._plain_label(suggestion.resource_name, "suggestionProvenance")
+        insert_button = QPushButton("插入译文")
+        insert_button.setObjectName(f"insertTerm_{index}")
+        insert_button.clicked.connect(
+            lambda _checked=False, current=suggestion: self.insert_term_suggestion(current)
+        )
+        footer.addWidget(provenance, 1)
+        footer.addWidget(insert_button)
+        layout.addLayout(pair)
+        layout.addLayout(footer)
+        return card
+
+    def _empty_suggestion(self, message: str) -> QLabel:
+        return self._plain_label(message, "emptySuggestion")
+
+    def apply_tm_suggestion(self, suggestion: TMSuggestion) -> bool:
+        try:
+            self.controller.apply_tm_suggestion(suggestion)
+        except EditorControllerError as exc:
+            self._show_error("无法应用翻译记忆", str(exc))
+            return False
+        self._refresh_target_from_controller()
+        self.statusBar().showMessage(f"已应用来自 {suggestion.resource_name} 的译文。", 5000)
+        return True
+
+    def insert_term_suggestion(self, suggestion: TermSuggestion) -> bool:
+        cursor = self.target_editor.textCursor()
+        position = cursor.position()
+        try:
+            self.controller.insert_term_suggestion(suggestion, position)
+        except EditorControllerError as exc:
+            self._show_error("无法插入术语", str(exc))
+            return False
+        self._refresh_target_from_controller()
+        cursor = self.target_editor.textCursor()
+        cursor.setPosition(position + len(suggestion.target_term))
+        self.target_editor.setTextCursor(cursor)
+        self.statusBar().showMessage(f"已插入术语：{suggestion.target_term}", 5000)
+        return True
+
+    def _refresh_target_from_controller(self) -> None:
+        self._refreshing = True
+        try:
+            self.target_editor.setPlainText(self.controller.current_segment.target)
+        finally:
+            self._refreshing = False
+        self._update_segment_item(self.controller.current_index)
+        self._render_progress_state()
+        self._update_title()
+
+    def add_term(self, source: str, target: str) -> bool:
+        try:
+            resource = self.controller.add_term(source, target)
+        except EditorControllerError as exc:
+            self._show_error("无法添加术语", str(exc))
+            return False
+        self.refresh_suggestions()
+        self.statusBar().showMessage(f"已添加到 {resource.name}：{source} → {target}", 6000)
+        return True
+
+    def _prompt_add_term(self) -> None:
+        prompt = QDialog(self)
+        prompt.setWindowTitle("添加术语")
+        layout = QVBoxLayout(prompt)
+        layout.addWidget(QLabel("源术语"))
+        source_input = QLineEdit()
+        source_input.setObjectName("addTermSource")
+        layout.addWidget(source_input)
+        layout.addWidget(QLabel("目标术语"))
+        target_input = QLineEdit()
+        target_input.setObjectName("addTermTarget")
+        layout.addWidget(target_input)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("添加")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(prompt.accept)
+        buttons.rejected.connect(prompt.reject)
+        layout.addWidget(buttons)
+        if prompt.exec() == QDialog.DialogCode.Accepted:
+            self.add_term(source_input.text(), target_input.text())
 
     def _confirm_unsaved(self) -> bool:
         if not self.controller.has_project or not self.controller.dirty:
@@ -740,6 +989,44 @@ QTabWidget#suggestionTabs::pane {
     background: #fbfcfe;
     border: 1px solid #d2dce6;
     border-radius: 6px;
+}
+QScrollArea#tmSuggestionsScroll, QScrollArea#termSuggestionsScroll {
+    border: none;
+    background: #fbfcfe;
+}
+QScrollArea#tmSuggestionsScroll > QWidget > QWidget,
+QScrollArea#termSuggestionsScroll > QWidget > QWidget {
+    background: #fbfcfe;
+}
+QFrame[suggestionCard="true"] {
+    background: #ffffff;
+    border: 1px solid #d9e2eb;
+    border-radius: 7px;
+}
+QLabel#suggestionSource, QLabel#termSource {
+    color: #45596c;
+    font-size: 12px;
+}
+QLabel#suggestionTarget, QLabel#termTarget {
+    color: #182f45;
+    font-size: 14px;
+    font-weight: 650;
+}
+QLabel#suggestionProvenance, QLabel#emptySuggestion {
+    color: #7a8b9c;
+    font-size: 10px;
+}
+QLabel#matchBadge {
+    color: white;
+    background: #08a0c9;
+    border-radius: 9px;
+    padding: 3px 7px;
+    font-size: 10px;
+    font-weight: 750;
+}
+QLabel#termArrow {
+    color: #0a97bd;
+    font-weight: 800;
 }
 QTabBar::tab {
     color: #65798d;
