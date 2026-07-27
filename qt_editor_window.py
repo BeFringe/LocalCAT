@@ -6,7 +6,7 @@ import html
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -109,6 +109,7 @@ class QtEditorWindow(QMainWindow):
         self.resize(1440, 880)
         self._build_ui()
         self._wire_actions()
+        self._install_shortcuts()
         if controller.has_project:
             self._render_project()
         else:
@@ -332,10 +333,13 @@ class QtEditorWindow(QMainWindow):
         actions = QHBoxLayout()
         self.previous_button = QPushButton("← 上一段")
         self.previous_button.setObjectName("previousSegmentButton")
+        self.previous_button.setToolTip("上一段 (Alt+Up)")
         self.next_button = QPushButton("下一段 →")
         self.next_button.setObjectName("nextSegmentButton")
+        self.next_button.setToolTip("下一段 (Alt+Down)")
         self.confirm_button = QPushButton("确认译文")
         self.confirm_button.setObjectName("confirmTranslationButton")
+        self.confirm_button.setToolTip("确认译文并前往下一未确认段 (Ctrl+Enter)")
         actions.addWidget(self.previous_button)
         actions.addWidget(self.next_button)
         actions.addStretch()
@@ -402,7 +406,26 @@ class QtEditorWindow(QMainWindow):
         self.target_editor.textChanged.connect(self._target_changed)
         self.previous_button.clicked.connect(lambda: self._navigate(-1))
         self.next_button.clicked.connect(lambda: self._navigate(1))
+        self.confirm_button.clicked.connect(self.confirm_current)
         self.add_term_button.clicked.connect(self._prompt_add_term)
+        self.unconfirmed_filter.toggled.connect(self._filter_changed)
+
+    def _install_shortcuts(self) -> None:
+        bindings = (
+            ("open", "Ctrl+O", self._choose_open),
+            ("save", "Ctrl+S", self._choose_save),
+            ("confirm", "Ctrl+Enter", self.confirm_current),
+            ("previous", "Alt+Up", lambda: self._navigate(-1)),
+            ("next", "Alt+Down", lambda: self._navigate(1)),
+            ("settings", "Ctrl+,", self._open_settings),
+        )
+        self.shortcuts: dict[str, QShortcut] = {}
+        for name, sequence, callback in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setObjectName(f"{name}Shortcut")
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(callback)
+            self.shortcuts[name] = shortcut
 
     def _show_empty_state(self) -> None:
         self.pages.setCurrentIndex(0)
@@ -484,17 +507,7 @@ class QtEditorWindow(QMainWindow):
                 f"{project.source_locale}  →  {project.target_locale}"
             )
             self.segment_count_label.setText(str(len(project.segments)))
-            self.segment_list.clear()
-            for index, segment in enumerate(project.segments):
-                summary = " ".join(segment.source.split())
-                if len(summary) > 72:
-                    summary = summary[:69] + "…"
-                prefix = "✓" if segment.confirmed else "○"
-                item = QListWidgetItem(f"{prefix}  {index + 1:03d}   {summary}")
-                item.setData(Qt.ItemDataRole.UserRole, index)
-                item.setToolTip(segment.source)
-                self.segment_list.addItem(item)
-            self.segment_list.setCurrentRow(self.controller.current_index)
+            self._populate_segment_list()
             self._render_current_segment()
         finally:
             self._refreshing = False
@@ -520,7 +533,14 @@ class QtEditorWindow(QMainWindow):
         if self._refreshing or not self.controller.has_project:
             return
         self.controller.update_target(self.target_editor.toPlainText())
-        self._update_segment_item(self.controller.current_index)
+        if self.unconfirmed_filter.isChecked():
+            self._refreshing = True
+            try:
+                self._populate_segment_list()
+            finally:
+                self._refreshing = False
+        else:
+            self._update_segment_item(self.controller.current_index)
         self._render_progress_state()
         self._update_title()
 
@@ -528,6 +548,8 @@ class QtEditorWindow(QMainWindow):
         segment = self.controller.current_segment
         self.confirmation_label.setText("已确认" if segment.confirmed else "待确认")
         self.confirmation_label.setProperty("confirmed", segment.confirmed)
+        self.confirmation_label.style().unpolish(self.confirmation_label)
+        self.confirmation_label.style().polish(self.confirmation_label)
         self.progress_bar.setValue(self.controller.confirmed_count)
 
     def _update_segment_item(self, project_index: int) -> None:
@@ -543,6 +565,26 @@ class QtEditorWindow(QMainWindow):
                 f"{'✓' if segment.confirmed else '○'}  {project_index + 1:03d}   {summary}"
             )
             break
+
+    def _populate_segment_list(self) -> None:
+        self.segment_list.clear()
+        project = self.controller.project
+        unconfirmed_only = self.unconfirmed_filter.isChecked()
+        selected_row = -1
+        for index, segment in enumerate(project.segments):
+            if unconfirmed_only and segment.confirmed:
+                continue
+            summary = " ".join(segment.source.split())
+            if len(summary) > 72:
+                summary = summary[:69] + "…"
+            prefix = "✓" if segment.confirmed else "○"
+            item = QListWidgetItem(f"{prefix}  {index + 1:03d}   {summary}")
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(segment.source)
+            self.segment_list.addItem(item)
+            if index == self.controller.current_index:
+                selected_row = self.segment_list.count() - 1
+        self.segment_list.setCurrentRow(selected_row)
 
     def _select_visible_row(self, row: int) -> None:
         if self._refreshing or row < 0:
@@ -565,13 +607,68 @@ class QtEditorWindow(QMainWindow):
     def _navigate(self, direction: int) -> None:
         if not self.controller.has_project:
             return
-        self.controller.move(direction)
+        self.controller.move(direction, unconfirmed_only=self.unconfirmed_filter.isChecked())
         self._refreshing = True
         try:
-            self.segment_list.setCurrentRow(self.controller.current_index)
+            self._select_project_index(self.controller.current_index)
             self._render_current_segment()
         finally:
             self._refreshing = False
+
+    def _select_project_index(self, project_index: int) -> None:
+        for row in range(self.segment_list.count()):
+            item = self.segment_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == project_index:
+                self.segment_list.setCurrentRow(row)
+                return
+        self.segment_list.setCurrentRow(-1)
+
+    def _filter_changed(self, enabled: bool) -> None:
+        if self._refreshing or not self.controller.has_project:
+            return
+        if enabled and self.controller.current_segment.confirmed:
+            next_unconfirmed = next(
+                (
+                    index
+                    for index, segment in enumerate(self.controller.project.segments)
+                    if not segment.confirmed
+                ),
+                None,
+            )
+            if next_unconfirmed is not None:
+                self.controller.go_to(next_unconfirmed)
+        self._refreshing = True
+        try:
+            self._populate_segment_list()
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+
+    def confirm_current(self) -> bool:
+        if not self.controller.has_project:
+            return False
+        try:
+            result = self.controller.confirm_current()
+        except EditorControllerError as exc:
+            self._show_error("无法确认译文", str(exc))
+            self.statusBar().showMessage("确认失败；当前段保持待确认。", 7000)
+            return False
+        if result.write_report.errors:
+            self._show_error("记忆库写入失败", "\n".join(result.write_report.errors))
+            self.statusBar().showMessage("记忆库写入失败；当前段未确认。", 7000)
+            return False
+        self._refreshing = True
+        try:
+            self._populate_segment_list()
+            self._render_current_segment()
+        finally:
+            self._refreshing = False
+        self._update_title()
+        self.statusBar().showMessage(
+            f"译文已确认 · 已写入 {len(result.write_report.written_resource_ids)} 个记忆库",
+            6000,
+        )
+        return True
 
     def _open_settings(self) -> None:
         dialog = QtSettingsDialog(self.controller, self)
