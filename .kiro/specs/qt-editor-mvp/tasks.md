@@ -72,7 +72,7 @@
   - _Boundary: EditorController Editing Writes_
   - _Depends: 2.1, 3.1_
 
-- [ ] 3.3 实现资源变更、导入协调和引擎安全热重载
+- [x] 3.3 实现资源变更、导入协调和引擎安全热重载
   - EditorController 提供资源新建、状态修改和 TMX/术语导入的单一公开入口
   - 资源新建或 Active/Lookup/Update 变化后重建查询与写回集合
   - 导入成功后热重载对应引擎；重载失败时保留上一组可用实例并返回结构化错误

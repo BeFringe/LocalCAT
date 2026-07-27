@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +11,8 @@ from editor_contracts import (
     ConfirmResult,
     EditorProject,
     EditorSegment,
+    ImportReport,
+    ImportRequest,
     ResourceConfig,
     ResourceKind,
     SuggestionBundle,
@@ -17,9 +21,9 @@ from editor_contracts import (
     WriteReport,
 )
 from editor_project import load_project, sample_project
-from glossary_engine import GlossaryEngine, GlossaryLoader
-from resource_importer import upsert_term
-from resource_repository import ResourceRepository
+from glossary_engine import GlossaryEngine
+from resource_importer import import_termbase, import_tmx, upsert_term
+from resource_repository import ResourceError, ResourceRepository
 from tm_engine import SourceUnit, TMEngine
 
 
@@ -37,7 +41,7 @@ class EditorController:
         self._dirty = False
         self._tm_engines: dict[str, TMEngine] = {}
         self._glossary_engines: dict[str, GlossaryEngine] = {}
-        self._rebuild_engines()
+        self.reload_resources()
 
     @property
     def project(self) -> EditorProject:
@@ -269,22 +273,116 @@ class EditorController:
         self._glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
         return resource
 
-    def _rebuild_engines(self) -> None:
+    def list_resources(self) -> tuple[ResourceConfig, ...]:
+        """Return the current persistent resource configuration."""
+
+        return self.repository.list_resources()
+
+    def create_resource(self, name: str, kind: ResourceKind) -> ResourceConfig:
+        """Create a managed resource and make it available immediately."""
+
+        try:
+            resource = self.repository.create_resource(name, kind)
+            self.reload_resources()
+            return resource
+        except ResourceError as exc:
+            raise EditorControllerError(str(exc)) from exc
+
+    def update_resource(self, resource: ResourceConfig) -> ResourceConfig:
+        """Persist resource state through the repository and rebuild engine sets."""
+
+        try:
+            updated = self.repository.update_resource(resource)
+            self.reload_resources()
+            return updated
+        except ResourceError as exc:
+            raise EditorControllerError(str(exc)) from exc
+
+    def import_resource(self, request: ImportRequest) -> ImportReport:
+        """Import into one configured resource and hot reload on any written result."""
+
+        try:
+            resource = self.repository.get(request.resource_id)
+        except ResourceError as exc:
+            raise EditorControllerError(str(exc)) from exc
+        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+            report = import_tmx(
+                request.input_path,
+                resource.path,
+                request.source_locale,
+                request.target_locale,
+            )
+        else:
+            report = import_termbase(request.input_path, resource.path)
+        if report.imported:
+            try:
+                self.reload_resources()
+            except EditorControllerError as exc:
+                return ImportReport(
+                    imported=report.imported,
+                    skipped=report.skipped,
+                    overwritten=report.overwritten,
+                    errors=(*report.errors, f"resource reload failed: {exc}"),
+                )
+        return report
+
+    def reload_resources(self) -> None:
+        """Build a complete active engine set before replacing the last known-good set."""
+
         tm_engines: dict[str, TMEngine] = {}
         glossary_engines: dict[str, GlossaryEngine] = {}
-        for resource in self.repository.list_resources():
-            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-                tm_engines[resource.id] = TMEngine(str(resource.path))
-            else:
-                glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
+        try:
+            for resource in self.repository.list_resources():
+                if not resource.active:
+                    continue
+                if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                    tm_engines[resource.id] = self._load_tm_engine(resource.path)
+                else:
+                    glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
+        except (OSError, UnicodeError, ValueError, csv.Error, json.JSONDecodeError) as exc:
+            raise EditorControllerError(f"unable to reload language resources: {exc}") from exc
         self._tm_engines = tm_engines
         self._glossary_engines = glossary_engines
 
     @staticmethod
+    def _load_tm_engine(path: Path) -> TMEngine:
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"translation memory does not exist: {path}")
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"translation memory line {line_number} must be an object")
+            source = record.get("source")
+            target = record.get("target")
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(f"translation memory line {line_number} has no source")
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError(f"translation memory line {line_number} has no target")
+        return TMEngine(str(path))
+
+    @staticmethod
     def _load_glossary_engine(path: Path) -> GlossaryEngine:
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"termbase does not exist: {path}")
+        terms: dict[str, str] = {}
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for line_number, row in enumerate(csv.reader(handle), start=1):
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                if len(row) < 2:
+                    raise ValueError(f"termbase row {line_number} has fewer than two columns")
+                source = row[0].strip()
+                target = row[1].strip()
+                if source.casefold() == "source" and target.casefold() == "target":
+                    continue
+                if not source or not target:
+                    raise ValueError(f"termbase row {line_number} has an empty term")
+                terms[source] = target
         engine = GlossaryEngine()
-        if path.exists():
-            GlossaryLoader(engine).load_file(str(path))
+        for source, target in terms.items():
+            engine.add_term(source, target, path.name)
         return engine
 
 
