@@ -154,7 +154,7 @@
   - _Boundary: QtBootstrap and Dependency Diagnostics_
   - _Depends: 5.4_
 
-- [ ] 6.2 建立关键 GUI 交互测试和五个既有入口回归
+- [x] 6.2 建立关键 GUI 交互测试和五个既有入口回归
   - 使用 QtTest 覆盖齿轮设置、TM 建议、术语插入、新增术语立即查询和 Ctrl+Enter 确认导航
   - 调整窗口为小/大尺寸并断言三个主区域保持可见和非零可用尺寸
   - 明确运行 `glossary_engine.py`、`tm_engine.py`、`logic_controller.py`、`stress_runner.py`、`translation_runner.py`、新增 unittest 和 Qt offscreen smoke
