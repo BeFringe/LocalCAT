@@ -83,7 +83,7 @@ class WorkspaceStateRepository:
         self._recent = updated
 
     def display_preferences(self) -> DisplayPreferences:
-        """Return persisted segment density and workspace mode."""
+        """Return persisted editor-only display preferences."""
 
         return self._preferences
 

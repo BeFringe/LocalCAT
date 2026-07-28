@@ -203,7 +203,7 @@ class EditorController:
             raise EditorControllerError(str(exc)) from exc
 
     def display_preferences(self) -> DisplayPreferences:
-        """Return local segment-density and workspace-mode preferences."""
+        """Return local editor-only display preferences."""
 
         return self.workspace_state.display_preferences()
 

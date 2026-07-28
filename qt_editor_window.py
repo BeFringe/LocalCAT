@@ -6,7 +6,7 @@ import html
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QResizeEvent,
     QShortcut,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -49,6 +50,9 @@ from PySide6.QtWidgets import (
 )
 
 from editor_contracts import (
+    EDITOR_FONT_SIZE_STEP,
+    MAX_EDITOR_FONT_SIZE,
+    MIN_EDITOR_FONT_SIZE,
     DisplayPreferences,
     EditorSegment,
     SegmentDensity,
@@ -110,7 +114,7 @@ def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> s
         cursor = end
     pieces.append(html.escape(text[cursor:]).replace("\n", "<br>"))
     return (
-        '<div style="white-space:pre-wrap; font-size:15px; color:#1c2b3a;">'
+        '<div style="white-space:pre-wrap; color:#1c2b3a;">'
         + "".join(pieces)
         + "</div>"
     )
@@ -126,6 +130,7 @@ class QtEditorWindow(QMainWindow):
         self._display_preferences: DisplayPreferences = controller.display_preferences()
         self.segment_density = self._display_preferences.segment_density
         self.workspace_mode = self._display_preferences.workspace_mode
+        self.editor_font_size = self._display_preferences.editor_font_size
         self.settings_dialog: QtSettingsDialog | None = None
         self.current_suggestions = SuggestionBundle()
         self.setObjectName("editorWindow")
@@ -133,6 +138,9 @@ class QtEditorWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
+        self.apply_editor_font_size(self.editor_font_size)
+        self.source_display.viewport().installEventFilter(self)
+        self.target_editor.viewport().installEventFilter(self)
         self._wire_actions()
         self._install_shortcuts()
         self.set_segment_density(self.segment_density, persist=False)
@@ -543,6 +551,78 @@ class QtEditorWindow(QMainWindow):
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
             self.shortcuts[name] = shortcut
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        """Handle Ctrl+wheel only for the two editor viewports."""
+
+        editor_viewports = (
+            self.source_display.viewport(),
+            self.target_editor.viewport(),
+        )
+        if (
+            watched in editor_viewports
+            and self.workspace_mode is WorkspaceMode.EDIT
+            and event.type() is QEvent.Type.Wheel
+        ):
+            wheel_event = event
+            if (
+                isinstance(wheel_event, QWheelEvent)
+                and wheel_event.modifiers()
+                == Qt.KeyboardModifier.ControlModifier
+            ):
+                vertical_delta = wheel_event.angleDelta().y()
+                if vertical_delta:
+                    direction = 1 if vertical_delta > 0 else -1
+                    self.set_editor_font_size(
+                        self.editor_font_size
+                        + direction * EDITOR_FONT_SIZE_STEP
+                    )
+                    wheel_event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def apply_editor_font_size(self, size: int) -> None:
+        """Apply one validated pixel size to both editor documents."""
+
+        for widget in (self.source_display, self.target_editor):
+            widget_font = widget.font()
+            widget_font.setPixelSize(size)
+            widget.setFont(widget_font)
+            document_font = widget.document().defaultFont()
+            document_font.setPixelSize(size)
+            widget.document().setDefaultFont(document_font)
+        self.editor_font_size = size
+
+    def set_editor_font_size(
+        self,
+        size: int,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Clamp, apply and optionally persist the local editor font size."""
+
+        if not isinstance(size, int) or isinstance(size, bool):
+            self._show_error("无法调整编辑字号", "编辑字号必须是整数。")
+            return False
+        normalized = max(MIN_EDITOR_FONT_SIZE, min(MAX_EDITOR_FONT_SIZE, size))
+        if normalized == self.editor_font_size:
+            return True
+
+        self.apply_editor_font_size(normalized)
+        preferences = replace(
+            self._display_preferences,
+            editor_font_size=normalized,
+        )
+        if not persist:
+            self._display_preferences = preferences
+            return True
+        try:
+            saved_preferences = self.controller.update_display_preferences(preferences)
+        except EditorControllerError as exc:
+            self._show_error("字号偏好未保存", str(exc))
+            return False
+        self._display_preferences = saved_preferences
+        return True
 
     def _show_empty_state(self) -> None:
         self.pages.setCurrentIndex(0)
@@ -1496,7 +1576,6 @@ QTextBrowser#sourceDisplay, QTextEdit#targetEditor {
     border-radius: 7px;
     padding: 12px;
     selection-background-color: #87d8eb;
-    font-size: 15px;
     line-height: 1.45;
 }
 QTextEdit#targetEditor:focus {
