@@ -18,9 +18,9 @@
 
 | 开发线 | 可写 Spec | 只读相邻 Spec |
 |---|---|---|
-| `feature5` / `/home/neotag/文档/CAT/localcat-feature5` | `tm-storage-retrieval-index` | 从 `ui-mvp` 基线继承的 `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`、Parser 与未来格式规格 |
-| `ui-mvp` / `/home/neotag/文档/CAT/CAT` | `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`；维护既有 `qt-editor-mvp` 验证事实 | Parser 与未来格式规格；Feature 5 正式规格留在 `feature5` 分支 |
-| `governance/kiro-steering` / `jolly-orchid` | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
+| `feature5` | `tm-storage-retrieval-index` | 从 `ui-mvp` 基线继承的 `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`、Parser 与未来格式规格 |
+| `ui-mvp` | `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`；维护既有 `qt-editor-mvp` 验证事实 | Parser 与未来格式规格；Feature 5 正式规格留在 `feature5` 分支 |
+| `governance/kiro-steering` | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
 
 `feature5-ui-integration.md`、`roadmap.md` 和 `repository-safety.md` 是共享治理文件。任一垂直线发现冲突时可以提出修订，但共享补丁只能提交一次，再通过 merge/rebase 由其他活动线继承，并同时复核两侧正式 Requirements/Design。
 

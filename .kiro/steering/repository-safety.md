@@ -6,7 +6,7 @@
 
 1. **活动 worktree 必须持久化**
    - 唯一工作副本不得位于 `/tmp`、tmpfs、容器临时层或会被系统清理的缓存目录。
-   - 新增长期工作树前先确认目标挂载类型和路径；LocalCAT 的 Feature 5 固定使用 `/home/neotag/文档/CAT/localcat-feature5`。
+   - 新增长期工作树前先确认目标挂载类型和路径；Feature 5 工作树应位于用户选择的持久目录，不在项目文档中固化机器相关绝对路径。
    - `git worktree prune` 只能清理失效元数据，不能被当作内容恢复手段。
 
 2. **Spec 与 Steering 必须进入 Git**

@@ -99,11 +99,11 @@ Qt 前端只能调用 `EditorController`，不得直接调用资源仓储、TM �
 
 ## 🚧 当前状态
 - **最新标签**: Feature 3 (`v0.3.0-feature3`) - 无状态 Logic + Excel 适配器与性能基准
-- **Qt 工作区**: `/home/neotag/文档/CAT/CAT` / `ui-mvp`
-- **Feature 5 工作区**: `/home/neotag/文档/CAT/localcat-feature5` / `feature5`
+- **活动开发线**: `ui-mvp` 负责 Qt 单 JSON 编辑器增量，`feature5` 负责 TM 存储、检索和统一文本匹配能力
+- **继承关系**: 两条开发线以已完成的 Qt 编辑器 MVP 为语义基线；共享变更只提交一次，并通过 merge/rebase 继承
 - **规格状态**: Feature 5 已从原成功补丁链恢复；matcher capability 抢救性 Requirements 待重新批准，Design / Tasks / 实施门保持关闭
-- **下一审批点**: Feature 5 Requirements 与 `qt-editor-font-zoom` Tasks；Qt JSON increment 等待 Feature 5 capability 契约闭合
-- **合并方向**: Feature 5 通过自身 gate 后合入 `ui-mvp`，再由 Qt 线接入 Controller adapter；不把未验收 UI 反向带入 Feature 5
+- **当前实施项**: `qt-editor-font-zoom` 已获 Tasks 实施批准；Qt JSON increment 继续等待 Feature 5 capability 契约闭合
+- **合并方向**: Feature 5 从已验收 UI 基线演化，通过自身 gate 后合入 `ui-mvp`，再由 Qt 线接入 Controller adapter
 - **明确后置**: 多文件/多 Sheet 项目、RPY/XLIFF codec、MyMemory context、MT、QA 与协作不伪装成当前已完成能力
 - **连续性约束**: `.kiro/` 由 Git 跟踪；活动 worktree 不得放在 `/tmp` 或 tmpfs，阶段产物与已验证任务要及时形成可恢复提交
 

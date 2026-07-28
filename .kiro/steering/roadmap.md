@@ -21,10 +21,10 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 
 ## Delivery Lanes
 
-| Lane | 工作区 / 分支 | 当前范围 | 明确不做 |
+| Lane | 活动分支 | 当前范围 | 明确不做 |
 |------|---------------|----------|----------|
-| Qt JSON | `/home/neotag/文档/CAT/CAT` / `ui-mvp` | 单 JSON、raw speaker、基础搜索/预处理/术语 CRUD、silver logo、紧凑“…” | 新项目格式、SQLite、fuzzy；合并前不启用 Match Case / Whole Word |
-| Feature 5 | `/home/neotag/文档/CAT/localcat-feature5` / `feature5` | canonical TM、SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher、exact/context/fuzzy query | Qt 控件、Parser codec、Glossary 管理 UI、Docker/协作 |
+| Qt JSON | `ui-mvp` | 单 JSON、raw speaker、基础搜索/预处理/术语 CRUD、silver logo、紧凑“…” | 新项目格式、SQLite、fuzzy；合并前不启用 Match Case / Whole Word |
+| Feature 5 | `feature5` | canonical TM、SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher、exact/context/fuzzy query | Qt 控件、Parser codec、Glossary 管理 UI、Docker/协作 |
 | Parser / Multi-document | 后续规格分支 | Parser registry、Project/Document/Segment、多格式 codec | 不阻塞前两条线 |
 
 两条活动线使用单一、可追踪的继承链：共享 SDD/Steering 与已验收 Qt 基线先在 `ui-mvp` 提交一次，`feature5` 再通过 rebase/merge 继承该历史，并只追加 Feature 5 自身规格与实现。不得在两个 worktree 中分别重建等价补丁；共享治理或跨线契约也必须只提交一次，再由活动分支继承。分支 tip 无需长期相同，但共同改动必须拥有同一提交祖先。
