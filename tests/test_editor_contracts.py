@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 
 from editor_contracts import (
+    DEFAULT_EDITOR_FONT_SIZE,
+    MAX_EDITOR_FONT_SIZE,
+    MIN_EDITOR_FONT_SIZE,
     ConfirmResult,
+    DisplayPreferences,
     EditorProject,
     EditorSegment,
     ImportReport,
@@ -16,6 +20,8 @@ from editor_contracts import (
     TMSuggestion,
     TermSuggestion,
     WriteReport,
+    SegmentDensity,
+    WorkspaceMode,
 )
 
 
@@ -100,6 +106,31 @@ class EditorContractsTest(unittest.TestCase):
                 resource_name="Main",
                 similarity=1.5,
             )
+
+    def test_display_preferences_validate_and_preserve_editor_font_size(self) -> None:
+        self.assertEqual(
+            DisplayPreferences().editor_font_size,
+            DEFAULT_EDITOR_FONT_SIZE,
+        )
+        for size in (MIN_EDITOR_FONT_SIZE, DEFAULT_EDITOR_FONT_SIZE, MAX_EDITOR_FONT_SIZE):
+            self.assertEqual(DisplayPreferences(editor_font_size=size).editor_font_size, size)
+
+        for invalid in (True, False, 15.0, "15"):
+            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
+                DisplayPreferences(editor_font_size=invalid)  # type: ignore[arg-type]
+        for invalid in (MIN_EDITOR_FONT_SIZE - 1, MAX_EDITOR_FONT_SIZE + 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                DisplayPreferences(editor_font_size=invalid)
+
+        original = DisplayPreferences(
+            segment_density=SegmentDensity.WRAPPED,
+            workspace_mode=WorkspaceMode.BROWSE,
+            editor_font_size=21,
+        )
+        resized = dataclasses.replace(original, editor_font_size=22)
+        self.assertIs(resized.segment_density, SegmentDensity.WRAPPED)
+        self.assertIs(resized.workspace_mode, WorkspaceMode.BROWSE)
+        self.assertEqual(resized.editor_font_size, 22)
 
 
 if __name__ == "__main__":

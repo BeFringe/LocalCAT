@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from editor_contracts import (
+    DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
     RecentProject,
     SegmentDensity,
@@ -138,16 +139,42 @@ class WorkspaceStateRepository:
         if isinstance(raw_display, dict):
             display = cast(dict[str, object], raw_display)
             try:
-                preferences = DisplayPreferences(
-                    segment_density=SegmentDensity(
-                        cast(str, display.get("segment_density", SegmentDensity.COMPACT.value))
-                    ),
-                    workspace_mode=WorkspaceMode(
-                        cast(str, display.get("workspace_mode", WorkspaceMode.EDIT.value))
-                    ),
+                segment_density = SegmentDensity(
+                    cast(
+                        str,
+                        display.get(
+                            "segment_density",
+                            SegmentDensity.COMPACT.value,
+                        ),
+                    )
+                )
+                workspace_mode = WorkspaceMode(
+                    cast(
+                        str,
+                        display.get(
+                            "workspace_mode",
+                            WorkspaceMode.EDIT.value,
+                        ),
+                    )
                 )
             except (TypeError, ValueError):
                 LOGGER.warning("Using default display preferences from invalid workspace state")
+            else:
+                editor_font_size = DEFAULT_EDITOR_FONT_SIZE
+                if "editor_font_size" in display:
+                    try:
+                        editor_font_size = DisplayPreferences(
+                            editor_font_size=cast(int, display["editor_font_size"])
+                        ).editor_font_size
+                    except (TypeError, ValueError):
+                        LOGGER.warning(
+                            "Using default editor font size from invalid workspace state"
+                        )
+                preferences = DisplayPreferences(
+                    segment_density=segment_density,
+                    workspace_mode=workspace_mode,
+                    editor_font_size=editor_font_size,
+                )
         return tuple(recent[:MAX_RECENT_PROJECTS]), preferences
 
     def _write_state(
@@ -168,6 +195,7 @@ class WorkspaceStateRepository:
             "display": {
                 "segment_density": preferences.segment_density.value,
                 "workspace_mode": preferences.workspace_mode.value,
+                "editor_font_size": preferences.editor_font_size,
             },
         }
         temp_path: Path | None = None

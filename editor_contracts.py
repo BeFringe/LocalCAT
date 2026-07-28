@@ -7,6 +7,12 @@ from enum import Enum
 from pathlib import Path
 
 
+DEFAULT_EDITOR_FONT_SIZE = 15
+MIN_EDITOR_FONT_SIZE = 10
+MAX_EDITOR_FONT_SIZE = 28
+EDITOR_FONT_SIZE_STEP = 1
+
+
 class ResourceKind(str, Enum):
     """Supported local language-resource categories."""
 
@@ -51,12 +57,23 @@ class DisplayPreferences:
 
     segment_density: SegmentDensity = SegmentDensity.COMPACT
     workspace_mode: WorkspaceMode = WorkspaceMode.EDIT
+    editor_font_size: int = DEFAULT_EDITOR_FONT_SIZE
 
     def __post_init__(self) -> None:
         if not isinstance(self.segment_density, SegmentDensity):
             raise TypeError("segment density must be a SegmentDensity")
         if not isinstance(self.workspace_mode, WorkspaceMode):
             raise TypeError("workspace mode must be a WorkspaceMode")
+        if not isinstance(self.editor_font_size, int) or isinstance(
+            self.editor_font_size,
+            bool,
+        ):
+            raise TypeError("editor font size must be an integer")
+        if not MIN_EDITOR_FONT_SIZE <= self.editor_font_size <= MAX_EDITOR_FONT_SIZE:
+            raise ValueError(
+                "editor font size must be between "
+                f"{MIN_EDITOR_FONT_SIZE} and {MAX_EDITOR_FONT_SIZE}"
+            )
 
 
 @dataclass(frozen=True)
