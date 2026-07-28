@@ -27,6 +27,7 @@ from editor_project import load_project, sample_project, save_project as save_pr
 from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
+from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from tm_engine import SourceUnit, TMEngine
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
 
@@ -220,7 +221,8 @@ class EditorController:
     def suggestions(self) -> SuggestionBundle:
         """Query every currently active Lookup resource for the current source."""
 
-        source = self.current_segment.source
+        segment = self.current_segment
+        source = segment.source
         tm_matches: list[TMSuggestion] = []
         terms: list[TermSuggestion] = []
         for resource in self.repository.list_resources():
@@ -238,6 +240,29 @@ class EditorController:
                             resource_name=resource.name,
                             similarity=match.similarity,
                             match_type=match.match_type,
+                        )
+                    )
+                    continue
+                alias = build_dialogue_alias(segment.speaker, source)
+                wrapped = (
+                    engine.query_exact(alias)
+                    if engine is not None and alias is not None
+                    else None
+                )
+                target = (
+                    unwrap_dialogue_target(wrapped.target, segment.speaker)
+                    if wrapped is not None
+                    else None
+                )
+                if wrapped is not None and target is not None:
+                    tm_matches.append(
+                        TMSuggestion(
+                            source=source,
+                            target=target,
+                            resource_id=resource.id,
+                            resource_name=resource.name,
+                            similarity=wrapped.similarity,
+                            match_type=wrapped.match_type,
                         )
                     )
             else:
@@ -401,6 +426,26 @@ class EditorController:
             return updated
         except ResourceError as exc:
             raise EditorControllerError(str(exc)) from exc
+
+    def delete_resource(self, resource_id: str) -> ResourceConfig:
+        """Delete one configured resource and remove it from live engine sets."""
+
+        try:
+            deleted = self.repository.delete_resource(resource_id)
+        except ResourceError as exc:
+            raise EditorControllerError(str(exc)) from exc
+        self._tm_engines.pop(resource_id, None)
+        self._glossary_engines.pop(resource_id, None)
+        try:
+            self.reload_resources()
+        except EditorControllerError as exc:
+            LOGGER.warning(
+                "Resource %s was deleted; remaining resources kept their last "
+                "known-good engines because reload failed: %s",
+                resource_id,
+                exc,
+            )
+        return deleted
 
     def import_resource(self, request: ImportRequest) -> ImportReport:
         """Import into one configured resource and hot reload on any written result."""

@@ -25,6 +25,7 @@ Layer 1 Storage
 ├── resource_repository.py       # 资源清单和受控本地文件
 ├── workspace_state.py           # 最近项目、段落断点与显示偏好
 ├── resource_importer.py         # TMX/CSV/XLSX 安全原子导入
+├── renpy_tm_compat.py           # 严格 speaker 对话封装查询与目标解包
 ├── editor_controller.py         # Qt 会话、项目断点、查询、写回、热重载
 ├── qt_editor.py                 # 标准库 bootstrap
 ├── qt_editor_window.py          # Layer 4 主编辑器
@@ -47,6 +48,7 @@ Layer 1 Storage
 - `workspace_state.py` 只保存 Qt 无关的本地工作区状态；Qt 前端不得直接访问它。
 - `logic_controller.py` 不导入 Qt/xlwings，保持无历史状态的三态接口。
 - `resource_importer.py` 不导入 PySide6；openpyxl 仅在 XLSX 路径中条件导入。
+- `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；未来 canonical TMRecord 落地后替换。
 - 核心 Engine 不向上导入 Controller 或 Frontend。
 
 该边界由 `tests/test_qt_user_journey.py` 的 AST 守卫和 Excel 适配器契约测试持续验证。
@@ -63,11 +65,12 @@ Layer 1 Storage
 
 - `tests/test_editor_*`：纯逻辑、项目和资源协调。
 - `tests/test_workspace_state.py`：最近项目、段落断点和显示偏好持久化。
-- `tests/test_resource_*`：清单、TMX/CSV/XLSX、原子失败语义。
+- `tests/test_resource_*`：清单、托管/外部删除、TMX/CSV/XLSX、原子失败语义。
+- `tests/test_renpy_tm_compat.py`：安全 speaker token、引号转义与拒绝猜测性解包。
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
 - 五个旧脚本自检仍是发布前回归矩阵的一部分。
 
 ## 开发上下文
 
-当前方法是无常驻 Agent 状态的 Kiro 规格驱动开发。持久上下文位于 `AGENTS.md`、`.kiro/steering/` 和 `.kiro/specs/`；早期 `plugins/modular-cat-architect/` 仅为历史材料，不得覆盖当前 steering 或实现事实。
+当前方法是无常驻 Agent 状态的 Kiro 规格驱动开发。持久上下文位于 `AGENTS.md`、`.kiro/steering/` 和 `.kiro/specs/`；早期 `plugins/modular-cat-architect/` 仅为历史材料，不得覆盖当前 steering 或实现事实。Parser 遗留草案也不得直接实施，需按同目录 `research.md`/`rebaseline-plan.md` 重新走审批。

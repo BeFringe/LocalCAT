@@ -99,6 +99,20 @@
   - 设置表把名称和路径作为弹性列，类型与导入列按完整内容给出最小宽度。
   - 新增真实 QVariant 回归和真实 `OWNattempt.tmx + 卷一_引.json` 验收，防止只验证构造器直调。
 
+### 第二轮真实资源反馈：导入“成功但无效”的根因
+
+- **观察**：`~/.local/share/LocalCAT/resources/` 中两个已导入翻译记忆库分别包含约 4,800 和 2,895 条 JSONL 记录，说明 TMX 解析、合并与落盘均已发生；设置表显示 `.jsonl` 是内部规范化存储，不是原 TMX 附件路径。
+- **根因**：`po/卷一_引.json` 将 `speaker` 与 `source` 分字段保存，而已导入的 MateCat/Ren'Py TMX 把同一内容保存为 `NVLHED "source"`。现有 `TMEngine.query_exact()` 只按完整 source 字符串索引，因此原始查询几乎不能命中。
+- **真实样本证据**：对项目正文直接查询两个活动导入资源各仅命中 1 条；加入“安全 speaker token + 同 speaker 目标可解包”的最终严格规则后，两个资源各新增 2,808 条可应用的等价精确命中。
+- **止血方案**：在 EditorController 与 TMEngine 之间加入 Qt 无关的严格兼容适配器。先执行普通 exact；仅当当前段有安全 speaker token 时再查询规范封装，并只在目标使用同一 speaker 封装时解包。该适配器不修改 TMEngine 数据模型、不迁移资源，也不承担通用 RPY 解析。
+- **长期边界**：MyMemory 上下文、多同源多译文和 Ren'Py 文档 round-trip 属于 Parser/TM storage 后续规格；本 MVP 只恢复当前导入资产的确定性精确复用。
+
+### 资源删除与桌面入口
+
+- 应用托管资源位于 ResourceRepository 自己的 `resources/` 目录，可在清单提交前先同目录改名为 tombstone；若清单写入失败则改名回滚，提交成功后再清理 tombstone。
+- 仓库自带 `tm.jsonl`、`terms.csv` 等外部路径资源只能取消登记，删除动作不得移除这些文件。
+- 已存在的 `.desktop` 使用通用 `accessories-text-editor` 图标且未刷新桌面数据库；新的安装器应把仓库内 `LocalCAT-logo-silver.png` 注册为 freedesktop 用户主题图标、声明工作目录/启动类，并在可用时运行 `update-desktop-database`。
+
 ### 长篇项目恢复与浏览校对模式
 
 - **背景**：2942 段项目暴露了单一当前段编辑视图在进度恢复和全文校对方面的不足。
@@ -119,7 +133,7 @@
 | 直接在 QWidget 调引擎 | UI 直接实例化 TM/Glossary | 文件少 | 违反四层依赖，难测试，多资源逻辑泄漏到 UI | 拒绝 |
 | 修改旧 LogicController | 把编辑状态和资源管理塞入旧类 | 表面复用 | 破坏无状态三态契约与 Excel 回归 | 拒绝 |
 | 新 EditorController | 新 Logic 层协调编辑会话、资源与引擎 | 保持旧契约，Qt 可薄化，便于测试 | 新增少量模块 | 采用 |
-| 立即使用 SQLite | TM/术语统一数据库 | 未来查询空间大 | 改变存储契约，超出精确匹配 MVP | 拒绝 |
+| 在 Qt MVP 立即使用 SQLite | TM/术语统一数据库 | 未来查询空间大 | 查询与多上下文契约未稳定，改变当前存储契约 | 本规格拒绝；由 Feature 5 storage/index ADR 在 context/fuzzy 前裁决 |
 | JSON 清单 + JSONL/CSV 资源 | 元数据 JSON，数据继续使用现有格式 | 兼容、可审计、迁移简单 | 大规模模糊查询仍有限 | 采用 |
 
 ## 设计决策

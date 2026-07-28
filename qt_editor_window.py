@@ -1244,9 +1244,9 @@ class QtEditorWindow(QMainWindow):
             | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Save,
         )
-        if decision is QMessageBox.StandardButton.Save:
+        if decision == QMessageBox.StandardButton.Save:
             return self._choose_save()
-        return decision is QMessageBox.StandardButton.Discard
+        return decision == QMessageBox.StandardButton.Discard
 
     def _update_title(self) -> None:
         if not self.controller.has_project:

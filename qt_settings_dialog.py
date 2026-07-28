@@ -21,10 +21,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QMenu,
     QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -76,6 +78,7 @@ class QtSettingsDialog(QDialog):
         self.setModal(True)
         self.import_worker: ImportWorker | None = None
         self._import_busy = False
+        self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
         self._build_ui()
         self.refresh_resources()
@@ -115,8 +118,15 @@ class QtSettingsDialog(QDialog):
         section_title.setObjectName("resourceSectionTitle")
         section_hint = QLabel("选择资源的可见性与读写权限，或创建新的本地资源。")
         section_hint.setObjectName("resourceSectionHint")
+        storage_hint = QLabel(
+            "导入文件会转换并合并到列表所示的内部 JSONL/CSV；这里显示的是 "
+            "LocalCAT 实际查询的本地存储路径。"
+        )
+        storage_hint.setObjectName("resourceStorageHint")
+        storage_hint.setWordWrap(True)
         intro.addWidget(section_title)
         intro.addWidget(section_hint)
+        intro.addWidget(storage_hint)
         intro_row.addLayout(intro)
         intro_row.addStretch()
         new_button = QPushButton("＋ 新建资源")
@@ -169,10 +179,10 @@ class QtSettingsDialog(QDialog):
 
     @staticmethod
     def _make_table(object_name: str) -> QTableWidget:
-        table = QTableWidget(0, 7)
+        table = QTableWidget(0, 8)
         table.setObjectName(object_name)
         table.setHorizontalHeaderLabels(
-            ["Active", "Lookup", "Update", "名称", "类型", "本地路径", "导入"]
+            ["Active", "Lookup", "Update", "名称", "类型", "本地路径", "导入", ""]
         )
         table.verticalHeader().setVisible(False)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -191,6 +201,8 @@ class QtSettingsDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(6, 154)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(7, 48)
         return table
 
     def refresh_resources(self) -> None:
@@ -255,6 +267,21 @@ class QtSettingsDialog(QDialog):
                 lambda _checked=False, configured=resource: self._prompt_import(configured)
             )
             table.setCellWidget(row, 6, import_button)
+            more_button = QToolButton()
+            more_button.setObjectName(f"more_{resource.id}")
+            more_button.setText("⋮")
+            more_button.setToolTip(f"{resource.name} 的更多操作")
+            more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu = QMenu(more_button)
+            delete_action = menu.addAction("删除资源")
+            delete_action.setObjectName(f"delete_{resource.id}")
+            delete_action.triggered.connect(
+                lambda _checked=False, configured=resource: self._confirm_delete_resource(
+                    configured
+                )
+            )
+            more_button.setMenu(menu)
+            table.setCellWidget(row, 7, more_button)
         table.resizeRowsToContents()
 
     def _set_state(self, resource_id: str, field: str, checked: bool) -> None:
@@ -281,6 +308,29 @@ class QtSettingsDialog(QDialog):
         self.resources_changed.emit()
         self.status_label.setText(f"已创建：{resource.name}")
         return resource
+
+    def _confirm_delete_resource(self, resource: ResourceConfig) -> None:
+        answer = QMessageBox.question(
+            self,
+            "删除语言资源",
+            (
+                f"确定删除“{resource.name}”吗？\n\n"
+                "LocalCAT 托管的数据文件会一并删除；仓库默认资源或其他外部"
+                "文件只会从列表取消登记。"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.controller.delete_resource(resource.id)
+        except EditorControllerError as exc:
+            QMessageBox.critical(self, "无法删除资源", str(exc))
+            return
+        self.refresh_resources()
+        self.resources_changed.emit()
+        self.status_label.setText(f"已删除：{resource.name}")
 
     def _prompt_create_resource(self) -> None:
         prompt = QDialog(self)
@@ -397,6 +447,7 @@ class QtSettingsDialog(QDialog):
             return False
 
         self.last_import_report = None
+        self._import_target_kind = resource.kind
         self._import_busy = True
         self._set_import_busy(True, f"正在导入 {resource.name}…")
         worker = ImportWorker(self.controller, request, self)
@@ -423,6 +474,16 @@ class QtSettingsDialog(QDialog):
             f"已导入 {report.imported} · 已跳过 {report.skipped} · "
             f"已覆盖 {report.overwritten} · 错误 {len(report.errors)}"
         )
+        if report.imported:
+            internal_format = (
+                "JSONL"
+                if self._import_target_kind is ResourceKind.TRANSLATION_MEMORY
+                else "CSV"
+            )
+            details += (
+                f"\n已合并到列表所示的内部 {internal_format} 存储；"
+                "导入文件本身不会成为运行时资源路径。"
+            )
         if report.errors:
             details += "\n" + "\n".join(report.errors[:4])
         self._show_import_feedback(details, failed=bool(report.errors and not report.imported))

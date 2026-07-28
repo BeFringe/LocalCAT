@@ -86,6 +86,116 @@ class EditorControllerResourcesTest(unittest.TestCase):
         self.assertEqual(report.errors, ())
         self.assertEqual(after.tm_matches[0].target, "办公室准备好了。")
 
+    def test_speaker_wrapped_renpy_tm_is_a_safe_exact_compatibility_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = EditorController(ResourceRepository(root / "app-data"))
+            controller.set_project(
+                EditorProject(
+                    name="RenPy",
+                    segments=(
+                        EditorSegment(
+                            id="1",
+                            source="I was in considerably higher spirits after eating.",
+                            speaker="NVLHED",
+                        ),
+                    ),
+                )
+            )
+            resource = controller.create_resource(
+                "MateCat export",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            resource.path.write_text(
+                json.dumps(
+                    {
+                        "source": 'NVLHED "I was in considerably higher spirits after eating."',
+                        "target": 'NVLHED "吃完饭后，我的精神好了很多。"',
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            controller.reload_resources()
+
+            suggestion = controller.suggestions().tm_matches[0]
+            controller.apply_tm_suggestion(suggestion)
+
+            self.assertEqual(
+                suggestion.source,
+                "I was in considerably higher spirits after eating.",
+            )
+            self.assertEqual(suggestion.target, "吃完饭后，我的精神好了很多。")
+            self.assertEqual(suggestion.match_type, "EXACT")
+            self.assertEqual(controller.current_segment.target, suggestion.target)
+
+    def test_speaker_compatibility_does_not_guess_at_mismatched_target_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = EditorController(ResourceRepository(root / "app-data"))
+            controller.set_project(
+                EditorProject(
+                    name="RenPy",
+                    segments=(EditorSegment(id="1", source="Hello.", speaker="alice"),),
+                )
+            )
+            resource = controller.create_resource("Unsafe", ResourceKind.TRANSLATION_MEMORY)
+            resource.path.write_text(
+                json.dumps(
+                    {
+                        "source": 'alice "Hello."',
+                        "target": 'bob "你好。"',
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            controller.reload_resources()
+
+            self.assertEqual(controller.suggestions().tm_matches, ())
+
+    def test_delete_resource_reloads_suggestion_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = self._controller(root)
+            resource = controller.create_resource("Temporary", ResourceKind.TRANSLATION_MEMORY)
+            resource.path.write_text(
+                '{"source":"The office is ready.","target":"临时译文"}\n',
+                encoding="utf-8",
+            )
+            controller.reload_resources()
+            self.assertTrue(controller.suggestions().tm_matches)
+
+            deleted = controller.delete_resource(resource.id)
+
+            self.assertEqual(deleted, resource)
+            self.assertEqual(controller.suggestions().tm_matches, ())
+
+    def test_delete_keeps_other_last_known_good_engine_when_reload_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = self._controller(root)
+            deleted_resource = controller.create_resource(
+                "Delete",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            remaining = controller.create_resource(
+                "Remaining",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            remaining.path.write_text(
+                '{"source":"The office is ready.","target":"保留译文"}\n',
+                encoding="utf-8",
+            )
+            controller.reload_resources()
+            remaining.path.write_text("{not-json\n", encoding="utf-8")
+
+            controller.delete_resource(deleted_resource.id)
+
+            self.assertEqual(controller.suggestions().tm_matches[0].target, "保留译文")
+
     def test_termbase_import_hot_reloads_current_suggestions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

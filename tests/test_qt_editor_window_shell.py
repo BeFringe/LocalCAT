@@ -8,8 +8,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from editor_contracts import ResourceKind
 from editor_controller import EditorController
@@ -30,6 +30,23 @@ class QtEditorWindowShellTest(unittest.TestCase):
 
     def _events(self) -> None:
         QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
+
+    def _schedule_message_box_click(
+        self,
+        standard_button: QMessageBox.StandardButton,
+        clicked: list[str],
+    ) -> None:
+        def click_button() -> None:
+            for widget in QApplication.topLevelWidgets():
+                if not isinstance(widget, QMessageBox):
+                    continue
+                button = widget.button(standard_button)
+                if button is not None:
+                    clicked.append(button.text())
+                    button.click()
+                    return
+
+        QTimer.singleShot(25, click_button)
 
     def test_empty_state_and_sample_reach_first_editor_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -109,6 +126,35 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertEqual(window.controller.current_segment.source, "First source")
             window.controller.save_project(root / "cleanup.json")
             window.close()
+
+    def test_discard_button_closes_dirty_project_without_saving(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.load_sample()
+            window.target_editor.setPlainText("未保存")
+            self._events()
+            clicked: list[str] = []
+
+            self._schedule_message_box_click(
+                QMessageBox.StandardButton.Discard,
+                clicked,
+            )
+            self.assertTrue(window.close_current_project())
+            self.assertFalse(window.controller.has_project)
+
+            window.load_sample()
+            window.target_editor.setPlainText("再次未保存")
+            window.show()
+            self._events()
+            self._schedule_message_box_click(
+                QMessageBox.StandardButton.Discard,
+                clicked,
+            )
+            self.assertTrue(window.close())
+            self._events()
+
+            self.assertEqual(len(clicked), 2)
+            self.assertFalse(window.isVisible())
 
     def test_three_columns_keep_usable_sizes_after_resize(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

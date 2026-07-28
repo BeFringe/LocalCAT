@@ -132,6 +132,61 @@ class ResourceRepository:
         self._resources = updated
         return replacement
 
+    def delete_resource(self, resource_id: str) -> ResourceConfig:
+        """Unregister one resource and remove only files owned by this repository."""
+
+        resource = self.get(resource_id)
+        updated = [
+            configured
+            for configured in self._resources
+            if configured.id != resource_id
+        ]
+        try:
+            managed_path = resource.path.resolve(strict=False).is_relative_to(
+                self.managed_dir
+            )
+        except (OSError, RuntimeError) as exc:
+            raise ResourceError(f"unable to resolve resource path safely: {exc}") from exc
+        tombstone: Path | None = None
+        if managed_path and resource.path.exists():
+            if not resource.path.is_file():
+                raise ResourceError(
+                    f"managed resource is not a regular file: {resource.path}"
+                )
+            tombstone = (
+                self.managed_dir
+                / f".{resource.path.name}.{uuid4().hex}.deleted"
+            )
+            try:
+                os.replace(resource.path, tombstone)
+            except OSError as exc:
+                raise ResourceError(f"unable to stage resource deletion: {exc}") from exc
+        try:
+            self._write_registry(updated)
+        except ResourceError:
+            if tombstone is not None:
+                try:
+                    os.replace(tombstone, resource.path)
+                except OSError as rollback_exc:
+                    raise ResourceError(
+                        "unable to save resource registry and deletion rollback failed: "
+                        f"{rollback_exc}"
+                    ) from rollback_exc
+            raise
+
+        self._resources = updated
+        if tombstone is not None:
+            try:
+                tombstone.unlink()
+            except OSError as exc:
+                LOGGER.warning("Unable to remove resource tombstone %s: %s", tombstone, exc)
+        LOGGER.info(
+            "Deleted resource %s (%s file)",
+            resource_id,
+            "managed" if managed_path else "external",
+        )
+        return resource
+
     def _bootstrap(
         self,
         default_tm_path: Path | None,

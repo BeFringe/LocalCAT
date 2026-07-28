@@ -1,7 +1,7 @@
 # Steering 同步机制
 
 > 确保 Steering 文档（product.md / structure.md / tech.md）与项目实际架构保持一致。
-> 解决治理基线 R2（Steering 文档静止）和 R3（border.md 归属模糊）。
+> 解决治理基线中识别的 Steering 文档静止和 border.md 归属模糊问题。详见 `evolution-risk-analysis.md`。
 
 ---
 
@@ -51,9 +51,9 @@
 ### ADR 修改时
 ADR 理论上不可修改。若发生：视为新增 ADR，旧 ADR 标记"已取代"，Steering 同步按新增流程执行。
 
-## 4. border.md 生命周期与归档（R3 决策）
+## 4. border.md 生命周期与归档
 
-**正式决策：方案 B + ADR 提升通道。** border.md 归入 Steering 扩展层，设有 ADR 提升通道处理全局性约束。
+**正式决策：border.md 归入 Steering 扩展层，设置 ADR 提升通道处理全局性约束。**
 
 **生命周期：创建 → 执行 → 归档 → (可选) 提升**
 
@@ -100,4 +100,4 @@ ADR 理论上不可修改。若发生：视为新增 ADR，旧 ADR 标记"已取
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| v1 | 2026-05-16 | 初始版本。解决 R2 + R3。定义 border.md 生命周期和 ADR 提升通道。 |
+| v1 | 2026-05-16 | 初始版本。解决 Steering 文档静止和 border.md 归属问题。定义 border.md 生命周期和 ADR 提升通道。 |

@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QMessageBox, QToolButton
 
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
 from editor_controller import EditorController
@@ -131,6 +132,55 @@ class QtSettingsDialogTest(unittest.TestCase):
 
             self.assertGreater(table.columnWidth(3), small_name_width)
             self.assertGreater(table.columnWidth(5), small_path_width)
+            dialog.close()
+
+    def test_more_menu_confirms_and_deletes_managed_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            resource = controller.create_resource("Delete me", ResourceKind.TERMBASE)
+            dialog = QtSettingsDialog(controller)
+            more_button = dialog.findChild(QToolButton, f"more_{resource.id}")
+
+            self.assertIsNotNone(more_button)
+            delete_action = next(
+                action for action in more_button.menu().actions() if action.text() == "删除资源"
+            )
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                delete_action.trigger()
+
+            self.assertNotIn(
+                resource.id,
+                {configured.id for configured in controller.list_resources()},
+            )
+            self.assertFalse(resource.path.exists())
+            dialog.close()
+
+    def test_cancelled_delete_keeps_resource_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            resource = controller.create_resource("Keep me", ResourceKind.TERMBASE)
+            dialog = QtSettingsDialog(controller)
+            more_button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            delete_action = next(
+                action for action in more_button.menu().actions() if action.text() == "删除资源"
+            )
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Cancel,
+            ):
+                delete_action.trigger()
+
+            self.assertIn(
+                resource.id,
+                {configured.id for configured in controller.list_resources()},
+            )
+            self.assertTrue(resource.path.exists())
             dialog.close()
 
 

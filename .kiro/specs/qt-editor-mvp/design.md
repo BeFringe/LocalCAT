@@ -27,6 +27,7 @@ Qt 专业编辑器 MVP 为 LocalCAT 增加 Layer 4 桌面前端，并新增一�
 
 - 编辑器项目与段落的会话契约和 JSON/TXT 编解码。
 - 本地资源清单、活动/Lookup/Update 状态和默认资源引导。
+- 本地资源的确认删除、托管文件回收和外部文件保护。
 - 本地最近项目、段落断点和工作区显示偏好。
 - TMX Level 1、两列 CSV/XLSX 的安全原子导入。
 - EditorController 的项目、建议、确认、术语添加和资源热重载接口。
@@ -37,6 +38,7 @@ Qt 专业编辑器 MVP 为 LocalCAT 增加 Layer 4 桌面前端，并新增一�
 - 不改变 TMEngine/GlossaryEngine 的既有数据格式和匹配算法。
 - 不改变 `LogicController.get_suggestions()` 三态契约。
 - 不实现通用 ParserRegistry；仅提供编辑器 MVP 所需的明确格式适配。
+- Ren'Py TM 封装兼容只负责确定性建议归一化，不解析或回写 `.rpy` 文档。
 - 不承担模糊匹配、多人协作、网络资源和复杂格式标签保真。
 - 浏览校对模式不直接编辑表格单元格；双击进入同段编辑模式完成修改。
 
@@ -74,6 +76,7 @@ graph LR
     ResourceRepo --> EditorController
     WorkspaceState --> EditorController
     ResourceImporter --> EditorController
+    RenPyTMCompat[RenPy TM compatibility] --> EditorController
     TMEngine[TM engine] --> EditorController
     GlossaryEngine[Glossary engine] --> EditorController
     EditorController --> MainWindow[Qt editor]
@@ -107,6 +110,7 @@ graph LR
 ├── editor_project.py            # JSON/TXT 项目读取、示例项目与原子 JSON 保存
 ├── resource_repository.py       # 本地资源清单、默认资源与状态持久化
 ├── resource_importer.py         # 安全 TMX 与 CSV/XLSX 解析、合并和原子写入
+├── renpy_tm_compat.py           # 说话人封装 TM 的严格查询别名与目标解包
 ├── workspace_state.py           # 最近项目、段落断点和显示偏好原子持久化
 ├── editor_controller.py         # Layer 3 编辑会话、查询、确认、热重载与资源操作
 ├── qt_settings_dialog.py        # Layer 4 资源设置、导入 worker 和状态反馈
@@ -207,6 +211,9 @@ sequenceDiagram
 | 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7 | 本地性、依赖、回归、快捷键和 README | 全部组件、README | bootstrap/full suite/offscreen/docs |
 | 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7 | 桌面启动、最近项目与段落恢复 | QtBootstrap, WorkspaceStateRepository, EditorController, QtEditorWindow | install/remember/open/close/quit |
 | 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7 | 紧凑/换行段落与浏览校对 | QtEditorWindow, WorkspaceStateRepository | density/workspace mode/browse activation |
+| 11.1–11.6 | 资源删除与内部存储解释 | ResourceRepository, EditorController, QtSettingsDialog | delete/confirm/import feedback |
+| 11.7, 11.8 | Ren'Py/MateCat 封装精确兼容 | RenPyTMCompat, EditorController | alias query/safe unwrap |
+| 11.9 | 自定义图标桌面入口 | QtBootstrap | install/cache/window icon |
 
 ## 组件与接口
 
@@ -217,6 +224,7 @@ sequenceDiagram
 | ResourceRepository | Layer 1 | 资源清单与状态 | 6 | Contracts | State |
 | WorkspaceStateRepository | Layer 1 | 最近项目、段落断点与显示偏好 | 9, 10 | stdlib | State |
 | ResourceImporter | Layer 2B | 安全原子语言资产导入 | 7, 8 | Contracts, openpyxl | Batch |
+| RenPyTMCompat | Layer 2B | 确定性 Ren'Py 对话封装兼容 | 11 | stdlib | Pure |
 | EditorController | Layer 3 | 会话、查询、写回和工作区恢复协调 | 2–7, 9 | Project, Repositories, Importer, Engines | Service, State |
 | QtSettingsDialog | Layer 4 | 资源管理与导入交互 | 6, 7 | EditorController | UI |
 | QtEditorWindow | Layer 4 | 编辑、项目菜单与浏览校对工作区 | 1–5, 8–10 | EditorController, SettingsDialog | UI |
@@ -276,12 +284,15 @@ def sample_project() -> EditorProject: ...
 - 首次运行注册现有 `tm.jsonl` 与 `terms.csv` 为活动 Lookup/Update 默认资源。
 - 新资源只创建在应用数据目录 `resources/` 下，名称经安全化但显示名保留。
 - 配置更新原子写入，不删除非活动资源文件。
+- 删除托管资源时先在同目录改名为 tombstone，再原子提交清单；提交失败必须恢复原文件。
+- 删除外部路径资源只取消登记，不删除其文件。
 
 ```python
 class ResourceRepository:
     def list_resources(self) -> tuple[ResourceConfig, ...]: ...
     def create_resource(self, name: str, kind: ResourceKind) -> ResourceConfig: ...
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig: ...
+    def delete_resource(self, resource_id: str) -> ResourceConfig: ...
     def get(self, resource_id: str) -> ResourceConfig: ...
 ```
 
@@ -334,6 +345,8 @@ def import_termbase(input_path: Path, target_path: Path) -> ImportReport: ...
 - 打开真实路径项目时恢复有效段落；导航、确认、保存和退出项目时更新本地断点。
 - 提供最近项目、退出当前项目和显示偏好的控制器入口，Qt 不直接访问 WorkspaceStateRepository。
 - 活动 Lookup 资源决定查询集合，活动 Update 资源决定写回集合。
+- 普通 source 精确查询优先；只有当前段 speaker 可安全封装时才追加严格 Ren'Py 别名查询。
+- 兼容命中的目标必须使用同一 speaker 封装才可解包；返回给 UI 的 suggestion.source 始终等于当前段正文。
 - 资源变动和成功导入后重建内存引擎；重建失败时保留上一组可用引擎。
 - 任何公开方法返回 frozen contract 或显式异常，不返回展示字符串。
 
@@ -349,6 +362,7 @@ class EditorController:
     def suggestions(self) -> SuggestionBundle: ...
     def add_term(self, source: str, target: str) -> ResourceConfig: ...
     def import_resource(self, request: ImportRequest) -> ImportReport: ...
+    def delete_resource(self, resource_id: str) -> ResourceConfig: ...
     def reload_resources(self) -> None: ...
 ```
 
@@ -361,6 +375,8 @@ class EditorController:
 - QVariant 返回的资源类型字符串在受控边界归一化；TM 与术语表真实创建路径均有回归。
 - 名称和路径列随窗口伸缩，类型与导入操作保持完整可见。
 - TM 资源提供“导入 TMX”，术语资源提供“导入术语表”。
+- 每行更多菜单提供删除；确认框明确托管文件会删除、外部文件只取消登记。
+- 设置页说明 TMX/术语表会转换并合并到列表所示 JSONL/CSV 内部路径。
 - 导入 worker 在后台调用控制器；对话框禁用冲突操作并显示忙碌状态。
 - 完成时显示 ImportReport，发出 `resources_changed` 信号。
 - 对话框只收集输入、调用 EditorController 并渲染结果；配置持久化、热重载和资源写入仍完全属于 EditorController/ResourceRepository。
@@ -380,6 +396,9 @@ class EditorController:
 
 - `qt_editor.py` 只使用 stdlib 解析参数并延迟导入 `qt_editor_window`。
 - `--install-desktop-launcher` 在 Linux 用户应用目录生成指向当前解释器与脚本绝对路径的 `.desktop` 文件，安装过程不导入 Qt。
+- 桌面入口包含绝对工作目录、`TryExec`、`StartupWMClass=LocalCAT` 和标准分类。
+- 仓库存在 `LocalCAT-logo-silver.png` 时，安装器把它注册为 freedesktop 用户主题图标，桌面入口使用稳定主题名，QApplication 使用同一资源；缺失时回退系统文本编辑器图标。
+- 成功写入 `.desktop` 后在命令可用时刷新 applications 目录的桌面数据库；刷新失败作为安装失败报告。
 - 缺少 PySide6 时向 stderr 输出 `python -m pip install -r requirements-ui.txt` 并返回非零退出码。
 - XLSX 导入缺少 openpyxl 时由 ResourceImporter 返回同样可操作的依赖错误；CSV/TMX 和核心功能仍可运行。
 - `--smoke-test` 在依赖可用时委派给窗口模块，缺依赖时走与普通启动相同的诊断路径。
@@ -418,6 +437,20 @@ erDiagram
 - Termbase：沿用 UTF-8-SIG 两列 CSV。
 - Project save：`{"schema_version": 1, "name": "...", "segments": [...]}`。
 
+## 增量架构决策
+
+### 严格兼容别名恢复现有 Ren'Py TM
+
+- **背景**：导入成功的 MateCat/Ren'Py 记忆单元包含 `speaker "text"`，当前项目却把 speaker 与正文拆开，导致 exact key 不同。
+- **决定**：普通精确查询未命中时，由纯函数基于当前段 speaker 生成无歧义别名；命中后仅解包具有相同 speaker 的目标，并将 suggestion.source 归一为当前正文。
+- **边界**：不修改 TMEngine、不迁移资源，不将该兼容桥扩展成 RPY parser 或 MyMemory context matcher。Parser/TM storage 建立 canonical TMRecord 后替换此桥。
+
+### SQLite 不属于 Qt MVP 的事后追加项
+
+- **背景**：当前 JSONL 精确索引可闭合 MVP，但多上下文、模糊检索与大型 TM 需要稳定的存储/查询契约。
+- **决定**：本规格不立即引入 SQLite，也不规定它必须在 Feature 5 之后完成。先由 Parser/Shared Contracts 稳定 `TMRecord` 和用途边界，再由 Feature 5 的 storage/index ADR 在 context/fuzzy 实施前或实施内，根据真实基准决定 SQLite schema 与迁移。
+- **理由**：Parser 必须保持存储无关；若 Feature 5 承诺多上下文或大库 fuzzy，SQLite/索引就是其前置门，而不是完成后的优化补丁。
+
 ## 错误处理
 
 | 类别 | 示例 | 响应 |
@@ -436,10 +469,10 @@ erDiagram
 ### 单元测试
 
 - ProjectCodec：JSON/TXT、已有 target/speaker/confirmed、无效输入、原子保存。
-- ResourceRepository：默认资源、创建、状态持久化、非活动保留。
+- ResourceRepository：默认资源、创建、状态持久化、托管/外部资源删除与失败回滚。
 - WorkspaceStateRepository：最近顺序、十项上限、段落恢复、显示偏好、无效文件降级。
 - ResourceImporter：多语言 TMX、缺语言对、DTD、带标签、重复覆盖、CSV/XLSX、失败不损坏。
-- EditorController：查询集合、确认回写、修改已确认段、导航、添加术语、导入热重载。
+- EditorController：查询集合、Ren'Py 封装兼容、确认回写、修改已确认段、导航、添加术语、删除与导入热重载。
 - Bootstrap：模拟缺少 PySide6 与缺少 openpyxl，验证错误信息包含精确安装命令且不出现 traceback。
 
 ### 集成测试
@@ -447,6 +480,7 @@ erDiagram
 - 临时 JSON 项目 + 临时 TM/术语资源完成打开、建议、应用、确认和保存。
 - 设置状态从 Lookup 开关传递到建议结果。
 - 导入 TMX/CSV 后无需重启即可查询到新内容。
+- 删除托管资源后清单、文件和建议同时消失；删除外部资源时文件仍存在。
 - 运行既有五个核心/集成脚本，验证旧三态与 Excel 接缝。
 - 用临时输入工作簿运行 headless openpyxl adapter，并对交互式 xlwings adapter 做编译/import 边界检查。
 

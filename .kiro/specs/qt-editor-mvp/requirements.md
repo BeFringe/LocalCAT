@@ -146,3 +146,19 @@ LocalCAT Qt 专业编辑器 MVP 为个人译者提供一个完全本地的桌面
 5. When 用户在浏览校对模式双击一个段落, the LocalCAT Qt 编辑器 shall 回到编辑模式并把该段设为当前段
 6. When 用户在编辑模式修改或确认译文后切换到浏览校对模式, the LocalCAT Qt 编辑器 shall 显示当前会话中的最新译文与确认状态
 7. When 用户重启编辑器, the LocalCAT Qt 编辑器 shall 恢复上次选择的段落密度和编辑或浏览校对模式
+
+### Requirement 11：资源治理、导入可解释性与 Ren'Py TM 兼容
+
+**目标：** 作为使用本地语言资产的个人译者，我希望能安全删除不再需要的资源，并确认已导入的 MateCat/Ren'Py 记忆库确实参与当前项目匹配。
+
+#### 验收标准
+
+1. When 用户打开任一资源的更多操作, the 语言资源设置 shall 提供“删除资源”操作
+2. When 用户取消删除确认, the 语言资源设置 shall 保留资源登记、资源文件和当前查询状态不变
+3. When 用户确认删除应用托管资源, the 语言资源设置 shall 从资源清单移除该资源并删除其位于 LocalCAT 托管目录内的数据文件
+4. When 用户确认删除仓库默认资源或其他外部路径资源, the 语言资源设置 shall 只取消登记而不删除外部文件
+5. While 资源导入正在运行, the 语言资源设置 shall 禁用删除和其他冲突资源操作
+6. When TMX 或术语表导入成功, the 语言资源设置 shall 显示已导入、已跳过、已覆盖和错误统计，并说明列表中的 JSONL/CSV 路径是 LocalCAT 转换合并后的内部存储路径
+7. When 当前项目段落把说话人和正文分开保存且翻译记忆包含等价的 `speaker "text"` Ren'Py/MateCat 单元, the EditorController shall 将其作为 100% 精确兼容匹配显示，并在应用时只写入解包后的目标正文
+8. If 翻译记忆单元无法按当前段说话人建立无歧义的封装关系, the EditorController shall 保持普通精确匹配行为且不得猜测性移除文本
+9. When 用户安装 Linux 桌面入口且仓库提供 `LocalCAT-logo-silver.png`, the LocalCAT Qt 编辑器 shall 将该图标用于应用菜单和运行窗口，并刷新桌面入口缓存

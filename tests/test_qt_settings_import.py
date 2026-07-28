@@ -95,6 +95,7 @@ class QtSettingsImportTest(unittest.TestCase):
             self.assertIsNot(controller.import_thread, self.app.thread())
             self.assertEqual(dialog.last_import_report.imported, 1)
             self.assertIn("已导入 1", dialog.import_feedback.text())
+            self.assertIn("内部 JSONL", dialog.import_feedback.text())
             self.assertTrue(dialog.active_table.isEnabled())
             self.assertEqual(controller.suggestions().tm_matches[0].target, "办公室准备好了。")
             dialog.close()

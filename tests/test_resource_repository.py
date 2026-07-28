@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from editor_contracts import ResourceKind
 from resource_repository import ResourceError, ResourceRepository
@@ -103,6 +104,81 @@ class ResourceRepositoryTest(unittest.TestCase):
                 repository.update_resource(replace(resource, path=(root / "elsewhere.jsonl").resolve()))
             with self.assertRaises(ResourceError):
                 repository.create_resource("  ", ResourceKind.TERMBASE)
+
+    def test_deletes_managed_resource_and_persists_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            repository = ResourceRepository(config_dir)
+            resource = repository.create_resource("Disposable", ResourceKind.TRANSLATION_MEMORY)
+            resource.path.write_text('{"source":"A","target":"甲"}\n', encoding="utf-8")
+
+            deleted = repository.delete_resource(resource.id)
+            restored = ResourceRepository(config_dir)
+
+            self.assertEqual(deleted, resource)
+            self.assertFalse(resource.path.exists())
+            self.assertEqual(restored.list_resources(), ())
+
+    def test_deleting_external_resource_only_unregisters_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tm_path, _ = self._make_defaults(root)
+            repository = ResourceRepository(root / "app-data", default_tm_path=tm_path)
+
+            repository.delete_resource("local-tm")
+
+            self.assertTrue(tm_path.exists())
+            self.assertEqual(repository.list_resources(), ())
+
+    def test_tampered_dotdot_path_is_never_treated_as_managed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "app-data"
+            external = config_dir / "outside.jsonl"
+            external.parent.mkdir(parents=True)
+            external.write_text("keep\n", encoding="utf-8")
+            registry = config_dir / "resources.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "resources": [
+                            {
+                                "id": "tampered",
+                                "name": "Tampered",
+                                "kind": "translation_memory",
+                                "path": str(config_dir / "resources" / ".." / "outside.jsonl"),
+                                "active": True,
+                                "lookup": True,
+                                "update": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repository = ResourceRepository(config_dir)
+
+            repository.delete_resource("tampered")
+
+            self.assertTrue(external.exists())
+
+    def test_delete_rolls_back_managed_file_if_registry_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = ResourceRepository(Path(temp_dir) / "app-data")
+            resource = repository.create_resource("Keep", ResourceKind.TRANSLATION_MEMORY)
+            original = resource.path.read_bytes()
+
+            with patch.object(
+                repository,
+                "_write_registry",
+                side_effect=ResourceError("registry unavailable"),
+            ):
+                with self.assertRaisesRegex(ResourceError, "registry unavailable"):
+                    repository.delete_resource(resource.id)
+
+            self.assertEqual(resource.path.read_bytes(), original)
+            self.assertEqual(repository.get(resource.id), resource)
 
     def test_corrupt_registry_is_reported_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

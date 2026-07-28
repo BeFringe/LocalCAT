@@ -244,3 +244,34 @@
 - 基线记录：实施前 `logic_controller.py` 自检因夹具句子不在当前 `tm.jsonl` 中失败；其他核心脚本通过。
 - 权威顺序：当前用户要求 → 最新 steering → 当前分支可运行契约 → 本规格；遗留 MCA playbook 仅作历史参考。
 - 真实 UI 根因：PySide6 QComboBox 把 str Enum 的 itemData 还原为普通 str，资源创建边界必须显式归一化。
+
+- [x] 10. 修复资源治理、真实 TMX 可用性和桌面入口
+
+- [x] 10.1 实现安全资源删除与设置更多菜单
+  - ResourceRepository 对托管文件采用 tombstone + 清单原子提交 + 失败回滚，外部资源只取消登记
+  - EditorController 删除后热重载资源集合；设置行更多菜单显示删除并在确认后刷新
+  - 导入期间禁用删除；取消确认不修改清单或文件
+  - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5_
+  - _Boundary: ResourceRepository, EditorController, QtSettingsDialog_
+
+- [x] 10.2 恢复 MateCat/Ren'Py TM 的严格精确兼容
+  - 新增 Qt 无关纯函数，仅对安全 speaker token 生成 `speaker "text"` 查询别名
+  - 普通 exact 优先；兼容命中只解包同 speaker 的目标并保持 suggestion.source 为当前正文
+  - 使用真实 `po/卷一_引.json` 和现有 LocalCAT 已导入资源证明命中显著恢复，无法无歧义解包时保持原文
+  - _Requirements: 4.1, 4.2, 4.3, 11.7, 11.8_
+  - _Boundary: RenPyTMCompat, EditorController_
+
+- [x] 10.3 解释内部资源路径并修复桌面图标安装
+  - 设置页明确显示 TMX/术语表导入后合并到 JSONL/CSV 内部存储，保留完整统计反馈
+  - `.desktop` 通过 freedesktop 主题名引用 `LocalCAT-logo-silver.png`，包含工作目录/启动类并刷新桌面数据库
+  - QApplication 使用同一窗口图标；安装后的真实桌面入口通过 validate、缓存刷新和 GUI 启动检查
+  - _Requirements: 7.2, 7.6, 9.1, 11.6, 11.9_
+  - _Boundary: QtSettingsDialog, QtBootstrap_
+
+- [x] 10.4 完成规格对照、真实数据和全量回归
+  - 运行新增 repository/controller/Qt/bootstrap 测试、完整 unittest、offscreen smoke 和既有核心入口
+  - 更新 validation、README/steering（如事实变化）以及 Parser/Feature 5 的权威关系说明
+  - 对照 Requirement 11 逐项验收，不把 MyMemory context、SQLite 或通用 RPY Parser 宣称为已完成
+  - _Requirements: 8.4, 8.5, 8.7, 11.1–11.9_
+  - _Boundary: Verification, Documentation_
+  - _Depends: 10.1, 10.2, 10.3_
