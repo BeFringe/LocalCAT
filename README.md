@@ -100,9 +100,10 @@ Qt 前端只能调用 `EditorController`，不得直接调用资源仓储、TM �
 ## 🚧 当前状态
 - **最新标签**: Feature 3 (`v0.3.0-feature3`) - 无状态 Logic + Excel 适配器与性能基准
 - **Qt 工作区**: `/home/neotag/文档/CAT/CAT` / `ui-mvp`
-- **Feature 5 工作区**: `/home/neotag/文档/CAT/feature5-worktree` / `feature5`
-- **共同基线**: `87b09ca`; 两条垂直线分别验收后由 `feature5 → ui-mvp` 合并
-- **下一审批点**: 分别批准 Qt JSON increment 与 Feature 5 Requirements；Parser/multi-document 后置
+- **Feature 5 工作区**: `/home/neotag/文档/CAT/localcat-feature5` / `feature5`
+- **规格状态**: Feature 5 已从原成功补丁链恢复；matcher capability 抢救性 Requirements 待重新批准，Design / Tasks / 实施门保持关闭
+- **下一审批点**: Feature 5 Requirements 与 `qt-editor-font-zoom` Tasks；Qt JSON increment 等待 Feature 5 capability 契约闭合
+- **合并方向**: Feature 5 通过自身 gate 后合入 `ui-mvp`，再由 Qt 线接入 Controller adapter；不把未验收 UI 反向带入 Feature 5
 - **明确后置**: 多文件/多 Sheet 项目、RPY/XLIFF codec、MyMemory context、MT、QA 与协作不伪装成当前已完成能力
 - **连续性约束**: `.kiro/` 由 Git 跟踪；活动 worktree 不得放在 `/tmp` 或 tmpfs，阶段产物与已验证任务要及时形成可恢复提交
 
