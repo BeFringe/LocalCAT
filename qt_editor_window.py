@@ -6,7 +6,7 @@ import html
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QRect, QSignalBlocker, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QResizeEvent,
     QShortcut,
+    QTextCursor,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -577,6 +578,37 @@ class QtEditorWindow(QMainWindow):
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
             self.shortcuts[name] = shortcut
+        self._install_target_editor_shortcuts()
+
+    def _install_target_editor_shortcuts(self) -> None:
+        bindings = (
+            (
+                "targetUndoShortcut",
+                "Ctrl+Z",
+                "撤销译文框最近一次文本编辑",
+                self.target_editor.undo,
+            ),
+            (
+                "targetRedoShortcut",
+                "Ctrl+Y",
+                "重做译文框最近一次文本编辑",
+                self.target_editor.redo,
+            ),
+            (
+                "targetAlternateRedoShortcut",
+                "Ctrl+Shift+Z",
+                "重做译文框最近一次文本编辑",
+                self.target_editor.redo,
+            ),
+        )
+        self.target_editor_shortcuts: dict[str, QShortcut] = {}
+        for object_name, sequence, description, callback in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self.target_editor)
+            shortcut.setObjectName(object_name)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.setWhatsThis(description)
+            shortcut.activated.connect(callback)
+            self.target_editor_shortcuts[object_name] = shortcut
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         """Handle Ctrl+wheel only for the two editor viewports."""
@@ -741,7 +773,7 @@ class QtEditorWindow(QMainWindow):
         try:
             self.segment_list.clear()
             self.source_display.clear()
-            self.target_editor.clear()
+            self._replace_target_text("")
             self.browse_table.clearContents()
             self.browse_table.setRowCount(0)
         finally:
@@ -801,7 +833,7 @@ class QtEditorWindow(QMainWindow):
         self.set_workspace_mode(self.workspace_mode, persist=False)
         self._update_title()
 
-    def _render_current_segment(self) -> None:
+    def _render_current_segment(self, *, reset_target_history: bool = True) -> None:
         segment = self.controller.current_segment
         project = self.controller.project
         speaker_text = segment.speaker or "无 speaker"
@@ -811,7 +843,8 @@ class QtEditorWindow(QMainWindow):
         self.speaker_display.style().unpolish(self.speaker_display)
         self.speaker_display.style().polish(self.speaker_display)
         self.source_display.setPlainText(segment.source)
-        self.target_editor.setPlainText(segment.target)
+        if reset_target_history:
+            self._replace_target_text(segment.target)
         self.segment_position_label.setText(
             f"{self.controller.current_index + 1} / {len(project.segments)}"
         )
@@ -1047,6 +1080,7 @@ class QtEditorWindow(QMainWindow):
         item = self.browse_table.item(row, 0)
         if item is None:
             return
+        previous_index = self.controller.current_index
         try:
             self.controller.go_to(int(item.data(Qt.ItemDataRole.UserRole)))
         except (TypeError, ValueError, EditorControllerError) as exc:
@@ -1057,7 +1091,11 @@ class QtEditorWindow(QMainWindow):
         self._refreshing = True
         try:
             self._select_project_index(self.controller.current_index)
-            self._render_current_segment()
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
         finally:
             self._refreshing = False
 
@@ -1077,6 +1115,7 @@ class QtEditorWindow(QMainWindow):
         if item is None:
             return
         index = int(item.data(Qt.ItemDataRole.UserRole))
+        previous_index = self.controller.current_index
         try:
             self.controller.go_to(index)
         except EditorControllerError as exc:
@@ -1084,18 +1123,27 @@ class QtEditorWindow(QMainWindow):
             return
         self._refreshing = True
         try:
-            self._render_current_segment()
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
         finally:
             self._refreshing = False
 
     def _navigate(self, direction: int) -> None:
         if not self.controller.has_project:
             return
+        previous_index = self.controller.current_index
         self.controller.move(direction, unconfirmed_only=self.unconfirmed_filter.isChecked())
         self._refreshing = True
         try:
             self._select_project_index(self.controller.current_index)
-            self._render_current_segment()
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
         finally:
             self._refreshing = False
 
@@ -1110,6 +1158,7 @@ class QtEditorWindow(QMainWindow):
     def _filter_changed(self, enabled: bool) -> None:
         if self._refreshing or not self.controller.has_project:
             return
+        previous_index = self.controller.current_index
         if enabled and self.controller.current_segment.confirmed:
             next_unconfirmed = next(
                 (
@@ -1124,13 +1173,18 @@ class QtEditorWindow(QMainWindow):
         self._refreshing = True
         try:
             self._populate_segment_list()
-            self._render_current_segment()
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
         finally:
             self._refreshing = False
 
     def confirm_current(self) -> bool:
         if not self.controller.has_project:
             return False
+        previous_index = self.controller.current_index
         try:
             result = self.controller.confirm_current()
         except EditorControllerError as exc:
@@ -1144,7 +1198,11 @@ class QtEditorWindow(QMainWindow):
         self._refreshing = True
         try:
             self._populate_segment_list()
-            self._render_current_segment()
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
         finally:
             self._refreshing = False
         self._update_title()
@@ -1283,7 +1341,14 @@ class QtEditorWindow(QMainWindow):
         except EditorControllerError as exc:
             self._show_error("无法应用翻译记忆", str(exc))
             return False
-        self._refresh_target_from_controller()
+        cursor = self.target_editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.select(QTextCursor.SelectionType.Document)
+            cursor.insertText(self.controller.current_segment.target)
+        finally:
+            cursor.endEditBlock()
+        self.target_editor.setTextCursor(cursor)
         self.statusBar().showMessage(f"已应用来自 {suggestion.resource_name} 的译文。", 5000)
         return True
 
@@ -1295,9 +1360,12 @@ class QtEditorWindow(QMainWindow):
         except EditorControllerError as exc:
             self._show_error("无法插入术语", str(exc))
             return False
-        self._refresh_target_from_controller()
-        cursor = self.target_editor.textCursor()
-        cursor.setPosition(position + len(suggestion.target_term))
+        cursor.clearSelection()
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(suggestion.target_term)
+        finally:
+            cursor.endEditBlock()
         self.target_editor.setTextCursor(cursor)
         self.statusBar().showMessage(f"已插入术语：{suggestion.target_term}", 5000)
         return True
@@ -1305,12 +1373,20 @@ class QtEditorWindow(QMainWindow):
     def _refresh_target_from_controller(self) -> None:
         self._refreshing = True
         try:
-            self.target_editor.setPlainText(self.controller.current_segment.target)
+            self._replace_target_text(self.controller.current_segment.target)
         finally:
             self._refreshing = False
         self._update_segment_item(self.controller.current_index)
         self._render_progress_state()
         self._update_title()
+
+    def _replace_target_text(self, text: str) -> None:
+        blocker = QSignalBlocker(self.target_editor)
+        try:
+            self.target_editor.setPlainText(text)
+            self.target_editor.document().clearUndoRedoStacks()
+        finally:
+            del blocker
 
     def add_term(self, source: str, target: str) -> bool:
         try:

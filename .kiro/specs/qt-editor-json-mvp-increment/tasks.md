@@ -167,7 +167,7 @@
   - _Boundary: QtTermbaseDialog, QtSettingsDialog Integration_
   - _Depends: 3.4, 3.5_
 
-- [ ] 4.6 实现译文框原生 undo/redo 与 edit blocks
+- [x] 4.6 实现译文框原生 undo/redo 与 edit blocks
   - 在 target editor 聚焦时绑定 `Ctrl+Z`、`Ctrl+Y` 和 `Ctrl+Shift+Z`
   - 继续通过文本变化同步 Controller；首次改变已确认 target 时恢复待确认
   - suggestion 插入使用单个 cursor edit block；切段、换项目或批量刷新时清空 per-segment document history
