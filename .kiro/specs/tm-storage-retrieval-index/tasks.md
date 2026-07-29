@@ -50,7 +50,7 @@
   - _Boundary: TextMatcherV1 Unicode Data_
   - _Depends: 1.4_
 
-- [ ] 2.3 实现 legacy、基础连续搜索与 text-v1 行为
+- [x] 2.3 实现 legacy、基础连续搜索与 text-v1 行为
   - legacy 保持区分大小写连续子串，基础搜索提供 Unicode case-fold 连续命中，text-v1 支持四种选项组合
   - Whole Word 对非纯 CJK 使用原文词界，对纯 CJK 明示退化为连续子串；空查询和零长命中返回空集
   - 合并折叠扩展造成的重复命中，并按原始文本起止位置稳定返回
@@ -358,3 +358,4 @@
 - 2026-07-29 / Task 1.5：冻结 candidate-budget-v1、召回/去重/截断/资源结果守恒与 benchmark-v1 双路径 suite；minimum 与实际 cohort count 分离，composition/digest/path/硬门均由 strict codec 闭合，真实 benchmark artifact 留给 Task 8.1 生成。独立复审第二轮通过；focused 32/32、全量 182/182、basedpyright 0 errors。
 - 2026-07-29 / Task 2.1：实现纯 `SimilarityScorerV1`，固定 NFC→casefold、Unicode code-point Levenshtein、多重集字符 bigram Dice 与未舍入算术平均；版本化黄金向量逐项绑定 folded 文本、距离、gram 计数、分项和最终分数，不夹带召回、阈值、排序或存储行为。独立复审通过；focused 6/6（22 subtests）、全量 188/188（161 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.2：固定 Unicode 16.0.0/UAX #29 rev.45 属性表、来源摘要与运行时 fail-closed 闸门，实现带原文 provenance 的 whole-string NFC/casefold 投影、默认词界和严格 pure-CJK 分类；第一轮 canonical blocking 缺陷经独立复审拦截后改为标准 composition 状态机，并以完整 NormalizationTest 99,825 输入、WordBreakTest 1,826 向量和 scorer 回归闭合。独立复审第二轮通过；focused 15/15（1,890 subtests）、全量 197/197（2,029 subtests）、basedpyright 0 errors。
+- 2026-07-29 / Task 2.3：实现 Core 内部纯 `TextMatcherV1`，固定 legacy、basic 与 configurable 四组合行为；overlap、NFC/casefold expansion、原文 span 投影去重、稳定排序、原文 UAX #29 Whole Word 过滤及 pure-CJK 连续匹配 tailoring 均由版本化 golden 闭合，且不携带 capability/readiness 权威。独立复审通过；focused 29/29（1,938 subtests）、全量 203/203（2,056 subtests）、basedpyright 0 errors。

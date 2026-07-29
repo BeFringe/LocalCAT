@@ -1,8 +1,8 @@
-"""Pinned Unicode primitives used by LocalCAT's internal text-v1 matcher.
+"""Pinned pure algorithms used by LocalCAT's internal text-v1 matcher.
 
-This module deliberately stops below substring search and capability gating.
-It owns fold-v1 projection, Unicode 16.0.0 default word boundaries, and the
-strict pure-CJK classifier consumed by later Feature 5 tasks.
+This module owns fold-v1 projection, Unicode 16.0.0 default word boundaries,
+the strict pure-CJK classifier, and deterministic substring hit production.
+Capability evaluation and the public gated execution port remain separate.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from unicode_word_break_data import (
     is_variation_selector,
     word_break_property,
 )
+from tm_contracts import SearchHit, SearchOptions, TextMatchProfile
 
 
 UNICODE_VERSION = "16.0.0"
@@ -439,10 +440,126 @@ def is_pure_cjk_v1(query: str) -> bool:
     return saw_base
 
 
+def _overlapping_starts(text: str, query: str) -> tuple[int, ...]:
+    """Return every overlapping occurrence start for a non-empty query."""
+
+    if not query:
+        return ()
+    starts: list[int] = []
+    search_from = 0
+    while True:
+        start = text.find(query, search_from)
+        if start < 0:
+            return tuple(starts)
+        starts.append(start)
+        search_from = start + 1
+
+
+def _validate_match_arguments(
+    *,
+    text: object,
+    query: object,
+    profile: object,
+    options: object,
+) -> tuple[str, str, TextMatchProfile, SearchOptions]:
+    raw_text = _require_text(text, "text")
+    raw_query = _require_text(query, "query")
+    if not isinstance(profile, TextMatchProfile):
+        raise TypeError("profile must be a TextMatchProfile")
+    if not isinstance(options, SearchOptions):
+        raise TypeError("options must be SearchOptions")
+
+    expected_options: SearchOptions | None
+    if profile is TextMatchProfile.LEGACY_COMPAT:
+        expected_options = SearchOptions(
+            match_case=True,
+            whole_word=False,
+        )
+    elif profile is TextMatchProfile.BASIC_CONTIGUOUS:
+        expected_options = SearchOptions(
+            match_case=False,
+            whole_word=False,
+        )
+    else:
+        expected_options = None
+    if expected_options is not None and options != expected_options:
+        raise ValueError("options are not allowed for text match profile")
+    return raw_text, raw_query, profile, options
+
+
+class TextMatcherV1:
+    """Core-internal deterministic matcher for the pinned text-v1 semantics."""
+
+    __slots__ = ()
+
+    semantics_version = TEXT_MATCHER_SEMANTICS_VERSION
+
+    def match(
+        self,
+        *,
+        text: str,
+        query: str,
+        profile: TextMatchProfile,
+        options: SearchOptions,
+    ) -> tuple[SearchHit, ...]:
+        """Return unique overlapping hits into the original input text."""
+
+        raw_text, raw_query, _, validated_options = (
+            _validate_match_arguments(
+                text=text,
+                query=query,
+                profile=profile,
+                options=options,
+            )
+        )
+        if not raw_text or not raw_query:
+            return ()
+
+        raw_spans: list[tuple[int, int]] = []
+        if validated_options.match_case:
+            for start in _overlapping_starts(raw_text, raw_query):
+                raw_spans.append((start, start + len(raw_query)))
+        else:
+            text_projection = fold_text_v1(raw_text)
+            query_projection = fold_text_v1(raw_query)
+            folded_query = query_projection.folded_text
+            if not folded_query:
+                return ()
+            for folded_start in _overlapping_starts(
+                text_projection.folded_text,
+                folded_query,
+            ):
+                projected = project_folded_span_v1(
+                    text_projection,
+                    folded_start,
+                    folded_start + len(folded_query),
+                )
+                if projected is not None:
+                    raw_spans.append(projected)
+
+        if (
+            validated_options.whole_word
+            and not is_pure_cjk_v1(raw_query)
+        ):
+            raw_spans = [
+                (start, end)
+                for start, end in raw_spans
+                if is_word_boundary_v1(raw_text, start)
+                and is_word_boundary_v1(raw_text, end)
+            ]
+
+        return tuple(
+            SearchHit(start_index=start, end_index=end)
+            for start, end in sorted(set(raw_spans))
+            if end > start
+        )
+
+
 __all__ = [
     "TEXT_MATCHER_SEMANTICS_VERSION",
     "UNICODE_VERSION",
     "FoldProjection",
+    "TextMatcherV1",
     "fold_text_v1",
     "is_pure_cjk_v1",
     "is_word_boundary_v1",
