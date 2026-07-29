@@ -127,7 +127,7 @@
 
 - [ ] 4. 实现 Qt 项目工具、编辑体验与桌面呈现
 
-- [ ] 4.1 在编辑与浏览视图显示 raw speaker
+- [x] 4.1 在编辑与浏览视图显示 raw speaker
   - 当前段显示规范化 raw speaker；空值使用稳定“无 speaker”状态
   - 浏览表增加同一 raw speaker 列，保持双击按稳定段落身份返回编辑
   - 不创建 alias、显式空白 profile、头像或推测名称

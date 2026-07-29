@@ -8,8 +8,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
+from PySide6.QtWidgets import QApplication, QWidget
 
 from editor_contracts import SegmentDensity, WorkspaceMode
 from editor_controller import EditorController
@@ -37,11 +37,13 @@ class QtBrowseModeTest(unittest.TestCase):
                             "id": "one",
                             "source": "A very long source sentence " * 12,
                             "target": "第一段译文",
+                            "speaker": '  <script>alert("raw")</script> & Hero  ',
                         },
                         {
                             "id": "two",
                             "source": "Another long source sentence " * 10,
                             "target": "第二段译文",
+                            "speaker": "",
                         },
                     ],
                 }
@@ -55,6 +57,72 @@ class QtBrowseModeTest(unittest.TestCase):
         window.show()
         self._events()
         return window, project_path
+
+    @staticmethod
+    def _project_snapshot(window: QtEditorWindow) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                segment.id,
+                segment.source,
+                segment.target,
+                segment.speaker,
+                segment.confirmed,
+            )
+            for segment in window.controller.project.segments
+        )
+
+    def test_raw_speaker_is_consistent_safe_and_read_only_across_views(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self._window(Path(temp_dir))
+            expected_raw = '<script>alert("raw")</script> & Hero'
+            before = self._project_snapshot(window)
+
+            self.assertTrue(window.speaker_display.isVisible())
+            self.assertEqual(window.speaker_display.objectName(), "speakerDisplay")
+            self.assertEqual(window.speaker_display.text(), expected_raw)
+            self.assertIs(window.speaker_display.textFormat(), Qt.TextFormat.PlainText)
+            self.assertTrue(window.speaker_display.toolTip())
+            self.assertTrue(window.speaker_display.accessibleName())
+
+            self.assertTrue(window.set_workspace_mode(WorkspaceMode.BROWSE))
+            self._events()
+
+            headers = [
+                window.browse_table.horizontalHeaderItem(column).text()
+                for column in range(window.browse_table.columnCount())
+            ]
+            self.assertEqual(headers, ["段落", "SOURCE", "TARGET", "SPEAKER", "状态"])
+            speaker_column = headers.index("SPEAKER")
+            self.assertEqual(
+                window.browse_table.item(0, speaker_column).text(),
+                expected_raw,
+            )
+            self.assertEqual(
+                window.browse_table.item(1, speaker_column).text(),
+                "无 speaker",
+            )
+
+            window.browse_table.cellDoubleClicked.emit(1, speaker_column)
+            self._events()
+
+            self.assertEqual(window.controller.current_index, 1)
+            self.assertEqual(window.controller.current_segment.id, "two")
+            self.assertEqual(window.speaker_display.text(), "无 speaker")
+            self.assertIn("无 speaker", window.speaker_display.accessibleName())
+            self.assertEqual(self._project_snapshot(window), before)
+            unavailable_names = {
+                widget.objectName().lower()
+                for widget in window.findChildren(QWidget)
+                if widget.objectName()
+            }
+            self.assertFalse(
+                any(
+                    token in object_name
+                    for object_name in unavailable_names
+                    for token in ("speakeralias", "speakerprofile", "speakeravatar")
+                )
+            )
+            window.close()
 
     def test_compact_and_wrapped_density_preserve_current_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -106,6 +174,10 @@ class QtBrowseModeTest(unittest.TestCase):
             self.assertEqual(window.workspace_pages.currentIndex(), 1)
             self.assertEqual(window.browse_table.rowCount(), 2)
             self.assertEqual(window.browse_table.item(0, 2).text(), "浏览页应显示的最新译文")
+            self.assertEqual(
+                window.browse_table.item(0, 3).text(),
+                '<script>alert("raw")</script> & Hero',
+            )
             self.assertTrue(window.browse_table.wordWrap())
             self.assertGreater(window.browse_table.rowHeight(0), 44)
 

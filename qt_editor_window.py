@@ -384,9 +384,13 @@ class QtEditorWindow(QMainWindow):
         header.addStretch()
         layout.addLayout(header)
 
-        self.browse_table = QTableWidget(0, 4)
+        self.browse_table = QTableWidget(0, 5)
         self.browse_table.setObjectName("browseTable")
-        self.browse_table.setHorizontalHeaderLabels(["段落", "SOURCE", "TARGET", "状态"])
+        self.browse_table.setHorizontalHeaderLabels(
+            ["段落", "SOURCE", "TARGET", "SPEAKER", "状态"]
+        )
+        self.browse_table.setToolTip("只读浏览段落 source、target 与 raw speaker")
+        self.browse_table.setAccessibleName("段落双语与 raw speaker 浏览表")
         self.browse_table.setWordWrap(True)
         self.browse_table.setShowGrid(False)
         self.browse_table.setAlternatingRowColors(True)
@@ -402,7 +406,9 @@ class QtEditorWindow(QMainWindow):
         browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         browse_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         browse_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        browse_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        browse_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        browse_header.resizeSection(3, 140)
+        browse_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.browse_table, 1)
         return panel
 
@@ -422,6 +428,26 @@ class QtEditorWindow(QMainWindow):
         source_header.addStretch()
         source_header.addWidget(self.segment_position_label)
         layout.addLayout(source_header)
+        speaker_row = QHBoxLayout()
+        speaker_title = QLabel("SPEAKER")
+        speaker_title.setObjectName("speakerEyebrow")
+        speaker_title.setToolTip("当前段的规范化 raw speaker")
+        speaker_title.setAccessibleName("Speaker 标签")
+        self.speaker_display = QLabel("无 speaker")
+        self.speaker_display.setObjectName("speakerDisplay")
+        self.speaker_display.setTextFormat(Qt.TextFormat.PlainText)
+        self.speaker_display.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.speaker_display.setWordWrap(True)
+        self.speaker_display.setToolTip(
+            "当前段规范化后的 raw speaker；空值显示“无 speaker”"
+        )
+        self.speaker_display.setAccessibleName("当前段 raw speaker：无 speaker")
+        speaker_row.addWidget(speaker_title)
+        speaker_row.addSpacing(8)
+        speaker_row.addWidget(self.speaker_display, 1)
+        layout.addLayout(speaker_row)
         self.source_display = QTextBrowser()
         self.source_display.setObjectName("sourceDisplay")
         self.source_display.setOpenExternalLinks(False)
@@ -778,6 +804,12 @@ class QtEditorWindow(QMainWindow):
     def _render_current_segment(self) -> None:
         segment = self.controller.current_segment
         project = self.controller.project
+        speaker_text = segment.speaker or "无 speaker"
+        self.speaker_display.setText(speaker_text)
+        self.speaker_display.setAccessibleName(f"当前段 raw speaker：{speaker_text}")
+        self.speaker_display.setProperty("empty", not bool(segment.speaker))
+        self.speaker_display.style().unpolish(self.speaker_display)
+        self.speaker_display.style().polish(self.speaker_display)
         self.source_display.setPlainText(segment.source)
         self.target_editor.setPlainText(segment.target)
         self.segment_position_label.setText(
@@ -992,6 +1024,7 @@ class QtEditorWindow(QMainWindow):
                     f"{index + 1:03d}",
                     segment.source,
                     segment.target or "—",
+                    segment.speaker or "无 speaker",
                     "已确认" if segment.confirmed else "待确认",
                 )
                 for column, value in enumerate(values):
@@ -1552,6 +1585,28 @@ QLabel#sectionEyebrow {
     font-size: 10px;
     font-weight: 800;
     letter-spacing: 1px;
+}
+QLabel#speakerEyebrow {
+    color: #66798d;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+QLabel#speakerDisplay {
+    color: #24455f;
+    background: #edf6f9;
+    border: 1px solid #d3e5eb;
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 650;
+}
+QLabel#speakerDisplay[empty="true"] {
+    color: #7c8b99;
+    background: #f4f6f8;
+    border-color: #e1e6eb;
+    font-style: italic;
+    font-weight: 500;
 }
 QLabel#segmentPosition {
     color: #78899a;
