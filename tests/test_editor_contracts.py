@@ -17,12 +17,23 @@ from editor_contracts import (
     EditorSegment,
     ImportReport,
     ImportRequest,
+    LegacyTermRow,
     PreprocessChange,
     PreprocessPreview,
+    PreparedTermMutation,
     ResourceConfig,
     ResourceKind,
     SuggestionBundle,
     TMSuggestion,
+    TermCleanupReport,
+    TermCommitOutcome,
+    TermCommitState,
+    TermDraft,
+    TermMatchPolicy,
+    TermMutationReport,
+    TermRecord,
+    TermRecordLocator,
+    TermRowKind,
     TermSuggestion,
     WriteReport,
     SegmentDensity,
@@ -319,6 +330,391 @@ class EditorContractsTest(unittest.TestCase):
                 dirty_before=False,
                 saved_baseline_digest_at_apply="",
                 changes=(valid_change,),
+            ),
+        )
+
+        for invalid_call in invalid_calls:
+            with self.subTest(invalid_call=invalid_call), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                invalid_call()
+
+    def test_mixed_termbase_contracts_are_frozen_and_preserve_row_identity(
+        self,
+    ) -> None:
+        file_digest = "a" * 64
+        legacy_locator = TermRecordLocator(
+            row_kind=TermRowKind.LEGACY,
+            file_digest=file_digest,
+            row_ordinal=0,
+            row_digest="b" * 64,
+            record_id=None,
+        )
+        v1_locator = TermRecordLocator(
+            row_kind=TermRowKind.V1,
+            file_digest=file_digest,
+            row_ordinal=1,
+            row_digest="c" * 64,
+            record_id="term-7",
+        )
+        legacy = TermRecord(
+            locator=legacy_locator,
+            record_id=None,
+            source="legacy",
+            target="旧术语",
+            policy=TermMatchPolicy.LEGACY,
+            match_case=None,
+            whole_word=None,
+        )
+        configured = TermRecord(
+            locator=v1_locator,
+            record_id="term-7",
+            source="Configured",
+            target="新术语",
+            policy=TermMatchPolicy.CONFIGURED,
+            match_case=False,
+            whole_word=True,
+        )
+        draft = TermDraft(source="New", target="新增")
+        incoming = LegacyTermRow(source="Imported", target="导入", input_ordinal=3)
+        prepared = PreparedTermMutation(
+            action="update",
+            resource_path=Path("/tmp/terms.csv"),
+            base_digest=file_digest,
+            staged_path=Path("/tmp/.terms.csv.stage"),
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            candidate_records=(legacy, configured),
+        )
+
+        self.assertEqual(draft.match_case, False)
+        self.assertEqual(draft.whole_word, True)
+        self.assertEqual(incoming.input_ordinal, 3)
+        self.assertEqual(prepared.candidate_records, (legacy, configured))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            configured.target = "changed"  # type: ignore[misc]
+
+    def test_term_commit_and_cleanup_contracts_express_recovery_states(self) -> None:
+        record = TermRecord(
+            locator=TermRecordLocator(
+                row_kind=TermRowKind.V1,
+                file_digest="a" * 64,
+                row_ordinal=0,
+                row_digest="b" * 64,
+                record_id="term-1",
+            ),
+            record_id="term-1",
+            source="source",
+            target="target",
+            policy=TermMatchPolicy.CONFIGURED,
+            match_case=False,
+            whole_word=True,
+        )
+        report = TermMutationReport(
+            action="create",
+            resource_path=Path("/tmp/terms.csv"),
+            committed_digest="c" * 64,
+            records=(record,),
+            created=1,
+            updated=0,
+            deleted=0,
+            imported=0,
+            overwritten=0,
+        )
+        committed = TermCommitOutcome(
+            state=TermCommitState.COMMITTED,
+            report=report,
+            error_code=None,
+            retryable=False,
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            quarantined=False,
+            safe_detail=None,
+        )
+        not_committed = TermCommitOutcome(
+            state=TermCommitState.NOT_COMMITTED,
+            report=None,
+            error_code="SOURCE_CHANGED",
+            retryable=True,
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            quarantined=False,
+            safe_detail="Reload the termbase and retry.",
+        )
+        rolled_back = TermCommitOutcome(
+            state=TermCommitState.ROLLED_BACK,
+            report=None,
+            error_code="DIRECTORY_FSYNC_FAILED",
+            retryable=True,
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            quarantined=False,
+            safe_detail="The previous bytes were restored; retry the change.",
+        )
+        indeterminate = TermCommitOutcome(
+            state=TermCommitState.INDETERMINATE,
+            report=None,
+            error_code="ROLLBACK_FAILED",
+            retryable=False,
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            quarantined=True,
+            safe_detail="Restore the resource from the recovery file.",
+        )
+        cleaned = TermCleanupReport(
+            cleaned=True,
+            recovery_path=None,
+            warning_code=None,
+        )
+        cleanup_warning = TermCleanupReport(
+            cleaned=False,
+            recovery_path=Path("/tmp/.terms.csv.recovery"),
+            warning_code="RECOVERY_DELETE_FAILED",
+        )
+
+        self.assertIs(committed.report, report)
+        self.assertTrue(not_committed.retryable)
+        self.assertTrue(rolled_back.retryable)
+        self.assertTrue(indeterminate.quarantined)
+        self.assertTrue(cleaned.cleaned)
+        self.assertFalse(cleanup_warning.cleaned)
+        self.assertEqual(
+            cleanup_warning.recovery_path,
+            Path("/tmp/.terms.csv.recovery"),
+        )
+
+    def test_term_rows_reject_legacy_v1_identity_and_policy_mismatches(self) -> None:
+        valid_legacy_locator = TermRecordLocator(
+            row_kind=TermRowKind.LEGACY,
+            file_digest="a" * 64,
+            row_ordinal=0,
+            row_digest="b" * 64,
+            record_id=None,
+        )
+        valid_v1_locator = TermRecordLocator(
+            row_kind=TermRowKind.V1,
+            file_digest="a" * 64,
+            row_ordinal=1,
+            row_digest="b" * 64,
+            record_id="term-1",
+        )
+
+        invalid_calls = (
+            lambda: TermRecordLocator(
+                row_kind=TermRowKind.LEGACY,
+                file_digest="not-sha256",
+                row_ordinal=0,
+                row_digest="b" * 64,
+                record_id=None,
+            ),
+            lambda: TermRecordLocator(
+                row_kind=TermRowKind.LEGACY,
+                file_digest="a" * 64,
+                row_ordinal=-1,
+                row_digest="b" * 64,
+                record_id=None,
+            ),
+            lambda: TermRecordLocator(
+                row_kind=TermRowKind.LEGACY,
+                file_digest="a" * 64,
+                row_ordinal=0,
+                row_digest="b" * 64,
+                record_id="legacy-id",
+            ),
+            lambda: TermRecordLocator(
+                row_kind=TermRowKind.V1,
+                file_digest="a" * 64,
+                row_ordinal=0,
+                row_digest="b" * 64,
+                record_id=None,
+            ),
+            lambda: TermRecord(
+                locator=valid_legacy_locator,
+                record_id=None,
+                source="legacy",
+                target="target",
+                policy=TermMatchPolicy.LEGACY,
+                match_case=False,
+                whole_word=None,
+            ),
+            lambda: TermRecord(
+                locator=valid_v1_locator,
+                record_id="other-id",
+                source="configured",
+                target="target",
+                policy=TermMatchPolicy.CONFIGURED,
+                match_case=False,
+                whole_word=True,
+            ),
+            lambda: TermRecord(
+                locator=valid_v1_locator,
+                record_id="term-1",
+                source="configured",
+                target="target",
+                policy=TermMatchPolicy.LEGACY,
+                match_case=False,
+                whole_word=True,
+            ),
+            lambda: TermRecord(
+                locator=valid_v1_locator,
+                record_id="term-1",
+                source="",
+                target="target",
+                policy=TermMatchPolicy.CONFIGURED,
+                match_case=False,
+                whole_word=True,
+            ),
+            lambda: TermDraft(
+                source="source",
+                target="target",
+                match_case=0,  # type: ignore[arg-type]
+            ),
+            lambda: LegacyTermRow(
+                source="source",
+                target="target",
+                input_ordinal=-1,
+            ),
+        )
+
+        for invalid_call in invalid_calls:
+            with self.subTest(invalid_call=invalid_call), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                invalid_call()
+
+    def test_term_mutation_contracts_reject_ambiguous_commit_states(self) -> None:
+        record = TermRecord(
+            locator=TermRecordLocator(
+                row_kind=TermRowKind.LEGACY,
+                file_digest="a" * 64,
+                row_ordinal=0,
+                row_digest="b" * 64,
+                record_id=None,
+            ),
+            record_id=None,
+            source="source",
+            target="target",
+            policy=TermMatchPolicy.LEGACY,
+            match_case=None,
+            whole_word=None,
+        )
+        report = TermMutationReport(
+            action="update",
+            resource_path=Path("/tmp/terms.csv"),
+            committed_digest="c" * 64,
+            records=(record,),
+            created=0,
+            updated=1,
+            deleted=0,
+            imported=0,
+            overwritten=0,
+        )
+        valid_outcome_fields = {
+            "report": None,
+            "error_code": "COMMIT_FAILED",
+            "retryable": True,
+            "recovery_path": Path("/tmp/.terms.csv.recovery"),
+            "quarantined": False,
+            "safe_detail": "Retry the operation.",
+        }
+
+        invalid_calls = (
+            lambda: PreparedTermMutation(
+                action="update",
+                resource_path=Path("/tmp/terms.csv"),
+                base_digest="a" * 64,
+                staged_path=Path("/tmp/terms.csv"),
+                recovery_path=None,
+                candidate_records=(record,),
+            ),
+            lambda: PreparedTermMutation(
+                action="update",
+                resource_path=Path("/tmp/terms.csv"),
+                base_digest="a" * 64,
+                staged_path=Path("/var/tmp/.terms.csv.stage"),
+                recovery_path=None,
+                candidate_records=(record,),
+            ),
+            lambda: PreparedTermMutation(
+                action="update",
+                resource_path=Path("/tmp/terms.csv"),
+                base_digest="a" * 64,
+                staged_path=Path("/tmp/.terms.csv.stage"),
+                recovery_path=Path("/tmp/.terms.csv.stage"),
+                candidate_records=(record,),
+            ),
+            lambda: PreparedTermMutation(
+                action="update",
+                resource_path=Path("/tmp/terms.csv"),
+                base_digest="a" * 64,
+                staged_path=Path("/tmp/.terms.csv.stage"),
+                recovery_path=None,
+                candidate_records=[record],  # type: ignore[arg-type]
+            ),
+            lambda: TermMutationReport(
+                action="update",
+                resource_path=Path("/tmp/terms.csv"),
+                committed_digest="c" * 64,
+                records=(record,),
+                created=0,
+                updated=-1,
+                deleted=0,
+                imported=0,
+                overwritten=0,
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.COMMITTED,
+                **valid_outcome_fields,
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.NOT_COMMITTED,
+                report=report,
+                error_code="COMMIT_FAILED",
+                retryable=True,
+                recovery_path=None,
+                quarantined=False,
+                safe_detail="Retry the operation.",
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.ROLLED_BACK,
+                report=None,
+                error_code=None,
+                retryable=True,
+                recovery_path=None,
+                quarantined=False,
+                safe_detail="Retry the operation.",
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.ROLLED_BACK,
+                report=None,
+                error_code="ROLLBACK_COMPLETED",
+                retryable=True,
+                recovery_path=None,
+                quarantined=True,
+                safe_detail="Retry the operation.",
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.INDETERMINATE,
+                report=None,
+                error_code="ROLLBACK_FAILED",
+                retryable=False,
+                recovery_path=None,
+                quarantined=True,
+                safe_detail="Restore the recovery file.",
+            ),
+            lambda: TermCommitOutcome(
+                state=TermCommitState.INDETERMINATE,
+                report=None,
+                error_code="ROLLBACK_FAILED",
+                retryable=True,
+                recovery_path=Path("/tmp/.terms.csv.recovery"),
+                quarantined=True,
+                safe_detail="Restore the recovery file.",
+            ),
+            lambda: TermCleanupReport(
+                cleaned=True,
+                recovery_path=Path("/tmp/.terms.csv.recovery"),
+                warning_code=None,
+            ),
+            lambda: TermCleanupReport(
+                cleaned=False,
+                recovery_path=None,
+                warning_code="RECOVERY_DELETE_FAILED",
             ),
         )
 

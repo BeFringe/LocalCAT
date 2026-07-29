@@ -16,7 +16,7 @@
   - 完成时，preview、apply report 和单批次 undo state 能完整表达正常、无变化和 stale 场景
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 5.2, 5.3, 5.5_
 
-- [ ] 1.3 建立 mixed termbase 与提交结果契约
+- [x] 1.3 建立 mixed termbase 与提交结果契约
   - 覆盖 legacy/v1 row kind、稳定 locator、term draft、prepared mutation、commit outcome 和 cleanup report
   - 明确 committed、not committed、rolled back、indeterminate、recovery 和 quarantine 的组合不变量
   - 完成时，legacy flags 只能为空，v1 locator 必须带稳定 ID，失败 outcome 能携带可操作 recovery 信息
