@@ -20,7 +20,7 @@
   - 完成时，每种成功与失败分支都能被类型化构造、持久比较，并证明原资产保持或提供 fail-stop 恢复位置
   - _Requirements: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 7.4, 7.5_
 
-- [ ] 1.4 定义文本匹配能力和不可变验证快照
+- [x] 1.4 定义文本匹配能力和不可变验证快照
   - 固化三态能力、legacy/basic/text-v1 用途、大小写与全词选项、稳定命中范围、语义版本、验证摘要和拒绝原因
   - 请求与结果绑定同一次不可变能力判定，消费方不能从摘要、SQLite、FTS5 或 benchmark 状态反推 readiness
   - 完成时，未覆盖用途、过期或版本不一致的证据会 fail-closed，公开拒绝信息不包含 query 或正文
@@ -354,3 +354,4 @@
 - 2026-07-29 / Task 1.1：冻结 `tm_contracts.py` 的记录、资源句柄、查询、结果、evidence、局部失败与严格 codec v1；运行时 `TMResourceHandle` 保持必需 `TMStore` 绑定且不进入持久 codec。独立复审通过；focused 15/15、全量 127/127、basedpyright 0 errors。
 - 2026-07-29 / Task 1.2：冻结 canonical 资源身份、确定性 sidecar、snapshot receipt/manifest/binding、阶段校验证据与 generation 闭合；sealed artifact 和单次 token 保持 registry 背书的模块私有运行期能力，公开协调器只暴露 `activate(SealedStage)`。独立复审通过；focused 27/27、全量 138/138、basedpyright 0 errors。
 - 2026-07-29 / Task 1.3：冻结迁移、导出与 schema upgrade 的显式成功/失败联合结果，使用 digest-backed 资产保持证据与无权限恢复定位替代可伪造布尔断言；strict codec 在编码与解码边界递归重验 lineage、计数和嵌套证据。独立复审通过；focused 38/38、全量 150/150、basedpyright 0 errors。
+- 2026-07-29 / Task 1.4：冻结 matcher 三态 capability、用途/选项矩阵、请求摘要与无正文 outcome；公开 strict codec 与内部 validation manifest codec 分离，required cohort 与 evidence 精确闭合且消费方不能反推 readiness。独立复审通过；focused 30/30、全量 165/165、basedpyright 0 errors。

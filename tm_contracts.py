@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import hashlib
 import json
@@ -28,9 +29,15 @@ SNAPSHOT_BINDING_VERSION = "snapshot-binding-v1"
 STAGE_VALIDATION_EVIDENCE_VERSION = "stage-validation-v1"
 GENERATION_EXPECTATION_VERSION = "generation-expectation-v1"
 ACTIVATION_TOKEN_VERSION = "activation-token-v1"
+MATCHER_VALIDATION_SUMMARY_VERSION = "matcher-validation-summary-v1"
+MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v1"
+MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 1
 
 _DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\Z")
 _SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_STRICT_UTC_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z"
+)
 _RUNTIME_CAPABILITY_FACTORY_KEY = object()
 _CONTEXT_FIELDS = (
     "speaker_raw",
@@ -1305,6 +1312,464 @@ class SchemaUpgradeFailure:
 type SchemaUpgradeOutcome = SchemaUpgradeReport | SchemaUpgradeFailure
 
 
+class TextMatcherState(str, Enum):
+    """Closed public readiness states derived by the Core evaluator."""
+
+    UNAVAILABLE = "UNAVAILABLE"
+    BASIC_VALIDATED = "BASIC_VALIDATED"
+    TEXT_V1_VALIDATED = "TEXT_V1_VALIDATED"
+
+
+class TextMatchProfile(str, Enum):
+    """Explicit caller purposes; options alone never imply a purpose."""
+
+    LEGACY_COMPAT = "LEGACY_COMPAT"
+    BASIC_CONTIGUOUS = "BASIC_CONTIGUOUS"
+    CONFIGURABLE_TEXT_V1 = "CONFIGURABLE_TEXT_V1"
+
+
+class TextMatchRejectCode(str, Enum):
+    """Closed, content-free reasons for fail-closed matcher outcomes."""
+
+    CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+    PROFILE_NOT_VALIDATED = "PROFILE_NOT_VALIDATED"
+    OPTIONS_NOT_ALLOWED = "OPTIONS_NOT_ALLOWED"
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    """Qt-neutral text match options."""
+
+    match_case: bool
+    whole_word: bool
+
+    def __post_init__(self) -> None:
+        _validate_search_options(self)
+
+
+def _validate_search_options(options: SearchOptions) -> None:
+    _require_bool(options.match_case, "search match_case")
+    _require_bool(options.whole_word, "search whole_word")
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    """Non-empty half-open range into the original text."""
+
+    start_index: int
+    end_index: int
+
+    def __post_init__(self) -> None:
+        _validate_search_hit(self)
+
+
+def _validate_search_hit(hit: SearchHit) -> None:
+    _require_int(hit.start_index, "search hit start index", minimum=0)
+    _require_int(hit.end_index, "search hit end index", minimum=0)
+    if hit.end_index <= hit.start_index:
+        raise ValueError(
+            "search hit end index must be greater than start index"
+        )
+
+
+@dataclass(frozen=True)
+class MatcherValidationSummary:
+    """Opaque public checksum; it never carries readiness inputs."""
+
+    summary_version: str
+    evidence_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_matcher_validation_summary(self)
+
+
+def _validate_matcher_validation_summary(
+    summary: MatcherValidationSummary,
+) -> None:
+    if summary.summary_version != MATCHER_VALIDATION_SUMMARY_VERSION:
+        raise ValueError("unsupported matcher validation summary version")
+    _require_digest(
+        summary.evidence_digest,
+        "matcher validation summary evidence digest",
+    )
+
+
+_BASIC_MATCHER_PROFILES = (
+    TextMatchProfile.LEGACY_COMPAT,
+    TextMatchProfile.BASIC_CONTIGUOUS,
+)
+_TEXT_V1_MATCHER_PROFILES = (
+    TextMatchProfile.LEGACY_COMPAT,
+    TextMatchProfile.BASIC_CONTIGUOUS,
+    TextMatchProfile.CONFIGURABLE_TEXT_V1,
+)
+
+
+@dataclass(frozen=True)
+class TextMatcherCapability:
+    """One immutable Core capability decision exposed to consumers."""
+
+    state: TextMatcherState
+    semantics_version: str | None
+    supported_profiles: tuple[TextMatchProfile, ...]
+    validation_summary: MatcherValidationSummary | None
+    unavailable_reason: str | None
+
+    def __post_init__(self) -> None:
+        _validate_text_matcher_capability(self)
+
+
+def _validate_text_matcher_capability(
+    capability: TextMatcherCapability,
+) -> None:
+    if not isinstance(capability.state, TextMatcherState):
+        raise TypeError("matcher capability state must be TextMatcherState")
+    profiles = _require_tuple(
+        capability.supported_profiles,
+        "matcher supported profiles",
+    )
+    for profile in profiles:
+        if not isinstance(profile, TextMatchProfile):
+            raise TypeError(
+                "matcher supported profiles must contain TextMatchProfile"
+            )
+    expected_profiles: tuple[TextMatchProfile, ...]
+    if capability.state is TextMatcherState.UNAVAILABLE:
+        expected_profiles = ()
+    elif capability.state is TextMatcherState.BASIC_VALIDATED:
+        expected_profiles = _BASIC_MATCHER_PROFILES
+    else:
+        expected_profiles = _TEXT_V1_MATCHER_PROFILES
+    if profiles != expected_profiles:
+        raise ValueError(
+            "matcher supported profiles must exactly match capability state"
+        )
+
+    if capability.state is TextMatcherState.UNAVAILABLE:
+        if (
+            capability.semantics_version is not None
+            or capability.validation_summary is not None
+        ):
+            raise ValueError(
+                "unavailable matcher capability must omit semantics and "
+                "validation summary"
+            )
+        if capability.unavailable_reason is None:
+            raise ValueError(
+                "unavailable matcher capability requires unavailable reason"
+            )
+        _require_diagnostic_identifier(
+            capability.unavailable_reason,
+            "matcher unavailable reason",
+        )
+        return
+
+    if capability.semantics_version is None:
+        raise ValueError(
+            "available matcher capability requires semantics version"
+        )
+    _require_identity(
+        capability.semantics_version,
+        "matcher semantics version",
+    )
+    if not isinstance(
+        capability.validation_summary,
+        MatcherValidationSummary,
+    ):
+        raise ValueError(
+            "available matcher capability requires validation summary"
+        )
+    _validate_matcher_validation_summary(capability.validation_summary)
+    if capability.unavailable_reason is not None:
+        raise ValueError(
+            "available matcher capability must omit unavailable reason"
+        )
+
+
+@dataclass(frozen=True)
+class TextMatchRequest:
+    """Raw match input plus an explicit purpose and options."""
+
+    text: str
+    query: str
+    profile: TextMatchProfile
+    options: SearchOptions
+
+    def __post_init__(self) -> None:
+        _validate_text_match_request(self)
+
+    @property
+    def request_digest(self) -> str:
+        """Opaque identity used to bind an outcome without echoing content."""
+
+        _validate_text_match_request(self)
+        return _stable_digest(
+            {
+                "options": {
+                    "match_case": self.options.match_case,
+                    "whole_word": self.options.whole_word,
+                },
+                "profile": self.profile.value,
+                "query": self.query,
+                "request_version": "text-match-request-v1",
+                "text": self.text,
+            }
+        )
+
+
+def _validate_text_match_request(request: TextMatchRequest) -> None:
+    if not isinstance(request.text, str):
+        raise TypeError("text must be a string")
+    if not isinstance(request.query, str):
+        raise TypeError("query must be a string")
+    if not isinstance(request.profile, TextMatchProfile):
+        raise TypeError("text match profile must be TextMatchProfile")
+    if not isinstance(request.options, SearchOptions):
+        raise TypeError("text match request options must be SearchOptions")
+    _validate_search_options(request.options)
+
+
+def _text_match_matrix_reject_code(
+    *,
+    capability: TextMatcherCapability,
+    profile: TextMatchProfile,
+    options: SearchOptions,
+) -> TextMatchRejectCode | None:
+    _validate_text_matcher_capability(capability)
+    if not isinstance(profile, TextMatchProfile):
+        raise TypeError("text match outcome profile must be TextMatchProfile")
+    if not isinstance(options, SearchOptions):
+        raise TypeError("text match outcome options must be SearchOptions")
+    _validate_search_options(options)
+    if capability.state is TextMatcherState.UNAVAILABLE:
+        return TextMatchRejectCode.CAPABILITY_UNAVAILABLE
+    if profile not in capability.supported_profiles:
+        return TextMatchRejectCode.PROFILE_NOT_VALIDATED
+    expected_options: SearchOptions | None
+    if profile is TextMatchProfile.LEGACY_COMPAT:
+        expected_options = SearchOptions(match_case=True, whole_word=False)
+    elif profile is TextMatchProfile.BASIC_CONTIGUOUS:
+        expected_options = SearchOptions(match_case=False, whole_word=False)
+    else:
+        expected_options = None
+    if expected_options is not None and options != expected_options:
+        return TextMatchRejectCode.OPTIONS_NOT_ALLOWED
+    return None
+
+
+def _require_search_hits(value: object) -> tuple[SearchHit, ...]:
+    hits = _require_tuple(value, "text match success hits")
+    for hit in hits:
+        if not isinstance(hit, SearchHit):
+            raise TypeError(
+                "text match success hits must contain SearchHit values"
+            )
+        _validate_search_hit(hit)
+    keys = tuple((hit.start_index, hit.end_index) for hit in hits)
+    if len(keys) != len(set(keys)):
+        raise ValueError("text match success hits must be unique")
+    if keys != tuple(sorted(keys)):
+        raise ValueError("text match success hits must use stable order")
+    return hits
+
+
+@dataclass(frozen=True)
+class TextMatchSuccess:
+    """Authorized hits bound to one request and capability snapshot."""
+
+    hits: tuple[SearchHit, ...]
+    request_profile: TextMatchProfile
+    request_options: SearchOptions
+    request_digest: str
+    capability: TextMatcherCapability
+
+    def __post_init__(self) -> None:
+        _validate_text_match_success(self)
+
+
+def _validate_text_match_success(success: TextMatchSuccess) -> None:
+    _require_search_hits(success.hits)
+    _require_digest(success.request_digest, "text match request digest")
+    if not isinstance(success.capability, TextMatcherCapability):
+        raise TypeError(
+            "text match success capability must be TextMatcherCapability"
+        )
+    reject_code = _text_match_matrix_reject_code(
+        capability=success.capability,
+        profile=success.request_profile,
+        options=success.request_options,
+    )
+    if reject_code is not None:
+        raise ValueError(
+            "text match success request is not authorized by capability"
+        )
+
+
+@dataclass(frozen=True)
+class TextMatchRejected:
+    """Content-free rejection bound to one request and capability snapshot."""
+
+    code: TextMatchRejectCode
+    safe_reason: str
+    request_profile: TextMatchProfile
+    request_options: SearchOptions
+    request_digest: str
+    capability: TextMatcherCapability
+
+    def __post_init__(self) -> None:
+        _validate_text_match_rejected(self)
+
+
+def _validate_text_match_rejected(rejected: TextMatchRejected) -> None:
+    if not isinstance(rejected.code, TextMatchRejectCode):
+        raise TypeError("text match reject code must be TextMatchRejectCode")
+    _require_digest(rejected.request_digest, "text match request digest")
+    if not isinstance(rejected.capability, TextMatcherCapability):
+        raise TypeError(
+            "text match rejection capability must be TextMatcherCapability"
+        )
+    expected_code = _text_match_matrix_reject_code(
+        capability=rejected.capability,
+        profile=rejected.request_profile,
+        options=rejected.request_options,
+    )
+    if expected_code is None:
+        raise ValueError("authorized text match request cannot be rejected")
+    if rejected.code is not expected_code:
+        raise ValueError(
+            "text match reject code does not match capability decision"
+        )
+    _require_diagnostic_identifier(
+        rejected.safe_reason,
+        "text match safe reason",
+    )
+    if rejected.safe_reason != f"MATCHER.{rejected.code.value}":
+        raise ValueError("text match safe reason must derive from reject code")
+
+
+type TextMatchOutcome = TextMatchSuccess | TextMatchRejected
+
+
+class CapabilityGatedTextMatcher(Protocol):
+    """Runtime-only public matcher port; implementations arrive in task 2.5."""
+
+    def capability(self) -> TextMatcherCapability: ...
+
+    def match(self, request: TextMatchRequest) -> TextMatchOutcome: ...
+
+
+@dataclass(frozen=True)
+class MatcherValidationCohortEvidence:
+    """Internal portable evidence for one required validation cohort."""
+
+    cohort_id: str
+    cohort_digest: str
+    passed: bool
+
+    def __post_init__(self) -> None:
+        _validate_matcher_validation_cohort_evidence(self)
+
+
+def _validate_matcher_validation_cohort_evidence(
+    evidence: MatcherValidationCohortEvidence,
+) -> None:
+    _require_identity(evidence.cohort_id, "matcher cohort id")
+    _require_digest(evidence.cohort_digest, "matcher cohort digest")
+    _require_bool(evidence.passed, "matcher cohort passed")
+
+
+def _parse_strict_utc_timestamp(value: object, field_name: str) -> datetime:
+    if (
+        not isinstance(value, str)
+        or _STRICT_UTC_TIMESTAMP.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field_name} must be a strict UTC timestamp")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError(f"{field_name} must be a strict UTC timestamp") from None
+
+
+@dataclass(frozen=True)
+class MatcherValidationManifest:
+    """Internal evidence input; it does not itself grant capability."""
+
+    evidence_schema_version: str
+    matcher_artifact_digest: str
+    matcher_build_digest: str
+    semantics_version: str
+    required_cohort_ids: tuple[str, ...]
+    cohort_evidence: tuple[MatcherValidationCohortEvidence, ...]
+    fixture_digest: str
+    evaluator_digest: str
+    generated_at_utc: str
+    valid_until_utc: str
+
+    def __post_init__(self) -> None:
+        _validate_matcher_validation_manifest(self)
+
+
+def _validate_matcher_validation_manifest(
+    manifest: MatcherValidationManifest,
+) -> None:
+    if (
+        manifest.evidence_schema_version
+        != MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported matcher evidence schema version")
+    _require_digest(
+        manifest.matcher_artifact_digest,
+        "matcher artifact digest",
+    )
+    _require_digest(manifest.matcher_build_digest, "matcher build digest")
+    _require_identity(manifest.semantics_version, "matcher semantics version")
+    required_ids = _require_string_tuple(
+        manifest.required_cohort_ids,
+        "matcher required cohort ids",
+        identities=True,
+    )
+    if not required_ids:
+        raise ValueError("matcher required cohort ids must not be empty")
+    if required_ids != tuple(sorted(required_ids)):
+        raise ValueError("matcher required cohort ids must use stable order")
+
+    evidence_items = _require_tuple(
+        manifest.cohort_evidence,
+        "matcher cohort evidence",
+    )
+    for evidence in evidence_items:
+        if not isinstance(evidence, MatcherValidationCohortEvidence):
+            raise TypeError(
+                "matcher cohort evidence must contain "
+                "MatcherValidationCohortEvidence values"
+            )
+        _validate_matcher_validation_cohort_evidence(evidence)
+    evidence_ids = tuple(item.cohort_id for item in evidence_items)
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise ValueError("matcher cohort evidence ids must be unique")
+    if evidence_ids != tuple(sorted(evidence_ids)):
+        raise ValueError("matcher cohort evidence must use stable order")
+    if evidence_ids != required_ids:
+        raise ValueError(
+            "matcher required cohort ids must exactly match cohort evidence ids"
+        )
+
+    _require_digest(manifest.fixture_digest, "matcher fixture digest")
+    _require_digest(manifest.evaluator_digest, "matcher evaluator digest")
+    generated = _parse_strict_utc_timestamp(
+        manifest.generated_at_utc,
+        "matcher generated_at_utc",
+    )
+    valid_until = _parse_strict_utc_timestamp(
+        manifest.valid_until_utc,
+        "matcher valid_until_utc",
+    )
+    if valid_until <= generated:
+        raise ValueError(
+            "matcher valid_until_utc must be later than generated_at_utc"
+        )
+
+
 @dataclass(frozen=True)
 class CanonicalResourceIdentity:
     """Stable resource and deterministic adjacent sidecar identity."""
@@ -2162,6 +2627,13 @@ type TMContract = (
     | ExportFailure
     | SchemaUpgradeReport
     | SchemaUpgradeFailure
+    | SearchOptions
+    | SearchHit
+    | MatcherValidationSummary
+    | TextMatcherCapability
+    | TextMatchRequest
+    | TextMatchSuccess
+    | TextMatchRejected
     | CanonicalResourceIdentity
     | SnapshotReceipt
     | SnapshotManifest
@@ -2409,6 +2881,115 @@ def _encode_schema_upgrade_failure(
     }
 
 
+def _encode_search_options(options: SearchOptions) -> dict[str, Any]:
+    return {
+        "match_case": options.match_case,
+        "whole_word": options.whole_word,
+    }
+
+
+def _encode_search_hit(hit: SearchHit) -> dict[str, Any]:
+    return {
+        "end_index": hit.end_index,
+        "start_index": hit.start_index,
+    }
+
+
+def _encode_matcher_validation_summary(
+    summary: MatcherValidationSummary,
+) -> dict[str, Any]:
+    return {
+        "evidence_digest": summary.evidence_digest,
+        "summary_version": summary.summary_version,
+    }
+
+
+def _encode_text_matcher_capability(
+    capability: TextMatcherCapability,
+) -> dict[str, Any]:
+    return {
+        "semantics_version": capability.semantics_version,
+        "state": capability.state.value,
+        "supported_profiles": [
+            profile.value for profile in capability.supported_profiles
+        ],
+        "unavailable_reason": capability.unavailable_reason,
+        "validation_summary": (
+            None
+            if capability.validation_summary is None
+            else _encode_matcher_validation_summary(
+                capability.validation_summary
+            )
+        ),
+    }
+
+
+def _encode_text_match_request(
+    request: TextMatchRequest,
+) -> dict[str, Any]:
+    return {
+        "options": _encode_search_options(request.options),
+        "profile": request.profile.value,
+        "query": request.query,
+        "text": request.text,
+    }
+
+
+def _encode_text_match_success(
+    success: TextMatchSuccess,
+) -> dict[str, Any]:
+    return {
+        "capability": _encode_text_matcher_capability(success.capability),
+        "hits": [_encode_search_hit(hit) for hit in success.hits],
+        "request_digest": success.request_digest,
+        "request_options": _encode_search_options(success.request_options),
+        "request_profile": success.request_profile.value,
+    }
+
+
+def _encode_text_match_rejected(
+    rejected: TextMatchRejected,
+) -> dict[str, Any]:
+    return {
+        "capability": _encode_text_matcher_capability(rejected.capability),
+        "code": rejected.code.value,
+        "request_digest": rejected.request_digest,
+        "request_options": _encode_search_options(rejected.request_options),
+        "request_profile": rejected.request_profile.value,
+        "safe_reason": rejected.safe_reason,
+    }
+
+
+def _encode_matcher_validation_cohort_evidence(
+    evidence: MatcherValidationCohortEvidence,
+) -> dict[str, Any]:
+    return {
+        "cohort_digest": evidence.cohort_digest,
+        "cohort_id": evidence.cohort_id,
+        "passed": evidence.passed,
+    }
+
+
+def _encode_matcher_validation_manifest(
+    manifest: MatcherValidationManifest,
+) -> dict[str, Any]:
+    return {
+        "cohort_evidence": [
+            _encode_matcher_validation_cohort_evidence(evidence)
+            for evidence in manifest.cohort_evidence
+        ],
+        "evaluator_digest": manifest.evaluator_digest,
+        "evidence_schema_version": manifest.evidence_schema_version,
+        "fixture_digest": manifest.fixture_digest,
+        "generated_at_utc": manifest.generated_at_utc,
+        "matcher_artifact_digest": manifest.matcher_artifact_digest,
+        "matcher_build_digest": manifest.matcher_build_digest,
+        "required_cohort_ids": list(manifest.required_cohort_ids),
+        "semantics_version": manifest.semantics_version,
+        "valid_until_utc": manifest.valid_until_utc,
+    }
+
+
 def _encode_canonical_resource_identity(
     identity: CanonicalResourceIdentity,
 ) -> dict[str, Any]:
@@ -2577,6 +3158,36 @@ def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
         return (
             "SchemaUpgradeFailure",
             _encode_schema_upgrade_failure(contract),
+        )
+    if isinstance(contract, SearchOptions):
+        _validate_search_options(contract)
+        return "SearchOptions", _encode_search_options(contract)
+    if isinstance(contract, SearchHit):
+        _validate_search_hit(contract)
+        return "SearchHit", _encode_search_hit(contract)
+    if isinstance(contract, MatcherValidationSummary):
+        _validate_matcher_validation_summary(contract)
+        return (
+            "MatcherValidationSummary",
+            _encode_matcher_validation_summary(contract),
+        )
+    if isinstance(contract, TextMatcherCapability):
+        _validate_text_matcher_capability(contract)
+        return (
+            "TextMatcherCapability",
+            _encode_text_matcher_capability(contract),
+        )
+    if isinstance(contract, TextMatchRequest):
+        _validate_text_match_request(contract)
+        return "TextMatchRequest", _encode_text_match_request(contract)
+    if isinstance(contract, TextMatchSuccess):
+        _validate_text_match_success(contract)
+        return "TextMatchSuccess", _encode_text_match_success(contract)
+    if isinstance(contract, TextMatchRejected):
+        _validate_text_match_rejected(contract)
+        return (
+            "TextMatchRejected",
+            _encode_text_match_rejected(contract),
         )
     if isinstance(contract, CanonicalResourceIdentity):
         return (
@@ -2791,6 +3402,221 @@ def _decode_path(value: object, field_name: str) -> Path:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string path")
     return Path(value)
+
+
+def _decode_text_matcher_state(value: object) -> TextMatcherState:
+    try:
+        return TextMatcherState(value)
+    except (TypeError, ValueError):
+        raise ValueError("text matcher state is invalid") from None
+
+
+def _decode_text_match_profile(value: object) -> TextMatchProfile:
+    try:
+        return TextMatchProfile(value)
+    except (TypeError, ValueError):
+        raise ValueError("text match profile is invalid") from None
+
+
+def _decode_text_match_reject_code(value: object) -> TextMatchRejectCode:
+    try:
+        return TextMatchRejectCode(value)
+    except (TypeError, ValueError):
+        raise ValueError("text match reject code is invalid") from None
+
+
+def _decode_search_options(value: object) -> SearchOptions:
+    payload = _strict_fields(
+        value,
+        "SearchOptions payload",
+        ("match_case", "whole_word"),
+    )
+    return SearchOptions(
+        match_case=payload["match_case"],
+        whole_word=payload["whole_word"],
+    )
+
+
+def _decode_search_hit(value: object) -> SearchHit:
+    payload = _strict_fields(
+        value,
+        "SearchHit payload",
+        ("end_index", "start_index"),
+    )
+    return SearchHit(
+        start_index=payload["start_index"],
+        end_index=payload["end_index"],
+    )
+
+
+def _decode_matcher_validation_summary(
+    value: object,
+) -> MatcherValidationSummary:
+    payload = _strict_fields(
+        value,
+        "MatcherValidationSummary payload",
+        ("evidence_digest", "summary_version"),
+    )
+    return MatcherValidationSummary(
+        summary_version=payload["summary_version"],
+        evidence_digest=payload["evidence_digest"],
+    )
+
+
+def _decode_text_matcher_capability(
+    value: object,
+) -> TextMatcherCapability:
+    payload = _strict_fields(
+        value,
+        "TextMatcherCapability payload",
+        (
+            "semantics_version",
+            "state",
+            "supported_profiles",
+            "unavailable_reason",
+            "validation_summary",
+        ),
+    )
+    summary_payload = payload["validation_summary"]
+    return TextMatcherCapability(
+        state=_decode_text_matcher_state(payload["state"]),
+        semantics_version=payload["semantics_version"],
+        supported_profiles=tuple(
+            _decode_text_match_profile(profile)
+            for profile in _as_list(
+                payload["supported_profiles"],
+                "matcher supported profiles",
+            )
+        ),
+        validation_summary=(
+            None
+            if summary_payload is None
+            else _decode_matcher_validation_summary(summary_payload)
+        ),
+        unavailable_reason=payload["unavailable_reason"],
+    )
+
+
+def _decode_text_match_request(value: object) -> TextMatchRequest:
+    payload = _strict_fields(
+        value,
+        "TextMatchRequest payload",
+        ("options", "profile", "query", "text"),
+    )
+    return TextMatchRequest(
+        text=payload["text"],
+        query=payload["query"],
+        profile=_decode_text_match_profile(payload["profile"]),
+        options=_decode_search_options(payload["options"]),
+    )
+
+
+def _decode_text_match_success(value: object) -> TextMatchSuccess:
+    payload = _strict_fields(
+        value,
+        "TextMatchSuccess payload",
+        (
+            "capability",
+            "hits",
+            "request_digest",
+            "request_options",
+            "request_profile",
+        ),
+    )
+    return TextMatchSuccess(
+        hits=tuple(
+            _decode_search_hit(hit)
+            for hit in _as_list(payload["hits"], "text match success hits")
+        ),
+        request_profile=_decode_text_match_profile(
+            payload["request_profile"]
+        ),
+        request_options=_decode_search_options(payload["request_options"]),
+        request_digest=payload["request_digest"],
+        capability=_decode_text_matcher_capability(payload["capability"]),
+    )
+
+
+def _decode_text_match_rejected(value: object) -> TextMatchRejected:
+    payload = _strict_fields(
+        value,
+        "TextMatchRejected payload",
+        (
+            "capability",
+            "code",
+            "request_digest",
+            "request_options",
+            "request_profile",
+            "safe_reason",
+        ),
+    )
+    return TextMatchRejected(
+        code=_decode_text_match_reject_code(payload["code"]),
+        safe_reason=payload["safe_reason"],
+        request_profile=_decode_text_match_profile(
+            payload["request_profile"]
+        ),
+        request_options=_decode_search_options(payload["request_options"]),
+        request_digest=payload["request_digest"],
+        capability=_decode_text_matcher_capability(payload["capability"]),
+    )
+
+
+def _decode_matcher_validation_cohort_evidence(
+    value: object,
+) -> MatcherValidationCohortEvidence:
+    payload = _strict_fields(
+        value,
+        "matcher cohort evidence",
+        ("cohort_digest", "cohort_id", "passed"),
+    )
+    return MatcherValidationCohortEvidence(
+        cohort_id=payload["cohort_id"],
+        cohort_digest=payload["cohort_digest"],
+        passed=payload["passed"],
+    )
+
+
+def _decode_matcher_validation_manifest(
+    value: object,
+) -> MatcherValidationManifest:
+    payload = _strict_fields(
+        value,
+        "matcher validation manifest",
+        (
+            "cohort_evidence",
+            "evaluator_digest",
+            "evidence_schema_version",
+            "fixture_digest",
+            "generated_at_utc",
+            "matcher_artifact_digest",
+            "matcher_build_digest",
+            "required_cohort_ids",
+            "semantics_version",
+            "valid_until_utc",
+        ),
+    )
+    return MatcherValidationManifest(
+        evidence_schema_version=payload["evidence_schema_version"],
+        matcher_artifact_digest=payload["matcher_artifact_digest"],
+        matcher_build_digest=payload["matcher_build_digest"],
+        semantics_version=payload["semantics_version"],
+        required_cohort_ids=_decode_string_tuple(
+            payload["required_cohort_ids"],
+            "matcher required cohort ids",
+        ),
+        cohort_evidence=tuple(
+            _decode_matcher_validation_cohort_evidence(evidence)
+            for evidence in _as_list(
+                payload["cohort_evidence"],
+                "matcher cohort evidence",
+            )
+        ),
+        fixture_digest=payload["fixture_digest"],
+        evaluator_digest=payload["evaluator_digest"],
+        generated_at_utc=payload["generated_at_utc"],
+        valid_until_utc=payload["valid_until_utc"],
+    )
 
 
 def _decode_asset_kind(value: object, field_name: str) -> AssetKind:
@@ -3448,6 +4274,20 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
         return _decode_schema_upgrade_report(value)
     if contract_type == "SchemaUpgradeFailure":
         return _decode_schema_upgrade_failure(value)
+    if contract_type == "SearchOptions":
+        return _decode_search_options(value)
+    if contract_type == "SearchHit":
+        return _decode_search_hit(value)
+    if contract_type == "MatcherValidationSummary":
+        return _decode_matcher_validation_summary(value)
+    if contract_type == "TextMatcherCapability":
+        return _decode_text_matcher_capability(value)
+    if contract_type == "TextMatchRequest":
+        return _decode_text_match_request(value)
+    if contract_type == "TextMatchSuccess":
+        return _decode_text_match_success(value)
+    if contract_type == "TextMatchRejected":
+        return _decode_text_match_rejected(value)
     if contract_type == "CanonicalResourceIdentity":
         return _decode_canonical_resource_identity(value)
     if contract_type == "SnapshotReceipt":
@@ -3489,6 +4329,63 @@ def contract_from_json(serialized: str) -> TMContract:
     return _decode_payload(contract_type, envelope["payload"])
 
 
+def matcher_validation_manifest_to_json(
+    manifest: MatcherValidationManifest,
+) -> str:
+    """Encode the Core-internal validation manifest independently."""
+
+    if not isinstance(manifest, MatcherValidationManifest):
+        raise TypeError(
+            "matcher validation manifest must be MatcherValidationManifest"
+        )
+    _validate_matcher_validation_manifest(manifest)
+    envelope = {
+        "manifest": _encode_matcher_validation_manifest(manifest),
+        "manifest_codec_version": MATCHER_VALIDATION_MANIFEST_CODEC_VERSION,
+    }
+    return json.dumps(
+        envelope,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def matcher_validation_manifest_from_json(
+    serialized: str,
+) -> MatcherValidationManifest:
+    """Decode one strict Core-internal validation manifest envelope."""
+
+    if not isinstance(serialized, str):
+        raise TypeError("serialized matcher manifest must be a string")
+
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(
+            f"non-finite JSON number is not allowed: {value}"
+        )
+
+    try:
+        value = json.loads(serialized, parse_constant=reject_non_finite)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError(
+            "serialized matcher manifest is not valid JSON"
+        ) from None
+    envelope = _strict_fields(
+        value,
+        "matcher validation manifest envelope",
+        ("manifest", "manifest_codec_version"),
+    )
+    version = envelope["manifest_codec_version"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError("manifest_codec_version must be an integer")
+    if version != MATCHER_VALIDATION_MANIFEST_CODEC_VERSION:
+        raise ValueError(
+            f"unsupported matcher manifest codec version: {version}"
+        )
+    return _decode_matcher_validation_manifest(envelope["manifest"])
+
+
 __all__ = [
     "ACTIVATION_TOKEN_VERSION",
     "CANONICAL_RESOURCE_IDENTITY_VERSION",
@@ -3504,6 +4401,7 @@ __all__ = [
     "AssetPreservationEvidence",
     "AssetPreservationState",
     "CanonicalResourceIdentity",
+    "CapabilityGatedTextMatcher",
     "ContextEvidence",
     "DiagnosticDisposition",
     "ExportDiagnostic",
@@ -3516,6 +4414,7 @@ __all__ = [
     "MigrationOutcome",
     "MigrationPreflight",
     "MigrationReport",
+    "MatcherValidationSummary",
     "MutableStageRef",
     "QueryReport",
     "RecoveryLocator",
@@ -3524,6 +4423,8 @@ __all__ = [
     "SchemaUpgradeFailure",
     "SchemaUpgradeOutcome",
     "SchemaUpgradeReport",
+    "SearchHit",
+    "SearchOptions",
     "SealedStage",
     "SimilarityEvidence",
     "SnapshotBinding",
@@ -3540,6 +4441,14 @@ __all__ = [
     "TMResourceHandle",
     "TMResult",
     "TMStore",
+    "TextMatchOutcome",
+    "TextMatchProfile",
+    "TextMatchRejectCode",
+    "TextMatchRejected",
+    "TextMatchRequest",
+    "TextMatchSuccess",
+    "TextMatcherCapability",
+    "TextMatcherState",
     "contract_from_json",
     "contract_to_json",
     "snapshot_receipt_digest",
