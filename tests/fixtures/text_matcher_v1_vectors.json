@@ -1,0 +1,158 @@
+{
+  "fixture_version": "text-matcher-v1-vectors-v1",
+  "semantics_version": "text-v1-unicode-16.0.0",
+  "vectors": [
+    {
+      "id": "legacy-case-sensitive-contiguous",
+      "text": "Office office OFFICE",
+      "query": "office",
+      "profile": "LEGACY_COMPAT",
+      "options": {"match_case": true, "whole_word": false},
+      "hits": [[7, 13]]
+    },
+    {
+      "id": "basic-unicode-casefold-contiguous",
+      "text": "Office office OFFICE",
+      "query": "office",
+      "profile": "BASIC_CONTIGUOUS",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[0, 6], [7, 13], [14, 20]]
+    },
+    {
+      "id": "configurable-false-false-overlap",
+      "text": "ababa",
+      "query": "aba",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[0, 3], [2, 5]]
+    },
+    {
+      "id": "configurable-true-false",
+      "text": "Office office OFFICE",
+      "query": "office",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": false},
+      "hits": [[7, 13]]
+    },
+    {
+      "id": "configurable-false-true",
+      "text": "OFFICE office2 office office_office office.",
+      "query": "office",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": true},
+      "hits": [[0, 6], [15, 21], [36, 42]]
+    },
+    {
+      "id": "configurable-true-true",
+      "text": "OFFICE office2 office office_office office.",
+      "query": "office",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[15, 21], [36, 42]]
+    },
+    {
+      "id": "sharp-s-expansion-original-offsets",
+      "text": "Straße STRASSE straße",
+      "query": "STRASSE",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[0, 6], [7, 14], [15, 21]]
+    },
+    {
+      "id": "sharp-s-partial-expansion-deduplicates-span",
+      "text": "ß",
+      "query": "s",
+      "profile": "BASIC_CONTIGUOUS",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[0, 1]]
+    },
+    {
+      "id": "dotted-i-expansion-projection",
+      "text": "İ i̇ i I",
+      "query": "i̇",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[0, 1], [2, 4]]
+    },
+    {
+      "id": "whole-word-rejects-digit-adjacency",
+      "text": "cat cat2 2cat cat",
+      "query": "cat",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[0, 3], [14, 17]]
+    },
+    {
+      "id": "whole-word-rejects-underscore-adjacency",
+      "text": "foo foo_bar bar foo",
+      "query": "foo",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[0, 3], [16, 19]]
+    },
+    {
+      "id": "whole-word-accepts-punctuation-boundaries",
+      "text": "cat!cat/cat—cat",
+      "query": "cat",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[0, 3], [4, 7], [8, 11], [12, 15]]
+    },
+    {
+      "id": "whole-word-combining-sequence",
+      "text": "á áb",
+      "query": "á",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[0, 2]]
+    },
+    {
+      "id": "whole-word-mixed-script-original-boundaries",
+      "text": "xabc中 abc中 文",
+      "query": "abc中",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": true, "whole_word": true},
+      "hits": [[6, 10]]
+    },
+    {
+      "id": "pure-cjk-whole-word-tailors-to-contiguous",
+      "text": "甲中文乙 中文",
+      "query": "中文",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": true},
+      "hits": [[1, 3], [5, 7]]
+    },
+    {
+      "id": "pure-cjk-contiguous-reference",
+      "text": "甲中文乙 中文",
+      "query": "中文",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": [[1, 3], [5, 7]]
+    },
+    {
+      "id": "empty-query-legacy",
+      "text": "anything",
+      "query": "",
+      "profile": "LEGACY_COMPAT",
+      "options": {"match_case": true, "whole_word": false},
+      "hits": []
+    },
+    {
+      "id": "empty-query-basic",
+      "text": "anything",
+      "query": "",
+      "profile": "BASIC_CONTIGUOUS",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": []
+    },
+    {
+      "id": "empty-text",
+      "text": "",
+      "query": "x",
+      "profile": "CONFIGURABLE_TEXT_V1",
+      "options": {"match_case": false, "whole_word": false},
+      "hits": []
+    }
+  ]
+}

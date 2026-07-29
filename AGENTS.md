@@ -61,6 +61,12 @@ Skills are located in `.opencode/skills/kiro-*/SKILL.md`
 - Keep steering current and verify alignment with `/kiro-spec-status`
 - Follow the user's instructions precisely, and within that scope act autonomously: gather the necessary context and complete the requested work end-to-end in this run, asking questions only when essential information is missing or the instructions are critically ambiguous.
 
+## Worktree Durability
+- Treat the active Git worktree as the only acceptable location for important drafts, review artifacts, task plans, recovery notes, generated Specs, and implementation evidence.
+- Never place the only copy of an important project artifact under `/tmp`, another tmpfs, or a system-cleaned directory. `/tmp` may be used only for disposable, reproducible intermediates after a persistent source copy exists.
+- Protect incomplete but valuable work with small, reviewable Git commits. Use later squash/fixup integration to refine history instead of relying on filesystem persistence.
+- When a phase or implementation task changes code, commit the verified code together with its corresponding `tasks.md` checkbox update.
+
 ## Steering Configuration
 - Load entire `.kiro/steering/` as project memory
 - Default files: `product.md`, `tech.md`, `structure.md`
