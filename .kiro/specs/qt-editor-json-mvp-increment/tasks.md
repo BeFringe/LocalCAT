@@ -50,7 +50,7 @@
   - _Boundary: TermbaseStore_
   - _Depends: 1.3_
 
-- [ ] 2.4 实现术语变更的 prepare 阶段
+- [x] 2.4 实现术语变更的 prepare 阶段
   - 为新增、更新、删除生成完整 candidate records，不在 prepare 阶段替换权威文件
   - 新记录持久化 `Match Case=false`、`Whole Word=true`；legacy 更新仍保持两列
   - 导入按 source 执行 last-write-wins：保留既有 row kind、v1 ID/flags 和原位置，新 source 追加为 legacy

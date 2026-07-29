@@ -5,10 +5,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
+import tempfile
+import uuid
 from pathlib import Path
 from typing import TextIO
 
 from editor_contracts import (
+    LegacyTermRow,
+    PreparedTermMutation,
+    TermDraft,
     TermMatchPolicy,
     TermRecord,
     TermRecordLocator,
@@ -61,12 +67,176 @@ class _CapturingLineIterator:
 
 
 class TermbaseStore:
-    """Read and eventually mutate one atomic mixed CSV termbase."""
+    """Read and prepare atomic mutations for one mixed CSV termbase."""
+
+    def prepare_create(
+        self,
+        path: Path,
+        draft: TermDraft,
+    ) -> PreparedTermMutation:
+        if not isinstance(draft, TermDraft):
+            raise TypeError("term draft must be a TermDraft")
+        path = _absolute_resource_path(path)
+        original, base_digest, records = self._read_snapshot(path)
+        conflicting_ordinal = _source_ordinal(records, draft.source)
+        if conflicting_ordinal is not None:
+            raise TermbaseValidationError(
+                "DUPLICATE_SOURCE",
+                len(records),
+                conflicting_ordinal,
+            )
+
+        existing_ids = {
+            record.record_id for record in records if record.record_id is not None
+        }
+        record_id = str(uuid.uuid4())
+        while record_id in existing_ids:
+            record_id = str(uuid.uuid4())
+
+        candidate_rows = _rows_from_records(records)
+        candidate_rows.append(
+            [
+                _V1_MARKER,
+                record_id,
+                draft.source,
+                draft.target,
+                "false",
+                "true",
+            ]
+        )
+        return self._prepare_artifacts(
+            action="create",
+            path=path,
+            original=original,
+            base_digest=base_digest,
+            candidate_rows=candidate_rows,
+        )
+
+    def prepare_update(
+        self,
+        path: Path,
+        locator: TermRecordLocator,
+        draft: TermDraft,
+    ) -> PreparedTermMutation:
+        if not isinstance(draft, TermDraft):
+            raise TypeError("term draft must be a TermDraft")
+        path = _absolute_resource_path(path)
+        original, base_digest, records = self._read_snapshot(path)
+        row_ordinal, current = _locate_current_record(
+            records,
+            base_digest,
+            locator,
+        )
+        conflicting_ordinal = _source_ordinal(records, draft.source)
+        if (
+            conflicting_ordinal is not None
+            and conflicting_ordinal != row_ordinal
+        ):
+            raise TermbaseValidationError(
+                "CONFLICTING_SOURCE",
+                row_ordinal,
+                conflicting_ordinal,
+            )
+
+        candidate_rows = _rows_from_records(records)
+        if current.locator.row_kind is TermRowKind.LEGACY:
+            candidate_rows[row_ordinal] = [draft.source, draft.target]
+        else:
+            record_id = current.record_id
+            if record_id is None:
+                raise AssertionError("validated v1 record must have an id")
+            candidate_rows[row_ordinal] = [
+                _V1_MARKER,
+                record_id,
+                draft.source,
+                draft.target,
+                _format_bool(draft.match_case),
+                _format_bool(draft.whole_word),
+            ]
+        return self._prepare_artifacts(
+            action="update",
+            path=path,
+            original=original,
+            base_digest=base_digest,
+            candidate_rows=candidate_rows,
+        )
+
+    def prepare_delete(
+        self,
+        path: Path,
+        locator: TermRecordLocator,
+    ) -> PreparedTermMutation:
+        path = _absolute_resource_path(path)
+        original, base_digest, records = self._read_snapshot(path)
+        row_ordinal, _ = _locate_current_record(
+            records,
+            base_digest,
+            locator,
+        )
+        candidate_rows = _rows_from_records(records)
+        del candidate_rows[row_ordinal]
+        return self._prepare_artifacts(
+            action="delete",
+            path=path,
+            original=original,
+            base_digest=base_digest,
+            candidate_rows=candidate_rows,
+        )
+
+    def prepare_merge_legacy(
+        self,
+        path: Path,
+        rows: tuple[LegacyTermRow, ...],
+    ) -> PreparedTermMutation:
+        if not isinstance(rows, tuple):
+            raise TypeError("legacy merge rows must be a tuple")
+        if not all(isinstance(row, LegacyTermRow) for row in rows):
+            raise TypeError("legacy merge rows must contain LegacyTermRow values")
+        if not rows:
+            raise TermbaseValidationError("EMPTY_IMPORT")
+
+        path = _absolute_resource_path(path)
+        original, base_digest, records = self._read_snapshot(path)
+        incoming_targets: dict[str, str] = {}
+        first_input_order: list[str] = []
+        for row in rows:
+            if row.source not in incoming_targets:
+                first_input_order.append(row.source)
+            incoming_targets[row.source] = row.target
+
+        candidate_rows = _rows_from_records(records)
+        existing_sources = {record.source for record in records}
+        for row_ordinal, record in enumerate(records):
+            target = incoming_targets.get(record.source)
+            if target is not None:
+                candidate_rows[row_ordinal] = _row_with_target(record, target)
+
+        for source in first_input_order:
+            if source not in existing_sources:
+                candidate_rows.append([source, incoming_targets[source]])
+
+        return self._prepare_artifacts(
+            action="merge_legacy",
+            path=path,
+            original=original,
+            base_digest=base_digest,
+            candidate_rows=candidate_rows,
+        )
 
     def list_records(self, path: Path) -> tuple[TermRecord, ...]:
         """Return a fully validated immutable snapshot in file order."""
 
+        return self._records_from_bytes(path.read_bytes())
+
+    def _read_snapshot(
+        self,
+        path: Path,
+    ) -> tuple[bytes, str, tuple[TermRecord, ...]]:
         original = path.read_bytes()
+        file_digest = hashlib.sha256(original).hexdigest()
+        return original, file_digest, self._records_from_bytes(original)
+
+    def _records_from_bytes(self, original: bytes) -> tuple[TermRecord, ...]:
         file_digest = hashlib.sha256(original).hexdigest()
         try:
             text = original.decode("utf-8-sig")
@@ -123,6 +293,44 @@ class TermbaseStore:
             records.append(record)
 
         return tuple(records)
+
+    def _prepare_artifacts(
+        self,
+        *,
+        action: str,
+        path: Path,
+        original: bytes,
+        base_digest: str,
+        candidate_rows: list[list[str]],
+    ) -> PreparedTermMutation:
+        candidate_bytes = _serialize_rows(candidate_rows)
+        candidate_records = self._records_from_bytes(candidate_bytes)
+        recovery_path: Path | None = None
+        staged_path: Path | None = None
+        try:
+            recovery_path = _write_durable_temp(
+                path.parent,
+                f".{path.name}.recovery-",
+                original,
+            )
+            staged_path = _write_durable_temp(
+                path.parent,
+                f".{path.name}.staged-",
+                candidate_bytes,
+            )
+            _fsync_directory(path.parent)
+            return PreparedTermMutation(
+                action=action,
+                resource_path=path,
+                base_digest=base_digest,
+                staged_path=staged_path,
+                recovery_path=recovery_path,
+                candidate_records=candidate_records,
+            )
+        except BaseException:
+            _cleanup_prepare_artifacts(staged_path, recovery_path)
+            _best_effort_fsync_directory(path.parent)
+            raise
 
     @staticmethod
     def _record_from_row(
@@ -183,6 +391,123 @@ def _parse_bool(value: str, row_ordinal: int) -> bool:
         return _BOOLEAN_VALUES[value]
     except KeyError as exc:
         raise TermbaseValidationError("INVALID_BOOLEAN", row_ordinal) from exc
+
+
+def _format_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _absolute_resource_path(path: Path) -> Path:
+    if not isinstance(path, Path):
+        raise TypeError("term resource path must be a Path")
+    return Path(os.path.abspath(path))
+
+
+def _source_ordinal(
+    records: tuple[TermRecord, ...],
+    source: str,
+) -> int | None:
+    for row_ordinal, record in enumerate(records):
+        if record.source == source:
+            return row_ordinal
+    return None
+
+
+def _locate_current_record(
+    records: tuple[TermRecord, ...],
+    base_digest: str,
+    locator: TermRecordLocator,
+) -> tuple[int, TermRecord]:
+    if not isinstance(locator, TermRecordLocator):
+        raise TypeError("term locator must be a TermRecordLocator")
+    if locator.file_digest != base_digest:
+        raise TermbaseValidationError("STALE_LOCATOR")
+    if locator.row_ordinal >= len(records):
+        raise TermbaseValidationError("STALE_LOCATOR")
+    current = records[locator.row_ordinal]
+    if current.locator != locator:
+        raise TermbaseValidationError("STALE_LOCATOR")
+    return locator.row_ordinal, current
+
+
+def _row_from_record(record: TermRecord) -> list[str]:
+    if record.locator.row_kind is TermRowKind.LEGACY:
+        return [record.source, record.target]
+    record_id = record.record_id
+    match_case = record.match_case
+    whole_word = record.whole_word
+    if (
+        record_id is None
+        or match_case is None
+        or whole_word is None
+    ):
+        raise AssertionError("validated v1 record must have identity and flags")
+    return [
+        _V1_MARKER,
+        record_id,
+        record.source,
+        record.target,
+        _format_bool(match_case),
+        _format_bool(whole_word),
+    ]
+
+
+def _row_with_target(record: TermRecord, target: str) -> list[str]:
+    row = _row_from_record(record)
+    if record.locator.row_kind is TermRowKind.LEGACY:
+        row[1] = target
+    else:
+        row[3] = target
+    return row
+
+
+def _rows_from_records(records: tuple[TermRecord, ...]) -> list[list[str]]:
+    return [_row_from_record(record) for record in records]
+
+
+def _serialize_rows(rows: list[list[str]]) -> bytes:
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    writer.writerows(rows)
+    return b"\xef\xbb\xbf" + stream.getvalue().encode("utf-8")
+
+
+def _write_durable_temp(directory: Path, prefix: str, data: bytes) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, dir=directory)
+    artifact_path = Path(raw_path)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            _ = stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        artifact_path.unlink(missing_ok=True)
+        raise
+    return artifact_path
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_prepare_artifacts(*paths: Path | None) -> None:
+    for path in paths:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _best_effort_fsync_directory(directory: Path) -> None:
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
 
 
 def _validate_strict_csv_record(raw_record: str, row_ordinal: int) -> None:
