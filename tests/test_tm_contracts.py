@@ -15,6 +15,8 @@ from tm_contracts import (
     ResourceQueryFailure,
     ResourceQueryMetadata,
     SimilarityEvidence,
+    SourceBindingState,
+    StoreHealth,
     TMContract,
     TMMatchType,
     TMQuery,
@@ -44,7 +46,19 @@ class _DummyTMStore:
         return iter(())
 
     def health(self):
-        return object()
+        return StoreHealth(
+            healthy=True,
+            schema_version=1,
+            generation=0,
+            record_count=0,
+            index_kind="UNBUILT",
+            snapshot_binding_digest=None,
+            source_binding_state=None,
+            exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+            diagnostic_codes=(),
+        )
 
 
 def _context_evidence(*, matched: bool = False) -> ContextEvidence:
@@ -137,6 +151,58 @@ def _result(
 
 
 class TMContractTests(unittest.TestCase):
+    def test_store_health_is_frozen_and_keeps_gates_independent(self) -> None:
+        health = StoreHealth(
+            healthy=True,
+            schema_version=1,
+            generation=3,
+            record_count=27,
+            index_kind="GRAM_FALLBACK",
+            snapshot_binding_digest="a" * 64,
+            source_binding_state=SourceBindingState.SOURCE_DIVERGED,
+            exact_available=True,
+            context_available=True,
+            fuzzy_available=False,
+            diagnostic_codes=("SOURCE.DIVERGED",),
+        )
+
+        self.assertTrue(health.exact_available)
+        self.assertTrue(health.context_available)
+        self.assertFalse(health.fuzzy_available)
+        with self.assertRaises(FrozenInstanceError):
+            setattr(health, "healthy", False)
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires exact availability",
+        ):
+            _ = StoreHealth(
+                healthy=True,
+                schema_version=1,
+                generation=0,
+                record_count=0,
+                index_kind="UNBUILT",
+                snapshot_binding_digest=None,
+                source_binding_state=None,
+                exact_available=False,
+                context_available=False,
+                fuzzy_available=True,
+                diagnostic_codes=(),
+            )
+        with self.assertRaisesRegex(ValueError, "stable sorted order"):
+            _ = StoreHealth(
+                healthy=False,
+                schema_version=1,
+                generation=0,
+                record_count=0,
+                index_kind="UNBUILT",
+                snapshot_binding_digest=None,
+                source_binding_state=None,
+                exact_available=False,
+                context_available=False,
+                fuzzy_available=False,
+                diagnostic_codes=("STORE.Z", "STORE.A"),
+            )
+
     def test_record_preserves_raw_context_origin_and_provenance(self) -> None:
         record = TMRecord(
             record_id=7,

@@ -248,7 +248,7 @@ class TMStore(Protocol):
 
     def export_records(self) -> Iterator[TMRecord]: ...
 
-    def health(self) -> Any: ...
+    def health(self) -> StoreHealth: ...
 
 
 @dataclass(frozen=True)
@@ -3221,6 +3221,80 @@ class SourceBindingState(str, Enum):
     VERIFIED_CURRENT = "VERIFIED_CURRENT"
     VERIFIED_HISTORY = "VERIFIED_HISTORY"
     SOURCE_DIVERGED = "SOURCE_DIVERGED"
+
+
+@dataclass(frozen=True)
+class StoreHealth:
+    """One immutable observation of physical and feature availability."""
+
+    healthy: bool
+    schema_version: int
+    generation: int
+    record_count: int
+    index_kind: str
+    snapshot_binding_digest: str | None
+    source_binding_state: SourceBindingState | None
+    exact_available: bool
+    context_available: bool
+    fuzzy_available: bool
+    diagnostic_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_bool(self.healthy, "store health status")
+        _require_int(
+            self.schema_version,
+            "store health schema version",
+            minimum=1,
+        )
+        _require_int(
+            self.generation,
+            "store health generation",
+            minimum=0,
+        )
+        _require_int(
+            self.record_count,
+            "store health record count",
+            minimum=0,
+        )
+        _require_identity(self.index_kind, "store health index kind")
+        if self.snapshot_binding_digest is not None:
+            _require_digest(
+                self.snapshot_binding_digest,
+                "store health snapshot binding digest",
+            )
+        if (
+            self.source_binding_state is not None
+            and not isinstance(
+                self.source_binding_state,
+                SourceBindingState,
+            )
+        ):
+            raise TypeError(
+                "store health source binding state must be "
+                "SourceBindingState or None"
+            )
+        _require_bool(self.exact_available, "store exact availability")
+        _require_bool(self.context_available, "store context availability")
+        _require_bool(self.fuzzy_available, "store fuzzy availability")
+        if (
+            self.context_available or self.fuzzy_available
+        ) and not self.exact_available:
+            raise ValueError(
+                "context or fuzzy availability requires exact availability"
+            )
+        if self.exact_available and not self.healthy:
+            raise ValueError(
+                "an unhealthy store cannot advertise exact availability"
+            )
+        codes = _require_string_tuple(
+            self.diagnostic_codes,
+            "store diagnostic codes",
+            identities=True,
+        )
+        if codes != tuple(sorted(codes)):
+            raise ValueError(
+                "store diagnostic codes must use stable sorted order"
+            )
 
 
 @dataclass(frozen=True)
@@ -6421,6 +6495,7 @@ __all__ = [
     "SnapshotReceipt",
     "SourceBindingState",
     "StageValidationEvidence",
+    "StoreHealth",
     "TMContract",
     "TMMatchType",
     "TMQuery",
