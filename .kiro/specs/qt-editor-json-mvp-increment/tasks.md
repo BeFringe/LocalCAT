@@ -58,7 +58,7 @@
   - 完成时，每种 mutation 都产生可验证 candidate，源文件在 prepare 成功或失败后保持原样
   - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.7, 7.9, 7.10, 7.13, 9.4_
 
-- [ ] 2.5 实现可恢复的术语 commit 与 cleanup
+- [x] 2.5 实现可恢复的术语 commit 与 cleanup
   - 在同目录创建并 fsync staged/recovery，提交前复核 source digest
   - replace 后失败时原子恢复旧字节；恢复失败返回 indeterminate outcome 并保留 recovery/quarantine 信息
   - 只允许 committed outcome 进入 finalize；cleanup 失败只产生可操作 warning，不改已提交资源

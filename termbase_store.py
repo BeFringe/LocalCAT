@@ -14,8 +14,12 @@ from typing import TextIO
 from editor_contracts import (
     LegacyTermRow,
     PreparedTermMutation,
+    TermCleanupReport,
+    TermCommitOutcome,
+    TermCommitState,
     TermDraft,
     TermMatchPolicy,
+    TermMutationReport,
     TermRecord,
     TermRecordLocator,
     TermRowKind,
@@ -24,6 +28,7 @@ from editor_contracts import (
 
 _V1_MARKER = TermRowKind.V1.value
 _BOOLEAN_VALUES = {"false": False, "true": True}
+_MutationCounts = tuple[int, int, int, int, int]
 
 
 class TermbaseValidationError(ValueError):
@@ -69,6 +74,293 @@ class _CapturingLineIterator:
 class TermbaseStore:
     """Read and prepare atomic mutations for one mixed CSV termbase."""
 
+    def __init__(self) -> None:
+        self._prepared_counts: dict[PreparedTermMutation, _MutationCounts] = {}
+        self._commit_outcomes: dict[
+            PreparedTermMutation,
+            TermCommitOutcome,
+        ] = {}
+
+    def commit(self, prepared: PreparedTermMutation) -> TermCommitOutcome:
+        _validate_prepared_mutation(prepared)
+        previous_outcome = self._commit_outcomes.get(prepared)
+        if previous_outcome is not None and previous_outcome.state in (
+            TermCommitState.COMMITTED,
+            TermCommitState.ROLLED_BACK,
+            TermCommitState.INDETERMINATE,
+        ):
+            raise ValueError("terminal term commit outcome cannot be retried")
+
+        resource_path = prepared.resource_path
+        recovery_path = prepared.recovery_path
+        if recovery_path is None:
+            return self._remember_outcome(
+                prepared,
+                _failed_outcome(
+                    state=TermCommitState.NOT_COMMITTED,
+                    error_code="RECOVERY_UNAVAILABLE",
+                    retryable=False,
+                    recovery_path=None,
+                    safe_detail="Prepare the termbase change again before retrying.",
+                ),
+            )
+
+        try:
+            recovery_bytes = recovery_path.read_bytes()
+        except OSError:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "RECOVERY_READ_FAILED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
+        if hashlib.sha256(recovery_bytes).hexdigest() != prepared.base_digest:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "RECOVERY_CHANGED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
+
+        try:
+            staged_bytes = prepared.staged_path.read_bytes()
+            staged_records = self._records_from_bytes(staged_bytes)
+        except (OSError, TermbaseValidationError):
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "STAGED_READ_FAILED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
+        if staged_records != prepared.candidate_records:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "STAGED_CHANGED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
+        staged_digest = hashlib.sha256(staged_bytes).hexdigest()
+
+        try:
+            source_digest = _digest_path(resource_path)
+        except OSError:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "SOURCE_DIGEST_FAILED",
+                    "Reload the termbase and retry.",
+                ),
+            )
+        if source_digest != prepared.base_digest:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "SOURCE_CHANGED",
+                    "Reload the termbase and retry.",
+                ),
+            )
+
+        try:
+            os.replace(prepared.staged_path, resource_path)
+        except OSError:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "REPLACE_FAILED",
+                    "Retry the change or discard its prepared artifacts.",
+                ),
+            )
+
+        try:
+            _fsync_directory(resource_path.parent)
+        except Exception:
+            return self._rollback_after_commit_failure(
+                prepared=prepared,
+                recovery_bytes=recovery_bytes,
+                error_code="DIRECTORY_FSYNC_FAILED",
+            )
+
+        try:
+            committed_digest = _digest_path(resource_path)
+            if committed_digest != staged_digest:
+                raise RuntimeError("committed digest mismatch")
+            committed_records = self.list_records(resource_path)
+            if committed_records != prepared.candidate_records:
+                raise RuntimeError("committed records mismatch")
+            old_records = self._records_from_bytes(recovery_bytes)
+            counts = self._prepared_counts.get(
+                prepared,
+                _derive_mutation_counts(
+                    prepared.action,
+                    old_records,
+                    committed_records,
+                ),
+            )
+            report = TermMutationReport(
+                action=prepared.action,
+                resource_path=resource_path,
+                committed_digest=committed_digest,
+                records=committed_records,
+                created=counts[0],
+                updated=counts[1],
+                deleted=counts[2],
+                imported=counts[3],
+                overwritten=counts[4],
+            )
+        except Exception:
+            return self._rollback_after_commit_failure(
+                prepared=prepared,
+                recovery_bytes=recovery_bytes,
+                error_code="COMMIT_VERIFICATION_FAILED",
+            )
+
+        return self._remember_outcome(
+            prepared,
+            TermCommitOutcome(
+                state=TermCommitState.COMMITTED,
+                report=report,
+                error_code=None,
+                retryable=False,
+                recovery_path=recovery_path,
+                quarantined=False,
+                safe_detail=None,
+            ),
+        )
+
+    def discard(self, prepared: PreparedTermMutation) -> None:
+        _validate_prepared_mutation(prepared)
+        outcome = self._commit_outcomes.get(prepared)
+        if outcome is not None and outcome.state in (
+            TermCommitState.COMMITTED,
+            TermCommitState.INDETERMINATE,
+        ):
+            raise ValueError(
+                "committed or indeterminate term mutation cannot be discarded"
+            )
+
+        prepared.staged_path.unlink(missing_ok=True)
+        if prepared.recovery_path is not None:
+            prepared.recovery_path.unlink(missing_ok=True)
+        _fsync_directory(prepared.resource_path.parent)
+        _ = self._prepared_counts.pop(prepared, None)
+        _ = self._commit_outcomes.pop(prepared, None)
+
+    def finalize(
+        self,
+        prepared: PreparedTermMutation,
+        outcome: TermCommitOutcome,
+    ) -> TermCleanupReport:
+        _validate_prepared_mutation(prepared)
+        if not isinstance(outcome, TermCommitOutcome):
+            raise TypeError("term commit outcome must be a TermCommitOutcome")
+        recorded_outcome = self._commit_outcomes.get(prepared)
+        if (
+            outcome.state is not TermCommitState.COMMITTED
+            or recorded_outcome is not outcome
+        ):
+            raise ValueError("only the recorded committed outcome can be finalized")
+
+        recovery_path = prepared.recovery_path
+        if recovery_path is None:
+            _ = self._prepared_counts.pop(prepared, None)
+            _ = self._commit_outcomes.pop(prepared, None)
+            return TermCleanupReport(
+                cleaned=True,
+                recovery_path=None,
+                warning_code=None,
+            )
+
+        try:
+            recovery_path.unlink()
+        except OSError:
+            return TermCleanupReport(
+                cleaned=False,
+                recovery_path=recovery_path,
+                warning_code="RECOVERY_DELETE_FAILED",
+            )
+
+        _ = self._prepared_counts.pop(prepared, None)
+        _ = self._commit_outcomes.pop(prepared, None)
+        return TermCleanupReport(
+            cleaned=True,
+            recovery_path=None,
+            warning_code=None,
+        )
+
+    def _remember_outcome(
+        self,
+        prepared: PreparedTermMutation,
+        outcome: TermCommitOutcome,
+    ) -> TermCommitOutcome:
+        self._commit_outcomes[prepared] = outcome
+        return outcome
+
+    def _rollback_after_commit_failure(
+        self,
+        *,
+        prepared: PreparedTermMutation,
+        recovery_bytes: bytes,
+        error_code: str,
+    ) -> TermCommitOutcome:
+        rollback_path: Path | None = None
+        try:
+            rollback_path = _write_durable_temp(
+                prepared.resource_path.parent,
+                f".{prepared.resource_path.name}.rollback-",
+                recovery_bytes,
+            )
+            os.replace(rollback_path, prepared.resource_path)
+            rollback_path = None
+            _fsync_directory(prepared.resource_path.parent)
+        except Exception:
+            _cleanup_prepare_artifacts(rollback_path)
+            _best_effort_fsync_directory(prepared.resource_path.parent)
+            return self._remember_outcome(
+                prepared,
+                _indeterminate_outcome(prepared, "ROLLBACK_FAILED"),
+            )
+
+        try:
+            restored_digest = _digest_path(prepared.resource_path)
+        except OSError:
+            return self._remember_outcome(
+                prepared,
+                _indeterminate_outcome(
+                    prepared,
+                    "ROLLBACK_VERIFICATION_FAILED",
+                ),
+            )
+        if restored_digest != prepared.base_digest:
+            return self._remember_outcome(
+                prepared,
+                _indeterminate_outcome(
+                    prepared,
+                    "ROLLBACK_VERIFICATION_FAILED",
+                ),
+            )
+
+        return self._remember_outcome(
+            prepared,
+            _failed_outcome(
+                state=TermCommitState.ROLLED_BACK,
+                error_code=error_code,
+                retryable=True,
+                recovery_path=prepared.recovery_path,
+                safe_detail="The previous bytes were restored; retry the change.",
+            ),
+        )
+
     def prepare_create(
         self,
         path: Path,
@@ -104,13 +396,15 @@ class TermbaseStore:
                 "true",
             ]
         )
-        return self._prepare_artifacts(
+        prepared = self._prepare_artifacts(
             action="create",
             path=path,
             original=original,
             base_digest=base_digest,
             candidate_rows=candidate_rows,
         )
+        self._prepared_counts[prepared] = (1, 0, 0, 0, 0)
+        return prepared
 
     def prepare_update(
         self,
@@ -153,13 +447,15 @@ class TermbaseStore:
                 _format_bool(draft.match_case),
                 _format_bool(draft.whole_word),
             ]
-        return self._prepare_artifacts(
+        prepared = self._prepare_artifacts(
             action="update",
             path=path,
             original=original,
             base_digest=base_digest,
             candidate_rows=candidate_rows,
         )
+        self._prepared_counts[prepared] = (0, 1, 0, 0, 0)
+        return prepared
 
     def prepare_delete(
         self,
@@ -175,13 +471,15 @@ class TermbaseStore:
         )
         candidate_rows = _rows_from_records(records)
         del candidate_rows[row_ordinal]
-        return self._prepare_artifacts(
+        prepared = self._prepare_artifacts(
             action="delete",
             path=path,
             original=original,
             base_digest=base_digest,
             candidate_rows=candidate_rows,
         )
+        self._prepared_counts[prepared] = (0, 0, 1, 0, 0)
+        return prepared
 
     def prepare_merge_legacy(
         self,
@@ -215,13 +513,25 @@ class TermbaseStore:
             if source not in existing_sources:
                 candidate_rows.append([source, incoming_targets[source]])
 
-        return self._prepare_artifacts(
+        prepared = self._prepare_artifacts(
             action="merge_legacy",
             path=path,
             original=original,
             base_digest=base_digest,
             candidate_rows=candidate_rows,
         )
+        imported = len(incoming_targets)
+        overwritten = len(rows) - imported + sum(
+            source in existing_sources for source in incoming_targets
+        )
+        self._prepared_counts[prepared] = (
+            0,
+            0,
+            0,
+            imported,
+            overwritten,
+        )
+        return prepared
 
     def list_records(self, path: Path) -> tuple[TermRecord, ...]:
         """Return a fully validated immutable snapshot in file order."""
@@ -401,6 +711,89 @@ def _absolute_resource_path(path: Path) -> Path:
     if not isinstance(path, Path):
         raise TypeError("term resource path must be a Path")
     return Path(os.path.abspath(path))
+
+
+def _validate_prepared_mutation(prepared: object) -> None:
+    if not isinstance(prepared, PreparedTermMutation):
+        raise TypeError("prepared term mutation must be a PreparedTermMutation")
+
+
+def _digest_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _failed_outcome(
+    *,
+    state: TermCommitState,
+    error_code: str,
+    retryable: bool,
+    recovery_path: Path | None,
+    safe_detail: str,
+) -> TermCommitOutcome:
+    return TermCommitOutcome(
+        state=state,
+        report=None,
+        error_code=error_code,
+        retryable=retryable,
+        recovery_path=recovery_path,
+        quarantined=state is TermCommitState.INDETERMINATE,
+        safe_detail=safe_detail,
+    )
+
+
+def _not_committed_outcome(
+    prepared: PreparedTermMutation,
+    error_code: str,
+    safe_detail: str,
+) -> TermCommitOutcome:
+    return _failed_outcome(
+        state=TermCommitState.NOT_COMMITTED,
+        error_code=error_code,
+        retryable=True,
+        recovery_path=prepared.recovery_path,
+        safe_detail=safe_detail,
+    )
+
+
+def _indeterminate_outcome(
+    prepared: PreparedTermMutation,
+    error_code: str,
+) -> TermCommitOutcome:
+    return _failed_outcome(
+        state=TermCommitState.INDETERMINATE,
+        error_code=error_code,
+        retryable=False,
+        recovery_path=prepared.recovery_path,
+        safe_detail=(
+            "Quarantine the resource and restore it from the recovery file "
+            "before retrying."
+        ),
+    )
+
+
+def _derive_mutation_counts(
+    action: str,
+    old_records: tuple[TermRecord, ...],
+    committed_records: tuple[TermRecord, ...],
+) -> _MutationCounts:
+    if action == "create":
+        return (1, 0, 0, 0, 0)
+    if action == "update":
+        return (0, 1, 0, 0, 0)
+    if action == "delete":
+        return (0, 0, 1, 0, 0)
+    if action == "merge_legacy":
+        old_by_source = {record.source: record for record in old_records}
+        imported = sum(
+            record.source not in old_by_source for record in committed_records
+        )
+        overwritten = sum(
+            record.source in old_by_source
+            and record.target != old_by_source[record.source].target
+            for record in committed_records
+        )
+        return (0, 0, 0, imported, overwritten)
+    raise ValueError("unsupported prepared term mutation action")
 
 
 def _source_ordinal(
