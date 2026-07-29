@@ -1,0 +1,114 @@
+{
+  "fixture_version": "text-matcher-unicode-vectors-v1",
+  "unicode_version": "16.0.0",
+  "semantics_version": "text-v1-unicode-16.0.0",
+  "source_digests": {
+    "PropList.txt": "53d614508e2a0b2305a8aa21cd60d993de9326cdf65993660dfcce4503548583",
+    "Scripts.txt": "9e88f0a677df47311106340be8ede2ecdacd9c1c931831218d2be6d5508e0039",
+    "WordBreakProperty.txt": "476464e71a4b7b779b8ba7c5671f4338fea77da8e6b6b05fb82b3fdd14603779",
+    "emoji-data.txt": "f1365a5173eee18e1f98b240cdc492e84a25f1ce7e0c9d1094eb29c41a22696a"
+  },
+  "fold_vectors": [
+    {
+      "id": "ascii-case",
+      "raw": "Office",
+      "folded": "office",
+      "source_spans": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6]]
+    },
+    {
+      "id": "sharp-s-expansion",
+      "raw": "Straße",
+      "folded": "strasse",
+      "source_spans": [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [4, 5], [5, 6]]
+    },
+    {
+      "id": "whole-string-nfc-composition",
+      "raw": "Café",
+      "folded": "café",
+      "source_spans": [[0, 1], [1, 2], [2, 3], [3, 5]]
+    },
+    {
+      "id": "fold-expansion-with-mark",
+      "raw": "İ",
+      "folded": "i̇",
+      "source_spans": [[0, 1], [0, 1]]
+    },
+    {
+      "id": "canonical-reordering",
+      "raw": "ạ́",
+      "folded": "ạ́",
+      "source_spans": [[0, 3], [1, 2]]
+    },
+    {
+      "id": "hangul-composition",
+      "raw": "각",
+      "folded": "각",
+      "source_spans": [[0, 3]]
+    },
+    {
+      "id": "blocked-composition-keeps-provenance",
+      "raw": "ẛ̣",
+      "folded": "ṩ",
+      "source_spans": [[0, 1], [1, 2]]
+    }
+  ],
+  "projection_vectors": [
+    {
+      "id": "expanded-fold-collapses-to-one-source",
+      "raw": "Straße",
+      "folded_start": 4,
+      "folded_end": 6,
+      "source_span": [4, 5]
+    },
+    {
+      "id": "composed-fold-covers-combining-sequence",
+      "raw": "Café",
+      "folded_start": 3,
+      "folded_end": 4,
+      "source_span": [3, 5]
+    },
+    {
+      "id": "empty-folded-range-has-no-source-span",
+      "raw": "Office",
+      "folded_start": 2,
+      "folded_end": 2,
+      "source_span": null
+    }
+  ],
+  "word_boundary_vectors": [
+    {"id": "empty", "text": "", "boundaries": []},
+    {"id": "letters", "text": "office", "boundaries": [0, 6]},
+    {"id": "apostrophe", "text": "can't", "boundaries": [0, 5]},
+    {"id": "decimal", "text": "3.2", "boundaries": [0, 3]},
+    {"id": "underscore", "text": "foo_bar", "boundaries": [0, 7]},
+    {"id": "combining", "text": "á", "boundaries": [0, 2]},
+    {"id": "hyphen", "text": "foo-bar", "boundaries": [0, 3, 4, 7]},
+    {"id": "horizontal-space-run", "text": "a  b", "boundaries": [0, 1, 3, 4]},
+    {"id": "emoji-zwj", "text": "👩‍💻", "boundaries": [0, 3]},
+    {"id": "regional-indicator-pairs", "text": "🇨🇳🇯🇵", "boundaries": [0, 2, 4]},
+    {"id": "mixed-latin-han", "text": "abc中文", "boundaries": [0, 3, 4, 5]},
+    {"id": "format-in-word", "text": "a‎b", "boundaries": [0, 3]},
+    {"id": "initial-format", "text": "‎a", "boundaries": [0, 1, 2]},
+    {"id": "newline", "text": "a\r\nb", "boundaries": [0, 1, 3, 4]}
+  ],
+  "pure_cjk_vectors": [
+    {"id": "han", "query": "中文", "expected": true},
+    {"id": "hiragana", "query": "かな", "expected": true},
+    {"id": "katakana", "query": "カナ", "expected": true},
+    {"id": "hangul", "query": "한글", "expected": true},
+    {"id": "mixed-cjk-bases", "query": "漢かなカナ한", "expected": true},
+    {"id": "attached-combining", "query": "が", "expected": true},
+    {"id": "attached-variation-selector", "query": "漢️", "expected": true},
+    {"id": "attached-zwj", "query": "漢‍字", "expected": true},
+    {"id": "empty", "query": "", "expected": false},
+    {"id": "leading-combining", "query": "́漢", "expected": false},
+    {"id": "leading-variation-selector", "query": "️漢", "expected": false},
+    {"id": "space", "query": "中 文", "expected": false},
+    {"id": "punctuation", "query": "中文。", "expected": false},
+    {"id": "digit", "query": "中文2", "expected": false},
+    {"id": "latin", "query": "A中文", "expected": false},
+    {"id": "emoji", "query": "中文😀", "expected": false},
+    {"id": "common-prolonged-mark", "query": "カー", "expected": false},
+    {"id": "mixed-script", "query": "office办公室", "expected": false}
+  ]
+}

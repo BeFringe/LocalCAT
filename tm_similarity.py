@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-import unicodedata
 
+from text_matcher import fold_text_v1
 from tm_contracts import SCORER_VERSION_V1, SimilarityEvidence
 
 
@@ -43,7 +43,7 @@ class SimilarityScorerV1:
 def _fold_v1(raw: str, label: str) -> str:
     if not isinstance(raw, str):
         raise TypeError(f"{label} must be a string")
-    return unicodedata.normalize("NFC", raw).casefold()
+    return fold_text_v1(raw).folded_text
 
 
 def _levenshtein_distance(query: str, candidate: str) -> int:

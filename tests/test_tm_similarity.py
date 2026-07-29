@@ -205,6 +205,14 @@ class SimilarityScorerV1Tests(unittest.TestCase):
                 )
                 self.assertEqual(repeated, (expected,) * repeat_count)
 
+    def test_blocked_canonical_composition_self_score_is_exact(self) -> None:
+        raw = "\u1E9B\u0323"
+        evidence = _SCORER.score(raw, raw)
+        self.assertEqual(
+            evidence,
+            SimilarityEvidence(1.0, 1.0, 1.0),
+        )
+
     def test_non_string_inputs_are_rejected(self) -> None:
         with self.assertRaisesRegex(TypeError, "^query must be a string$"):
             _SCORER.score(cast(Any, 1), "candidate")

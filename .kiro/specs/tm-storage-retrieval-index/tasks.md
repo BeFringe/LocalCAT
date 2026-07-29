@@ -42,7 +42,7 @@
   - _Boundary: SimilarityScorerV1_
   - _Depends: 1.1_
 
-- [ ] 2.2 (P) 实现固定版本 Unicode 折叠、词界与纯 CJK 分类
+- [x] 2.2 (P) 实现固定版本 Unicode 折叠、词界与纯 CJK 分类
   - 使用固定语义版本的数据处理 case-fold expansion、原文 span 投影和 Unicode word-boundary，不依赖宿主正则词界
   - 纯 CJK 仅接受 Han、Hiragana、Katakana、Hangul；附着标记、ZWJ 和变体选择符只能跟随基字符
   - 完成时，数字、下划线、标点、组合字符、emoji、混合脚本和纯 CJK 分类黄金样例稳定通过
@@ -357,3 +357,4 @@
 - 2026-07-29 / Task 1.4：冻结 matcher 三态 capability、用途/选项矩阵、请求摘要与无正文 outcome；公开 strict codec 与内部 validation manifest codec 分离，required cohort 与 evidence 精确闭合且消费方不能反推 readiness。独立复审通过；focused 30/30、全量 165/165、basedpyright 0 errors。
 - 2026-07-29 / Task 1.5：冻结 candidate-budget-v1、召回/去重/截断/资源结果守恒与 benchmark-v1 双路径 suite；minimum 与实际 cohort count 分离，composition/digest/path/硬门均由 strict codec 闭合，真实 benchmark artifact 留给 Task 8.1 生成。独立复审第二轮通过；focused 32/32、全量 182/182、basedpyright 0 errors。
 - 2026-07-29 / Task 2.1：实现纯 `SimilarityScorerV1`，固定 NFC→casefold、Unicode code-point Levenshtein、多重集字符 bigram Dice 与未舍入算术平均；版本化黄金向量逐项绑定 folded 文本、距离、gram 计数、分项和最终分数，不夹带召回、阈值、排序或存储行为。独立复审通过；focused 6/6（22 subtests）、全量 188/188（161 subtests）、basedpyright 0 errors。
+- 2026-07-29 / Task 2.2：固定 Unicode 16.0.0/UAX #29 rev.45 属性表、来源摘要与运行时 fail-closed 闸门，实现带原文 provenance 的 whole-string NFC/casefold 投影、默认词界和严格 pure-CJK 分类；第一轮 canonical blocking 缺陷经独立复审拦截后改为标准 composition 状态机，并以完整 NormalizationTest 99,825 输入、WordBreakTest 1,826 向量和 scorer 回归闭合。独立复审第二轮通过；focused 15/15（1,890 subtests）、全量 197/197（2,029 subtests）、basedpyright 0 errors。
