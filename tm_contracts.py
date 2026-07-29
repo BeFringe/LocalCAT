@@ -348,6 +348,16 @@ def _validate_similarity_evidence(
         raise ValueError(f"scorer version must be {SCORER_VERSION_V1}")
 
 
+class SimilarityScorer(Protocol):
+    """Storage-independent scorer port for one query/candidate pair."""
+
+    def score(
+        self,
+        query: str,
+        candidate: str,
+    ) -> SimilarityEvidence: ...
+
+
 @dataclass(frozen=True)
 class ContextEvidence:
     """Raw context comparison facts for exact-source variants."""
@@ -6379,6 +6389,7 @@ __all__ = [
     "SearchOptions",
     "SealedStage",
     "SimilarityEvidence",
+    "SimilarityScorer",
     "SnapshotBinding",
     "SnapshotKind",
     "SnapshotManifest",

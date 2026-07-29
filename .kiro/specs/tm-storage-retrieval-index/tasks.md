@@ -34,7 +34,7 @@
 
 - [ ] 2. 实现无存储依赖的匹配与评分算法
 
-- [ ] 2.1 (P) 实现 similarity-v1 确定性评分
+- [x] 2.1 (P) 实现 similarity-v1 确定性评分
   - 实现 Levenshtein ratio 与多重集字符 bigram Dice，保留两个分项并以算术平均产生最终分数
   - 覆盖空串、单字符、重复字符、Unicode、阈值边界和重复执行稳定性
   - 完成时，版本化黄金样例的距离、gram 计数、两个分项和最终分数逐项一致
@@ -356,3 +356,4 @@
 - 2026-07-29 / Task 1.3：冻结迁移、导出与 schema upgrade 的显式成功/失败联合结果，使用 digest-backed 资产保持证据与无权限恢复定位替代可伪造布尔断言；strict codec 在编码与解码边界递归重验 lineage、计数和嵌套证据。独立复审通过；focused 38/38、全量 150/150、basedpyright 0 errors。
 - 2026-07-29 / Task 1.4：冻结 matcher 三态 capability、用途/选项矩阵、请求摘要与无正文 outcome；公开 strict codec 与内部 validation manifest codec 分离，required cohort 与 evidence 精确闭合且消费方不能反推 readiness。独立复审通过；focused 30/30、全量 165/165、basedpyright 0 errors。
 - 2026-07-29 / Task 1.5：冻结 candidate-budget-v1、召回/去重/截断/资源结果守恒与 benchmark-v1 双路径 suite；minimum 与实际 cohort count 分离，composition/digest/path/硬门均由 strict codec 闭合，真实 benchmark artifact 留给 Task 8.1 生成。独立复审第二轮通过；focused 32/32、全量 182/182、basedpyright 0 errors。
+- 2026-07-29 / Task 2.1：实现纯 `SimilarityScorerV1`，固定 NFC→casefold、Unicode code-point Levenshtein、多重集字符 bigram Dice 与未舍入算术平均；版本化黄金向量逐项绑定 folded 文本、距离、gram 计数、分项和最终分数，不夹带召回、阈值、排序或存储行为。独立复审通过；focused 6/6（22 subtests）、全量 188/188（161 subtests）、basedpyright 0 errors。
