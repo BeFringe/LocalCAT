@@ -11,16 +11,27 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import math
+from pathlib import Path
 import re
 from typing import Any, Mapping, Protocol
 
 
 TM_CONTRACT_CODEC_VERSION = 1
 SCORER_VERSION_V1 = "scorer-v1"
+CANONICAL_RESOURCE_IDENTITY_VERSION = "canonical-resource-v1"
+SNAPSHOT_FORMAT_VERSION = "localcat-jsonl-v1"
+SNAPSHOT_MANIFEST_VERSION = "snapshot-manifest-v1"
+SNAPSHOT_BINDING_VERSION = "snapshot-binding-v1"
+STAGE_VALIDATION_EVIDENCE_VERSION = "stage-validation-v1"
+GENERATION_EXPECTATION_VERSION = "generation-expectation-v1"
+ACTIVATION_TOKEN_VERSION = "activation-token-v1"
 
 _DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\Z")
+_SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_RUNTIME_CAPABILITY_FACTORY_KEY = object()
 _CONTEXT_FIELDS = (
     "speaker_raw",
     "context_prev_raw",
@@ -120,6 +131,29 @@ def _require_diagnostic_identifier(value: object, field_name: str) -> None:
         raise ValueError(
             f"{field_name} must be a safe diagnostic identifier, not message text"
         )
+
+
+def _require_digest(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or _SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+
+
+def _require_absolute_path(value: object, field_name: str) -> None:
+    if not isinstance(value, Path):
+        raise TypeError(f"{field_name} must be a Path")
+    if not value.is_absolute() or ".." in value.parts:
+        raise ValueError(f"{field_name} must be an absolute normalized path")
+
+
+def _stable_digest(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -494,6 +528,843 @@ class QueryReport:
             )
 
 
+@dataclass(frozen=True)
+class CanonicalResourceIdentity:
+    """Stable resource and deterministic adjacent sidecar identity."""
+
+    resource_id: str
+    configured_jsonl_path: Path
+    canonical_sidecar_path: Path
+    snapshot_manifest_path: Path
+    target_identity: str
+    identity_version: str = CANONICAL_RESOURCE_IDENTITY_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_canonical_resource_identity(self)
+
+    @classmethod
+    def from_configured_jsonl(
+        cls,
+        resource_id: str,
+        configured_jsonl_path: Path,
+    ) -> CanonicalResourceIdentity:
+        _require_identity(resource_id, "resource id")
+        _require_absolute_path(
+            configured_jsonl_path,
+            "configured JSONL path",
+        )
+        sidecar = configured_jsonl_path.with_name(
+            f"{configured_jsonl_path.name}.sqlite3"
+        )
+        manifest = configured_jsonl_path.with_name(
+            f"{configured_jsonl_path.name}.localcat-snapshot.json"
+        )
+        target_identity = _canonical_target_identity(
+            resource_id,
+            configured_jsonl_path,
+            sidecar,
+            manifest,
+        )
+        return cls(
+            resource_id=resource_id,
+            configured_jsonl_path=configured_jsonl_path,
+            canonical_sidecar_path=sidecar,
+            snapshot_manifest_path=manifest,
+            target_identity=target_identity,
+        )
+
+
+def _canonical_target_identity(
+    resource_id: str,
+    configured_jsonl_path: Path,
+    canonical_sidecar_path: Path,
+    snapshot_manifest_path: Path,
+) -> str:
+    return _stable_digest(
+        {
+            "configured_jsonl_path": str(configured_jsonl_path),
+            "identity_version": CANONICAL_RESOURCE_IDENTITY_VERSION,
+            "resource_id": resource_id,
+            "sidecar_path": str(canonical_sidecar_path),
+            "snapshot_manifest_path": str(snapshot_manifest_path),
+        }
+    )
+
+
+def _validate_canonical_resource_identity(
+    identity: CanonicalResourceIdentity,
+) -> None:
+    _require_identity(identity.resource_id, "resource id")
+    _require_absolute_path(
+        identity.configured_jsonl_path,
+        "configured JSONL path",
+    )
+    _require_absolute_path(
+        identity.canonical_sidecar_path,
+        "canonical sidecar path",
+    )
+    _require_absolute_path(
+        identity.snapshot_manifest_path,
+        "snapshot manifest path",
+    )
+    if identity.identity_version != CANONICAL_RESOURCE_IDENTITY_VERSION:
+        raise ValueError("unsupported canonical resource identity version")
+    expected_sidecar = identity.configured_jsonl_path.with_name(
+        f"{identity.configured_jsonl_path.name}.sqlite3"
+    )
+    if identity.canonical_sidecar_path != expected_sidecar:
+        raise ValueError("canonical sidecar path is not deterministic")
+    expected_manifest = identity.configured_jsonl_path.with_name(
+        f"{identity.configured_jsonl_path.name}.localcat-snapshot.json"
+    )
+    if identity.snapshot_manifest_path != expected_manifest:
+        raise ValueError("snapshot manifest path is not deterministic")
+    expected_target = _canonical_target_identity(
+        identity.resource_id,
+        identity.configured_jsonl_path,
+        identity.canonical_sidecar_path,
+        identity.snapshot_manifest_path,
+    )
+    if identity.target_identity != expected_target:
+        raise ValueError("canonical target identity does not match resource")
+
+
+class SnapshotKind(str, Enum):
+    """Supported canonical ancestry snapshot purposes."""
+
+    MIGRATION_SOURCE = "MIGRATION_SOURCE"
+    EXPLICIT_EXPORT = "EXPLICIT_EXPORT"
+
+
+class SourceBindingState(str, Enum):
+    """Observed relationship between canonical history and configured JSONL."""
+
+    VERIFIED_CURRENT = "VERIFIED_CURRENT"
+    VERIFIED_HISTORY = "VERIFIED_HISTORY"
+    SOURCE_DIVERGED = "SOURCE_DIVERGED"
+
+
+@dataclass(frozen=True)
+class SnapshotReceipt:
+    """Portable ancestry receipt for one immutable JSONL snapshot."""
+
+    snapshot_id: str
+    resource_id: str
+    canonical_store_id: str
+    exported_revision: int
+    jsonl_digest: str
+    record_count: int
+    format_version: str = SNAPSHOT_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_snapshot_receipt(self)
+
+
+def _validate_snapshot_receipt(receipt: SnapshotReceipt) -> None:
+    _require_identity(receipt.snapshot_id, "snapshot id")
+    _require_identity(receipt.resource_id, "snapshot resource id")
+    _require_identity(receipt.canonical_store_id, "canonical store id")
+    _require_int(receipt.exported_revision, "exported revision", minimum=0)
+    _require_digest(receipt.jsonl_digest, "JSONL digest")
+    _require_int(receipt.record_count, "snapshot record count", minimum=0)
+    if receipt.format_version != SNAPSHOT_FORMAT_VERSION:
+        raise ValueError("unsupported snapshot format version")
+
+
+def snapshot_receipt_digest(receipt: SnapshotReceipt) -> str:
+    """Return the portable digest shared by receipt, manifest, and ledger."""
+
+    if not isinstance(receipt, SnapshotReceipt):
+        raise TypeError("receipt must be SnapshotReceipt")
+    _validate_snapshot_receipt(receipt)
+    return _stable_digest(
+        {
+            "canonical_store_id": receipt.canonical_store_id,
+            "exported_revision": receipt.exported_revision,
+            "format_version": receipt.format_version,
+            "jsonl_digest": receipt.jsonl_digest,
+            "record_count": receipt.record_count,
+            "resource_id": receipt.resource_id,
+            "snapshot_id": receipt.snapshot_id,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class SnapshotManifest:
+    """Portable adjacent manifest content for a snapshot receipt."""
+
+    manifest_version: str
+    snapshot_kind: SnapshotKind
+    receipt: SnapshotReceipt
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_snapshot_manifest(self)
+
+
+def _validate_snapshot_manifest(manifest: SnapshotManifest) -> None:
+    if manifest.manifest_version != SNAPSHOT_MANIFEST_VERSION:
+        raise ValueError("unsupported snapshot manifest version")
+    if not isinstance(manifest.snapshot_kind, SnapshotKind):
+        raise TypeError("snapshot kind must be SnapshotKind")
+    if not isinstance(manifest.receipt, SnapshotReceipt):
+        raise TypeError("manifest receipt must be SnapshotReceipt")
+    _validate_snapshot_receipt(manifest.receipt)
+    _require_digest(manifest.receipt_digest, "receipt digest")
+    if manifest.receipt_digest != snapshot_receipt_digest(manifest.receipt):
+        raise ValueError("snapshot manifest receipt digest does not match")
+
+
+@dataclass(frozen=True)
+class SnapshotBinding:
+    """Configured JSONL, adjacent manifest, and canonical ancestry pair."""
+
+    configured_jsonl_path: Path
+    manifest_path: Path
+    snapshot_kind: SnapshotKind
+    receipt: SnapshotReceipt
+    manifest: SnapshotManifest
+    binding_version: str = SNAPSHOT_BINDING_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_snapshot_binding(self)
+
+
+def _validate_snapshot_binding(binding: SnapshotBinding) -> None:
+    _require_absolute_path(
+        binding.configured_jsonl_path,
+        "binding configured JSONL path",
+    )
+    _require_absolute_path(binding.manifest_path, "binding manifest path")
+    expected_manifest = binding.configured_jsonl_path.with_name(
+        f"{binding.configured_jsonl_path.name}.localcat-snapshot.json"
+    )
+    if binding.manifest_path != expected_manifest:
+        raise ValueError("binding manifest path is not deterministic")
+    if binding.binding_version != SNAPSHOT_BINDING_VERSION:
+        raise ValueError("unsupported snapshot binding version")
+    if not isinstance(binding.snapshot_kind, SnapshotKind):
+        raise TypeError("binding snapshot kind must be SnapshotKind")
+    if not isinstance(binding.receipt, SnapshotReceipt):
+        raise TypeError("binding receipt must be SnapshotReceipt")
+    if not isinstance(binding.manifest, SnapshotManifest):
+        raise TypeError("binding manifest must be SnapshotManifest")
+    _validate_snapshot_receipt(binding.receipt)
+    _validate_snapshot_manifest(binding.manifest)
+    if binding.snapshot_kind is not binding.manifest.snapshot_kind:
+        raise ValueError("binding and manifest snapshot kinds do not match")
+    if binding.receipt != binding.manifest.receipt:
+        raise ValueError("binding and manifest must carry the same receipt")
+
+
+@dataclass(frozen=True)
+class StageValidationEvidence:
+    """Complete, versioned validation facts for a mutable stage."""
+
+    evidence_version: str
+    resource_id: str
+    target_identity: str
+    source_binding: SnapshotBinding
+    snapshot_receipt_digest: str
+    manifest_temp_digest: str
+    schema_version: int
+    fold_version: str
+    index_version: str
+    record_count: int
+    origin_batch_count: int
+    fts_count: int
+    gram_counts: tuple[tuple[int, int], ...]
+    exact_parity_digest: str
+    integrity_ok: bool
+    foreign_keys_ok: bool
+    stage_file_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_stage_validation_evidence(self)
+
+
+def _validate_stage_validation_evidence(
+    evidence: StageValidationEvidence,
+) -> None:
+    if evidence.evidence_version != STAGE_VALIDATION_EVIDENCE_VERSION:
+        raise ValueError("unsupported stage validation evidence version")
+    _require_identity(evidence.resource_id, "stage resource id")
+    _require_digest(evidence.target_identity, "stage target identity")
+    if not isinstance(evidence.source_binding, SnapshotBinding):
+        raise TypeError("stage source binding must be SnapshotBinding")
+    _validate_snapshot_binding(evidence.source_binding)
+    receipt = evidence.source_binding.receipt
+    if evidence.resource_id != receipt.resource_id:
+        raise ValueError("stage and source binding resource identities differ")
+    _require_digest(evidence.snapshot_receipt_digest, "snapshot receipt digest")
+    if evidence.snapshot_receipt_digest != snapshot_receipt_digest(receipt):
+        raise ValueError("stage snapshot receipt digest does not match ancestry")
+    _require_digest(evidence.manifest_temp_digest, "manifest temporary digest")
+    _require_int(evidence.schema_version, "stage schema version", minimum=1)
+    _require_identity(evidence.fold_version, "stage fold version")
+    _require_identity(evidence.index_version, "stage index version")
+    _require_int(evidence.record_count, "stage record count", minimum=0)
+    if evidence.record_count != receipt.record_count:
+        raise ValueError("stage record count does not match snapshot receipt")
+    _require_int(
+        evidence.origin_batch_count,
+        "stage origin batch count",
+        minimum=0,
+    )
+    _require_int(evidence.fts_count, "stage FTS count", minimum=0)
+    if evidence.fts_count > evidence.record_count:
+        raise ValueError("stage FTS count cannot exceed record count")
+    gram_counts = _require_tuple(evidence.gram_counts, "stage gram counts")
+    gram_sizes: list[int] = []
+    for pair in gram_counts:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise TypeError("stage gram counts must contain integer pairs")
+        gram_size, gram_count = pair
+        _require_int(gram_size, "stage gram size", minimum=1)
+        _require_int(gram_count, "stage gram count", minimum=0)
+        gram_sizes.append(gram_size)
+    if gram_sizes != sorted(set(gram_sizes)):
+        raise ValueError("stage gram sizes must be unique and ordered")
+    _require_digest(evidence.exact_parity_digest, "exact parity digest")
+    _require_bool(evidence.integrity_ok, "stage integrity status")
+    _require_bool(evidence.foreign_keys_ok, "stage foreign-key status")
+    if not evidence.integrity_ok:
+        raise ValueError("stage integrity validation must pass")
+    if not evidence.foreign_keys_ok:
+        raise ValueError("stage foreign-key validation must pass")
+    _require_digest(evidence.stage_file_digest, "stage file digest")
+
+
+@dataclass(frozen=True)
+class MutableStageRef:
+    """Path-bearing working-stage shape that is never activation authority."""
+
+    stage_id: str
+    resource_identity: CanonicalResourceIdentity
+    staged_db_path: Path
+    manifest_temp_path: Path
+
+    def __post_init__(self) -> None:
+        _require_identity(self.stage_id, "mutable stage id")
+        if not isinstance(self.resource_identity, CanonicalResourceIdentity):
+            raise TypeError("mutable stage resource identity is invalid")
+        _validate_canonical_resource_identity(self.resource_identity)
+        _require_absolute_path(self.staged_db_path, "staged database path")
+        _require_absolute_path(
+            self.manifest_temp_path,
+            "manifest temporary path",
+        )
+        if (
+            self.staged_db_path.parent
+            != self.resource_identity.canonical_sidecar_path.parent
+        ):
+            raise ValueError(
+                "staged database must be adjacent to canonical sidecar"
+            )
+        if (
+            self.manifest_temp_path.parent
+            != self.resource_identity.snapshot_manifest_path.parent
+        ):
+            raise ValueError(
+                "temporary manifest must be adjacent to final manifest"
+            )
+        if self.staged_db_path == self.resource_identity.canonical_sidecar_path:
+            raise ValueError("mutable stage cannot be the canonical sidecar")
+        if (
+            self.manifest_temp_path
+            == self.resource_identity.snapshot_manifest_path
+        ):
+            raise ValueError(
+                "temporary manifest cannot be the published manifest"
+            )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _SealedArtifactRef:
+    """Module-private opaque reference created only by the sealing seam."""
+
+    registry_namespace: str
+    artifact_id: str
+    seal_digest: str
+
+    def __init__(
+        self,
+        *,
+        registry_namespace: str,
+        artifact_id: str,
+        seal_digest: str,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _RUNTIME_CAPABILITY_FACTORY_KEY:
+            raise TypeError(
+                "sealed artifact refs require the module-private factory"
+            )
+        _require_identity(registry_namespace, "registry namespace")
+        _require_identity(artifact_id, "artifact id")
+        _require_digest(seal_digest, "artifact seal digest")
+        object.__setattr__(self, "registry_namespace", registry_namespace)
+        object.__setattr__(self, "artifact_id", artifact_id)
+        object.__setattr__(self, "seal_digest", seal_digest)
+
+
+@dataclass(frozen=True)
+class GenerationExpectation:
+    """Expected prior generation and lineage; does not publish a next one."""
+
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    expectation_version: str = GENERATION_EXPECTATION_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_generation_expectation(self)
+
+
+def _validate_generation_expectation(
+    expectation: GenerationExpectation,
+) -> None:
+    _require_identity(expectation.resource_id, "generation resource id")
+    _require_digest(expectation.target_identity, "generation target identity")
+    _require_identity(
+        expectation.canonical_store_id,
+        "generation canonical store id",
+    )
+    _require_digest(
+        expectation.snapshot_receipt_digest,
+        "generation snapshot receipt digest",
+    )
+    if expectation.expected_prior_generation is not None:
+        _require_int(
+            expectation.expected_prior_generation,
+            "expected prior generation",
+            minimum=0,
+        )
+    if expectation.expectation_version != GENERATION_EXPECTATION_VERSION:
+        raise ValueError("unsupported generation expectation version")
+
+
+def stage_validation_evidence_digest(
+    evidence: StageValidationEvidence,
+) -> str:
+    """Digest the complete portable validation and ancestry facts."""
+
+    _validate_stage_validation_evidence(evidence)
+    return _stable_digest(
+        {
+            "evidence_version": evidence.evidence_version,
+            "exact_parity_digest": evidence.exact_parity_digest,
+            "fold_version": evidence.fold_version,
+            "foreign_keys_ok": evidence.foreign_keys_ok,
+            "fts_count": evidence.fts_count,
+            "gram_counts": [list(pair) for pair in evidence.gram_counts],
+            "index_version": evidence.index_version,
+            "integrity_ok": evidence.integrity_ok,
+            "manifest_temp_digest": evidence.manifest_temp_digest,
+            "origin_batch_count": evidence.origin_batch_count,
+            "record_count": evidence.record_count,
+            "resource_id": evidence.resource_id,
+            "schema_version": evidence.schema_version,
+            "snapshot_receipt_digest": evidence.snapshot_receipt_digest,
+            "source_binding": {
+                "binding_version": (
+                    evidence.source_binding.binding_version
+                ),
+                "configured_jsonl_path": str(
+                    evidence.source_binding.configured_jsonl_path
+                ),
+                "manifest_path": str(evidence.source_binding.manifest_path),
+                "manifest_receipt_digest": (
+                    evidence.source_binding.manifest.receipt_digest
+                ),
+                "manifest_version": (
+                    evidence.source_binding.manifest.manifest_version
+                ),
+                "snapshot_kind": evidence.source_binding.snapshot_kind.value,
+            },
+            "stage_file_digest": evidence.stage_file_digest,
+            "target_identity": evidence.target_identity,
+        }
+    )
+
+
+def _artifact_seal_digest(
+    *,
+    registry_namespace: str,
+    artifact_id: str,
+    mutable_stage: MutableStageRef,
+    evidence: StageValidationEvidence,
+) -> str:
+    """Pure digest helper for a registry's private sealed entry."""
+
+    _require_identity(registry_namespace, "registry namespace")
+    _require_identity(artifact_id, "artifact id")
+    if not isinstance(mutable_stage, MutableStageRef):
+        raise TypeError("artifact sealing requires MutableStageRef")
+    if not isinstance(evidence, StageValidationEvidence):
+        raise TypeError("artifact sealing requires StageValidationEvidence")
+    _validate_stage_validation_evidence(evidence)
+    identity = mutable_stage.resource_identity
+    if (
+        evidence.resource_id != identity.resource_id
+        or evidence.target_identity != identity.target_identity
+        or evidence.source_binding.configured_jsonl_path
+        != identity.configured_jsonl_path
+        or evidence.source_binding.manifest_path
+        != identity.snapshot_manifest_path
+    ):
+        raise ValueError("stage evidence does not match resource identity")
+    return _stable_digest(
+        {
+            "artifact_id": artifact_id,
+            "canonical_store_id": (
+                evidence.source_binding.receipt.canonical_store_id
+            ),
+            "evidence_digest": stage_validation_evidence_digest(evidence),
+            "manifest_temp_path": str(mutable_stage.manifest_temp_path),
+            "registry_namespace": registry_namespace,
+            "resource_id": evidence.resource_id,
+            "staged_db_path": str(mutable_stage.staged_db_path),
+            "target_identity": evidence.target_identity,
+        }
+    )
+
+
+def _sealed_stage_contract_digest(
+    *,
+    artifact: _SealedArtifactRef,
+    evidence: StageValidationEvidence,
+    generation: GenerationExpectation,
+    activation_nonce: str,
+) -> str:
+    """Bind registry, artifact, lineage, evidence, nonce, and generation."""
+
+    if not isinstance(artifact, _SealedArtifactRef):
+        raise TypeError("sealed stage artifact is invalid")
+    if not isinstance(evidence, StageValidationEvidence):
+        raise TypeError("sealed stage evidence is invalid")
+    if not isinstance(generation, GenerationExpectation):
+        raise TypeError("sealed stage generation expectation is invalid")
+    _validate_stage_validation_evidence(evidence)
+    _validate_generation_expectation(generation)
+    _require_identity(activation_nonce, "activation nonce")
+    receipt = evidence.source_binding.receipt
+    if (
+        generation.resource_id != evidence.resource_id
+        or generation.target_identity != evidence.target_identity
+        or generation.canonical_store_id != receipt.canonical_store_id
+        or generation.snapshot_receipt_digest
+        != evidence.snapshot_receipt_digest
+    ):
+        raise ValueError("sealed stage generation lineage does not close")
+    return _stable_digest(
+        {
+            "activation_nonce": activation_nonce,
+            "artifact_id": artifact.artifact_id,
+            "artifact_seal_digest": artifact.seal_digest,
+            "canonical_store_id": generation.canonical_store_id,
+            "evidence_digest": stage_validation_evidence_digest(evidence),
+            "expected_prior_generation": (
+                generation.expected_prior_generation
+            ),
+            "registry_namespace": artifact.registry_namespace,
+            "resource_id": generation.resource_id,
+            "snapshot_receipt_digest": (
+                generation.snapshot_receipt_digest
+            ),
+            "target_identity": generation.target_identity,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class SealedStage:
+    """Closed stage shape whose authority still depends on registry membership."""
+
+    artifact: _SealedArtifactRef
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
+    activation_nonce: str
+    sealed_stage_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_sealed_stage(self)
+
+    @property
+    def expected_prior_generation(self) -> int | None:
+        return self.generation.expected_prior_generation
+
+
+def _validate_sealed_stage(stage: SealedStage) -> None:
+    _require_digest(stage.sealed_stage_digest, "sealed stage digest")
+    expected_digest = _sealed_stage_contract_digest(
+        artifact=stage.artifact,
+        evidence=stage.evidence,
+        generation=stage.generation,
+        activation_nonce=stage.activation_nonce,
+    )
+    if stage.sealed_stage_digest != expected_digest:
+        raise ValueError("sealed stage digest does not close")
+
+
+def _create_sealed_stage(
+    *,
+    registry_namespace: str,
+    artifact_id: str,
+    mutable_stage: MutableStageRef,
+    evidence: StageValidationEvidence,
+    generation: GenerationExpectation,
+    activation_nonce: str,
+) -> SealedStage:
+    """Module-private StageSealer seam; it does not grant registry authority."""
+
+    seal_digest = _artifact_seal_digest(
+        registry_namespace=registry_namespace,
+        artifact_id=artifact_id,
+        mutable_stage=mutable_stage,
+        evidence=evidence,
+    )
+    artifact = _SealedArtifactRef(
+        registry_namespace=registry_namespace,
+        artifact_id=artifact_id,
+        seal_digest=seal_digest,
+        _factory_key=_RUNTIME_CAPABILITY_FACTORY_KEY,
+    )
+    sealed_stage_digest = _sealed_stage_contract_digest(
+        artifact=artifact,
+        evidence=evidence,
+        generation=generation,
+        activation_nonce=activation_nonce,
+    )
+    return SealedStage(
+        artifact=artifact,
+        evidence=evidence,
+        generation=generation,
+        activation_nonce=activation_nonce,
+        sealed_stage_digest=sealed_stage_digest,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _ActivationToken:
+    """Module-private token shape created only by the coordinator seam."""
+
+    token_id: str
+    registry_namespace: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    activation_nonce: str
+    token_version: str = ACTIVATION_TOKEN_VERSION
+
+    def __init__(
+        self,
+        *,
+        token_id: str,
+        registry_namespace: str,
+        resource_id: str,
+        target_identity: str,
+        canonical_store_id: str,
+        artifact_id: str,
+        artifact_seal_digest: str,
+        sealed_stage_digest: str,
+        snapshot_receipt_digest: str,
+        expected_prior_generation: int | None,
+        activation_nonce: str,
+        token_version: str = ACTIVATION_TOKEN_VERSION,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _RUNTIME_CAPABILITY_FACTORY_KEY:
+            raise TypeError(
+                "activation tokens require the module-private factory"
+            )
+        object.__setattr__(self, "token_id", token_id)
+        object.__setattr__(
+            self,
+            "registry_namespace",
+            registry_namespace,
+        )
+        object.__setattr__(self, "resource_id", resource_id)
+        object.__setattr__(self, "target_identity", target_identity)
+        object.__setattr__(
+            self,
+            "canonical_store_id",
+            canonical_store_id,
+        )
+        object.__setattr__(self, "artifact_id", artifact_id)
+        object.__setattr__(
+            self,
+            "artifact_seal_digest",
+            artifact_seal_digest,
+        )
+        object.__setattr__(
+            self,
+            "sealed_stage_digest",
+            sealed_stage_digest,
+        )
+        object.__setattr__(
+            self,
+            "snapshot_receipt_digest",
+            snapshot_receipt_digest,
+        )
+        object.__setattr__(
+            self,
+            "expected_prior_generation",
+            expected_prior_generation,
+        )
+        object.__setattr__(self, "activation_nonce", activation_nonce)
+        object.__setattr__(self, "token_version", token_version)
+        _validate_activation_token(self)
+
+
+def _validate_activation_token(token: _ActivationToken) -> None:
+    _require_identity(token.token_id, "activation token id")
+    _require_identity(token.registry_namespace, "token registry namespace")
+    _require_identity(token.resource_id, "token resource id")
+    _require_digest(token.target_identity, "token target identity")
+    _require_identity(token.canonical_store_id, "token canonical store id")
+    _require_identity(token.artifact_id, "token artifact id")
+    _require_digest(token.artifact_seal_digest, "token artifact seal digest")
+    _require_digest(token.sealed_stage_digest, "token sealed stage digest")
+    _require_digest(
+        token.snapshot_receipt_digest,
+        "token snapshot receipt digest",
+    )
+    if token.expected_prior_generation is not None:
+        _require_int(
+            token.expected_prior_generation,
+            "token expected prior generation",
+            minimum=0,
+        )
+    _require_identity(token.activation_nonce, "token activation nonce")
+    if token.token_version != ACTIVATION_TOKEN_VERSION:
+        raise ValueError("unsupported activation token version")
+
+
+def _validate_activation_token_for_stage(
+    token: _ActivationToken,
+    stage: SealedStage,
+) -> None:
+    """Revalidate the full immutable token/stage chain."""
+
+    if not isinstance(token, _ActivationToken):
+        raise TypeError("token must be a private activation token")
+    if not isinstance(stage, SealedStage):
+        raise TypeError("stage must be SealedStage")
+    _validate_activation_token(token)
+    _validate_sealed_stage(stage)
+    receipt = stage.evidence.source_binding.receipt
+    expected = (
+        stage.artifact.registry_namespace,
+        stage.evidence.resource_id,
+        stage.evidence.target_identity,
+        receipt.canonical_store_id,
+        stage.artifact.artifact_id,
+        stage.artifact.seal_digest,
+        stage.sealed_stage_digest,
+        stage.evidence.snapshot_receipt_digest,
+        stage.expected_prior_generation,
+        stage.activation_nonce,
+    )
+    actual = (
+        token.registry_namespace,
+        token.resource_id,
+        token.target_identity,
+        token.canonical_store_id,
+        token.artifact_id,
+        token.artifact_seal_digest,
+        token.sealed_stage_digest,
+        token.snapshot_receipt_digest,
+        token.expected_prior_generation,
+        token.activation_nonce,
+    )
+    if actual != expected:
+        raise ValueError("activation token does not close over sealed stage")
+
+
+def _create_activation_token(
+    *,
+    token_id: str,
+    stage: SealedStage,
+) -> _ActivationToken:
+    """Module-private coordinator seam; registry state grants single use."""
+
+    if not isinstance(stage, SealedStage):
+        raise TypeError("activation token stage must be SealedStage")
+    _validate_sealed_stage(stage)
+    receipt = stage.evidence.source_binding.receipt
+    token = _ActivationToken(
+        token_id=token_id,
+        registry_namespace=stage.artifact.registry_namespace,
+        resource_id=stage.evidence.resource_id,
+        target_identity=stage.evidence.target_identity,
+        canonical_store_id=receipt.canonical_store_id,
+        artifact_id=stage.artifact.artifact_id,
+        artifact_seal_digest=stage.artifact.seal_digest,
+        sealed_stage_digest=stage.sealed_stage_digest,
+        snapshot_receipt_digest=stage.evidence.snapshot_receipt_digest,
+        expected_prior_generation=stage.expected_prior_generation,
+        activation_nonce=stage.activation_nonce,
+        _factory_key=_RUNTIME_CAPABILITY_FACTORY_KEY,
+    )
+    _validate_activation_token_for_stage(token, stage)
+    return token
+
+
+class ActivationCapabilityState(str, Enum):
+    """Registry-owned linear activation states."""
+
+    SEALED = "SEALED"
+    TOKEN_ISSUED = "TOKEN_ISSUED"
+    CONSUMED = "CONSUMED"
+    CANCELLED = "CANCELLED"
+
+
+class _SealedArtifactRegistryPort(Protocol):
+    """Private registry lifecycle boundary for the future coordinator."""
+
+    @property
+    def registry_namespace(self) -> str: ...
+
+    def seal(
+        self,
+        mutable_stage: MutableStageRef,
+        evidence: StageValidationEvidence,
+        generation: GenerationExpectation,
+    ) -> SealedStage: ...
+
+    def contains(self, stage: SealedStage) -> bool: ...
+
+    def state(self, stage: SealedStage) -> ActivationCapabilityState: ...
+
+    def issue_token(
+        self,
+        stage: SealedStage,
+        *,
+        current_generation: int | None,
+    ) -> _ActivationToken: ...
+
+    def consume(self, token: _ActivationToken) -> None: ...
+
+    def cancel(self, token: _ActivationToken) -> None: ...
+
+
+class ResourceStoreCoordinatorPort(Protocol):
+    """Public activation boundary; implementation arrives in task 5.5."""
+
+    def activate(
+        self,
+        sealed_stage: SealedStage,
+    ) -> None: ...
+
+
 type TMContract = (
     TMRecord
     | TMRecordDraft
@@ -503,6 +1374,11 @@ type TMContract = (
     | TMResult
     | ResourceQueryFailure
     | QueryReport
+    | CanonicalResourceIdentity
+    | SnapshotReceipt
+    | SnapshotManifest
+    | SnapshotBinding
+    | StageValidationEvidence
 )
 
 
@@ -561,6 +1437,75 @@ def _encode_failure(failure: ResourceQueryFailure) -> dict[str, Any]:
     }
 
 
+def _encode_canonical_resource_identity(
+    identity: CanonicalResourceIdentity,
+) -> dict[str, Any]:
+    return {
+        "canonical_sidecar_path": str(identity.canonical_sidecar_path),
+        "configured_jsonl_path": str(identity.configured_jsonl_path),
+        "identity_version": identity.identity_version,
+        "resource_id": identity.resource_id,
+        "snapshot_manifest_path": str(identity.snapshot_manifest_path),
+        "target_identity": identity.target_identity,
+    }
+
+
+def _encode_snapshot_receipt(receipt: SnapshotReceipt) -> dict[str, Any]:
+    return {
+        "canonical_store_id": receipt.canonical_store_id,
+        "exported_revision": receipt.exported_revision,
+        "format_version": receipt.format_version,
+        "jsonl_digest": receipt.jsonl_digest,
+        "record_count": receipt.record_count,
+        "resource_id": receipt.resource_id,
+        "snapshot_id": receipt.snapshot_id,
+    }
+
+
+def _encode_snapshot_manifest(manifest: SnapshotManifest) -> dict[str, Any]:
+    return {
+        "manifest_version": manifest.manifest_version,
+        "receipt": _encode_snapshot_receipt(manifest.receipt),
+        "receipt_digest": manifest.receipt_digest,
+        "snapshot_kind": manifest.snapshot_kind.value,
+    }
+
+
+def _encode_snapshot_binding(binding: SnapshotBinding) -> dict[str, Any]:
+    return {
+        "binding_version": binding.binding_version,
+        "configured_jsonl_path": str(binding.configured_jsonl_path),
+        "manifest": _encode_snapshot_manifest(binding.manifest),
+        "manifest_path": str(binding.manifest_path),
+        "receipt": _encode_snapshot_receipt(binding.receipt),
+        "snapshot_kind": binding.snapshot_kind.value,
+    }
+
+
+def _encode_stage_validation_evidence(
+    evidence: StageValidationEvidence,
+) -> dict[str, Any]:
+    return {
+        "evidence_version": evidence.evidence_version,
+        "exact_parity_digest": evidence.exact_parity_digest,
+        "fold_version": evidence.fold_version,
+        "foreign_keys_ok": evidence.foreign_keys_ok,
+        "fts_count": evidence.fts_count,
+        "gram_counts": [list(pair) for pair in evidence.gram_counts],
+        "index_version": evidence.index_version,
+        "integrity_ok": evidence.integrity_ok,
+        "manifest_temp_digest": evidence.manifest_temp_digest,
+        "origin_batch_count": evidence.origin_batch_count,
+        "record_count": evidence.record_count,
+        "resource_id": evidence.resource_id,
+        "schema_version": evidence.schema_version,
+        "snapshot_receipt_digest": evidence.snapshot_receipt_digest,
+        "source_binding": _encode_snapshot_binding(evidence.source_binding),
+        "stage_file_digest": evidence.stage_file_digest,
+        "target_identity": evidence.target_identity,
+    }
+
+
 def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
     if isinstance(contract, TMResourceHandle):
         raise TypeError(
@@ -616,6 +1561,22 @@ def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
             ],
             "results": [_encode_result(result) for result in contract.results],
         }
+    if isinstance(contract, CanonicalResourceIdentity):
+        return (
+            "CanonicalResourceIdentity",
+            _encode_canonical_resource_identity(contract),
+        )
+    if isinstance(contract, SnapshotReceipt):
+        return "SnapshotReceipt", _encode_snapshot_receipt(contract)
+    if isinstance(contract, SnapshotManifest):
+        return "SnapshotManifest", _encode_snapshot_manifest(contract)
+    if isinstance(contract, SnapshotBinding):
+        return "SnapshotBinding", _encode_snapshot_binding(contract)
+    if isinstance(contract, StageValidationEvidence):
+        return (
+            "StageValidationEvidence",
+            _encode_stage_validation_evidence(contract),
+        )
     raise TypeError(f"unsupported TM contract type: {type(contract).__name__}")
 
 
@@ -809,6 +1770,197 @@ def _decode_failure(value: object) -> ResourceQueryFailure:
     )
 
 
+def _decode_path(value: object, field_name: str) -> Path:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string path")
+    return Path(value)
+
+
+def _decode_snapshot_kind(value: object, field_name: str) -> SnapshotKind:
+    try:
+        return SnapshotKind(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} is invalid") from None
+
+
+def _decode_canonical_resource_identity(
+    value: object,
+) -> CanonicalResourceIdentity:
+    payload = _strict_fields(
+        value,
+        "CanonicalResourceIdentity payload",
+        (
+            "canonical_sidecar_path",
+            "configured_jsonl_path",
+            "identity_version",
+            "resource_id",
+            "snapshot_manifest_path",
+            "target_identity",
+        ),
+    )
+    return CanonicalResourceIdentity(
+        resource_id=payload["resource_id"],
+        configured_jsonl_path=_decode_path(
+            payload["configured_jsonl_path"],
+            "configured_jsonl_path",
+        ),
+        canonical_sidecar_path=_decode_path(
+            payload["canonical_sidecar_path"],
+            "canonical_sidecar_path",
+        ),
+        snapshot_manifest_path=_decode_path(
+            payload["snapshot_manifest_path"],
+            "snapshot_manifest_path",
+        ),
+        target_identity=payload["target_identity"],
+        identity_version=payload["identity_version"],
+    )
+
+
+def _decode_snapshot_receipt(value: object) -> SnapshotReceipt:
+    payload = _strict_fields(
+        value,
+        "SnapshotReceipt payload",
+        (
+            "canonical_store_id",
+            "exported_revision",
+            "format_version",
+            "jsonl_digest",
+            "record_count",
+            "resource_id",
+            "snapshot_id",
+        ),
+    )
+    return SnapshotReceipt(
+        snapshot_id=payload["snapshot_id"],
+        resource_id=payload["resource_id"],
+        canonical_store_id=payload["canonical_store_id"],
+        exported_revision=payload["exported_revision"],
+        jsonl_digest=payload["jsonl_digest"],
+        record_count=payload["record_count"],
+        format_version=payload["format_version"],
+    )
+
+
+def _decode_snapshot_manifest(value: object) -> SnapshotManifest:
+    payload = _strict_fields(
+        value,
+        "SnapshotManifest payload",
+        (
+            "manifest_version",
+            "receipt",
+            "receipt_digest",
+            "snapshot_kind",
+        ),
+    )
+    return SnapshotManifest(
+        manifest_version=payload["manifest_version"],
+        snapshot_kind=_decode_snapshot_kind(
+            payload["snapshot_kind"],
+            "SnapshotManifest snapshot_kind",
+        ),
+        receipt=_decode_snapshot_receipt(payload["receipt"]),
+        receipt_digest=payload["receipt_digest"],
+    )
+
+
+def _decode_snapshot_binding(value: object) -> SnapshotBinding:
+    payload = _strict_fields(
+        value,
+        "SnapshotBinding payload",
+        (
+            "binding_version",
+            "configured_jsonl_path",
+            "manifest",
+            "manifest_path",
+            "receipt",
+            "snapshot_kind",
+        ),
+    )
+    return SnapshotBinding(
+        configured_jsonl_path=_decode_path(
+            payload["configured_jsonl_path"],
+            "SnapshotBinding configured_jsonl_path",
+        ),
+        manifest_path=_decode_path(
+            payload["manifest_path"],
+            "SnapshotBinding manifest_path",
+        ),
+        snapshot_kind=_decode_snapshot_kind(
+            payload["snapshot_kind"],
+            "SnapshotBinding snapshot_kind",
+        ),
+        receipt=_decode_snapshot_receipt(payload["receipt"]),
+        manifest=_decode_snapshot_manifest(payload["manifest"]),
+        binding_version=payload["binding_version"],
+    )
+
+
+def _decode_gram_counts(value: object) -> tuple[tuple[int, int], ...]:
+    pairs: list[tuple[int, int]] = []
+    for entry in _as_list(value, "gram_counts"):
+        pair = _as_list(entry, "gram_counts entry")
+        if len(pair) != 2:
+            raise ValueError("gram_counts entries must contain two values")
+        gram_size, gram_count = pair
+        if (
+            not isinstance(gram_size, int)
+            or isinstance(gram_size, bool)
+            or not isinstance(gram_count, int)
+            or isinstance(gram_count, bool)
+        ):
+            raise ValueError("gram_counts entries must contain integers")
+        pairs.append((gram_size, gram_count))
+    return tuple(pairs)
+
+
+def _decode_stage_validation_evidence(
+    value: object,
+) -> StageValidationEvidence:
+    payload = _strict_fields(
+        value,
+        "StageValidationEvidence payload",
+        (
+            "evidence_version",
+            "exact_parity_digest",
+            "fold_version",
+            "foreign_keys_ok",
+            "fts_count",
+            "gram_counts",
+            "index_version",
+            "integrity_ok",
+            "manifest_temp_digest",
+            "origin_batch_count",
+            "record_count",
+            "resource_id",
+            "schema_version",
+            "snapshot_receipt_digest",
+            "source_binding",
+            "stage_file_digest",
+            "target_identity",
+        ),
+    )
+    return StageValidationEvidence(
+        evidence_version=payload["evidence_version"],
+        resource_id=payload["resource_id"],
+        target_identity=payload["target_identity"],
+        source_binding=_decode_snapshot_binding(payload["source_binding"]),
+        snapshot_receipt_digest=payload["snapshot_receipt_digest"],
+        manifest_temp_digest=payload["manifest_temp_digest"],
+        schema_version=payload["schema_version"],
+        fold_version=payload["fold_version"],
+        index_version=payload["index_version"],
+        record_count=payload["record_count"],
+        origin_batch_count=payload["origin_batch_count"],
+        fts_count=payload["fts_count"],
+        gram_counts=_decode_gram_counts(payload["gram_counts"]),
+        exact_parity_digest=payload["exact_parity_digest"],
+        integrity_ok=payload["integrity_ok"],
+        foreign_keys_ok=payload["foreign_keys_ok"],
+        stage_file_digest=payload["stage_file_digest"],
+    )
+
+
 def _decode_payload(contract_type: str, value: object) -> TMContract:
     if contract_type == "TMRecord":
         payload = _strict_fields(
@@ -917,6 +2069,16 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
                 )
             ),
         )
+    if contract_type == "CanonicalResourceIdentity":
+        return _decode_canonical_resource_identity(value)
+    if contract_type == "SnapshotReceipt":
+        return _decode_snapshot_receipt(value)
+    if contract_type == "SnapshotManifest":
+        return _decode_snapshot_manifest(value)
+    if contract_type == "SnapshotBinding":
+        return _decode_snapshot_binding(value)
+    if contract_type == "StageValidationEvidence":
+        return _decode_stage_validation_evidence(value)
     raise ValueError("unsupported contract type")
 
 
@@ -949,12 +2111,31 @@ def contract_from_json(serialized: str) -> TMContract:
 
 
 __all__ = [
+    "ACTIVATION_TOKEN_VERSION",
+    "CANONICAL_RESOURCE_IDENTITY_VERSION",
+    "GENERATION_EXPECTATION_VERSION",
     "SCORER_VERSION_V1",
+    "SNAPSHOT_BINDING_VERSION",
+    "SNAPSHOT_FORMAT_VERSION",
+    "SNAPSHOT_MANIFEST_VERSION",
+    "STAGE_VALIDATION_EVIDENCE_VERSION",
     "TM_CONTRACT_CODEC_VERSION",
+    "ActivationCapabilityState",
+    "CanonicalResourceIdentity",
     "ContextEvidence",
+    "GenerationExpectation",
+    "MutableStageRef",
     "QueryReport",
+    "ResourceStoreCoordinatorPort",
     "ResourceQueryFailure",
+    "SealedStage",
     "SimilarityEvidence",
+    "SnapshotBinding",
+    "SnapshotKind",
+    "SnapshotManifest",
+    "SnapshotReceipt",
+    "SourceBindingState",
+    "StageValidationEvidence",
     "TMContract",
     "TMMatchType",
     "TMQuery",
@@ -965,5 +2146,7 @@ __all__ = [
     "TMStore",
     "contract_from_json",
     "contract_to_json",
+    "snapshot_receipt_digest",
+    "stage_validation_evidence_digest",
     "validate_resource_handles",
 ]

@@ -8,7 +8,7 @@
   - 完成时，合法契约可稳定往返，非法版本、非法范围、缺失 fuzzy evidence 或正文泄漏诊断均被拒绝
   - _Requirements: 1.3, 1.4, 1.5, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 4.3, 4.6, 4.7, 5.1, 5.2, 5.7, 7.4, 7.6, 7.7_
 
-- [ ] 1.2 定义 canonical、来源绑定和原子激活契约
+- [x] 1.2 定义 canonical、来源绑定和原子激活契约
   - 固化资源身份、deterministic sidecar、snapshot receipt/manifest、来源状态、阶段校验证据、sealed artifact、单次激活 token 与 generation
   - 区分 mutable stage 与 sealed artifact，禁止裸路径、可伪造 validated 标志或不匹配的资源/来源绑定进入激活
   - 完成时，只有身份、digest、ancestry、expected generation 和 artifact registry 全部闭合的不可变对象能构造激活请求
@@ -352,3 +352,4 @@
 ## Implementation Notes
 
 - 2026-07-29 / Task 1.1：冻结 `tm_contracts.py` 的记录、资源句柄、查询、结果、evidence、局部失败与严格 codec v1；运行时 `TMResourceHandle` 保持必需 `TMStore` 绑定且不进入持久 codec。独立复审通过；focused 15/15、全量 127/127、basedpyright 0 errors。
+- 2026-07-29 / Task 1.2：冻结 canonical 资源身份、确定性 sidecar、snapshot receipt/manifest/binding、阶段校验证据与 generation 闭合；sealed artifact 和单次 token 保持 registry 背书的模块私有运行期能力，公开协调器只暴露 `activate(SealedStage)`。独立复审通过；focused 27/27、全量 138/138、basedpyright 0 errors。
