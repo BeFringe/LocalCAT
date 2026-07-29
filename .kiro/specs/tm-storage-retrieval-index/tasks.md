@@ -2,7 +2,7 @@
 
 - [ ] 1. 冻结版本化基础契约与验证夹具
 
-- [ ] 1.1 定义记录、资源、查询、结果和失败契约
+- [x] 1.1 定义记录、资源、查询、结果和失败契约
   - 固化记录身份、原始 source/target、上下文、来源批次、资源顺序、provenance、匹配类型和双 source 形状
   - 对相似度范围、非空身份、资源顺序、evidence 与匹配类型组合、局部失败安全摘要建立构造期校验
   - 完成时，合法契约可稳定往返，非法版本、非法范围、缺失 fuzzy evidence 或正文泄漏诊断均被拒绝
@@ -350,3 +350,5 @@
   - _Requirements: 2.9, 4.2, 6.10, 7.5, 8.7, 9.12_
 
 ## Implementation Notes
+
+- 2026-07-29 / Task 1.1：冻结 `tm_contracts.py` 的记录、资源句柄、查询、结果、evidence、局部失败与严格 codec v1；运行时 `TMResourceHandle` 保持必需 `TMStore` 绑定且不进入持久 codec。独立复审通过；focused 15/15、全量 127/127、basedpyright 0 errors。
