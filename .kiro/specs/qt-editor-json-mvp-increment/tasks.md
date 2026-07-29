@@ -41,7 +41,7 @@
   - _Boundary: TargetPreprocessor_
   - _Depends: 1.2_
 
-- [ ] 2.3 (P) 实现 legacy/v1 mixed CSV 的严格读取
+- [x] 2.3 (P) 实现 legacy/v1 mixed CSV 的严格读取
   - 将严格两列行识别为 legacy，将带 marker、稳定 ID 和两个选项的六列行识别为 v1
   - 为 legacy 生成 digest/ordinal locator，为 v1 使用持久 ID，并保留文件显示顺序
   - 处理 UTF-8-SIG、quoted comma、空行、未知 marker、重复 source/ID 和无效布尔值
