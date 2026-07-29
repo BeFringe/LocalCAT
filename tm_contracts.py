@@ -30,8 +30,8 @@ STAGE_VALIDATION_EVIDENCE_VERSION = "stage-validation-v1"
 GENERATION_EXPECTATION_VERSION = "generation-expectation-v1"
 ACTIVATION_TOKEN_VERSION = "activation-token-v1"
 MATCHER_VALIDATION_SUMMARY_VERSION = "matcher-validation-summary-v1"
-MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v1"
-MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 1
+MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v2"
+MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 2
 CANDIDATE_BUDGET_VERSION = "candidate-budget-v1"
 BENCHMARK_CONTRACT_VERSION = "benchmark-v1"
 BENCHMARK_SUITE_VERSION = "benchmark-suite-v1"
@@ -2987,6 +2987,8 @@ class MatcherValidationCohortEvidence:
     cohort_id: str
     cohort_digest: str
     passed: bool
+    generated_at_utc: str
+    valid_until_utc: str
 
     def __post_init__(self) -> None:
         _validate_matcher_validation_cohort_evidence(self)
@@ -2998,6 +3000,19 @@ def _validate_matcher_validation_cohort_evidence(
     _require_identity(evidence.cohort_id, "matcher cohort id")
     _require_digest(evidence.cohort_digest, "matcher cohort digest")
     _require_bool(evidence.passed, "matcher cohort passed")
+    generated = _parse_strict_utc_timestamp(
+        evidence.generated_at_utc,
+        "matcher cohort generated_at_utc",
+    )
+    valid_until = _parse_strict_utc_timestamp(
+        evidence.valid_until_utc,
+        "matcher cohort valid_until_utc",
+    )
+    if valid_until <= generated:
+        raise ValueError(
+            "matcher cohort valid_until_utc must be later than "
+            "generated_at_utc"
+        )
 
 
 def _parse_strict_utc_timestamp(value: object, field_name: str) -> datetime:
@@ -4426,7 +4441,9 @@ def _encode_matcher_validation_cohort_evidence(
     return {
         "cohort_digest": evidence.cohort_digest,
         "cohort_id": evidence.cohort_id,
+        "generated_at_utc": evidence.generated_at_utc,
         "passed": evidence.passed,
+        "valid_until_utc": evidence.valid_until_utc,
     }
 
 
@@ -5078,12 +5095,20 @@ def _decode_matcher_validation_cohort_evidence(
     payload = _strict_fields(
         value,
         "matcher cohort evidence",
-        ("cohort_digest", "cohort_id", "passed"),
+        (
+            "cohort_digest",
+            "cohort_id",
+            "generated_at_utc",
+            "passed",
+            "valid_until_utc",
+        ),
     )
     return MatcherValidationCohortEvidence(
         cohort_id=payload["cohort_id"],
         cohort_digest=payload["cohort_digest"],
         passed=payload["passed"],
+        generated_at_utc=payload["generated_at_utc"],
+        valid_until_utc=payload["valid_until_utc"],
     )
 
 

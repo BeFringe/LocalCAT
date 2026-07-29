@@ -57,7 +57,7 @@
   - 完成时，所有 profile 的命中集合和原文 offsets 与版本化黄金样例完全一致
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10_
 
-- [ ] 2.4 实现 matcher validation manifest 与三态证据评估
+- [x] 2.4 实现 matcher validation manifest 与三态证据评估
   - 以同一语义版本的基础 cohort 决定 UNAVAILABLE/BASIC_VALIDATED，以完整四组合与 Unicode cohort 决定 TEXT_V1_VALIDATED
   - 证据缺失、失败、过期、build/fixture/version 不一致时按规则降级，并发布不可变能力快照
   - manifest 显式绑定 evidence schema、artifact/build、semantics、cohort/fixture/evaluator digests、生成时间和有效期
@@ -359,3 +359,4 @@
 - 2026-07-29 / Task 2.1：实现纯 `SimilarityScorerV1`，固定 NFC→casefold、Unicode code-point Levenshtein、多重集字符 bigram Dice 与未舍入算术平均；版本化黄金向量逐项绑定 folded 文本、距离、gram 计数、分项和最终分数，不夹带召回、阈值、排序或存储行为。独立复审通过；focused 6/6（22 subtests）、全量 188/188（161 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.2：固定 Unicode 16.0.0/UAX #29 rev.45 属性表、来源摘要与运行时 fail-closed 闸门，实现带原文 provenance 的 whole-string NFC/casefold 投影、默认词界和严格 pure-CJK 分类；第一轮 canonical blocking 缺陷经独立复审拦截后改为标准 composition 状态机，并以完整 NormalizationTest 99,825 输入、WordBreakTest 1,826 向量和 scorer 回归闭合。独立复审第二轮通过；focused 15/15（1,890 subtests）、全量 197/197（2,029 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.3：实现 Core 内部纯 `TextMatcherV1`，固定 legacy、basic 与 configurable 四组合行为；overlap、NFC/casefold expansion、原文 span 投影去重、稳定排序、原文 UAX #29 Whole Word 过滤及 pure-CJK 连续匹配 tailoring 均由版本化 golden 闭合，且不携带 capability/readiness 权威。独立复审通过；focused 29/29（1,938 subtests）、全量 203/203（2,056 subtests）、basedpyright 0 errors。
+- 2026-07-29 / Task 2.4：实现 Core 内部唯一 `MatcherCapabilityEvaluator` 与原子不可变快照 publisher，以独立 basic/full cohort 时间窗闭合 UNAVAILABLE、BASIC_VALIDATED、TEXT_V1_VALIDATED 三态；为忠实表达 full-only 过期降级，内部 evidence schema/manifest codec 升至 v2，旧 v1 严格拒绝且公开 matcher 契约形状不变。第一轮复审拦截多 full cohort 部分缺失误判 UNAVAILABLE 的缺陷，修复为“完整 BASIC + 任意 full 子集”降级语义并加入双 full cohort 矩阵；独立复审第二轮通过；focused 23/23（67 subtests）、全量 211/211（2,080 subtests）、basedpyright 0 errors。

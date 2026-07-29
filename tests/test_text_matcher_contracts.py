@@ -8,6 +8,7 @@ import unittest
 import tm_contracts
 from tm_contracts import (
     MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION,
+    MATCHER_VALIDATION_MANIFEST_CODEC_VERSION,
     MATCHER_VALIDATION_SUMMARY_VERSION,
     CapabilityGatedTextMatcher,
     MatcherValidationCohortEvidence,
@@ -99,11 +100,15 @@ def _manifest() -> MatcherValidationManifest:
                 cohort_id="matcher-basic-v1",
                 cohort_digest=_DIGEST_C,
                 passed=True,
+                generated_at_utc="2020-01-01T00:00:00Z",
+                valid_until_utc="2021-01-01T00:00:00Z",
             ),
             MatcherValidationCohortEvidence(
                 cohort_id="matcher-text-v1",
                 cohort_digest=_DIGEST_D,
                 passed=False,
+                generated_at_utc="2020-01-01T00:00:00Z",
+                valid_until_utc="2020-06-01T00:00:00Z",
             ),
         ),
         fixture_digest=_DIGEST_C,
@@ -464,6 +469,10 @@ class TextMatcherContractTests(unittest.TestCase):
     def test_manifest_allows_failed_and_expired_evidence(self) -> None:
         manifest = _manifest()
         self.assertFalse(manifest.cohort_evidence[1].passed)
+        self.assertEqual(
+            manifest.cohort_evidence[1].valid_until_utc,
+            "2020-06-01T00:00:00Z",
+        )
         basic_only = replace(
             manifest,
             required_cohort_ids=("matcher-basic-v1",),
@@ -519,11 +528,67 @@ class TextMatcherContractTests(unittest.TestCase):
                 manifest,
                 valid_until_utc=manifest.generated_at_utc,
             )
+        with self.assertRaisesRegex(ValueError, "strict UTC"):
+            replace(
+                manifest.cohort_evidence[0],
+                generated_at_utc="2020-01-01T00:00:00+00:00",
+            )
+        with self.assertRaisesRegex(ValueError, "later"):
+            replace(
+                manifest.cohort_evidence[0],
+                valid_until_utc=(
+                    manifest.cohort_evidence[0].generated_at_utc
+                ),
+            )
         envelope = json.loads(
             matcher_validation_manifest_to_json(manifest)
         )
-        envelope["manifest_codec_version"] = 2
+        envelope["manifest_codec_version"] = (
+            MATCHER_VALIDATION_MANIFEST_CODEC_VERSION + 1
+        )
         with self.assertRaisesRegex(ValueError, "codec version"):
+            matcher_validation_manifest_from_json(
+                json.dumps(
+                    envelope,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+
+    def test_manifest_v1_shape_is_strictly_rejected(self) -> None:
+        envelope = json.loads(
+            matcher_validation_manifest_to_json(_manifest())
+        )
+        self.assertEqual(
+            envelope["manifest_codec_version"],
+            MATCHER_VALIDATION_MANIFEST_CODEC_VERSION,
+        )
+        self.assertEqual(
+            envelope["manifest"]["evidence_schema_version"],
+            MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION,
+        )
+        for evidence in envelope["manifest"]["cohort_evidence"]:
+            evidence.pop("generated_at_utc")
+            evidence.pop("valid_until_utc")
+        envelope["manifest"]["evidence_schema_version"] = (
+            "matcher-validation-v1"
+        )
+        envelope["manifest_codec_version"] = 1
+        with self.assertRaisesRegex(ValueError, "codec version"):
+            matcher_validation_manifest_from_json(
+                json.dumps(
+                    envelope,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        envelope["manifest_codec_version"] = (
+            MATCHER_VALIDATION_MANIFEST_CODEC_VERSION
+        )
+        envelope["manifest"]["evidence_schema_version"] = (
+            MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION
+        )
+        with self.assertRaisesRegex(ValueError, "fields"):
             matcher_validation_manifest_from_json(
                 json.dumps(
                     envelope,
