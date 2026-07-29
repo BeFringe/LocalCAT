@@ -9,7 +9,17 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QMessageBox, QToolButton
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QHeaderView,
+    QMessageBox,
+    QSizePolicy,
+    QToolButton,
+)
 
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
 from editor_controller import EditorController
@@ -132,6 +142,121 @@ class QtSettingsDialogTest(unittest.TestCase):
 
             self.assertGreater(table.columnWidth(3), small_name_width)
             self.assertGreater(table.columnWidth(5), small_path_width)
+            dialog.close()
+
+    def test_more_button_is_compact_accessible_and_action_column_does_not_stretch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            table = dialog.active_table
+            button = dialog.findChild(QToolButton, f"more_{resource.id}")
+
+            self.assertIsNotNone(button)
+            self.assertTrue(button.autoRaise())
+            self.assertEqual(
+                button.sizePolicy().horizontalPolicy(),
+                QSizePolicy.Policy.Fixed,
+            )
+            self.assertGreaterEqual(button.width(), 32)
+            self.assertLessEqual(button.width(), 40)
+            self.assertEqual(
+                button.width(),
+                min(40, max(32, button.sizeHint().width() + 8)),
+            )
+            self.assertEqual(
+                table.horizontalHeader().sectionResizeMode(7),
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+            self.assertEqual(
+                table.horizontalHeader().sectionResizeMode(6),
+                QHeaderView.ResizeMode.Fixed,
+            )
+            self.assertEqual(
+                table.horizontalHeader().sectionResizeMode(3),
+                QHeaderView.ResizeMode.Stretch,
+            )
+            self.assertEqual(
+                table.horizontalHeader().sectionResizeMode(5),
+                QHeaderView.ResizeMode.Stretch,
+            )
+            self.assertEqual(button.toolTip(), "Primary TM 的更多操作")
+            self.assertEqual(button.accessibleName(), "Primary TM 的更多操作")
+            self.assertEqual(button.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+            dialog.close()
+
+    def test_more_button_stays_visible_without_overlap_at_narrow_and_wide_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            table = dialog.active_table
+            button = dialog.findChild(QToolButton, f"more_{resource.id}")
+
+            dialog.show()
+            for width in (860, 1320):
+                dialog.resize(width, 560)
+                self.app.processEvents()
+                cell_left = table.columnViewportPosition(7)
+                cell_right = cell_left + table.columnWidth(7)
+                button_left = button.geometry().left()
+                button_right = button.geometry().right() + 1
+                import_right = (
+                    table.columnViewportPosition(6) + table.columnWidth(6)
+                )
+
+                self.assertTrue(button.isVisible())
+                self.assertGreaterEqual(cell_left, import_right)
+                self.assertGreaterEqual(button_left, cell_left)
+                self.assertLessEqual(button_right, cell_right)
+                self.assertLessEqual(cell_right, table.viewport().width())
+
+            dialog.close()
+
+    def test_more_button_opens_its_menu_with_pointer_enter_and_space(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            menu = button.menu()
+            opened: list[bool] = []
+            menu.aboutToShow.connect(lambda: opened.append(True))
+            dialog.show()
+            self.app.processEvents()
+
+            button.setFocus()
+            self.app.processEvents()
+            self.assertTrue(button.hasFocus())
+            close_timer = QTimer(menu)
+            close_timer.setSingleShot(True)
+            close_timer.timeout.connect(menu.close)
+            close_timer.start(25)
+            QTest.keyClick(button, Qt.Key.Key_Return)
+            self.app.processEvents()
+            self.assertEqual(len(opened), 1)
+
+            close_timer.start(25)
+            QTest.keyClick(button, Qt.Key.Key_Space)
+            self.app.processEvents()
+            self.assertEqual(len(opened), 2)
+
+            close_timer.start(25)
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            self.app.processEvents()
+            self.assertEqual(len(opened), 3)
             dialog.close()
 
     def test_more_menu_confirms_and_deletes_managed_resource(self) -> None:

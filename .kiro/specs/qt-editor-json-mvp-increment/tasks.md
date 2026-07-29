@@ -190,7 +190,7 @@
   - _Requirements: 8.1, 8.2_
   - _Boundary: QtBootstrap_
 
-- [ ] 4.9 收紧资源 ellipsis 并保持键盘可用
+- [x] 4.9 收紧资源 ellipsis 并保持键盘可用
   - 使用 auto-raise、固定横向策略和 32 logical px 最小键盘命中宽度
   - 宽度取内容 size hint 加安全 padding，最大 40 logical px；操作列不参与 Stretch
   - 名称/路径列承担剩余空间，窄/宽窗口下菜单按钮均可见、不遮挡相邻信息

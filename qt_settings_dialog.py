@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -37,6 +39,17 @@ from editor_controller import EditorController, EditorControllerError
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
 TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+
+
+class _ResourceMoreButton(QToolButton):
+    """Keep the resource menu reachable with standard keyboard activation."""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.menu() is not None:
+            event.accept()
+            self.showMenu()
+            return
+        super().keyPressEvent(event)
 
 
 class ImportWorker(QThread):
@@ -201,8 +214,7 @@ class QtSettingsDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(6, 154)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        table.setColumnWidth(7, 48)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         return table
 
     def refresh_resources(self) -> None:
@@ -267,7 +279,7 @@ class QtSettingsDialog(QDialog):
                 lambda _checked=False, configured=resource: self._prompt_import(configured)
             )
             table.setCellWidget(row, 6, import_button)
-            more_button = QToolButton()
+            more_button = _ResourceMoreButton()
             more_button.setObjectName(f"more_{resource.id}")
             more_button.setText("⋮")
             more_button.setToolTip(f"{resource.name} 的更多操作")
@@ -281,6 +293,17 @@ class QtSettingsDialog(QDialog):
                 )
             )
             more_button.setMenu(menu)
+            more_button.setAutoRaise(True)
+            size_policy = more_button.sizePolicy()
+            size_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
+            more_button.setSizePolicy(size_policy)
+            more_button.setAccessibleName(f"{resource.name} 的更多操作")
+            more_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            compact_width = min(
+                40,
+                max(32, more_button.sizeHint().width() + 8),
+            )
+            more_button.setFixedWidth(compact_width)
             table.setCellWidget(row, 7, more_button)
         table.resizeRowsToContents()
 
