@@ -10,7 +10,7 @@
   - 完成时，合法契约可稳定构造，非法 capability、tuple 或 offset 组合会在边界测试中失败
   - _Requirements: 1.1, 1.3, 3.1, 3.3, 3.7, 3.9, 9.1, 9.7_
 
-- [ ] 1.2 建立预处理、批次报告与撤销会话契约
+- [x] 1.2 建立预处理、批次报告与撤销会话契约
   - 覆盖有序 literal rule、段落前后差异、项目 session、revision、dirty 和 saved baseline
   - 约束 changed segment ID 唯一、before/after 状态完整及 stale preview 所需字段
   - 完成时，preview、apply report 和单批次 undo state 能完整表达正常、无变化和 stale 场景

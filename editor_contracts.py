@@ -116,6 +116,169 @@ class EditorProject:
 
 
 @dataclass(frozen=True)
+class LiteralReplaceRule:
+    """One ordered, case-sensitive literal target replacement."""
+
+    find: str
+    replacement: str
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.find, str) or not isinstance(self.replacement, str):
+            raise TypeError("literal rule values must be strings")
+        if not self.find:
+            raise ValueError("literal rule find value must not be empty")
+        if not isinstance(self.enabled, bool):
+            raise TypeError("literal rule enabled state must be a boolean")
+
+
+@dataclass(frozen=True)
+class PreprocessChange:
+    """Complete before/after state for one changed target segment."""
+
+    segment_id: str
+    segment_index: int
+    before_target: str
+    after_target: str
+    before_confirmed: bool
+    after_confirmed: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segment_id, str):
+            raise TypeError("preprocess change segment id must be a string")
+        if not self.segment_id.strip():
+            raise ValueError("preprocess change segment id must not be empty")
+        if (
+            not isinstance(self.segment_index, int)
+            or isinstance(self.segment_index, bool)
+        ):
+            raise TypeError("preprocess change segment index must be an integer")
+        if self.segment_index < 0:
+            raise ValueError("preprocess change segment index must not be negative")
+        if not isinstance(self.before_target, str) or not isinstance(
+            self.after_target,
+            str,
+        ):
+            raise TypeError("preprocess change targets must be strings")
+        if self.before_target == self.after_target:
+            raise ValueError("preprocess change must contain an actual target change")
+        if not isinstance(self.before_confirmed, bool) or not isinstance(
+            self.after_confirmed,
+            bool,
+        ):
+            raise TypeError("preprocess change confirmed states must be booleans")
+        if self.after_confirmed:
+            raise ValueError("a changed target must become unconfirmed")
+
+
+@dataclass(frozen=True)
+class PreprocessPreview:
+    """Immutable preprocessing preview bound to one project revision."""
+
+    project_session_id: str
+    base_revision: int
+    changes: tuple[PreprocessChange, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.project_session_id, str):
+            raise TypeError("preview project session id must be a string")
+        if not self.project_session_id.strip():
+            raise ValueError("preview project session id must not be empty")
+        if not isinstance(self.base_revision, int) or isinstance(
+            self.base_revision,
+            bool,
+        ):
+            raise TypeError("preview base revision must be an integer")
+        if self.base_revision < 0:
+            raise ValueError("preview base revision must not be negative")
+        if not isinstance(self.changes, tuple):
+            raise TypeError("preview changes must be a tuple")
+        if not all(isinstance(change, PreprocessChange) for change in self.changes):
+            raise TypeError("preview changes must contain PreprocessChange values")
+        segment_ids = tuple(change.segment_id for change in self.changes)
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("preview changed segment ids must be unique")
+
+
+@dataclass(frozen=True)
+class BatchOperationReport:
+    """Observable result of one preprocessing apply or undo request."""
+
+    operation: str
+    project_session_id: str
+    resulting_revision: int
+    changed_segment_ids: tuple[str, ...]
+    dirty: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, str):
+            raise TypeError("batch operation must be a string")
+        if not self.operation.strip():
+            raise ValueError("batch operation must not be empty")
+        if not isinstance(self.project_session_id, str):
+            raise TypeError("batch report project session id must be a string")
+        if not self.project_session_id.strip():
+            raise ValueError("batch report project session id must not be empty")
+        if not isinstance(self.resulting_revision, int) or isinstance(
+            self.resulting_revision,
+            bool,
+        ):
+            raise TypeError("batch report revision must be an integer")
+        if self.resulting_revision < 0:
+            raise ValueError("batch report revision must not be negative")
+        if not isinstance(self.changed_segment_ids, tuple):
+            raise TypeError("batch report changed segment ids must be a tuple")
+        if not all(
+            isinstance(segment_id, str) and segment_id.strip()
+            for segment_id in self.changed_segment_ids
+        ):
+            raise ValueError("batch report segment ids must be non-empty strings")
+        if len(self.changed_segment_ids) != len(set(self.changed_segment_ids)):
+            raise ValueError("batch report changed segment ids must be unique")
+        if not isinstance(self.dirty, bool):
+            raise TypeError("batch report dirty state must be a boolean")
+
+
+@dataclass(frozen=True)
+class BatchUndoState:
+    """The single undo snapshot retained for the latest applied batch."""
+
+    project_session_id: str
+    applied_revision: int
+    dirty_before: bool
+    saved_baseline_digest_at_apply: str
+    changes: tuple[PreprocessChange, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.project_session_id, str):
+            raise TypeError("batch undo project session id must be a string")
+        if not self.project_session_id.strip():
+            raise ValueError("batch undo project session id must not be empty")
+        if not isinstance(self.applied_revision, int) or isinstance(
+            self.applied_revision,
+            bool,
+        ):
+            raise TypeError("batch undo applied revision must be an integer")
+        if self.applied_revision < 0:
+            raise ValueError("batch undo applied revision must not be negative")
+        if not isinstance(self.dirty_before, bool):
+            raise TypeError("batch undo dirty state must be a boolean")
+        if not isinstance(self.saved_baseline_digest_at_apply, str):
+            raise TypeError("batch undo saved baseline digest must be a string")
+        if not self.saved_baseline_digest_at_apply.strip():
+            raise ValueError("batch undo saved baseline digest must not be empty")
+        if not isinstance(self.changes, tuple):
+            raise TypeError("batch undo changes must be a tuple")
+        if not self.changes:
+            raise ValueError("batch undo state must contain at least one change")
+        if not all(isinstance(change, PreprocessChange) for change in self.changes):
+            raise TypeError("batch undo changes must contain PreprocessChange values")
+        segment_ids = tuple(change.segment_id for change in self.changes)
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("batch undo changed segment ids must be unique")
+
+
+@dataclass(frozen=True)
 class ResourceConfig:
     """Persistent configuration for one TM or termbase resource."""
 
