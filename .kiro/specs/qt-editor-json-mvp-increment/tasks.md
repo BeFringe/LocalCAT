@@ -32,7 +32,7 @@
   - _Boundary: SpeakerInventoryService_
   - _Depends: 1.1_
 
-- [ ] 2.2 (P) 实现 target-only 有序 literal 预处理预览
+- [x] 2.2 (P) 实现 target-only 有序 literal 预处理预览
   - 按用户可见顺序执行区分大小写、从左到右、非重叠的普通字符串替换
   - 只为 target 实际变化的段落生成 before/after 差异，不改变项目或 confirmed
   - 拒绝空 find、无启用规则和无实际变化，不加入 regex、脚本、Unicode normalization 或递归重跑
