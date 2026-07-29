@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, QTimer, Signal
+from PySide6.QtCore import QModelIndex, QPersistentModelIndex, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -39,6 +41,31 @@ from editor_controller import EditorController, EditorControllerError
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
 TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+_RESOURCE_MORE_BUTTON_STYLE = """
+QToolButton {
+    border: none;
+    background: transparent;
+    color: #26435e;
+    padding: 0;
+    margin: 0;
+}
+QToolButton:hover,
+QToolButton:focus {
+    border: none;
+    background: transparent;
+    color: #0798c6;
+}
+QToolButton:pressed {
+    border: none;
+    background: transparent;
+    color: #047fa8;
+}
+QToolButton::menu-indicator {
+    image: none;
+    width: 0;
+    height: 0;
+}
+"""
 
 
 class _ResourceMoreButton(QToolButton):
@@ -50,6 +77,18 @@ class _ResourceMoreButton(QToolButton):
             self.showMenu()
             return
         super().keyPressEvent(event)
+
+
+class _FullCellWidgetDelegate(QStyledItemDelegate):
+    """Keep action widgets flush instead of applying text-item padding."""
+
+    def updateEditorGeometry(
+        self,
+        editor: QWidget,
+        option: QStyleOptionViewItem,
+        _index: QModelIndex | QPersistentModelIndex,
+    ) -> None:
+        editor.setGeometry(option.rect)
 
 
 class ImportWorker(QThread):
@@ -205,7 +244,7 @@ class QtSettingsDialog(QDialog):
         table.setWordWrap(False)
         table.setMinimumHeight(128)
         header = table.horizontalHeader()
-        header.setMinimumSectionSize(54)
+        header.setMinimumSectionSize(32)
         for column in range(3):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -214,7 +253,11 @@ class QtSettingsDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(6, 154)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(7, 32)
+        full_cell_delegate = _FullCellWidgetDelegate(table)
+        table.setItemDelegateForColumn(6, full_cell_delegate)
+        table.setItemDelegateForColumn(7, full_cell_delegate)
         return table
 
     def refresh_resources(self) -> None:
@@ -294,6 +337,7 @@ class QtSettingsDialog(QDialog):
             )
             more_button.setMenu(menu)
             more_button.setAutoRaise(True)
+            more_button.setStyleSheet(_RESOURCE_MORE_BUTTON_STYLE)
             size_policy = more_button.sizePolicy()
             size_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
             more_button.setSizePolicy(size_policy)

@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHeaderView,
     QMessageBox,
+    QPushButton,
     QSizePolicy,
     QToolButton,
 )
@@ -155,8 +157,15 @@ class QtSettingsDialogTest(unittest.TestCase):
             )
             table = dialog.active_table
             button = dialog.findChild(QToolButton, f"more_{resource.id}")
-
             self.assertIsNotNone(button)
+            expected_button_width = min(
+                40,
+                max(32, button.sizeHint().width() + 8),
+            )
+
+            dialog.show()
+            self.app.processEvents()
+
             self.assertTrue(button.autoRaise())
             self.assertEqual(
                 button.sizePolicy().horizontalPolicy(),
@@ -164,13 +173,14 @@ class QtSettingsDialogTest(unittest.TestCase):
             )
             self.assertGreaterEqual(button.width(), 32)
             self.assertLessEqual(button.width(), 40)
-            self.assertEqual(
-                button.width(),
-                min(40, max(32, button.sizeHint().width() + 8)),
-            )
-            self.assertEqual(
+            self.assertEqual(button.width(), expected_button_width)
+            self.assertLessEqual(table.columnWidth(7), 40)
+            self.assertIn(
                 table.horizontalHeader().sectionResizeMode(7),
-                QHeaderView.ResizeMode.ResizeToContents,
+                (
+                    QHeaderView.ResizeMode.ResizeToContents,
+                    QHeaderView.ResizeMode.Fixed,
+                ),
             )
             self.assertEqual(
                 table.horizontalHeader().sectionResizeMode(6),
@@ -207,17 +217,138 @@ class QtSettingsDialogTest(unittest.TestCase):
                 self.app.processEvents()
                 cell_left = table.columnViewportPosition(7)
                 cell_right = cell_left + table.columnWidth(7)
-                button_left = button.geometry().left()
-                button_right = button.geometry().right() + 1
+                button_left = button.mapTo(
+                    table.viewport(),
+                    button.rect().topLeft(),
+                ).x()
+                button_right = button_left + button.width()
                 import_right = (
                     table.columnViewportPosition(6) + table.columnWidth(6)
                 )
 
                 self.assertTrue(button.isVisible())
+                self.assertLessEqual(table.columnWidth(7), 40)
+                self.assertEqual(
+                    button.width(),
+                    min(40, max(32, button.sizeHint().width() + 8)),
+                )
                 self.assertGreaterEqual(cell_left, import_right)
                 self.assertGreaterEqual(button_left, cell_left)
                 self.assertLessEqual(button_right, cell_right)
                 self.assertLessEqual(cell_right, table.viewport().width())
+
+            dialog.close()
+
+    def test_more_button_keeps_transparent_unframed_edges_in_all_states(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            self.assertIsNotNone(button)
+            assert button is not None
+            dialog.show()
+            self.app.processEvents()
+
+            def rendered_state() -> QImage:
+                return button.grab().toImage()
+
+            def edge_colors(image: QImage) -> tuple[QColor, ...]:
+                return tuple(
+                    image.pixelColor(x, y)
+                    for x, y in (
+                        (1, 1),
+                        (image.width() - 2, 1),
+                        (1, image.height() - 2),
+                        (image.width() - 2, image.height() - 2),
+                    )
+                )
+
+            normal_image = rendered_state()
+            button.setFocus()
+            self.app.processEvents()
+            focus_image = rendered_state()
+            QApplication.sendEvent(button, QEvent(QEvent.Type.Enter))
+            self.app.processEvents()
+            hover_image = rendered_state()
+            button.setDown(True)
+            self.app.processEvents()
+            pressed_image = rendered_state()
+
+            button.setDown(False)
+            QApplication.sendEvent(button, QEvent(QEvent.Type.Leave))
+            self.app.processEvents()
+
+            normal_edges = edge_colors(normal_image)
+            for image in (normal_image, focus_image, hover_image, pressed_image):
+                self.assertEqual(edge_colors(image), normal_edges)
+                self.assertTrue(
+                    all(color.alpha() == 0 for color in edge_colors(image))
+                )
+                glyph_pixels = tuple(
+                    (x, y)
+                    for y in range(image.height())
+                    for x in range(image.width())
+                    if image.pixelColor(x, y).alpha() > 0
+                )
+                self.assertTrue(glyph_pixels)
+                glyph_left = min(x for x, _y in glyph_pixels)
+                glyph_right = max(x for x, _y in glyph_pixels)
+                glyph_top = min(y for _x, y in glyph_pixels)
+                glyph_bottom = max(y for _x, y in glyph_pixels)
+                self.assertAlmostEqual(
+                    (glyph_left + glyph_right + 1) / 2,
+                    image.width() / 2,
+                    delta=1,
+                )
+                self.assertAlmostEqual(
+                    (glyph_top + glyph_bottom + 1) / 2,
+                    image.height() / 2,
+                    delta=max(1.0, image.devicePixelRatio() * 1.5),
+                )
+            self.assertIn("background: transparent", button.styleSheet())
+            self.assertIn("border: none", button.styleSheet())
+            self.assertIn("QToolButton::menu-indicator", button.styleSheet())
+            dialog.close()
+
+    def test_import_and_more_hit_areas_are_tightly_adjacent_after_show(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            table = dialog.active_table
+            import_button = dialog.findChild(QPushButton, f"import_{resource.id}")
+            more_button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            self.assertIsNotNone(import_button)
+            self.assertIsNotNone(more_button)
+            assert import_button is not None
+            assert more_button is not None
+
+            dialog.show()
+            for width in (860, 1040, 1320):
+                dialog.resize(width, 560)
+                self.app.processEvents()
+                import_left = import_button.mapTo(
+                    table.viewport(),
+                    import_button.rect().topLeft(),
+                ).x()
+                more_left = more_button.mapTo(
+                    table.viewport(),
+                    more_button.rect().topLeft(),
+                ).x()
+                gap = more_left - (import_left + import_button.width())
+
+                self.assertEqual(table.columnWidth(7), 32)
+                self.assertEqual(more_button.width(), 32)
+                self.assertEqual(gap, 0)
 
             dialog.close()
 
