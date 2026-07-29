@@ -7,10 +7,13 @@ from dataclasses import FrozenInstanceError
 from typing import cast
 
 from tm_contracts import (
+    CANDIDATE_BUDGET_VERSION,
+    CandidateRecallMetadata,
     TM_CONTRACT_CODEC_VERSION,
     ContextEvidence,
     QueryReport,
     ResourceQueryFailure,
+    ResourceQueryMetadata,
     SimilarityEvidence,
     TMContract,
     TMMatchType,
@@ -22,6 +25,7 @@ from tm_contracts import (
     TMStore,
     contract_from_json,
     contract_to_json,
+    candidate_budget_v1,
     validate_resource_handles,
 )
 
@@ -64,6 +68,34 @@ def _similarity_evidence(score: float = 0.8) -> SimilarityEvidence:
         levenshtein_ratio=0.75,
         dice_bigram=0.85,
         final_similarity=score,
+    )
+
+
+def _resource_metadata(
+    *,
+    resource_id: str = "tm.primary",
+    returned_count: int = 1,
+    result_limit: int = 10,
+) -> ResourceQueryMetadata:
+    return ResourceQueryMetadata(
+        resource_id=resource_id,
+        context_available=False,
+        context_unavailable_code="CONTEXT.NOT_INDEXED",
+        recall=CandidateRecallMetadata(
+            resource_id=resource_id,
+            index_kind="GRAM_FALLBACK",
+            fuzzy_available=False,
+            fuzzy_unavailable_code="FUZZY.CAPABILITY_UNAVAILABLE",
+            stages=(),
+            union_unique_count=0,
+            deduplicated_count=0,
+            result_limit=result_limit,
+            candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+            candidate_budget=candidate_budget_v1(result_limit),
+            truncated=False,
+        ),
+        scored_count=0,
+        returned_count=returned_count,
     )
 
 
@@ -171,6 +203,7 @@ class TMContractTests(unittest.TestCase):
                         retryable=False,
                     ),
                 ),
+                resource_metadata=(_resource_metadata(),),
             ),
         )
 
@@ -448,13 +481,70 @@ class TMContractTests(unittest.TestCase):
                 scorer_version="scorer-v2",
             )
 
-    def test_query_report_has_no_candidate_metadata_placeholder(self) -> None:
-        report = QueryReport()
+    def test_query_report_requires_closed_resource_metadata(self) -> None:
+        report = QueryReport(
+            results=(),
+            resource_failures=(),
+            resource_metadata=(),
+        )
         payload = json.loads(contract_to_json(report))["payload"]
-        self.assertNotIn("resource_metadata", payload)
-        with self.assertRaises(TypeError):
+        self.assertEqual(payload["resource_metadata"], [])
+
+        envelope = json.loads(contract_to_json(report))
+        del envelope["payload"]["resource_metadata"]
+        with self.assertRaisesRegex(ValueError, "resource_metadata"):
+            contract_from_json(json.dumps(envelope))
+
+        with self.assertRaisesRegex(ValueError, "returned count"):
             QueryReport(
-                resource_metadata=()  # pyright: ignore[reportCallIssue]
+                results=(_result(TMMatchType.EXACT),),
+                resource_failures=(),
+                resource_metadata=(
+                    _resource_metadata(returned_count=0),
+                ),
+            )
+
+        two_results = (
+            _result(
+                TMMatchType.EXACT,
+                resource_id="tm.primary",
+                record_id=7,
+            ),
+            _result(
+                TMMatchType.EXACT,
+                resource_id="tm.secondary",
+                record_id=8,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "same global result limit"):
+            QueryReport(
+                results=two_results,
+                resource_failures=(),
+                resource_metadata=(
+                    _resource_metadata(
+                        resource_id="tm.primary",
+                        result_limit=10,
+                    ),
+                    _resource_metadata(
+                        resource_id="tm.secondary",
+                        result_limit=5,
+                    ),
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "global result limit"):
+            QueryReport(
+                results=two_results,
+                resource_failures=(),
+                resource_metadata=(
+                    _resource_metadata(
+                        resource_id="tm.primary",
+                        result_limit=1,
+                    ),
+                    _resource_metadata(
+                        resource_id="tm.secondary",
+                        result_limit=1,
+                    ),
+                ),
             )
 
     def test_decoder_does_not_echo_untrusted_field_or_contract_type(self) -> None:

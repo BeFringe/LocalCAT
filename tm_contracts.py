@@ -32,6 +32,11 @@ ACTIVATION_TOKEN_VERSION = "activation-token-v1"
 MATCHER_VALIDATION_SUMMARY_VERSION = "matcher-validation-summary-v1"
 MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v1"
 MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 1
+CANDIDATE_BUDGET_VERSION = "candidate-budget-v1"
+BENCHMARK_CONTRACT_VERSION = "benchmark-v1"
+BENCHMARK_SUITE_VERSION = "benchmark-suite-v1"
+BENCHMARK_PERCENTILE_METHOD = "nearest-rank"
+BENCHMARK_RSS_SCOPE = "child-process-lifetime-v1"
 
 _DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\Z")
 _SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -101,6 +106,13 @@ def _require_ratio(value: object, field_name: str) -> None:
         raise TypeError(f"{field_name} must be a number")
     if not math.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError(f"{field_name} must be between 0 and 1")
+
+
+def _require_nonnegative_number(value: object, field_name: str) -> None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a number")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field_name} must be finite and non-negative")
 
 
 def _require_string_tuple(
@@ -480,6 +492,490 @@ class TMResult:
                 )
 
 
+class CandidateStage(str, Enum):
+    """Ordered recall and candidate-pool transformation stages."""
+
+    FTS_TRIGRAM = "FTS_TRIGRAM"
+    GRAM_3 = "GRAM_3"
+    GRAM_2 = "GRAM_2"
+    GRAM_1 = "GRAM_1"
+    UNION = "UNION"
+    DEDUPLICATE = "DEDUPLICATE"
+    TRUNCATE = "TRUNCATE"
+
+
+_CANDIDATE_SOURCE_STAGES = (
+    CandidateStage.FTS_TRIGRAM,
+    CandidateStage.GRAM_3,
+    CandidateStage.GRAM_2,
+    CandidateStage.GRAM_1,
+)
+_CANDIDATE_STAGE_ORDER = {
+    stage: position
+    for position, stage in enumerate(
+        (
+            *_CANDIDATE_SOURCE_STAGES,
+            CandidateStage.UNION,
+            CandidateStage.DEDUPLICATE,
+            CandidateStage.TRUNCATE,
+        )
+    )
+}
+_CANDIDATE_INDEX_KINDS = ("FTS5_TRIGRAM", "GRAM_FALLBACK")
+
+
+def candidate_budget_v1(result_limit: int) -> int:
+    """Return the frozen candidate-budget-v1 pool limit."""
+
+    _require_int(result_limit, "result limit", minimum=1)
+    return min(8192, max(2048, result_limit * 128))
+
+
+@dataclass(frozen=True)
+class CandidateStageMetadata:
+    """Conserved counts for one executed recall or pool stage."""
+
+    stage: CandidateStage
+    input_count: int
+    added_unique_count: int
+    output_unique_count: int
+    dropped_count: int
+
+    def __post_init__(self) -> None:
+        _validate_candidate_stage_metadata(self)
+
+
+def _validate_candidate_stage_metadata(
+    metadata: CandidateStageMetadata,
+) -> None:
+    if not isinstance(metadata.stage, CandidateStage):
+        raise TypeError("candidate stage must be CandidateStage")
+    for field_name, value in (
+        ("input count", metadata.input_count),
+        ("added unique count", metadata.added_unique_count),
+        ("output unique count", metadata.output_unique_count),
+        ("dropped count", metadata.dropped_count),
+    ):
+        _require_int(value, f"candidate stage {field_name}", minimum=0)
+    if (
+        metadata.input_count
+        + metadata.added_unique_count
+        - metadata.dropped_count
+        != metadata.output_unique_count
+    ):
+        raise ValueError("candidate stage counts must conserve input and output")
+    if metadata.stage in _CANDIDATE_SOURCE_STAGES:
+        if (
+            metadata.dropped_count != 0
+            or metadata.output_unique_count
+            != metadata.input_count + metadata.added_unique_count
+        ):
+            raise ValueError(
+                "candidate source stage must only grow the cumulative unique pool"
+            )
+    elif metadata.stage is CandidateStage.UNION:
+        if (
+            metadata.added_unique_count != 0
+            or metadata.dropped_count != 0
+            or metadata.output_unique_count != metadata.input_count
+        ):
+            raise ValueError(
+                "UNION must preserve the cumulative unique pool"
+            )
+    if (
+        metadata.stage
+        in (CandidateStage.DEDUPLICATE, CandidateStage.TRUNCATE)
+        and metadata.added_unique_count != 0
+    ):
+        raise ValueError(
+            f"{metadata.stage.value} must not add unique candidates"
+        )
+
+
+@dataclass(frozen=True)
+class CandidateRecallMetadata:
+    """Recall-only metadata, excluding scorer and global-limit claims."""
+
+    resource_id: str
+    index_kind: str
+    fuzzy_available: bool
+    fuzzy_unavailable_code: str | None
+    stages: tuple[CandidateStageMetadata, ...]
+    union_unique_count: int
+    deduplicated_count: int
+    result_limit: int
+    candidate_budget_version: str
+    candidate_budget: int
+    truncated: bool
+
+    def __post_init__(self) -> None:
+        _validate_candidate_recall_metadata(self)
+
+
+def _candidate_final_count(metadata: CandidateRecallMetadata) -> int:
+    if not metadata.stages:
+        return 0
+    return metadata.stages[-1].output_unique_count
+
+
+def _validate_candidate_recall_metadata(
+    metadata: CandidateRecallMetadata,
+) -> None:
+    _require_identity(metadata.resource_id, "candidate resource id")
+    _require_identity(metadata.index_kind, "candidate index kind")
+    if metadata.index_kind not in _CANDIDATE_INDEX_KINDS:
+        raise ValueError("candidate index kind is unsupported")
+    _require_bool(metadata.fuzzy_available, "fuzzy available")
+    _require_int(
+        metadata.union_unique_count,
+        "union unique count",
+        minimum=0,
+    )
+    _require_int(
+        metadata.deduplicated_count,
+        "deduplicated count",
+        minimum=0,
+    )
+    _require_int(metadata.result_limit, "result limit", minimum=1)
+    if metadata.candidate_budget_version != CANDIDATE_BUDGET_VERSION:
+        raise ValueError(
+            f"candidate budget version must be {CANDIDATE_BUDGET_VERSION}"
+        )
+    _require_int(metadata.candidate_budget, "candidate budget", minimum=1)
+    expected_budget = candidate_budget_v1(metadata.result_limit)
+    if metadata.candidate_budget != expected_budget:
+        raise ValueError(
+            "candidate budget must equal candidate-budget-v1 for result limit"
+        )
+    _require_bool(metadata.truncated, "candidate truncated")
+
+    stages = _require_tuple(metadata.stages, "candidate stages")
+    if any(
+        not isinstance(stage_metadata, CandidateStageMetadata)
+        for stage_metadata in stages
+    ):
+        raise TypeError(
+            "candidate stages must contain CandidateStageMetadata values"
+        )
+    for stage_metadata in stages:
+        _validate_candidate_stage_metadata(stage_metadata)
+
+    if metadata.fuzzy_available:
+        if metadata.fuzzy_unavailable_code is not None:
+            raise ValueError(
+                "fuzzy unavailable code must be empty when fuzzy is available"
+            )
+        if not stages:
+            raise ValueError(
+                "available fuzzy recall must include executed stages"
+            )
+    else:
+        if metadata.fuzzy_unavailable_code is None:
+            raise ValueError(
+                "fuzzy unavailable code is required when fuzzy is unavailable"
+            )
+        _require_diagnostic_identifier(
+            metadata.fuzzy_unavailable_code,
+            "fuzzy unavailable code",
+        )
+        if stages:
+            raise ValueError(
+                "fuzzy unavailable recall must have empty stages"
+            )
+        if (
+            metadata.union_unique_count != 0
+            or metadata.deduplicated_count != 0
+            or metadata.truncated
+        ):
+            raise ValueError(
+                "fuzzy unavailable recall must have zero counts and not truncate"
+            )
+        return
+
+    stage_values = tuple(stage_metadata.stage for stage_metadata in stages)
+    if len(stage_values) != len(set(stage_values)):
+        raise ValueError("candidate stage order must not repeat stages")
+    stage_positions = tuple(
+        _CANDIDATE_STAGE_ORDER[stage]
+        for stage in stage_values
+    )
+    if stage_positions != tuple(sorted(stage_positions)):
+        raise ValueError("candidate stage order is invalid")
+    if (
+        CandidateStage.TRUNCATE in stage_values
+    ) != metadata.truncated:
+        raise ValueError(
+            "candidate truncated flag must match TRUNCATE stage"
+        )
+
+    expected_suffix = (
+        CandidateStage.UNION,
+        CandidateStage.DEDUPLICATE,
+    )
+    if metadata.truncated:
+        expected_suffix += (CandidateStage.TRUNCATE,)
+    if stage_values[-len(expected_suffix):] != expected_suffix:
+        raise ValueError(
+            "candidate stage order must end with UNION, DEDUPLICATE"
+            + (", TRUNCATE" if metadata.truncated else "")
+        )
+    source_stages = stage_values[:-len(expected_suffix)]
+    if not source_stages or any(
+        stage not in _CANDIDATE_SOURCE_STAGES
+        for stage in source_stages
+    ):
+        raise ValueError(
+            "candidate stage order must start with recall source stages"
+        )
+    if metadata.index_kind == "FTS5_TRIGRAM":
+        if CandidateStage.FTS_TRIGRAM not in source_stages:
+            raise ValueError(
+                "FTS5_TRIGRAM index kind must execute FTS_TRIGRAM"
+            )
+    elif CandidateStage.FTS_TRIGRAM in source_stages:
+        raise ValueError(
+            "GRAM_FALLBACK index kind must not execute FTS_TRIGRAM"
+        )
+
+    prior_output = 0
+    for stage_metadata in stages:
+        if stage_metadata.input_count != prior_output:
+            raise ValueError(
+                "candidate stage input counts must be continuous"
+            )
+        prior_output = stage_metadata.output_unique_count
+
+    union_metadata = stages[stage_values.index(CandidateStage.UNION)]
+    if union_metadata.output_unique_count != metadata.union_unique_count:
+        raise ValueError(
+            "UNION output must equal union unique count"
+        )
+    deduplicate_metadata = stages[
+        stage_values.index(CandidateStage.DEDUPLICATE)
+    ]
+    if (
+        deduplicate_metadata.output_unique_count
+        != metadata.deduplicated_count
+    ):
+        raise ValueError(
+            "DEDUPLICATE output must equal deduplicated count"
+        )
+
+    if metadata.truncated:
+        truncate_metadata = stages[-1]
+        if (
+            truncate_metadata.input_count
+            != metadata.deduplicated_count
+            or truncate_metadata.output_unique_count
+            != metadata.candidate_budget
+            or truncate_metadata.dropped_count <= 0
+        ):
+            raise ValueError(
+                "TRUNCATE counts must reduce deduplicated candidates "
+                "to candidate budget"
+            )
+    elif metadata.deduplicated_count > metadata.candidate_budget:
+        raise ValueError(
+            "candidate pool above budget must include TRUNCATE"
+        )
+
+
+@dataclass(frozen=True)
+class CandidateEvidence:
+    """Recall evidence for one candidate id before scoring."""
+
+    record_id: int
+    recall_stages: tuple[CandidateStage, ...]
+    matched_grams: int
+    query_grams: int
+    overlap_ratio: float
+    pretruncate_rank: int | None
+
+    def __post_init__(self) -> None:
+        _validate_candidate_evidence(self)
+
+
+def _validate_candidate_evidence(evidence: CandidateEvidence) -> None:
+    _require_int(evidence.record_id, "candidate record id", minimum=1)
+    recall_stages = _require_tuple(
+        evidence.recall_stages,
+        "candidate recall stages",
+    )
+    if not recall_stages:
+        raise ValueError("candidate recall stages must not be empty")
+    if any(
+        not isinstance(stage, CandidateStage)
+        for stage in recall_stages
+    ):
+        raise TypeError(
+            "candidate recall stages must contain CandidateStage values"
+        )
+    if any(
+        stage not in _CANDIDATE_SOURCE_STAGES
+        for stage in recall_stages
+    ):
+        raise ValueError(
+            "candidate recall stages may contain only recall source stages"
+        )
+    if len(recall_stages) != len(set(recall_stages)):
+        raise ValueError("candidate recall stages must be unique")
+    positions = tuple(
+        _CANDIDATE_STAGE_ORDER[stage]
+        for stage in recall_stages
+    )
+    if positions != tuple(sorted(positions)):
+        raise ValueError("candidate recall stages must be in stable order")
+    _require_int(evidence.matched_grams, "matched grams", minimum=1)
+    _require_int(evidence.query_grams, "query grams", minimum=1)
+    if evidence.matched_grams > evidence.query_grams:
+        raise ValueError("matched grams must not exceed query grams")
+    _require_ratio(evidence.overlap_ratio, "candidate overlap ratio")
+    expected_overlap = evidence.matched_grams / evidence.query_grams
+    if not math.isclose(
+        evidence.overlap_ratio,
+        expected_overlap,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "candidate overlap ratio must equal matched/query grams"
+        )
+    if evidence.pretruncate_rank is not None:
+        _require_int(
+            evidence.pretruncate_rank,
+            "candidate pretruncate rank",
+            minimum=1,
+        )
+
+
+@dataclass(frozen=True)
+class CandidateRetrievalReport:
+    """Candidate ids and recall-only metadata from one resource."""
+
+    candidates: tuple[CandidateEvidence, ...]
+    metadata: CandidateRecallMetadata
+
+    def __post_init__(self) -> None:
+        _validate_candidate_retrieval_report(self)
+
+
+def _validate_candidate_retrieval_report(
+    report: CandidateRetrievalReport,
+) -> None:
+    if not isinstance(report.metadata, CandidateRecallMetadata):
+        raise TypeError(
+            "candidate retrieval metadata must be CandidateRecallMetadata"
+        )
+    _validate_candidate_recall_metadata(report.metadata)
+    candidates = _require_tuple(report.candidates, "candidate values")
+    if any(
+        not isinstance(candidate, CandidateEvidence)
+        for candidate in candidates
+    ):
+        raise TypeError(
+            "candidate values must contain CandidateEvidence values"
+        )
+    for candidate in candidates:
+        _validate_candidate_evidence(candidate)
+    if not report.metadata.fuzzy_available:
+        if candidates:
+            raise ValueError(
+                "fuzzy unavailable recall must return empty candidates"
+            )
+        return
+    if len(candidates) != _candidate_final_count(report.metadata):
+        raise ValueError(
+            "candidate count must equal final recall stage output"
+        )
+    record_ids = tuple(candidate.record_id for candidate in candidates)
+    if len(record_ids) != len(set(record_ids)):
+        raise ValueError("candidate values must have unique record ids")
+    executed_source_stages = {
+        stage_metadata.stage
+        for stage_metadata in report.metadata.stages
+        if stage_metadata.stage in _CANDIDATE_SOURCE_STAGES
+    }
+    for candidate in candidates:
+        if not set(candidate.recall_stages).issubset(
+            executed_source_stages
+        ):
+            raise ValueError(
+                "candidate recall stages must be executed by metadata"
+            )
+    if report.metadata.truncated:
+        ranks = tuple(
+            candidate.pretruncate_rank
+            for candidate in candidates
+        )
+        if any(rank is None for rank in ranks):
+            raise ValueError(
+                "truncated candidates require pretruncate ranks"
+            )
+        if set(ranks) != set(range(1, len(candidates) + 1)):
+            raise ValueError(
+                "truncated candidate pretruncate ranks must be contiguous"
+            )
+
+
+@dataclass(frozen=True)
+class ResourceQueryMetadata:
+    """Post-recall scorer/filter/global-limit counts for one resource."""
+
+    resource_id: str
+    context_available: bool
+    context_unavailable_code: str | None
+    recall: CandidateRecallMetadata
+    scored_count: int
+    returned_count: int
+
+    def __post_init__(self) -> None:
+        _validate_resource_query_metadata(self)
+
+
+def _validate_resource_query_metadata(
+    metadata: ResourceQueryMetadata,
+) -> None:
+    _require_identity(metadata.resource_id, "resource query metadata id")
+    _require_bool(metadata.context_available, "context available")
+    if metadata.context_available:
+        if metadata.context_unavailable_code is not None:
+            raise ValueError(
+                "context unavailable code must be empty when context is available"
+            )
+    else:
+        if metadata.context_unavailable_code is None:
+            raise ValueError(
+                "context unavailable code is required when context is unavailable"
+            )
+        _require_diagnostic_identifier(
+            metadata.context_unavailable_code,
+            "context unavailable code",
+        )
+    if not isinstance(metadata.recall, CandidateRecallMetadata):
+        raise TypeError(
+            "resource recall must be CandidateRecallMetadata"
+        )
+    _validate_candidate_recall_metadata(metadata.recall)
+    if metadata.resource_id != metadata.recall.resource_id:
+        raise ValueError(
+            "resource query metadata resource id must match recall resource id"
+        )
+    _require_int(metadata.scored_count, "scored count", minimum=0)
+    _require_int(metadata.returned_count, "returned count", minimum=0)
+    final_candidate_count = _candidate_final_count(metadata.recall)
+    if metadata.scored_count > final_candidate_count:
+        raise ValueError(
+            "scored count must not exceed recalled candidate count"
+        )
+    if (
+        not metadata.recall.fuzzy_available
+        and metadata.scored_count != 0
+    ):
+        raise ValueError(
+            "fuzzy unavailable resource must not score candidates"
+        )
+
+
 @dataclass(frozen=True)
 class ResourceQueryFailure:
     """A resource-local failure with no arbitrary body-bearing message field."""
@@ -507,14 +1003,19 @@ class ResourceQueryFailure:
 class QueryReport:
     """Aggregated results and isolated resource-local failures."""
 
-    results: tuple[TMResult, ...] = ()
-    resource_failures: tuple[ResourceQueryFailure, ...] = ()
+    results: tuple[TMResult, ...]
+    resource_failures: tuple[ResourceQueryFailure, ...]
+    resource_metadata: tuple[ResourceQueryMetadata, ...]
 
     def __post_init__(self) -> None:
         results = _require_tuple(self.results, "query results")
         failures = _require_tuple(
             self.resource_failures,
             "query resource_failures",
+        )
+        resource_metadata = _require_tuple(
+            self.resource_metadata,
+            "query resource_metadata",
         )
         if any(not isinstance(result, TMResult) for result in results):
             raise TypeError("query results must contain TMResult values")
@@ -525,14 +1026,825 @@ class QueryReport:
             raise TypeError(
                 "query resource_failures must contain ResourceQueryFailure values"
             )
+        if any(
+            not isinstance(metadata, ResourceQueryMetadata)
+            for metadata in resource_metadata
+        ):
+            raise TypeError(
+                "query resource_metadata must contain "
+                "ResourceQueryMetadata values"
+            )
+        for metadata in resource_metadata:
+            _validate_resource_query_metadata(metadata)
         failure_ids = tuple(failure.resource_id for failure in failures)
         if len(failure_ids) != len(set(failure_ids)):
             raise ValueError("query report may contain one failure per resource")
+        metadata_ids = tuple(
+            metadata.resource_id
+            for metadata in resource_metadata
+        )
+        if len(metadata_ids) != len(set(metadata_ids)):
+            raise ValueError(
+                "query report may contain one metadata entry per resource"
+            )
+        result_limits = tuple(
+            metadata.recall.result_limit
+            for metadata in resource_metadata
+        )
+        if len(set(result_limits)) > 1:
+            raise ValueError(
+                "resource metadata must declare the same global result limit"
+            )
+        if (
+            result_limits
+            and sum(
+                metadata.returned_count
+                for metadata in resource_metadata
+            )
+            > result_limits[0]
+        ):
+            raise ValueError(
+                "resource returned counts must not exceed global result limit"
+            )
         result_ids = {result.resource_id for result in results}
         if result_ids.intersection(failure_ids):
             raise ValueError(
                 "a failed query resource cannot also contribute results"
             )
+        if set(metadata_ids).intersection(failure_ids):
+            raise ValueError(
+                "a failed query resource cannot also contribute metadata"
+            )
+        if result_ids.difference(metadata_ids):
+            raise ValueError(
+                "each result resource must have resource metadata"
+            )
+        for metadata in resource_metadata:
+            resource_result_count = sum(
+                result.resource_id == metadata.resource_id
+                for result in results
+            )
+            if metadata.returned_count != resource_result_count:
+                raise ValueError(
+                    "resource returned count must equal its query result count"
+                )
+        if sum(
+            metadata.returned_count
+            for metadata in resource_metadata
+        ) != len(results):
+            raise ValueError(
+                "resource returned counts must equal query result count"
+            )
+
+
+class BenchmarkExecutionPath(str, Enum):
+    """Closed benchmark paths that must never share one capability result."""
+
+    FTS5_TRIGRAM = "FTS5_TRIGRAM"
+    GRAM_FALLBACK = "GRAM_FALLBACK"
+
+
+_BENCHMARK_GATE_ORDER = (
+    "CANDIDATE_RECALL",
+    "EXACT_P95",
+    "FUZZY_P95",
+    "MIGRATION",
+    "PEAK_RSS",
+)
+_BENCHMARK_REQUIRED_ENVIRONMENT_FIELDS = (
+    "cpu",
+    "fts5_enabled",
+    "os",
+    "python_version",
+    "ram_mib",
+    "sqlite_version",
+    "unicode_version",
+)
+
+
+@dataclass(frozen=True)
+class BenchmarkContract:
+    """Fixed benchmark-v1 corpus, cohort, statistic, and hard-gate contract."""
+
+    contract_version: str
+    corpus_generator_version: str
+    corpus_seed: int
+    corpus_record_count: int
+    corpus_digest: str
+    corpus_composition_version: str
+    corpus_composition_digest: str
+    exact_cohort_digest: str
+    exact_min_samples: int
+    exact_cohort_count: int
+    fuzzy_cohort_digest: str
+    fuzzy_min_samples: int
+    fuzzy_cohort_count: int
+    oracle_subset_digest: str
+    oracle_subset_record_count: int
+    oracle_query_count: int
+    top_k: int
+    minimum_similarity: float
+    warmup_queries_per_cohort: int
+    measured_repeats: int
+    percentile_method: str
+    rss_scope: str
+    candidate_budget_version: str
+    scorer_config_digest: str
+    fast_path_config_digest: str
+    fallback_path_config_digest: str
+    exact_p95_gate_ms: float
+    fuzzy_p95_gate_ms: float
+    migration_gate_seconds: float
+    peak_rss_gate_mib: float
+    candidate_recall_gate: float
+
+    def __post_init__(self) -> None:
+        _validate_benchmark_contract(self)
+
+
+def _require_fixed_number(
+    value: object,
+    expected: int | float,
+    field_name: str,
+) -> None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a number")
+    if not math.isfinite(value) or value != expected:
+        raise ValueError(f"{field_name} must be {expected}")
+
+
+def _validate_benchmark_contract(contract: BenchmarkContract) -> None:
+    if contract.contract_version != BENCHMARK_CONTRACT_VERSION:
+        raise ValueError(
+            f"contract version must be {BENCHMARK_CONTRACT_VERSION}"
+        )
+    _require_identity(
+        contract.corpus_generator_version,
+        "corpus generator version",
+    )
+    _require_int(contract.corpus_seed, "corpus seed", minimum=0)
+    _require_int(
+        contract.corpus_record_count,
+        "corpus record count",
+        minimum=0,
+    )
+    if contract.corpus_record_count != 100_000:
+        raise ValueError("corpus record count must be 100000")
+    for field_name, digest in (
+        ("corpus digest", contract.corpus_digest),
+        (
+            "corpus composition digest",
+            contract.corpus_composition_digest,
+        ),
+        ("exact cohort digest", contract.exact_cohort_digest),
+        ("fuzzy cohort digest", contract.fuzzy_cohort_digest),
+        ("oracle subset digest", contract.oracle_subset_digest),
+        ("scorer config digest", contract.scorer_config_digest),
+        ("fast path config digest", contract.fast_path_config_digest),
+        ("fallback path config digest", contract.fallback_path_config_digest),
+    ):
+        _require_digest(digest, field_name)
+    _require_identity(
+        contract.corpus_composition_version,
+        "corpus composition version",
+    )
+    _require_int(
+        contract.exact_min_samples,
+        "exact minimum samples",
+        minimum=0,
+    )
+    if contract.exact_min_samples != 1_000:
+        raise ValueError("exact minimum samples must be 1000")
+    _require_int(
+        contract.exact_cohort_count,
+        "exact cohort count",
+        minimum=contract.exact_min_samples,
+    )
+    _require_int(
+        contract.fuzzy_min_samples,
+        "fuzzy minimum samples",
+        minimum=0,
+    )
+    if contract.fuzzy_min_samples != 200:
+        raise ValueError("fuzzy minimum samples must be 200")
+    _require_int(
+        contract.fuzzy_cohort_count,
+        "fuzzy cohort count",
+        minimum=contract.fuzzy_min_samples,
+    )
+    _require_int(
+        contract.oracle_subset_record_count,
+        "oracle record count",
+        minimum=0,
+    )
+    if contract.oracle_subset_record_count != 5_000:
+        raise ValueError("oracle record count must be 5000")
+    _require_int(
+        contract.oracle_query_count,
+        "oracle query count",
+        minimum=0,
+    )
+    if contract.oracle_query_count != 200:
+        raise ValueError("oracle query count must be 200")
+    _require_int(contract.top_k, "top_k", minimum=1)
+    if contract.top_k != 10:
+        raise ValueError("top_k must be 10")
+    _require_fixed_number(
+        contract.minimum_similarity,
+        0.60,
+        "minimum similarity",
+    )
+    _require_int(
+        contract.warmup_queries_per_cohort,
+        "warmup queries per cohort",
+        minimum=0,
+    )
+    if contract.warmup_queries_per_cohort != 100:
+        raise ValueError("warmup queries per cohort must be 100")
+    _require_int(
+        contract.measured_repeats,
+        "measured repeats",
+        minimum=1,
+    )
+    if contract.measured_repeats != 1:
+        raise ValueError("measured repeats must be 1")
+    if contract.percentile_method != BENCHMARK_PERCENTILE_METHOD:
+        raise ValueError(
+            "percentile method must be nearest-rank"
+        )
+    if contract.rss_scope != BENCHMARK_RSS_SCOPE:
+        raise ValueError(
+            f"RSS scope must be {BENCHMARK_RSS_SCOPE}"
+        )
+    if contract.candidate_budget_version != CANDIDATE_BUDGET_VERSION:
+        raise ValueError(
+            "candidate budget version must be candidate-budget-v1"
+        )
+    _require_fixed_number(
+        contract.exact_p95_gate_ms,
+        50.0,
+        "exact p95 gate",
+    )
+    _require_fixed_number(
+        contract.fuzzy_p95_gate_ms,
+        500.0,
+        "fuzzy p95 gate",
+    )
+    _require_fixed_number(
+        contract.migration_gate_seconds,
+        120.0,
+        "migration gate",
+    )
+    _require_fixed_number(
+        contract.peak_rss_gate_mib,
+        512.0,
+        "peak RSS gate",
+    )
+    _require_fixed_number(
+        contract.candidate_recall_gate,
+        1.0,
+        "candidate recall gate",
+    )
+
+
+def _benchmark_contract_payload(
+    contract: BenchmarkContract,
+) -> dict[str, Any]:
+    return {
+        "candidate_budget_version": contract.candidate_budget_version,
+        "candidate_recall_gate": contract.candidate_recall_gate,
+        "contract_version": contract.contract_version,
+        "corpus_composition_digest": (
+            contract.corpus_composition_digest
+        ),
+        "corpus_composition_version": (
+            contract.corpus_composition_version
+        ),
+        "corpus_digest": contract.corpus_digest,
+        "corpus_generator_version": contract.corpus_generator_version,
+        "corpus_record_count": contract.corpus_record_count,
+        "corpus_seed": contract.corpus_seed,
+        "exact_cohort_digest": contract.exact_cohort_digest,
+        "exact_cohort_count": contract.exact_cohort_count,
+        "exact_min_samples": contract.exact_min_samples,
+        "exact_p95_gate_ms": contract.exact_p95_gate_ms,
+        "fallback_path_config_digest": (
+            contract.fallback_path_config_digest
+        ),
+        "fast_path_config_digest": contract.fast_path_config_digest,
+        "fuzzy_cohort_digest": contract.fuzzy_cohort_digest,
+        "fuzzy_cohort_count": contract.fuzzy_cohort_count,
+        "fuzzy_min_samples": contract.fuzzy_min_samples,
+        "fuzzy_p95_gate_ms": contract.fuzzy_p95_gate_ms,
+        "measured_repeats": contract.measured_repeats,
+        "migration_gate_seconds": contract.migration_gate_seconds,
+        "minimum_similarity": contract.minimum_similarity,
+        "oracle_query_count": contract.oracle_query_count,
+        "oracle_subset_digest": contract.oracle_subset_digest,
+        "oracle_subset_record_count": contract.oracle_subset_record_count,
+        "peak_rss_gate_mib": contract.peak_rss_gate_mib,
+        "percentile_method": contract.percentile_method,
+        "rss_scope": contract.rss_scope,
+        "scorer_config_digest": contract.scorer_config_digest,
+        "top_k": contract.top_k,
+        "warmup_queries_per_cohort": (
+            contract.warmup_queries_per_cohort
+        ),
+    }
+
+
+def benchmark_contract_digest(contract: BenchmarkContract) -> str:
+    """Digest every approved benchmark-v1 parameter."""
+
+    if not isinstance(contract, BenchmarkContract):
+        raise TypeError("benchmark contract must be BenchmarkContract")
+    _validate_benchmark_contract(contract)
+    return _stable_digest(_benchmark_contract_payload(contract))
+
+
+def _validate_benchmark_environment(
+    environment: tuple[tuple[str, str], ...],
+) -> None:
+    pairs = _require_tuple(environment, "benchmark environment")
+    keys: list[str] = []
+    for pair in pairs:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise TypeError(
+                "benchmark environment entries must be two-item tuples"
+            )
+        key, value = pair
+        _require_identity(key, "benchmark environment key")
+        _require_identity(value, "benchmark environment value")
+        keys.append(key)
+    if len(keys) != len(set(keys)):
+        raise ValueError("benchmark environment keys must be unique")
+    if tuple(keys) != tuple(sorted(keys)):
+        raise ValueError(
+            "benchmark environment keys must be in stable order"
+        )
+    missing = set(_BENCHMARK_REQUIRED_ENVIRONMENT_FIELDS).difference(keys)
+    if missing:
+        raise ValueError(
+            "benchmark environment is missing required fields"
+        )
+
+
+def benchmark_environment_digest(
+    environment: tuple[tuple[str, str], ...],
+) -> str:
+    """Digest a strict environment tuple without accepting free-form messages."""
+
+    _validate_benchmark_environment(environment)
+    return _stable_digest(
+        {"environment": [list(pair) for pair in environment]}
+    )
+
+
+@dataclass(frozen=True)
+class BenchmarkReport:
+    """One path-specific benchmark-v1 result bound to all input facts."""
+
+    contract: BenchmarkContract
+    contract_digest: str
+    corpus_digest: str
+    corpus_composition_version: str
+    corpus_composition_digest: str
+    exact_cohort_digest: str
+    fuzzy_cohort_digest: str
+    oracle_subset_digest: str
+    scorer_config_digest: str
+    execution_path: BenchmarkExecutionPath
+    path_config_digest: str
+    exact_sample_count: int
+    fuzzy_sample_count: int
+    oracle_query_count: int
+    percentile_method: str
+    candidate_recall: float
+    exact_p50_ms: float
+    exact_p95_ms: float
+    exact_max_ms: float
+    fuzzy_top10_p50_ms: float
+    fuzzy_top10_p95_ms: float
+    fuzzy_top10_max_ms: float
+    migration_seconds: float
+    peak_rss_mib: float
+    passed: bool
+    failed_gates: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    environment_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_benchmark_report(self)
+
+
+def _validate_percentile_triplet(
+    p50: float,
+    p95: float,
+    maximum: float,
+    field_prefix: str,
+) -> None:
+    _require_nonnegative_number(p50, f"{field_prefix} p50")
+    _require_nonnegative_number(p95, f"{field_prefix} p95")
+    _require_nonnegative_number(maximum, f"{field_prefix} max")
+    if not p50 <= p95 <= maximum:
+        raise ValueError(
+            f"{field_prefix} p50/p95/max must be monotonic"
+        )
+
+
+def _validate_benchmark_report(report: BenchmarkReport) -> None:
+    if not isinstance(report.contract, BenchmarkContract):
+        raise TypeError("report contract must be BenchmarkContract")
+    _validate_benchmark_contract(report.contract)
+    expected_contract_digest = benchmark_contract_digest(report.contract)
+    _require_digest(report.contract_digest, "contract digest")
+    if report.contract_digest != expected_contract_digest:
+        raise ValueError(
+            "report contract digest must bind the benchmark contract"
+        )
+    if (
+        report.corpus_composition_version
+        != report.contract.corpus_composition_version
+    ):
+        raise ValueError(
+            "report corpus composition version must match benchmark contract"
+        )
+    for field_name, actual, expected in (
+        ("corpus digest", report.corpus_digest, report.contract.corpus_digest),
+        (
+            "corpus composition digest",
+            report.corpus_composition_digest,
+            report.contract.corpus_composition_digest,
+        ),
+        (
+            "exact cohort digest",
+            report.exact_cohort_digest,
+            report.contract.exact_cohort_digest,
+        ),
+        (
+            "fuzzy cohort digest",
+            report.fuzzy_cohort_digest,
+            report.contract.fuzzy_cohort_digest,
+        ),
+        (
+            "oracle subset digest",
+            report.oracle_subset_digest,
+            report.contract.oracle_subset_digest,
+        ),
+        (
+            "scorer config digest",
+            report.scorer_config_digest,
+            report.contract.scorer_config_digest,
+        ),
+    ):
+        _require_digest(actual, field_name)
+        if actual != expected:
+            raise ValueError(
+                f"report {field_name} must match benchmark contract"
+            )
+    if not isinstance(report.execution_path, BenchmarkExecutionPath):
+        raise TypeError(
+            "report execution path must be BenchmarkExecutionPath"
+        )
+    expected_path_config_digest = (
+        report.contract.fast_path_config_digest
+        if report.execution_path is BenchmarkExecutionPath.FTS5_TRIGRAM
+        else report.contract.fallback_path_config_digest
+    )
+    _require_digest(report.path_config_digest, "path config digest")
+    if report.path_config_digest != expected_path_config_digest:
+        raise ValueError(
+            "report path config digest must match execution path"
+        )
+    _require_int(
+        report.exact_sample_count,
+        "exact sample count",
+        minimum=0,
+    )
+    if report.exact_sample_count != report.contract.exact_cohort_count:
+        raise ValueError(
+            "exact sample count must equal exact cohort count"
+        )
+    _require_int(
+        report.fuzzy_sample_count,
+        "fuzzy sample count",
+        minimum=0,
+    )
+    if report.fuzzy_sample_count != report.contract.fuzzy_cohort_count:
+        raise ValueError(
+            "fuzzy sample count must equal fuzzy cohort count"
+        )
+    _require_int(
+        report.oracle_query_count,
+        "oracle query count",
+        minimum=0,
+    )
+    if report.oracle_query_count != report.contract.oracle_query_count:
+        raise ValueError(
+            "oracle query count must match benchmark contract"
+        )
+    if report.percentile_method != report.contract.percentile_method:
+        raise ValueError(
+            "report percentile method must match benchmark contract"
+        )
+    _require_ratio(report.candidate_recall, "candidate recall")
+    _validate_percentile_triplet(
+        report.exact_p50_ms,
+        report.exact_p95_ms,
+        report.exact_max_ms,
+        "exact",
+    )
+    _validate_percentile_triplet(
+        report.fuzzy_top10_p50_ms,
+        report.fuzzy_top10_p95_ms,
+        report.fuzzy_top10_max_ms,
+        "fuzzy top-10",
+    )
+    _require_nonnegative_number(
+        report.migration_seconds,
+        "migration seconds",
+    )
+    _require_nonnegative_number(
+        report.peak_rss_mib,
+        "peak RSS MiB",
+    )
+    _require_bool(report.passed, "benchmark passed")
+    failed_gates = _require_string_tuple(
+        report.failed_gates,
+        "failed gates",
+        identities=True,
+    )
+    unknown_gates = set(failed_gates).difference(_BENCHMARK_GATE_ORDER)
+    if unknown_gates:
+        raise ValueError("failed gates contain unsupported gate")
+    expected_failed_gates = tuple(
+        gate
+        for gate, failed in (
+            (
+                "CANDIDATE_RECALL",
+                report.candidate_recall
+                < report.contract.candidate_recall_gate,
+            ),
+            (
+                "EXACT_P95",
+                report.exact_p95_ms
+                > report.contract.exact_p95_gate_ms,
+            ),
+            (
+                "FUZZY_P95",
+                report.fuzzy_top10_p95_ms
+                > report.contract.fuzzy_p95_gate_ms,
+            ),
+            (
+                "MIGRATION",
+                report.migration_seconds
+                > report.contract.migration_gate_seconds,
+            ),
+            (
+                "PEAK_RSS",
+                report.peak_rss_mib
+                > report.contract.peak_rss_gate_mib,
+            ),
+        )
+        if failed
+    )
+    if failed_gates != expected_failed_gates:
+        raise ValueError(
+            "failed gates must exactly match measured hard-gate failures"
+        )
+    if report.passed != (not expected_failed_gates):
+        raise ValueError(
+            "benchmark passed must derive from failed gates"
+        )
+    _validate_benchmark_environment(report.environment)
+    _require_digest(report.environment_digest, "environment digest")
+    if report.environment_digest != benchmark_environment_digest(
+        report.environment
+    ):
+        raise ValueError(
+            "report environment digest must bind environment"
+        )
+    environment = dict(report.environment)
+    fts5_enabled = environment["fts5_enabled"]
+    if report.execution_path is BenchmarkExecutionPath.FTS5_TRIGRAM:
+        if fts5_enabled != "true":
+            raise ValueError(
+                "FTS5 environment must enable FTS5 for fast path"
+            )
+    elif fts5_enabled != "false":
+        raise ValueError(
+            "fallback environment must disable FTS5"
+        )
+
+
+@dataclass(frozen=True)
+class BenchmarkSuiteContract:
+    """Aggregate contract requiring both benchmark-v1 execution paths."""
+
+    suite_version: str
+    benchmark_contract: BenchmarkContract
+    benchmark_contract_digest: str
+    required_paths: tuple[BenchmarkExecutionPath, ...]
+
+    def __post_init__(self) -> None:
+        _validate_benchmark_suite_contract(self)
+
+
+def _validate_benchmark_suite_contract(
+    contract: BenchmarkSuiteContract,
+) -> None:
+    if contract.suite_version != BENCHMARK_SUITE_VERSION:
+        raise ValueError(
+            f"benchmark suite version must be {BENCHMARK_SUITE_VERSION}"
+        )
+    if not isinstance(contract.benchmark_contract, BenchmarkContract):
+        raise TypeError(
+            "suite benchmark contract must be BenchmarkContract"
+        )
+    _validate_benchmark_contract(contract.benchmark_contract)
+    _require_digest(
+        contract.benchmark_contract_digest,
+        "suite benchmark contract digest",
+    )
+    if contract.benchmark_contract_digest != benchmark_contract_digest(
+        contract.benchmark_contract
+    ):
+        raise ValueError(
+            "suite benchmark contract digest must bind benchmark contract"
+        )
+    required_paths = _require_tuple(
+        contract.required_paths,
+        "suite required paths",
+    )
+    if any(
+        not isinstance(path, BenchmarkExecutionPath)
+        for path in required_paths
+    ):
+        raise TypeError(
+            "suite required paths must contain BenchmarkExecutionPath values"
+        )
+    if required_paths != tuple(BenchmarkExecutionPath):
+        raise ValueError(
+            "suite required paths must contain both benchmark paths "
+            "in stable order"
+        )
+
+
+def _benchmark_suite_contract_payload(
+    contract: BenchmarkSuiteContract,
+) -> dict[str, Any]:
+    return {
+        "benchmark_contract": _benchmark_contract_payload(
+            contract.benchmark_contract
+        ),
+        "benchmark_contract_digest": (
+            contract.benchmark_contract_digest
+        ),
+        "required_paths": [
+            path.value for path in contract.required_paths
+        ],
+        "suite_version": contract.suite_version,
+    }
+
+
+def benchmark_suite_contract_digest(
+    contract: BenchmarkSuiteContract,
+) -> str:
+    """Digest the two-path aggregate contract and nested benchmark contract."""
+
+    if not isinstance(contract, BenchmarkSuiteContract):
+        raise TypeError(
+            "benchmark suite contract must be BenchmarkSuiteContract"
+        )
+    _validate_benchmark_suite_contract(contract)
+    return _stable_digest(_benchmark_suite_contract_payload(contract))
+
+
+@dataclass(frozen=True)
+class BenchmarkSuiteReport:
+    """Both path reports with aggregate pass/failure derived from facts."""
+
+    suite_contract: BenchmarkSuiteContract
+    suite_contract_digest: str
+    corpus_composition_version: str
+    corpus_composition_digest: str
+    path_reports: tuple[BenchmarkReport, ...]
+    passed: bool
+    failed_paths: tuple[BenchmarkExecutionPath, ...]
+
+    def __post_init__(self) -> None:
+        _validate_benchmark_suite_report(self)
+
+
+def _validate_benchmark_suite_report(
+    report: BenchmarkSuiteReport,
+) -> None:
+    if not isinstance(report.suite_contract, BenchmarkSuiteContract):
+        raise TypeError(
+            "suite report contract must be BenchmarkSuiteContract"
+        )
+    _validate_benchmark_suite_contract(report.suite_contract)
+    _require_digest(
+        report.suite_contract_digest,
+        "suite contract digest",
+    )
+    if report.suite_contract_digest != benchmark_suite_contract_digest(
+        report.suite_contract
+    ):
+        raise ValueError(
+            "suite contract digest must bind suite contract"
+        )
+    benchmark_contract = report.suite_contract.benchmark_contract
+    if (
+        report.corpus_composition_version
+        != benchmark_contract.corpus_composition_version
+    ):
+        raise ValueError(
+            "suite corpus composition version must match benchmark contract"
+        )
+    _require_digest(
+        report.corpus_composition_digest,
+        "suite corpus composition digest",
+    )
+    if (
+        report.corpus_composition_digest
+        != benchmark_contract.corpus_composition_digest
+    ):
+        raise ValueError(
+            "suite corpus composition digest must match benchmark contract"
+        )
+    path_reports = _require_tuple(
+        report.path_reports,
+        "suite path reports",
+    )
+    if any(
+        not isinstance(path_report, BenchmarkReport)
+        for path_report in path_reports
+    ):
+        raise TypeError(
+            "suite path reports must contain BenchmarkReport values"
+        )
+    for path_report in path_reports:
+        _validate_benchmark_report(path_report)
+        if path_report.contract != benchmark_contract:
+            raise ValueError(
+                "suite path report contract must match suite contract"
+            )
+        if (
+            path_report.corpus_composition_version
+            != report.corpus_composition_version
+        ):
+            raise ValueError(
+                "suite path corpus composition version must match suite"
+            )
+        if (
+            path_report.corpus_composition_digest
+            != report.corpus_composition_digest
+        ):
+            raise ValueError(
+                "suite path corpus composition digest must match suite"
+            )
+    execution_paths = tuple(
+        path_report.execution_path
+        for path_report in path_reports
+    )
+    required_paths = report.suite_contract.required_paths
+    if (
+        len(execution_paths) != len(required_paths)
+        or set(execution_paths) != set(required_paths)
+    ):
+        raise ValueError(
+            "suite must report both benchmark paths exactly once"
+        )
+    if execution_paths != required_paths:
+        raise ValueError(
+            "suite benchmark path order must match required paths"
+        )
+    _require_bool(report.passed, "aggregate passed")
+    failed_paths = _require_tuple(
+        report.failed_paths,
+        "suite failed paths",
+    )
+    if any(
+        not isinstance(path, BenchmarkExecutionPath)
+        for path in failed_paths
+    ):
+        raise TypeError(
+            "suite failed paths must contain BenchmarkExecutionPath values"
+        )
+    expected_failed_paths = tuple(
+        path_report.execution_path
+        for path_report in path_reports
+        if not path_report.passed
+    )
+    if failed_paths != expected_failed_paths:
+        raise ValueError(
+            "suite failed paths must derive from path reports"
+        )
+    if report.passed != (not expected_failed_paths):
+        raise ValueError(
+            "aggregate passed must derive from both path reports"
+        )
 
 
 class AssetKind(str, Enum):
@@ -2614,8 +3926,17 @@ type TMContract = (
     | SimilarityEvidence
     | ContextEvidence
     | TMResult
+    | CandidateStageMetadata
+    | CandidateRecallMetadata
+    | CandidateEvidence
+    | CandidateRetrievalReport
+    | ResourceQueryMetadata
     | ResourceQueryFailure
     | QueryReport
+    | BenchmarkContract
+    | BenchmarkReport
+    | BenchmarkSuiteContract
+    | BenchmarkSuiteReport
     | AssetPreservationEvidence
     | RecoveryLocator
     | MigrationDiagnostic
@@ -2694,6 +4015,135 @@ def _encode_failure(failure: ResourceQueryFailure) -> dict[str, Any]:
         "resource_id": failure.resource_id,
         "retryable": failure.retryable,
         "stage": failure.stage,
+    }
+
+
+def _encode_candidate_stage_metadata(
+    metadata: CandidateStageMetadata,
+) -> dict[str, Any]:
+    return {
+        "added_unique_count": metadata.added_unique_count,
+        "dropped_count": metadata.dropped_count,
+        "input_count": metadata.input_count,
+        "output_unique_count": metadata.output_unique_count,
+        "stage": metadata.stage.value,
+    }
+
+
+def _encode_candidate_recall_metadata(
+    metadata: CandidateRecallMetadata,
+) -> dict[str, Any]:
+    return {
+        "candidate_budget": metadata.candidate_budget,
+        "candidate_budget_version": metadata.candidate_budget_version,
+        "deduplicated_count": metadata.deduplicated_count,
+        "fuzzy_available": metadata.fuzzy_available,
+        "fuzzy_unavailable_code": metadata.fuzzy_unavailable_code,
+        "index_kind": metadata.index_kind,
+        "resource_id": metadata.resource_id,
+        "result_limit": metadata.result_limit,
+        "stages": [
+            _encode_candidate_stage_metadata(stage)
+            for stage in metadata.stages
+        ],
+        "truncated": metadata.truncated,
+        "union_unique_count": metadata.union_unique_count,
+    }
+
+
+def _encode_candidate_evidence(
+    evidence: CandidateEvidence,
+) -> dict[str, Any]:
+    return {
+        "matched_grams": evidence.matched_grams,
+        "overlap_ratio": evidence.overlap_ratio,
+        "pretruncate_rank": evidence.pretruncate_rank,
+        "query_grams": evidence.query_grams,
+        "recall_stages": [
+            stage.value for stage in evidence.recall_stages
+        ],
+        "record_id": evidence.record_id,
+    }
+
+
+def _encode_candidate_retrieval_report(
+    report: CandidateRetrievalReport,
+) -> dict[str, Any]:
+    return {
+        "candidates": [
+            _encode_candidate_evidence(candidate)
+            for candidate in report.candidates
+        ],
+        "metadata": _encode_candidate_recall_metadata(report.metadata),
+    }
+
+
+def _encode_resource_query_metadata(
+    metadata: ResourceQueryMetadata,
+) -> dict[str, Any]:
+    return {
+        "context_available": metadata.context_available,
+        "context_unavailable_code": metadata.context_unavailable_code,
+        "recall": _encode_candidate_recall_metadata(metadata.recall),
+        "resource_id": metadata.resource_id,
+        "returned_count": metadata.returned_count,
+        "scored_count": metadata.scored_count,
+    }
+
+
+def _encode_benchmark_report(
+    report: BenchmarkReport,
+) -> dict[str, Any]:
+    return {
+        "candidate_recall": report.candidate_recall,
+        "contract": _benchmark_contract_payload(report.contract),
+        "contract_digest": report.contract_digest,
+        "corpus_composition_digest": report.corpus_composition_digest,
+        "corpus_composition_version": report.corpus_composition_version,
+        "corpus_digest": report.corpus_digest,
+        "environment": [list(pair) for pair in report.environment],
+        "environment_digest": report.environment_digest,
+        "exact_cohort_digest": report.exact_cohort_digest,
+        "exact_max_ms": report.exact_max_ms,
+        "exact_p50_ms": report.exact_p50_ms,
+        "exact_p95_ms": report.exact_p95_ms,
+        "exact_sample_count": report.exact_sample_count,
+        "execution_path": report.execution_path.value,
+        "failed_gates": list(report.failed_gates),
+        "fuzzy_cohort_digest": report.fuzzy_cohort_digest,
+        "fuzzy_sample_count": report.fuzzy_sample_count,
+        "fuzzy_top10_max_ms": report.fuzzy_top10_max_ms,
+        "fuzzy_top10_p50_ms": report.fuzzy_top10_p50_ms,
+        "fuzzy_top10_p95_ms": report.fuzzy_top10_p95_ms,
+        "migration_seconds": report.migration_seconds,
+        "oracle_query_count": report.oracle_query_count,
+        "oracle_subset_digest": report.oracle_subset_digest,
+        "passed": report.passed,
+        "path_config_digest": report.path_config_digest,
+        "peak_rss_mib": report.peak_rss_mib,
+        "percentile_method": report.percentile_method,
+        "scorer_config_digest": report.scorer_config_digest,
+    }
+
+
+def _encode_benchmark_suite_report(
+    report: BenchmarkSuiteReport,
+) -> dict[str, Any]:
+    return {
+        "corpus_composition_digest": report.corpus_composition_digest,
+        "corpus_composition_version": report.corpus_composition_version,
+        "failed_paths": [
+            path.value for path in report.failed_paths
+        ],
+        "passed": report.passed,
+        "path_reports": [
+            _encode_benchmark_report(path_report)
+            for path_report in report.path_reports
+        ],
+        "suite_contract": _benchmark_suite_contract_payload(
+            report.suite_contract
+        ),
+        "suite_contract_digest": report.suite_contract_digest,
     }
 
 
@@ -3104,16 +4554,66 @@ def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
         return "ContextEvidence", _encode_context_evidence(contract)
     if isinstance(contract, TMResult):
         return "TMResult", _encode_result(contract)
+    if isinstance(contract, CandidateStageMetadata):
+        _validate_candidate_stage_metadata(contract)
+        return (
+            "CandidateStageMetadata",
+            _encode_candidate_stage_metadata(contract),
+        )
+    if isinstance(contract, CandidateRecallMetadata):
+        _validate_candidate_recall_metadata(contract)
+        return (
+            "CandidateRecallMetadata",
+            _encode_candidate_recall_metadata(contract),
+        )
+    if isinstance(contract, CandidateEvidence):
+        _validate_candidate_evidence(contract)
+        return "CandidateEvidence", _encode_candidate_evidence(contract)
+    if isinstance(contract, CandidateRetrievalReport):
+        _validate_candidate_retrieval_report(contract)
+        return (
+            "CandidateRetrievalReport",
+            _encode_candidate_retrieval_report(contract),
+        )
+    if isinstance(contract, ResourceQueryMetadata):
+        _validate_resource_query_metadata(contract)
+        return (
+            "ResourceQueryMetadata",
+            _encode_resource_query_metadata(contract),
+        )
     if isinstance(contract, ResourceQueryFailure):
         return "ResourceQueryFailure", _encode_failure(contract)
     if isinstance(contract, QueryReport):
+        contract.__post_init__()
         return "QueryReport", {
+            "resource_metadata": [
+                _encode_resource_query_metadata(metadata)
+                for metadata in contract.resource_metadata
+            ],
             "resource_failures": [
                 _encode_failure(failure)
                 for failure in contract.resource_failures
             ],
             "results": [_encode_result(result) for result in contract.results],
         }
+    if isinstance(contract, BenchmarkContract):
+        _validate_benchmark_contract(contract)
+        return "BenchmarkContract", _benchmark_contract_payload(contract)
+    if isinstance(contract, BenchmarkReport):
+        _validate_benchmark_report(contract)
+        return "BenchmarkReport", _encode_benchmark_report(contract)
+    if isinstance(contract, BenchmarkSuiteContract):
+        _validate_benchmark_suite_contract(contract)
+        return (
+            "BenchmarkSuiteContract",
+            _benchmark_suite_contract_payload(contract),
+        )
+    if isinstance(contract, BenchmarkSuiteReport):
+        _validate_benchmark_suite_report(contract)
+        return (
+            "BenchmarkSuiteReport",
+            _encode_benchmark_suite_report(contract),
+        )
     if isinstance(contract, AssetPreservationEvidence):
         _validate_asset_preservation_evidence(contract)
         return (
@@ -4144,6 +5644,417 @@ def _decode_stage_validation_evidence(
     )
 
 
+def _decode_candidate_stage(
+    value: object,
+    field_name: str,
+) -> CandidateStage:
+    try:
+        return CandidateStage(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} is invalid") from None
+
+
+def _decode_candidate_stage_metadata(
+    value: object,
+) -> CandidateStageMetadata:
+    payload = _strict_fields(
+        value,
+        "CandidateStageMetadata payload",
+        (
+            "added_unique_count",
+            "dropped_count",
+            "input_count",
+            "output_unique_count",
+            "stage",
+        ),
+    )
+    return CandidateStageMetadata(
+        stage=_decode_candidate_stage(
+            payload["stage"],
+            "candidate stage",
+        ),
+        input_count=payload["input_count"],
+        added_unique_count=payload["added_unique_count"],
+        output_unique_count=payload["output_unique_count"],
+        dropped_count=payload["dropped_count"],
+    )
+
+
+def _decode_candidate_recall_metadata(
+    value: object,
+) -> CandidateRecallMetadata:
+    payload = _strict_fields(
+        value,
+        "CandidateRecallMetadata payload",
+        (
+            "candidate_budget",
+            "candidate_budget_version",
+            "deduplicated_count",
+            "fuzzy_available",
+            "fuzzy_unavailable_code",
+            "index_kind",
+            "resource_id",
+            "result_limit",
+            "stages",
+            "truncated",
+            "union_unique_count",
+        ),
+    )
+    return CandidateRecallMetadata(
+        resource_id=payload["resource_id"],
+        index_kind=payload["index_kind"],
+        fuzzy_available=payload["fuzzy_available"],
+        fuzzy_unavailable_code=payload["fuzzy_unavailable_code"],
+        stages=tuple(
+            _decode_candidate_stage_metadata(stage)
+            for stage in _as_list(payload["stages"], "candidate stages")
+        ),
+        union_unique_count=payload["union_unique_count"],
+        deduplicated_count=payload["deduplicated_count"],
+        result_limit=payload["result_limit"],
+        candidate_budget_version=payload["candidate_budget_version"],
+        candidate_budget=payload["candidate_budget"],
+        truncated=payload["truncated"],
+    )
+
+
+def _decode_candidate_evidence(value: object) -> CandidateEvidence:
+    payload = _strict_fields(
+        value,
+        "CandidateEvidence payload",
+        (
+            "matched_grams",
+            "overlap_ratio",
+            "pretruncate_rank",
+            "query_grams",
+            "recall_stages",
+            "record_id",
+        ),
+    )
+    return CandidateEvidence(
+        record_id=payload["record_id"],
+        recall_stages=tuple(
+            _decode_candidate_stage(stage, "candidate recall stage")
+            for stage in _as_list(
+                payload["recall_stages"],
+                "candidate recall stages",
+            )
+        ),
+        matched_grams=payload["matched_grams"],
+        query_grams=payload["query_grams"],
+        overlap_ratio=payload["overlap_ratio"],
+        pretruncate_rank=payload["pretruncate_rank"],
+    )
+
+
+def _decode_candidate_retrieval_report(
+    value: object,
+) -> CandidateRetrievalReport:
+    payload = _strict_fields(
+        value,
+        "CandidateRetrievalReport payload",
+        ("candidates", "metadata"),
+    )
+    return CandidateRetrievalReport(
+        candidates=tuple(
+            _decode_candidate_evidence(candidate)
+            for candidate in _as_list(
+                payload["candidates"],
+                "candidate values",
+            )
+        ),
+        metadata=_decode_candidate_recall_metadata(payload["metadata"]),
+    )
+
+
+def _decode_resource_query_metadata(
+    value: object,
+) -> ResourceQueryMetadata:
+    payload = _strict_fields(
+        value,
+        "ResourceQueryMetadata payload",
+        (
+            "context_available",
+            "context_unavailable_code",
+            "recall",
+            "resource_id",
+            "returned_count",
+            "scored_count",
+        ),
+    )
+    return ResourceQueryMetadata(
+        resource_id=payload["resource_id"],
+        context_available=payload["context_available"],
+        context_unavailable_code=payload["context_unavailable_code"],
+        recall=_decode_candidate_recall_metadata(payload["recall"]),
+        scored_count=payload["scored_count"],
+        returned_count=payload["returned_count"],
+    )
+
+
+def _decode_benchmark_contract(value: object) -> BenchmarkContract:
+    payload = _strict_fields(
+        value,
+        "BenchmarkContract payload",
+        (
+            "candidate_budget_version",
+            "candidate_recall_gate",
+            "contract_version",
+            "corpus_composition_digest",
+            "corpus_composition_version",
+            "corpus_digest",
+            "corpus_generator_version",
+            "corpus_record_count",
+            "corpus_seed",
+            "exact_cohort_digest",
+            "exact_cohort_count",
+            "exact_min_samples",
+            "exact_p95_gate_ms",
+            "fallback_path_config_digest",
+            "fast_path_config_digest",
+            "fuzzy_cohort_digest",
+            "fuzzy_cohort_count",
+            "fuzzy_min_samples",
+            "fuzzy_p95_gate_ms",
+            "measured_repeats",
+            "migration_gate_seconds",
+            "minimum_similarity",
+            "oracle_query_count",
+            "oracle_subset_digest",
+            "oracle_subset_record_count",
+            "peak_rss_gate_mib",
+            "percentile_method",
+            "rss_scope",
+            "scorer_config_digest",
+            "top_k",
+            "warmup_queries_per_cohort",
+        ),
+    )
+    return BenchmarkContract(
+        contract_version=payload["contract_version"],
+        corpus_generator_version=payload["corpus_generator_version"],
+        corpus_seed=payload["corpus_seed"],
+        corpus_record_count=payload["corpus_record_count"],
+        corpus_digest=payload["corpus_digest"],
+        corpus_composition_version=payload[
+            "corpus_composition_version"
+        ],
+        corpus_composition_digest=payload[
+            "corpus_composition_digest"
+        ],
+        exact_cohort_digest=payload["exact_cohort_digest"],
+        exact_min_samples=payload["exact_min_samples"],
+        exact_cohort_count=payload["exact_cohort_count"],
+        fuzzy_cohort_digest=payload["fuzzy_cohort_digest"],
+        fuzzy_min_samples=payload["fuzzy_min_samples"],
+        fuzzy_cohort_count=payload["fuzzy_cohort_count"],
+        oracle_subset_digest=payload["oracle_subset_digest"],
+        oracle_subset_record_count=payload["oracle_subset_record_count"],
+        oracle_query_count=payload["oracle_query_count"],
+        top_k=payload["top_k"],
+        minimum_similarity=payload["minimum_similarity"],
+        warmup_queries_per_cohort=payload[
+            "warmup_queries_per_cohort"
+        ],
+        measured_repeats=payload["measured_repeats"],
+        percentile_method=payload["percentile_method"],
+        rss_scope=payload["rss_scope"],
+        candidate_budget_version=payload["candidate_budget_version"],
+        scorer_config_digest=payload["scorer_config_digest"],
+        fast_path_config_digest=payload["fast_path_config_digest"],
+        fallback_path_config_digest=payload[
+            "fallback_path_config_digest"
+        ],
+        exact_p95_gate_ms=payload["exact_p95_gate_ms"],
+        fuzzy_p95_gate_ms=payload["fuzzy_p95_gate_ms"],
+        migration_gate_seconds=payload["migration_gate_seconds"],
+        peak_rss_gate_mib=payload["peak_rss_gate_mib"],
+        candidate_recall_gate=payload["candidate_recall_gate"],
+    )
+
+
+def _decode_benchmark_execution_path(
+    value: object,
+) -> BenchmarkExecutionPath:
+    try:
+        return BenchmarkExecutionPath(value)
+    except (TypeError, ValueError):
+        raise ValueError("benchmark execution path is invalid") from None
+
+
+def _decode_benchmark_environment(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    for entry in _as_list(value, "benchmark environment"):
+        pair = _as_list(entry, "benchmark environment entry")
+        if len(pair) != 2:
+            raise ValueError(
+                "benchmark environment entries must contain two values"
+            )
+        key, item_value = pair
+        if not isinstance(key, str) or not isinstance(item_value, str):
+            raise TypeError(
+                "benchmark environment entries must contain strings"
+            )
+        pairs.append((key, item_value))
+    return tuple(pairs)
+
+
+def _decode_benchmark_report(value: object) -> BenchmarkReport:
+    payload = _strict_fields(
+        value,
+        "BenchmarkReport payload",
+        (
+            "candidate_recall",
+            "contract",
+            "contract_digest",
+            "corpus_composition_digest",
+            "corpus_composition_version",
+            "corpus_digest",
+            "environment",
+            "environment_digest",
+            "exact_cohort_digest",
+            "exact_max_ms",
+            "exact_p50_ms",
+            "exact_p95_ms",
+            "exact_sample_count",
+            "execution_path",
+            "failed_gates",
+            "fuzzy_cohort_digest",
+            "fuzzy_sample_count",
+            "fuzzy_top10_max_ms",
+            "fuzzy_top10_p50_ms",
+            "fuzzy_top10_p95_ms",
+            "migration_seconds",
+            "oracle_query_count",
+            "oracle_subset_digest",
+            "passed",
+            "path_config_digest",
+            "peak_rss_mib",
+            "percentile_method",
+            "scorer_config_digest",
+        ),
+    )
+    return BenchmarkReport(
+        contract=_decode_benchmark_contract(payload["contract"]),
+        contract_digest=payload["contract_digest"],
+        corpus_digest=payload["corpus_digest"],
+        corpus_composition_version=payload[
+            "corpus_composition_version"
+        ],
+        corpus_composition_digest=payload[
+            "corpus_composition_digest"
+        ],
+        exact_cohort_digest=payload["exact_cohort_digest"],
+        fuzzy_cohort_digest=payload["fuzzy_cohort_digest"],
+        oracle_subset_digest=payload["oracle_subset_digest"],
+        scorer_config_digest=payload["scorer_config_digest"],
+        execution_path=_decode_benchmark_execution_path(
+            payload["execution_path"]
+        ),
+        path_config_digest=payload["path_config_digest"],
+        exact_sample_count=payload["exact_sample_count"],
+        fuzzy_sample_count=payload["fuzzy_sample_count"],
+        oracle_query_count=payload["oracle_query_count"],
+        percentile_method=payload["percentile_method"],
+        candidate_recall=payload["candidate_recall"],
+        exact_p50_ms=payload["exact_p50_ms"],
+        exact_p95_ms=payload["exact_p95_ms"],
+        exact_max_ms=payload["exact_max_ms"],
+        fuzzy_top10_p50_ms=payload["fuzzy_top10_p50_ms"],
+        fuzzy_top10_p95_ms=payload["fuzzy_top10_p95_ms"],
+        fuzzy_top10_max_ms=payload["fuzzy_top10_max_ms"],
+        migration_seconds=payload["migration_seconds"],
+        peak_rss_mib=payload["peak_rss_mib"],
+        passed=payload["passed"],
+        failed_gates=_decode_string_tuple(
+            payload["failed_gates"],
+            "failed gates",
+        ),
+        environment=_decode_benchmark_environment(
+            payload["environment"]
+        ),
+        environment_digest=payload["environment_digest"],
+    )
+
+
+def _decode_benchmark_suite_contract(
+    value: object,
+) -> BenchmarkSuiteContract:
+    payload = _strict_fields(
+        value,
+        "BenchmarkSuiteContract payload",
+        (
+            "benchmark_contract",
+            "benchmark_contract_digest",
+            "required_paths",
+            "suite_version",
+        ),
+    )
+    return BenchmarkSuiteContract(
+        suite_version=payload["suite_version"],
+        benchmark_contract=_decode_benchmark_contract(
+            payload["benchmark_contract"]
+        ),
+        benchmark_contract_digest=payload[
+            "benchmark_contract_digest"
+        ],
+        required_paths=tuple(
+            _decode_benchmark_execution_path(path)
+            for path in _as_list(
+                payload["required_paths"],
+                "suite required paths",
+            )
+        ),
+    )
+
+
+def _decode_benchmark_suite_report(
+    value: object,
+) -> BenchmarkSuiteReport:
+    payload = _strict_fields(
+        value,
+        "BenchmarkSuiteReport payload",
+        (
+            "corpus_composition_digest",
+            "corpus_composition_version",
+            "failed_paths",
+            "passed",
+            "path_reports",
+            "suite_contract",
+            "suite_contract_digest",
+        ),
+    )
+    return BenchmarkSuiteReport(
+        suite_contract=_decode_benchmark_suite_contract(
+            payload["suite_contract"]
+        ),
+        suite_contract_digest=payload["suite_contract_digest"],
+        corpus_composition_version=payload[
+            "corpus_composition_version"
+        ],
+        corpus_composition_digest=payload[
+            "corpus_composition_digest"
+        ],
+        path_reports=tuple(
+            _decode_benchmark_report(path_report)
+            for path_report in _as_list(
+                payload["path_reports"],
+                "suite path reports",
+            )
+        ),
+        passed=payload["passed"],
+        failed_paths=tuple(
+            _decode_benchmark_execution_path(path)
+            for path in _as_list(
+                payload["failed_paths"],
+                "suite failed paths",
+            )
+        ),
+    )
+
+
 def _decode_payload(contract_type: str, value: object) -> TMContract:
     if contract_type == "TMRecord":
         payload = _strict_fields(
@@ -4231,13 +6142,23 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
         return _decode_context_evidence(value)
     if contract_type == "TMResult":
         return _decode_result(value)
+    if contract_type == "CandidateStageMetadata":
+        return _decode_candidate_stage_metadata(value)
+    if contract_type == "CandidateRecallMetadata":
+        return _decode_candidate_recall_metadata(value)
+    if contract_type == "CandidateEvidence":
+        return _decode_candidate_evidence(value)
+    if contract_type == "CandidateRetrievalReport":
+        return _decode_candidate_retrieval_report(value)
+    if contract_type == "ResourceQueryMetadata":
+        return _decode_resource_query_metadata(value)
     if contract_type == "ResourceQueryFailure":
         return _decode_failure(value)
     if contract_type == "QueryReport":
         payload = _strict_fields(
             value,
             "QueryReport payload",
-            ("resource_failures", "results"),
+            ("resource_failures", "resource_metadata", "results"),
         )
         return QueryReport(
             results=tuple(
@@ -4251,7 +6172,22 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
                     "resource_failures",
                 )
             ),
+            resource_metadata=tuple(
+                _decode_resource_query_metadata(metadata)
+                for metadata in _as_list(
+                    payload["resource_metadata"],
+                    "resource_metadata",
+                )
+            ),
         )
+    if contract_type == "BenchmarkContract":
+        return _decode_benchmark_contract(value)
+    if contract_type == "BenchmarkReport":
+        return _decode_benchmark_report(value)
+    if contract_type == "BenchmarkSuiteContract":
+        return _decode_benchmark_suite_contract(value)
+    if contract_type == "BenchmarkSuiteReport":
+        return _decode_benchmark_suite_report(value)
     if contract_type == "AssetPreservationEvidence":
         return _decode_asset_preservation_evidence(value)
     if contract_type == "RecoveryLocator":
@@ -4388,7 +6324,12 @@ def matcher_validation_manifest_from_json(
 
 __all__ = [
     "ACTIVATION_TOKEN_VERSION",
+    "BENCHMARK_CONTRACT_VERSION",
+    "BENCHMARK_PERCENTILE_METHOD",
+    "BENCHMARK_RSS_SCOPE",
+    "BENCHMARK_SUITE_VERSION",
     "CANONICAL_RESOURCE_IDENTITY_VERSION",
+    "CANDIDATE_BUDGET_VERSION",
     "GENERATION_EXPECTATION_VERSION",
     "SCORER_VERSION_V1",
     "SNAPSHOT_BINDING_VERSION",
@@ -4400,7 +6341,17 @@ __all__ = [
     "AssetKind",
     "AssetPreservationEvidence",
     "AssetPreservationState",
+    "BenchmarkContract",
+    "BenchmarkExecutionPath",
+    "BenchmarkReport",
+    "BenchmarkSuiteContract",
+    "BenchmarkSuiteReport",
     "CanonicalResourceIdentity",
+    "CandidateEvidence",
+    "CandidateRecallMetadata",
+    "CandidateRetrievalReport",
+    "CandidateStage",
+    "CandidateStageMetadata",
     "CapabilityGatedTextMatcher",
     "ContextEvidence",
     "DiagnosticDisposition",
@@ -4420,6 +6371,7 @@ __all__ = [
     "RecoveryLocator",
     "ResourceStoreCoordinatorPort",
     "ResourceQueryFailure",
+    "ResourceQueryMetadata",
     "SchemaUpgradeFailure",
     "SchemaUpgradeOutcome",
     "SchemaUpgradeReport",
@@ -4449,6 +6401,10 @@ __all__ = [
     "TextMatchSuccess",
     "TextMatcherCapability",
     "TextMatcherState",
+    "benchmark_contract_digest",
+    "benchmark_environment_digest",
+    "benchmark_suite_contract_digest",
+    "candidate_budget_v1",
     "contract_from_json",
     "contract_to_json",
     "snapshot_receipt_digest",

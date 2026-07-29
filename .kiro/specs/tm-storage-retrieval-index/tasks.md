@@ -1,6 +1,6 @@
 # 实施计划
 
-- [ ] 1. 冻结版本化基础契约与验证夹具
+- [x] 1. 冻结版本化基础契约与验证夹具
 
 - [x] 1.1 定义记录、资源、查询、结果和失败契约
   - 固化记录身份、原始 source/target、上下文、来源批次、资源顺序、provenance、匹配类型和双 source 形状
@@ -26,7 +26,7 @@
   - 完成时，未覆盖用途、过期或版本不一致的证据会 fail-closed，公开拒绝信息不包含 query 或正文
   - _Requirements: 6.9, 6.10, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 1.5 固化 benchmark-v1 与候选元数据契约
+- [x] 1.5 固化 benchmark-v1 与候选元数据契约
   - 固化 100k 语料、查询 cohort、oracle、top-10、阈值、预热、p95、RSS、候选预算和四项硬门
   - 分离候选召回阶段计数与评分/过滤/global limit 后的资源结果计数，使 union、去重、截断、scored 和 returned 可对账
   - 完成时，缺少或篡改参数、计数不守恒、能力路径混报的报告都会被验证器拒绝
@@ -355,3 +355,4 @@
 - 2026-07-29 / Task 1.2：冻结 canonical 资源身份、确定性 sidecar、snapshot receipt/manifest/binding、阶段校验证据与 generation 闭合；sealed artifact 和单次 token 保持 registry 背书的模块私有运行期能力，公开协调器只暴露 `activate(SealedStage)`。独立复审通过；focused 27/27、全量 138/138、basedpyright 0 errors。
 - 2026-07-29 / Task 1.3：冻结迁移、导出与 schema upgrade 的显式成功/失败联合结果，使用 digest-backed 资产保持证据与无权限恢复定位替代可伪造布尔断言；strict codec 在编码与解码边界递归重验 lineage、计数和嵌套证据。独立复审通过；focused 38/38、全量 150/150、basedpyright 0 errors。
 - 2026-07-29 / Task 1.4：冻结 matcher 三态 capability、用途/选项矩阵、请求摘要与无正文 outcome；公开 strict codec 与内部 validation manifest codec 分离，required cohort 与 evidence 精确闭合且消费方不能反推 readiness。独立复审通过；focused 30/30、全量 165/165、basedpyright 0 errors。
+- 2026-07-29 / Task 1.5：冻结 candidate-budget-v1、召回/去重/截断/资源结果守恒与 benchmark-v1 双路径 suite；minimum 与实际 cohort count 分离，composition/digest/path/硬门均由 strict codec 闭合，真实 benchmark artifact 留给 Task 8.1 生成。独立复审第二轮通过；focused 32/32、全量 182/182、basedpyright 0 errors。
