@@ -528,6 +528,783 @@ class QueryReport:
             )
 
 
+class AssetKind(str, Enum):
+    """Portable operation assets whose preservation can be proven."""
+
+    ORIGINAL_SOURCE = "ORIGINAL_SOURCE"
+    ACTIVE_STORE = "ACTIVE_STORE"
+    EXPORT_DESTINATION = "EXPORT_DESTINATION"
+
+
+class AssetPreservationState(str, Enum):
+    """Closed relationship between before and observed asset digests."""
+
+    VERIFIED_UNCHANGED = "VERIFIED_UNCHANGED"
+    VERIFIED_CHANGED = "VERIFIED_CHANGED"
+    UNVERIFIED = "UNVERIFIED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class DiagnosticDisposition(str, Enum):
+    """Closed effect of a safe row/record diagnostic."""
+
+    REJECTED = "REJECTED"
+    WARNING = "WARNING"
+
+
+@dataclass(frozen=True)
+class AssetPreservationEvidence:
+    """Digest-backed preservation fact, not a caller-supplied success flag."""
+
+    asset_kind: AssetKind
+    state: AssetPreservationState
+    before_digest: str | None
+    observed_digest: str | None
+
+    def __post_init__(self) -> None:
+        _validate_asset_preservation_evidence(self)
+
+
+def _validate_asset_preservation_evidence(
+    evidence: AssetPreservationEvidence,
+) -> None:
+    if not isinstance(evidence.asset_kind, AssetKind):
+        raise TypeError("asset preservation kind must be AssetKind")
+    if not isinstance(evidence.state, AssetPreservationState):
+        raise TypeError(
+            "asset preservation state must be AssetPreservationState"
+        )
+    if evidence.state is AssetPreservationState.NOT_APPLICABLE:
+        if (
+            evidence.before_digest is not None
+            or evidence.observed_digest is not None
+        ):
+            raise ValueError(
+                "not-applicable asset preservation must omit digests"
+            )
+        return
+    if evidence.before_digest is None:
+        raise ValueError("asset preservation requires a before digest")
+    _require_digest(evidence.before_digest, "asset before digest")
+    if evidence.state is AssetPreservationState.UNVERIFIED:
+        if evidence.observed_digest is not None:
+            raise ValueError(
+                "unverified asset preservation must omit observed digest"
+            )
+        return
+    if evidence.observed_digest is None:
+        raise ValueError("verified asset preservation requires observed digest")
+    _require_digest(evidence.observed_digest, "asset observed digest")
+    if (
+        evidence.state is AssetPreservationState.VERIFIED_UNCHANGED
+        and evidence.observed_digest != evidence.before_digest
+    ):
+        raise ValueError("verified unchanged asset digests must match")
+    if (
+        evidence.state is AssetPreservationState.VERIFIED_CHANGED
+        and evidence.observed_digest == evidence.before_digest
+    ):
+        raise ValueError("verified changed asset digests must differ")
+
+
+@dataclass(frozen=True)
+class RecoveryLocator:
+    """Portable recovery location without filesystem authority."""
+
+    path: Path
+    asset_kind: AssetKind
+    expected_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_recovery_locator(self)
+
+
+def _validate_recovery_locator(locator: RecoveryLocator) -> None:
+    _require_absolute_path(locator.path, "recovery locator path")
+    if not isinstance(locator.asset_kind, AssetKind):
+        raise TypeError("recovery locator asset kind must be AssetKind")
+    _require_digest(locator.expected_digest, "recovery expected digest")
+
+
+@dataclass(frozen=True)
+class MigrationDiagnostic:
+    """Safe, locatable migration fact without TM text."""
+
+    code: str
+    stage: str
+    line_number: int | None
+    record_id: int | None
+    disposition: DiagnosticDisposition
+    safe_summary: str
+
+    def __post_init__(self) -> None:
+        _validate_migration_diagnostic(self)
+
+
+def _validate_migration_diagnostic(
+    diagnostic: MigrationDiagnostic,
+) -> None:
+    _require_diagnostic_identifier(diagnostic.code, "migration diagnostic code")
+    _require_diagnostic_identifier(
+        diagnostic.stage,
+        "migration diagnostic stage",
+    )
+    if diagnostic.line_number is not None:
+        _require_int(
+            diagnostic.line_number,
+            "migration diagnostic line number",
+            minimum=1,
+        )
+    if diagnostic.record_id is not None:
+        _require_int(
+            diagnostic.record_id,
+            "migration diagnostic record id",
+            minimum=1,
+        )
+    if diagnostic.line_number is None and diagnostic.record_id is None:
+        raise ValueError(
+            "migration diagnostic requires a line or record location"
+        )
+    if not isinstance(diagnostic.disposition, DiagnosticDisposition):
+        raise TypeError(
+            "migration diagnostic disposition must be DiagnosticDisposition"
+        )
+    _require_diagnostic_identifier(
+        diagnostic.safe_summary,
+        "migration diagnostic safe summary",
+    )
+
+
+@dataclass(frozen=True)
+class ExportDiagnostic:
+    """Safe, record-local export fact without TM text."""
+
+    code: str
+    record_id: int | None
+    disposition: DiagnosticDisposition
+    safe_summary: str
+
+    def __post_init__(self) -> None:
+        _validate_export_diagnostic(self)
+
+
+def _validate_export_diagnostic(diagnostic: ExportDiagnostic) -> None:
+    _require_diagnostic_identifier(diagnostic.code, "export diagnostic code")
+    if diagnostic.record_id is not None:
+        _require_int(
+            diagnostic.record_id,
+            "export diagnostic record id",
+            minimum=1,
+        )
+    if not isinstance(diagnostic.disposition, DiagnosticDisposition):
+        raise TypeError(
+            "export diagnostic disposition must be DiagnosticDisposition"
+        )
+    if (
+        diagnostic.disposition is DiagnosticDisposition.REJECTED
+        and diagnostic.record_id is None
+    ):
+        raise ValueError("rejected export diagnostic requires a record id")
+    _require_diagnostic_identifier(
+        diagnostic.safe_summary,
+        "export diagnostic safe summary",
+    )
+
+
+def _migration_diagnostic_key(
+    diagnostic: MigrationDiagnostic,
+) -> tuple[int, int, str, str, str, str]:
+    return (
+        diagnostic.line_number
+        if diagnostic.line_number is not None
+        else 2**63 - 1,
+        diagnostic.record_id if diagnostic.record_id is not None else 2**63 - 1,
+        diagnostic.stage,
+        diagnostic.code,
+        diagnostic.disposition.value,
+        diagnostic.safe_summary,
+    )
+
+
+def _export_diagnostic_key(
+    diagnostic: ExportDiagnostic,
+) -> tuple[int, str, str, str]:
+    return (
+        diagnostic.record_id if diagnostic.record_id is not None else 2**63 - 1,
+        diagnostic.code,
+        diagnostic.disposition.value,
+        diagnostic.safe_summary,
+    )
+
+
+def _migration_diagnostic_location(
+    diagnostic: MigrationDiagnostic,
+) -> tuple[str, int]:
+    if diagnostic.line_number is not None:
+        return ("LINE", diagnostic.line_number)
+    if diagnostic.record_id is None:
+        raise ValueError(
+            "migration diagnostic requires a line or record location"
+        )
+    return ("RECORD", diagnostic.record_id)
+
+
+def _export_diagnostic_location(
+    diagnostic: ExportDiagnostic,
+) -> tuple[str, int]:
+    if diagnostic.record_id is None:
+        raise ValueError("export diagnostic requires a record location")
+    return ("RECORD", diagnostic.record_id)
+
+
+def _require_migration_diagnostics(
+    value: object,
+) -> tuple[MigrationDiagnostic, ...]:
+    diagnostics = _require_tuple(value, "migration diagnostics")
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, MigrationDiagnostic):
+            raise TypeError(
+                "migration diagnostics must contain MigrationDiagnostic values"
+            )
+        _validate_migration_diagnostic(diagnostic)
+    keys = tuple(_migration_diagnostic_key(item) for item in diagnostics)
+    if len(keys) != len(set(keys)):
+        raise ValueError("migration diagnostics must be unique")
+    if keys != tuple(sorted(keys)):
+        raise ValueError("migration diagnostics must use stable order")
+    rejected_locations = tuple(
+        _migration_diagnostic_location(item)
+        for item in diagnostics
+        if item.disposition is DiagnosticDisposition.REJECTED
+    )
+    if len(rejected_locations) != len(set(rejected_locations)):
+        raise ValueError(
+            "rejected migration diagnostic locations must be unique"
+        )
+    return diagnostics
+
+
+def _require_export_diagnostics(
+    value: object,
+) -> tuple[ExportDiagnostic, ...]:
+    diagnostics = _require_tuple(value, "export diagnostics")
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, ExportDiagnostic):
+            raise TypeError(
+                "export diagnostics must contain ExportDiagnostic values"
+            )
+        _validate_export_diagnostic(diagnostic)
+    keys = tuple(_export_diagnostic_key(item) for item in diagnostics)
+    if len(keys) != len(set(keys)):
+        raise ValueError("export diagnostics must be unique")
+    if keys != tuple(sorted(keys)):
+        raise ValueError("export diagnostics must use stable order")
+    rejected_locations = tuple(
+        _export_diagnostic_location(item)
+        for item in diagnostics
+        if item.disposition is DiagnosticDisposition.REJECTED
+    )
+    if len(rejected_locations) != len(set(rejected_locations)):
+        raise ValueError(
+            "rejected export diagnostic locations must be unique"
+        )
+    return diagnostics
+
+
+def _rejected_migration_location_count(
+    diagnostics: tuple[MigrationDiagnostic, ...],
+) -> int:
+    return len(
+        {
+            _migration_diagnostic_location(item)
+            for item in diagnostics
+            if item.disposition is DiagnosticDisposition.REJECTED
+        }
+    )
+
+
+def _rejected_export_location_count(
+    diagnostics: tuple[ExportDiagnostic, ...],
+) -> int:
+    return len(
+        {
+            _export_diagnostic_location(item)
+            for item in diagnostics
+            if item.disposition is DiagnosticDisposition.REJECTED
+        }
+    )
+
+
+def _validate_preservation_and_recovery(
+    *,
+    evidence: tuple[AssetPreservationEvidence, ...],
+    recovery_locators: tuple[RecoveryLocator, ...],
+    retryable: bool,
+    field_name: str,
+) -> None:
+    for item in evidence:
+        if not isinstance(item, AssetPreservationEvidence):
+            raise TypeError(
+                f"{field_name} must contain AssetPreservationEvidence values"
+            )
+        _validate_asset_preservation_evidence(item)
+    evidence_kinds = tuple(item.asset_kind for item in evidence)
+    if len(evidence_kinds) != len(set(evidence_kinds)):
+        raise ValueError(f"{field_name} asset kinds must be unique")
+
+    locators = _require_tuple(recovery_locators, "recovery locators")
+    for locator in locators:
+        if not isinstance(locator, RecoveryLocator):
+            raise TypeError(
+                "recovery locators must contain RecoveryLocator values"
+            )
+        _validate_recovery_locator(locator)
+    locator_kinds = tuple(locator.asset_kind for locator in locators)
+    if len(locator_kinds) != len(set(locator_kinds)):
+        raise ValueError("recovery locator asset kinds must be unique")
+    if locator_kinds != tuple(sorted(locator_kinds, key=lambda item: item.value)):
+        raise ValueError("recovery locators must use stable asset order")
+
+    by_kind = {item.asset_kind: item for item in evidence}
+    for locator in locators:
+        preserved = by_kind.get(locator.asset_kind)
+        if preserved is None or preserved.before_digest is None:
+            raise ValueError(
+                "recovery locator must correspond to a prior asset digest"
+            )
+        if locator.expected_digest != preserved.before_digest:
+            raise ValueError(
+                "recovery locator expected digest must match prior asset"
+            )
+
+    needs_recovery = tuple(
+        item
+        for item in evidence
+        if item.state
+        in (
+            AssetPreservationState.VERIFIED_CHANGED,
+            AssetPreservationState.UNVERIFIED,
+        )
+    )
+    recovery_kinds = tuple(
+        sorted(
+            (item.asset_kind for item in needs_recovery),
+            key=lambda item: item.value,
+        )
+    )
+    if locator_kinds != recovery_kinds:
+        if not recovery_kinds:
+            raise ValueError(
+                "recovery locators must be empty when preservation is verified"
+            )
+        raise ValueError(
+            "recovery locator asset kinds must exactly match assets "
+            "requiring recovery"
+        )
+    if needs_recovery and retryable:
+        raise ValueError(
+            "unproven asset preservation must be fail-stop and not retryable"
+        )
+
+
+@dataclass(frozen=True)
+class MigrationPreflight:
+    """Portable validation counts and safe row diagnostics."""
+
+    source_digest: str
+    valid_count: int
+    invalid_count: int
+    duplicate_source_count: int
+    variant_count: int
+    diagnostics: tuple[MigrationDiagnostic, ...]
+
+    def __post_init__(self) -> None:
+        _require_digest(self.source_digest, "migration source digest")
+        _require_int(self.valid_count, "migration valid count", minimum=0)
+        _require_int(self.invalid_count, "migration invalid count", minimum=0)
+        _require_int(
+            self.duplicate_source_count,
+            "migration duplicate source count",
+            minimum=0,
+        )
+        _require_int(self.variant_count, "migration variant count", minimum=0)
+        if self.valid_count + self.invalid_count == 0:
+            raise ValueError("migration preflight must describe at least one row")
+        if self.duplicate_source_count > self.variant_count:
+            raise ValueError(
+                "migration duplicate source count cannot exceed variant count"
+            )
+        if self.variant_count > self.valid_count:
+            raise ValueError(
+                "migration variant count cannot exceed valid count"
+            )
+        diagnostics = _require_migration_diagnostics(self.diagnostics)
+        if (
+            _rejected_migration_location_count(diagnostics)
+            != self.invalid_count
+        ):
+            raise ValueError(
+                "migration invalid count must match rejected diagnostics"
+            )
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    """Successful migration evidence for one complete active generation."""
+
+    resource_id: str
+    canonical_store_id: str
+    source_digest: str
+    snapshot_receipt: SnapshotReceipt
+    migrated_count: int
+    variant_count: int
+    skipped_count: int
+    diagnostics: tuple[MigrationDiagnostic, ...]
+    activated_generation: int
+    canonical_exact_available: bool
+    context_available: bool
+    fuzzy_available: bool
+
+    def __post_init__(self) -> None:
+        _require_identity(self.resource_id, "migration resource id")
+        _require_identity(
+            self.canonical_store_id,
+            "migration canonical store id",
+        )
+        _require_digest(self.source_digest, "migration source digest")
+        if not isinstance(self.snapshot_receipt, SnapshotReceipt):
+            raise TypeError("migration snapshot receipt must be SnapshotReceipt")
+        _validate_snapshot_receipt(self.snapshot_receipt)
+        if self.snapshot_receipt.resource_id != self.resource_id:
+            raise ValueError("migration resource does not match receipt")
+        if (
+            self.snapshot_receipt.canonical_store_id
+            != self.canonical_store_id
+        ):
+            raise ValueError("migration canonical store does not match receipt")
+        if self.snapshot_receipt.jsonl_digest != self.source_digest:
+            raise ValueError("migration source digest does not match receipt")
+        _require_int(self.migrated_count, "migrated count", minimum=0)
+        if self.snapshot_receipt.record_count != self.migrated_count:
+            raise ValueError("migration record count does not match receipt")
+        _require_int(self.variant_count, "migrated variant count", minimum=0)
+        _require_int(self.skipped_count, "migration skipped count", minimum=0)
+        if self.variant_count > self.migrated_count:
+            raise ValueError(
+                "migration variant count cannot exceed migrated count"
+            )
+        diagnostics = _require_migration_diagnostics(self.diagnostics)
+        if (
+            _rejected_migration_location_count(diagnostics)
+            != self.skipped_count
+        ):
+            raise ValueError(
+                "migration skipped count must match rejected diagnostics"
+            )
+        _require_int(
+            self.activated_generation,
+            "migration activated generation",
+            minimum=0,
+        )
+        _require_bool(
+            self.canonical_exact_available,
+            "migration canonical exact availability",
+        )
+        _require_bool(self.context_available, "migration context availability")
+        _require_bool(self.fuzzy_available, "migration fuzzy availability")
+        if not self.canonical_exact_available:
+            raise ValueError(
+                "successful migration requires canonical exact availability"
+            )
+
+
+@dataclass(frozen=True)
+class MigrationFailure:
+    """Fail-stop migration result with explicit asset preservation facts."""
+
+    stage: str
+    error_code: str
+    retryable: bool
+    diagnostics: tuple[MigrationDiagnostic, ...]
+    active_generation: int | None
+    original_source_preservation: AssetPreservationEvidence
+    active_store_preservation: AssetPreservationEvidence
+    recovery_locators: tuple[RecoveryLocator, ...]
+
+    def __post_init__(self) -> None:
+        _require_diagnostic_identifier(self.stage, "migration failure stage")
+        _require_diagnostic_identifier(
+            self.error_code,
+            "migration failure error code",
+        )
+        _require_bool(self.retryable, "migration failure retryable")
+        _require_migration_diagnostics(self.diagnostics)
+        if self.active_generation is not None:
+            _require_int(
+                self.active_generation,
+                "migration active generation",
+                minimum=0,
+            )
+        if not isinstance(
+            self.original_source_preservation,
+            AssetPreservationEvidence,
+        ):
+            raise TypeError(
+                "migration source preservation must be "
+                "AssetPreservationEvidence"
+            )
+        if not isinstance(
+            self.active_store_preservation,
+            AssetPreservationEvidence,
+        ):
+            raise TypeError(
+                "migration store preservation must be "
+                "AssetPreservationEvidence"
+            )
+        if (
+            self.original_source_preservation.asset_kind
+            is not AssetKind.ORIGINAL_SOURCE
+        ):
+            raise ValueError(
+                "migration source preservation has the wrong asset kind"
+            )
+        if (
+            self.original_source_preservation.state
+            is AssetPreservationState.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "migration requires original source preservation evidence"
+            )
+        if (
+            self.active_store_preservation.asset_kind
+            is not AssetKind.ACTIVE_STORE
+        ):
+            raise ValueError(
+                "migration store preservation has the wrong asset kind"
+            )
+        if (
+            self.active_generation is None
+            and self.active_store_preservation.state
+            is not AssetPreservationState.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "first migration failure has no prior active store"
+            )
+        if (
+            self.active_generation is not None
+            and self.active_store_preservation.state
+            is AssetPreservationState.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "existing generation requires active store preservation"
+            )
+        _validate_preservation_and_recovery(
+            evidence=(
+                self.original_source_preservation,
+                self.active_store_preservation,
+            ),
+            recovery_locators=self.recovery_locators,
+            retryable=self.retryable,
+            field_name="migration preservation evidence",
+        )
+
+
+@dataclass(frozen=True)
+class ExportReport:
+    """Successful compatible export and immutable snapshot evidence."""
+
+    exported_count: int
+    skipped_count: int
+    destination_digest: str
+    canonical_generation: int
+    exported_revision: int
+    snapshot_id: str
+    snapshot_receipt_digest: str
+    snapshot_receipt: SnapshotReceipt
+    diagnostics: tuple[ExportDiagnostic, ...]
+
+    def __post_init__(self) -> None:
+        _require_int(self.exported_count, "exported count", minimum=0)
+        _require_int(self.skipped_count, "export skipped count", minimum=0)
+        _require_digest(self.destination_digest, "export destination digest")
+        _require_int(
+            self.canonical_generation,
+            "export canonical generation",
+            minimum=0,
+        )
+        _require_int(
+            self.exported_revision,
+            "exported revision",
+            minimum=0,
+        )
+        _require_identity(self.snapshot_id, "export snapshot id")
+        _require_digest(
+            self.snapshot_receipt_digest,
+            "export snapshot receipt digest",
+        )
+        if not isinstance(self.snapshot_receipt, SnapshotReceipt):
+            raise TypeError("export snapshot receipt must be SnapshotReceipt")
+        _validate_snapshot_receipt(self.snapshot_receipt)
+        if self.snapshot_receipt.jsonl_digest != self.destination_digest:
+            raise ValueError("export destination digest does not match receipt")
+        if self.snapshot_receipt.record_count != self.exported_count:
+            raise ValueError("exported count does not match receipt")
+        if self.snapshot_receipt.exported_revision != self.exported_revision:
+            raise ValueError("exported revision does not match receipt")
+        if self.snapshot_receipt.snapshot_id != self.snapshot_id:
+            raise ValueError("export snapshot id does not match receipt")
+        if (
+            snapshot_receipt_digest(self.snapshot_receipt)
+            != self.snapshot_receipt_digest
+        ):
+            raise ValueError("export snapshot receipt digest does not match")
+        diagnostics = _require_export_diagnostics(self.diagnostics)
+        if _rejected_export_location_count(diagnostics) != self.skipped_count:
+            raise ValueError(
+                "export skipped count must match rejected diagnostics"
+            )
+
+
+@dataclass(frozen=True)
+class ExportFailure:
+    """Fail-stop export result with destination preservation evidence."""
+
+    stage: str
+    error_code: str
+    retryable: bool
+    diagnostics: tuple[ExportDiagnostic, ...]
+    previous_destination_preservation: AssetPreservationEvidence
+    recovery_locators: tuple[RecoveryLocator, ...]
+
+    def __post_init__(self) -> None:
+        _require_diagnostic_identifier(self.stage, "export failure stage")
+        _require_diagnostic_identifier(
+            self.error_code,
+            "export failure error code",
+        )
+        _require_bool(self.retryable, "export failure retryable")
+        _require_export_diagnostics(self.diagnostics)
+        if not isinstance(
+            self.previous_destination_preservation,
+            AssetPreservationEvidence,
+        ):
+            raise TypeError(
+                "export destination preservation must be "
+                "AssetPreservationEvidence"
+            )
+        if (
+            self.previous_destination_preservation.asset_kind
+            is not AssetKind.EXPORT_DESTINATION
+        ):
+            raise ValueError(
+                "export destination preservation has the wrong asset kind"
+            )
+        _validate_preservation_and_recovery(
+            evidence=(self.previous_destination_preservation,),
+            recovery_locators=self.recovery_locators,
+            retryable=self.retryable,
+            field_name="export preservation evidence",
+        )
+
+
+type MigrationOutcome = MigrationReport | MigrationFailure
+type ExportOutcome = ExportReport | ExportFailure
+
+
+@dataclass(frozen=True)
+class SchemaUpgradeReport:
+    """Successful monotonic schema upgrade with lineage and digest proof."""
+
+    canonical_store_id: str
+    from_version: int
+    to_version: int
+    backup_path: Path
+    backup_digest: str
+    success_digest: str
+    activated_generation: int
+
+    def __post_init__(self) -> None:
+        _require_identity(
+            self.canonical_store_id,
+            "schema canonical store id",
+        )
+        _require_int(self.from_version, "schema from version", minimum=1)
+        _require_int(self.to_version, "schema to version", minimum=1)
+        if self.to_version <= self.from_version:
+            raise ValueError(
+                "schema to version must be greater than from version"
+            )
+        _require_absolute_path(self.backup_path, "schema backup path")
+        _require_digest(self.backup_digest, "schema backup digest")
+        _require_digest(self.success_digest, "schema success digest")
+        if self.backup_digest == self.success_digest:
+            raise ValueError("schema success and backup digests must differ")
+        _require_int(
+            self.activated_generation,
+            "schema activated generation",
+            minimum=0,
+        )
+
+
+@dataclass(frozen=True)
+class SchemaUpgradeFailure:
+    """Fail-stop schema upgrade result with active-store preservation."""
+
+    stage: str
+    error_code: str
+    retryable: bool
+    active_generation: int
+    active_store_preservation: AssetPreservationEvidence
+    recovery_locators: tuple[RecoveryLocator, ...]
+
+    def __post_init__(self) -> None:
+        _require_diagnostic_identifier(
+            self.stage,
+            "schema upgrade failure stage",
+        )
+        _require_diagnostic_identifier(
+            self.error_code,
+            "schema upgrade failure error code",
+        )
+        _require_bool(self.retryable, "schema upgrade failure retryable")
+        _require_int(
+            self.active_generation,
+            "schema upgrade active generation",
+            minimum=0,
+        )
+        if not isinstance(
+            self.active_store_preservation,
+            AssetPreservationEvidence,
+        ):
+            raise TypeError(
+                "schema store preservation must be "
+                "AssetPreservationEvidence"
+            )
+        if (
+            self.active_store_preservation.asset_kind
+            is not AssetKind.ACTIVE_STORE
+        ):
+            raise ValueError(
+                "schema store preservation has the wrong asset kind"
+            )
+        if (
+            self.active_store_preservation.state
+            is AssetPreservationState.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "schema upgrade requires active store preservation"
+            )
+        _validate_preservation_and_recovery(
+            evidence=(self.active_store_preservation,),
+            recovery_locators=self.recovery_locators,
+            retryable=self.retryable,
+            field_name="schema preservation evidence",
+        )
+
+
+type SchemaUpgradeOutcome = SchemaUpgradeReport | SchemaUpgradeFailure
+
+
 @dataclass(frozen=True)
 class CanonicalResourceIdentity:
     """Stable resource and deterministic adjacent sidecar identity."""
@@ -1374,6 +2151,17 @@ type TMContract = (
     | TMResult
     | ResourceQueryFailure
     | QueryReport
+    | AssetPreservationEvidence
+    | RecoveryLocator
+    | MigrationDiagnostic
+    | ExportDiagnostic
+    | MigrationPreflight
+    | MigrationReport
+    | MigrationFailure
+    | ExportReport
+    | ExportFailure
+    | SchemaUpgradeReport
+    | SchemaUpgradeFailure
     | CanonicalResourceIdentity
     | SnapshotReceipt
     | SnapshotManifest
@@ -1432,6 +2220,190 @@ def _encode_failure(failure: ResourceQueryFailure) -> dict[str, Any]:
     return {
         "error_code": failure.error_code,
         "resource_id": failure.resource_id,
+        "retryable": failure.retryable,
+        "stage": failure.stage,
+    }
+
+
+def _encode_asset_preservation_evidence(
+    evidence: AssetPreservationEvidence,
+) -> dict[str, Any]:
+    return {
+        "asset_kind": evidence.asset_kind.value,
+        "before_digest": evidence.before_digest,
+        "observed_digest": evidence.observed_digest,
+        "state": evidence.state.value,
+    }
+
+
+def _encode_recovery_locator(locator: RecoveryLocator) -> dict[str, Any]:
+    return {
+        "asset_kind": locator.asset_kind.value,
+        "expected_digest": locator.expected_digest,
+        "path": str(locator.path),
+    }
+
+
+def _encode_migration_diagnostic(
+    diagnostic: MigrationDiagnostic,
+) -> dict[str, Any]:
+    return {
+        "code": diagnostic.code,
+        "disposition": diagnostic.disposition.value,
+        "line_number": diagnostic.line_number,
+        "record_id": diagnostic.record_id,
+        "safe_summary": diagnostic.safe_summary,
+        "stage": diagnostic.stage,
+    }
+
+
+def _encode_export_diagnostic(
+    diagnostic: ExportDiagnostic,
+) -> dict[str, Any]:
+    return {
+        "code": diagnostic.code,
+        "disposition": diagnostic.disposition.value,
+        "record_id": diagnostic.record_id,
+        "safe_summary": diagnostic.safe_summary,
+    }
+
+
+def _encode_migration_preflight(
+    preflight: MigrationPreflight,
+) -> dict[str, Any]:
+    return {
+        "diagnostics": [
+            _encode_migration_diagnostic(diagnostic)
+            for diagnostic in preflight.diagnostics
+        ],
+        "duplicate_source_count": preflight.duplicate_source_count,
+        "invalid_count": preflight.invalid_count,
+        "source_digest": preflight.source_digest,
+        "valid_count": preflight.valid_count,
+        "variant_count": preflight.variant_count,
+    }
+
+
+def _encode_migration_report(report: MigrationReport) -> dict[str, Any]:
+    return {
+        "activated_generation": report.activated_generation,
+        "canonical_store_id": report.canonical_store_id,
+        "canonical_exact_available": report.canonical_exact_available,
+        "context_available": report.context_available,
+        "diagnostics": [
+            _encode_migration_diagnostic(diagnostic)
+            for diagnostic in report.diagnostics
+        ],
+        "fuzzy_available": report.fuzzy_available,
+        "migrated_count": report.migrated_count,
+        "resource_id": report.resource_id,
+        "skipped_count": report.skipped_count,
+        "snapshot_receipt": _encode_snapshot_receipt(
+            report.snapshot_receipt
+        ),
+        "source_digest": report.source_digest,
+        "variant_count": report.variant_count,
+    }
+
+
+def _encode_migration_failure(
+    failure: MigrationFailure,
+) -> dict[str, Any]:
+    return {
+        "active_generation": failure.active_generation,
+        "active_store_preservation": (
+            _encode_asset_preservation_evidence(
+                failure.active_store_preservation
+            )
+        ),
+        "diagnostics": [
+            _encode_migration_diagnostic(diagnostic)
+            for diagnostic in failure.diagnostics
+        ],
+        "error_code": failure.error_code,
+        "original_source_preservation": (
+            _encode_asset_preservation_evidence(
+                failure.original_source_preservation
+            )
+        ),
+        "recovery_locators": [
+            _encode_recovery_locator(locator)
+            for locator in failure.recovery_locators
+        ],
+        "retryable": failure.retryable,
+        "stage": failure.stage,
+    }
+
+
+def _encode_export_report(report: ExportReport) -> dict[str, Any]:
+    return {
+        "canonical_generation": report.canonical_generation,
+        "destination_digest": report.destination_digest,
+        "diagnostics": [
+            _encode_export_diagnostic(diagnostic)
+            for diagnostic in report.diagnostics
+        ],
+        "exported_count": report.exported_count,
+        "exported_revision": report.exported_revision,
+        "skipped_count": report.skipped_count,
+        "snapshot_id": report.snapshot_id,
+        "snapshot_receipt": _encode_snapshot_receipt(
+            report.snapshot_receipt
+        ),
+        "snapshot_receipt_digest": report.snapshot_receipt_digest,
+    }
+
+
+def _encode_export_failure(failure: ExportFailure) -> dict[str, Any]:
+    return {
+        "diagnostics": [
+            _encode_export_diagnostic(diagnostic)
+            for diagnostic in failure.diagnostics
+        ],
+        "error_code": failure.error_code,
+        "previous_destination_preservation": (
+            _encode_asset_preservation_evidence(
+                failure.previous_destination_preservation
+            )
+        ),
+        "recovery_locators": [
+            _encode_recovery_locator(locator)
+            for locator in failure.recovery_locators
+        ],
+        "retryable": failure.retryable,
+        "stage": failure.stage,
+    }
+
+
+def _encode_schema_upgrade_report(
+    report: SchemaUpgradeReport,
+) -> dict[str, Any]:
+    return {
+        "activated_generation": report.activated_generation,
+        "backup_digest": report.backup_digest,
+        "backup_path": str(report.backup_path),
+        "canonical_store_id": report.canonical_store_id,
+        "from_version": report.from_version,
+        "success_digest": report.success_digest,
+        "to_version": report.to_version,
+    }
+
+
+def _encode_schema_upgrade_failure(
+    failure: SchemaUpgradeFailure,
+) -> dict[str, Any]:
+    return {
+        "active_generation": failure.active_generation,
+        "active_store_preservation": (
+            _encode_asset_preservation_evidence(
+                failure.active_store_preservation
+            )
+        ),
+        "error_code": failure.error_code,
+        "recovery_locators": [
+            _encode_recovery_locator(locator)
+            for locator in failure.recovery_locators
+        ],
         "retryable": failure.retryable,
         "stage": failure.stage,
     }
@@ -1561,6 +2533,51 @@ def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
             ],
             "results": [_encode_result(result) for result in contract.results],
         }
+    if isinstance(contract, AssetPreservationEvidence):
+        _validate_asset_preservation_evidence(contract)
+        return (
+            "AssetPreservationEvidence",
+            _encode_asset_preservation_evidence(contract),
+        )
+    if isinstance(contract, RecoveryLocator):
+        _validate_recovery_locator(contract)
+        return "RecoveryLocator", _encode_recovery_locator(contract)
+    if isinstance(contract, MigrationDiagnostic):
+        _validate_migration_diagnostic(contract)
+        return (
+            "MigrationDiagnostic",
+            _encode_migration_diagnostic(contract),
+        )
+    if isinstance(contract, ExportDiagnostic):
+        _validate_export_diagnostic(contract)
+        return "ExportDiagnostic", _encode_export_diagnostic(contract)
+    if isinstance(contract, MigrationPreflight):
+        contract.__post_init__()
+        return "MigrationPreflight", _encode_migration_preflight(contract)
+    if isinstance(contract, MigrationReport):
+        contract.__post_init__()
+        return "MigrationReport", _encode_migration_report(contract)
+    if isinstance(contract, MigrationFailure):
+        contract.__post_init__()
+        return "MigrationFailure", _encode_migration_failure(contract)
+    if isinstance(contract, ExportReport):
+        contract.__post_init__()
+        return "ExportReport", _encode_export_report(contract)
+    if isinstance(contract, ExportFailure):
+        contract.__post_init__()
+        return "ExportFailure", _encode_export_failure(contract)
+    if isinstance(contract, SchemaUpgradeReport):
+        contract.__post_init__()
+        return (
+            "SchemaUpgradeReport",
+            _encode_schema_upgrade_report(contract),
+        )
+    if isinstance(contract, SchemaUpgradeFailure):
+        contract.__post_init__()
+        return (
+            "SchemaUpgradeFailure",
+            _encode_schema_upgrade_failure(contract),
+        )
     if isinstance(contract, CanonicalResourceIdentity):
         return (
             "CanonicalResourceIdentity",
@@ -1774,6 +2791,346 @@ def _decode_path(value: object, field_name: str) -> Path:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string path")
     return Path(value)
+
+
+def _decode_asset_kind(value: object, field_name: str) -> AssetKind:
+    try:
+        return AssetKind(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} is invalid") from None
+
+
+def _decode_asset_preservation_state(
+    value: object,
+) -> AssetPreservationState:
+    try:
+        return AssetPreservationState(value)
+    except (TypeError, ValueError):
+        raise ValueError("asset preservation state is invalid") from None
+
+
+def _decode_diagnostic_disposition(
+    value: object,
+) -> DiagnosticDisposition:
+    try:
+        return DiagnosticDisposition(value)
+    except (TypeError, ValueError):
+        raise ValueError("diagnostic disposition is invalid") from None
+
+
+def _decode_asset_preservation_evidence(
+    value: object,
+) -> AssetPreservationEvidence:
+    payload = _strict_fields(
+        value,
+        "AssetPreservationEvidence payload",
+        ("asset_kind", "before_digest", "observed_digest", "state"),
+    )
+    return AssetPreservationEvidence(
+        asset_kind=_decode_asset_kind(
+            payload["asset_kind"],
+            "asset preservation kind",
+        ),
+        state=_decode_asset_preservation_state(payload["state"]),
+        before_digest=payload["before_digest"],
+        observed_digest=payload["observed_digest"],
+    )
+
+
+def _decode_recovery_locator(value: object) -> RecoveryLocator:
+    payload = _strict_fields(
+        value,
+        "RecoveryLocator payload",
+        ("asset_kind", "expected_digest", "path"),
+    )
+    return RecoveryLocator(
+        path=_decode_path(payload["path"], "RecoveryLocator path"),
+        asset_kind=_decode_asset_kind(
+            payload["asset_kind"],
+            "recovery locator asset kind",
+        ),
+        expected_digest=payload["expected_digest"],
+    )
+
+
+def _decode_recovery_locators(
+    value: object,
+) -> tuple[RecoveryLocator, ...]:
+    return tuple(
+        _decode_recovery_locator(locator)
+        for locator in _as_list(value, "recovery locators")
+    )
+
+
+def _decode_migration_diagnostic(value: object) -> MigrationDiagnostic:
+    payload = _strict_fields(
+        value,
+        "MigrationDiagnostic payload",
+        (
+            "code",
+            "disposition",
+            "line_number",
+            "record_id",
+            "safe_summary",
+            "stage",
+        ),
+    )
+    return MigrationDiagnostic(
+        code=payload["code"],
+        stage=payload["stage"],
+        line_number=payload["line_number"],
+        record_id=payload["record_id"],
+        disposition=_decode_diagnostic_disposition(
+            payload["disposition"]
+        ),
+        safe_summary=payload["safe_summary"],
+    )
+
+
+def _decode_export_diagnostic(value: object) -> ExportDiagnostic:
+    payload = _strict_fields(
+        value,
+        "ExportDiagnostic payload",
+        ("code", "disposition", "record_id", "safe_summary"),
+    )
+    return ExportDiagnostic(
+        code=payload["code"],
+        record_id=payload["record_id"],
+        disposition=_decode_diagnostic_disposition(
+            payload["disposition"]
+        ),
+        safe_summary=payload["safe_summary"],
+    )
+
+
+def _decode_migration_diagnostics(
+    value: object,
+) -> tuple[MigrationDiagnostic, ...]:
+    return tuple(
+        _decode_migration_diagnostic(diagnostic)
+        for diagnostic in _as_list(value, "migration diagnostics")
+    )
+
+
+def _decode_export_diagnostics(
+    value: object,
+) -> tuple[ExportDiagnostic, ...]:
+    return tuple(
+        _decode_export_diagnostic(diagnostic)
+        for diagnostic in _as_list(value, "export diagnostics")
+    )
+
+
+def _decode_migration_preflight(value: object) -> MigrationPreflight:
+    payload = _strict_fields(
+        value,
+        "MigrationPreflight payload",
+        (
+            "diagnostics",
+            "duplicate_source_count",
+            "invalid_count",
+            "source_digest",
+            "valid_count",
+            "variant_count",
+        ),
+    )
+    return MigrationPreflight(
+        source_digest=payload["source_digest"],
+        valid_count=payload["valid_count"],
+        invalid_count=payload["invalid_count"],
+        duplicate_source_count=payload["duplicate_source_count"],
+        variant_count=payload["variant_count"],
+        diagnostics=_decode_migration_diagnostics(payload["diagnostics"]),
+    )
+
+
+def _decode_migration_report(value: object) -> MigrationReport:
+    payload = _strict_fields(
+        value,
+        "MigrationReport payload",
+        (
+            "activated_generation",
+            "canonical_store_id",
+            "canonical_exact_available",
+            "context_available",
+            "diagnostics",
+            "fuzzy_available",
+            "migrated_count",
+            "resource_id",
+            "skipped_count",
+            "snapshot_receipt",
+            "source_digest",
+            "variant_count",
+        ),
+    )
+    return MigrationReport(
+        resource_id=payload["resource_id"],
+        canonical_store_id=payload["canonical_store_id"],
+        source_digest=payload["source_digest"],
+        snapshot_receipt=_decode_snapshot_receipt(
+            payload["snapshot_receipt"]
+        ),
+        migrated_count=payload["migrated_count"],
+        variant_count=payload["variant_count"],
+        skipped_count=payload["skipped_count"],
+        diagnostics=_decode_migration_diagnostics(payload["diagnostics"]),
+        activated_generation=payload["activated_generation"],
+        canonical_exact_available=payload["canonical_exact_available"],
+        context_available=payload["context_available"],
+        fuzzy_available=payload["fuzzy_available"],
+    )
+
+
+def _decode_migration_failure(value: object) -> MigrationFailure:
+    payload = _strict_fields(
+        value,
+        "MigrationFailure payload",
+        (
+            "active_generation",
+            "active_store_preservation",
+            "diagnostics",
+            "error_code",
+            "original_source_preservation",
+            "recovery_locators",
+            "retryable",
+            "stage",
+        ),
+    )
+    return MigrationFailure(
+        stage=payload["stage"],
+        error_code=payload["error_code"],
+        retryable=payload["retryable"],
+        diagnostics=_decode_migration_diagnostics(payload["diagnostics"]),
+        active_generation=payload["active_generation"],
+        original_source_preservation=(
+            _decode_asset_preservation_evidence(
+                payload["original_source_preservation"]
+            )
+        ),
+        active_store_preservation=_decode_asset_preservation_evidence(
+            payload["active_store_preservation"]
+        ),
+        recovery_locators=_decode_recovery_locators(
+            payload["recovery_locators"]
+        ),
+    )
+
+
+def _decode_export_report(value: object) -> ExportReport:
+    payload = _strict_fields(
+        value,
+        "ExportReport payload",
+        (
+            "canonical_generation",
+            "destination_digest",
+            "diagnostics",
+            "exported_count",
+            "exported_revision",
+            "skipped_count",
+            "snapshot_id",
+            "snapshot_receipt",
+            "snapshot_receipt_digest",
+        ),
+    )
+    return ExportReport(
+        exported_count=payload["exported_count"],
+        skipped_count=payload["skipped_count"],
+        destination_digest=payload["destination_digest"],
+        canonical_generation=payload["canonical_generation"],
+        exported_revision=payload["exported_revision"],
+        snapshot_id=payload["snapshot_id"],
+        snapshot_receipt_digest=payload["snapshot_receipt_digest"],
+        snapshot_receipt=_decode_snapshot_receipt(
+            payload["snapshot_receipt"]
+        ),
+        diagnostics=_decode_export_diagnostics(payload["diagnostics"]),
+    )
+
+
+def _decode_export_failure(value: object) -> ExportFailure:
+    payload = _strict_fields(
+        value,
+        "ExportFailure payload",
+        (
+            "diagnostics",
+            "error_code",
+            "previous_destination_preservation",
+            "recovery_locators",
+            "retryable",
+            "stage",
+        ),
+    )
+    return ExportFailure(
+        stage=payload["stage"],
+        error_code=payload["error_code"],
+        retryable=payload["retryable"],
+        diagnostics=_decode_export_diagnostics(payload["diagnostics"]),
+        previous_destination_preservation=(
+            _decode_asset_preservation_evidence(
+                payload["previous_destination_preservation"]
+            )
+        ),
+        recovery_locators=_decode_recovery_locators(
+            payload["recovery_locators"]
+        ),
+    )
+
+
+def _decode_schema_upgrade_report(value: object) -> SchemaUpgradeReport:
+    payload = _strict_fields(
+        value,
+        "SchemaUpgradeReport payload",
+        (
+            "activated_generation",
+            "backup_digest",
+            "backup_path",
+            "canonical_store_id",
+            "from_version",
+            "success_digest",
+            "to_version",
+        ),
+    )
+    return SchemaUpgradeReport(
+        canonical_store_id=payload["canonical_store_id"],
+        from_version=payload["from_version"],
+        to_version=payload["to_version"],
+        backup_path=_decode_path(
+            payload["backup_path"],
+            "SchemaUpgradeReport backup_path",
+        ),
+        backup_digest=payload["backup_digest"],
+        success_digest=payload["success_digest"],
+        activated_generation=payload["activated_generation"],
+    )
+
+
+def _decode_schema_upgrade_failure(
+    value: object,
+) -> SchemaUpgradeFailure:
+    payload = _strict_fields(
+        value,
+        "SchemaUpgradeFailure payload",
+        (
+            "active_generation",
+            "active_store_preservation",
+            "error_code",
+            "recovery_locators",
+            "retryable",
+            "stage",
+        ),
+    )
+    return SchemaUpgradeFailure(
+        stage=payload["stage"],
+        error_code=payload["error_code"],
+        retryable=payload["retryable"],
+        active_generation=payload["active_generation"],
+        active_store_preservation=_decode_asset_preservation_evidence(
+            payload["active_store_preservation"]
+        ),
+        recovery_locators=_decode_recovery_locators(
+            payload["recovery_locators"]
+        ),
+    )
 
 
 def _decode_snapshot_kind(value: object, field_name: str) -> SnapshotKind:
@@ -2069,6 +3426,28 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
                 )
             ),
         )
+    if contract_type == "AssetPreservationEvidence":
+        return _decode_asset_preservation_evidence(value)
+    if contract_type == "RecoveryLocator":
+        return _decode_recovery_locator(value)
+    if contract_type == "MigrationDiagnostic":
+        return _decode_migration_diagnostic(value)
+    if contract_type == "ExportDiagnostic":
+        return _decode_export_diagnostic(value)
+    if contract_type == "MigrationPreflight":
+        return _decode_migration_preflight(value)
+    if contract_type == "MigrationReport":
+        return _decode_migration_report(value)
+    if contract_type == "MigrationFailure":
+        return _decode_migration_failure(value)
+    if contract_type == "ExportReport":
+        return _decode_export_report(value)
+    if contract_type == "ExportFailure":
+        return _decode_export_failure(value)
+    if contract_type == "SchemaUpgradeReport":
+        return _decode_schema_upgrade_report(value)
+    if contract_type == "SchemaUpgradeFailure":
+        return _decode_schema_upgrade_failure(value)
     if contract_type == "CanonicalResourceIdentity":
         return _decode_canonical_resource_identity(value)
     if contract_type == "SnapshotReceipt":
@@ -2121,13 +3500,30 @@ __all__ = [
     "STAGE_VALIDATION_EVIDENCE_VERSION",
     "TM_CONTRACT_CODEC_VERSION",
     "ActivationCapabilityState",
+    "AssetKind",
+    "AssetPreservationEvidence",
+    "AssetPreservationState",
     "CanonicalResourceIdentity",
     "ContextEvidence",
+    "DiagnosticDisposition",
+    "ExportDiagnostic",
+    "ExportFailure",
+    "ExportOutcome",
+    "ExportReport",
     "GenerationExpectation",
+    "MigrationDiagnostic",
+    "MigrationFailure",
+    "MigrationOutcome",
+    "MigrationPreflight",
+    "MigrationReport",
     "MutableStageRef",
     "QueryReport",
+    "RecoveryLocator",
     "ResourceStoreCoordinatorPort",
     "ResourceQueryFailure",
+    "SchemaUpgradeFailure",
+    "SchemaUpgradeOutcome",
+    "SchemaUpgradeReport",
     "SealedStage",
     "SimilarityEvidence",
     "SnapshotBinding",

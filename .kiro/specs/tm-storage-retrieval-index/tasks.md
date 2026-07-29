@@ -14,7 +14,7 @@
   - 完成时，只有身份、digest、ancestry、expected generation 和 artifact registry 全部闭合的不可变对象能构造激活请求
   - _Requirements: 1.9, 2.9, 2.10, 2.11, 2.12, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
-- [ ] 1.3 定义迁移、导出、升级和恢复结果契约
+- [x] 1.3 定义迁移、导出、升级和恢复结果契约
   - 固化预检计数、逐行安全诊断、成功证据、失败阶段、可重试性、资产保持证明和恢复路径
   - 以显式 success/failure 联合结果表达迁移、导出和 schema upgrade，禁止以半成品或空结果隐式表示成功
   - 完成时，每种成功与失败分支都能被类型化构造、持久比较，并证明原资产保持或提供 fail-stop 恢复位置
@@ -353,3 +353,4 @@
 
 - 2026-07-29 / Task 1.1：冻结 `tm_contracts.py` 的记录、资源句柄、查询、结果、evidence、局部失败与严格 codec v1；运行时 `TMResourceHandle` 保持必需 `TMStore` 绑定且不进入持久 codec。独立复审通过；focused 15/15、全量 127/127、basedpyright 0 errors。
 - 2026-07-29 / Task 1.2：冻结 canonical 资源身份、确定性 sidecar、snapshot receipt/manifest/binding、阶段校验证据与 generation 闭合；sealed artifact 和单次 token 保持 registry 背书的模块私有运行期能力，公开协调器只暴露 `activate(SealedStage)`。独立复审通过；focused 27/27、全量 138/138、basedpyright 0 errors。
+- 2026-07-29 / Task 1.3：冻结迁移、导出与 schema upgrade 的显式成功/失败联合结果，使用 digest-backed 资产保持证据与无权限恢复定位替代可伪造布尔断言；strict codec 在编码与解码边界递归重验 lineage、计数和嵌套证据。独立复审通过；focused 38/38、全量 150/150、basedpyright 0 errors。
