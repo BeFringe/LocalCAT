@@ -64,7 +64,7 @@
   - 完成时，三态转换矩阵和 manifest 缺失/错配/过期测试全部通过，消费方无法设置或覆写状态
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 2.5 实现 capability-gated matcher 执行端口
+- [x] 2.5 实现 capability-gated matcher 执行端口
   - 每次请求只读取一次不可变能力快照，并用它校验 profile、选项和语义版本后执行对应匹配算法
   - 拒绝当前状态未覆盖的用途和选项且不返回命中；成功与拒绝都携带同一次判定的状态、版本和只读摘要
   - 完成时，profile×state×options、single-snapshot race 和无正文拒绝信息测试全部通过
@@ -360,3 +360,4 @@
 - 2026-07-29 / Task 2.2：固定 Unicode 16.0.0/UAX #29 rev.45 属性表、来源摘要与运行时 fail-closed 闸门，实现带原文 provenance 的 whole-string NFC/casefold 投影、默认词界和严格 pure-CJK 分类；第一轮 canonical blocking 缺陷经独立复审拦截后改为标准 composition 状态机，并以完整 NormalizationTest 99,825 输入、WordBreakTest 1,826 向量和 scorer 回归闭合。独立复审第二轮通过；focused 15/15（1,890 subtests）、全量 197/197（2,029 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.3：实现 Core 内部纯 `TextMatcherV1`，固定 legacy、basic 与 configurable 四组合行为；overlap、NFC/casefold expansion、原文 span 投影去重、稳定排序、原文 UAX #29 Whole Word 过滤及 pure-CJK 连续匹配 tailoring 均由版本化 golden 闭合，且不携带 capability/readiness 权威。独立复审通过；focused 29/29（1,938 subtests）、全量 203/203（2,056 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.4：实现 Core 内部唯一 `MatcherCapabilityEvaluator` 与原子不可变快照 publisher，以独立 basic/full cohort 时间窗闭合 UNAVAILABLE、BASIC_VALIDATED、TEXT_V1_VALIDATED 三态；为忠实表达 full-only 过期降级，内部 evidence schema/manifest codec 升至 v2，旧 v1 严格拒绝且公开 matcher 契约形状不变。第一轮复审拦截多 full cohort 部分缺失误判 UNAVAILABLE 的缺陷，修复为“完整 BASIC + 任意 full 子集”降级语义并加入双 full cohort 矩阵；独立复审第二轮通过；focused 23/23（67 subtests）、全量 211/211（2,080 subtests）、basedpyright 0 errors。
+- 2026-07-29 / Task 2.5：实现唯一公开 `CapabilityGatedTextMatcherV1` 执行端口，每次调用只读取一次不可变 capability 快照，复用冻结的用途/选项矩阵并将 success/rejection、请求摘要和同一快照成套返回；拒绝路径不执行算法且不泄露正文，授权路径只调用一次 `TextMatcherV1`。独立复审连续拦截 evaluator 语义重绑、发布窗口 TOCTOU 与 caller expectation ABA，最终改为 publisher 构造时深复制私有 expectation/evaluator，并在发布锁内二次核对身份、摘要及语义版本，任何漂移均 fail-closed 为 UNAVAILABLE。独立复审第四轮通过；matcher focused 45/45（1,998 subtests）、全量 219/219（2,116 subtests）、basedpyright 0 errors。

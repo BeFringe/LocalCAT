@@ -215,6 +215,47 @@ def _expectation_payload(
     }
 
 
+def _expectation_digest(
+    expectation: MatcherValidationExpectation,
+) -> str:
+    canonical = json.dumps(
+        _expectation_payload(expectation),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _clone_expectation(
+    expectation: MatcherValidationExpectation,
+) -> MatcherValidationExpectation:
+    """Detach publisher authority from caller-owned live object aliases."""
+
+    def clone_cohorts(
+        cohorts: tuple[MatcherValidationCohortExpectation, ...],
+    ) -> tuple[MatcherValidationCohortExpectation, ...]:
+        return tuple(
+            MatcherValidationCohortExpectation(
+                cohort_id=cohort.cohort_id,
+                cohort_digest=cohort.cohort_digest,
+            )
+            for cohort in cohorts
+        )
+
+    return MatcherValidationExpectation(
+        evidence_schema_version=expectation.evidence_schema_version,
+        matcher_artifact_digest=expectation.matcher_artifact_digest,
+        matcher_build_digest=expectation.matcher_build_digest,
+        semantics_version=expectation.semantics_version,
+        basic_cohorts=clone_cohorts(expectation.basic_cohorts),
+        full_cohorts=clone_cohorts(expectation.full_cohorts),
+        fixture_digest=expectation.fixture_digest,
+        evaluator_digest=expectation.evaluator_digest,
+    )
+
+
 def _capability_summary(
     *,
     canonical_manifest_json: str,
@@ -429,7 +470,11 @@ class MatcherCapabilityPublisher:
 
     __slots__: tuple[str, ...] = (
         "__evaluator",
+        "__evaluator_identity",
+        "__expectation_digest",
+        "__expectation_identity",
         "__lock",
+        "__semantics_version",
         "__snapshot",
     )
 
@@ -440,9 +485,18 @@ class MatcherCapabilityPublisher:
         initial_manifest: MatcherValidationManifest | None,
         evaluated_at_utc: datetime,
     ) -> None:
-        self.__evaluator = _require_evaluator(evaluator)
+        validated_evaluator = _require_evaluator(evaluator)
+        expectation = _clone_expectation(
+            validated_evaluator.expectation
+        )
+        private_evaluator = MatcherCapabilityEvaluator(expectation)
+        self.__evaluator = private_evaluator
+        self.__evaluator_identity = private_evaluator
+        self.__expectation_identity = expectation
+        self.__expectation_digest = _expectation_digest(expectation)
+        self.__semantics_version = expectation.semantics_version
         self.__lock = Lock()
-        self.__snapshot = self.__evaluator.evaluate(
+        self.__snapshot = private_evaluator.evaluate(
             initial_manifest,
             evaluated_at_utc=evaluated_at_utc,
         )
@@ -453,6 +507,31 @@ class MatcherCapabilityPublisher:
         with self.__lock:
             return self.__snapshot
 
+    @property
+    def semantics_version(self) -> str:
+        """Return the frozen semantics identity accepted by this publisher."""
+
+        return self.__semantics_version
+
+    def __trusted_evaluator(
+        self,
+    ) -> MatcherCapabilityEvaluator | None:
+        """Return the write-once evaluator only while its identity is intact."""
+
+        evaluator = self.__evaluator
+        if evaluator is not self.__evaluator_identity:
+            return None
+        expectation = evaluator.expectation
+        if expectation is not self.__expectation_identity:
+            return None
+        try:
+            current_digest = _expectation_digest(expectation)
+        except (TypeError, ValueError):
+            return None
+        if current_digest != self.__expectation_digest:
+            return None
+        return evaluator
+
     def refresh(
         self,
         manifest: MatcherValidationManifest | None,
@@ -461,11 +540,26 @@ class MatcherCapabilityPublisher:
     ) -> TextMatcherCapability:
         """Evaluate a manifest, then atomically publish that exact result."""
 
-        next_snapshot = self.__evaluator.evaluate(
-            manifest,
-            evaluated_at_utc=evaluated_at_utc,
-        )
+        evaluator = self.__trusted_evaluator()
+        if evaluator is None:
+            next_snapshot = _unavailable_capability()
+        else:
+            next_snapshot = evaluator.evaluate(
+                manifest,
+                evaluated_at_utc=evaluated_at_utc,
+            )
         with self.__lock:
+            trusted_at_publish = self.__trusted_evaluator()
+            semantics_match = (
+                next_snapshot.state is TextMatcherState.UNAVAILABLE
+                or next_snapshot.semantics_version
+                == self.__semantics_version
+            )
+            if (
+                trusted_at_publish is not evaluator
+                or not semantics_match
+            ):
+                next_snapshot = _unavailable_capability()
             self.__snapshot = next_snapshot
             return self.__snapshot
 
