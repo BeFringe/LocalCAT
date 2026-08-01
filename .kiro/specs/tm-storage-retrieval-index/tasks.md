@@ -113,7 +113,7 @@
   - 完成时，预折叠输入、索引内容、回滚行为和候选集合通过确定性测试
   - _Requirements: 4.2, 5.3, 5.4_
 
-- [ ] 4.2 实现 1/2/3-gram fallback 与短查询召回
+- [x] 4.2 实现 1/2/3-gram fallback 与短查询召回
   - 一、二字符查询使用对应 posting；无 FTS5 时由 1/2/3-gram union 提供完整 fallback
   - 保持能力选择显式可诊断，并使相同配置的候选阶段顺序稳定
   - 完成时，短查询、纯 CJK 和禁用 FTS5 环境都能返回非空、可重复、受预算约束的候选集合
@@ -368,3 +368,4 @@
 - 2026-08-01 / Task 3.4：实现 leased canonical revision、completed snapshot ledger 与 `SourceBindingMonitor`；严格核对 configured JSONL、deterministic manifest、receipt、resource/canonical identity、digest、record count 和 revision ancestry。正常 local/import append 只推进 canonical revision 并把 CURRENT 变为 HISTORY，不改双文件；任一外部或 ledger 错配锁存 DIVERGED，canonical exact/append 继续权威且修回文件或重开不会隐式清除。completed-binding seam 只登记已发布且与当前 revision 闭合的 pair，不实现 issued/temp/fsync/replace/recovery/clear。集群实现阶段机械验证通过；source/store focused 47/47、全量 289/289（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster A 统一复审。
 - 2026-08-01 / Cluster A 复审：xhigh 累积复审拦截 canonical facts/revision 的 autocommit 混读、drain 窗口 next stage 篡改后误发布，以及 HISTORY 只校验上界的 ancestry 缺口。修正把当前 schema 升至 pre-release v2，以唯一 `completed_revision` 让 batch completion、record count 与 head revision 同事务闭合；所有公开 revision/binding facts 使用单一 read snapshot，divergence latch 以 canonical fingerprint 重核并在事实变化时重试；generation 只在 drain 后重新完成 schema/identity/integrity/FK/ancestry health 验证才发布。原 reviewer 定点复验最终批准；cluster focused 51/51、fresh 全量 293/293（含 Qt smoke）、basedpyright error-level 0 errors。
 - 2026-08-01 / Task 4.1：实现对已由 fold-v1 预折叠文本的 contentful FTS5 trigram 写入计划与 fast recall seam；长度至少三的查询按首次出现顺序生成唯一 code-point trigram，逐个作为转义 phrase 做 OR union，store 在 generation lease 内以参数绑定查询并返回去重稳定 identity。无 FTS 或短查询明确 unavailable，不伪造 gram fallback、budget、阶段 metadata 或最终评分；FTS 行继续通过 Task 3.2 controlled plan 与 origin/record/completed revision 同事务提交和回滚。集群实现阶段机械验证通过；candidate/store focused 47/47、全量 299/299（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.2/4.3 后执行 Cluster B 统一复审。
+- 2026-08-01 / Task 4.2：统一 candidate write plan 在 FTS 配置写入 FTS+唯一 1/2-gram、无 FTS 配置写入唯一 1/2/3-gram，继续由 store 同事务提交。1/2 字符查询只走对应 posting；无 FTS 长查询按 3→2→1 posting union 返回 matched/query overlap evidence，纯 CJK 与 SQL 行序扰动下保持 overlap 降序、record id tie 的确定顺序。caller limit 与 8192 candidate hard cap 共同限流，4096 posting cap 先形成实际执行集合，SQL 与 denominator 只使用同一集合；FTS 长查询显式留给 4.3 合并，不伪造 budget-v1 或阶段账本。集群实现阶段机械验证通过；candidate/store focused 57/57、全量 309/309（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.3 后执行 Cluster B 统一复审。

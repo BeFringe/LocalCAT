@@ -1563,6 +1563,75 @@ class SQLiteTMStore:
             record_ids.add(record_id)
         return tuple(sorted(record_ids))
 
+    def gram_candidate_overlaps(
+        self,
+        query_postings: tuple[tuple[int, str], ...],
+        *,
+        candidate_cap: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return record identities and matched unique posting counts."""
+
+        if type(query_postings) is not tuple:
+            raise TypeError("query_postings must be a built-in tuple")
+        prepared: list[tuple[int, str]] = []
+        for posting in query_postings:
+            if type(posting) is not tuple or len(posting) != 2:
+                raise TypeError("query_postings must contain built-in pairs")
+            gram_size, gram = posting
+            if type(gram_size) is not int or type(gram) is not str:
+                raise TypeError("query posting values must use built-in types")
+            if gram_size not in {1, 2, 3} or len(gram) != gram_size:
+                raise ValueError("query posting is invalid")
+            prepared.append((gram_size, gram))
+        if len(set(prepared)) != len(prepared):
+            raise ValueError("query_postings must be unique")
+        if not prepared:
+            raise ValueError("query_postings must not be empty")
+        if type(candidate_cap) is not int:
+            raise TypeError("candidate_cap must be a built-in integer")
+        if not 1 <= candidate_cap <= 8192:
+            raise ValueError("candidate_cap is outside the safe range")
+
+        values_sql = ",".join("(?, ?)" for _ in prepared)
+        parameters: list[int | str] = []
+        for gram_size, gram in prepared:
+            parameters.extend((gram_size, gram))
+        parameters.append(candidate_cap)
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                self._validate_identity(connection, lease)
+                try:
+                    rows = connection.execute(
+                        "WITH query_grams(gram_size, gram) AS (VALUES "
+                        f"{values_sql}) "
+                        "SELECT postings.record_id, COUNT(*) AS matched_count "
+                        "FROM tm_gram AS postings "
+                        "JOIN query_grams AS query "
+                        "ON query.gram_size = postings.gram_size "
+                        "AND query.gram = postings.gram "
+                        "GROUP BY postings.record_id "
+                        "ORDER BY matched_count DESC, postings.record_id ASC "
+                        "LIMIT ?",
+                        tuple(parameters),
+                    ).fetchall()
+                except sqlite3.Error as error:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.GRAM_QUERY_FAILED"
+                    ) from error
+        overlaps: list[tuple[int, int]] = []
+        for row in rows:
+            if (
+                type(row) is not tuple
+                or len(row) != 2
+                or type(row[0]) is not int
+                or row[0] < 1
+                or type(row[1]) is not int
+                or not 1 <= row[1] <= len(prepared)
+            ):
+                raise SQLiteStoreSchemaError("STORE.GRAM_RESULT_INVALID")
+            overlaps.append((row[0], row[1]))
+        return tuple(overlaps)
+
     def export_records(self) -> Iterator[TMRecord]:
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
