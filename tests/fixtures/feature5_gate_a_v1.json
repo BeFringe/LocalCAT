@@ -1,0 +1,56 @@
+{
+  "schema_version": "feature5-gate-a-v1",
+  "components": {
+    "CONTRACTS": {
+      "artifact_paths": ["tm_contracts.py"],
+      "fixture_paths": [],
+      "artifact_digest": "65be0446b8e9039c79c42661d75745e3472ea7a66c87ec547682374ca5f26003",
+      "fixture_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "transcript_digest": "3e7b79ffb42a66aef2e1e35cfabf602c933dd409fbbeae9055f80a2cabb32d06"
+    },
+    "SIMILARITY": {
+      "artifact_paths": ["tm_similarity.py"],
+      "fixture_paths": ["tests/fixtures/tm_similarity_vectors.json"],
+      "artifact_digest": "715d31e40398e19e3ec4d32de874d71726369f93428d1c1cd5dfd9180531afc4",
+      "fixture_digest": "b16f708f6aba1cedf50cb016f6476a7e065d2574d62d1cb125835b9245b61e5d",
+      "transcript_digest": "b1cebe3c74392bf4d3e520acd055da177efe1e2695f7f8baa3634abd12e069c0"
+    },
+    "TEXT": {
+      "artifact_paths": ["text_matcher.py", "unicode_word_break_data.py"],
+      "fixture_paths": [
+        "tests/fixtures/text_matcher_unicode_vectors.json",
+        "tests/fixtures/text_matcher_v1_vectors.json",
+        "tests/fixtures/unicode-16.0.0-WordBreakTest.txt"
+      ],
+      "artifact_digest": "e1ccfabb3fb0dbb178632c1bad5aa176373a58fcacee7e5ae4f7d4a7d4ff3b80",
+      "fixture_digest": "ef13a6158435b6cc4d53b0186e26883618a6ee4951075b35e4bee8b00916a28a",
+      "transcript_digest": "a81adbdebc71e91bf8e6c45d6dd651682c397b0fdfe3e574af2f5baeeed78e94"
+    }
+  },
+  "matcher": {
+    "artifact_paths": ["text_matcher.py", "unicode_word_break_data.py"],
+    "build_paths": [
+      "capability_gated_text_matcher.py",
+      "matcher_capability.py",
+      "matcher_validation.py",
+      "text_matcher.py",
+      "tm_contracts.py",
+      "tm_gate_a.py",
+      "unicode_word_break_data.py"
+    ],
+    "evaluator_path": "matcher_capability.py",
+    "fixture_paths": ["tests/fixtures/text_matcher_v1_vectors.json"],
+    "matcher_artifact_digest": "e1ccfabb3fb0dbb178632c1bad5aa176373a58fcacee7e5ae4f7d4a7d4ff3b80",
+    "matcher_build_digest": "596d41cc635982786b9b991f2391770486e4e9e6906ba7d9448736b3bcf26d68",
+    "fixture_digest": "09967fd2e72b8f5d748c5754ff76983b55d584b73e55abba15e730fdda528ed1",
+    "evaluator_digest": "bf41a588ff902d93beee0ced8b0c015f2f18883bf2db298b90a20cf975003777",
+    "semantics_version": "text-v1-unicode-16.0.0",
+    "basic_cohorts": {
+      "matcher-basic-v1": "223b85a732b1e5e7bfe539a872cbcdda71237757eb520cc265876b566c491ba9"
+    },
+    "full_cohorts": {
+      "matcher-text-v1": "c99669bd7f4ff1d7160e6427dea04c8047697f4c7b9c0b9053b055176e0f7845",
+      "matcher-unicode-v1": "6bc9f08b5c16c57daa17f5039a68c432a8db79b8df47fe732c8cbdc6e71cab56"
+    }
+  }
+}
