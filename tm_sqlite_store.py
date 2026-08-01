@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
+import time
 import unicodedata
 import uuid
 
@@ -227,6 +230,24 @@ class SQLiteStoreSchemaError(RuntimeError):
     """A safe, resource-local schema or connection policy failure."""
 
 
+class SQLiteStoreLifecycleError(SQLiteStoreSchemaError):
+    """A safe lifecycle failure scoped to one resource generation."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        resource_id: str,
+        generation: int,
+        retryable: bool,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.resource_id = resource_id
+        self.generation = generation
+        self.retryable = retryable
+
+
 @dataclass(frozen=True)
 class SQLiteCandidateRecord:
     """Folded source input exposed to a pre-transaction plan builder."""
@@ -314,8 +335,15 @@ type _PreparedRecordDraft = tuple[
 ]
 
 
-class SQLiteTMStore:
-    """Task 3.2 store port, gated until its behavioral tests are green."""
+@dataclass(frozen=True)
+class _SQLiteGenerationView:
+    stage: MutableStageRef
+    canonical_store_id: str
+    generation: int
+
+
+class ResourceStoreCoordinator:
+    """Own one resource's operation leases and active generation view."""
 
     def __init__(
         self,
@@ -327,25 +355,227 @@ class SQLiteTMStore:
             raise TypeError("canonical_store_id must be a built-in string")
         if not canonical_store_id.strip():
             raise ValueError("canonical_store_id must not be empty")
-        self._stage = _snapshot_store_stage(stage)
+        private_stage = _snapshot_store_stage(stage)
+        snapshot = inspect_stage_schema(
+            private_stage,
+            canonical_store_id=canonical_store_id,
+        )
+        self._resource_id = private_stage.resource_identity.resource_id
+        self._target_identity = (
+            private_stage.resource_identity.target_identity
+        )
+        self._condition = threading.Condition()
+        self._state = "READY"
+        self._active_lease_count = 0
+        self._view = _SQLiteGenerationView(
+            stage=private_stage,
+            canonical_store_id=canonical_store_id,
+            generation=snapshot.generation,
+        )
+
+    @property
+    def resource_id(self) -> str:
+        return self._resource_id
+
+    @property
+    def current_generation(self) -> int:
+        with self._condition:
+            return self._view.generation
+
+    @property
+    def state(self) -> str:
+        with self._condition:
+            return self._state
+
+    def wait_for_state(
+        self,
+        state: str,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        if type(state) is not str or state not in {
+            "READY",
+            "DRAINING",
+            "ACTIVATING",
+            "FAILED",
+        }:
+            raise ValueError("state is invalid")
+        timeout = _require_timeout(timeout_seconds)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._state != state:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    @contextmanager
+    def _operation_lease(self) -> Iterator[_SQLiteGenerationView]:
+        with self._condition:
+            view = self._view
+            if self._state != "READY":
+                raise SQLiteStoreLifecycleError(
+                    "STORE.RESOURCE_DRAINING",
+                    resource_id=self._resource_id,
+                    generation=view.generation,
+                    retryable=True,
+                )
+            self._active_lease_count += 1
+        try:
+            yield view
+        finally:
+            with self._condition:
+                self._active_lease_count -= 1
+                if self._active_lease_count < 0:
+                    self._active_lease_count = 0
+                    self._state = "FAILED"
+                    self._condition.notify_all()
+                    raise RuntimeError("operation lease count underflow")
+                if self._active_lease_count == 0:
+                    self._condition.notify_all()
+
+    def _transition_generation(
+        self,
+        stage: MutableStageRef,
+        *,
+        canonical_store_id: str,
+        expected_prior_generation: int,
+        timeout_seconds: float,
+    ) -> int:
+        """Drain and publish an already-prepared view; activation calls this later."""
+
+        if type(canonical_store_id) is not str:
+            raise TypeError("canonical_store_id must be a built-in string")
+        if not canonical_store_id.strip():
+            raise ValueError("canonical_store_id must not be empty")
+        if type(expected_prior_generation) is not int:
+            raise TypeError(
+                "expected_prior_generation must be a built-in integer"
+            )
+        if expected_prior_generation < 0:
+            raise ValueError(
+                "expected_prior_generation must be non-negative"
+            )
+        timeout = _require_timeout(timeout_seconds)
+        next_stage = _snapshot_store_stage(stage)
+        next_identity = next_stage.resource_identity
+        if (
+            next_identity.resource_id != self._resource_id
+            or next_identity.target_identity != self._target_identity
+        ):
+            raise SQLiteStoreLifecycleError(
+                "STORE.IDENTITY_MISMATCH",
+                resource_id=self._resource_id,
+                generation=self.current_generation,
+                retryable=False,
+            )
+
+        with self._condition:
+            current_view = self._view
+        if canonical_store_id != current_view.canonical_store_id:
+            raise SQLiteStoreLifecycleError(
+                "STORE.IDENTITY_MISMATCH",
+                resource_id=self._resource_id,
+                generation=current_view.generation,
+                retryable=False,
+            )
+        if next_stage.staged_db_path != current_view.stage.staged_db_path:
+            _ = inspect_stage_schema(
+                next_stage,
+                canonical_store_id=canonical_store_id,
+            )
+
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            current_view = self._view
+            if self._state != "READY":
+                raise SQLiteStoreLifecycleError(
+                    "STORE.RESOURCE_DRAINING",
+                    resource_id=self._resource_id,
+                    generation=current_view.generation,
+                    retryable=True,
+                )
+            if current_view.generation != expected_prior_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_STALE",
+                    resource_id=self._resource_id,
+                    generation=current_view.generation,
+                    retryable=False,
+                )
+            self._state = "DRAINING"
+            self._condition.notify_all()
+            while self._active_lease_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._state = "READY"
+                    self._condition.notify_all()
+                    raise SQLiteStoreLifecycleError(
+                        "STORE.DRAIN_TIMEOUT",
+                        resource_id=self._resource_id,
+                        generation=current_view.generation,
+                        retryable=True,
+                    )
+                self._condition.wait(remaining)
+            self._state = "ACTIVATING"
+            self._condition.notify_all()
+            next_generation = current_view.generation + 1
+            self._view = _SQLiteGenerationView(
+                stage=next_stage,
+                canonical_store_id=canonical_store_id,
+                generation=next_generation,
+            )
+            self._state = "READY"
+            self._condition.notify_all()
+            return next_generation
+
+
+def _require_timeout(value: object) -> float:
+    if type(value) is int:
+        timeout = float(value)
+    elif type(value) is float:
+        timeout = value
+    else:
+        raise TypeError("timeout_seconds must be a built-in number")
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout_seconds must be finite and non-negative")
+    return timeout
+
+
+class SQLiteTMStore:
+    """Per-resource store whose public operations use generation leases."""
+
+    def __init__(
+        self,
+        stage: MutableStageRef,
+        *,
+        canonical_store_id: str,
+    ) -> None:
+        if type(canonical_store_id) is not str:
+            raise TypeError("canonical_store_id must be a built-in string")
+        if not canonical_store_id.strip():
+            raise ValueError("canonical_store_id must not be empty")
         self._canonical_store_id = canonical_store_id
-        _ = inspect_stage_schema(
-            self._stage,
+        self._coordinator = ResourceStoreCoordinator(
+            stage,
             canonical_store_id=self._canonical_store_id,
         )
+
+    @property
+    def coordinator(self) -> ResourceStoreCoordinator:
+        return self._coordinator
 
     def exact_records(self, source_raw: str) -> tuple[TMRecord, ...]:
         if type(source_raw) is not str:
             raise TypeError("source_raw must be a built-in string")
-        with _open_configured_connection(
-            self._stage.staged_db_path
-        ) as connection:
-            self._validate_identity(connection)
-            rows = connection.execute(
-                f"SELECT {_RECORD_COLUMNS} FROM tm_record "
-                "WHERE source_raw = ? ORDER BY record_id DESC",
-                (source_raw,),
-            ).fetchall()
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                self._validate_identity(connection, lease)
+                rows = connection.execute(
+                    f"SELECT {_RECORD_COLUMNS} FROM tm_record "
+                    "WHERE source_raw = ? ORDER BY record_id DESC",
+                    (source_raw,),
+                ).fetchall()
         return tuple(_record_from_row(row) for row in rows)
 
     def append(self, draft: TMRecordDraft) -> TMRecord:
@@ -387,7 +617,7 @@ class SQLiteTMStore:
             prepared_invalid_count,
             prepared_duplicate_source_count,
             prepared_drafts,
-            validated_candidate_plan,
+            candidate_records,
         ) = _prepare_append_batch_inputs(
             batch_id=batch_id,
             kind=kind,
@@ -400,26 +630,55 @@ class SQLiteTMStore:
             created_at=created_at,
             extension=extension,
         )
-        stage_identity = self._stage.resource_identity
-        database_path = self._stage.staged_db_path
-        expected_resource_id = stage_identity.resource_id
-        expected_canonical_store_id = self._canonical_store_id
-        expected_target_identity = stage_identity.target_identity
-        open_connection = _open_configured_connection
+        with self._coordinator._operation_lease() as lease:
+            validated_candidate_plan = _prepare_candidate_write_plan(
+                extension,
+                candidate_records,
+                batch_size=len(prepared_drafts),
+            )
+            return self._append_prepared_batch(
+                lease=lease,
+                prepared_batch_id=prepared_batch_id,
+                prepared_kind=prepared_kind,
+                prepared_source_digest=prepared_source_digest,
+                prepared_source_path=prepared_source_path,
+                timestamp=timestamp,
+                prepared_invalid_count=prepared_invalid_count,
+                prepared_duplicate_source_count=(
+                    prepared_duplicate_source_count
+                ),
+                prepared_drafts=prepared_drafts,
+                validated_candidate_plan=validated_candidate_plan,
+            )
+
+    def _append_prepared_batch(
+        self,
+        *,
+        lease: _SQLiteGenerationView,
+        prepared_batch_id: str,
+        prepared_kind: str,
+        prepared_source_digest: str | None,
+        prepared_source_path: str | None,
+        timestamp: str,
+        prepared_invalid_count: int,
+        prepared_duplicate_source_count: int,
+        prepared_drafts: tuple[_PreparedRecordDraft, ...],
+        validated_candidate_plan: _ValidatedCandidateWritePlan,
+    ) -> tuple[TMRecord, ...]:
         validate_store_identity = _validate_store_identity
         apply_candidate_write_plan = _apply_candidate_write_plan
         inserted: list[TMRecord] = []
         record_ids_by_ordinal: dict[int, int] = {}
-        with open_connection(
-            database_path
-        ) as connection:
+        with _open_leased_connection(lease) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 validate_store_identity(
                     connection,
-                    resource_id=expected_resource_id,
-                    canonical_store_id=expected_canonical_store_id,
-                    target_identity=expected_target_identity,
+                    resource_id=lease.stage.resource_identity.resource_id,
+                    canonical_store_id=lease.canonical_store_id,
+                    target_identity=(
+                        lease.stage.resource_identity.target_identity
+                    ),
                 )
                 connection.execute(
                     "INSERT INTO tm_origin_batch("
@@ -536,18 +795,17 @@ class SQLiteTMStore:
                 raise ValueError(
                     "record_ids must contain positive integers"
                 )
-        if not record_ids:
-            return ()
-        placeholders = ",".join("?" for _ in record_ids)
-        with _open_configured_connection(
-            self._stage.staged_db_path
-        ) as connection:
-            self._validate_identity(connection)
-            rows = connection.execute(
-                f"SELECT {_RECORD_COLUMNS} FROM tm_record "
-                f"WHERE record_id IN ({placeholders})",
-                record_ids,
-            ).fetchall()
+        with self._coordinator._operation_lease() as lease:
+            if not record_ids:
+                return ()
+            placeholders = ",".join("?" for _ in record_ids)
+            with _open_leased_connection(lease) as connection:
+                self._validate_identity(connection, lease)
+                rows = connection.execute(
+                    f"SELECT {_RECORD_COLUMNS} FROM tm_record "
+                    f"WHERE record_id IN ({placeholders})",
+                    record_ids,
+                ).fetchall()
         by_id = {
             record.record_id: record
             for record in (_record_from_row(row) for row in rows)
@@ -559,22 +817,25 @@ class SQLiteTMStore:
         )
 
     def export_records(self) -> Iterator[TMRecord]:
-        with _open_configured_connection(
-            self._stage.staged_db_path
-        ) as connection:
-            self._validate_identity(connection)
-            rows = connection.execute(
-                f"SELECT {_RECORD_COLUMNS} FROM tm_record "
-                "ORDER BY record_id ASC"
-            ).fetchall()
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                self._validate_identity(connection, lease)
+                rows = connection.execute(
+                    f"SELECT {_RECORD_COLUMNS} FROM tm_record "
+                    "ORDER BY record_id ASC"
+                ).fetchall()
         return iter(tuple(_record_from_row(row) for row in rows))
 
-    def _validate_identity(self, connection: sqlite3.Connection) -> None:
-        identity = self._stage.resource_identity
+    def _validate_identity(
+        self,
+        connection: sqlite3.Connection,
+        lease: _SQLiteGenerationView,
+    ) -> None:
+        identity = lease.stage.resource_identity
         _validate_store_identity(
             connection,
             resource_id=identity.resource_id,
-            canonical_store_id=self._canonical_store_id,
+            canonical_store_id=lease.canonical_store_id,
             target_identity=identity.target_identity,
         )
 
@@ -667,7 +928,7 @@ def _prepare_append_batch_inputs(
     int,
     int,
     tuple[_PreparedRecordDraft, ...],
-    _ValidatedCandidateWritePlan,
+    tuple[SQLiteCandidateRecord, ...],
 ]:
     _validate_batch_arguments(
         batch_id=batch_id,
@@ -694,11 +955,6 @@ def _prepare_append_batch_inputs(
         )
         for draft in prepared_drafts
     )
-    candidate_plan = (
-        SQLiteCandidateWritePlan()
-        if extension is None
-        else extension(candidate_records)
-    )
     return (
         batch_id,
         kind,
@@ -712,10 +968,28 @@ def _prepare_append_batch_inputs(
         invalid_count,
         duplicate_source_count,
         prepared_drafts,
-        _validate_and_copy_candidate_plan(
-            candidate_plan,
-            batch_size=len(prepared_drafts),
-        ),
+        candidate_records,
+    )
+
+
+def _prepare_candidate_write_plan(
+    extension: Callable[
+        [tuple[SQLiteCandidateRecord, ...]],
+        SQLiteCandidateWritePlan,
+    ]
+    | None,
+    candidate_records: tuple[SQLiteCandidateRecord, ...],
+    *,
+    batch_size: int,
+) -> _ValidatedCandidateWritePlan:
+    candidate_plan = (
+        SQLiteCandidateWritePlan()
+        if extension is None
+        else extension(candidate_records)
+    )
+    return _validate_and_copy_candidate_plan(
+        candidate_plan,
+        batch_size=batch_size,
     )
 
 
@@ -1079,6 +1353,39 @@ def _open_configured_connection(
         yield connection
     finally:
         connection.close()
+
+
+@contextmanager
+def _open_leased_connection(
+    lease: _SQLiteGenerationView,
+) -> Iterator[sqlite3.Connection]:
+    """Keep one generation lease around one thread-local connection."""
+
+    try:
+        with _open_configured_connection(
+            lease.stage.staged_db_path
+        ) as connection:
+            yield connection
+    except sqlite3.OperationalError as error:
+        sqlite_code = getattr(error, "sqlite_errorcode", None)
+        primary_code = (
+            sqlite_code & 0xFF
+            if type(sqlite_code) is int
+            else None
+        )
+        message = str(error).lower()
+        if (
+            primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or "database is locked" in message
+            or "database table is locked" in message
+        ):
+            raise SQLiteStoreLifecycleError(
+                "STORE.BUSY_TIMEOUT",
+                resource_id=lease.stage.resource_identity.resource_id,
+                generation=lease.generation,
+                retryable=True,
+            ) from error
+        raise
 
 
 def initialize_stage_schema(
@@ -1659,11 +1966,13 @@ __all__ = [
     "BUSY_TIMEOUT_MS",
     "CANDIDATE_INDEX_VERSION",
     "FOLD_VERSION_V1",
+    "ResourceStoreCoordinator",
     "SQLiteCandidateRecord",
     "SQLiteCandidateWritePlan",
     "SQLiteGramRow",
     "SQLiteRuntimeCapability",
     "SQLiteSchemaSnapshot",
+    "SQLiteStoreLifecycleError",
     "SQLiteStoreSchemaError",
     "SQLiteTMStore",
     "TM_SCHEMA_VERSION",

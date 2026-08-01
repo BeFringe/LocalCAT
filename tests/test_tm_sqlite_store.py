@@ -25,6 +25,7 @@ from tm_sqlite_store import (
     SQLiteCandidateRecord,
     SQLiteCandidateWritePlan,
     SQLiteGramRow,
+    SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     _schema_digest,
@@ -1268,6 +1269,348 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 tuple(record.target_raw for record in store.exact_records("concurrent")),
                 ("winner", "first"),
             )
+
+    def test_drain_rejects_new_operations_without_opening_connections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary_stage = _stage(root, "tm.primary")
+            secondary_stage = _stage(root, "tm.secondary")
+            initialize_stage_schema(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            initialize_stage_schema(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            primary = SQLiteTMStore(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            secondary = SQLiteTMStore(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            primary_connection_closed = threading.Event()
+            reader_errors: list[BaseException] = []
+            switch_errors: list[BaseException] = []
+            switch_closed_observations: list[bool] = []
+            opened_paths: list[Path] = []
+
+            @contextmanager
+            def held_connection(
+                database_path: Path,
+                **kwargs: Any,
+            ) -> Iterator[sqlite3.Connection]:
+                opened_paths.append(database_path)
+                try:
+                    with _open_configured_connection(
+                        database_path,
+                        **kwargs,
+                    ) as connection:
+                        if database_path == primary_stage.staged_db_path:
+                            entered.set()
+                            if not release.wait(timeout=2):
+                                raise RuntimeError("test did not release reader")
+                        yield connection
+                finally:
+                    if database_path == primary_stage.staged_db_path:
+                        primary_connection_closed.set()
+
+            def read_primary() -> None:
+                try:
+                    _ = primary.exact_records("source")
+                except BaseException as error:
+                    reader_errors.append(error)
+
+            def switch_primary() -> None:
+                try:
+                    _ = primary.coordinator._transition_generation(
+                        primary_stage,
+                        canonical_store_id="store.primary",
+                        expected_prior_generation=0,
+                        timeout_seconds=1.0,
+                    )
+                    switch_closed_observations.append(
+                        primary_connection_closed.is_set()
+                    )
+                except BaseException as error:
+                    switch_errors.append(error)
+
+            with patch(
+                "tm_sqlite_store._open_configured_connection",
+                held_connection,
+            ):
+                reader = threading.Thread(target=read_primary)
+                reader.start()
+                self.assertTrue(entered.wait(timeout=2))
+                switcher = threading.Thread(target=switch_primary)
+                switcher.start()
+                self.assertTrue(
+                    primary.coordinator.wait_for_state(
+                        "DRAINING",
+                        timeout_seconds=1.0,
+                    )
+                )
+
+                calls_before_rejection = len(opened_paths)
+                blocked_operations = (
+                    lambda: primary.exact_records("source"),
+                    lambda: primary.records_by_id(()),
+                    lambda: tuple(primary.export_records()),
+                    lambda: primary.append(_draft("source", "target")),
+                )
+                for operation in blocked_operations:
+                    with self.assertRaises(SQLiteStoreLifecycleError) as raised:
+                        _ = operation()
+                    self.assertEqual(
+                        raised.exception.code,
+                        "STORE.RESOURCE_DRAINING",
+                    )
+                    self.assertEqual(
+                        raised.exception.resource_id,
+                        "tm.primary",
+                    )
+                    self.assertTrue(raised.exception.retryable)
+                self.assertEqual(len(opened_paths), calls_before_rejection)
+                self.assertEqual(secondary.exact_records("source"), ())
+
+                release.set()
+                reader.join(timeout=2)
+                switcher.join(timeout=2)
+
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(switcher.is_alive())
+            self.assertEqual(reader_errors, [])
+            self.assertEqual(switch_errors, [])
+            self.assertEqual(switch_closed_observations, [True])
+            self.assertEqual(primary.coordinator.current_generation, 1)
+            self.assertEqual(secondary.coordinator.current_generation, 0)
+
+    def test_drain_timeout_keeps_prior_generation_and_recovers_ready_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = _stage(Path(temporary))
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            reader_errors: list[BaseException] = []
+
+            @contextmanager
+            def held_connection(
+                database_path: Path,
+                **kwargs: Any,
+            ) -> Iterator[sqlite3.Connection]:
+                with _open_configured_connection(
+                    database_path,
+                    **kwargs,
+                ) as connection:
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise RuntimeError("test did not release reader")
+                    yield connection
+
+            def read() -> None:
+                try:
+                    _ = store.exact_records("source")
+                except BaseException as error:
+                    reader_errors.append(error)
+
+            with patch(
+                "tm_sqlite_store._open_configured_connection",
+                held_connection,
+            ):
+                reader = threading.Thread(target=read)
+                reader.start()
+                self.assertTrue(entered.wait(timeout=2))
+                with self.assertRaises(SQLiteStoreLifecycleError) as raised:
+                    _ = store.coordinator._transition_generation(
+                        stage,
+                        canonical_store_id="store.primary",
+                        expected_prior_generation=0,
+                        timeout_seconds=0.01,
+                    )
+                self.assertEqual(raised.exception.code, "STORE.DRAIN_TIMEOUT")
+                self.assertEqual(raised.exception.generation, 0)
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(store.coordinator.current_generation, 0)
+                self.assertEqual(store.coordinator.state, "READY")
+                release.set()
+                reader.join(timeout=2)
+
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(reader_errors, [])
+            self.assertEqual(store.exact_records("source"), ())
+
+    def test_generation_switch_exposes_only_complete_old_or_new_version(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_stage = _stage(root, "tm.primary")
+            initialize_stage_schema(
+                old_stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                old_stage,
+                canonical_store_id="store.primary",
+            )
+            _ = store.append_batch(
+                batch_id="import.old",
+                kind="import",
+                drafts=(
+                    _draft("versioned", "old-first"),
+                    _draft("versioned", "old-winner"),
+                ),
+                source_digest="a" * 64,
+                source_path=(root / "old.jsonl").resolve(),
+            )
+
+            new_stage = MutableStageRef(
+                stage_id="stage.tm.primary.next",
+                resource_identity=old_stage.resource_identity,
+                staged_db_path=(root / ".tm.primary.next.sqlite3").resolve(),
+                manifest_temp_path=(root / ".tm.primary.next.manifest").resolve(),
+            )
+            initialize_stage_schema(
+                new_stage,
+                canonical_store_id="store.primary",
+            )
+            new_store = SQLiteTMStore(
+                new_stage,
+                canonical_store_id="store.primary",
+            )
+            _ = new_store.append_batch(
+                batch_id="import.new",
+                kind="import",
+                drafts=(
+                    _draft("versioned", "new-first"),
+                    _draft("versioned", "new-winner"),
+                ),
+                source_digest="b" * 64,
+                source_path=(root / "new.jsonl").resolve(),
+            )
+
+            observations: list[tuple[str, ...]] = []
+            stop = threading.Event()
+            saw_old = threading.Event()
+            reader_errors: list[BaseException] = []
+
+            def observe() -> None:
+                try:
+                    while not stop.is_set():
+                        try:
+                            observed = tuple(
+                                record.target_raw
+                                for record in store.exact_records("versioned")
+                            )
+                            observations.append(observed)
+                            if observed == ("old-winner", "old-first"):
+                                saw_old.set()
+                        except SQLiteStoreLifecycleError as error:
+                            if error.code != "STORE.RESOURCE_DRAINING":
+                                raise
+                except BaseException as error:
+                    reader_errors.append(error)
+
+            readers = tuple(threading.Thread(target=observe) for _ in range(4))
+            for reader in readers:
+                reader.start()
+            self.assertTrue(saw_old.wait(timeout=2))
+            self.assertEqual(
+                store.coordinator._transition_generation(
+                    new_stage,
+                    canonical_store_id="store.primary",
+                    expected_prior_generation=0,
+                    timeout_seconds=1.0,
+                ),
+                1,
+            )
+            for _ in range(20):
+                observations.append(
+                    tuple(
+                        record.target_raw
+                        for record in store.exact_records("versioned")
+                    )
+                )
+            stop.set()
+            for reader in readers:
+                reader.join(timeout=2)
+
+            self.assertTrue(all(not reader.is_alive() for reader in readers))
+            self.assertEqual(reader_errors, [])
+            self.assertIn(("old-winner", "old-first"), observations)
+            self.assertIn(("new-winner", "new-first"), observations)
+            self.assertEqual(
+                set(observations),
+                {
+                    ("old-winner", "old-first"),
+                    ("new-winner", "new-first"),
+                },
+            )
+
+    def test_busy_timeout_is_resource_local_and_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary_stage = _stage(root, "tm.primary")
+            secondary_stage = _stage(root, "tm.secondary")
+            initialize_stage_schema(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            initialize_stage_schema(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            primary = SQLiteTMStore(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            secondary = SQLiteTMStore(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            blocker = sqlite3.connect(
+                primary_stage.staged_db_path,
+                isolation_level=None,
+            )
+            try:
+                blocker.execute("PRAGMA journal_mode=DELETE")
+                blocker.execute("BEGIN EXCLUSIVE")
+                with patch("tm_sqlite_store.BUSY_TIMEOUT_MS", 25):
+                    with self.assertRaises(SQLiteStoreLifecycleError) as raised:
+                        _ = primary.append(_draft("locked", "not written"))
+                self.assertEqual(raised.exception.code, "STORE.BUSY_TIMEOUT")
+                self.assertEqual(raised.exception.resource_id, "tm.primary")
+                self.assertEqual(raised.exception.generation, 0)
+                self.assertTrue(raised.exception.retryable)
+
+                secondary_record = secondary.append(
+                    _draft("available", "written")
+                )
+                self.assertEqual(
+                    secondary.exact_records("available"),
+                    (secondary_record,),
+                )
+            finally:
+                blocker.rollback()
+                blocker.close()
+            self.assertEqual(primary.exact_records("locked"), ())
+
+
 class SQLiteSchemaTests(unittest.TestCase):
     def test_dangling_symlink_stage_never_creates_reserved_target(
         self,
