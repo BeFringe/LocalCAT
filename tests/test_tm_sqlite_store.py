@@ -12,6 +12,7 @@ from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
+import tm_sqlite_store
 from tm_contracts import (
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -28,6 +29,7 @@ from tm_sqlite_store import (
     SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
+    _SQLiteGenerationView,
     _schema_digest,
     _open_configured_connection,
     initialize_stage_schema,
@@ -73,6 +75,75 @@ def _draft(
 
 
 class SQLiteTMStoreTests(unittest.TestCase):
+    def test_canonical_revision_concurrent_append_is_one_complete_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = _stage(Path(temporary))
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            _ = store.append(_draft("seed", "seed target"))
+            original_read_meta = tm_sqlite_store._read_meta
+            original_revision = (
+                tm_sqlite_store._canonical_revision_from_connection
+            )
+            revision_meta_reads = 0
+            append_interleaved = False
+
+            def interleave_after_meta(
+                connection: sqlite3.Connection,
+            ) -> dict[str, str]:
+                nonlocal append_interleaved, revision_meta_reads
+                meta = original_read_meta(connection)
+                revision_meta_reads += 1
+                if (
+                    not append_interleaved
+                    and revision_meta_reads == 2
+                    and not connection.in_transaction
+                ):
+                    append_interleaved = True
+                    _ = store.append(_draft("concurrent", "new target"))
+                return meta
+
+            def interleave_after_snapshot(
+                connection: sqlite3.Connection,
+                lease: _SQLiteGenerationView,
+            ) -> tm_sqlite_store.CanonicalRevisionSnapshot:
+                nonlocal append_interleaved
+                revision = original_revision(connection, lease)
+                if not append_interleaved:
+                    append_interleaved = True
+                    _ = store.append(_draft("concurrent", "new target"))
+                return revision
+
+            with (
+                patch(
+                    "tm_sqlite_store._read_meta",
+                    side_effect=interleave_after_meta,
+                ),
+                patch(
+                    "tm_sqlite_store._canonical_revision_from_connection",
+                    side_effect=interleave_after_snapshot,
+                ),
+            ):
+                revision = store.canonical_revision()
+
+            self.assertIn(
+                (revision.head_revision, revision.record_count),
+                {(1, 1), (2, 2)},
+            )
+            self.assertEqual(
+                store.exact_records("concurrent")[0].target_raw,
+                "new target",
+            )
+            self.assertEqual(store.canonical_revision().head_revision, 2)
+
     def test_local_append_preserves_variants_and_raw_exact_winner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             stage = _stage(Path(temporary))
@@ -318,7 +389,8 @@ class SQLiteTMStoreTests(unittest.TestCase):
             try:
                 batch = connection.execute(
                     "SELECT kind, source_digest, source_path, status, "
-                    "valid_count, invalid_count, duplicate_source_count "
+                    "valid_count, invalid_count, duplicate_source_count, "
+                    "completed_revision "
                     "FROM tm_origin_batch WHERE batch_id = ?",
                     ("migration.batch-001",),
                 ).fetchone()
@@ -339,6 +411,7 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     "completed",
                     3,
                     2,
+                    1,
                     1,
                 ),
             )
@@ -1453,6 +1526,105 @@ class SQLiteTMStoreTests(unittest.TestCase):
             self.assertFalse(reader.is_alive())
             self.assertEqual(reader_errors, [])
             self.assertEqual(store.exact_records("source"), ())
+
+    def test_drain_window_tamper_rejects_next_generation_and_keeps_prior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prior_stage = _stage(root, "tm.primary")
+            initialize_stage_schema(
+                prior_stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                prior_stage,
+                canonical_store_id="store.primary",
+            )
+            prior_record = store.append(_draft("versioned", "prior"))
+            next_stage = MutableStageRef(
+                stage_id="stage.tm.primary.next",
+                resource_identity=prior_stage.resource_identity,
+                staged_db_path=(root / ".tm.primary.next.sqlite3").resolve(),
+                manifest_temp_path=(
+                    root / ".tm.primary.next.manifest.tmp"
+                ).resolve(),
+            )
+            initialize_stage_schema(
+                next_stage,
+                canonical_store_id="store.primary",
+            )
+            next_store = SQLiteTMStore(
+                next_stage,
+                canonical_store_id="store.primary",
+            )
+            _ = next_store.append(_draft("versioned", "next"))
+            lease_entered = threading.Event()
+            release_lease = threading.Event()
+            switch_errors: list[BaseException] = []
+
+            def hold_prior_lease() -> None:
+                with store.coordinator._operation_lease():
+                    lease_entered.set()
+                    if not release_lease.wait(timeout=2):
+                        raise RuntimeError("test did not release prior lease")
+
+            def switch_generation() -> None:
+                try:
+                    _ = store.coordinator._transition_generation(
+                        next_stage,
+                        canonical_store_id="store.primary",
+                        expected_prior_generation=0,
+                        timeout_seconds=1.0,
+                    )
+                except BaseException as error:
+                    switch_errors.append(error)
+
+            holder = threading.Thread(target=hold_prior_lease)
+            switcher = threading.Thread(target=switch_generation)
+            holder.start()
+            self.assertTrue(lease_entered.wait(timeout=2))
+            switcher.start()
+            self.assertTrue(
+                store.coordinator.wait_for_state(
+                    "DRAINING",
+                    timeout_seconds=1.0,
+                )
+            )
+            connection = sqlite3.connect(next_stage.staged_db_path)
+            try:
+                connection.execute(
+                    "UPDATE tm_meta SET value = 'store.tampered' "
+                    "WHERE key = 'canonical_store_id'"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            release_lease.set()
+            holder.join(timeout=2)
+            switcher.join(timeout=2)
+
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(switcher.is_alive())
+            self.assertEqual(len(switch_errors), 1)
+            self.assertIsInstance(
+                switch_errors[0],
+                SQLiteStoreLifecycleError,
+            )
+            lifecycle_error = cast(
+                SQLiteStoreLifecycleError,
+                switch_errors[0],
+            )
+            self.assertEqual(
+                lifecycle_error.code,
+                "STORE.NEXT_GENERATION_INVALID",
+            )
+            self.assertEqual(lifecycle_error.resource_id, "tm.primary")
+            self.assertEqual(lifecycle_error.generation, 0)
+            self.assertFalse(lifecycle_error.retryable)
+            self.assertEqual(store.coordinator.current_generation, 0)
+            self.assertEqual(store.coordinator.state, "READY")
+            self.assertEqual(store.exact_records("versioned"), (prior_record,))
 
     def test_generation_switch_exposes_only_complete_old_or_new_version(
         self,

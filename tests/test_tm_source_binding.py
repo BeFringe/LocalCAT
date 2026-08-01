@@ -5,9 +5,11 @@ import hashlib
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
+import tm_sqlite_store
 from tm_contracts import (
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -24,6 +26,7 @@ from tm_contracts import (
 from tm_sqlite_store import (
     SQLiteTMStore,
     SourceBindingMonitor,
+    _SQLiteGenerationView,
     initialize_stage_schema,
 )
 
@@ -116,6 +119,82 @@ def _prepared_store(
 
 
 class SourceBindingMonitorTests(unittest.TestCase):
+    def test_concurrent_append_during_observation_never_latches_divergence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, store, _binding, _jsonl, _manifest = _prepared_store(
+                Path(temporary)
+            )
+            original_read_meta = tm_sqlite_store._read_meta
+            original_read_facts = tm_sqlite_store._read_source_binding_facts
+            observing_thread = threading.get_ident()
+            append_interleaved = False
+            observation_meta_reads = 0
+
+            def interleave_after_meta(
+                connection: sqlite3.Connection,
+            ) -> dict[str, str]:
+                nonlocal append_interleaved, observation_meta_reads
+                meta = original_read_meta(connection)
+                if threading.get_ident() == observing_thread:
+                    observation_meta_reads += 1
+                if (
+                    threading.get_ident() == observing_thread
+                    and not append_interleaved
+                    and not connection.in_transaction
+                    and observation_meta_reads == 2
+                ):
+                    append_interleaved = True
+                    _ = store.append(_draft("concurrent", "canonical append"))
+                return meta
+
+            def interleave_after_snapshot(
+                connection: sqlite3.Connection,
+                lease: _SQLiteGenerationView,
+            ) -> object:
+                nonlocal append_interleaved
+                facts = original_read_facts(connection, lease)
+                if not append_interleaved:
+                    append_interleaved = True
+                    _ = store.append(_draft("concurrent", "canonical append"))
+                return facts
+
+            with (
+                patch(
+                    "tm_sqlite_store._read_meta",
+                    side_effect=interleave_after_meta,
+                ),
+                patch(
+                    "tm_sqlite_store._read_source_binding_facts",
+                    side_effect=interleave_after_snapshot,
+                ),
+            ):
+                observation = store.source_binding_monitor.observe()
+
+            self.assertIn(
+                observation.state,
+                {
+                    SourceBindingState.VERIFIED_CURRENT,
+                    SourceBindingState.VERIFIED_HISTORY,
+                },
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_HISTORY,
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM tm_meta "
+                        "WHERE key = 'divergence_latched'"
+                    ).fetchone(),
+                    ("0",),
+                )
+            finally:
+                connection.close()
+
     def test_completed_binding_is_current_then_append_makes_history_only(
         self,
     ) -> None:
@@ -283,6 +362,63 @@ class SourceBindingMonitorTests(unittest.TestCase):
                         observation.state,
                         SourceBindingState.SOURCE_DIVERGED,
                     )
+
+    def test_historical_receipt_count_must_match_its_exact_revision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, store, binding, _jsonl, _manifest = _prepared_store(
+                Path(temporary)
+            )
+            _ = store.append(_draft("second", "second target"))
+            forged_jsonl = (
+                b'{"source":"seed","target":"seed target"}\n'
+                b'{"source":"second","target":"second target"}\n'
+            )
+            forged_receipt = replace(
+                binding.receipt,
+                exported_revision=1,
+                record_count=2,
+                jsonl_digest=hashlib.sha256(forged_jsonl).hexdigest(),
+            )
+            forged_manifest = SnapshotManifest(
+                manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                snapshot_kind=binding.snapshot_kind,
+                receipt=forged_receipt,
+                receipt_digest=snapshot_receipt_digest(forged_receipt),
+            )
+            binding.configured_jsonl_path.write_bytes(forged_jsonl)
+            binding.manifest_path.write_text(
+                contract_to_json(forged_manifest),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute(
+                    "UPDATE tm_snapshot_receipt "
+                    "SET exported_revision = ?, record_count = ?, "
+                    "jsonl_digest = ? WHERE snapshot_id = ?",
+                    (
+                        forged_receipt.exported_revision,
+                        forged_receipt.record_count,
+                        forged_receipt.jsonl_digest,
+                        forged_receipt.snapshot_id,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            observation = store.source_binding_monitor.observe()
+
+            self.assertEqual(
+                observation.state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            self.assertIn(
+                "SOURCE_BINDING.ANCESTRY_INVALID",
+                observation.diagnostic_codes,
+            )
 
     def test_diverged_store_remains_canonical_and_append_cannot_clear_latch(
         self,

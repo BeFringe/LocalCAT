@@ -42,7 +42,7 @@ from tm_contracts import (
 )
 
 
-TM_SCHEMA_VERSION = 1
+TM_SCHEMA_VERSION = 2
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
 CANDIDATE_INDEX_VERSION = "candidate-index-v1"
 BUSY_TIMEOUT_MS = 5000
@@ -81,8 +81,8 @@ _FTS5_SHADOW_TABLES = frozenset(
     }
 )
 _APPROVED_SCHEMA_DIGESTS = {
-    False: "725b94300abd64b5c06824ecb63357e2f737111e9fbd42094796183b924532a7",
-    True: "8d093e3e7db360c2b8510ef524ca05170c187a9a2dd4c1f7326dec0a7df89da6",
+    False: "d807116c449da67b6186a64c500def04923eaecc9eed8edf47aa9cebeac3d751",
+    True: "a8925fe918c9394684eeb61b74052719480f7259cf2fa2ad3322704db21c5b1d",
 }
 _REQUIRED_META_KEYS = frozenset(
     {
@@ -127,6 +127,7 @@ _SCHEMA_STATEMENTS = (
         invalid_count INTEGER NOT NULL CHECK(invalid_count >= 0),
         duplicate_source_count INTEGER NOT NULL
             CHECK(duplicate_source_count >= 0),
+        completed_revision INTEGER UNIQUE,
         created_at TEXT NOT NULL CHECK(length(created_at) > 0),
         CHECK(
             (
@@ -141,6 +142,18 @@ _SCHEMA_STATEMENTS = (
                 AND length(source_digest) = 64
                 AND source_path IS NOT NULL
                 AND length(source_path) > 0
+            )
+        ),
+        CHECK(
+            (
+                status = 'completed'
+                AND completed_revision IS NOT NULL
+                AND completed_revision >= 1
+            )
+            OR
+            (
+                status IN ('staged', 'failed')
+                AND completed_revision IS NULL
             )
         ),
         UNIQUE(kind, source_digest)
@@ -554,6 +567,20 @@ class ResourceStoreCoordinator:
                 self._condition.wait(remaining)
             self._state = "ACTIVATING"
             self._condition.notify_all()
+            try:
+                _validate_next_generation_stage(
+                    next_stage,
+                    canonical_store_id=canonical_store_id,
+                )
+            except Exception as error:
+                self._state = "READY"
+                self._condition.notify_all()
+                raise SQLiteStoreLifecycleError(
+                    "STORE.NEXT_GENERATION_INVALID",
+                    resource_id=self._resource_id,
+                    generation=current_view.generation,
+                    retryable=False,
+                ) from error
             next_generation = current_view.generation + 1
             self._view = _SQLiteGenerationView(
                 stage=next_stage,
@@ -577,51 +604,62 @@ class SourceBindingMonitor:
         """Derive and latch source divergence in one generation lease."""
 
         with self._coordinator._operation_lease() as lease:
-            with _open_leased_connection(lease) as connection:
-                facts = _read_source_binding_facts(connection, lease)
-            diagnostics = list(facts.diagnostic_codes)
-            binding = facts.binding
-            if facts.divergence_latched:
-                diagnostics.append("SOURCE_BINDING.DIVERGENCE_LATCHED")
-            elif binding is None:
-                diagnostics.append("SOURCE_BINDING.LEDGER_MISSING")
-            else:
-                diagnostics.extend(
-                    _configured_pair_diagnostics(
-                        binding,
-                        identity=lease.stage.resource_identity,
-                        canonical_store_id=lease.canonical_store_id,
-                        head_revision=facts.head_revision,
-                        record_count=facts.record_count,
+            while True:
+                with _open_leased_connection(lease) as connection:
+                    facts = _read_source_binding_facts(connection, lease)
+                diagnostics = list(facts.diagnostic_codes)
+                binding = facts.binding
+                if facts.divergence_latched:
+                    diagnostics.append("SOURCE_BINDING.DIVERGENCE_LATCHED")
+                elif binding is None:
+                    diagnostics.append("SOURCE_BINDING.LEDGER_MISSING")
+                else:
+                    diagnostics.extend(
+                        _configured_pair_diagnostics(
+                            binding,
+                            identity=lease.stage.resource_identity,
+                            canonical_store_id=lease.canonical_store_id,
+                            head_revision=facts.head_revision,
+                            cumulative_record_counts=(
+                                facts.cumulative_record_counts
+                            ),
+                        )
                     )
-                )
 
-            diagnostic_codes = tuple(sorted(set(diagnostics)))
-            if diagnostic_codes:
-                if not facts.divergence_latched:
-                    _latch_source_divergence(lease)
-                state = SourceBindingState.SOURCE_DIVERGED
-            else:
-                assert binding is not None
-                state = (
-                    SourceBindingState.VERIFIED_CURRENT
-                    if binding.receipt.exported_revision
-                    == facts.head_revision
-                    else SourceBindingState.VERIFIED_HISTORY
+                diagnostic_codes = tuple(sorted(set(diagnostics)))
+                if diagnostic_codes:
+                    if (
+                        not facts.divergence_latched
+                        and not _latch_source_divergence(
+                            lease,
+                            expected_fingerprint=(
+                                facts.canonical_fingerprint
+                            ),
+                        )
+                    ):
+                        continue
+                    state = SourceBindingState.SOURCE_DIVERGED
+                else:
+                    assert binding is not None
+                    state = (
+                        SourceBindingState.VERIFIED_CURRENT
+                        if binding.receipt.exported_revision
+                        == facts.head_revision
+                        else SourceBindingState.VERIFIED_HISTORY
+                    )
+                return SourceBindingObservation(
+                    resource_id=lease.stage.resource_identity.resource_id,
+                    canonical_store_id=lease.canonical_store_id,
+                    generation=lease.generation,
+                    head_revision=facts.head_revision,
+                    state=state,
+                    binding_digest=(
+                        None
+                        if binding is None
+                        else _snapshot_binding_digest(binding)
+                    ),
+                    diagnostic_codes=diagnostic_codes,
                 )
-            return SourceBindingObservation(
-                resource_id=lease.stage.resource_identity.resource_id,
-                canonical_store_id=lease.canonical_store_id,
-                generation=lease.generation,
-                head_revision=facts.head_revision,
-                state=state,
-                binding_digest=(
-                    None
-                    if binding is None
-                    else _snapshot_binding_digest(binding)
-                ),
-                diagnostic_codes=diagnostic_codes,
-            )
 
     def register_completed_binding(self, binding: SnapshotBinding) -> None:
         """Register a pair already published and validated by its owner.
@@ -643,7 +681,12 @@ class SourceBindingMonitor:
                 identity=identity,
                 canonical_store_id=lease.canonical_store_id,
                 head_revision=private_binding.receipt.exported_revision,
-                record_count=private_binding.receipt.record_count,
+                cumulative_record_counts=(
+                    (
+                        private_binding.receipt.exported_revision,
+                        private_binding.receipt.record_count,
+                    ),
+                ),
             )
             if pair_diagnostics:
                 if any(code.endswith("_MISSING") for code in pair_diagnostics):
@@ -725,36 +768,109 @@ class SourceBindingMonitor:
                     raise
 
 
+def _validate_next_generation_stage(
+    stage: MutableStageRef,
+    *,
+    canonical_store_id: str,
+) -> None:
+    """Reopen and fully validate a drained transition target in rw mode."""
+
+    snapshot = inspect_stage_schema(
+        stage,
+        canonical_store_id=canonical_store_id,
+        _allow_diverged_runtime=True,
+    )
+    lease = _SQLiteGenerationView(
+        stage=stage,
+        canonical_store_id=canonical_store_id,
+        generation=snapshot.generation,
+    )
+    with _open_configured_connection(
+        stage.staged_db_path,
+        require_existing=True,
+    ) as connection:
+        identity = stage.resource_identity
+        _validate_store_identity(
+            connection,
+            resource_id=identity.resource_id,
+            canonical_store_id=canonical_store_id,
+            target_identity=identity.target_identity,
+        )
+        integrity_rows = connection.execute(
+            "PRAGMA integrity_check"
+        ).fetchall()
+        if integrity_rows != [("ok",)]:
+            raise SQLiteStoreSchemaError("STORE.INTEGRITY_CHECK_FAILED")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise SQLiteStoreSchemaError("STORE.FOREIGN_KEY_CHECK_FAILED")
+        revision = _canonical_revision_from_connection(connection, lease)
+        if (
+            revision.head_revision != snapshot.head_revision
+            or revision.record_count != _table_count(connection, "tm_record")
+        ):
+            raise SQLiteStoreSchemaError("STORE.NEXT_GENERATION_UNHEALTHY")
+
+
 @dataclass(frozen=True)
 class _SourceBindingFacts:
     head_revision: int
     record_count: int
+    cumulative_record_counts: tuple[tuple[int, int], ...]
     divergence_latched: bool
     binding: SnapshotBinding | None
     diagnostic_codes: tuple[str, ...]
+    canonical_fingerprint: str
 
 
 def _read_source_binding_facts(
     connection: sqlite3.Connection,
     lease: _SQLiteGenerationView,
 ) -> _SourceBindingFacts:
+    if connection.in_transaction:
+        raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_NESTED")
+    connection.execute("BEGIN")
+    try:
+        facts = _read_source_binding_facts_in_transaction(connection, lease)
+        connection.commit()
+        return facts
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _read_source_binding_facts_in_transaction(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> _SourceBindingFacts:
+    if not connection.in_transaction:
+        raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_MISSING")
     identity = lease.stage.resource_identity
-    _validate_store_identity(
-        connection,
-        resource_id=identity.resource_id,
-        canonical_store_id=lease.canonical_store_id,
-        target_identity=identity.target_identity,
-    )
     meta = _read_meta(connection)
+    if (
+        meta["resource_id"] != identity.resource_id
+        or meta["canonical_store_id"] != lease.canonical_store_id
+        or meta["target_identity"] != identity.target_identity
+    ):
+        raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
     head_revision = _meta_int(meta, "head_revision")
     record_count = _table_count(connection, "tm_record")
-    completed_batches = connection.execute(
-        "SELECT COUNT(*) FROM tm_origin_batch WHERE status = 'completed'"
-    ).fetchone()
+    ancestry_rows = connection.execute(
+        "SELECT b.batch_id, b.status, b.completed_revision, "
+        "b.valid_count, COUNT(r.record_id) "
+        "FROM tm_origin_batch AS b "
+        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
+        "GROUP BY b.batch_id, b.status, b.completed_revision, b.valid_count "
+        "ORDER BY b.batch_id"
+    ).fetchall()
     diagnostics: list[str] = []
-    if completed_batches is None or type(completed_batches[0]) is not int:
-        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
-    elif completed_batches[0] != head_revision:
+    cumulative_record_counts: tuple[tuple[int, int], ...] = ()
+    try:
+        cumulative_record_counts = _validate_revision_ancestry_rows(
+            ancestry_rows,
+            head_revision=head_revision,
+            record_count=record_count,
+        )
+    except SQLiteStoreSchemaError:
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
     rows = connection.execute(
@@ -785,13 +901,81 @@ def _read_source_binding_facts(
                 or rows[0][12] != rows[0][1]
             ):
                 diagnostics.append("SOURCE_BINDING.LEDGER_PATH_MISMATCH")
+    fingerprint_payload = {
+        "meta": tuple(sorted(meta.items())),
+        "record_count": record_count,
+        "ancestry_rows": ancestry_rows,
+        "ledger_rows": rows,
+    }
+    canonical_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return _SourceBindingFacts(
         head_revision=head_revision,
         record_count=record_count,
+        cumulative_record_counts=cumulative_record_counts,
         divergence_latched=_meta_bool(meta, "divergence_latched"),
         binding=binding,
         diagnostic_codes=tuple(sorted(set(diagnostics))),
+        canonical_fingerprint=canonical_fingerprint,
     )
+
+
+def _validate_revision_ancestry_rows(
+    rows: list[tuple[object, ...]],
+    *,
+    head_revision: int,
+    record_count: int,
+) -> tuple[tuple[int, int], ...]:
+    completed: list[tuple[int, int]] = []
+    completed_record_count = 0
+    for row in rows:
+        if len(row) != 5:
+            raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+        batch_id, status, completed_revision, valid_count, batch_record_count = row
+        if (
+            type(batch_id) is not str
+            or type(status) is not str
+            or type(valid_count) is not int
+            or type(batch_record_count) is not int
+            or valid_count < 0
+            or batch_record_count < 0
+        ):
+            raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+        if status == "completed":
+            if (
+                type(completed_revision) is not int
+                or completed_revision < 1
+                or valid_count != batch_record_count
+            ):
+                raise SQLiteStoreSchemaError(
+                    "STORE.REVISION_ANCESTRY_MISMATCH"
+                )
+            completed.append((completed_revision, valid_count))
+            completed_record_count += batch_record_count
+        elif (
+            status not in {"staged", "failed"}
+            or completed_revision is not None
+            or batch_record_count != 0
+        ):
+            raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    completed.sort()
+    if (
+        tuple(revision for revision, _count in completed)
+        != tuple(range(1, head_revision + 1))
+        or completed_record_count != record_count
+    ):
+        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    cumulative = 0
+    result: list[tuple[int, int]] = []
+    for revision, batch_count in completed:
+        cumulative += batch_count
+        result.append((revision, cumulative))
+    return tuple(result)
 
 
 def _binding_from_ledger_row(row: tuple[object, ...]) -> SnapshotBinding:
@@ -853,7 +1037,7 @@ def _configured_pair_diagnostics(
     identity: CanonicalResourceIdentity,
     canonical_store_id: str,
     head_revision: int,
-    record_count: int,
+    cumulative_record_counts: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
     diagnostics: list[str] = []
     try:
@@ -872,11 +1056,14 @@ def _configured_pair_diagnostics(
         or receipt.exported_revision > head_revision
     ):
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
-    if receipt.record_count > record_count:
-        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    record_count_at_revision = {0: 0}
+    record_count_at_revision.update(cumulative_record_counts)
+    expected_record_count = record_count_at_revision.get(
+        receipt.exported_revision
+    )
     if (
-        receipt.exported_revision == head_revision
-        and receipt.record_count != record_count
+        expected_record_count is None
+        or receipt.record_count != expected_record_count
     ):
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
@@ -989,17 +1176,24 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _latch_source_divergence(lease: _SQLiteGenerationView) -> None:
-    identity = lease.stage.resource_identity
+def _latch_source_divergence(
+    lease: _SQLiteGenerationView,
+    *,
+    expected_fingerprint: str,
+) -> bool:
     with _open_leased_connection(lease) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            _validate_store_identity(
+            current_facts = _read_source_binding_facts_in_transaction(
                 connection,
-                resource_id=identity.resource_id,
-                canonical_store_id=lease.canonical_store_id,
-                target_identity=identity.target_identity,
+                lease,
             )
+            if (
+                current_facts.canonical_fingerprint
+                != expected_fingerprint
+            ):
+                connection.rollback()
+                return False
             updated = connection.execute(
                 "UPDATE tm_meta SET value = '1' "
                 "WHERE key = 'divergence_latched'"
@@ -1009,6 +1203,7 @@ def _latch_source_divergence(lease: _SQLiteGenerationView) -> None:
                     "STORE.DIVERGENCE_LATCH_MISSING"
                 )
             connection.commit()
+            return True
         except Exception:
             connection.rollback()
             raise
@@ -1185,11 +1380,17 @@ class SQLiteTMStore:
                         lease.stage.resource_identity.target_identity
                     ),
                 )
+                prior_head_revision = _meta_int(
+                    _read_meta(connection),
+                    "head_revision",
+                )
+                completed_revision = prior_head_revision + 1
                 connection.execute(
                     "INSERT INTO tm_origin_batch("
                     "batch_id, kind, source_digest, source_path, status, "
                     "valid_count, invalid_count, duplicate_source_count, "
-                    "created_at) VALUES (?, ?, ?, ?, 'staged', ?, ?, ?, ?)",
+                    "completed_revision, created_at) "
+                    "VALUES (?, ?, ?, ?, 'staged', ?, ?, ?, NULL, ?)",
                     (
                         prepared_batch_id,
                         prepared_kind,
@@ -1266,14 +1467,20 @@ class SQLiteTMStore:
                         for draft in prepared_drafts
                     },
                 )
-                connection.execute(
-                    "UPDATE tm_origin_batch SET status = 'completed' "
+                completed_batch = connection.execute(
+                    "UPDATE tm_origin_batch "
+                    "SET status = 'completed', completed_revision = ? "
                     "WHERE batch_id = ?",
-                    (prepared_batch_id,),
+                    (completed_revision, prepared_batch_id),
                 )
+                if completed_batch.rowcount != 1:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.BATCH_COMPLETION_MISSING"
+                    )
                 updated = connection.execute(
-                    "UPDATE tm_meta SET value = CAST(value AS INTEGER) + 1 "
-                    "WHERE key = 'head_revision'"
+                    "UPDATE tm_meta SET value = ? "
+                    "WHERE key = 'head_revision' AND value = ?",
+                    (str(completed_revision), str(prior_head_revision)),
                 )
                 if updated.rowcount != 1:
                     raise SQLiteStoreSchemaError(
@@ -1365,6 +1572,26 @@ def _canonical_revision_from_connection(
     connection: sqlite3.Connection,
     lease: _SQLiteGenerationView,
 ) -> CanonicalRevisionSnapshot:
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN")
+    try:
+        revision = _canonical_revision_from_transaction(connection, lease)
+        if owns_transaction:
+            connection.commit()
+        return revision
+    except Exception:
+        if owns_transaction:
+            connection.rollback()
+        raise
+
+
+def _canonical_revision_from_transaction(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> CanonicalRevisionSnapshot:
+    if not connection.in_transaction:
+        raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_MISSING")
     identity = lease.stage.resource_identity
     _validate_store_identity(
         connection,
@@ -1374,21 +1601,26 @@ def _canonical_revision_from_connection(
     )
     meta = _read_meta(connection)
     head_revision = _meta_int(meta, "head_revision")
-    completed_count = connection.execute(
-        "SELECT COUNT(*) FROM tm_origin_batch WHERE status = 'completed'"
-    ).fetchone()
-    if (
-        completed_count is None
-        or type(completed_count[0]) is not int
-        or completed_count[0] != head_revision
-    ):
-        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    record_count = _table_count(connection, "tm_record")
+    ancestry_rows = connection.execute(
+        "SELECT b.batch_id, b.status, b.completed_revision, "
+        "b.valid_count, COUNT(r.record_id) "
+        "FROM tm_origin_batch AS b "
+        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
+        "GROUP BY b.batch_id, b.status, b.completed_revision, b.valid_count "
+        "ORDER BY b.batch_id"
+    ).fetchall()
+    _ = _validate_revision_ancestry_rows(
+        ancestry_rows,
+        head_revision=head_revision,
+        record_count=record_count,
+    )
     return CanonicalRevisionSnapshot(
         resource_id=identity.resource_id,
         canonical_store_id=lease.canonical_store_id,
         generation=lease.generation,
         head_revision=head_revision,
-        record_count=_table_count(connection, "tm_record"),
+        record_count=record_count,
     )
 
 
@@ -1856,13 +2088,14 @@ def _open_configured_connection(
     database_path: Path,
     *,
     expected_file: _ReservedStageFile | None = None,
+    require_existing: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     """Open one short, thread-local connection under the fixed policy."""
 
     _require_absolute_path(database_path, "database_path")
     database: str | Path = database_path
     uri = False
-    if expected_file is not None:
+    if expected_file is not None or require_existing:
         database = f"{database_path.as_uri()}?mode=rw"
         uri = True
     connection = sqlite3.connect(
@@ -2001,7 +2234,8 @@ def inspect_stage_schema(
     if not validated_stage.staged_db_path.is_file():
         raise SQLiteStoreSchemaError("STORE.DATABASE_MISSING")
     with _open_configured_connection(
-        validated_stage.staged_db_path
+        validated_stage.staged_db_path,
+        require_existing=True,
     ) as connection:
         meta = _read_meta(connection)
         schema_version = _meta_int(meta, "schema_version")
