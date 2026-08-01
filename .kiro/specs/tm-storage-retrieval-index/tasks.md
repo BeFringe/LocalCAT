@@ -98,7 +98,7 @@
   - 完成时，并发读写、busy timeout、drain timeout 和 generation 变化测试都只观察到一个完整版本
   - _Requirements: 2.10, 7.4, 7.5, 7.6, 7.7_
 
-- [ ] 3.4 实现 canonical revision、snapshot ledger 与来源状态机
+- [x] 3.4 实现 canonical revision、snapshot ledger 与来源状态机
   - 绑定配置 JSONL 路径、deterministic adjacent sidecar、manifest、snapshot receipt、canonical store identity 和 ancestry
   - canonical 正常写入只推进 revision 并形成 VERIFIED_HISTORY，不修改 snapshot、不触发或清除 divergence
   - identity、digest、manifest、ledger 或 ancestry 不一致时报告 SOURCE_DIVERGED，保持 last-known-good canonical 为读写权威
@@ -365,3 +365,4 @@
 - 2026-08-01 / Task 3.1：从旧会话未跟踪成果恢复并独立复审 per-resource SQLite schema 与安全连接策略；mutable stage 使用原子保留文件、严格身份/批准 schema digest/对象类型/索引/外键复核，固定 DELETE journal、FULL synchronous、foreign keys、5000 ms busy timeout，关闭 WAL 与扩展加载，并冻结 SQLite 3.51.2、FTS5、Unicode 16.0.0 运行时能力快照。独立复审通过；focused 17/17、全量 259/259（含 Qt smoke）、basedpyright error-level 0 errors。
 - 2026-08-01 / Task 3.2：实现 raw exact winner、完整变体/上下文/provenance 历史以及 migration、local_write、import 的按序事务化追加；candidate 扩展先在事务外生成封闭计划，再由 store 在 origin/record/status/revision 同一事务内写入，真实 SQL、commit 与扩展失败均整体回滚。复审反复暴露的共同根因收束为 caller-owned 值闭包：所有 scalar/nested value 在 fold/hash/compare/connection 前做 exact-type 校验并复制，长期 store handle 重建私有 identity/stage/path 快照而不保留调用方引用；该经验已并入评审集群 v1。最终独立复审与定点复验通过；focused 35/35、全量 277/277（含 Qt smoke）、basedpyright error-level 0 errors。
 - 2026-08-01 / Task 3.3：新增 per-resource `ResourceStoreCoordinator`，所有公开读写在打开线程内短连接前取得绑定 resource、generation 与私有 stage 快照的 operation lease；状态机在 DRAINING 后拒发新 lease，有界排空超时恢复 prior generation，旧连接关闭后才发布完整新 generation。SQLite busy/locked 归一为当前资源的可重试 lifecycle failure，另一资源保持可用；未提前实现 sealed activation、source binding 或 candidate retrieval。集群实现阶段机械验证通过；focused 39/39、全量 281/281（含 Qt smoke）、basedpyright error-level 0 errors，等待 Task 3.4 后执行 Cluster A 统一复审。
+- 2026-08-01 / Task 3.4：实现 leased canonical revision、completed snapshot ledger 与 `SourceBindingMonitor`；严格核对 configured JSONL、deterministic manifest、receipt、resource/canonical identity、digest、record count 和 revision ancestry。正常 local/import append 只推进 canonical revision 并把 CURRENT 变为 HISTORY，不改双文件；任一外部或 ledger 错配锁存 DIVERGED，canonical exact/append 继续权威且修回文件或重开不会隐式清除。completed-binding seam 只登记已发布且与当前 revision 闭合的 pair，不实现 issued/temp/fsync/replace/recovery/clear。集群实现阶段机械验证通过；source/store focused 47/47、全量 289/289（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster A 统一复审。

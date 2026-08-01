@@ -15,6 +15,7 @@ import sqlite3
 import stat
 import threading
 import time
+from typing import cast
 import unicodedata
 import uuid
 
@@ -25,10 +26,19 @@ from text_matcher import (
 )
 from tm_contracts import (
     SCORER_VERSION_V1,
+    SNAPSHOT_MANIFEST_VERSION,
     CanonicalResourceIdentity,
     MutableStageRef,
+    SnapshotBinding,
+    SnapshotKind,
+    SnapshotManifest,
+    SnapshotReceipt,
+    SourceBindingState,
     TMRecord,
     TMRecordDraft,
+    contract_from_json,
+    contract_to_json,
+    snapshot_receipt_digest,
 )
 
 
@@ -342,6 +352,30 @@ class _SQLiteGenerationView:
     generation: int
 
 
+@dataclass(frozen=True)
+class CanonicalRevisionSnapshot:
+    """One leased observation of a canonical revision and its ancestry."""
+
+    resource_id: str
+    canonical_store_id: str
+    generation: int
+    head_revision: int
+    record_count: int
+
+
+@dataclass(frozen=True)
+class SourceBindingObservation:
+    """Safe source-binding state derived from one canonical generation."""
+
+    resource_id: str
+    canonical_store_id: str
+    generation: int
+    head_revision: int
+    state: SourceBindingState
+    binding_digest: str | None
+    diagnostic_codes: tuple[str, ...]
+
+
 class ResourceStoreCoordinator:
     """Own one resource's operation leases and active generation view."""
 
@@ -359,6 +393,7 @@ class ResourceStoreCoordinator:
         snapshot = inspect_stage_schema(
             private_stage,
             canonical_store_id=canonical_store_id,
+            _allow_diverged_runtime=True,
         )
         self._resource_id = private_stage.resource_identity.resource_id
         self._target_identity = (
@@ -530,6 +565,455 @@ class ResourceStoreCoordinator:
             return next_generation
 
 
+class SourceBindingMonitor:
+    """Observe one configured snapshot without publishing either file."""
+
+    def __init__(self, coordinator: ResourceStoreCoordinator) -> None:
+        if type(coordinator) is not ResourceStoreCoordinator:
+            raise TypeError("coordinator must be ResourceStoreCoordinator")
+        self._coordinator = coordinator
+
+    def observe(self) -> SourceBindingObservation:
+        """Derive and latch source divergence in one generation lease."""
+
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                facts = _read_source_binding_facts(connection, lease)
+            diagnostics = list(facts.diagnostic_codes)
+            binding = facts.binding
+            if facts.divergence_latched:
+                diagnostics.append("SOURCE_BINDING.DIVERGENCE_LATCHED")
+            elif binding is None:
+                diagnostics.append("SOURCE_BINDING.LEDGER_MISSING")
+            else:
+                diagnostics.extend(
+                    _configured_pair_diagnostics(
+                        binding,
+                        identity=lease.stage.resource_identity,
+                        canonical_store_id=lease.canonical_store_id,
+                        head_revision=facts.head_revision,
+                        record_count=facts.record_count,
+                    )
+                )
+
+            diagnostic_codes = tuple(sorted(set(diagnostics)))
+            if diagnostic_codes:
+                if not facts.divergence_latched:
+                    _latch_source_divergence(lease)
+                state = SourceBindingState.SOURCE_DIVERGED
+            else:
+                assert binding is not None
+                state = (
+                    SourceBindingState.VERIFIED_CURRENT
+                    if binding.receipt.exported_revision
+                    == facts.head_revision
+                    else SourceBindingState.VERIFIED_HISTORY
+                )
+            return SourceBindingObservation(
+                resource_id=lease.stage.resource_identity.resource_id,
+                canonical_store_id=lease.canonical_store_id,
+                generation=lease.generation,
+                head_revision=facts.head_revision,
+                state=state,
+                binding_digest=(
+                    None
+                    if binding is None
+                    else _snapshot_binding_digest(binding)
+                ),
+                diagnostic_codes=diagnostic_codes,
+            )
+
+    def register_completed_binding(self, binding: SnapshotBinding) -> None:
+        """Register a pair already published and validated by its owner.
+
+        This deliberately has no issued receipt, file creation, replace,
+        fsync, recovery, rebinding, or divergence-clearing behavior.
+        """
+
+        private_binding = _snapshot_completed_binding(binding)
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            _validate_binding_identity(
+                private_binding,
+                identity=identity,
+                canonical_store_id=lease.canonical_store_id,
+            )
+            pair_diagnostics = _configured_pair_diagnostics(
+                private_binding,
+                identity=identity,
+                canonical_store_id=lease.canonical_store_id,
+                head_revision=private_binding.receipt.exported_revision,
+                record_count=private_binding.receipt.record_count,
+            )
+            if pair_diagnostics:
+                if any(code.endswith("_MISSING") for code in pair_diagnostics):
+                    raise FileNotFoundError("completed snapshot pair is missing")
+                raise ValueError("completed snapshot pair does not match binding")
+
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    revision = _canonical_revision_from_connection(
+                        connection,
+                        lease,
+                    )
+                    receipt = private_binding.receipt
+                    if (
+                        receipt.exported_revision != revision.head_revision
+                        or receipt.record_count != revision.record_count
+                    ):
+                        raise ValueError(
+                            "completed binding must describe current revision"
+                        )
+                    existing = connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_binding"
+                    ).fetchone()
+                    if existing is None or type(existing[0]) is not int:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.SNAPSHOT_LEDGER_CORRUPT"
+                        )
+                    if existing[0] != 0:
+                        raise ValueError(
+                            "completed snapshot binding is already registered"
+                        )
+                    if _meta_bool(_read_meta(connection), "divergence_latched"):
+                        raise ValueError(
+                            "diverged source binding cannot be registered"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_receipt("
+                        "snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)",
+                        (
+                            receipt.snapshot_id,
+                            receipt.resource_id,
+                            receipt.canonical_store_id,
+                            receipt.exported_revision,
+                            receipt.jsonl_digest,
+                            receipt.record_count,
+                            receipt.format_version,
+                            Path.__str__(private_binding.configured_jsonl_path),
+                            Path.__str__(private_binding.manifest_path),
+                            datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, ?, ?, ?)",
+                        (
+                            Path.__str__(private_binding.configured_jsonl_path),
+                            Path.__str__(private_binding.manifest_path),
+                            private_binding.snapshot_kind.value,
+                            receipt.snapshot_id,
+                            private_binding.binding_version,
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+
+@dataclass(frozen=True)
+class _SourceBindingFacts:
+    head_revision: int
+    record_count: int
+    divergence_latched: bool
+    binding: SnapshotBinding | None
+    diagnostic_codes: tuple[str, ...]
+
+
+def _read_source_binding_facts(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> _SourceBindingFacts:
+    identity = lease.stage.resource_identity
+    _validate_store_identity(
+        connection,
+        resource_id=identity.resource_id,
+        canonical_store_id=lease.canonical_store_id,
+        target_identity=identity.target_identity,
+    )
+    meta = _read_meta(connection)
+    head_revision = _meta_int(meta, "head_revision")
+    record_count = _table_count(connection, "tm_record")
+    completed_batches = connection.execute(
+        "SELECT COUNT(*) FROM tm_origin_batch WHERE status = 'completed'"
+    ).fetchone()
+    diagnostics: list[str] = []
+    if completed_batches is None or type(completed_batches[0]) is not int:
+        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    elif completed_batches[0] != head_revision:
+        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+
+    rows = connection.execute(
+        "SELECT b.configured_jsonl_path, b.manifest_path, "
+        "b.snapshot_kind, b.binding_version, "
+        "r.snapshot_id, r.resource_id, r.canonical_store_id, "
+        "r.exported_revision, r.jsonl_digest, r.record_count, "
+        "r.format_version, r.destination_jsonl_path, "
+        "r.destination_manifest_path, r.status "
+        "FROM tm_snapshot_binding AS b "
+        "LEFT JOIN tm_snapshot_receipt AS r "
+        "ON r.snapshot_id = b.snapshot_id "
+        "WHERE b.binding_id = 1"
+    ).fetchall()
+    binding: SnapshotBinding | None = None
+    if len(rows) > 1:
+        diagnostics.append("SOURCE_BINDING.LEDGER_INVALID")
+    elif len(rows) == 1:
+        try:
+            binding = _binding_from_ledger_row(rows[0])
+        except (TypeError, ValueError):
+            diagnostics.append("SOURCE_BINDING.LEDGER_INVALID")
+        else:
+            if rows[0][13] != "completed":
+                diagnostics.append("SOURCE_BINDING.LEDGER_NOT_COMPLETED")
+            if (
+                rows[0][11] != rows[0][0]
+                or rows[0][12] != rows[0][1]
+            ):
+                diagnostics.append("SOURCE_BINDING.LEDGER_PATH_MISMATCH")
+    return _SourceBindingFacts(
+        head_revision=head_revision,
+        record_count=record_count,
+        divergence_latched=_meta_bool(meta, "divergence_latched"),
+        binding=binding,
+        diagnostic_codes=tuple(sorted(set(diagnostics))),
+    )
+
+
+def _binding_from_ledger_row(row: tuple[object, ...]) -> SnapshotBinding:
+    if len(row) != 14:
+        raise ValueError("snapshot ledger row is invalid")
+    string_indexes = tuple(range(0, 7)) + (8, 10, 11, 12, 13)
+    if any(type(row[index]) is not str for index in string_indexes):
+        raise TypeError("snapshot ledger string is invalid")
+    if type(row[7]) is not int or type(row[9]) is not int:
+        raise TypeError("snapshot ledger integer is invalid")
+    values = cast(
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            int,
+            str,
+            int,
+            str,
+            str,
+            str,
+            str,
+        ],
+        row,
+    )
+    receipt = SnapshotReceipt(
+        snapshot_id=values[4],
+        resource_id=values[5],
+        canonical_store_id=values[6],
+        exported_revision=values[7],
+        jsonl_digest=values[8],
+        record_count=values[9],
+        format_version=values[10],
+    )
+    kind = SnapshotKind(values[2])
+    manifest = SnapshotManifest(
+        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+        snapshot_kind=kind,
+        receipt=receipt,
+        receipt_digest=snapshot_receipt_digest(receipt),
+    )
+    return SnapshotBinding(
+        configured_jsonl_path=Path(values[0]),
+        manifest_path=Path(values[1]),
+        snapshot_kind=kind,
+        receipt=receipt,
+        manifest=manifest,
+        binding_version=values[3],
+    )
+
+
+def _configured_pair_diagnostics(
+    binding: SnapshotBinding,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    head_revision: int,
+    record_count: int,
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    try:
+        _validate_binding_identity(
+            binding,
+            identity=identity,
+            canonical_store_id=canonical_store_id,
+        )
+    except (TypeError, ValueError):
+        diagnostics.append("SOURCE_BINDING.IDENTITY_MISMATCH")
+
+    receipt = binding.receipt
+    if (
+        type(head_revision) is not int
+        or head_revision < 0
+        or receipt.exported_revision > head_revision
+    ):
+        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    if receipt.record_count > record_count:
+        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    if (
+        receipt.exported_revision == head_revision
+        and receipt.record_count != record_count
+    ):
+        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+
+    try:
+        jsonl_digest = _file_sha256(identity.configured_jsonl_path)
+    except FileNotFoundError:
+        diagnostics.append("SOURCE_BINDING.JSONL_MISSING")
+    except OSError:
+        diagnostics.append("SOURCE_BINDING.JSONL_UNREADABLE")
+    else:
+        if jsonl_digest != receipt.jsonl_digest:
+            diagnostics.append("SOURCE_BINDING.JSONL_DIGEST_MISMATCH")
+
+    try:
+        manifest_bytes = identity.snapshot_manifest_path.read_bytes()
+    except FileNotFoundError:
+        diagnostics.append("SOURCE_BINDING.MANIFEST_MISSING")
+    except OSError:
+        diagnostics.append("SOURCE_BINDING.MANIFEST_UNREADABLE")
+    else:
+        expected_bytes = contract_to_json(binding.manifest).encode("utf-8")
+        if manifest_bytes != expected_bytes:
+            diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
+        else:
+            try:
+                decoded = contract_from_json(manifest_bytes.decode("utf-8"))
+            except (TypeError, ValueError, UnicodeDecodeError):
+                diagnostics.append("SOURCE_BINDING.MANIFEST_INVALID")
+            else:
+                if type(decoded) is not SnapshotManifest or decoded != binding.manifest:
+                    diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
+    return tuple(sorted(set(diagnostics)))
+
+
+def _validate_binding_identity(
+    binding: SnapshotBinding,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+) -> None:
+    receipt = binding.receipt
+    if (
+        binding.configured_jsonl_path != identity.configured_jsonl_path
+        or binding.manifest_path != identity.snapshot_manifest_path
+        or receipt.resource_id != identity.resource_id
+        or receipt.canonical_store_id != canonical_store_id
+    ):
+        raise ValueError("snapshot binding identity does not match store")
+
+
+def _snapshot_completed_binding(value: object) -> SnapshotBinding:
+    if type(value) is not SnapshotBinding:
+        raise TypeError("binding must be exact SnapshotBinding")
+    if type(value.receipt) is not SnapshotReceipt:
+        raise TypeError("binding receipt must be exact SnapshotReceipt")
+    if type(value.manifest) is not SnapshotManifest:
+        raise TypeError("binding manifest must be exact SnapshotManifest")
+    if type(value.snapshot_kind) is not SnapshotKind:
+        raise TypeError("binding snapshot kind must be exact SnapshotKind")
+    if type(value.manifest.snapshot_kind) is not SnapshotKind:
+        raise TypeError("manifest snapshot kind must be exact SnapshotKind")
+    if type(value.manifest.receipt) is not SnapshotReceipt:
+        raise TypeError("manifest receipt must be exact SnapshotReceipt")
+    for path_value in (value.configured_jsonl_path, value.manifest_path):
+        if type(path_value) is not _NATIVE_PATH_TYPE:
+            raise TypeError("binding paths must be exact native Path values")
+    receipt = value.receipt
+    manifest_receipt = value.manifest.receipt
+    scalar_values = (
+        value.binding_version,
+        receipt.snapshot_id,
+        receipt.resource_id,
+        receipt.canonical_store_id,
+        receipt.jsonl_digest,
+        receipt.format_version,
+        value.manifest.manifest_version,
+        value.manifest.receipt_digest,
+        manifest_receipt.snapshot_id,
+        manifest_receipt.resource_id,
+        manifest_receipt.canonical_store_id,
+        manifest_receipt.jsonl_digest,
+        manifest_receipt.format_version,
+    )
+    if any(type(item) is not str for item in scalar_values):
+        raise TypeError("binding scalar values must use built-in strings")
+    if type(receipt.exported_revision) is not int:
+        raise TypeError("binding revision must be a built-in integer")
+    if type(receipt.record_count) is not int:
+        raise TypeError("binding record count must be a built-in integer")
+    if type(manifest_receipt.exported_revision) is not int:
+        raise TypeError("manifest revision must be a built-in integer")
+    if type(manifest_receipt.record_count) is not int:
+        raise TypeError("manifest record count must be a built-in integer")
+    serialized = contract_to_json(value)
+    copied = contract_from_json(serialized)
+    if type(copied) is not SnapshotBinding:
+        raise TypeError("binding private snapshot is invalid")
+    return copied
+
+
+def _snapshot_binding_digest(binding: SnapshotBinding) -> str:
+    return hashlib.sha256(contract_to_json(binding).encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _latch_source_divergence(lease: _SQLiteGenerationView) -> None:
+    identity = lease.stage.resource_identity
+    with _open_leased_connection(lease) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _validate_store_identity(
+                connection,
+                resource_id=identity.resource_id,
+                canonical_store_id=lease.canonical_store_id,
+                target_identity=identity.target_identity,
+            )
+            updated = connection.execute(
+                "UPDATE tm_meta SET value = '1' "
+                "WHERE key = 'divergence_latched'"
+            )
+            if updated.rowcount != 1:
+                raise SQLiteStoreSchemaError(
+                    "STORE.DIVERGENCE_LATCH_MISSING"
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
 def _require_timeout(value: object) -> float:
     if type(value) is int:
         timeout = float(value)
@@ -560,10 +1044,31 @@ class SQLiteTMStore:
             stage,
             canonical_store_id=self._canonical_store_id,
         )
+        self._source_binding_monitor = SourceBindingMonitor(
+            self._coordinator
+        )
 
     @property
     def coordinator(self) -> ResourceStoreCoordinator:
         return self._coordinator
+
+    @property
+    def source_binding_monitor(self) -> SourceBindingMonitor:
+        return self._source_binding_monitor
+
+    def canonical_revision(self) -> CanonicalRevisionSnapshot:
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                return _canonical_revision_from_connection(
+                    connection,
+                    lease,
+                )
+
+    def register_completed_snapshot_binding(
+        self,
+        binding: SnapshotBinding,
+    ) -> None:
+        self._source_binding_monitor.register_completed_binding(binding)
 
     def exact_records(self, source_raw: str) -> tuple[TMRecord, ...]:
         if type(source_raw) is not str:
@@ -854,6 +1359,46 @@ def _validate_store_identity(
         or meta["target_identity"] != target_identity
     ):
         raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+
+
+def _canonical_revision_from_connection(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> CanonicalRevisionSnapshot:
+    identity = lease.stage.resource_identity
+    _validate_store_identity(
+        connection,
+        resource_id=identity.resource_id,
+        canonical_store_id=lease.canonical_store_id,
+        target_identity=identity.target_identity,
+    )
+    meta = _read_meta(connection)
+    head_revision = _meta_int(meta, "head_revision")
+    completed_count = connection.execute(
+        "SELECT COUNT(*) FROM tm_origin_batch WHERE status = 'completed'"
+    ).fetchone()
+    if (
+        completed_count is None
+        or type(completed_count[0]) is not int
+        or completed_count[0] != head_revision
+    ):
+        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    return CanonicalRevisionSnapshot(
+        resource_id=identity.resource_id,
+        canonical_store_id=lease.canonical_store_id,
+        generation=lease.generation,
+        head_revision=head_revision,
+        record_count=_table_count(connection, "tm_record"),
+    )
+
+
+def _table_count(connection: sqlite3.Connection, table_name: str) -> int:
+    if table_name not in _BASE_TABLES:
+        raise ValueError("table name is not approved")
+    row = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+    if row is None or type(row[0]) is not int or row[0] < 0:
+        raise SQLiteStoreSchemaError("STORE.TABLE_COUNT_INVALID")
+    return row[0]
 
 
 def _record_from_row(row: tuple[object, ...]) -> TMRecord:
@@ -1447,6 +1992,7 @@ def inspect_stage_schema(
     stage: MutableStageRef,
     *,
     canonical_store_id: str,
+    _allow_diverged_runtime: bool = False,
 ) -> SQLiteSchemaSnapshot:
     """Strictly inspect one stage without publishing physical readiness."""
 
@@ -1471,7 +2017,11 @@ def inspect_stage_schema(
         ):
             raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
         runtime = detect_sqlite_runtime()
-        _validate_stage_meta(meta, runtime=runtime)
+        _validate_stage_meta(
+            meta,
+            runtime=runtime,
+            allow_diverged_runtime=_allow_diverged_runtime,
+        )
         table_names = _schema_object_names(connection, "table")
         index_names = _schema_object_names(connection, "index")
         expected_tables = set(_BASE_TABLES)
@@ -1635,6 +2185,7 @@ def _validate_stage_meta(
     meta: dict[str, str],
     *,
     runtime: SQLiteRuntimeCapability,
+    allow_diverged_runtime: bool = False,
 ) -> None:
     expected_versions = {
         "fold_version": FOLD_VERSION_V1,
@@ -1655,7 +2206,10 @@ def _validate_stage_meta(
         raise SQLiteStoreSchemaError("STORE.STAGE_PUBLISHED")
     if "activation_digest" in meta:
         raise SQLiteStoreSchemaError("STORE.STAGE_PUBLISHED")
-    if _meta_bool(meta, "divergence_latched"):
+    if (
+        _meta_bool(meta, "divergence_latched")
+        and not allow_diverged_runtime
+    ):
         raise SQLiteStoreSchemaError("STORE.STAGE_DIVERGED")
     if _meta_int(meta, "generation") != 0:
         raise SQLiteStoreSchemaError("STORE.STAGE_REVISION_INVALID")
@@ -1965,6 +2519,7 @@ def _meta_bool(meta: dict[str, str], key: str) -> bool:
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "CANDIDATE_INDEX_VERSION",
+    "CanonicalRevisionSnapshot",
     "FOLD_VERSION_V1",
     "ResourceStoreCoordinator",
     "SQLiteCandidateRecord",
@@ -1975,6 +2530,8 @@ __all__ = [
     "SQLiteStoreLifecycleError",
     "SQLiteStoreSchemaError",
     "SQLiteTMStore",
+    "SourceBindingMonitor",
+    "SourceBindingObservation",
     "TM_SCHEMA_VERSION",
     "detect_sqlite_runtime",
     "initialize_stage_schema",
