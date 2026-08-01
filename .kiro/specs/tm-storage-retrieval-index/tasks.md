@@ -78,7 +78,7 @@
 
 - [ ] 3. 建立事务化 SQLite canonical store
 
-- [ ] 3.1 创建 per-resource schema 与安全连接策略
+- [x] 3.1 创建 per-resource schema 与安全连接策略
   - 每个 TM 资源建立独立 canonical sidecar，包含 metadata、origin batch、完整 record、snapshot ledger/binding 和候选索引所需表
   - 建立 raw source exact B-tree、外键与版本字段，并启用 DELETE journal、FULL synchronous、foreign keys、5000 ms busy timeout
   - 显式记录运行时 SQLite/FTS5/Unicode 能力，保持扩展加载和 WAL 关闭
@@ -362,3 +362,4 @@
 - 2026-07-29 / Task 2.4：实现 Core 内部唯一 `MatcherCapabilityEvaluator` 与原子不可变快照 publisher，以独立 basic/full cohort 时间窗闭合 UNAVAILABLE、BASIC_VALIDATED、TEXT_V1_VALIDATED 三态；为忠实表达 full-only 过期降级，内部 evidence schema/manifest codec 升至 v2，旧 v1 严格拒绝且公开 matcher 契约形状不变。第一轮复审拦截多 full cohort 部分缺失误判 UNAVAILABLE 的缺陷，修复为“完整 BASIC + 任意 full 子集”降级语义并加入双 full cohort 矩阵；独立复审第二轮通过；focused 23/23（67 subtests）、全量 211/211（2,080 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.5：实现唯一公开 `CapabilityGatedTextMatcherV1` 执行端口，每次调用只读取一次不可变 capability 快照，复用冻结的用途/选项矩阵并将 success/rejection、请求摘要和同一快照成套返回；拒绝路径不执行算法且不泄露正文，授权路径只调用一次 `TextMatcherV1`。独立复审连续拦截 evaluator 语义重绑、发布窗口 TOCTOU 与 caller expectation ABA，最终改为 publisher 构造时深复制私有 expectation/evaluator，并在发布锁内二次核对身份、摘要及语义版本，任何漂移均 fail-closed 为 UNAVAILABLE。独立复审第四轮通过；matcher focused 45/45（1,998 subtests）、全量 219/219（2,116 subtests）、basedpyright 0 errors。
 - 2026-08-01 / Task 2.6：建立可重算 Gate A 与独立 matcher release evidence；Gate A 机械盘点完整 `tm_contracts.__all__`、40 成员 codec union 与 `StoreHealth` 能力不变式，各组件输入缺失/畸形只撤销自身授权；matcher 的 BASIC 与 full-only cohort 原始 fixture 字节摘要、派生 transcript 和 UTC 时间窗独立闭合，full-only 缺失、畸形、空白篡改均只降级为 BASIC，BASIC/common evidence 失效才发布 UNAVAILABLE；CLI 按请求的 full/basic 层级 fail-closed。独立复审通过；focused 22/22、全量 248/248、basedpyright 0 errors。
+- 2026-08-01 / Task 3.1：从旧会话未跟踪成果恢复并独立复审 per-resource SQLite schema 与安全连接策略；mutable stage 使用原子保留文件、严格身份/批准 schema digest/对象类型/索引/外键复核，固定 DELETE journal、FULL synchronous、foreign keys、5000 ms busy timeout，关闭 WAL 与扩展加载，并冻结 SQLite 3.51.2、FTS5、Unicode 16.0.0 运行时能力快照。独立复审通过；focused 17/17、全量 259/259（含 Qt smoke）、basedpyright error-level 0 errors。
