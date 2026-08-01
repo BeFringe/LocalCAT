@@ -119,7 +119,7 @@
   - 完成时，短查询、纯 CJK 和禁用 FTS5 环境都能返回非空、可重复、受预算约束的候选集合
   - _Requirements: 4.2, 5.3, 5.4, 7.7_
 
-- [ ] 4.3 合并候选阶段、预算与召回证据
+- [x] 4.3 合并候选阶段、预算与召回证据
   - 对 overlap、union、去重、稳定预排序和截断逐阶段记录可守恒计数，输出索引路径与候选预算
   - 使用版本化预算限制候选，并保持召回层只返回候选身份，不承担最终 CAT 相似度排序
   - 把 canonical record、FTS 和 gram posting 写入接到同一事务，在每个索引阶段注入失败验证整体回滚
@@ -369,3 +369,4 @@
 - 2026-08-01 / Cluster A 复审：xhigh 累积复审拦截 canonical facts/revision 的 autocommit 混读、drain 窗口 next stage 篡改后误发布，以及 HISTORY 只校验上界的 ancestry 缺口。修正把当前 schema 升至 pre-release v2，以唯一 `completed_revision` 让 batch completion、record count 与 head revision 同事务闭合；所有公开 revision/binding facts 使用单一 read snapshot，divergence latch 以 canonical fingerprint 重核并在事实变化时重试；generation 只在 drain 后重新完成 schema/identity/integrity/FK/ancestry health 验证才发布。原 reviewer 定点复验最终批准；cluster focused 51/51、fresh 全量 293/293（含 Qt smoke）、basedpyright error-level 0 errors。
 - 2026-08-01 / Task 4.1：实现对已由 fold-v1 预折叠文本的 contentful FTS5 trigram 写入计划与 fast recall seam；长度至少三的查询按首次出现顺序生成唯一 code-point trigram，逐个作为转义 phrase 做 OR union，store 在 generation lease 内以参数绑定查询并返回去重稳定 identity。无 FTS 或短查询明确 unavailable，不伪造 gram fallback、budget、阶段 metadata 或最终评分；FTS 行继续通过 Task 3.2 controlled plan 与 origin/record/completed revision 同事务提交和回滚。集群实现阶段机械验证通过；candidate/store focused 47/47、全量 299/299（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.2/4.3 后执行 Cluster B 统一复审。
 - 2026-08-01 / Task 4.2：统一 candidate write plan 在 FTS 配置写入 FTS+唯一 1/2-gram、无 FTS 配置写入唯一 1/2/3-gram，继续由 store 同事务提交。1/2 字符查询只走对应 posting；无 FTS 长查询按 3→2→1 posting union 返回 matched/query overlap evidence，纯 CJK 与 SQL 行序扰动下保持 overlap 降序、record id tie 的确定顺序。caller limit 与 8192 candidate hard cap 共同限流，4096 posting cap 先形成实际执行集合，SQL 与 denominator 只使用同一集合；FTS 长查询显式留给 4.3 合并，不伪造 budget-v1 或阶段账本。集群实现阶段机械验证通过；candidate/store focused 57/57、全量 309/309（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.3 后执行 Cluster B 统一复审。
+- 2026-08-01 / Task 4.3：实现唯一 `CandidateRetriever`，在单一 generation lease + SQLite read snapshot 内按 FTS_TRIGRAM、按需 GRAM_2/GRAM_1，或无 FTS 的 GRAM_3/2/1 执行召回，并从同一 canonical `source_fold_v1` 快照重算 overlap 与长度差。完整构造 frozen `CandidateRetrievalReport`：source stage、UNION、DEDUPLICATE、可选 TRUNCATE 的计数连续守恒，`candidate-budget-v1` 只在 pool 超限时截断，候选按 overlap ratio、source length delta、record id 稳定预排并绑定真实 recall stages/rank；短 query 正确报告 GRAM_FALLBACK，不提前执行 scorer、threshold 或 global limit。集群实现阶段机械验证通过；candidate/store/contract focused 85/85、全量 320/320（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster B 统一复审。

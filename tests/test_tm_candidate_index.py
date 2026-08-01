@@ -7,6 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from tm_candidate_index import (
+    CANDIDATE_CONTRACT_FLOOR,
+    CandidateRetriever,
     GRAM_LONG_QUERY_FTS_SELECTED_CODE,
     GramPostingIndex,
     FTS5TrigramIndex,
@@ -15,9 +17,16 @@ from tm_candidate_index import (
     unique_character_ngrams,
     unique_character_trigrams,
 )
-from tm_contracts import CanonicalResourceIdentity, MutableStageRef, TMRecordDraft
+from tm_contracts import (
+    CandidateStage,
+    CanonicalResourceIdentity,
+    MutableStageRef,
+    TMRecordDraft,
+    candidate_budget_v1,
+)
 from tm_sqlite_store import (
     SQLiteCandidateRecord,
+    SQLiteCandidateRecallSnapshot,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     initialize_stage_schema,
@@ -582,6 +591,356 @@ class GramPostingIndexTests(unittest.TestCase):
                         _ = call()
                     open_connection.assert_not_called()
         self.assertEqual(dispatches, [])
+
+
+class CandidateRetrieverTests(unittest.TestCase):
+    def _store_with_records(
+        self,
+        root: Path,
+        *,
+        fts5_available: bool,
+        sources: tuple[str, ...],
+    ) -> tuple[SQLiteTMStore, tuple[int, ...]]:
+        stage = _stage(root)
+        with patch("tm_sqlite_store._probe_fts5", return_value=fts5_available):
+            snapshot = initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(stage, canonical_store_id="store.primary")
+        self.assertEqual(snapshot.fts5_available, fts5_available)
+        records = store.append_batch(
+            batch_id="import.retriever",
+            kind="import",
+            drafts=tuple(
+                _draft(source, f"target-{ordinal}")
+                for ordinal, source in enumerate(sources)
+            ),
+            source_digest="7" * 64,
+            source_path=(root / "source.jsonl").resolve(),
+            extension=lambda values: build_candidate_write_plan(
+                values,
+                fts5_available=fts5_available,
+            ),
+        )
+        return store, tuple(record.record_id for record in records)
+
+    def test_budget_formula_and_short_cjk_path_return_frozen_recall_report(self) -> None:
+        self.assertEqual(CANDIDATE_CONTRACT_FLOOR, 2048)
+        self.assertEqual(candidate_budget_v1(1), 2048)
+        self.assertEqual(candidate_budget_v1(16), 2048)
+        self.assertEqual(candidate_budget_v1(17), 2176)
+        self.assertEqual(candidate_budget_v1(1000), 8192)
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=True,
+                sources=("猫", "猫狗", "狗猫"),
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "猫", result_limit=1
+            )
+
+        self.assertEqual(
+            tuple(candidate.record_id for candidate in report.candidates),
+            record_ids,
+        )
+        self.assertEqual(report.metadata.index_kind, "GRAM_FALLBACK")
+        self.assertEqual(report.metadata.result_limit, 1)
+        self.assertEqual(report.metadata.candidate_budget, 2048)
+        self.assertEqual(
+            tuple(stage.stage for stage in report.metadata.stages),
+            (
+                CandidateStage.GRAM_1,
+                CandidateStage.UNION,
+                CandidateStage.DEDUPLICATE,
+            ),
+        )
+        self.assertTrue(all(candidate.overlap_ratio == 1.0 for candidate in report.candidates))
+        self.assertTrue(
+            all(
+                candidate.pretruncate_rank is not None
+                for candidate in report.candidates
+            )
+        )
+
+    def test_fts_empty_or_low_pool_unions_grams_with_continuous_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=True,
+                sources=("abcdef", "abcxyz", "abzzzz", "a-only"),
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "abcdef", result_limit=10
+            )
+
+        self.assertEqual(
+            tuple(stage.stage for stage in report.metadata.stages),
+            (
+                CandidateStage.FTS_TRIGRAM,
+                CandidateStage.GRAM_2,
+                CandidateStage.GRAM_1,
+                CandidateStage.UNION,
+                CandidateStage.DEDUPLICATE,
+            ),
+        )
+        prior = 0
+        for stage in report.metadata.stages:
+            self.assertEqual(stage.input_count, prior)
+            self.assertEqual(
+                stage.input_count + stage.added_unique_count - stage.dropped_count,
+                stage.output_unique_count,
+            )
+            prior = stage.output_unique_count
+        self.assertEqual(
+            {candidate.record_id for candidate in report.candidates},
+            set(record_ids),
+        )
+        exact = next(
+            candidate
+            for candidate in report.candidates
+            if candidate.record_id == record_ids[0]
+        )
+        self.assertEqual(
+            exact.recall_stages,
+            (CandidateStage.FTS_TRIGRAM, CandidateStage.GRAM_2, CandidateStage.GRAM_1),
+        )
+        self.assertEqual(exact.overlap_ratio, 1.0)
+
+    def test_empty_fts_pool_is_rescued_by_two_gram_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=True,
+                sources=("abx", "unrelated"),
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "abc", result_limit=10
+            )
+        self.assertEqual(report.metadata.stages[0].stage, CandidateStage.FTS_TRIGRAM)
+        self.assertEqual(report.metadata.stages[0].output_unique_count, 0)
+        self.assertEqual(report.metadata.stages[1].stage, CandidateStage.GRAM_2)
+        self.assertIn(record_ids[0], tuple(item.record_id for item in report.candidates))
+        rescued = next(
+            item for item in report.candidates if item.record_id == record_ids[0]
+        )
+        self.assertEqual((rescued.matched_grams, rescued.query_grams), (3, 6))
+        self.assertEqual(rescued.overlap_ratio, 0.5)
+
+    def test_no_fts_long_path_is_321_and_preorder_uses_ratio_length_then_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=False,
+                sources=("abcx", "abcy", "abc-long", "zzz"),
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "abcd", result_limit=10
+            )
+
+        self.assertEqual(report.metadata.index_kind, "GRAM_FALLBACK")
+        self.assertEqual(
+            tuple(stage.stage for stage in report.metadata.stages[:3]),
+            (CandidateStage.GRAM_3, CandidateStage.GRAM_2, CandidateStage.GRAM_1),
+        )
+        self.assertEqual(
+            tuple(candidate.record_id for candidate in report.candidates[:2]),
+            record_ids[:2],
+        )
+        self.assertNotIn(record_ids[3], tuple(c.record_id for c in report.candidates))
+
+    def test_empty_query_is_explicitly_unavailable_and_does_not_fake_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=False, sources=("abc",)
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "", result_limit=10
+            )
+        self.assertFalse(report.metadata.fuzzy_available)
+        self.assertEqual(report.metadata.fuzzy_unavailable_code, "CANDIDATE.GRAM_QUERY_EMPTY")
+        self.assertEqual(report.metadata.stages, ())
+        self.assertEqual(report.candidates, ())
+
+    def test_sql_row_order_does_not_affect_pretruncate_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary),
+                fts5_available=False,
+                sources=("abcx", "abcy", "abcz"),
+            )
+            first = CandidateRetriever().candidates(
+                "tm.primary", store, "abcd", result_limit=10
+            )
+            original = store.candidate_recall_snapshot
+
+            def disorder(*args: object, **kwargs: object):
+                snapshot = original(*args, **kwargs)
+                return type(snapshot)(
+                    fts5_available=snapshot.fts5_available,
+                    stage_matches=tuple(
+                        (stage, tuple(reversed(matches)))
+                        for stage, matches in snapshot.stage_matches
+                    ),
+                    folded_sources=tuple(reversed(snapshot.folded_sources)),
+                )
+
+            with patch.object(store, "candidate_recall_snapshot", side_effect=disorder):
+                second = CandidateRetriever().candidates(
+                    "tm.primary", store, "abcd", result_limit=10
+                )
+        self.assertEqual(first, second)
+
+    def test_pool_above_budget_truncates_only_after_stable_preorder(self) -> None:
+        sources = tuple(f"abc{i:04d}" for i in range(CANDIDATE_CONTRACT_FLOOR + 1))
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=False, sources=sources
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "abc0000", result_limit=1
+            )
+        self.assertTrue(report.metadata.truncated)
+        self.assertEqual(len(report.candidates), 2048)
+        self.assertEqual(report.metadata.union_unique_count, 2049)
+        self.assertEqual(report.metadata.deduplicated_count, 2049)
+        self.assertEqual(report.metadata.stages[-1].stage, CandidateStage.TRUNCATE)
+        self.assertEqual(report.metadata.stages[-1].dropped_count, 1)
+        self.assertEqual(
+            tuple(candidate.pretruncate_rank for candidate in report.candidates),
+            tuple(range(1, 2049)),
+        )
+
+    def test_non_degenerate_fts_pool_at_contract_floor_skips_fallback(self) -> None:
+        sources = tuple(
+            f"abcd-{ordinal:04d}" for ordinal in range(CANDIDATE_CONTRACT_FLOOR)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=True, sources=sources
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "abcd", result_limit=1
+            )
+        self.assertEqual(
+            tuple(stage.stage for stage in report.metadata.stages),
+            (
+                CandidateStage.FTS_TRIGRAM,
+                CandidateStage.UNION,
+                CandidateStage.DEDUPLICATE,
+            ),
+        )
+        self.assertEqual(len(report.candidates), CANDIDATE_CONTRACT_FLOOR)
+        self.assertFalse(report.metadata.truncated)
+
+    def test_degenerate_repeated_trigram_forces_two_gram_union(self) -> None:
+        sources = tuple(
+            f"aaaa-{ordinal:04d}" for ordinal in range(CANDIDATE_CONTRACT_FLOOR)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=True, sources=sources
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, "aaaa", result_limit=1
+            )
+        self.assertEqual(
+            tuple(stage.stage for stage in report.metadata.stages[:2]),
+            (CandidateStage.FTS_TRIGRAM, CandidateStage.GRAM_2),
+        )
+        self.assertNotIn(
+            CandidateStage.GRAM_1,
+            tuple(stage.stage for stage in report.metadata.stages),
+        )
+
+    def test_candidate_query_failure_is_resource_local_and_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, _ = self._store_with_records(
+                root, fts5_available=False, sources=("abcdef",)
+            )
+            connection = sqlite3.connect(_stage(root).staged_db_path)
+            try:
+                connection.execute("DROP TABLE tm_gram")
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(
+                SQLiteStoreSchemaError, "STORE.CANDIDATE_QUERY_FAILED"
+            ):
+                _ = CandidateRetriever().candidates(
+                    "tm.primary", store, "abcdef", result_limit=10
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, _ = self._store_with_records(
+                root, fts5_available=True, sources=("abcdef",)
+            )
+            connection = sqlite3.connect(_stage(root).staged_db_path)
+            try:
+                connection.execute("DROP TABLE tm_fts")
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(
+                SQLiteStoreSchemaError, "STORE.CANDIDATE_QUERY_FAILED"
+            ):
+                _ = CandidateRetriever().candidates(
+                    "tm.primary", store, "abcdef", result_limit=10
+                )
+
+    def test_rejects_nested_forgery_before_store_query(self) -> None:
+        class StringSubtype(str):
+            def __hash__(self) -> int:
+                raise AssertionError("forged query was hashed")
+
+        class IntSubtype(int):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=False, sources=("abc",)
+            )
+            with patch.object(
+                store,
+                "candidate_recall_snapshot",
+                side_effect=AssertionError("store queried"),
+            ) as query:
+                with self.assertRaises(TypeError):
+                    _ = CandidateRetriever().candidates(
+                        StringSubtype("tm.primary"), store, "abc", result_limit=10
+                    )
+                with self.assertRaises(TypeError):
+                    _ = CandidateRetriever().candidates(
+                        "tm.primary", store, StringSubtype("abc"), result_limit=10
+                    )
+                with self.assertRaises(TypeError):
+                    _ = CandidateRetriever().candidates(
+                        "tm.primary", store, "abc", result_limit=IntSubtype(10)
+                    )
+                query.assert_not_called()
+
+            forged = object.__new__(SQLiteCandidateRecallSnapshot)
+            object.__setattr__(forged, "fts5_available", False)
+            object.__setattr__(
+                forged,
+                "stage_matches",
+                (("GRAM_3", ((1, 1),)),),
+            )
+            object.__setattr__(
+                forged,
+                "folded_sources",
+                ((1, StringSubtype("abc")),),
+            )
+            with patch.object(
+                store, "candidate_recall_snapshot", return_value=forged
+            ):
+                with self.assertRaises(TypeError):
+                    _ = CandidateRetriever().candidates(
+                        "tm.primary", store, "abc", result_limit=10
+                    )
 
 
 if __name__ == "__main__":

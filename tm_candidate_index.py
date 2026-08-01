@@ -6,9 +6,19 @@ from dataclasses import dataclass
 
 from tm_sqlite_store import (
     SQLiteCandidateRecord,
+    SQLiteCandidateRecallSnapshot,
     SQLiteCandidateWritePlan,
     SQLiteGramRow,
     SQLiteTMStore,
+)
+from tm_contracts import (
+    CANDIDATE_BUDGET_VERSION,
+    CandidateEvidence,
+    CandidateRecallMetadata,
+    CandidateRetrievalReport,
+    CandidateStage,
+    CandidateStageMetadata,
+    candidate_budget_v1,
 )
 
 
@@ -18,6 +28,55 @@ GRAM_EMPTY_QUERY_CODE = "CANDIDATE.GRAM_QUERY_EMPTY"
 GRAM_LONG_QUERY_FTS_SELECTED_CODE = "CANDIDATE.GRAM_LONG_QUERY_FTS_SELECTED"
 GRAM_CANDIDATE_HARD_CAP = 8192
 GRAM_QUERY_POSTING_HARD_CAP = 4096
+CANDIDATE_CONTRACT_FLOOR = candidate_budget_v1(1)
+
+
+def _copy_candidate_recall_snapshot(
+    value: object,
+) -> SQLiteCandidateRecallSnapshot:
+    """Reject forged nested store values before hashing or ordering them."""
+
+    if type(value) is not SQLiteCandidateRecallSnapshot:
+        raise TypeError("store returned an invalid candidate snapshot")
+    if type(value.fts5_available) is not bool:
+        raise TypeError("candidate snapshot capability is invalid")
+    if type(value.stage_matches) is not tuple:
+        raise TypeError("candidate snapshot stages are invalid")
+    copied_stages: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+    for stage_entry in value.stage_matches:
+        if type(stage_entry) is not tuple or len(stage_entry) != 2:
+            raise TypeError("candidate snapshot stage is invalid")
+        stage_name, matches = stage_entry
+        if type(stage_name) is not str or type(matches) is not tuple:
+            raise TypeError("candidate snapshot stage values are invalid")
+        copied_matches: list[tuple[int, int]] = []
+        for match in matches:
+            if type(match) is not tuple or len(match) != 2:
+                raise TypeError("candidate snapshot match is invalid")
+            record_id, matched_count = match
+            if type(record_id) is not int or type(matched_count) is not int:
+                raise TypeError("candidate snapshot match values are invalid")
+            if record_id < 1 or matched_count < 0:
+                raise ValueError("candidate snapshot match values are invalid")
+            copied_matches.append((record_id, matched_count))
+        copied_stages.append((stage_name, tuple(copied_matches)))
+    if type(value.folded_sources) is not tuple:
+        raise TypeError("candidate snapshot sources are invalid")
+    copied_sources: list[tuple[int, str]] = []
+    for source_entry in value.folded_sources:
+        if type(source_entry) is not tuple or len(source_entry) != 2:
+            raise TypeError("candidate snapshot source is invalid")
+        record_id, folded_source = source_entry
+        if type(record_id) is not int or type(folded_source) is not str:
+            raise TypeError("candidate snapshot source values are invalid")
+        if record_id < 1 or not folded_source:
+            raise ValueError("candidate snapshot source values are invalid")
+        copied_sources.append((record_id, folded_source))
+    return SQLiteCandidateRecallSnapshot(
+        fts5_available=value.fts5_available,
+        stage_matches=tuple(copied_stages),
+        folded_sources=tuple(copied_sources),
+    )
 
 
 def unique_character_ngrams(folded_text: str, gram_size: int) -> tuple[str, ...]:
@@ -394,7 +453,232 @@ class FTS5TrigramIndex:
         )
 
 
+class CandidateRetriever:
+    """Sole recall orchestrator for candidate-budget-v1 evidence."""
+
+    def candidates(
+        self,
+        resource_id: str,
+        store: SQLiteTMStore,
+        folded_query: str,
+        *,
+        result_limit: int,
+    ) -> CandidateRetrievalReport:
+        if type(resource_id) is not str:
+            raise TypeError("resource_id must be a built-in string")
+        if not resource_id.strip():
+            raise ValueError("resource_id must not be empty")
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be SQLiteTMStore")
+        if type(folded_query) is not str:
+            raise TypeError("folded_query must be a built-in string")
+        if type(result_limit) is not int:
+            raise TypeError("result_limit must be a built-in integer")
+        if result_limit < 1:
+            raise ValueError("result_limit must be positive")
+        if store.coordinator.resource_id != resource_id:
+            raise ValueError("resource_id must match the store resource")
+
+        budget = candidate_budget_v1(result_limit)
+        query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...]
+        fts_match_expression: str | None = None
+        fts_query_degenerate = False
+        if not folded_query:
+            query_grams_by_size = ()
+        elif len(folded_query) == 1:
+            query_grams_by_size = (
+                (1, unique_character_ngrams(folded_query, 1)),
+            )
+        elif len(folded_query) == 2:
+            query_grams_by_size = (
+                (2, unique_character_ngrams(folded_query, 2)),
+            )
+        else:
+            query_grams_by_size = tuple(
+                (
+                    gram_size,
+                    unique_character_ngrams(folded_query, gram_size)[
+                        :GRAM_QUERY_POSTING_HARD_CAP
+                    ],
+                )
+                for gram_size in (3, 2, 1)
+            )
+            query_trigrams = query_grams_by_size[0][1]
+            fts_match_expression = build_fts5_match_expression(query_trigrams)
+            fts_query_degenerate = len(query_trigrams) <= 1
+
+        snapshot = _copy_candidate_recall_snapshot(store.candidate_recall_snapshot(
+            fts_match_expression=fts_match_expression,
+            query_grams_by_size=query_grams_by_size,
+            candidate_floor=CANDIDATE_CONTRACT_FLOOR,
+            fts_query_degenerate=fts_query_degenerate,
+        ))
+        index_kind = (
+            "FTS5_TRIGRAM"
+            if snapshot.fts5_available and len(folded_query) >= 3
+            else "GRAM_FALLBACK"
+        )
+        if not folded_query:
+            return CandidateRetrievalReport(
+                candidates=(),
+                metadata=CandidateRecallMetadata(
+                    resource_id=resource_id,
+                    index_kind=index_kind,
+                    fuzzy_available=False,
+                    fuzzy_unavailable_code=GRAM_EMPTY_QUERY_CODE,
+                    stages=(),
+                    union_unique_count=0,
+                    deduplicated_count=0,
+                    result_limit=result_limit,
+                    candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+                    candidate_budget=budget,
+                    truncated=False,
+                ),
+            )
+
+        grams_by_stage = {
+            CandidateStage[f"GRAM_{gram_size}"]: grams
+            for gram_size, grams in query_grams_by_size
+        }
+        if len(folded_query) >= 3:
+            grams_by_stage[CandidateStage.FTS_TRIGRAM] = (
+                unique_character_trigrams(folded_query)[
+                    :GRAM_QUERY_POSTING_HARD_CAP
+                ]
+            )
+        sources_by_id = dict(snapshot.folded_sources)
+        if len(sources_by_id) != len(snapshot.folded_sources):
+            raise ValueError("store returned duplicate candidate sources")
+        cumulative_ids: set[int] = set()
+        recall_stages_by_id: dict[int, list[CandidateStage]] = {}
+        matched_by_id: dict[int, int] = {}
+        stage_metadata: list[CandidateStageMetadata] = []
+        executed_query_grams = 0
+
+        for stage_name, raw_matches in snapshot.stage_matches:
+            try:
+                stage = CandidateStage(stage_name)
+            except ValueError as error:
+                raise ValueError("store returned an unknown candidate stage") from error
+            if stage not in grams_by_stage:
+                raise ValueError("store returned an unrequested candidate stage")
+            query_grams = grams_by_stage[stage]
+            executed_query_grams += len(query_grams)
+            input_count = len(cumulative_ids)
+            stage_ids: set[int] = set()
+            for record_id, store_matched_count in raw_matches:
+                if record_id in stage_ids:
+                    raise ValueError("store returned duplicate candidate stage rows")
+                stage_ids.add(record_id)
+                source = sources_by_id.get(record_id)
+                if source is None:
+                    raise ValueError("store omitted a candidate folded source")
+                if stage is CandidateStage.FTS_TRIGRAM:
+                    source_grams = set(unique_character_ngrams(source, 3))
+                    matched_count = sum(
+                        gram in source_grams for gram in query_grams
+                    )
+                else:
+                    matched_count = store_matched_count
+                if not 1 <= matched_count <= len(query_grams):
+                    raise ValueError("store returned an invalid candidate overlap")
+                recall_stages_by_id.setdefault(record_id, []).append(stage)
+                matched_by_id[record_id] = matched_by_id.get(record_id, 0) + matched_count
+            cumulative_ids.update(stage_ids)
+            stage_metadata.append(
+                CandidateStageMetadata(
+                    stage=stage,
+                    input_count=input_count,
+                    added_unique_count=len(cumulative_ids) - input_count,
+                    output_unique_count=len(cumulative_ids),
+                    dropped_count=0,
+                )
+            )
+
+        if set(sources_by_id) != cumulative_ids:
+            raise ValueError("store candidate sources do not close the recalled pool")
+
+        union_count = len(cumulative_ids)
+        stage_metadata.extend(
+            (
+                CandidateStageMetadata(
+                    stage=CandidateStage.UNION,
+                    input_count=union_count,
+                    added_unique_count=0,
+                    output_unique_count=union_count,
+                    dropped_count=0,
+                ),
+                CandidateStageMetadata(
+                    stage=CandidateStage.DEDUPLICATE,
+                    input_count=union_count,
+                    added_unique_count=0,
+                    output_unique_count=union_count,
+                    dropped_count=0,
+                ),
+            )
+        )
+        ranked_ids = tuple(
+            sorted(
+                cumulative_ids,
+                key=lambda record_id: (
+                    -(matched_by_id[record_id] / executed_query_grams),
+                    abs(len(sources_by_id[record_id]) - len(folded_query)),
+                    record_id,
+                ),
+            )
+        )
+        truncated = union_count > budget
+        if truncated:
+            stage_metadata.append(
+                CandidateStageMetadata(
+                    stage=CandidateStage.TRUNCATE,
+                    input_count=union_count,
+                    added_unique_count=0,
+                    output_unique_count=budget,
+                    dropped_count=union_count - budget,
+                )
+            )
+            returned_ids = ranked_ids[:budget]
+        else:
+            returned_ids = ranked_ids
+        rank_by_id = {
+            record_id: rank
+            for rank, record_id in enumerate(ranked_ids, start=1)
+        }
+        candidates = tuple(
+            CandidateEvidence(
+                record_id=record_id,
+                recall_stages=tuple(recall_stages_by_id[record_id]),
+                matched_grams=matched_by_id[record_id],
+                query_grams=executed_query_grams,
+                overlap_ratio=(
+                    matched_by_id[record_id] / executed_query_grams
+                ),
+                pretruncate_rank=rank_by_id[record_id],
+            )
+            for record_id in returned_ids
+        )
+        return CandidateRetrievalReport(
+            candidates=candidates,
+            metadata=CandidateRecallMetadata(
+                resource_id=resource_id,
+                index_kind=index_kind,
+                fuzzy_available=True,
+                fuzzy_unavailable_code=None,
+                stages=tuple(stage_metadata),
+                union_unique_count=union_count,
+                deduplicated_count=union_count,
+                result_limit=result_limit,
+                candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+                candidate_budget=budget,
+                truncated=truncated,
+            ),
+        )
+
+
 __all__ = [
+    "CANDIDATE_CONTRACT_FLOOR",
+    "CandidateRetriever",
     "FTS5CandidateResult",
     "FTS5TrigramIndex",
     "FTS5_QUERY_TOO_SHORT_CODE",
