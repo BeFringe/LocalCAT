@@ -107,7 +107,7 @@
 
 - [ ] 4. 建立可替换且可核对的候选索引
 
-- [ ] 4.1 实现 FTS5 trigram 快速召回
+- [x] 4.1 实现 FTS5 trigram 快速召回
   - 对已由 fold-v1 生成的索引文本建立内容型 trigram，禁止再次折叠或把 tokenizer 大小写当作产品 Match Case
   - 为长度至少三的查询构造唯一 trigram 候选请求，并保持索引行与 canonical record 同事务
   - 完成时，预折叠输入、索引内容、回滚行为和候选集合通过确定性测试
@@ -367,3 +367,4 @@
 - 2026-08-01 / Task 3.3：新增 per-resource `ResourceStoreCoordinator`，所有公开读写在打开线程内短连接前取得绑定 resource、generation 与私有 stage 快照的 operation lease；状态机在 DRAINING 后拒发新 lease，有界排空超时恢复 prior generation，旧连接关闭后才发布完整新 generation。SQLite busy/locked 归一为当前资源的可重试 lifecycle failure，另一资源保持可用；未提前实现 sealed activation、source binding 或 candidate retrieval。集群实现阶段机械验证通过；focused 39/39、全量 281/281（含 Qt smoke）、basedpyright error-level 0 errors，等待 Task 3.4 后执行 Cluster A 统一复审。
 - 2026-08-01 / Task 3.4：实现 leased canonical revision、completed snapshot ledger 与 `SourceBindingMonitor`；严格核对 configured JSONL、deterministic manifest、receipt、resource/canonical identity、digest、record count 和 revision ancestry。正常 local/import append 只推进 canonical revision 并把 CURRENT 变为 HISTORY，不改双文件；任一外部或 ledger 错配锁存 DIVERGED，canonical exact/append 继续权威且修回文件或重开不会隐式清除。completed-binding seam 只登记已发布且与当前 revision 闭合的 pair，不实现 issued/temp/fsync/replace/recovery/clear。集群实现阶段机械验证通过；source/store focused 47/47、全量 289/289（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster A 统一复审。
 - 2026-08-01 / Cluster A 复审：xhigh 累积复审拦截 canonical facts/revision 的 autocommit 混读、drain 窗口 next stage 篡改后误发布，以及 HISTORY 只校验上界的 ancestry 缺口。修正把当前 schema 升至 pre-release v2，以唯一 `completed_revision` 让 batch completion、record count 与 head revision 同事务闭合；所有公开 revision/binding facts 使用单一 read snapshot，divergence latch 以 canonical fingerprint 重核并在事实变化时重试；generation 只在 drain 后重新完成 schema/identity/integrity/FK/ancestry health 验证才发布。原 reviewer 定点复验最终批准；cluster focused 51/51、fresh 全量 293/293（含 Qt smoke）、basedpyright error-level 0 errors。
+- 2026-08-01 / Task 4.1：实现对已由 fold-v1 预折叠文本的 contentful FTS5 trigram 写入计划与 fast recall seam；长度至少三的查询按首次出现顺序生成唯一 code-point trigram，逐个作为转义 phrase 做 OR union，store 在 generation lease 内以参数绑定查询并返回去重稳定 identity。无 FTS 或短查询明确 unavailable，不伪造 gram fallback、budget、阶段 metadata 或最终评分；FTS 行继续通过 Task 3.2 controlled plan 与 origin/record/completed revision 同事务提交和回滚。集群实现阶段机械验证通过；candidate/store focused 47/47、全量 299/299（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.2/4.3 后执行 Cluster B 统一复审。

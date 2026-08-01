@@ -1528,6 +1528,41 @@ class SQLiteTMStore:
             if record_id in by_id
         )
 
+    def fts5_candidate_ids(
+        self,
+        match_expression: str,
+    ) -> tuple[int, ...] | None:
+        """Return FTS identities, or None when this generation has no FTS5."""
+
+        if type(match_expression) is not str:
+            raise TypeError("match_expression must be a built-in string")
+        if not match_expression:
+            raise ValueError("match_expression must not be empty")
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                self._validate_identity(connection, lease)
+                if not _meta_bool(_read_meta(connection), "fts5_available"):
+                    return None
+                rows = connection.execute(
+                    "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
+                    (match_expression,),
+                ).fetchall()
+        record_ids: set[int] = set()
+        for row in rows:
+            if type(row) is not tuple or len(row) != 1:
+                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+            value = row[0]
+            if type(value) is int:
+                record_id = value
+            elif type(value) is str and value.isdecimal():
+                record_id = int(value)
+            else:
+                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+            if record_id < 1:
+                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+            record_ids.add(record_id)
+        return tuple(sorted(record_ids))
+
     def export_records(self) -> Iterator[TMRecord]:
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
