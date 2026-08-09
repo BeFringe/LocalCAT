@@ -11,15 +11,25 @@ from pathlib import Path
 import sqlite3
 import stat
 from typing import cast
+import uuid
 
+from tm_activation_journal import _ActivationPreparation
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
+    AssetKind,
+    AssetPreservationEvidence,
+    AssetPreservationState,
     CanonicalResourceIdentity,
     DiagnosticDisposition,
     MigrationDiagnostic,
+    MigrationFailure,
+    MigrationOutcome,
     MigrationPreflight,
+    MigrationReport,
     MutableStageRef,
+    RecoveryLocator,
+    SealedStage,
     SnapshotKind,
     SnapshotManifest,
     SnapshotReceipt,
@@ -29,12 +39,14 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
+    ResourceStoreCoordinator,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     initialize_stage_schema,
     inspect_stage_schema,
     unique_character_ngrams,
 )
+from tm_stage_sealer import StageSealer
 
 
 _NATIVE_PATH_TYPE = type(Path())
@@ -138,13 +150,21 @@ class TMMigrationService:
         *,
         resource_identity: CanonicalResourceIdentity,
         canonical_store_id: str,
+        coordinator: ResourceStoreCoordinator | None = None,
     ) -> None:
         self._resource_identity = _snapshot_resource_identity(resource_identity)
         if type(canonical_store_id) is not str:
             raise TypeError("canonical_store_id must be a built-in string")
         if not canonical_store_id.strip():
             raise ValueError("canonical_store_id must not be empty")
+        if coordinator is not None and type(coordinator) is not (
+            ResourceStoreCoordinator
+        ):
+            raise TypeError(
+                "coordinator must be exact ResourceStoreCoordinator or None"
+            )
         self._canonical_store_id = canonical_store_id
+        self._coordinator = coordinator
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity:
@@ -166,37 +186,558 @@ class TMMigrationService:
         """Build or reuse one complete unpublished migration stage."""
 
         preflight = self.preflight(source)
-        stage = _migration_stage_ref(
+        stage = self._build_stage(
+            source,
+            preflight=preflight,
+            canonical_store_id=self._canonical_store_id,
+            batch_kind="migration",
+            batch_prefix="migration",
+            snapshot_prefix="snapshot.migration",
+            stage_prefix="migration",
+        )
+        return MigrationStageBuild(
+            preflight=preflight,
+            mutable_stage=stage,
+            reused_completed_revision=None,
+        )
+
+    def import_snapshot(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationOutcome:
+        """Explicitly replace the active canonical with one exact snapshot.
+
+        Task 5.10 disambiguation entry point: the source must be the
+        explicitly chosen configured JSONL.  The operation builds a fresh
+        mutable stage with a brand-new canonical store id, seals it, and
+        drives the live coordinator's explicit replacement activation
+        pipeline.  On success the resource gets a new generation with the
+        new store id and binding and any ``SOURCE_DIVERGED`` state is
+        cleared; on failure the prior canonical, JSONL bytes, manifest
+        bytes, and divergence state are preserved.
+        """
+
+        return self._explicit_disambiguation(source, resource_id)
+
+    def rebuild_from_snapshot(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationOutcome:
+        """Explicitly rebuild the active canonical from one exact snapshot.
+
+        Semantically identical to :meth:`import_snapshot`: both operations
+        perform the same full-replacement safety contract and differ only
+        in the caller's intent.
+        """
+
+        return self._explicit_disambiguation(source, resource_id)
+
+    def _explicit_disambiguation(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationOutcome:
+        coordinator = self._coordinator
+        stage_label = "PREFLIGHT"
+        preflight: MigrationPreflight | None = None
+        source_before = _try_file_digest(
+            self._resource_identity.configured_jsonl_path
+        )
+        if source_before is None:
+            raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
+        if coordinator is None:
+            raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
+        store_path = coordinator.active_store_path
+        if store_path is None:
+            raise MigrationPreflightError("IMPORT.ACTIVE_RESOURCE_REQUIRED")
+        store_before = _try_file_digest(
+            store_path
+        )
+        if store_before is None:
+            raise MigrationPreflightError("IMPORT.ACTIVE_STORE_UNREADABLE")
+        prepared = None
+        new_store_id: str | None = None
+        sealed: SealedStage | None = None
+        try:
+            if (
+                type(resource_id) is not str
+                or not resource_id.strip()
+            ):
+                raise MigrationPreflightError("IMPORT.RESOURCE_ID_INVALID")
+            if resource_id != self._resource_identity.resource_id:
+                raise MigrationPreflightError(
+                    "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
+                )
+            if coordinator.canonical_store_id != self._canonical_store_id:
+                raise MigrationPreflightError("IMPORT.COORDINATOR_MISMATCH")
+            prior_generation = coordinator.current_generation
+            if prior_generation is None:
+                raise MigrationPreflightError(
+                    "IMPORT.ACTIVE_RESOURCE_REQUIRED"
+                )
+            self._validate_source_preconditions(source)
+            preflight = _scan_jsonl(source)
+            origin_token = uuid.uuid4().hex
+            new_store_id = f"store.import.{origin_token}"
+            stage = self._build_stage(
+                source,
+                preflight=preflight,
+                canonical_store_id=new_store_id,
+                batch_kind="import",
+                batch_prefix="import",
+                snapshot_prefix="snapshot.import",
+                stage_prefix="import",
+                path_salt=uuid.uuid4().hex,
+                batch_id=f"import.{origin_token}",
+            )
+            stage_label = "ACTIVATION"
+            sealed = StageSealer(
+                registry=coordinator.sealed_registry,
+                canonical_store_id=new_store_id,
+            ).seal(
+                stage,
+                expected_prior_generation=prior_generation,
+            )
+            prepared = coordinator.activate_replacement(sealed)
+            handle = coordinator.publish_prepared_activation(prepared)
+            generation = coordinator.publish_activation(prepared, handle)
+            report = self._success_report(
+                preflight=preflight,
+                sealed=sealed,
+                canonical_store_id=new_store_id,
+                generation=generation,
+            )
+            # The publication is durably READY: the same service instance
+            # adopts the fresh canonical store id so a second explicit
+            # import/rebuild of the identical bytes succeeds as the next
+            # generation without a caller-side service renewal.
+            self._canonical_store_id = new_store_id
+            return report
+        except Exception as error:
+            if prepared is not None:
+                return self._reconcile_failed_activation(
+                    error,
+                    prepared=prepared,
+                    sealed=sealed,
+                    preflight=preflight,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    store_before=store_before,
+                    store_path=store_path,
+                    new_store_id=new_store_id,
+                )
+            return self._disambiguation_failure(
+                error,
+                preflight=preflight,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                source_before=source_before,
+                store_before=store_before,
+                store_path=store_path,
+            )
+
+    def _success_report(
+        self,
+        *,
+        preflight: MigrationPreflight,
+        sealed: SealedStage,
+        canonical_store_id: str,
+        generation: int,
+    ) -> MigrationReport:
+        """Build one completed import report from sealed evidence."""
+
+        receipt = sealed.evidence.source_binding.receipt
+        if (
+            type(receipt) is not SnapshotReceipt
+            or receipt.canonical_store_id != canonical_store_id
+        ):
+            raise MigrationPreflightError("IMPORT.RECEIPT_MISMATCH")
+        return MigrationReport(
+            resource_id=self._resource_identity.resource_id,
+            canonical_store_id=canonical_store_id,
+            source_digest=preflight.source_digest,
+            snapshot_receipt=receipt,
+            migrated_count=preflight.valid_count,
+            variant_count=preflight.variant_count,
+            skipped_count=preflight.invalid_count,
+            diagnostics=preflight.diagnostics,
+            activated_generation=generation,
+            canonical_exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+        )
+
+    def _reconcile_failed_activation(
+        self,
+        error: Exception,
+        *,
+        prepared: _ActivationPreparation,
+        sealed: SealedStage | None,
+        preflight: MigrationPreflight | None,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+        store_before: str,
+        store_path: Path,
+        new_store_id: str | None,
+    ) -> MigrationOutcome:
+        """Auto-restore the prior READY service after one failed activation.
+
+        Task 5.10 failure reconciliation: a failure before any durable
+        journal cancels the live preparation (no journal means nothing was
+        replaced), a durable pending journal (PREPARED through
+        MANIFEST_PUBLISHED) is rolled back, and a durable
+        ``GENERATION_PUBLISHED`` journal whose candidate active set is
+        provable completes via fresh-coordinator recovery and reports
+        success.  A rollback that cannot be proven fails stop with honest
+        unverified preservation evidence and never claims VERIFIED_UNCHANGED.
+        """
+
+        try:
+            journal_phase = coordinator.durable_activation_phase
+        except Exception as phase_error:
+            return self._disambiguation_failure(
+                phase_error,
+                preflight=preflight,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                source_before=source_before,
+                store_before=store_before,
+                store_path=store_path,
+                force_unverified=True,
+            )
+        if journal_phase is None:
+            try:
+                coordinator.cancel_prepared_activation(prepared)
+            except Exception as cancel_error:
+                if _disambiguation_error_code(
+                    cancel_error
+                ) != "ACTIVATION.PREPARATION_NOT_ACTIVE":
+                    return self._disambiguation_failure(
+                        cancel_error,
+                        preflight=preflight,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        source_before=source_before,
+                        store_before=store_before,
+                        store_path=store_path,
+                        force_unverified=True,
+                    )
+            return self._disambiguation_failure(
+                error,
+                preflight=preflight,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                source_before=source_before,
+                store_before=store_before,
+                store_path=store_path,
+            )
+        if journal_phase == "GENERATION_PUBLISHED":
+            try:
+                coordinator.rollback_durable_activation()
+            except Exception as rollback_error:
+                if _disambiguation_error_code(
+                    rollback_error
+                ) != "ACTIVATION.ROLLBACK_COMPLETED_INVALID":
+                    return self._disambiguation_failure(
+                        rollback_error,
+                        preflight=preflight,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        source_before=source_before,
+                        store_before=store_before,
+                        store_path=store_path,
+                        force_unverified=True,
+                    )
+            else:
+                return self._disambiguation_failure(
+                    error,
+                    preflight=preflight,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    store_before=store_before,
+                    store_path=store_path,
+                )
+            # The candidate active set is proven and the completed journal
+            # is the cold-recovery authority: a fresh coordinator bound to
+            # the unchanged prior id re-proves and completes the candidate
+            # publication (crash-window recovery), then the high-level
+            # operation reports the completed import.
+            if preflight is None or new_store_id is None:
+                return self._disambiguation_failure(
+                    error,
+                    preflight=preflight,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    store_before=store_before,
+                    store_path=store_path,
+                    force_unverified=True,
+                )
+            recovery_coordinator = ResourceStoreCoordinator(
+                canonical_store_id=coordinator.canonical_store_id,
+                resource_identity=self._resource_identity,
+            )
+            report = recovery_coordinator.recover_durable_activation()
+            if (
+                report is None
+                or getattr(report, "action", None) != "COMPLETED"
+                or report.generation is None
+                or recovery_coordinator.state != "READY"
+                or recovery_coordinator.canonical_store_id != new_store_id
+                or recovery_coordinator.current_generation
+                != report.generation
+            ):
+                return self._disambiguation_failure(
+                    error,
+                    preflight=preflight,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    store_before=store_before,
+                    store_path=store_path,
+                    force_unverified=True,
+                )
+            if sealed is None:
+                return self._disambiguation_failure(
+                    error,
+                    preflight=preflight,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    store_before=store_before,
+                    store_path=store_path,
+                    force_unverified=True,
+                )
+            # The crash-window recovery completed the candidate
+            # publication through a fresh coordinator bound to the
+            # unchanged prior id.  The original coordinator adopts the
+            # recovered authority (view, store id, generation) through
+            # its narrow coordinator-owned transition and returns to
+            # READY so the same live service keeps serving the completed
+            # import without a caller-side restart.
+            coordinator.adopt_recovered_authority(recovery_coordinator)
+            adopted_report = self._success_report(
+                preflight=preflight,
+                sealed=sealed,
+                canonical_store_id=new_store_id,
+                generation=report.generation,
+            )
+            # The recovered publication is durably READY: the same service
+            # instance adopts the fresh canonical store id so subsequent
+            # explicit imports reuse this service without renewal.
+            self._canonical_store_id = new_store_id
+            return adopted_report
+        try:
+            coordinator.rollback_durable_activation()
+        except Exception as rollback_error:
+            return self._disambiguation_failure(
+                rollback_error,
+                preflight=preflight,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                source_before=source_before,
+                store_before=store_before,
+                store_path=store_path,
+                force_unverified=True,
+            )
+        return self._disambiguation_failure(
+            error,
+            preflight=preflight,
+            stage_label=stage_label,
+            coordinator=coordinator,
+            source_before=source_before,
+            store_before=store_before,
+            store_path=store_path,
+        )
+
+    def _disambiguation_failure(
+        self,
+        error: Exception,
+        *,
+        preflight: MigrationPreflight | None,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+        store_before: str,
+        store_path: Path,
+        force_unverified: bool = False,
+    ) -> MigrationFailure:
+        """Build one preservation-backed failure without leaking paths.
+
+        ``force_unverified`` marks the active store UNVERIFIED with a
+        recovery locator and non-retryable when the rollback outcome could
+        not be proven: an unprovable rollback never claims
+        VERIFIED_UNCHANGED.
+        """
+
+        identity = self._resource_identity
+        error_code = _disambiguation_error_code(error)
+        retryable = _disambiguation_retryable(error)
+        diagnostics = (
+            () if preflight is None else preflight.diagnostics
+        )
+        active_generation = coordinator.current_generation
+        source_observed = _try_file_digest(
+            identity.configured_jsonl_path
+        )
+        store_observed = _try_file_digest(store_path)
+        locators: list[RecoveryLocator] = []
+        if source_observed == source_before:
+            source_evidence = _unchanged_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            )
+        elif source_observed is not None:
+            source_evidence = _changed_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+                source_observed,
+            )
+        else:
+            source_evidence = _unverified_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            )
+            locators.append(
+                RecoveryLocator(
+                    path=identity.configured_jsonl_path,
+                    asset_kind=AssetKind.ORIGINAL_SOURCE,
+                    expected_digest=source_before,
+                )
+            )
+            retryable = False
+        if force_unverified:
+            store_evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            backup_path = _find_recovery_backup(
+                store_path,
+                label="database",
+                expected_digest=store_before,
+            )
+            if backup_path is None:
+                backup_path = store_path
+            locators.append(
+                RecoveryLocator(
+                    path=backup_path,
+                    asset_kind=AssetKind.ACTIVE_STORE,
+                    expected_digest=store_before,
+                )
+            )
+            retryable = False
+        elif store_observed == store_before:
+            store_evidence = _unchanged_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+        elif store_observed is not None:
+            store_evidence = _changed_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+                store_observed,
+            )
+        else:
+            store_evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            backup_path = _find_recovery_backup(
+                store_path,
+                label="database",
+                expected_digest=store_before,
+            )
+            if backup_path is None:
+                backup_path = store_path
+            locators.append(
+                RecoveryLocator(
+                    path=backup_path,
+                    asset_kind=AssetKind.ACTIVE_STORE,
+                    expected_digest=store_before,
+                )
+            )
+            retryable = False
+        locators.sort(
+            key=lambda locator: locator.asset_kind.value
+        )
+        return MigrationFailure(
+            stage=stage_label,
+            error_code=error_code,
+            retryable=retryable,
+            diagnostics=diagnostics,
+            active_generation=active_generation,
+            original_source_preservation=source_evidence,
+            active_store_preservation=store_evidence,
+            recovery_locators=tuple(locators),
+        )
+
+    def _build_stage(
+        self,
+        source: Path,
+        *,
+        preflight: MigrationPreflight,
+        canonical_store_id: str,
+        batch_kind: str,
+        batch_prefix: str,
+        snapshot_prefix: str,
+        stage_prefix: str,
+        path_salt: str | None = None,
+        batch_id: str | None = None,
+    ) -> MutableStageRef:
+        """Build or reuse one complete unpublished stage (shared builder).
+
+        The stage is deterministic per (identity, source digest, prefix)
+        and is never the canonical sidecar: reuse is only accepted after
+        the full stage closure is re-proven from disk, and any build
+        failure removes exactly the created stage files.  Migration
+        origins use the deterministic ``migration.<source digest>`` batch
+        id; explicit imports pass a fresh collision-resistant
+        ``import.<uuid>`` batch id whose token also shapes the snapshot
+        receipt id.
+        """
+
+        if batch_id is None:
+            batch_id = f"{batch_prefix}.{preflight.source_digest}"
+        if type(batch_id) is not str or not batch_id.strip():
+            raise ValueError("batch id must be a non-empty string")
+        stage = _deterministic_stage_ref(
             self._resource_identity,
             source_digest=preflight.source_digest,
+            stage_prefix=stage_prefix,
+            path_salt=path_salt,
         )
         if stage.staged_db_path.exists() or stage.manifest_temp_path.exists():
             _validate_reusable_stage(
                 stage,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=canonical_store_id,
                 preflight=preflight,
+                batch_kind=batch_kind,
+                batch_prefix=batch_prefix,
+                snapshot_prefix=snapshot_prefix,
+                batch_id=batch_id,
             )
-            return MigrationStageBuild(
-                preflight=preflight,
-                mutable_stage=stage,
-                reused_completed_revision=None,
-            )
+            return stage
 
         initialize_stage_schema(
             stage,
-            canonical_store_id=self._canonical_store_id,
+            canonical_store_id=canonical_store_id,
         )
         stage_identity = _created_file_identity(stage.staged_db_path)
         manifest_identity: _CreatedFileIdentity | None = None
         try:
             store = SQLiteTMStore(
                 stage,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=canonical_store_id,
             )
             observation = _StreamingBuildObservation()
             store.append_streamed_batch(
-                batch_id=f"migration.{preflight.source_digest}",
-                kind="migration",
+                batch_id=batch_id,
+                kind=batch_kind,
                 drafts=_iter_draft_pairs(source, observation),
                 source_digest=preflight.source_digest,
                 source_path=source,
@@ -215,11 +756,14 @@ class TMMigrationService:
                     "MIGRATION.STAGE_REVISION_INVALID"
                 )
             receipt = SnapshotReceipt(
-                snapshot_id=(
-                    f"snapshot.migration.{preflight.source_digest[:24]}"
+                snapshot_id=_snapshot_id_for_origin(
+                    batch_id=batch_id,
+                    batch_kind=batch_kind,
+                    snapshot_prefix=snapshot_prefix,
+                    source_digest=preflight.source_digest,
                 ),
                 resource_id=self._resource_identity.resource_id,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=canonical_store_id,
                 exported_revision=revision.head_revision,
                 jsonl_digest=preflight.source_digest,
                 record_count=preflight.valid_count,
@@ -245,8 +789,12 @@ class TMMigrationService:
             )
             _validate_reusable_stage(
                 stage,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=canonical_store_id,
                 preflight=preflight,
+                batch_kind=batch_kind,
+                batch_prefix=batch_prefix,
+                snapshot_prefix=snapshot_prefix,
+                batch_id=batch_id,
             )
         except BaseException:
             if manifest_identity is not None:
@@ -256,11 +804,7 @@ class TMMigrationService:
                 )
             _remove_created_file(stage.staged_db_path, stage_identity)
             raise
-        return MigrationStageBuild(
-            preflight=preflight,
-            mutable_stage=stage,
-            reused_completed_revision=None,
-        )
+        return stage
 
     def _validate_source_preconditions(self, source: Path) -> None:
         if type(source) is not _NATIVE_PATH_TYPE:
@@ -517,23 +1061,54 @@ def _draft_from_jsonl(row: dict[str, object]) -> TMRecordDraft:
     )
 
 
-def _migration_stage_ref(
+def _deterministic_stage_ref(
     identity: CanonicalResourceIdentity,
     *,
     source_digest: str,
+    stage_prefix: str,
+    path_salt: str | None = None,
 ) -> MutableStageRef:
-    name_key = f"{identity.target_identity[:16]}.{source_digest[:16]}"
+    name_key = (
+        f"{identity.target_identity[:16]}.{source_digest[:16]}"
+        if path_salt is None
+        else (
+            f"{path_salt}.{identity.target_identity[:16]}."
+            f"{source_digest[:16]}"
+        )
+    )
     parent = identity.canonical_sidecar_path.parent
     return MutableStageRef(
-        stage_id=f"stage.migration.{name_key}",
+        stage_id=f"stage.{stage_prefix}.{name_key}",
         resource_identity=identity,
         staged_db_path=(
-            parent / f".localcat-migration.{name_key}.sqlite3.stage"
+            parent / f".localcat-{stage_prefix}.{name_key}.sqlite3.stage"
         ).absolute(),
         manifest_temp_path=(
-            parent / f".localcat-migration.{name_key}.manifest.tmp"
+            parent / f".localcat-{stage_prefix}.{name_key}.manifest.tmp"
         ).absolute(),
     )
+
+
+def _snapshot_id_for_origin(
+    *,
+    batch_id: str,
+    batch_kind: str,
+    snapshot_prefix: str,
+    source_digest: str,
+) -> str:
+    """Derive the deterministic snapshot receipt id for one origin batch.
+
+    Migration origins keep the historical ``snapshot.migration.<digest>``
+    shape; explicit imports derive the id from the fresh import batch
+    token so two identical imports never collide and the receipt binds
+    the exact origin batch (StageSealer and Gate B re-derive the same
+    shape from the single batch row).
+    """
+
+    if batch_kind == "import":
+        token = batch_id[len("import."):]
+        return f"snapshot.import.{token[:24]}"
+    return f"{snapshot_prefix}.{source_digest[:24]}"
 
 
 def _validate_reusable_stage(
@@ -541,6 +1116,10 @@ def _validate_reusable_stage(
     *,
     canonical_store_id: str,
     preflight: MigrationPreflight,
+    batch_kind: str = "migration",
+    batch_prefix: str = "migration",
+    snapshot_prefix: str = "snapshot.migration",
+    batch_id: str | None = None,
 ) -> None:
     """Validate a completed mutable stage with bounded streaming checks."""
 
@@ -573,10 +1152,16 @@ def _validate_reusable_stage(
                 "SELECT batch_id, source_digest, source_path, status, "
                 "valid_count, invalid_count, duplicate_source_count, "
                 "completed_revision FROM tm_origin_batch "
-                "WHERE kind = 'migration' ORDER BY batch_id"
+                "WHERE kind = ? ORDER BY batch_id",
+                (batch_kind,),
             ).fetchall()
+            expected_batch_id = (
+                batch_id
+                if batch_id is not None
+                else f"{batch_prefix}.{preflight.source_digest}"
+            )
             expected_batch = (
-                f"migration.{preflight.source_digest}",
+                expected_batch_id,
                 preflight.source_digest,
                 str(stage.resource_identity.configured_jsonl_path),
                 "completed",
@@ -598,8 +1183,11 @@ def _validate_reusable_stage(
                 "destination_manifest_path, status "
                 "FROM tm_snapshot_receipt ORDER BY snapshot_id"
             ).fetchall()
-            expected_snapshot_id = (
-                f"snapshot.migration.{preflight.source_digest[:24]}"
+            expected_snapshot_id = _snapshot_id_for_origin(
+                batch_id=expected_batch_id,
+                batch_kind=batch_kind,
+                snapshot_prefix=snapshot_prefix,
+                source_digest=preflight.source_digest,
             )
             if len(receipt_rows) != 1:
                 raise ValueError("snapshot receipt does not close")
@@ -641,8 +1229,7 @@ def _validate_reusable_stage(
         manifest = decoded
         if (
             manifest.snapshot_kind is not SnapshotKind.MIGRATION_SOURCE
-            or manifest.receipt.snapshot_id
-            != f"snapshot.migration.{preflight.source_digest[:24]}"
+            or manifest.receipt.snapshot_id != expected_snapshot_id
             or manifest.receipt.resource_id
             != stage.resource_identity.resource_id
             or manifest.receipt.canonical_store_id != canonical_store_id
@@ -825,6 +1412,94 @@ def _require_source_readable(source: Path) -> None:
     readable = mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     if not stat.S_ISREG(mode) or not readable:
         raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
+
+
+def _try_file_digest(path: Path) -> str | None:
+    """Hash one file's exact bytes, or return None when unreadable."""
+
+    try:
+        with path.open("rb") as stream:
+            digest = hashlib.sha256()
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _unchanged_preservation(
+    asset_kind: AssetKind,
+    digest: str,
+) -> AssetPreservationEvidence:
+    return AssetPreservationEvidence(
+        asset_kind=asset_kind,
+        state=AssetPreservationState.VERIFIED_UNCHANGED,
+        before_digest=digest,
+        observed_digest=digest,
+    )
+
+
+def _changed_preservation(
+    asset_kind: AssetKind,
+    before_digest: str,
+    observed_digest: str,
+) -> AssetPreservationEvidence:
+    return AssetPreservationEvidence(
+        asset_kind=asset_kind,
+        state=AssetPreservationState.VERIFIED_CHANGED,
+        before_digest=before_digest,
+        observed_digest=observed_digest,
+    )
+
+
+def _unverified_preservation(
+    asset_kind: AssetKind,
+    before_digest: str,
+) -> AssetPreservationEvidence:
+    return AssetPreservationEvidence(
+        asset_kind=asset_kind,
+        state=AssetPreservationState.UNVERIFIED,
+        before_digest=before_digest,
+        observed_digest=None,
+    )
+
+
+def _disambiguation_error_code(error: Exception) -> str:
+    error_code = getattr(error, "error_code", None)
+    if type(error_code) is str and error_code:
+        return error_code
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    return "IMPORT.FAILED"
+
+
+def _disambiguation_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    return retryable if type(retryable) is bool else False
+
+
+def _find_recovery_backup(
+    sidecar: Path,
+    *,
+    label: str,
+    expected_digest: str,
+) -> Path | None:
+    """Locate one journal-owned recovery backup by its exact bytes."""
+
+    candidates = sorted(
+        sidecar.parent.glob(
+            f".{sidecar.name}.localcat-recovery.*.{label}.bak"
+        ),
+        key=str,
+    )
+    for candidate in candidates:
+        if _try_file_digest(candidate) == expected_digest:
+            return candidate
+    return None
 
 
 def _reject_json_constant(_value: str) -> None:

@@ -191,7 +191,7 @@
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
   - _Depends: 5.9_
 
-- [ ] 5.10 实现显式 import 与 rebuild 消歧
+- [x] 5.10 实现显式 import 与 rebuild 消歧
   - 已激活资源的显式 import/rebuild 通过 fresh mutable stage、完整索引、seal 与同一协调器切换
   - 仅完整验证和激活成功才清除 SOURCE_DIVERGED；失败保持 canonical、原 JSONL、manifest 与 divergence 不变
   - 完成时，成功消歧产生新 generation，失败路径不改变三方资产且 last-known-good canonical 继续服务
@@ -377,3 +377,4 @@
 - 2026-08-01 / Task 4.1：实现对已由 fold-v1 预折叠文本的 contentful FTS5 trigram 写入计划与 fast recall seam；长度至少三的查询按首次出现顺序生成唯一 code-point trigram，逐个作为转义 phrase 做 OR union，store 在 generation lease 内以参数绑定查询并返回去重稳定 identity。无 FTS 或短查询明确 unavailable，不伪造 gram fallback、budget、阶段 metadata 或最终评分；FTS 行继续通过 Task 3.2 controlled plan 与 origin/record/completed revision 同事务提交和回滚。集群实现阶段机械验证通过；candidate/store focused 47/47、全量 299/299（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.2/4.3 后执行 Cluster B 统一复审。
 - 2026-08-01 / Task 4.2：统一 candidate write plan 在 FTS 配置写入 FTS+唯一 1/2-gram、无 FTS 配置写入唯一 1/2/3-gram，继续由 store 同事务提交。1/2 字符查询只走对应 posting；无 FTS 长查询按 3→2→1 posting union 返回 matched/query overlap evidence，纯 CJK 与 SQL 行序扰动下保持 overlap 降序、record id tie 的确定顺序。caller limit 与 8192 candidate hard cap 共同限流，4096 posting cap 先形成实际执行集合，SQL 与 denominator 只使用同一集合；FTS 长查询显式留给 4.3 合并，不伪造 budget-v1 或阶段账本。集群实现阶段机械验证通过；candidate/store focused 57/57、全量 309/309（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.3 后执行 Cluster B 统一复审。
 - 2026-08-01 / Task 4.3：实现唯一 `CandidateRetriever`，在单一 generation lease + SQLite read snapshot 内按 FTS_TRIGRAM、按需 GRAM_2/GRAM_1，或无 FTS 的 GRAM_3/2/1 执行召回，并从同一 canonical `source_fold_v1` 快照重算 overlap 与长度差。完整构造 frozen `CandidateRetrievalReport`：source stage、UNION、DEDUPLICATE、可选 TRUNCATE 的计数连续守恒，`candidate-budget-v1` 只在 pool 超限时截断，候选按 overlap ratio、source length delta、record id 稳定预排并绑定真实 recall stages/rank；短 query 正确报告 GRAM_FALLBACK，不提前执行 scorer、threshold 或 global limit。集群实现阶段机械验证通过；candidate/store/contract focused 85/85、全量 320/320（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster B 统一复审。
+- 2026-08-10 / Task 5.10：实现 `import_snapshot()` / `rebuild_from_snapshot()` 的显式消歧；每次请求以 fresh `import` origin、store id、snapshot id 和完整候选索引构建 sealed stage，由同一 coordinator 在 prior/candidate store-id 闭包下排空 lease、持久日志、切换并冷恢复。配置 JSONL 或相邻 manifest 缺失/改写只能由成功的全量激活清除 divergence；可证回滚失败在业务 API 返回前恢复 prior READY 权威，已持久 `GENERATION_PUBLISHED` 则拒绝回滚并向前恢复。同一 service 可对相同快照连续产生新 generation，canonical ledger/ancestry 破坏与外来 symlink/directory/multi-link 仍 fail-closed。集群实现阶段机械验证通过；focused 29/29、fresh 全量 656/656（skip 1，含 Qt smoke）、basedpyright error-level 0 errors，等待 Task 5.11 后执行 Cluster E 统一复审。

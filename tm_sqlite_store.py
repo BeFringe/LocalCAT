@@ -201,9 +201,12 @@ from tm_activation_recovery import (
     _recovery_sealed_stage_digest,
     _replace_activation_database,
     _replay_cancelled_terminal_recovery,
+    _require_cancelled_lineage_consistency,
     _replay_terminal_recovery,
     _require_activation_grant_identity,
+    _require_activation_grant_identity_replacement,
     _require_activation_token_identity,
+    _require_activation_token_identity_replacement,
     _require_rollback_backups,
     _restore_activation_file,
     _retire_coexisting_terminal,
@@ -774,6 +777,22 @@ class _CoordinatorStorePort:
     def notify_all(self) -> None:
         self._coordinator._condition.notify_all()
 
+    def activate_candidate_store_id(self, candidate_id: str) -> None:
+        """Narrow replacement seam: switch coordinator authority store id.
+
+        Called by recovery/publication only after the candidate generation
+        is durably published (GENERATION_PUBLISHED journal, final active
+        set revalidation, token consumption, and the activated-lineage
+        marker).  Before that point the coordinator keeps the prior store
+        id so cancellation and rollback rehydrate the prior authority.
+        """
+
+        if type(candidate_id) is not str:
+            raise TypeError("candidate store id must be a built-in string")
+        if not candidate_id.strip():
+            raise ValueError("candidate store id must not be empty")
+        self._coordinator._canonical_store_id = candidate_id
+
     def drain_for_transition(self) -> None:
         """Stop new leases, drain live leases, prove the view, then ACTIVATING.
 
@@ -1111,6 +1130,24 @@ class ResourceStoreCoordinator:
         return self._resource_id
 
     @property
+    def canonical_store_id(self) -> str:
+        """The coordinator's current (active) canonical store id."""
+
+        with self._condition:
+            return self._canonical_store_id
+
+    @property
+    def active_store_path(self) -> Path | None:
+        """The active canonical DB path, or None before first activation."""
+
+        with self._condition:
+            return (
+                None
+                if self._view is None
+                else self._view.stage.staged_db_path
+            )
+
+    @property
     def current_generation(self) -> int | None:
         with self._condition:
             return None if self._view is None else self._view.generation
@@ -1123,6 +1160,47 @@ class ResourceStoreCoordinator:
     def state(self) -> str:
         with self._condition:
             return self._state
+
+    @property
+    def durable_activation_phase(self) -> str | None:
+        """The last durable activation journal phase, or None when absent.
+
+        Read-only public seam for callers that must choose between
+        Task 5.9 rollback (pending phases) and Task 5.8 recovery (a
+        completed ``GENERATION_PUBLISHED`` journal) after a failed
+        publication: the journal, when present, is re-read and re-parsed
+        so a corrupt or foreign journal fails closed instead of being
+        silently treated as absent.
+        """
+
+        with self._condition:
+            journal_path = _activation_journal_path(
+                self._resource_identity
+            )
+            try:
+                journal_identity = _lstat_activation_journal_identity(
+                    journal_path
+                )
+            except ActivationPreparationError:
+                raise
+            if journal_identity is None:
+                return None
+            try:
+                disk_bytes, _disk_identity = _read_activation_journal_file(
+                    journal_path,
+                    journal_identity,
+                )
+                disk_record = _parse_activation_journal_bytes(
+                    disk_bytes,
+                    expected_journal_path=journal_path,
+                )
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_PENDING",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+            return disk_record.phase.value
 
     def wait_for_state(
         self,
@@ -1180,7 +1258,40 @@ class ResourceStoreCoordinator:
                     self._condition.notify_all()
 
     def activate(self, sealed_stage: SealedStage) -> _ActivationPreparation:
-        """Prepare exactly one registered sealed stage for later activation.
+        """Prepare one registered same-store-id sealed stage (Task 5.5).
+
+        Ordinary activation retains the same-id rule: the sealed stage's
+        canonical store id must equal the coordinator's current id.
+        Explicit replacement of an already-active resource (a fresh
+        canonical store id) must use :meth:`activate_replacement`.
+        """
+
+        return self._activate(sealed_stage, replacement=False)
+
+    def activate_replacement(
+        self,
+        sealed_stage: SealedStage,
+    ) -> _ActivationPreparation:
+        """Explicitly prepare a replacement stage with a different store id.
+
+        The Task 5.10 disambiguation seam: the sealed stage must carry a
+        fresh canonical store id different from the coordinator's current
+        (prior) id, and the resource/target/generation facts must bind
+        exactly like an ordinary activation.  Everything else (Gate B,
+        token, drain, backups) follows the same preparation pipeline, and
+        the coordinator keeps the prior store id until the candidate
+        generation is durably published.
+        """
+
+        return self._activate(sealed_stage, replacement=True)
+
+    def _activate(
+        self,
+        sealed_stage: SealedStage,
+        *,
+        replacement: bool,
+    ) -> _ActivationPreparation:
+        """Shared preparation pipeline for ordinary and replacement stages.
 
         This Task 5.5 seam performs fresh Gate B evaluation, issues the
         registry token, drains leases, repeats Gate B after the drain, and
@@ -1274,6 +1385,12 @@ class ResourceStoreCoordinator:
                     or _lstat_any_entry(
                         self._resource_identity.snapshot_manifest_path
                     )
+                    or (
+                        self._view is not None
+                        and _lstat_any_entry(
+                            self._view.stage.staged_db_path
+                        )
+                    )
                 )
                 if not pair_present:
                     # The true never-activated legacy state has no pair,
@@ -1339,16 +1456,26 @@ class ResourceStoreCoordinator:
                 reason_code=first_report.error_code,
             )
         first_grant = first_report.grant
-        _require_activation_grant_identity(
-            first_grant,
-            identity=self._resource_identity,
-            canonical_store_id=self._canonical_store_id,
-            prior_view=initial_view,
-            current_generation=initial_generation,
-        )
+        if replacement:
+            _require_activation_grant_identity_replacement(
+                first_grant,
+                identity=self._resource_identity,
+                canonical_store_id=self._canonical_store_id,
+                prior_view=initial_view,
+                current_generation=initial_generation,
+            )
+        else:
+            _require_activation_grant_identity(
+                first_grant,
+                identity=self._resource_identity,
+                canonical_store_id=self._canonical_store_id,
+                prior_view=initial_view,
+                current_generation=initial_generation,
+            )
         pre_drain_captures = _capture_pre_drain_assets(
             initial_view,
             identity=self._resource_identity,
+            replacement=replacement,
         )
 
         token: contract_module._ActivationToken | None = None
@@ -1425,32 +1552,55 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
                     retryable=False,
                 )
-            _require_activation_grant_identity(
-                second_grant,
-                identity=self._resource_identity,
-                canonical_store_id=self._canonical_store_id,
-                prior_view=initial_view,
-                current_generation=initial_generation,
-            )
+            if replacement:
+                _require_activation_grant_identity_replacement(
+                    second_grant,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    prior_view=initial_view,
+                    current_generation=initial_generation,
+                )
+            else:
+                _require_activation_grant_identity(
+                    second_grant,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    prior_view=initial_view,
+                    current_generation=initial_generation,
+                )
             assert token is not None
             contract_module._validate_activation_token_for_stage(
                 token,
                 sealed_stage,
             )
-            _require_activation_token_identity(
-                token,
-                identity=self._resource_identity,
-                canonical_store_id=self._canonical_store_id,
-                current_generation=initial_generation,
-            )
+            if replacement:
+                _require_activation_token_identity_replacement(
+                    token,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    candidate_store_id=second_grant.canonical_store_id,
+                    current_generation=initial_generation,
+                )
+            else:
+                _require_activation_token_identity(
+                    token,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    current_generation=initial_generation,
+                )
             physical_snapshot = registry.resolve_physical_readiness(
                 sealed_stage
+            )
+            expected_candidate_id = (
+                second_grant.canonical_store_id
+                if replacement
+                else self._canonical_store_id
             )
             if (
                 physical_snapshot.mutable_stage.resource_identity
                 != self._resource_identity
                 or physical_snapshot.canonical_store_id
-                != self._canonical_store_id
+                != expected_candidate_id
             ):
                 raise ActivationPreparationError(
                     "ACTIVATION.IDENTITY_MISMATCH",
@@ -1475,20 +1625,27 @@ class ResourceStoreCoordinator:
                     pre_drain_captures,
                     (source_capture,),
                 )
+                prior_manifest_absent = False
             else:
                 captures = _capture_prior_assets(
                     _CoordinatorStorePort(self),
                     initial_view,
                     identity=self._resource_identity,
+                    replacement=replacement,
                 )
                 _require_same_asset_captures(
                     pre_drain_captures,
                     captures,
                 )
+                prior_manifest_absent = all(
+                    asset.asset_kind != "MANIFEST"
+                    for asset in captures
+                )
                 backups = _create_recovery_backups(
                     captures,
                     preparation_id=preparation_id,
                     owned_paths=owned_paths,
+                    manifest_absent=prior_manifest_absent,
                 )
                 _revalidate_prior_assets(captures)
             with self._condition:
@@ -1505,10 +1662,22 @@ class ResourceStoreCoordinator:
                     preparation_id=preparation_id,
                     resource_id=second_grant.resource_id,
                     target_identity=second_grant.target_identity,
-                    canonical_store_id=self._canonical_store_id,
+                    canonical_store_id=(
+                        second_grant.canonical_store_id
+                        if replacement
+                        else self._canonical_store_id
+                    ),
+                    prior_canonical_store_id=(
+                        self._canonical_store_id if replacement else None
+                    ),
                     expected_prior_generation=initial_generation,
                     gate_b_grant_digest=second_grant.grant_digest,
                     had_prior_canonical=initial_view is not None,
+                    prior_manifest_absent=(
+                        False
+                        if initial_view is None
+                        else prior_manifest_absent
+                    ),
                     backup_evidence=tuple(
                         asset.evidence for asset in backups
                     ),
@@ -1605,6 +1774,25 @@ class ResourceStoreCoordinator:
             )
             for backup in preparation._backup_assets
         )
+        record: _ActivationJournalRecord | None = None
+        try:
+            record = _build_activation_journal_record(
+                _CoordinatorStorePort(self),
+                preparation,
+            )
+            _require_cancelled_lineage_consistency(
+                self._resource_identity,
+                had_prior_canonical=preparation.had_prior_canonical,
+            )
+            _ = self._write_activation_terminal_locked(record)
+        except ActivationPreparationError:
+            # The live assets no longer prove the PREPARED closure (for
+            # example a tampered candidate/source/prior/backup).  The
+            # cancellation is still a fail-safe cleanup: no CANCELLED
+            # terminal becomes durable (cold recovery fails closed on the
+            # unproven state), and the candidates stay owned by the sealed
+            # stage.
+            record = None
         try:
             _remove_recovery_backups(owned_paths)
             self._sealed_registry.cancel(preparation._token)
@@ -1842,6 +2030,118 @@ class ResourceStoreCoordinator:
         with self._condition:
             return rollback_durable_activation(_CoordinatorStorePort(self))
 
+    def adopt_recovered_authority(
+        self,
+        recovered: ResourceStoreCoordinator,
+    ) -> str:
+        """Adopt a fully recovered completed activation authority.
+
+        Narrow Task 5.10 transition for one fail-stopped coordinator: after
+        a fresh coordinator re-proved and completed a durable
+        ``GENERATION_PUBLISHED`` journal (crash-window recovery), this
+        method adopts only the exact recovered authority - same immutable
+        resource identity, recovered ``READY`` state, non-null recovered
+        view whose store id/generation/canonical paths are coherent - and
+        only while this coordinator is fail-stopped (``ACTIVATING``) with
+        zero live leases and no cleanup reservation.  The proven view and
+        store id are adopted under the coordinator-owned condition lock,
+        the stale live preparation/registry state is retired, and the
+        coordinator returns to ``READY`` and notifies waiters.  It is not a
+        generic setter: any other type, identity, state, or unproven
+        authority is rejected without mutation.
+        """
+
+        if type(recovered) is not ResourceStoreCoordinator:
+            raise TypeError(
+                "recovered authority must be exact ResourceStoreCoordinator"
+            )
+        if (
+            recovered._resource_identity != self._resource_identity
+            or recovered._resource_id != self._resource_id
+            or recovered._target_identity != self._target_identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_IDENTITY_MISMATCH",
+                retryable=False,
+            )
+        if recovered.state != "READY":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_STATE_INVALID",
+                retryable=False,
+            )
+        recovered_view = recovered._view
+        if type(recovered_view) is not _SQLiteGenerationView:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_VIEW_INVALID",
+                retryable=False,
+            )
+        if (
+            recovered_view.canonical_store_id
+            != recovered._canonical_store_id
+            or recovered_view.generation
+            != recovered.current_generation
+            or recovered._active_lease_count != 0
+            or recovered._preparation is not None
+            or recovered._cleanup_reservation is not None
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_AUTHORITY_INVALID",
+                retryable=False,
+            )
+        if (
+            recovered_view.stage.resource_identity
+            != self._resource_identity
+            or recovered_view.stage.staged_db_path
+            != self._resource_identity.canonical_sidecar_path
+            or recovered_view.stage.manifest_temp_path
+            != self._resource_identity.snapshot_manifest_path
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_PATH_MISMATCH",
+                retryable=False,
+            )
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._active_lease_count != 0
+                or self._cleanup_reservation is not None
+                or self._cleanup_in_progress
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_ADOPTION_INVALID",
+                    retryable=True,
+                )
+            stale_preparation = self._preparation
+            self._view = recovered_view
+            self._canonical_store_id = recovered._canonical_store_id
+            self._preparation = None
+            self._cleanup_reservation = None
+            self._state = "READY"
+            self._condition.notify_all()
+        if stale_preparation is not None:
+            self._retire_stale_preparation_registry(stale_preparation)
+        return "READY"
+
+    def _retire_stale_preparation_registry(
+        self,
+        preparation: _ActivationPreparation,
+    ) -> None:
+        """Best-effort retire of the superseded preparation's registry token.
+
+        The completed durable journal is the recovery authority; the stale
+        in-memory token entry is retired only when it is still issued.  Any
+        registry refusal is deliberately ignored: after cold-style recovery
+        has re-proven the completed journal, an unreachable process-local
+        token must not overturn the adopted durable authority.
+        """
+
+        token = preparation._token
+        stage_seal_error = _CoordinatorStorePort(self).stage_seal_error
+        try:
+            self._sealed_registry.consume(token)
+        except stage_seal_error:
+            return
+
     def _advance_activation_journal_after_effect_locked(
         self,
         preparation: _ActivationPreparation,
@@ -1877,11 +2177,17 @@ class ResourceStoreCoordinator:
         target one place.
         """
 
-        return _write_activation_journal(
-            record,
-            journal_path,
-            expected_final_identity=expected_final_identity,
-        )
+        try:
+            return _write_activation_journal(
+                record,
+                journal_path,
+                expected_final_identity=expected_final_identity,
+            )
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_WRITE_FAILED",
+                retryable=True,
+            ) from error
 
     def _write_activation_terminal_locked(
         self,

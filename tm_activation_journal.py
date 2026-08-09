@@ -282,9 +282,11 @@ class _ActivationPreparation:
     resource_id: str
     target_identity: str
     canonical_store_id: str
+    prior_canonical_store_id: str | None
     expected_prior_generation: int | None
     gate_b_grant_digest: str
     had_prior_canonical: bool
+    prior_manifest_absent: bool
     backup_evidence: tuple[ActivationBackupEvidence, ...]
     _token: contract_module._ActivationToken = field(
         repr=False,
@@ -314,9 +316,11 @@ class _ActivationPreparation:
         resource_id: str,
         target_identity: str,
         canonical_store_id: str,
+        prior_canonical_store_id: str | None,
         expected_prior_generation: int | None,
         gate_b_grant_digest: str,
         had_prior_canonical: bool,
+        prior_manifest_absent: bool,
         backup_evidence: tuple[ActivationBackupEvidence, ...],
         _token: contract_module._ActivationToken,
         _physical_snapshot: object,
@@ -331,24 +335,50 @@ class _ActivationPreparation:
             raise TypeError("activation preparation id is invalid")
         if type(had_prior_canonical) is not bool:
             raise TypeError("activation prior-presence flag is invalid")
+        if type(prior_manifest_absent) is not bool:
+            raise TypeError("activation prior-manifest-presence flag is invalid")
+        if not had_prior_canonical and prior_manifest_absent:
+            raise ValueError("first activation has no prior manifest to be absent")
         if had_prior_canonical != bool(_backup_assets):
             raise ValueError("activation prior asset state is inconsistent")
-        if had_prior_canonical and len(_backup_assets) != 2:
-            raise ValueError("activation prior asset set is incomplete")
+        backup_kinds = {asset.asset_kind for asset in _backup_assets}
+        if had_prior_canonical:
+            expected_backup_kinds = (
+                {"DATABASE"} if prior_manifest_absent
+                else {"DATABASE", "MANIFEST"}
+            )
+            if backup_kinds != expected_backup_kinds:
+                raise ValueError("activation prior asset set is incomplete")
         if backup_evidence != tuple(
             asset.evidence for asset in _backup_assets
         ):
             raise ValueError("activation backup evidence is inconsistent")
         if type(_sealed_stage) is not SealedStage:
             raise TypeError("activation sealed stage is invalid")
+        if prior_canonical_store_id is not None and (
+            type(prior_canonical_store_id) is not str
+            or not prior_canonical_store_id.strip()
+        ):
+            raise TypeError(
+                "prior canonical store id must be a non-empty string or None"
+            )
+        if (
+            prior_canonical_store_id is not None
+            and prior_canonical_store_id == canonical_store_id
+        ):
+            raise ValueError(
+                "explicit replacement must use a different canonical store id"
+            )
         for name, value in (
             ("preparation_id", preparation_id),
             ("resource_id", resource_id),
             ("target_identity", target_identity),
             ("canonical_store_id", canonical_store_id),
+            ("prior_canonical_store_id", prior_canonical_store_id),
             ("expected_prior_generation", expected_prior_generation),
             ("gate_b_grant_digest", gate_b_grant_digest),
             ("had_prior_canonical", had_prior_canonical),
+            ("prior_manifest_absent", prior_manifest_absent),
             ("backup_evidence", backup_evidence),
             ("_token", _token),
             ("_physical_snapshot", _physical_snapshot),
@@ -464,6 +494,7 @@ _ACTIVATION_JOURNAL_OPTIONAL_IDENTITY_PAIR_FIELDS = frozenset(
 _ACTIVATION_JOURNAL_PRIOR_OPTIONAL_FIELDS = frozenset(
     {
         "prior_binding_snapshot_id",
+        "prior_canonical_store_id",
         "prior_db_backup_digest",
         "prior_db_backup_identity",
         "prior_db_backup_path",
@@ -491,6 +522,7 @@ _ACTIVATION_JOURNAL_RECORD_FIELDS = frozenset(
         "had_prior_canonical",
         "phase",
         "prior_generation",
+        "prior_manifest_absent",
     }
 )
 
@@ -523,6 +555,7 @@ class _ActivationJournalRecord:
     resource_id: str
     target_identity: str
     canonical_store_id: str
+    prior_canonical_store_id: str | None
     expected_prior_generation: int | None
     prior_generation: int | None
     gate_b_grant_digest: str
@@ -540,6 +573,7 @@ class _ActivationJournalRecord:
     candidate_manifest_temp_identity: tuple[int, int]
     source_jsonl_identity: tuple[int, int]
     had_prior_canonical: bool
+    prior_manifest_absent: bool
     prior_binding_snapshot_id: str | None
     prior_receipt_digest: str | None
     prior_manifest_digest: str | None
@@ -1849,6 +1883,7 @@ def _terminal_new_authority_closes_main_prior(
         or main_record.prior_db_path is None
         or main_record.prior_db_identity is None
         or main_record.prior_db_digest is None
+        or main_record.prior_manifest_absent
         or main_record.prior_manifest_path is None
         or main_record.prior_manifest_identity is None
         or main_record.prior_manifest_digest is None
@@ -1903,6 +1938,8 @@ def _terminal_prior_closure_matches(
         or terminal_record.prior_db_path != main_record.prior_db_path
         or terminal_record.prior_db_identity != main_record.prior_db_identity
         or terminal_record.prior_db_digest != main_record.prior_db_digest
+        or terminal_record.prior_manifest_absent
+        != main_record.prior_manifest_absent
         or terminal_record.prior_manifest_path
         != main_record.prior_manifest_path
         or terminal_record.prior_manifest_identity
@@ -1953,6 +1990,8 @@ def _rollback_terminal_prior_closes(
         or terminal_record.prior_generation != main_record.prior_generation
         or terminal_record.prior_db_path != main_record.prior_db_path
         or terminal_record.prior_db_digest != main_record.prior_db_digest
+        or terminal_record.prior_manifest_absent
+        != main_record.prior_manifest_absent
         or terminal_record.prior_manifest_path
         != main_record.prior_manifest_path
         or terminal_record.prior_manifest_digest
@@ -1993,8 +2032,6 @@ def _activation_terminal_coexistence_valid(
         terminal_record.journal_version != _ACTIVATION_JOURNAL_VERSION
         or terminal_record.resource_id != main_record.resource_id
         or terminal_record.target_identity != main_record.target_identity
-        or terminal_record.canonical_store_id
-        != main_record.canonical_store_id
     ):
         return False
     if main_record.phase is _ActivationJournalPhase.GENERATION_PUBLISHED:
@@ -2002,9 +2039,13 @@ def _activation_terminal_coexistence_valid(
             terminal_record.phase
             is not _ActivationJournalPhase.GENERATION_PUBLISHED
         ):
-            return _rollback_terminal_prior_closes(
-                terminal_record,
-                main_record,
+            return (
+                terminal_record.canonical_store_id
+                == main_record.canonical_store_id
+                and _rollback_terminal_prior_closes(
+                    terminal_record,
+                    main_record,
+                )
             )
         if terminal_record == main_record:
             return True
@@ -2018,8 +2059,15 @@ def _activation_terminal_coexistence_valid(
             main_record,
         )
     return (
-        _terminal_prior_closure_matches(terminal_record, main_record)
-        or _rollback_terminal_prior_closes(terminal_record, main_record)
+        (
+            terminal_record.canonical_store_id
+            == main_record.canonical_store_id
+            and _rollback_terminal_prior_closes(
+                terminal_record,
+                main_record,
+            )
+        )
+        or _terminal_prior_closure_matches(terminal_record, main_record)
     )
 
 
@@ -2044,18 +2092,22 @@ def _remove_journal_proven_backups(
         return
     owned: list[_OwnedRecoveryPath] = []
     expected_digests: list[str] = []
-    for path, identity_value, digest_value in (
+    _backup_triples = [
         (
             record.prior_db_backup_path,
             record.prior_db_backup_identity,
             record.prior_db_backup_digest,
         ),
-        (
-            record.prior_manifest_backup_path,
-            record.prior_manifest_backup_identity,
-            record.prior_manifest_backup_digest,
-        ),
-    ):
+    ]
+    if not record.prior_manifest_absent:
+        _backup_triples.append(
+            (
+                record.prior_manifest_backup_path,
+                record.prior_manifest_backup_identity,
+                record.prior_manifest_backup_digest,
+            )
+        )
+    for path, identity_value, digest_value in _backup_triples:
         if path is None or identity_value is None or digest_value is None:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_MISMATCH",
@@ -2271,6 +2323,7 @@ def _capture_pre_drain_assets(
     view: _SQLiteGenerationView | None,
     *,
     identity: CanonicalResourceIdentity,
+    replacement: bool = False,
 ) -> tuple[_PriorAssetCapture, ...]:
     if view is None:
         _require_first_activation_absence(identity)
@@ -2280,20 +2333,28 @@ def _capture_pre_drain_assets(
                 asset_kind="SOURCE",
             ),
         )
-    return (
+    captures = [
         _capture_activation_file(
             view.stage.staged_db_path,
             asset_kind="DATABASE",
         ),
-        _capture_activation_file(
-            identity.snapshot_manifest_path,
-            asset_kind="MANIFEST",
-        ),
+    ]
+    if not replacement or _lstat_any_entry(
+        identity.snapshot_manifest_path
+    ):
+        captures.append(
+            _capture_activation_file(
+                identity.snapshot_manifest_path,
+                asset_kind="MANIFEST",
+            )
+        )
+    captures.append(
         _capture_activation_file(
             identity.configured_jsonl_path,
             asset_kind="SOURCE",
-        ),
+        )
     )
+    return tuple(captures)
 
 
 
@@ -2536,15 +2597,18 @@ def _create_recovery_backups(
     *,
     preparation_id: str,
     owned_paths: list[_OwnedRecoveryPath],
+    manifest_absent: bool = False,
 ) -> tuple[_RecoveryBackupAsset, ...]:
     backup_captures = tuple(
         capture
         for capture in captures
         if capture.asset_kind in {"DATABASE", "MANIFEST"}
     )
+    expected_kinds = (
+        ("DATABASE",) if manifest_absent else ("DATABASE", "MANIFEST")
+    )
     if tuple(capture.asset_kind for capture in backup_captures) != (
-        "DATABASE",
-        "MANIFEST",
+        expected_kinds
     ):
         raise ActivationPreparationError(
             "ACTIVATION.PRIOR_ASSET_SET_INCOMPLETE",
@@ -3507,11 +3571,13 @@ def _activation_journal_record_payload(
         ),
         "candidate_stage_db_path": str(record.candidate_stage_db_path),
         "canonical_store_id": record.canonical_store_id,
+        "prior_canonical_store_id": record.prior_canonical_store_id,
         "evidence_digest": record.evidence_digest,
         "expected_prior_generation": record.expected_prior_generation,
         "gate_b_grant_digest": record.gate_b_grant_digest,
         "had_prior_canonical": record.had_prior_canonical,
         "journal_id": record.journal_id,
+        "prior_manifest_absent": record.prior_manifest_absent,
         "journal_path": str(record.journal_path),
         "journal_version": record.journal_version,
         "manifest_temp_digest": record.manifest_temp_digest,
@@ -3754,6 +3820,10 @@ def _decode_activation_journal_record(
             mapping["canonical_store_id"],
             "canonical_store_id",
         ),
+        prior_canonical_store_id=_decode_optional_journal_identity(
+            mapping["prior_canonical_store_id"],
+            "prior_canonical_store_id",
+        ),
         expected_prior_generation=_decode_journal_optional_int(
             mapping["expected_prior_generation"],
             "expected_prior_generation",
@@ -3821,6 +3891,10 @@ def _decode_activation_journal_record(
         had_prior_canonical=_decode_journal_bool(
             mapping["had_prior_canonical"],
             "had_prior_canonical",
+        ),
+        prior_manifest_absent=_decode_journal_bool(
+            mapping["prior_manifest_absent"],
+            "prior_manifest_absent",
         ),
         prior_binding_snapshot_id=_decode_optional_journal_identity(
             mapping["prior_binding_snapshot_id"],
@@ -4015,6 +4089,20 @@ def _validate_activation_journal_record(
         value = getattr(record, field_name)
         if value is not None:
             _validate_journal_native_identity_pair(value, field_name)
+    if record.prior_canonical_store_id is not None and (
+        type(record.prior_canonical_store_id) is not str
+        or not record.prior_canonical_store_id.strip()
+    ):
+        raise TypeError(
+            "prior canonical store id must be a non-empty string or None"
+        )
+    if (
+        record.prior_canonical_store_id is not None
+        and record.prior_canonical_store_id == record.canonical_store_id
+    ):
+        raise ValueError(
+            "explicit replacement must use a different canonical store id"
+        )
     if record.expected_prior_generation is not None and (
         record.expected_prior_generation < 0
     ):
@@ -4035,18 +4123,12 @@ def _validate_activation_journal_record(
             or record.expected_prior_generation != record.prior_generation
             or record.prior_binding_snapshot_id is None
             or record.prior_receipt_digest is None
-            or record.prior_manifest_digest is None
             or record.prior_db_path is None
-            or record.prior_manifest_path is None
             or record.prior_db_digest is None
             or record.prior_db_identity is None
-            or record.prior_manifest_identity is None
             or record.prior_db_backup_path is None
-            or record.prior_manifest_backup_path is None
             or record.prior_db_backup_digest is None
-            or record.prior_manifest_backup_digest is None
             or record.prior_db_backup_identity is None
-            or record.prior_manifest_backup_identity is None
         ):
             raise ValueError(
                 "activation journal prior facts are incomplete"
@@ -4055,16 +4137,47 @@ def _validate_activation_journal_record(
             raise ValueError(
                 "activation journal prior database digest does not close"
             )
-        if (
-            record.prior_manifest_digest
-            != record.prior_manifest_backup_digest
-        ):
-            raise ValueError(
-                "activation journal prior manifest digest does not close"
-            )
+        if record.prior_manifest_absent:
+            if (
+                record.prior_manifest_path is not None
+                or record.prior_manifest_digest is not None
+                or record.prior_manifest_identity is not None
+                or record.prior_manifest_backup_path is not None
+                or record.prior_manifest_backup_digest is not None
+                or record.prior_manifest_backup_identity is not None
+            ):
+                raise ValueError(
+                    "activation journal absent prior manifest must not "
+                    "carry manifest facts"
+                )
+        else:
+            if (
+                record.prior_manifest_path is None
+                or record.prior_manifest_digest is None
+                or record.prior_manifest_identity is None
+                or record.prior_manifest_backup_path is None
+                or record.prior_manifest_backup_digest is None
+                or record.prior_manifest_backup_identity is None
+            ):
+                raise ValueError(
+                    "activation journal prior facts are incomplete"
+                )
+            if (
+                record.prior_manifest_digest
+                != record.prior_manifest_backup_digest
+            ):
+                raise ValueError(
+                    "activation journal prior manifest digest does not close"
+                )
     else:
+        if record.prior_manifest_absent:
+            raise ValueError(
+                "first activation journal must explicitly encode "
+                "manifest absence as false"
+            )
         if (
-            record.prior_generation is not None
+            record.prior_canonical_store_id is not None
+            or record.prior_generation is not None
             or record.expected_prior_generation is not None
             or record.prior_binding_snapshot_id is not None
             or record.prior_receipt_digest is not None

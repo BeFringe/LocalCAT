@@ -731,9 +731,11 @@ def _grant_report(
         candidate_index_version=recomputed.facts.index_version,
         fold_version=recomputed.facts.fold_version,
         origin_batch_count=recomputed.facts.origin_batch_count,
-        migration_batch_id=(
-            f"migration.{recomputed.facts.receipt.jsonl_digest}"
-        ),
+        # The frozen field name is the historical migration seam; the value
+        # carries the actual single origin batch id (``migration.<digest>``
+        # for migration origins, ``import.<uuid>`` for explicit imports) so
+        # Gate B binds the exact batch the activation will publish.
+        migration_batch_id=recomputed.facts.origin_batch_id,
         completed_revision=recomputed.facts.receipt.exported_revision,
         source_digest=recomputed.facts.receipt.jsonl_digest,
         record_count=recomputed.facts.record_count,

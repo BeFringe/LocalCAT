@@ -80,6 +80,8 @@ class _StageFacts:
     extension_loading_enabled: bool
     record_count: int
     origin_batch_count: int
+    origin_batch_id: str
+    origin_batch_kind: str
     fts_count: int
     gram_counts: tuple[tuple[int, int], ...]
     receipt: SnapshotReceipt
@@ -561,6 +563,27 @@ def _stage_closure_digest(connection: sqlite3.Connection) -> str:
     return digest.hexdigest()
 
 
+def _import_batch_token(batch_id: str) -> str:
+    """Return the 32-hex token of one import-shaped origin batch id.
+
+    Explicit import origins (Task 5.10) use a fresh collision-resistant
+    ``import.<uuid4-hex>`` batch id that is not derivable from the source
+    bytes; the sealer proves the shape and binds the snapshot receipt id
+    to the same token so StageSealer recomputation and Gate B observe the
+    exact one batch the activation will publish.
+    """
+
+    if not batch_id.startswith("import."):
+        raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+    token = batch_id[len("import."):]
+    if len(token) != 32 or any(
+        character not in "0123456789abcdef"
+        for character in token
+    ):
+        raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+    return token
+
+
 def _validate_stage_facts(
     stage: MutableStageRef,
     *,
@@ -632,7 +655,10 @@ def _validate_stage_facts(
                     batch[8],
                     "batch completed_revision",
                 )
-                if batch_kind != "migration" or batch_status != "completed":
+                if (
+                    batch_kind not in {"migration", "import"}
+                    or batch_status != "completed"
+                ):
                     raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
                 if batch_completed_revision != 1:
                     raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
@@ -744,17 +770,27 @@ def _validate_stage_facts(
                 if record is not None:
                     raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
                 source_digest = scan_digest.hexdigest()
+                if batch_kind == "migration":
+                    if batch_id != f"migration.{source_digest}":
+                        raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
+                    expected_snapshot_id = (
+                        f"snapshot.migration.{source_digest[:24]}"
+                    )
+                elif batch_kind == "import":
+                    import_token = _import_batch_token(batch_id)
+                    expected_snapshot_id = (
+                        f"snapshot.import.{import_token[:24]}"
+                    )
+                else:
+                    raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
                 if (
-                    batch_id != f"migration.{source_digest}"
-                    or batch_source_digest != source_digest
+                    batch_source_digest != source_digest
                     or batch_valid_count != valid_count
                     or batch_invalid_count != invalid_count
                     or batch_duplicate_count != duplicate_source_count
                 ):
                     raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
-                if receipt.snapshot_id != (
-                    f"snapshot.migration.{source_digest[:24]}"
-                ):
+                if receipt.snapshot_id != expected_snapshot_id:
                     raise StageSealError("SEALER.RECEIPT_INVALID")
                 if receipt.jsonl_digest != source_digest:
                     raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
@@ -817,6 +853,8 @@ def _validate_stage_facts(
             extension_loading_enabled=schema.extension_loading_enabled,
             record_count=valid_count,
             origin_batch_count=1,
+            origin_batch_id=batch_id,
+            origin_batch_kind=batch_kind,
             fts_count=fts_count,
             gram_counts=tuple(
                 (size, gram_counts[size]) for size in required_sizes
