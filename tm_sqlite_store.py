@@ -92,6 +92,7 @@ from tm_activation_journal import (
     _activation_journal_path,
     _activation_journal_record_payload,
     _activation_journal_temp_path,
+    _activation_lineage_marker_path,
     _activation_quarantine_directory,
     _activation_rollback_eligible,
     _activation_terminal_coexistence_valid,
@@ -122,6 +123,7 @@ from tm_activation_journal import (
     _fsync_recovery_deletion_directory,
     _fsync_recovery_directory,
     _lstat_activation_journal_identity,
+    _lstat_activation_lineage_marker_identity,
     _lstat_activation_terminal_identity,
     _lstat_any_entry,
     _open_activation_journal_temp,
@@ -754,6 +756,14 @@ class _CoordinatorStorePort:
         return self._coordinator._cleanup_in_progress
 
     @property
+    def active_lease_count(self) -> int:
+        return self._coordinator._active_lease_count
+
+    @property
+    def drain_timeout_seconds(self) -> float:
+        return self._coordinator._drain_timeout_seconds
+
+    @property
     def sealed_registry(self) -> Any:
         return self._coordinator._sealed_registry
 
@@ -761,6 +771,70 @@ class _CoordinatorStorePort:
 
     def notify_all(self) -> None:
         self._coordinator._condition.notify_all()
+
+    def drain_for_transition(self) -> None:
+        """Stop new leases, drain live leases, prove the view, then ACTIVATING.
+
+        Recovery and rollback call this port operation while the coordinator
+        condition is held and before any journal/disk mutation.  ``READY ->
+        DRAINING`` makes ``_operation_lease`` reject new leases, the
+        condition is released by ``wait`` so in-flight leases can complete
+        and decrement, and the view/generation is proven unchanged before
+        ``ACTIVATING``.  A drain timeout (or an observed view change)
+        restores ``READY`` and notifies waiters, leaving the resource in a
+        coherent non-transition state.
+        """
+
+        with self._coordinator._condition:
+            if (
+                self._coordinator._state != "READY"
+                or self._coordinator._preparation is not None
+                or self._coordinator._cleanup_reservation is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.CONCURRENT_PREPARATION",
+                    retryable=True,
+                )
+            initial_view = self._coordinator._view
+            initial_generation = (
+                None
+                if initial_view is None
+                else initial_view.generation
+            )
+            self._coordinator._state = "DRAINING"
+            self._coordinator._condition.notify_all()
+            deadline = (
+                time.monotonic() + self._coordinator._drain_timeout_seconds
+            )
+            try:
+                while self._coordinator._active_lease_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.DRAIN_TIMEOUT",
+                            retryable=True,
+                        )
+                    self._coordinator._condition.wait(remaining)
+                current_view = self._coordinator._view
+                current_generation = (
+                    None
+                    if current_view is None
+                    else current_view.generation
+                )
+                if (
+                    current_view is not initial_view
+                    or current_generation != initial_generation
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+            except BaseException:
+                self._coordinator._state = "READY"
+                self._coordinator._condition.notify_all()
+                raise
+            self._coordinator._state = "ACTIVATING"
+            self._coordinator._condition.notify_all()
 
     def open_configured_connection(
         self,
@@ -883,6 +957,76 @@ class _CoordinatorStorePort:
         record: _ActivationJournalRecord,
     ) -> _ActivationFileIdentity:
         return self._coordinator._write_activation_terminal_locked(record)
+
+    @property
+    def stage_seal_error(self) -> type[RuntimeError]:
+        """The registry's StageSealError type used by readiness/token seams."""
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        return stage_seal_error
+
+    def validate_stage_facts(
+        self,
+        stage_ref: Any,
+        *,
+        canonical_store_id: str,
+    ) -> Any:
+        """Re-prove one SEALED stage's seal facts from disk (sealer seam)."""
+
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return stage_sealer._validate_stage_facts(
+            cast(Any, stage_ref),
+            canonical_store_id=canonical_store_id,
+            allow_sealed=True,
+        )
+
+    def accepted_jsonl_row(
+        self,
+        payload: object,
+    ) -> tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ] | None:
+        """One migration-accepted JSONL row, or None when rejected."""
+
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return stage_sealer._accepted_jsonl_row(payload)
+
+    def build_sealed_binding(
+        self,
+        identity: CanonicalResourceIdentity,
+        receipt: SnapshotReceipt,
+        manifest: SnapshotManifest,
+    ) -> SnapshotBinding:
+        """Deterministic MIGRATION_SOURCE snapshot binding construction."""
+
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return stage_sealer._build_binding(identity, receipt, manifest)
+
+    def build_seal_evidence(
+        self,
+        facts: Any,
+        binding: SnapshotBinding,
+        *,
+        stage_file_digest: str,
+        manifest_temp_digest: str,
+    ) -> Any:
+        """Reconstruct one sealed stage's validation evidence from facts."""
+
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return stage_sealer._build_evidence(
+            facts,
+            binding,
+            stage_file_digest=stage_file_digest,
+            manifest_temp_digest=manifest_temp_digest,
+        )
 
     def advance_after_effect(
         self,
@@ -1106,6 +1250,51 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.RECOVERY_PENDING",
                     retryable=False,
                 )
+            terminal_path = _activation_terminal_path(self._resource_identity)
+            try:
+                terminal_identity = _lstat_activation_terminal_identity(
+                    terminal_path
+                )
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_PENDING",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+            if journal_identity is None and terminal_identity is None:
+                marker_path = _activation_lineage_marker_path(
+                    self._resource_identity
+                )
+                try:
+                    marker_identity = (
+                        _lstat_activation_lineage_marker_identity(
+                            marker_path
+                        )
+                    )
+                except ActivationPreparationError as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PENDING",
+                        retryable=False,
+                        reason_code=error.code,
+                    ) from error
+                pair_present = (
+                    _lstat_any_entry(
+                        self._resource_identity.canonical_sidecar_path
+                    )
+                    or _lstat_any_entry(
+                        self._resource_identity.snapshot_manifest_path
+                    )
+                )
+                if pair_present and marker_identity is None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PENDING",
+                        retryable=False,
+                    )
+                if marker_identity is not None and not pair_present:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PENDING",
+                        retryable=False,
+                    )
             initial_view = self._view
             initial_generation = (
                 None if initial_view is None else initial_view.generation

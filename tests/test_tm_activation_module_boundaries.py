@@ -25,6 +25,23 @@ def _imported_modules(path: Path) -> set[str]:
     return modules
 
 
+def _dynamic_imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "import_module"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            modules.add(first.value)
+    return modules
+
+
 class TMActivationModuleBoundariesTest(unittest.TestCase):
     def test_recovery_module_never_imports_the_store(self) -> None:
         path = PROJECT_ROOT / "tm_activation_recovery.py"
@@ -48,7 +65,8 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
         )
 
     def test_recovery_module_imports_only_contracts_journal_and_stdlib(self) -> None:
-        modules = _imported_modules(PROJECT_ROOT / "tm_activation_recovery.py")
+        path = PROJECT_ROOT / "tm_activation_recovery.py"
+        modules = _imported_modules(path)
         self.assertIn("tm_contracts", modules)
         self.assertIn("tm_activation_journal", modules)
         for module in modules:
@@ -57,6 +75,18 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
             if module.startswith("tm_contracts"):
                 continue
             self.assertIn(module, sys.stdlib_module_names, module)
+        # Literal dynamic imports (importlib.import_module) are forbidden
+        # too: recovery depends only on contracts, journal, stdlib, and
+        # the explicit store validation port.
+        self.assertEqual(_dynamic_imported_modules(path), set())
+
+    def test_recovery_module_has_no_stage_sealer_reference(self) -> None:
+        path = PROJECT_ROOT / "tm_activation_recovery.py"
+        py_compile.compile(str(path), doraise=True)
+        source = path.read_text(encoding="utf-8")
+        self.assertNotIn("tm_stage_sealer", source)
+        self.assertNotIn("StageSealError", source)
+        self.assertNotIn("import_module", source)
 
     def test_store_reexports_former_private_activation_names(self) -> None:
         for name in (

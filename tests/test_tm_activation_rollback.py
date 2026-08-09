@@ -286,16 +286,36 @@ class RollbackFirstActivationTests(unittest.TestCase):
                 ),
             )
             self.assertIsNone(recovered.current_generation)
-            _assert_first_activation_rolled_back(
-                self,
-                identity,
-                record,
-                journal_path,
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
                 source_bytes,
-                "MANIFEST_PUBLISHED",
-                expected_quarantine={
-                    identity.snapshot_manifest_path.name,
-                },
+            )
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertFalse(journal_path.exists())
+            terminal_path = _activation_terminal_path(identity)
+            self.assertTrue(terminal_path.is_file())
+            self.assertEqual(
+                set(_quarantine_entries(identity, record)),
+                {identity.snapshot_manifest_path.name},
+            )
+            # The new canonical DB inode was externally deleted before the
+            # rollback could quarantine it, so candidate retirement cannot
+            # be proven from the deterministic quarantine directory: the
+            # terminal replay fails closed instead of accepting bare
+            # absence, and the legacy JSONL stays intact.
+            fresh = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                fresh.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.QUARANTINE_MISSING",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(fresh.state, "ACTIVATING")
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
             )
 
     def test_manifest_published_receipt_tamper_rolls_back(self) -> None:

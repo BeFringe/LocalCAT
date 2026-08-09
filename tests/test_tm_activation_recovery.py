@@ -271,8 +271,18 @@ class ActivationRecoveryCancelTests(unittest.TestCase):
                     self.assertFalse(
                         identity.snapshot_manifest_path.exists()
                     )
-                    self.assertTrue(candidate_db.is_file())
-                    self.assertTrue(candidate_manifest.is_file())
+                    self.assertFalse(candidate_db.exists())
+                    self.assertFalse(candidate_manifest.exists())
+                    quarantine_dir = (
+                        store_module._activation_quarantine_directory(
+                            identity,
+                            journal._record,
+                        )
+                    )
+                    self.assertEqual(
+                        {entry.name for entry in quarantine_dir.iterdir()},
+                        {candidate_db.name, candidate_manifest.name},
+                    )
                     self.assertEqual(
                         identity.configured_jsonl_path.read_bytes(),
                         SOURCE_BYTES,
@@ -946,16 +956,29 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             real_write = store_module._write_activation_journal_bytes
             calls = {"count": 0}
 
-            def fail_second_write(descriptor: int, payload: bytes) -> None:
+            def fail_generation_journal_write(
+                descriptor: int,
+                payload: bytes,
+            ) -> None:
                 calls["count"] += 1
-                if calls["count"] == 2:
+                try:
+                    parsed = _parse_activation_journal_bytes(
+                        payload,
+                        expected_journal_path=journal_path,
+                    )
+                except Exception:
+                    parsed = None
+                if (
+                    parsed is not None
+                    and parsed.phase is GENERATION_PUBLISHED
+                ):
                     raise OSError("injected generation journal write")
                 real_write(descriptor, payload)
 
             first = _fresh(identity)
             with patch(
                 "tm_activation_journal._write_activation_journal_bytes",
-                side_effect=fail_second_write,
+                side_effect=fail_generation_journal_write,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()

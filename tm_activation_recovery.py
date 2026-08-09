@@ -12,7 +12,6 @@ has no dependency on the store module.  The coordinator in
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import sqlite3
@@ -54,15 +53,19 @@ from tm_activation_journal import (
     _activation_file_identity,
     _activation_journal_path,
     _activation_journal_temp_path,
+    _activation_lineage_marker_path,
+    _activation_lineage_marker_temp_path,
     _activation_rollback_eligible,
     _activation_terminal_coexistence_valid,
     _activation_terminal_path,
     _activation_terminal_temp_path,
     _capture_activation_file,
+    _ensure_activation_lineage_marker,
     _fsync_activation_directory,
     _fsync_activation_file,
     _fsync_recovery_backup,
     _lstat_activation_journal_identity,
+    _lstat_activation_lineage_marker_identity,
     _lstat_activation_terminal_identity,
     _lstat_any_entry,
     _open_activation_journal_temp,
@@ -70,6 +73,7 @@ from tm_activation_journal import (
     _quarantine_failed_activation_artifacts,
     _read_activation_file_bytes,
     _read_activation_journal_file,
+    _read_activation_lineage_marker,
     _remove_journal_proven_backups,
     _remove_orphaned_activation_temp,
     _remove_orphaned_rollback_temp,
@@ -77,6 +81,7 @@ from tm_activation_journal import (
     _remove_owned_activation_terminal_final,
     _replace_activation_file,
     _replay_activation_journal,
+    _retire_cancelled_candidate_assets,
     _require_first_activation_absence,
     _rollback_terminal_prior_closes,
     _write_recovery_backup,
@@ -121,11 +126,32 @@ class _StoreValidationPort(Protocol):
     def cleanup_in_progress(self) -> bool: ...
 
     @property
+    def active_lease_count(self) -> int: ...
+
+    @property
+    def drain_timeout_seconds(self) -> float: ...
+
+    @property
     def sealed_registry(self) -> Any: ...
 
     store_schema_error: type[RuntimeError]
 
     def notify_all(self) -> None: ...
+
+    def drain_for_transition(self) -> None:
+        """Stop new leases, drain live leases, prove the view, then ACTIVATING.
+
+        Narrow coordinator port operation used by recovery/rollback before
+        any disk mutation: the coordinator condition is held for the whole
+        transition, ``READY -> DRAINING`` rejects new operation leases, the
+        condition is released while waiting so in-flight leases can finish
+        and decrement, and the view/generation must be unchanged before
+        ``ACTIVATING``.  A drain timeout or an observed view change restores
+        ``READY`` and notifies waiters so the resource is left in a coherent
+        non-transition state with no disk/generation transition.
+        """
+        ...
+
     def open_configured_connection(
         self,
         database_path: Path,
@@ -191,6 +217,60 @@ class _StoreValidationPort(Protocol):
         self,
         record: _ActivationJournalRecord,
     ) -> _ActivationFileIdentity: ...
+
+    @property
+    def stage_seal_error(self) -> type[RuntimeError]:
+        """The registry's sealed-mode error type for readiness/token seams."""
+        ...
+
+    def validate_stage_facts(
+        self,
+        stage_ref: Any,
+        *,
+        canonical_store_id: str,
+    ) -> Any:
+        """Re-prove one SEALED stage's seal facts from disk.
+
+        Mirrors the stage sealer's private sealed-mode validation so this
+        module never imports the sealer: the returned facts carry
+        resource/target identity, schema/fold/index versions, record/origin/
+        FTS counts, gram counts, exact parity digest, and the ledger receipt.
+        """
+        ...
+
+    def accepted_jsonl_row(
+        self,
+        payload: object,
+    ) -> tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ] | None:
+        """One migration-accepted JSONL row, or None when rejected."""
+        ...
+
+    def build_sealed_binding(
+        self,
+        identity: CanonicalResourceIdentity,
+        receipt: SnapshotReceipt,
+        manifest: SnapshotManifest,
+    ) -> SnapshotBinding:
+        """Deterministic MIGRATION_SOURCE snapshot binding construction."""
+        ...
+
+    def build_seal_evidence(
+        self,
+        facts: Any,
+        binding: SnapshotBinding,
+        *,
+        stage_file_digest: str,
+        manifest_temp_digest: str,
+    ) -> Any:
+        """Reconstruct one sealed stage's validation evidence from facts."""
+        ...
 
 
 class _CoordinatorPublishPort(_StoreValidationPort, Protocol):
@@ -591,11 +671,9 @@ def _validate_replaced_activation_database(
         )
     active_ref = _canonical_activation_ref(identity, journal_id=record.journal_id)
     try:
-        stage_sealer = importlib.import_module("tm_stage_sealer")
-        facts = stage_sealer._validate_stage_facts(
-            cast(MutableStageRef, cast(object, active_ref)),
+        facts = port.validate_stage_facts(
+            active_ref,
             canonical_store_id=canonical_store_id,
-            allow_sealed=True,
         )
         snapshot = port.inspect_stage_schema(
             active_ref,
@@ -1078,6 +1156,12 @@ def _restore_activation_file(
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         source_descriptor = os.open(backup_path, flags)
+        source_observed = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_observed.st_mode)
+            or source_observed.st_nlink != 1
+        ):
+            raise OSError("rollback backup is not an exact single-link file")
         temp_descriptor, temp_identity = _open_activation_journal_temp(
             temp_path
         )
@@ -1297,11 +1381,13 @@ def _recovery_expected_manifest_bytes(
     return contract_to_json(manifest).encode("utf-8")
 
 
-def _recovery_jsonl_winners_digest(path: Path) -> str:
+def _recovery_jsonl_winners_digest(
+    port: _StoreValidationPort,
+    path: Path,
+) -> str:
     """Last-valid-wins exact winners digest over the configured JSONL."""
 
-    stage_sealer = importlib.import_module("tm_stage_sealer")
-    accepted_row = stage_sealer._accepted_jsonl_row
+    accepted_row = port.accepted_jsonl_row
 
     def reject_non_finite(value: str) -> None:
         raise ValueError(f"non-finite JSON number is not allowed: {value}")
@@ -1720,6 +1806,7 @@ def _revalidate_recovered_prior_set(
 
 
 def _revalidate_recovered_sealed_database(
+    port: _StoreValidationPort,
     record: _ActivationJournalRecord,
     *,
     stage_ref: _StoreRuntimeRef,
@@ -1738,7 +1825,6 @@ def _revalidate_recovered_sealed_database(
     sealed stage.
     """
 
-    stage_sealer = importlib.import_module("tm_stage_sealer")
     database_capture = _capture_journal_closure_file(database_path)
     if (
         (database_capture[0].device, database_capture[0].inode)
@@ -1750,10 +1836,9 @@ def _revalidate_recovered_sealed_database(
             retryable=False,
         )
     try:
-        facts = stage_sealer._validate_stage_facts(
-            cast(MutableStageRef, cast(object, stage_ref)),
+        facts = port.validate_stage_facts(
+            stage_ref,
             canonical_store_id=canonical_store_id,
-            allow_sealed=True,
         )
     except Exception as error:
         raise ActivationPreparationError(
@@ -1806,8 +1891,8 @@ def _revalidate_recovered_sealed_database(
             "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
             retryable=False,
         )
-    binding = stage_sealer._build_binding(identity, receipt, manifest)
-    evidence = stage_sealer._build_evidence(
+    binding = port.build_sealed_binding(identity, receipt, manifest)
+    evidence = port.build_seal_evidence(
         facts,
         binding,
         stage_file_digest=record.stage_db_digest,
@@ -1937,7 +2022,7 @@ def _revalidate_recovered_active_set(
                     binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
-                jsonl_parity = _recovery_jsonl_winners_digest(
+                jsonl_parity = _recovery_jsonl_winners_digest(port,
                     identity.configured_jsonl_path
                 )
                 if (
@@ -2110,7 +2195,7 @@ def _revalidate_discovered_active_set(
                     binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
-                if _recovery_jsonl_winners_digest(
+                if _recovery_jsonl_winners_digest(port,
                     identity.configured_jsonl_path
                 ) != _activation_exact_parity_digest(port, connection):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
@@ -2623,25 +2708,114 @@ def _rollback_inconsistent_activation(
     )
 
 
+def _require_cancelled_lineage_consistency(
+    identity: CanonicalResourceIdentity,
+    *,
+    had_prior_canonical: bool,
+) -> None:
+    """Validate the write-once lineage fact before a PREPARED cancellation.
+
+    A cancellation returns to a prior canonical generation only when the
+    durable activated-lineage marker exists and revalidates for the stable
+    identity (the resource crossed physical activation before).  A
+    cancelled first activation was genuinely never activated, so the
+    marker final and temporary must both be absent; a foreign, tampered,
+    hardlinked, or leftover marker/temp fails closed because it would
+    otherwise turn a never-activated legacy resource into a
+    claimed-activated one.
+    """
+
+    marker_path = _activation_lineage_marker_path(identity)
+    marker_identity = _lstat_activation_lineage_marker_identity(
+        marker_path
+    )
+    if had_prior_canonical:
+        if marker_identity is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        _read_activation_lineage_marker(
+            marker_path,
+            identity=identity,
+        )
+        return
+    if marker_identity is not None:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    if _lstat_any_entry(
+        _activation_lineage_marker_temp_path(marker_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+
+
 def _discover_active_canonical(
     port: _StoreValidationPort,
 ) -> ActivationRecoveryReport | None:
     """Re-prove and rehydrate the active canonical generation (no journal).
 
     With no journal on disk the deterministic canonical sidecar/manifest
-    pair is the only surviving authority.  A fully validated completed
-    activation is hydrated into the one in-memory view and reported as a
-    terminal COMPLETED; an absent pair is the unchanged legacy state
-    (``None``); anything partial, foreign, or tampered fails closed in
-    ``ACTIVATING`` and never authorizes a store.
+    pair is the only surviving authority, and the write-once
+    activated-lineage marker is the persistent fact that distinguishes a
+    true never-activated legacy resource from a resource that crossed
+    physical activation but lost its completed authority.  A fully
+    validated completed activation with a valid marker is hydrated into
+    the one in-memory view and reported as a terminal COMPLETED; an
+    absent pair with no marker is the unchanged legacy state (``None``);
+    a marker with a missing/partial/tampered pair, a pair without a valid
+    marker (authority with no transition record is never silently
+    trusted), or any foreign/tampered entry fails closed in ``ACTIVATING``
+    and never authorizes a store.
     """
 
     identity = port.resource_identity
+    marker_path = _activation_lineage_marker_path(identity)
+    try:
+        marker_identity = _lstat_activation_lineage_marker_identity(
+            marker_path
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
     if (
         not _lstat_any_entry(identity.canonical_sidecar_path)
         and not _lstat_any_entry(identity.snapshot_manifest_path)
     ):
+        if marker_identity is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                retryable=False,
+            )
+        if port.view is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                retryable=False,
+            )
         return None
+    if marker_identity is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    try:
+        _read_activation_lineage_marker(
+            marker_path,
+            identity=identity,
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
     try:
         generation, fts5_available = _revalidate_discovered_active_set(port,
             identity,
@@ -3002,7 +3176,7 @@ def _complete_prepared_cancellation(
         manifest_temp_path=record.candidate_manifest_temp_path,
     )
     try:
-        _revalidate_recovered_sealed_database(
+        _revalidate_recovered_sealed_database(port,
             record,
             stage_ref=candidate_ref,
             database_path=record.candidate_stage_db_path,
@@ -3031,6 +3205,10 @@ def _complete_prepared_cancellation(
         except ActivationPreparationError as error:
             raise _recovery_mismatch(error) from error
         fts5_available = False
+    _require_cancelled_lineage_consistency(
+        identity,
+        had_prior_canonical=record.had_prior_canonical,
+    )
     _remove_journal_proven_backups(record)
     _retire_coexisting_terminal(port, record)
     _ = port.write_terminal(record)
@@ -3038,6 +3216,13 @@ def _complete_prepared_cancellation(
         _activation_journal_path(identity),
         journal_identity,
     )
+    # The CANCELLED terminal and retired journal are durable, so the
+    # journal-proven candidate DB/manifest pair may now be quarantined:
+    # a crash at any boundary leaves main or terminal authority able to
+    # resume, and a fresh deterministic migration retry no longer hits
+    # MIGRATION.STAGE_SEALED.  Mutated/symlinked/hardlinked/foreign
+    # candidates fail closed and are never removed.
+    _retire_cancelled_candidate_assets(record, identity=identity)
     if record.had_prior_canonical:
         prior_db_path = record.prior_db_path
         prior_manifest_path = record.prior_manifest_path
@@ -3232,6 +3417,12 @@ def _recover_generation_publication(
         activation_digest=activation_digest,
         require_manifest_published=True,
     )
+    # The completed main journal is durable at GENERATION_PUBLISHED and the
+    # full active set is re-proven, so the write-once activated-lineage
+    # marker may be ensured.  A marker failure keeps the completed journal
+    # as the cold-recovery authority and the view is withheld under
+    # ACTIVATING for a fresh recovery to resume.
+    _ensure_activation_lineage_marker(identity)
     _remove_journal_proven_backups(record)
     return ActivationRecoveryReport(
         phase=report_phase.value,
@@ -3283,6 +3474,7 @@ def _replay_terminal_recovery(
         generation=next_generation,
         fts5_available=snapshot.fts5_available,
     )
+    _ensure_activation_lineage_marker(identity)
     _remove_journal_proven_backups(record)
     return ActivationRecoveryReport(
         phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
@@ -3312,11 +3504,17 @@ def _replay_cancelled_terminal_recovery(
             "ACTIVATION.RECOVERY_TERMINAL_INVALID",
             retryable=False,
         )
+    _require_cancelled_lineage_consistency(
+        identity,
+        had_prior_canonical=record.had_prior_canonical,
+    )
     if not record.had_prior_canonical:
         try:
             _require_first_activation_absence(identity)
         except ActivationPreparationError as error:
             raise _recovery_mismatch(error) from error
+        _remove_journal_proven_backups(record)
+        _retire_cancelled_candidate_assets(record, identity=identity)
         return None
     try:
         fts5_available = _revalidate_recovered_prior_set(port,
@@ -3334,6 +3532,12 @@ def _replay_cancelled_terminal_recovery(
     # cancellation already removed every backup before the terminal, so
     # this is a no-op for the unchanged-prior path.
     _remove_journal_proven_backups(record)
+    # A PREPARED cancellation retires the journal-proven candidate
+    # DB/manifest pair only after the CANCELLED terminal; a crash in that
+    # window leaves terminal-only state with the candidates still present,
+    # so the terminal replay finishes the retirement idempotently before
+    # reporting the prior/legacy state.
+    _retire_cancelled_candidate_assets(record, identity=identity)
     if (
         record.prior_db_path != identity.canonical_sidecar_path
         and _lstat_any_entry(identity.canonical_sidecar_path)
@@ -3564,6 +3768,15 @@ def _publish_activation_journal(
         )
     else:
         terminal_identity = coexisting[0]
+    # The superseded GENERATION_PUBLISHED record is the last authority
+    # that authenticates the completed activation's prior DB/manifest
+    # backups.  Both the main journal and its terminal mirror are durable
+    # at this point, so the journal-proven backups are cleaned idempotently
+    # (identity/digest-bound, parent fsync, never globbed) before the main
+    # journal is retired; a crash at every boundary leaves a main or
+    # terminal record able to resume the cleanup and no backup becomes
+    # ownerless.
+    _remove_journal_proven_backups(disk_record)
     _remove_owned_activation_journal_final(journal_path, existing)
     handle = port.write_journal(
         record,
@@ -3590,10 +3803,7 @@ def _build_activation_journal_record(
     phase, or mapping is accepted as authority.
     """
 
-    stage_seal_error = getattr(
-        importlib.import_module("tm_stage_sealer"),
-        "StageSealError",
-    )
+    stage_seal_error = port.stage_seal_error
     stage = preparation._sealed_stage
     token = preparation._token
     registry = cast(Any, port.sealed_registry)
@@ -3907,10 +4117,7 @@ def _revalidate_activation_journal_closure(
     coordinator/preparation change invalidates the journal.
     """
 
-    stage_seal_error = getattr(
-        importlib.import_module("tm_stage_sealer"),
-        "StageSealError",
-    )
+    stage_seal_error = port.stage_seal_error
     stage = preparation._sealed_stage
     token = preparation._token
     if type(stage) is not SealedStage:
@@ -4324,7 +4531,12 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
         )
     journal_path = _activation_journal_path(port.resource_identity)
     terminal_path = _activation_terminal_path(port.resource_identity)
-    port.state = "ACTIVATING"
+    # Recovery mutates durable authority files, so live operation leases
+    # must be drained first: READY -> DRAINING rejects new leases, the
+    # wait releases the coordinator condition so in-flight leases finish,
+    # the view/generation is proven unchanged, and only then ACTIVATING.
+    # A drain timeout restores READY without any disk transition.
+    port.drain_for_transition()
     try:
         try:
             journal_identity = _lstat_activation_journal_identity(
@@ -4374,10 +4586,10 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
             _remove_orphaned_activation_temp(terminal_temp_path)
         if journal_identity is None:
             if terminal_identity is None:
-                if port.view is not None:
-                    port.state = "READY"
-                    port.notify_all()
-                    return None
+                # A live in-memory view never bypasses the cold discovery:
+                # the marker and the active canonical pair are re-proven
+                # from disk (or fail closed), so a deleted/tampered
+                # authority is never silently trusted from caller memory.
                 report = _discover_active_canonical(port)
             else:
                 terminal_record = _load_recovery_terminal(port,
@@ -4532,10 +4744,7 @@ def rollback_durable_activation(
     :meth:`recover_durable_activation`.
     """
 
-    stage_seal_error = getattr(
-    importlib.import_module("tm_stage_sealer"),
-    "StageSealError",
-    )
+    stage_seal_error = port.stage_seal_error
     if (
         port.state not in {"READY", "ACTIVATING"}
         or port.cleanup_in_progress
@@ -4547,7 +4756,12 @@ def rollback_durable_activation(
         )
     journal_path = _activation_journal_path(port.resource_identity)
     terminal_path = _activation_terminal_path(port.resource_identity)
-    port.state = "ACTIVATING"
+    if port.state == "READY":
+        # A rollback invoked from READY mutates/switches the authority, so
+        # drain live leases first (READY -> DRAINING -> proven -> ACTIVATING).
+        # A fail-stopped ACTIVATING rollback needs no drain: ACTIVATING is
+        # entered only after a completed drain, so no lease can be live.
+        port.drain_for_transition()
     try:
         try:
             journal_identity = _lstat_activation_journal_identity(
@@ -4597,10 +4811,10 @@ def rollback_durable_activation(
             _remove_orphaned_activation_temp(terminal_temp_path)
         if journal_identity is None:
             if terminal_identity is None:
-                if port.view is not None:
-                    port.state = "READY"
-                    port.notify_all()
-                    return None
+                # A live in-memory view never bypasses the cold discovery:
+                # the marker and the active canonical pair are re-proven
+                # from disk (or fail closed), so a deleted/tampered
+                # authority is never silently trusted from caller memory.
                 report = _discover_active_canonical(port)
             else:
                 terminal_record = _load_recovery_terminal(port,
@@ -4706,7 +4920,7 @@ def rollback_durable_activation(
                     raise ActivationPreparationError(
                         "ACTIVATION.ROLLBACK_TOKEN_CANCEL_FAILED",
                         retryable=True,
-                        reason_code=error.error_code,
+                        reason_code=cast(str, getattr(error, "error_code")),
                     ) from error
         report = _rollback_inconsistent_activation(port,
             record,
@@ -4748,10 +4962,7 @@ def publish_activation(
             "ACTIVATION.JOURNAL_HANDLE_INVALID",
             retryable=False,
         )
-    stage_seal_error = getattr(
-        importlib.import_module("tm_stage_sealer"),
-        "StageSealError",
-    )
+    stage_seal_error = port.stage_seal_error
     prepared_record = _load_activation_transition_record(port,
         preparation,
         handle,
@@ -4873,8 +5084,16 @@ def publish_activation(
         raise ActivationPreparationError(
             "ACTIVATION.TOKEN_CONSUME_FAILED",
             retryable=True,
-            reason_code=error.error_code,
+            reason_code=cast(str, getattr(error, "error_code")),
         ) from error
+    # Only after the GENERATION_PUBLISHED journal is durable, the final
+    # active-set revalidation passed, and the live token is consumed is the
+    # write-once activated-lineage marker ensured.  A marker failure leaves
+    # the completed main journal as the cold-recovery authority (the view
+    # stays withheld under ACTIVATING) and a fresh recovery resumes the
+    # publication; the marker is never cleared by rollback or cancellation
+    # and survives every later generation/import/upgrade.
+    _ensure_activation_lineage_marker(port.resource_identity)
     port.preparation = None
     port.state = "READY"
     port.notify_all()

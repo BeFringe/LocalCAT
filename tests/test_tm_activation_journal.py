@@ -23,6 +23,7 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+from tm_activation_journal import _ensure_activation_lineage_marker
 from tm_contracts import (
     ActivationCapabilityState,
     CanonicalResourceIdentity,
@@ -206,6 +207,7 @@ def _existing_fixture(
         source_path=identity.configured_jsonl_path,
     )
     _publish_prior_binding(store, identity)
+    _ensure_activation_lineage_marker(identity)
     return identity, store, coordinator, stage, sealed
 
 

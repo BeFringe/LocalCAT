@@ -657,6 +657,34 @@ Activation recovery 固定为：
 
 每个恢复分支都 fsync 受影响文件及 parent directory；不得把新 manifest 留给旧 DB，也不得生成第二个 generation。
 
+### 激活血缘标记（activated-lineage marker）
+
+物理激活成功后的资源/目标必须留下一个最小的、确定性的、邻接的、只写一次的激活血缘标记，作为“该资源/目标已经成功跨越物理激活”的持久事实。它**不是**第二套可变的 canonical 权威，不保存任何用户正文，也不随 generation 变化；后续 generation、显式 import/rebuild、schema upgrade 都保留同一个标记事实。
+
+**身份与路径**
+
+- 标记路径确定且不可由调用方指定：`identity.canonical_sidecar_path` 同目录下的 `.{sidecar 名}.localcat-activated-lineage.json`，临时文件为 `<标记路径>.tmp`（同目录、确定性命名）。
+- 标记**只**绑定稳定血缘事实：`lineage_version`、`resource_id`、`target_identity` 与 `record_digest`。它**不**绑定 `canonical_store_id` 或任何可变 coordinator 身份：显式 import/rebuild 可以创建新的 canonical store id，后续 generation 也不改变这一只写一次的标记事实。
+
+**严格 codec（v1）**
+
+- `lineage_version="activated-lineage-v1"`、`resource_id`、`target_identity`、`record_digest` 四个字段；`record_digest` 是其余三个字段经 `_stable_digest` 计算的 SHA-256。
+- 文件必须是 canonical JSON（`sort_keys`、无重复键、禁止非有限数字、无多余字段），只读/重放时逐字节复核序列化与摘要。
+- 标记文件必须是 regular 单链接文件；symlink、hardlink、目录或其他外来条目一律 fail-closed，绝不跟随、使用或覆盖。读取用 `O_NOFOLLOW` + open-time fstat + post-read lstat 复核同一 inode；发布握手期允许 final/temp 同 inode 的两链接中间态，仅由配对 inode 证明接受。
+
+**发布与重放顺序**
+
+- 首次物理激活的发布顺序固定为：完整 active set 复核通过且视图 withheld 在 `ACTIVATING` → `GENERATION_PUBLISHED` journal 落盘 durable → 同一 active set 再次复核 → token consumed → **最后**确保（写入或严格重校验）血缘标记 → `READY`。标记失败时 view 继续 withheld 在 `ACTIVATING`，完成的 journal 是冷恢复权威，fresh recovery 幂等补写标记后收尾；rollback 与取消绝不清除标记。
+- 冷恢复发布（`MANIFEST_PUBLISHED` 推进 generation）同样先重新证明 active set、落盘 durable `GENERATION_PUBLISHED`、再次复核，之后才确保标记；失败时收回 view 停在 `ACTIVATING`。终态重放（`GENERATION_PUBLISHED`）先重放 view 并复核 active set，再确保标记，最后清理 journal-owned backups。已存在且合法的标记绝不重写。
+- 标记发布是原子 no-clobber 协议：exclusive 确定性临时文件（`O_EXCL` + 全量写入 + fsync）→ `os.link` 发布 final（final 已存在时 `FileExistsError` 即外来 final，fail-stop 且绝不覆盖，仅身份绑定清理自有临时）→ parent fsync → 仅当 final/temp 仍是同一 inode 且 `st_nlink==2` 时 unlink 临时 → 再次 parent fsync → 最终单链接逐字节重校验。崩溃重放只接受配对握手态（final/temp 同 inode 且字节等于确定性 payload）并完成 unlink；其他 symlink/hardlink/外来 final 或 temp 一律 fail-closed；字节精确的 owned 单链接临时文件恢复发布流程。
+- `DB_REPLACED → MANIFEST_PUBLISHED → GENERATION_PUBLISHED` 的恢复/终态重放路径在报告 COMPLETED 前幂等补写或严格重校验标记。
+- rollback 与 PREPARED 取消**绝不**清除标记。PREPARED 取消的 lineage 一致性：取消回退到 prior canonical generation 仅当 durable 标记存在并通过稳定身份重校验；第一次激活（无 prior）取消时标记 final 与 temp 必须**都不存在**——任何外来、篡改、hardlink 或残留标记/temp 一律 fail-closed，防止把从未激活的 legacy 资源变成声称已激活。
+- 无 journal、无 terminal 的冷发现：无论进程内是否已有 live view，都先对磁盘重新证明 canonical pair 与标记。无标记且无 canonical pair 是真正的从未激活 legacy（返回 `None`/READY，此时 live view 非空同样 fail-stop）；有标记但 pair 缺失/部分/篡改时 fail-stop 并报告恢复失败，绝不静默返回 `None`；有 pair 但无有效标记（无 transition record 的权威）绝不静默信任，同样 fail-stop。
+
+**取消候选隔离（quarantine closure）**
+
+- PREPARED 取消的候选 DB/manifest 退役进确定性隔离目录：路径缺失只在该 journal 记录的 inode 已作为 regular 单链接条目存在于该确定性隔离目录（候选或 canonical basename，扫描限定单目录）时才被接受；inode 缺失（外部删除/移动）一律 `ACTIVATION.QUARANTINE_MISSING` 非重试 fail-stop，不再有 authority-path 兜底。隔离条目必须 regular 单链接，任何外来条目 `ACTIVATION.QUARANTINE_FOREIGN` fail-stop；隔离目标绝不被覆盖。
+
 ### 物理 schema
 
 ```sql

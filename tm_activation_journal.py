@@ -738,6 +738,730 @@ def _lstat_activation_terminal_identity(
 
 
 
+_LINEAGE_MARKER_VERSION = "activated-lineage-v1"
+
+_LINEAGE_MARKER_ENVELOPE_FIELDS = frozenset(
+    {
+        "lineage_version",
+        "resource_id",
+        "target_identity",
+        "record_digest",
+    }
+)
+
+
+
+def _activation_lineage_marker_path(
+    identity: CanonicalResourceIdentity,
+) -> Path:
+    """Deterministic write-once activated-lineage marker path."""
+
+    return identity.canonical_sidecar_path.with_name(
+        f".{identity.canonical_sidecar_path.name}"
+        ".localcat-activated-lineage.json"
+    )
+
+
+
+def _activation_lineage_marker_temp_path(marker_path: Path) -> Path:
+    return marker_path.with_name(f"{marker_path.name}.tmp")
+
+
+
+def _lstat_activation_lineage_marker_identity(
+    path: Path,
+) -> _ActivationFileIdentity | None:
+    """Regular single-link marker identity, None when absent, fail-closed.
+
+    The marker is a journal-managed durable fact, so a symlink, hardlink,
+    directory, or any other foreign entry fails closed and is never
+    followed, used, or overwritten.
+    """
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    return _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+
+
+
+def _activation_lineage_marker_payload(
+    identity: CanonicalResourceIdentity,
+) -> bytes:
+    """Canonical strict-JSON payload for one activated-lineage marker.
+
+    The marker binds only the stable lineage facts: the codec version, the
+    resource id, and the stable target identity.  It deliberately does not
+    bind ``canonical_store_id`` (or any mutable coordinator identity):
+    explicit import/rebuild may create a new canonical store id, while
+    later generations likewise leave this write-once marker unchanged.
+    """
+
+    payload = {
+        "lineage_version": _LINEAGE_MARKER_VERSION,
+        "resource_id": identity.resource_id,
+        "target_identity": identity.target_identity,
+    }
+    mapping = dict(payload)
+    mapping["record_digest"] = contract_module._stable_digest(payload)
+    return json.dumps(
+        mapping,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+
+def _parse_activation_lineage_marker_bytes(
+    payload: bytes,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Strictly parse and revalidate one durable lineage marker."""
+
+    if type(payload) is not bytes:
+        raise TypeError("activation lineage marker payload must be bytes")
+    try:
+        serialized = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate lineage marker key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            serialized,
+            parse_constant=reject_non_finite,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    if type(value) is not dict:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    mapping: dict[str, object] = value
+    if set(mapping) != _LINEAGE_MARKER_ENVELOPE_FIELDS:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    try:
+        canonical = json.dumps(
+            mapping,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    if canonical != serialized:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    digest_field = mapping["record_digest"]
+    _require_activation_journal_digest(digest_field, "record_digest")
+    payload_mapping = {
+        key: value
+        for key, value in mapping.items()
+        if key != "record_digest"
+    }
+    if contract_module._stable_digest(payload_mapping) != digest_field:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    if mapping["lineage_version"] != _LINEAGE_MARKER_VERSION:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    for field_name, expected in (
+        ("resource_id", identity.resource_id),
+        ("target_identity", identity.target_identity),
+    ):
+        value = mapping[field_name]
+        if type(value) is not str or value != expected:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+
+
+
+def _read_activation_lineage_marker(
+    path: Path,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Durably read and strictly revalidate one lineage marker."""
+
+    marker_identity = _lstat_activation_lineage_marker_identity(path)
+    if marker_identity is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    try:
+        payload, observed_identity = _read_activation_journal_file(
+            path,
+            marker_identity,
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if observed_identity != marker_identity:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    _parse_activation_lineage_marker_bytes(
+        payload,
+        identity=identity,
+    )
+
+
+
+def _read_activation_lineage_marker_bytes(
+    path: Path,
+    expected_identity: _ActivationFileIdentity | None,
+) -> bytes:
+    """Identity-bound O_NOFOLLOW read with post-read path revalidation.
+
+    The descriptor is opened without following symlinks and the open-time
+    fstat must prove a regular file with the exact expected identity; the
+    same path is re-lstat'ed after the descriptor read so a swap or a
+    hardlink added mid-read fails closed.  The two-link handoff state
+    (marker publication temporary linked to the final) is allowed here
+    because the caller separately proves the paired inode state.
+    """
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        identity = _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+        if (
+            expected_identity is not None
+            and identity != expected_identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        payload = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            payload.extend(chunk)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    finally:
+        os.close(descriptor)
+    try:
+        final = os.lstat(path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or (final.st_dev, final.st_ino)
+        != (identity.device, identity.inode)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    return bytes(payload)
+
+
+
+def _revalidate_activation_lineage_marker_final(
+    marker_path: Path,
+    expected_identity: _ActivationFileIdentity,
+    expected_bytes: bytes,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Strictly revalidate one published marker final after handoff."""
+
+    final_identity = _lstat_activation_lineage_marker_identity(
+        marker_path
+    )
+    if final_identity is None or final_identity != expected_identity:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    payload = _read_activation_lineage_marker_bytes(
+        marker_path,
+        expected_identity,
+    )
+    if payload != expected_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    _parse_activation_lineage_marker_bytes(
+        payload,
+        identity=identity,
+    )
+
+
+
+def _unlink_activation_lineage_marker_handoff_temp(
+    temp_path: Path,
+    marker_path: Path,
+    expected_identity: _ActivationFileIdentity,
+) -> None:
+    """Identity-bound unlink of the temporary after the two-link handoff.
+
+    Both names must still be the same exact regular inode with exactly two
+    links (the temporary plus the final); a foreign, hardlinked, swapped,
+    or vanished entry fails closed and is never removed.
+    """
+
+    try:
+        temp_observed = os.lstat(temp_path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    try:
+        final_observed = os.lstat(marker_path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    if (
+        not stat.S_ISREG(temp_observed.st_mode)
+        or temp_observed.st_nlink != 2
+        or (temp_observed.st_dev, temp_observed.st_ino)
+        != (expected_identity.device, expected_identity.inode)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    if (
+        not stat.S_ISREG(final_observed.st_mode)
+        or final_observed.st_nlink != 2
+        or (final_observed.st_dev, final_observed.st_ino)
+        != (temp_observed.st_dev, temp_observed.st_ino)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    try:
+        os.unlink(temp_path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    try:
+        _fsync_activation_directory(temp_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+
+
+
+def _publish_activation_lineage_marker_link(
+    temp_path: Path,
+    marker_path: Path,
+    temp_identity: _ActivationFileIdentity,
+) -> None:
+    """Narrow fault-injection seam for the atomic no-clobber link."""
+
+    os.link(temp_path, marker_path)
+
+
+
+def _publish_activation_lineage_marker_from_temp(
+    temp_path: Path,
+    marker_path: Path,
+    temp_identity: _ActivationFileIdentity,
+    expected_bytes: bytes,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Atomically publish a fully fsynced temporary as the marker final.
+
+    The hard-link operation fails with ``FileExistsError`` when the final
+    already exists, so a concurrently inserted foreign final (symlink,
+    regular file, directory, or hardlink) is never silently overwritten.
+    The parent directory is fsynced after the link, the temporary is
+    unlinked only while it is still the exact same inode paired with the
+    final, and the parent is fsynced again.  Any failure before the
+    temporary unlink leaves the recoverable two-link handoff (or the owned
+    temporary) for a later replay; any foreign final/temp is never removed
+    or overwritten.
+    """
+
+    try:
+        _publish_activation_lineage_marker_link(
+            temp_path,
+            marker_path,
+            temp_identity,
+        )
+    except FileExistsError as error:
+        # A foreign final won the race: it is never overwritten.  The
+        # temporary is still exclusively ours, so it is cleaned
+        # identity-bound and the fail-stop is non-retryable.
+        _ = _remove_owned_activation_journal_temp(
+            temp_path,
+            temp_identity,
+        )
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    try:
+        _fsync_activation_directory(marker_path.parent)
+        _unlink_activation_lineage_marker_handoff_temp(
+            temp_path,
+            marker_path,
+            temp_identity,
+        )
+        _fsync_activation_directory(marker_path.parent)
+    except ActivationPreparationError:
+        raise
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    _revalidate_activation_lineage_marker_final(
+        marker_path,
+        temp_identity,
+        expected_bytes,
+        identity,
+    )
+
+
+
+def _finish_activation_lineage_marker_handoff(
+    temp_path: Path,
+    marker_path: Path,
+    handoff_identity: _ActivationFileIdentity,
+    expected_bytes: bytes,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Finish one interrupted two-link marker handoff after a crash.
+
+    The temporary two-link handoff is accepted only when the final and the
+    temporary are the same exact inode and the bytes equal the
+    deterministic marker payload; the temporary is then unlinked and the
+    single-link final revalidated.  Any other symlink/hardlink/foreign
+    final or temp fails closed and is never removed or overwritten.
+    """
+
+    try:
+        final_observed = os.lstat(marker_path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        temp_observed = os.lstat(temp_path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    if (
+        not stat.S_ISREG(final_observed.st_mode)
+        or final_observed.st_nlink != 2
+        or (final_observed.st_dev, final_observed.st_ino)
+        != (handoff_identity.device, handoff_identity.inode)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    if (
+        not stat.S_ISREG(temp_observed.st_mode)
+        or temp_observed.st_nlink != 2
+        or (temp_observed.st_dev, temp_observed.st_ino)
+        != (handoff_identity.device, handoff_identity.inode)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    payload = _read_activation_lineage_marker_bytes(
+        marker_path,
+        handoff_identity,
+    )
+    if payload != expected_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    try:
+        os.unlink(temp_path)
+        _fsync_activation_directory(marker_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    _revalidate_activation_lineage_marker_final(
+        marker_path,
+        handoff_identity,
+        expected_bytes,
+        identity,
+    )
+
+
+
+def _write_activation_lineage_marker_temp(
+    temp_path: Path,
+    marker_path: Path,
+    expected_bytes: bytes,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Exclusively create, fully write, and fsync the marker temporary."""
+
+    descriptor = -1
+    temp_identity: _ActivationFileIdentity | None = None
+    try:
+        descriptor, temp_identity = _open_activation_journal_temp(
+            temp_path
+        )
+    except FileExistsError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        ) from error
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    assert temp_identity is not None
+    try:
+        try:
+            _write_activation_journal_bytes(descriptor, expected_bytes)
+            _fsync_activation_journal(descriptor)
+            _close_activation_journal(descriptor)
+            descriptor = -1
+        except OSError as error:
+            _ = _remove_owned_activation_journal_temp(
+                temp_path,
+                temp_identity,
+            )
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=True,
+            ) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    temp_bytes = _read_activation_lineage_marker_bytes(
+        temp_path,
+        temp_identity,
+    )
+    if temp_bytes != expected_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    _publish_activation_lineage_marker_from_temp(
+        temp_path,
+        marker_path,
+        temp_identity,
+        expected_bytes,
+        identity,
+    )
+
+
+
+def _ensure_activation_lineage_marker(
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Durably publish (or revalidate) the write-once activated-lineage marker.
+
+    The marker records that this resource/target has crossed physical
+    activation at least once and binds only version + resource_id +
+    target_identity + digest, so it keeps validating unchanged across
+    store ids, generations, imports, and rebuilds.  Publication is an
+    atomic no-clobber protocol: an exclusive deterministic temporary is
+    fully written and fsynced, the final is published with a hard-link
+    that fails if the final already exists, the parent is fsynced, the
+    temporary is unlinked only while it is still the exact paired inode,
+    and the parent is fsynced again.  A crash-replay may accept the
+    temporary two-link handoff only when final and temp are the same exact
+    inode with the deterministic payload, then finish the unlink; any
+    other symlink/hardlink/foreign final or temp fails closed and is never
+    removed or overwritten.  An existing valid marker is revalidated,
+    never rewritten; an interrupted owned temporary (byte-exact regular
+    single-link file) resumes publication.
+    """
+
+    marker_path = _activation_lineage_marker_path(identity)
+    temp_path = _activation_lineage_marker_temp_path(marker_path)
+    expected_bytes = _activation_lineage_marker_payload(identity)
+    try:
+        temp_observed = os.lstat(temp_path)
+    except FileNotFoundError:
+        temp_observed = None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    try:
+        final_observed = os.lstat(marker_path)
+    except FileNotFoundError:
+        final_observed = None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    if final_observed is not None:
+        if (
+            temp_observed is not None
+            and stat.S_ISREG(temp_observed.st_mode)
+            and stat.S_ISREG(final_observed.st_mode)
+            and (temp_observed.st_dev, temp_observed.st_ino)
+            == (final_observed.st_dev, final_observed.st_ino)
+        ):
+            _finish_activation_lineage_marker_handoff(
+                temp_path,
+                marker_path,
+                _ActivationFileIdentity(
+                    final_observed.st_dev,
+                    final_observed.st_ino,
+                ),
+                expected_bytes,
+                identity,
+            )
+            return
+        marker_identity = _lstat_activation_lineage_marker_identity(
+            marker_path
+        )
+        if marker_identity is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        _read_activation_lineage_marker(
+            marker_path,
+            identity=identity,
+        )
+        return
+    if temp_observed is not None:
+        if (
+            not stat.S_ISREG(temp_observed.st_mode)
+            or temp_observed.st_nlink != 1
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        temp_identity = _ActivationFileIdentity(
+            temp_observed.st_dev,
+            temp_observed.st_ino,
+        )
+        temp_bytes = _read_activation_lineage_marker_bytes(
+            temp_path,
+            temp_identity,
+        )
+        if temp_bytes != expected_bytes:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+            )
+        _publish_activation_lineage_marker_from_temp(
+            temp_path,
+            marker_path,
+            temp_identity,
+            expected_bytes,
+            identity,
+        )
+        return
+    _write_activation_lineage_marker_temp(
+        temp_path,
+        marker_path,
+        expected_bytes,
+        identity,
+    )
+
+
+
 def _lstat_any_entry(path: Path) -> bool:
     try:
         os.lstat(path)
@@ -1360,7 +2084,7 @@ def _activation_file_identity(path: Path) -> _ActivationFileIdentity:
             "ACTIVATION.PRIOR_ASSET_INVALID",
             retryable=False,
         ) from error
-    if not stat.S_ISREG(observed.st_mode):
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
         raise ActivationPreparationError(
             "ACTIVATION.PRIOR_ASSET_INVALID",
             retryable=False,
@@ -1374,6 +2098,23 @@ def _capture_activation_file(
     *,
     asset_kind: str,
 ) -> _PriorAssetCapture:
+    # Single-link closure: the journal-managed file must be an exact
+    # regular single-link entry at the initial lstat, at the descriptor
+    # fstat/read, and at the final revalidation.  A hardlink added at any
+    # of these seams fails closed so a foreign link is never captured,
+    # copied, or retired as a journal-owned asset.
+    try:
+        initial = os.lstat(path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        )
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1386,7 +2127,7 @@ def _capture_activation_file(
         ) from error
     try:
         observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode):
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
             raise ActivationPreparationError(
                 "ACTIVATION.PRIOR_ASSET_INVALID",
                 retryable=False,
@@ -1434,6 +2175,7 @@ def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
         observed = os.fstat(descriptor)
         if (
             not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
             or (observed.st_dev, observed.st_ino)
             != (capture.identity.device, capture.identity.inode)
         ):
@@ -1447,7 +2189,6 @@ def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
             if not chunk:
                 break
             payload.extend(chunk)
-        return bytes(payload)
     except OSError as error:
         raise ActivationPreparationError(
             "ACTIVATION.PRIOR_ASSET_INVALID",
@@ -1455,6 +2196,16 @@ def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
         ) from error
     finally:
         os.close(descriptor)
+    # Final revalidation: the path must still be the exact same regular
+    # single-link entry after the descriptor read.  A path swap or a
+    # hardlink added during the read fails closed so a foreign link is
+    # never returned as a journal-owned asset.
+    if _activation_file_identity(capture.path) != capture.identity:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        )
+    return bytes(payload)
 
 
 
@@ -1614,6 +2365,7 @@ def _remove_recovery_path(owned: _OwnedRecoveryPath) -> None:
         ) from error
     if (
         not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
         or (observed.st_dev, observed.st_ino)
         != (owned.identity.device, owned.identity.inode)
     ):
@@ -1649,6 +2401,7 @@ def _create_recovery_backup(
         source_observed = os.fstat(source_descriptor)
         if (
             not stat.S_ISREG(source_observed.st_mode)
+            or source_observed.st_nlink != 1
             or (source_observed.st_dev, source_observed.st_ino)
             != (capture.identity.device, capture.identity.inode)
         ):
@@ -1814,6 +2567,7 @@ def _fsync_activation_file(
         observed = os.fstat(descriptor)
         if (
             not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
             or (observed.st_dev, observed.st_ino)
             != (expected_identity.device, expected_identity.inode)
         ):
@@ -2120,6 +2874,174 @@ def _quarantine_failed_activation_artifacts(
             allow_digest=allow_digest,
         )
 
+
+
+def _require_cancelled_candidate_quarantine_closure(
+    quarantine_dir: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Prove one cancelled candidate inode already sits in quarantine.
+
+    Absence at the journal-recorded stage name is accepted only when the
+    exact recorded inode is found as a regular single-link entry inside
+    the deterministic quarantine directory (under the candidate or the
+    canonical basename, depending on cancellation/rollback).  Every
+    quarantine entry must be a regular single-link file and the scan is
+    bounded to this one deterministic directory, never a filesystem-wide
+    search.  A missing inode means the candidate was externally deleted
+    or moved, which fails closed: absence is never accepted merely
+    because an authority path is absent or holds a different file.
+    """
+
+    try:
+        names = os.listdir(quarantine_dir)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    for name in names:
+        try:
+            observed = os.lstat(quarantine_dir / name)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FOREIGN",
+                retryable=False,
+            )
+        if (observed.st_dev, observed.st_ino) == expected_identity:
+            return
+    raise ActivationPreparationError(
+        "ACTIVATION.QUARANTINE_MISSING",
+        retryable=False,
+    )
+
+
+def _quarantine_candidate_rename(source: Path, target: Path) -> None:
+    """Narrow fault-injection seam for one cancelled-candidate rename."""
+
+    os.rename(source, target)
+
+
+
+def _retire_cancelled_candidate_assets(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Quarantine the journal-proven candidate DB/manifest pair of a cancel.
+
+    A PREPARED cancellation retires the exact candidate stage database and
+    temporary manifest after the CANCELLED terminal is durable and the main
+    journal is retired, so a later deterministic migration retry rebuilds a
+    fresh stage instead of failing with ``MIGRATION.STAGE_SEALED``.  Each
+    file must still be the exact journal-owned regular single-link file
+    (identity-bound); a mutated, symlinked, hardlinked, or foreign entry
+    fails closed and is never removed.  Absence is accepted only when the
+    deterministic quarantine closure proves it: the exact same inode must
+    already sit at the deterministic quarantine target, proving an earlier
+    interrupted retirement.  The move is an atomic same-directory rename
+    followed by directory fsyncs, and the quarantine target is never
+    overwritten, so every crash window resumes idempotently from the
+    terminal authority.
+    """
+
+    quarantine_dir = _activation_quarantine_directory(identity, record)
+    _require_quarantine_directory(quarantine_dir)
+    for path, expected_identity in (
+        (
+            record.candidate_stage_db_path,
+            record.candidate_stage_db_identity,
+        ),
+        (
+            record.candidate_manifest_temp_path,
+            record.candidate_manifest_temp_identity,
+        ),
+    ):
+        try:
+            observed = os.lstat(path)
+        except FileNotFoundError:
+            _require_cancelled_candidate_quarantine_closure(
+                quarantine_dir,
+                expected_identity,
+            )
+            continue
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino)
+            != (expected_identity[0], expected_identity[1])
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FOREIGN",
+                retryable=False,
+            )
+        target = quarantine_dir / path.name
+        try:
+            target_observed = os.lstat(target)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        else:
+            if (
+                not stat.S_ISREG(target_observed.st_mode)
+                or (target_observed.st_dev, target_observed.st_ino)
+                != (observed.st_dev, observed.st_ino)
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                    retryable=False,
+                )
+            continue
+        try:
+            _quarantine_candidate_rename(path, target)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        try:
+            _fsync_activation_directory(quarantine_dir)
+            _fsync_activation_directory(path.parent)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=False,
+            )
+        try:
+            final = os.lstat(target)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        if (final.st_dev, final.st_ino) != (observed.st_dev, observed.st_ino):
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=False,
+            )
 
 
 def _remove_orphaned_rollback_temp(path: Path) -> None:
