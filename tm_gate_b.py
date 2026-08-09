@@ -11,6 +11,12 @@ or modifies any canonical/JSONL asset.
 All public diagnostics are stable code-only values; they never contain TM
 source/target text or local paths.  Path-bearing facts enter only through the
 coordinator-owned registry readiness seam, never as public parameters.
+
+Linearization semantics: a successful grant proves the exact artifact bytes
+(staged DB, temporary manifest) and the configured source at Gate B's
+terminal closure point, which re-runs immediately after claim closure and
+before the grant is minted.  A grant cannot prevent external mutation after
+evaluation returns; Task 5.5 must freshly revalidate before any replacement.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from tm_sqlite_store import SQLiteStoreSchemaError
 from tm_stage_sealer import (
     _PhysicalReadinessSnapshot,
     _SealedRecomputation,
+    _require_linearization_closure,
     SealedArtifactRegistry,
     StageSealError,
 )
@@ -799,7 +806,10 @@ class GateBEvaluator:
         """Recompute all physical facts from disk and the registry entry.
 
         Denials are returned as inspectable reports without any grant; the
-        evaluation never writes, publishes, drains, or issues anything.
+        evaluation never writes, publishes, drains, or issues anything.  The
+        terminal identity+digest closure runs again at the linearization
+        point after claim closure and immediately before grant minting, so
+        the grant always describes the exact artifact bytes at that point.
         """
 
         try:
@@ -825,6 +835,12 @@ class GateBEvaluator:
                     expected_prior_generation=(
                         snapshot.expected_prior_generation
                     ),
+                    expected_database_identity=(
+                        snapshot.database_identity
+                    ),
+                    expected_manifest_identity=(
+                        snapshot.manifest_identity
+                    ),
                 )
             except StageSealError as error:
                 raise _GateBFailure(_map_gate_b_code(error)) from error
@@ -839,7 +855,11 @@ class GateBEvaluator:
                 RuntimeError,
             ) as error:
                 raise _GateBFailure("GATE_B.READINESS_FAILED") from error
-            _require_claim_closure(snapshot, recomputed)
+            try:
+                _require_claim_closure(snapshot, recomputed)
+                _require_linearization_closure(snapshot, recomputed)
+            except StageSealError as error:
+                raise _GateBFailure(_map_gate_b_code(error)) from error
             return _grant_report(snapshot, recomputed)
         except _GateBFailure as failure:
             return _denial_report(failure.error_code)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -1146,6 +1147,246 @@ class GateBStalenessTests(unittest.TestCase):
                 prior_db_digest,
             )
             self.assertEqual(first.grant.artifact_id, sealed.artifact.artifact_id)
+
+
+class GateBAdversarialClosureTests(unittest.TestCase):
+    """Finding A: terminal identity+digest closure before any grant."""
+
+    def _swap_with_identical_bytes(self, target: Path) -> None:
+        payload = target.read_bytes()
+        replacement = target.with_name(f"{target.name}.replacement")
+        replacement.write_bytes(payload)
+        os.replace(replacement, target)
+
+    def test_same_inode_db_mutation_after_db_digest_before_grant_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_evidence = tm_stage_sealer._build_evidence
+
+            def mutate_db_then_build_evidence(*args: Any, **kwargs: Any) -> Any:
+                connection = _raw_connection(stage.staged_db_path)
+                try:
+                    connection.execute("PRAGMA user_version=99")
+                    connection.commit()
+                finally:
+                    connection.close()
+                return real_build_evidence(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_evidence",
+                side_effect=mutate_db_then_build_evidence,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
+            self.assertFalse(report.granted)
+            self.assertIsNone(report.grant)
+
+    def test_same_inode_manifest_mutation_after_digest_before_grant_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def mutate_manifest_then_build_binding(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                with stage.manifest_temp_path.open("ab") as stream:
+                    stream.write(b"\n")
+                return real_build_binding(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=mutate_manifest_then_build_binding,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
+
+    def test_source_mutation_after_validation_before_grant_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def mutate_source_then_build_binding(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                with identity.configured_jsonl_path.open("ab") as stream:
+                    stream.write(b'{"source":"y","target":"late"}\n')
+                return real_build_binding(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=mutate_source_then_build_binding,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.SOURCE_MISMATCH")
+
+    def test_byte_identical_db_swap_during_evaluation_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def swap_db_then_build_binding(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                self._swap_with_identical_bytes(stage.staged_db_path)
+                return real_build_binding(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=swap_db_then_build_binding,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
+
+    def test_byte_identical_manifest_swap_during_evaluation_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def swap_manifest_then_build_binding(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                self._swap_with_identical_bytes(stage.manifest_temp_path)
+                return real_build_binding(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=swap_manifest_then_build_binding,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
+
+    def test_byte_identical_source_swap_during_evaluation_denies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def swap_source_then_build_binding(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                self._swap_with_identical_bytes(
+                    identity.configured_jsonl_path
+                )
+                return real_build_binding(*args, **kwargs)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=swap_source_then_build_binding,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.SOURCE_MISMATCH")
+
+    def test_byte_identical_db_swap_after_registration_denies(
+        self,
+    ) -> None:
+        def swap_db(stage: MutableStageRef, _identity: Any) -> None:
+            self._swap_with_identical_bytes(stage.staged_db_path)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+                tamper=swap_db,
+            )
+            report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
+
+    def test_byte_identical_manifest_swap_after_registration_denies(
+        self,
+    ) -> None:
+        def swap_manifest(stage: MutableStageRef, _identity: Any) -> None:
+            self._swap_with_identical_bytes(stage.manifest_temp_path)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+                tamper=swap_manifest,
+            )
+            report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
+
+
+class GateBLinearizationTests(unittest.TestCase):
+    """Finding B: terminal closure re-runs at the Gate B linearization point.
+
+    Claim closure and grant minting happen after the recomputation returns,
+    so the recomputation-internal closure cannot see a mutation made in or
+    after _require_claim_closure.  Gate B re-runs the same no-follow
+    identity+digest closure at its linearization point, immediately before
+    the grant is minted, so a grant's digests always describe the exact
+    artifact bytes at that point.
+    """
+
+    def test_claim_closure_mutation_before_grant_denies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_require_claim_closure = tm_gate_b._require_claim_closure
+
+            def mutate_after_claim_closure(
+                snapshot: tm_stage_sealer._PhysicalReadinessSnapshot,
+                recomputed: tm_stage_sealer._SealedRecomputation,
+            ) -> None:
+                real_require_claim_closure(snapshot, recomputed)
+                connection = _raw_connection(stage.staged_db_path)
+                try:
+                    connection.execute(
+                        "UPDATE tm_record SET target_raw = 'tampered' "
+                        "WHERE record_id = 1"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            with patch(
+                "tm_gate_b._require_claim_closure",
+                side_effect=mutate_after_claim_closure,
+            ):
+                report = _evaluate(registry, sealed, fts5_available=True)
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
+            self.assertNotEqual(
+                hashlib.sha256(
+                    stage.staged_db_path.read_bytes()
+                ).hexdigest(),
+                sealed.evidence.stage_file_digest,
+            )
 
 
 class GateBBoundaryTests(unittest.TestCase):

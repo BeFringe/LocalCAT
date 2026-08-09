@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import cast
+from typing import Protocol, cast
 import uuid
 
 import tm_contracts as contract_module
@@ -93,10 +93,29 @@ class _ArtifactFileIdentity:
 
 
 @dataclass(frozen=True)
+class _RegistryReservation:
+    """Creation-time identity claim held between reserve and commit."""
+
+    reservation_id: str
+    mutable: MutableStageRef
+    database_identity: _ArtifactFileIdentity
+    manifest_identity: _ArtifactFileIdentity
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (
+            str(self.mutable.staged_db_path),
+            str(self.mutable.manifest_temp_path),
+        )
+
+
+@dataclass(frozen=True)
 class _RegistryEntry:
     mutable: MutableStageRef
     stage: SealedStage
     state: ActivationCapabilityState
+    database_identity: _ArtifactFileIdentity
+    manifest_identity: _ArtifactFileIdentity
 
 
 @dataclass(frozen=True)
@@ -115,6 +134,8 @@ class _PhysicalReadinessSnapshot:
     mutable_stage: MutableStageRef
     evidence: StageValidationEvidence
     generation: GenerationExpectation
+    database_identity: _ArtifactFileIdentity
+    manifest_identity: _ArtifactFileIdentity
 
 
 def _snapshot_str(value: object, field_name: str) -> str:
@@ -1096,6 +1117,67 @@ def _mark_stage_sealed(
         connection.close()
 
 
+def _restore_stage_unpublished(
+    path: Path,
+    expected: _ArtifactFileIdentity,
+) -> None:
+    """Durably roll the SEALED marker back to UNPUBLISHED after a failed seal.
+
+    Only the StageSealer recovery path calls this, before any registry
+    publication: the stage bytes are unchanged, so a deterministic retry can
+    re-validate and re-seal the same completed stage.  Identity is enforced
+    exactly like the marker write, so a swapped path is never rewritten.
+    """
+
+    _require_identity_unchanged(
+        path,
+        expected,
+        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+    )
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=rw",
+            uri=True,
+            timeout=5.0,
+            isolation_level=None,
+        )
+    except sqlite3.DatabaseError as error:
+        raise StageSealError("SEALER.STAGE_INVALID") from error
+    try:
+        connection.enable_load_extension(False)
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            status_rows = connection.execute(
+                "SELECT value FROM tm_meta "
+                "WHERE key = 'activation_status'"
+            ).fetchall()
+            if status_rows == [("UNPUBLISHED",)]:
+                connection.commit()
+                return
+            if status_rows != [("SEALED",)]:
+                raise StageSealError("SEALER.STAGE_INVALID")
+            cursor = connection.execute(
+                "UPDATE tm_meta SET value = 'UNPUBLISHED' "
+                "WHERE key = 'activation_status' AND value = 'SEALED'"
+            )
+            if cursor.rowcount != 1:
+                raise StageSealError("SEALER.STAGE_INVALID")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    except sqlite3.DatabaseError as error:
+        raise StageSealError("SEALER.STAGE_INVALID") from error
+    finally:
+        connection.close()
+    _fsync_file(path, expected)
+    _fsync_directory(path.parent)
+
+
 def _fsync_file(path: Path, expected: _ArtifactFileIdentity) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -1364,6 +1446,58 @@ class _SealedRecomputation:
     generation: GenerationExpectation
     stage_file_digest: str
     manifest_temp_digest: str
+    source_identity: _ArtifactFileIdentity
+
+
+def _require_terminal_closure(
+    stage: MutableStageRef,
+    *,
+    database_identity: _ArtifactFileIdentity,
+    manifest_identity: _ArtifactFileIdentity,
+    source_path: Path,
+    source_identity: _ArtifactFileIdentity,
+    stage_file_digest: str,
+    manifest_temp_digest: str,
+    source_digest: str,
+) -> None:
+    """Reusable terminal identity+digest closure over one artifact trio.
+
+    Re-observes every path with stable no-follow authority and re-hashes the
+    exact bytes a readiness grant is about to describe.  Any in-place
+    mutation or path swap since the last observation denies here, so a grant
+    can never describe bytes that no longer match the registry-owned artifact
+    or its configured source.  The recomputation runs this closure before it
+    returns, and Gate B re-runs it at its linearization point immediately
+    before minting the grant.
+    """
+
+    _require_identity_unchanged(
+        stage.staged_db_path,
+        database_identity,
+        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+    )
+    _require_identity_unchanged(
+        stage.manifest_temp_path,
+        manifest_identity,
+        unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+    )
+    _require_identity_unchanged(
+        source_path,
+        source_identity,
+        unsafe_code="SEALER.SOURCE_DIGEST_MISMATCH",
+    )
+    if (
+        _file_sha256(stage.staged_db_path, database_identity)
+        != stage_file_digest
+    ):
+        raise StageSealError("SEALER.ARTIFACT_MUTATED")
+    if (
+        _file_sha256(stage.manifest_temp_path, manifest_identity)
+        != manifest_temp_digest
+    ):
+        raise StageSealError("SEALER.ARTIFACT_MUTATED")
+    if _file_sha256(source_path, source_identity) != source_digest:
+        raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
 
 
 def _recompute_sealed_facts(
@@ -1371,12 +1505,20 @@ def _recompute_sealed_facts(
     *,
     canonical_store_id: str,
     expected_prior_generation: int | None,
+    expected_database_identity: _ArtifactFileIdentity,
+    expected_manifest_identity: _ArtifactFileIdentity,
 ) -> _SealedRecomputation:
     """Recompute every physical fact of one SEALED stage from disk.
 
     Gate B consumes this fresh snapshot; it never re-serializes the sealed
-    evidence.  File identities are captured before validation and rechecked
-    before hashing, so any mutation or path swap during evaluation denies.
+    evidence.  File identities (staged DB, temp manifest, configured source)
+    are captured with no-follow authority before validation, checked against
+    the registry's creation-time identities, and rechecked in a terminal
+    identity+digest closure before the recomputation returns.  Because claim
+    closure and grant minting happen after this return, Gate B re-runs the
+    same closure at its linearization point immediately before minting the
+    grant; the retained no-follow source identity makes that second closure
+    possible without re-exposing path-bearing facts.
     """
 
     database_identity = _artifact_file_identity(
@@ -1389,6 +1531,22 @@ def _recompute_sealed_facts(
         missing_code="SEALER.STAGE_MANIFEST_MISSING",
         unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
     )
+    source_path = stage.resource_identity.configured_jsonl_path
+    source_identity = _artifact_file_identity(
+        source_path,
+        missing_code="SEALER.SOURCE_DIGEST_MISMATCH",
+        unsafe_code="SEALER.SOURCE_DIGEST_MISMATCH",
+    )
+    if (database_identity.device, database_identity.inode) != (
+        expected_database_identity.device,
+        expected_database_identity.inode,
+    ):
+        raise StageSealError("SEALER.STAGE_DATABASE_UNSAFE")
+    if (manifest_identity.device, manifest_identity.inode) != (
+        expected_manifest_identity.device,
+        expected_manifest_identity.inode,
+    ):
+        raise StageSealError("SEALER.STAGE_MANIFEST_UNSAFE")
     facts = _validate_stage_facts(
         stage,
         canonical_store_id=canonical_store_id,
@@ -1403,6 +1561,11 @@ def _recompute_sealed_facts(
         stage.manifest_temp_path,
         manifest_identity,
         unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+    )
+    _require_identity_unchanged(
+        source_path,
+        source_identity,
+        unsafe_code="SEALER.SOURCE_DIGEST_MISMATCH",
     )
     stage_file_digest = _file_sha256(
         stage.staged_db_path,
@@ -1430,21 +1593,91 @@ def _recompute_sealed_facts(
         expected_prior_generation=expected_prior_generation,
     )
     _require_generation_closure(generation, evidence)
+    _require_terminal_closure(
+        stage,
+        database_identity=database_identity,
+        manifest_identity=manifest_identity,
+        source_path=source_path,
+        source_identity=source_identity,
+        stage_file_digest=stage_file_digest,
+        manifest_temp_digest=manifest_temp_digest,
+        source_digest=facts.receipt.jsonl_digest,
+    )
     return _SealedRecomputation(
         facts=facts,
         evidence=evidence,
         generation=generation,
         stage_file_digest=stage_file_digest,
         manifest_temp_digest=manifest_temp_digest,
+        source_identity=source_identity,
     )
+
+
+def _require_linearization_closure(
+    snapshot: _PhysicalReadinessSnapshot,
+    recomputed: _SealedRecomputation,
+) -> None:
+    """Terminal closure at the Gate B linearization point, before the grant.
+
+    Re-runs the terminal identity+digest closure after claim closure and
+    immediately before Gate B mints its grant, using the registry-owned
+    DB/manifest identities from the snapshot and the recomputation's retained
+    no-follow source identity and validated source digest.  Any mutation or
+    swap in or after claim closure denies here, so a successful grant proves
+    the exact artifact and configured-source bytes at this linearization
+    point.  Path-bearing facts stay private to this module.
+    """
+
+    _require_terminal_closure(
+        snapshot.mutable_stage,
+        database_identity=snapshot.database_identity,
+        manifest_identity=snapshot.manifest_identity,
+        source_path=(
+            snapshot.mutable_stage.resource_identity.configured_jsonl_path
+        ),
+        source_identity=recomputed.source_identity,
+        stage_file_digest=recomputed.stage_file_digest,
+        manifest_temp_digest=recomputed.manifest_temp_digest,
+        source_digest=recomputed.facts.receipt.jsonl_digest,
+    )
+
+
+class _SealLifecycleRegistry(
+    contract_module._SealedArtifactRegistryPort,
+    Protocol,
+):
+    """Reservation/commit/release seam the StageSealer requires."""
+
+    @property
+    def registry_namespace(self) -> str: ...
+
+    def reserve(
+        self,
+        mutable_stage: MutableStageRef,
+        *,
+        database_identity: _ArtifactFileIdentity,
+        manifest_identity: _ArtifactFileIdentity,
+    ) -> _RegistryReservation: ...
+
+    def commit(
+        self,
+        reservation: _RegistryReservation,
+        evidence: StageValidationEvidence,
+        generation: GenerationExpectation,
+    ) -> SealedStage: ...
+
+    def release(self, reservation: _RegistryReservation) -> None: ...
 
 
 class SealedArtifactRegistry:
     """Coordinator-owned sealed artifact authority for one namespace.
 
     The registry is created and owned by the coordinator; the StageSealer
-    only registers through it. Token issuance, consumption, and
-    cancellation belong to Task 5.5 and fail closed until that exists.
+    registers only through the reservation/commit/release seam, which
+    carries the sealer's creation-time no-follow file identities so a
+    byte-identical path swap can never be registered.  Token issuance,
+    consumption, and cancellation belong to Task 5.5 and fail closed until
+    that exists.
     """
 
     def __init__(self, *, registry_namespace: str) -> None:
@@ -1454,6 +1687,7 @@ class SealedArtifactRegistry:
             raise ValueError("registry_namespace must not be empty")
         self._registry_namespace = registry_namespace
         self._entries: dict[str, _RegistryEntry] = {}
+        self._reservations: dict[tuple[str, str], _RegistryReservation] = {}
         self._sealed_paths: dict[tuple[str, str], str] = {}
 
     @property
@@ -1466,13 +1700,122 @@ class SealedArtifactRegistry:
         evidence: StageValidationEvidence,
         generation: GenerationExpectation,
     ) -> SealedStage:
+        """Single-shot convenience registration for port callers.
+
+        The identities captured here are the ones visible at call time; the
+        StageSealer's creation-time identities enter only through reserve(),
+        so the sealer flow stays immune to swaps before registration.
+        """
+
         try:
             stage = _snapshot_stage(mutable_stage)
+        except (TypeError, ValueError) as error:
+            raise StageSealError("SEALER.TYPE_INVALID") from error
+        database_identity = _artifact_file_identity(
+            stage.staged_db_path,
+            missing_code="SEALER.STAGE_DATABASE_MISSING",
+            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+        )
+        manifest_identity = _artifact_file_identity(
+            stage.manifest_temp_path,
+            missing_code="SEALER.STAGE_MANIFEST_MISSING",
+            unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+        )
+        reservation = self.reserve(
+            stage,
+            database_identity=database_identity,
+            manifest_identity=manifest_identity,
+        )
+        try:
+            return self.commit(reservation, evidence, generation)
+        except BaseException:
+            self.release(reservation)
+            raise
+
+    def reserve(
+        self,
+        mutable_stage: MutableStageRef,
+        *,
+        database_identity: _ArtifactFileIdentity,
+        manifest_identity: _ArtifactFileIdentity,
+    ) -> _RegistryReservation:
+        """Reserve one stage before any irreversible transition.
+
+        The identities are the sealer's creation-time no-follow captures;
+        the registry re-observes the paths immediately so a swap before
+        reservation denies instead of being registered.
+        """
+
+        try:
+            stage = _snapshot_stage(mutable_stage)
+        except (TypeError, ValueError) as error:
+            raise StageSealError("SEALER.TYPE_INVALID") from error
+        if (
+            type(database_identity) is not _ArtifactFileIdentity
+            or type(manifest_identity) is not _ArtifactFileIdentity
+        ):
+            raise StageSealError("SEALER.TYPE_INVALID")
+        self._reject_second_seal(stage)
+        key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
+        if key in self._reservations:
+            raise StageSealError("SEALER.ALREADY_RESERVED")
+        observed_database = _artifact_file_identity(
+            stage.staged_db_path,
+            missing_code="SEALER.STAGE_DATABASE_MISSING",
+            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+        )
+        if (observed_database.device, observed_database.inode) != (
+            database_identity.device,
+            database_identity.inode,
+        ):
+            raise StageSealError("SEALER.STAGE_DATABASE_UNSAFE")
+        observed_manifest = _artifact_file_identity(
+            stage.manifest_temp_path,
+            missing_code="SEALER.STAGE_MANIFEST_MISSING",
+            unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+        )
+        if (observed_manifest.device, observed_manifest.inode) != (
+            manifest_identity.device,
+            manifest_identity.inode,
+        ):
+            raise StageSealError("SEALER.STAGE_MANIFEST_UNSAFE")
+        reservation = _RegistryReservation(
+            reservation_id=f"reservation.{uuid.uuid4().hex}",
+            mutable=stage,
+            database_identity=database_identity,
+            manifest_identity=manifest_identity,
+        )
+        self._reservations[reservation.key] = reservation
+        return reservation
+
+    def commit(
+        self,
+        reservation: _RegistryReservation,
+        evidence: StageValidationEvidence,
+        generation: GenerationExpectation,
+    ) -> SealedStage:
+        """Finalize one reservation into the authoritative sealed entry.
+
+        Runs only after the SEALED marker committed and its fsync completed.
+        The registry re-observes the paths against the reservation's
+        creation-time identities and re-proves the sealed digests before
+        recording the entry; any mismatch denies without recording anything.
+        """
+
+        if type(reservation) is not _RegistryReservation:
+            raise StageSealError("SEALER.TYPE_INVALID")
+        existing = self._reservations.get(reservation.key)
+        if (
+            existing is None
+            or existing.reservation_id != reservation.reservation_id
+        ):
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        try:
             claim = _snapshot_evidence(evidence)
             expected_generation = _snapshot_generation(generation)
         except (TypeError, ValueError) as error:
             raise StageSealError("SEALER.TYPE_INVALID") from error
-        self._reject_second_seal(stage)
+        stage = reservation.mutable
         try:
             contract_module._validate_stage_validation_evidence(claim)
             identity = stage.resource_identity
@@ -1486,12 +1829,26 @@ class SealedArtifactRegistry:
             ):
                 raise StageSealError("SEALER.EVIDENCE_MISMATCH")
             _require_generation_closure(expected_generation, claim)
+            _require_identity_unchanged(
+                stage.staged_db_path,
+                reservation.database_identity,
+                unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+            )
+            _require_identity_unchanged(
+                stage.manifest_temp_path,
+                reservation.manifest_identity,
+                unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+            )
             _require_stage_sealed_marker(stage.staged_db_path)
-            if _file_sha256(stage.staged_db_path) != claim.stage_file_digest:
+            if _file_sha256(
+                stage.staged_db_path,
+                reservation.database_identity,
+            ) != claim.stage_file_digest:
                 raise StageSealError("SEALER.EVIDENCE_MISMATCH")
-            if _file_sha256(stage.manifest_temp_path) != (
-                claim.manifest_temp_digest
-            ):
+            if _file_sha256(
+                stage.manifest_temp_path,
+                reservation.manifest_identity,
+            ) != claim.manifest_temp_digest:
                 raise StageSealError("SEALER.EVIDENCE_MISMATCH")
             artifact_id = f"artifact.{uuid.uuid4().hex}"
             sealed_stage = contract_module._create_sealed_stage(
@@ -1515,11 +1872,24 @@ class SealedArtifactRegistry:
             mutable=stage,
             stage=sealed_stage,
             state=ActivationCapabilityState.SEALED,
+            database_identity=reservation.database_identity,
+            manifest_identity=reservation.manifest_identity,
         )
-        self._sealed_paths[
-            (str(stage.staged_db_path), str(stage.manifest_temp_path))
-        ] = artifact_id
+        self._sealed_paths[reservation.key] = artifact_id
+        del self._reservations[reservation.key]
         return sealed_stage
+
+    def release(self, reservation: _RegistryReservation) -> None:
+        """Release one uncommitted reservation; never touches committed entries."""
+
+        if type(reservation) is not _RegistryReservation:
+            return
+        existing = self._reservations.get(reservation.key)
+        if (
+            existing is not None
+            and existing.reservation_id == reservation.reservation_id
+        ):
+            del self._reservations[reservation.key]
 
     def _reject_second_seal(self, stage: MutableStageRef) -> None:
         key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
@@ -1569,17 +1939,39 @@ class SealedArtifactRegistry:
         return entry
 
     def _entry(self, stage: SealedStage) -> _RegistryEntry:
-        """Registry authority check that also re-proves the sealed file digests."""
+        """Registry authority check that re-proves identities and digests."""
 
         entry = self._match_entry(stage)
         evidence = entry.stage.evidence
-        if _file_sha256(entry.mutable.staged_db_path) != (
-            evidence.stage_file_digest
+        observed_database = _artifact_file_identity(
+            entry.mutable.staged_db_path,
+            missing_code="SEALER.STAGE_DATABASE_MISSING",
+            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+        )
+        if (observed_database.device, observed_database.inode) != (
+            entry.database_identity.device,
+            entry.database_identity.inode,
         ):
             raise StageSealError("SEALER.ARTIFACT_MUTATED")
-        if _file_sha256(entry.mutable.manifest_temp_path) != (
-            evidence.manifest_temp_digest
+        observed_manifest = _artifact_file_identity(
+            entry.mutable.manifest_temp_path,
+            missing_code="SEALER.STAGE_MANIFEST_MISSING",
+            unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+        )
+        if (observed_manifest.device, observed_manifest.inode) != (
+            entry.manifest_identity.device,
+            entry.manifest_identity.inode,
         ):
+            raise StageSealError("SEALER.ARTIFACT_MUTATED")
+        if _file_sha256(
+            entry.mutable.staged_db_path,
+            entry.database_identity,
+        ) != evidence.stage_file_digest:
+            raise StageSealError("SEALER.ARTIFACT_MUTATED")
+        if _file_sha256(
+            entry.mutable.manifest_temp_path,
+            entry.manifest_identity,
+        ) != evidence.manifest_temp_digest:
             raise StageSealError("SEALER.ARTIFACT_MUTATED")
         return entry
 
@@ -1613,6 +2005,8 @@ class SealedArtifactRegistry:
             mutable_stage=entry.mutable,
             evidence=entry.stage.evidence,
             generation=entry.stage.generation,
+            database_identity=entry.database_identity,
+            manifest_identity=entry.manifest_identity,
         )
 
     def contains(self, stage: SealedStage) -> bool:
@@ -1673,6 +2067,9 @@ class StageSealer:
     ) -> None:
         if not callable(getattr(registry, "seal", None)):
             raise StageSealError("SEALER.TYPE_INVALID")
+        for seam_name in ("reserve", "commit", "release"):
+            if not callable(getattr(registry, seam_name, None)):
+                raise StageSealError("SEALER.TYPE_INVALID")
         namespace = registry.registry_namespace
         if type(namespace) is not str or not namespace.strip():
             raise StageSealError("SEALER.TYPE_INVALID")
@@ -1691,6 +2088,9 @@ class StageSealer:
     def canonical_store_id(self) -> str:
         return self._canonical_store_id
 
+    def _lifecycle_registry(self) -> _SealLifecycleRegistry:
+        return cast(_SealLifecycleRegistry, self._registry)
+
     def seal(
         self,
         mutable_stage: MutableStageRef,
@@ -1700,10 +2100,14 @@ class StageSealer:
         """Seal one complete migration stage into one opaque artifact.
 
         Ordering is validate (capturing a closure digest), fsync content,
-        then recheck the closure under the write lock before writing the
-        SEALED marker and registering: a reported fsync failure happens
-        before any state transition, so the same completed stage can
-        deterministically retry without rebuilding or duplicating records.
+        reserve the artifact in the registry, then recheck the closure under
+        the write lock before writing the SEALED marker.  The marker commit
+        is itself fsynced (DB and parent) before any digest work or registry
+        publication, so registration only ever follows the final fsynced
+        sealed state.  Any post-marker failure durably restores UNPUBLISHED
+        and releases the reservation, so the same completed stage
+        deterministically retries without rebuilding or duplicating records.
+        A path swap during the seal denies and never mints an entry.
         """
 
         if expected_prior_generation is not None:
@@ -1730,42 +2134,65 @@ class StageSealer:
             canonical_store_id=self._canonical_store_id,
         )
         _fsync_stage_assets(stage, database_identity, manifest_identity)
-        _mark_stage_sealed(
-            stage.staged_db_path,
-            database_identity,
-            expected_closure_digest=facts.closure_digest,
-        )
-        stage_file_digest = _file_sha256(
-            stage.staged_db_path,
-            database_identity,
-        )
-        manifest_temp_digest, manifest = _verify_manifest_at_digest(
-            stage.manifest_temp_path,
-            manifest_identity,
-            facts.receipt,
-        )
-        _verify_sealed_stage(
+        lifecycle = self._lifecycle_registry()
+        reservation = lifecycle.reserve(
             stage,
-            record_count=facts.record_count,
             database_identity=database_identity,
+            manifest_identity=manifest_identity,
         )
-        binding = _build_binding(
-            stage.resource_identity,
-            facts.receipt,
-            manifest,
-        )
-        evidence = _build_evidence(
-            facts,
-            binding,
-            stage_file_digest=stage_file_digest,
-            manifest_temp_digest=manifest_temp_digest,
-        )
-        generation = _build_generation(
-            facts,
-            canonical_store_id=self._canonical_store_id,
-            expected_prior_generation=expected_prior_generation,
-        )
-        return self._registry.seal(stage, evidence, generation)
+        marker_written = False
+        try:
+            _mark_stage_sealed(
+                stage.staged_db_path,
+                database_identity,
+                expected_closure_digest=facts.closure_digest,
+            )
+            marker_written = True
+            _fsync_file(stage.staged_db_path, database_identity)
+            _fsync_directory(stage.staged_db_path.parent)
+            stage_file_digest = _file_sha256(
+                stage.staged_db_path,
+                database_identity,
+            )
+            manifest_temp_digest, manifest = _verify_manifest_at_digest(
+                stage.manifest_temp_path,
+                manifest_identity,
+                facts.receipt,
+            )
+            _verify_sealed_stage(
+                stage,
+                record_count=facts.record_count,
+                database_identity=database_identity,
+            )
+            binding = _build_binding(
+                stage.resource_identity,
+                facts.receipt,
+                manifest,
+            )
+            evidence = _build_evidence(
+                facts,
+                binding,
+                stage_file_digest=stage_file_digest,
+                manifest_temp_digest=manifest_temp_digest,
+            )
+            generation = _build_generation(
+                facts,
+                canonical_store_id=self._canonical_store_id,
+                expected_prior_generation=expected_prior_generation,
+            )
+            return lifecycle.commit(reservation, evidence, generation)
+        except BaseException as error:
+            try:
+                if marker_written:
+                    _restore_stage_unpublished(
+                        stage.staged_db_path,
+                        database_identity,
+                    )
+            finally:
+                lifecycle.release(reservation)
+            if isinstance(error, StageSealError):
+                raise
+            raise StageSealError("SEALER.STAGE_INVALID") from error
 
 
 __all__ = ["SealedArtifactRegistry", "StageSealError", "StageSealer"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -18,11 +19,14 @@ from tm_contracts import (
     SNAPSHOT_MANIFEST_VERSION,
     ActivationCapabilityState,
     CanonicalResourceIdentity,
+    GenerationExpectation,
     MutableStageRef,
     SealedStage,
     SnapshotKind,
+    SnapshotBinding,
     SnapshotManifest,
     SnapshotReceipt,
+    StageValidationEvidence,
     TMRecordDraft,
     contract_to_json,
     snapshot_receipt_digest,
@@ -125,6 +129,27 @@ def _expect_seal_code(
     return raised.exception
 
 
+def _assert_clean_unpublished(
+    test: unittest.TestCase,
+    sealer: StageSealer,
+    stage: MutableStageRef,
+) -> None:
+    registry = _registry(sealer)
+    test.assertEqual(len(registry._entries), 0)
+    test.assertEqual(len(registry._reservations), 0)
+    connection = sqlite3.connect(str(stage.staged_db_path))
+    try:
+        status_rows = connection.execute(
+            "SELECT value FROM tm_meta "
+            "WHERE key = 'activation_status'"
+        ).fetchall()
+    finally:
+        connection.close()
+    test.assertEqual(status_rows, [("UNPUBLISHED",)])
+    test.assertTrue(stage.staged_db_path.is_file())
+    test.assertTrue(stage.manifest_temp_path.is_file())
+
+
 class _PathSubclass(Path):
     pass
 
@@ -144,6 +169,26 @@ class _FakeRegistry:
         generation: object,
     ) -> object:
         raise AssertionError("seal must not be reached")
+
+    def reserve(
+        self,
+        mutable_stage: object,
+        *,
+        database_identity: object,
+        manifest_identity: object,
+    ) -> object:
+        raise AssertionError("reserve must not be reached")
+
+    def commit(
+        self,
+        reservation: object,
+        evidence: object,
+        generation: object,
+    ) -> object:
+        raise AssertionError("commit must not be reached")
+
+    def release(self, reservation: object) -> None:
+        raise AssertionError("release must not be reached")
 
 
 class StageSealerHappyPathTests(unittest.TestCase):
@@ -781,12 +826,14 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
             finally:
                 locker.close()
 
-    def test_fsync_order_is_db_manifest_parent_exactly_once(self) -> None:
+    def test_fsync_sequence_closes_marker_before_registration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, stage = _build_stage(Path(temporary), fts5_available=True)
             calls: list[tuple[str, str]] = []
             real_file_fsync = tm_stage_sealer._fsync_file
             real_directory_fsync = tm_stage_sealer._fsync_directory
+            real_mark_sealed = tm_stage_sealer._mark_stage_sealed
+            real_commit = SealedArtifactRegistry.commit
 
             def record_file(path: Path, expected: object) -> None:
                 calls.append(("file", path.name))
@@ -795,6 +842,28 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
             def record_directory(path: Path) -> None:
                 calls.append(("dir", path.name))
                 real_directory_fsync(path)
+
+            def record_marker(
+                path: Path,
+                expected: object,
+                *,
+                expected_closure_digest: str,
+            ) -> None:
+                calls.append(("marker", path.name))
+                real_mark_sealed(
+                    path,
+                    cast(Any, expected),
+                    expected_closure_digest=expected_closure_digest,
+                )
+
+            def record_commit(
+                self: SealedArtifactRegistry,
+                reservation: tm_stage_sealer._RegistryReservation,
+                evidence: StageValidationEvidence,
+                generation: GenerationExpectation,
+            ) -> SealedStage:
+                calls.append(("commit", reservation.mutable.staged_db_path.name))
+                return real_commit(self, reservation, evidence, generation)
 
             sealer = _sealer()
             with (
@@ -806,6 +875,16 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                     "tm_stage_sealer._fsync_directory",
                     side_effect=record_directory,
                 ),
+                patch(
+                    "tm_stage_sealer._mark_stage_sealed",
+                    side_effect=record_marker,
+                ),
+                patch.object(
+                    SealedArtifactRegistry,
+                    "commit",
+                    autospec=True,
+                    side_effect=record_commit,
+                ),
             ):
                 sealed = _seal(sealer, stage, fts5_available=True)
             self.assertTrue(sealer.registry.contains(sealed))
@@ -815,6 +894,10 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                     ("file", stage.staged_db_path.name),
                     ("file", stage.manifest_temp_path.name),
                     ("dir", stage.staged_db_path.parent.name),
+                    ("marker", stage.staged_db_path.name),
+                    ("file", stage.staged_db_path.name),
+                    ("dir", stage.staged_db_path.parent.name),
+                    ("commit", stage.staged_db_path.name),
                 ],
             )
 
@@ -846,7 +929,7 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
         self,
     ) -> None:
         real_fsync = tm_stage_sealer.os.fsync
-        for failed_call in (1, 2, 3):
+        for failed_call in (1, 2, 3, 4, 5):
             with self.subTest(failed_call=failed_call):
                 with tempfile.TemporaryDirectory() as temporary:
                     identity, stage = _build_stage(
@@ -877,9 +960,19 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                             ),
                             "SEALER.FSYNC_FAILED",
                         )
-                    self.assertEqual(calls[0], failed_call)
+                    if failed_call <= 3:
+                        self.assertEqual(calls[0], failed_call)
+                    else:
+                        self.assertEqual(
+                            calls[0],
+                            failed_call + 2,
+                        )
                     self.assertEqual(
                         len(_registry(sealer)._entries),
+                        0,
+                    )
+                    self.assertEqual(
+                        len(_registry(sealer)._reservations),
                         0,
                     )
                     self.assertTrue(stage.staged_db_path.is_file())
@@ -928,7 +1021,381 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                     )
 
 
+
+class StageSealerDurableRetryTests(unittest.TestCase):
+    """Finding B: failure-injection retry determinism with disk-state proof."""
+
+    def test_reservation_failure_leaves_no_state_and_retry_succeeds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, stage = _build_stage(
+                Path(temporary),
+                fts5_available=True,
+            )
+            sealer = _sealer()
+            with patch.object(
+                SealedArtifactRegistry,
+                "reserve",
+                side_effect=StageSealError("SEALER.ALREADY_RESERVED"),
+            ):
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(sealer, stage, fts5_available=True),
+                    "SEALER.ALREADY_RESERVED",
+                )
+            _assert_clean_unpublished(self, sealer, stage)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                SOURCE_BYTES,
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(_registry(sealer)._entries), 1)
+
+    def test_post_marker_failures_restore_unpublished_and_retry_succeeds(
+        self,
+    ) -> None:
+        real_verify_sealed = tm_stage_sealer._verify_sealed_stage
+        real_verify_manifest = tm_stage_sealer._verify_manifest_at_digest
+        real_sha256 = tm_stage_sealer._file_sha256
+
+        def one_shot(
+            function: Any,
+            *,
+            code: str,
+        ) -> Any:
+            state = [0]
+
+            def injected(*args: Any, **kwargs: Any) -> Any:
+                state[0] += 1
+                if state[0] == 1:
+                    raise StageSealError(code)
+                return function(*args, **kwargs)
+
+            return injected
+
+        cases: tuple[tuple[str, str, str], ...] = (
+            (
+                "post_marker_db_digest",
+                "tm_stage_sealer._file_sha256",
+                "SEALER.DIGEST_UNREADABLE",
+            ),
+            (
+                "post_marker_manifest",
+                "tm_stage_sealer._verify_manifest_at_digest",
+                "SEALER.MANIFEST_INVALID",
+            ),
+            (
+                "post_marker_reopen_evidence",
+                "tm_stage_sealer._verify_sealed_stage",
+                "SEALER.INTEGRITY_FAILED",
+            ),
+        )
+        functions = {
+            "tm_stage_sealer._file_sha256": real_sha256,
+            "tm_stage_sealer._verify_manifest_at_digest": real_verify_manifest,
+            "tm_stage_sealer._verify_sealed_stage": real_verify_sealed,
+        }
+        for name, patch_target, expected_code in cases:
+            with self.subTest(failure=name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity, stage = _build_stage(
+                        Path(temporary),
+                        fts5_available=True,
+                    )
+                    sealer = _sealer()
+                    with patch(
+                        patch_target,
+                        side_effect=one_shot(
+                            functions[patch_target],
+                            code=expected_code,
+                        ),
+                    ):
+                        _expect_seal_code(
+                            self,
+                            lambda: _seal(
+                                sealer,
+                                stage,
+                                fts5_available=True,
+                            ),
+                            expected_code,
+                        )
+                    _assert_clean_unpublished(self, sealer, stage)
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        SOURCE_BYTES,
+                    )
+                    sealed = _seal(sealer, stage, fts5_available=True)
+                    self.assertTrue(sealer.registry.contains(sealed))
+                    self.assertEqual(len(_registry(sealer)._entries), 1)
+                    connection = sqlite3.connect(
+                        str(stage.staged_db_path)
+                    )
+                    try:
+                        record_count = connection.execute(
+                            "SELECT COUNT(*) FROM tm_record"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    self.assertEqual(record_count, (3,))
+
+    def test_registry_commit_failure_restores_unpublished_and_retry_succeeds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, stage = _build_stage(
+                Path(temporary),
+                fts5_available=True,
+            )
+            sealer = _sealer()
+            real_commit = SealedArtifactRegistry.commit
+            state = [0]
+
+            def one_shot_commit(
+                self_registry: SealedArtifactRegistry,
+                reservation: tm_stage_sealer._RegistryReservation,
+                evidence: StageValidationEvidence,
+                generation: GenerationExpectation,
+            ) -> SealedStage:
+                state[0] += 1
+                if state[0] == 1:
+                    raise OSError("injected registry commit failure")
+                return real_commit(
+                    self_registry,
+                    reservation,
+                    evidence,
+                    generation,
+                )
+
+            with patch.object(
+                SealedArtifactRegistry,
+                "commit",
+                autospec=True,
+                side_effect=one_shot_commit,
+            ):
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(sealer, stage, fts5_available=True),
+                    "SEALER.STAGE_INVALID",
+                )
+            _assert_clean_unpublished(self, sealer, stage)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                SOURCE_BYTES,
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(_registry(sealer)._entries), 1)
+            connection = sqlite3.connect(str(stage.staged_db_path))
+            try:
+                record_count = connection.execute(
+                    "SELECT COUNT(*) FROM tm_record"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(record_count, (3,))
+
+
+class StageSealerIdentitySwapTests(unittest.TestCase):
+    """Finding A: creation-time identity enforcement at registration."""
+
+    def _swap_with_identical_bytes(self, target: Path) -> None:
+        payload = target.read_bytes()
+        replacement = target.with_name(f"{target.name}.replacement")
+        replacement.write_bytes(payload)
+        os.replace(replacement, target)
+
+    def _identity_of(self, path: Path) -> tuple[int, int]:
+        observed = tm_stage_sealer._artifact_file_identity(
+            path,
+            missing_code="SEALER.STAGE_DATABASE_MISSING",
+            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+        )
+        return (observed.device, observed.inode)
+
+    def test_byte_identical_db_inode_swap_before_registration_denied(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            sealer = _sealer()
+            original_identity = self._identity_of(stage.staged_db_path)
+            swapped_bytes: list[bytes] = []
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def swap_db_before_registration(
+                identity: CanonicalResourceIdentity,
+                receipt: SnapshotReceipt,
+                manifest: SnapshotManifest,
+            ) -> SnapshotBinding:
+                swapped_bytes.append(stage.staged_db_path.read_bytes())
+                self._swap_with_identical_bytes(stage.staged_db_path)
+                return real_build_binding(identity, receipt, manifest)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=swap_db_before_registration,
+            ):
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(sealer, stage, fts5_available=True),
+                    "SEALER.STAGE_DATABASE_UNSAFE",
+                )
+            registry = _registry(sealer)
+            self.assertEqual(len(registry._entries), 0)
+            self.assertEqual(len(registry._reservations), 0)
+            self.assertNotEqual(
+                self._identity_of(stage.staged_db_path),
+                original_identity,
+            )
+            self.assertEqual(
+                stage.staged_db_path.read_bytes(),
+                swapped_bytes[0],
+            )
+            _expect_seal_code(
+                self,
+                lambda: _seal(sealer, stage, fts5_available=True),
+                "SEALER.STAGE_INVALID",
+            )
+            self.assertEqual(len(registry._entries), 0)
+            self.assertEqual(len(registry._reservations), 0)
+
+    def test_byte_identical_manifest_inode_swap_before_registration_denied(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            sealer = _sealer()
+            original_identity = self._identity_of(stage.manifest_temp_path)
+            real_build_binding = tm_stage_sealer._build_binding
+
+            def swap_manifest_before_registration(
+                identity: CanonicalResourceIdentity,
+                receipt: SnapshotReceipt,
+                manifest: SnapshotManifest,
+            ) -> SnapshotBinding:
+                self._swap_with_identical_bytes(stage.manifest_temp_path)
+                return real_build_binding(identity, receipt, manifest)
+
+            with patch(
+                "tm_stage_sealer._build_binding",
+                side_effect=swap_manifest_before_registration,
+            ):
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(sealer, stage, fts5_available=True),
+                    "SEALER.STAGE_MANIFEST_UNSAFE",
+                )
+            registry = _registry(sealer)
+            self.assertEqual(len(registry._entries), 0)
+            self.assertEqual(len(registry._reservations), 0)
+            self.assertNotEqual(
+                self._identity_of(stage.manifest_temp_path),
+                original_identity,
+            )
+            _assert_clean_unpublished(self, sealer, stage)
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(registry._entries), 1)
+            self.assertEqual(len(registry._reservations), 0)
+
+    def test_registry_rejects_double_reservation_and_stale_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            registry = _registry(_sealer())
+            database_identity = tm_stage_sealer._artifact_file_identity(
+                stage.staged_db_path,
+                missing_code="SEALER.STAGE_DATABASE_MISSING",
+                unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+            )
+            manifest_identity = tm_stage_sealer._artifact_file_identity(
+                stage.manifest_temp_path,
+                missing_code="SEALER.STAGE_MANIFEST_MISSING",
+                unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+            )
+            reservation = registry.reserve(
+                stage,
+                database_identity=database_identity,
+                manifest_identity=manifest_identity,
+            )
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.ALREADY_RESERVED$",
+            ):
+                registry.reserve(
+                    stage,
+                    database_identity=database_identity,
+                    manifest_identity=manifest_identity,
+                )
+            registry.release(reservation)
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.RESERVATION_MISMATCH$",
+            ):
+                registry.commit(
+                    reservation,
+                    cast(Any, object()),
+                    cast(Any, object()),
+                )
+            self.assertEqual(len(registry._reservations), 0)
+            self.assertEqual(len(registry._entries), 0)
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(registry._entries), 1)
+            self.assertEqual(len(registry._reservations), 0)
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.ALREADY_SEALED$",
+            ):
+                registry.reserve(
+                    stage,
+                    database_identity=database_identity,
+                    manifest_identity=manifest_identity,
+                )
+
+    def test_release_is_idempotent_and_retry_seals_exactly_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            registry = _registry(_sealer())
+            database_identity = tm_stage_sealer._artifact_file_identity(
+                stage.staged_db_path,
+                missing_code="SEALER.STAGE_DATABASE_MISSING",
+                unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+            )
+            manifest_identity = tm_stage_sealer._artifact_file_identity(
+                stage.manifest_temp_path,
+                missing_code="SEALER.STAGE_MANIFEST_MISSING",
+                unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+            )
+            reservation = registry.reserve(
+                stage,
+                database_identity=database_identity,
+                manifest_identity=manifest_identity,
+            )
+            registry.release(reservation)
+            registry.release(reservation)
+            self.assertEqual(len(registry._reservations), 0)
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(registry._entries), 1)
+            self.assertEqual(len(registry._reservations), 0)
+
+
 class StageSealerRegistryTests(unittest.TestCase):
+
     def _sealed_fixture(
         self,
     ) -> tuple[
