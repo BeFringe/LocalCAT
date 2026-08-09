@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v3）
+# Feature 5 评审集群与推理强度指南（采纳稿 v4）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -45,7 +45,7 @@
 | A — Store lifecycle | 3.3 + 3.4 | generation lease/drain ↔ canonical/source-binding 状态机 | `high` | `xhigh` | 1 | 小 |
 | B — Candidate index | 4.1 + 4.2 + 4.3 | FTS5 trigram → gram fallback → merge/budget/metadata 召回流水线；与 record/index 同事务 | `medium` | `high` | 1 | 小 |
 | C — Stage build + seal | 5.1 + 5.2 + 5.3 + 5.4 | preflight → mutable stage → seal/integrity → Gate B 证据与 opaque artifact | `high` | `xhigh` | 1 | 中 |
-| D — Activation + recovery | 5.5 + 5.6 + 5.7 + 5.8 + 5.9 | journal 状态机 `PREPARED→DB_REPLACED→MANIFEST_PUBLISHED→GENERATION_PUBLISHED` + 成套回滚 | `xhigh` | `xhigh` | 1 | 大 |
+| D — Activation + recovery | 5.5 + 5.6 + 5.7 + 5.8 + 5.9 | journal 状态机 `PREPARED→DB_REPLACED→MANIFEST_PUBLISHED→GENERATION_PUBLISHED` + 成套回滚 | 5.5/5.7 `xhigh`；5.6/5.8/5.9 `high` | `xhigh` | 1 | 大 |
 | E — Divergence + upgrade | 5.10 + 5.11 | 复用 seal/activate 的显式消歧与 schema copy-switch | `high` | `high` | 1 | 小 |
 | F — Export + snapshot | 5.12 + 5.13 + 5.14 | 任意路径导出与配置快照发布协议 + 崩溃恢复矩阵 | `high` | `xhigh` | 1 | 中 |
 | G — Facade integration | 6.1 + 6.2 + 6.3 | 双状态激活/not 分支 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
@@ -67,7 +67,7 @@
 
 **C — Stage build + seal：** preflight 正确才有 stage 正确，stage 完整才有 seal 意义，Gate B 聚合证据。seal 对抗性要求（先闭合全部 indexes/count/parity，再 close/fsync；artifact mutation、registry/ref、resource/binding mismatch 均拒绝）要求 `xhigh` 复审。
 
-**D — Activation + recovery：** Feature 5 最高风险区域。journal 四阶段每个恢复分支必须产生一个完整 generation。token 单次消费、nonce 防重放、成套回滚（DB + manifest 同时恢复）是对抗向量。
+**D — Activation + recovery：** Feature 5 最高风险区域。journal 四阶段每个恢复分支必须产生一个完整 generation。token 单次消费、nonce 防重放、成套回滚（DB + manifest 同时恢复）是对抗向量。v4 将实施强度按任务阻力临时细分：5.5 负责 capability、lease drain 与备份 authority，5.7 定义正常激活和两条恢复路径共同依赖的发布线性化点，二者保持 `xhigh`；5.6、5.8、5.9 在这两条边界上实现有明确 phase/验收矩阵的 journal 与恢复分支，降为 `high`。该覆盖不改变 Cluster D 的共享不变量、单次复审时机或 `xhigh` 复审强度。
 **E — Divergence + upgrade：** 复用 D 的 seal/activate 流水线。新成本仅在 divergence 清除条件和 schema upgrade 复制切换。复审者已在 D 加载激活模型，成本递减。
 
 **F — Export + snapshot：** 5.12 不改变活动 binding，5.13/5.14 才改变配置快照；两者共享 temporary/fsync/replace/manifest 协议但发布后果不同。复审必须分别证明任意路径损坏不污染 authority，以及 issued receipt 恢复只能完成、取消或进入 divergence。
