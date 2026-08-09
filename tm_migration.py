@@ -27,6 +27,7 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
+    SQLiteStoreSchemaError,
     SQLiteTMStore,
     initialize_stage_schema,
     inspect_stage_schema,
@@ -497,10 +498,17 @@ def _validate_reusable_stage(
             or not stage.manifest_temp_path.is_file()
         ):
             raise ValueError("stage pair is incomplete")
-        schema = inspect_stage_schema(
-            stage,
-            canonical_store_id=canonical_store_id,
-        )
+        try:
+            schema = inspect_stage_schema(
+                stage,
+                canonical_store_id=canonical_store_id,
+            )
+        except SQLiteStoreSchemaError as error:
+            if str(error) == "STORE.STAGE_PUBLISHED":
+                raise MigrationPreflightError(
+                    "MIGRATION.STAGE_SEALED"
+                ) from error
+            raise
         connection = sqlite3.connect(
             f"{stage.staged_db_path.as_uri()}?mode=ro",
             uri=True,

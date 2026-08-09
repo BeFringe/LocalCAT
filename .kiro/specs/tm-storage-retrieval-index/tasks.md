@@ -140,7 +140,7 @@
   - 完成时，尚未 sealed 的 stage 已具备记录/索引/receipt/manifest 全量内容，且记录数、顺序和逐字段内容与接受输入一致
   - _Requirements: 1.2, 1.9, 2.2, 2.3, 2.6, 3.1, 3.2, 3.3_
 
-- [ ] 5.3 校验、关闭并封存不可变 artifact
+- [x] 5.3 校验、关闭并封存不可变 artifact
   - 在 mutable stage 上完成 integrity、foreign key、record/index count、exact parity、资源身份、来源绑定、版本和 digest 校验
   - 关闭全部连接并 fsync 数据库、temporary manifest 与 parent 后，才登记 opaque artifact 并产生单次 sealed stage
   - seal 后任何文件变化、registry/ref 不一致、错资源、错目标或 stale generation 均必须拒绝

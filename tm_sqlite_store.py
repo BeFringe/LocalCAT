@@ -2203,6 +2203,8 @@ def _validate_store_identity(
         or meta["target_identity"] != target_identity
     ):
         raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+    if meta.get("activation_status") == "SEALED":
+        raise SQLiteStoreSchemaError("STORE.STAGE_SEALED")
 
 
 def _canonical_revision_from_connection(
