@@ -101,7 +101,7 @@ class _StoreValidationPort(Protocol):
     @property
     def canonical_store_id(self) -> str: ...
 
-    def activate_candidate_store_id(self, candidate_id: str) -> None: ...
+    def _activate_candidate_store_id(self, candidate_id: str) -> None: ...
 
     @property
     def view(self) -> _SQLiteGenerationView | None: ...
@@ -3814,7 +3814,7 @@ def _recover_generation_publication(
     # The GENERATION_PUBLISHED journal, the re-proven active set, and the
     # write-once marker are durable: coordinator authority switches to the
     # candidate store id so later operations observe the new generation.
-    port.activate_candidate_store_id(record.canonical_store_id)
+    port._activate_candidate_store_id(record.canonical_store_id)
     _remove_journal_proven_backups(record)
     return ActivationRecoveryReport(
         phase=report_phase.value,
@@ -3867,7 +3867,7 @@ def _replay_terminal_recovery(
         fts5_available=snapshot.fts5_available,
     )
     _ensure_activation_lineage_marker(identity)
-    port.activate_candidate_store_id(record.canonical_store_id)
+    port._activate_candidate_store_id(record.canonical_store_id)
     _remove_journal_proven_backups(record)
     return ActivationRecoveryReport(
         phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
@@ -5594,7 +5594,7 @@ def publish_activation(
     # final revalidation, consumed token, marker): coordinator authority
     # switches to the candidate store id before READY so the replacement
     # becomes the resource's current canonical identity.
-    port.activate_candidate_store_id(prepared_record.canonical_store_id)
+    port._activate_candidate_store_id(prepared_record.canonical_store_id)
     port.preparation = None
     port.state = "READY"
     port.notify_all()

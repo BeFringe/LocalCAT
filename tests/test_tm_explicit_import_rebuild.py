@@ -338,7 +338,7 @@ def _drive_to_prepared(
         preflight = _explicit_preflight(service, identity)
         origin_token = uuid.uuid4().hex
         new_store_id = f"store.import.{origin_token}"
-        stage = service._build_stage(
+        stage, _stage_identity, _manifest_identity = service._build_stage(
             identity.configured_jsonl_path,
             preflight=preflight,
             canonical_store_id=new_store_id,
@@ -732,6 +732,139 @@ class ExplicitImportValidationTests(unittest.TestCase):
                 expected_code="ACTIVATION.GATE_B_REJECTED",
                 expected_stage="ACTIVATION",
                 expected_retryable=False,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+
+    def test_seal_failure_removes_exactly_the_fresh_stage_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=MigrationPreflightError(
+                        "IMPORT.SEAL_FAILED"
+                    ),
+                ),
+            ):
+                first = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(first, MigrationFailure)
+            failure = cast(MigrationFailure, first)
+            self.assertEqual(failure.error_code, "IMPORT.SEAL_FAILED")
+            self.assertEqual(failure.stage, "ACTIVATION")
+            self.assertFalse(failure.retryable)
+            self.assertEqual(
+                failure.active_store_preservation.state,
+                AssetPreservationState.VERIFIED_UNCHANGED,
+            )
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+            self.assertEqual(coordinator.state, "READY")
+            # the fresh stage DB and manifest temp are removed by identity
+            self.assertEqual(list(root.glob(".localcat-import.*")), [])
+            # a repeated fresh-salt failure must not grow stage/temp pairs
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=MigrationPreflightError(
+                        "IMPORT.SEAL_FAILED"
+                    ),
+                ),
+            ):
+                second = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(second, MigrationFailure)
+            self.assertEqual(list(root.glob(".localcat-import.*")), [])
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_seal_failure_hostile_stage_swap_never_unlinks_foreign_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            decoy = root / "decoy.sqlite3"
+            decoy.write_bytes(b"foreign-bytes")
+            swapped_stage_path: Path | None = None
+
+            def seal_then_swap(
+                stage: MutableStageRef,
+                *args: Any,
+                **kwargs: Any,
+            ) -> SealedStage:
+                nonlocal swapped_stage_path
+                swapped_stage_path = stage.staged_db_path
+                stage.staged_db_path.unlink()
+                os.symlink(decoy, stage.staged_db_path)
+                raise MigrationPreflightError("IMPORT.SEAL_FAILED")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=seal_then_swap,
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            self.assertEqual(failure.error_code, "IMPORT.SEAL_FAILED")
+            self.assertEqual(
+                failure.active_store_preservation.state,
+                AssetPreservationState.VERIFIED_UNCHANGED,
+            )
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(coordinator.state, "READY")
+            # the foreign symlink and decoy are never disturbed; only the
+            # owned manifest temporary is removed by identity
+            self.assertIsNotNone(swapped_stage_path)
+            assert swapped_stage_path is not None
+            self.assertTrue(swapped_stage_path.is_symlink())
+            self.assertTrue(decoy.is_file())
+            self.assertFalse(
+                swapped_stage_path.with_name(
+                    swapped_stage_path.name.replace(
+                        ".sqlite3.stage",
+                        ".manifest.tmp",
+                    )
+                ).exists()
             )
             self.assertEqual(
                 store.source_binding_monitor.observe().state,
@@ -2046,7 +2179,7 @@ class ExplicitImportOriginBindingTests(unittest.TestCase):
             )
             with patch("tm_sqlite_store._probe_fts5", return_value=False):
                 preflight = _explicit_preflight(service, identity)
-                stage = service._build_stage(
+                stage, _stage_identity, _manifest_identity = service._build_stage(
                     identity.configured_jsonl_path,
                     preflight=preflight,
                     canonical_store_id="store.import.new",

@@ -200,7 +200,7 @@ class TMMigrationService:
         """Build or reuse one complete unpublished migration stage."""
 
         preflight = self.preflight(source)
-        stage = self._build_stage(
+        stage, _stage_identity, _manifest_identity = self._build_stage(
             source,
             preflight=preflight,
             canonical_store_id=self._canonical_store_id,
@@ -290,6 +290,7 @@ class TMMigrationService:
         stage_label = "PREFLIGHT"
         ticket: _SchemaUpgradeSnapshotTicket | None = None
         backup_path: Path | None = None
+        backup_identity: tuple[int, int] | None = None
         backup_digest: str | None = None
         prepared: _ActivationPreparation | None = None
         sealed: SealedStage | None = None
@@ -323,6 +324,7 @@ class TMMigrationService:
             )
             ticket = coordinator.prepare_schema_upgrade_ticket()
             backup_path = ticket.backup_path
+            backup_identity = ticket.backup_identity
             backup_digest = ticket.backup_digest
             # The ticket seam is the stabilization point.  Build and inspect
             # the candidate only from that durable recovery snapshot; the
@@ -438,6 +440,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     backup_digest=backup_digest,
                 )
             if coordinator.state == "ACTIVATING":
@@ -454,6 +457,7 @@ class TMMigrationService:
                         store_before=store_before,
                         store_path=store_path,
                         backup_path=backup_path,
+                        backup_identity=backup_identity,
                     )
             return self._schema_upgrade_failure(
                 error,
@@ -462,6 +466,7 @@ class TMMigrationService:
                 store_before=store_before,
                 store_path=store_path,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
             )
 
     def _explicit_disambiguation(
@@ -490,6 +495,9 @@ class TMMigrationService:
         prepared = None
         new_store_id: str | None = None
         sealed: SealedStage | None = None
+        stage: MutableStageRef | None = None
+        stage_identity: _CreatedFileIdentity | None = None
+        manifest_identity: _CreatedFileIdentity | None = None
         try:
             if (
                 type(resource_id) is not str
@@ -511,7 +519,7 @@ class TMMigrationService:
             preflight = _scan_jsonl(source)
             origin_token = uuid.uuid4().hex
             new_store_id = f"store.import.{origin_token}"
-            stage = self._build_stage(
+            stage, stage_identity, manifest_identity = self._build_stage(
                 source,
                 preflight=preflight,
                 canonical_store_id=new_store_id,
@@ -546,6 +554,20 @@ class TMMigrationService:
             self._canonical_store_id = new_store_id
             return report
         except Exception as error:
+            if (
+                stage is not None
+                and stage_identity is not None
+                and sealed is None
+            ):
+                if manifest_identity is not None:
+                    _remove_created_file(
+                        stage.manifest_temp_path,
+                        manifest_identity,
+                    )
+                _remove_created_file(
+                    stage.staged_db_path,
+                    stage_identity,
+                )
             if prepared is not None:
                 return self._reconcile_failed_activation(
                     error,
@@ -936,6 +958,7 @@ class TMMigrationService:
         store_before: str,
         store_path: Path,
         backup_path: Path | None,
+        backup_identity: tuple[int, int] | None,
         backup_digest: str | None,
     ) -> SchemaUpgradeOutcome:
         """Auto-restore the prior READY service after one failed upgrade.
@@ -961,6 +984,7 @@ class TMMigrationService:
                 store_before=store_before,
                 store_path=store_path,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
                 force_unverified=True,
             )
         if journal_phase is None:
@@ -977,6 +1001,7 @@ class TMMigrationService:
                         store_before=store_before,
                         store_path=store_path,
                         backup_path=backup_path,
+                        backup_identity=backup_identity,
                         force_unverified=True,
                     )
             return self._schema_upgrade_failure(
@@ -986,6 +1011,7 @@ class TMMigrationService:
                 store_before=store_before,
                 store_path=store_path,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
             )
         if journal_phase == "GENERATION_PUBLISHED":
             try:
@@ -1001,6 +1027,7 @@ class TMMigrationService:
                         store_before=store_before,
                         store_path=store_path,
                         backup_path=backup_path,
+                        backup_identity=backup_identity,
                         force_unverified=True,
                     )
             else:
@@ -1011,6 +1038,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                 )
             # The candidate active set is proven and the completed
             # journal is the cold-recovery authority: a fresh coordinator
@@ -1039,6 +1067,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     force_unverified=True,
                 )
             if backup_path is None or backup_digest is None:
@@ -1049,6 +1078,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     force_unverified=True,
                 )
             new_store_path = recovery_coordinator.active_store_path
@@ -1060,6 +1090,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     force_unverified=True,
                 )
             success_digest = _try_file_digest(new_store_path)
@@ -1071,6 +1102,7 @@ class TMMigrationService:
                     store_before=store_before,
                     store_path=store_path,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     force_unverified=True,
                 )
             # The recovered publication is durably READY: the same
@@ -1094,6 +1126,7 @@ class TMMigrationService:
                 store_before=store_before,
                 store_path=store_path,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
                 force_unverified=True,
             )
         return self._schema_upgrade_failure(
@@ -1103,6 +1136,7 @@ class TMMigrationService:
             store_before=store_before,
             store_path=store_path,
             backup_path=backup_path,
+            backup_identity=backup_identity,
         )
 
     def _schema_upgrade_failure(
@@ -1114,6 +1148,7 @@ class TMMigrationService:
         store_before: str,
         store_path: Path,
         backup_path: Path | None = None,
+        backup_identity: tuple[int, int] | None = None,
         force_unverified: bool = False,
     ) -> SchemaUpgradeFailure:
         """Build one preservation-backed schema upgrade failure.
@@ -1121,7 +1156,13 @@ class TMMigrationService:
         ``force_unverified`` marks the active store UNVERIFIED with a
         recovery locator and non-retryable when the rollback outcome could
         not be proven: an unprovable rollback never claims
-        VERIFIED_UNCHANGED.
+        VERIFIED_UNCHANGED.  A recovery locator is only ever built from a
+        path whose current bytes are re-proven to equal the preservation
+        ``before_digest``; when no such path exists the failure stops
+        explicitly instead of exposing a locator whose bytes do not match.
+        The schema-upgrade backup and any unexposed byte-exact locator
+        snapshot are strictly removed so failed attempts never accumulate
+        hidden full DB copies.
         """
 
         error_code = _schema_upgrade_error_code(error)
@@ -1131,26 +1172,14 @@ class TMMigrationService:
             active_generation = 0
         store_observed = _try_file_digest(store_path)
         locators: list[RecoveryLocator] = []
+        locator_path: Path | None = None
+        needs_recovery = False
         if force_unverified:
             store_evidence = _unverified_preservation(
                 AssetKind.ACTIVE_STORE,
                 store_before,
             )
-            if (
-                backup_path is not None
-                and _try_file_digest(backup_path) == store_before
-            ):
-                locator_path = backup_path
-            else:
-                locator_path = store_path
-            locators.append(
-                RecoveryLocator(
-                    path=locator_path,
-                    asset_kind=AssetKind.ACTIVE_STORE,
-                    expected_digest=store_before,
-                )
-            )
-            retryable = False
+            needs_recovery = True
         elif store_observed == store_before:
             store_evidence = _unchanged_preservation(
                 AssetKind.ACTIVE_STORE,
@@ -1162,33 +1191,30 @@ class TMMigrationService:
                 store_before,
                 store_observed,
             )
-            if (
-                backup_path is not None
-                and _try_file_digest(backup_path) == store_before
-            ):
-                locator_path = backup_path
-            else:
-                locator_path = store_path
-            locators.append(
-                RecoveryLocator(
-                    path=locator_path,
-                    asset_kind=AssetKind.ACTIVE_STORE,
-                    expected_digest=store_before,
-                )
-            )
-            retryable = False
+            needs_recovery = True
         else:
             store_evidence = _unverified_preservation(
                 AssetKind.ACTIVE_STORE,
                 store_before,
             )
-            if (
-                backup_path is not None
-                and _try_file_digest(backup_path) == store_before
-            ):
-                locator_path = backup_path
-            else:
-                locator_path = store_path
+            needs_recovery = True
+        if needs_recovery:
+            locator_path = self._proven_schema_upgrade_locator(
+                coordinator,
+                store_path=store_path,
+                store_before=store_before,
+                backup_path=backup_path,
+            )
+            if locator_path is None:
+                self._release_unexposed_schema_upgrade_artifacts(
+                    coordinator,
+                    backup_path=backup_path,
+                    backup_identity=backup_identity,
+                    locator_path=None,
+                )
+                raise MigrationPreflightError(
+                    "SCHEMA.PRIOR_STATE_UNRECOVERABLE"
+                )
             locators.append(
                 RecoveryLocator(
                     path=locator_path,
@@ -1197,7 +1223,13 @@ class TMMigrationService:
                 )
             )
             retryable = False
-        return SchemaUpgradeFailure(
+        self._release_unexposed_schema_upgrade_artifacts(
+            coordinator,
+            backup_path=backup_path,
+            backup_identity=backup_identity,
+            locator_path=locator_path,
+        )
+        outcome = SchemaUpgradeFailure(
             stage=stage_label,
             error_code=error_code,
             retryable=retryable,
@@ -1205,6 +1237,77 @@ class TMMigrationService:
             active_store_preservation=store_evidence,
             recovery_locators=tuple(locators),
         )
+        snapshot = coordinator.schema_upgrade_locator_snapshot
+        if (
+            snapshot is not None
+            and locator_path is not None
+            and snapshot.path == locator_path
+        ):
+            coordinator._detach_schema_upgrade_locator_snapshot(locator_path)
+        return outcome
+
+    def _proven_schema_upgrade_locator(
+        self,
+        coordinator: ResourceStoreCoordinator,
+        *,
+        store_path: Path,
+        store_before: str,
+        backup_path: Path | None,
+    ) -> Path | None:
+        """One rehash-proven byte-exact recovery locator for the prior store.
+
+        Candidates are the activation pipeline's journal-owned byte-exact
+        ``.localcat-recovery.*.database.bak`` (the Task 5.10 locator
+        family), the Design-required ``Connection.backup()`` schema
+        backup, the coordinator-captured byte-exact locator snapshot, and
+        finally the live canonical -- each accepted only after re-hashing
+        proves its current bytes equal ``store_before``.
+        """
+
+        journal_backup = _find_recovery_backup(
+            store_path,
+            label="database",
+            expected_digest=store_before,
+        )
+        if journal_backup is not None:
+            return journal_backup
+        if (
+            backup_path is not None
+            and _try_file_digest(backup_path) == store_before
+        ):
+            return backup_path
+        snapshot = coordinator.schema_upgrade_locator_snapshot
+        if (
+            snapshot is not None
+            and _try_file_digest(snapshot.path) == store_before
+        ):
+            return snapshot.path
+        if _try_file_digest(store_path) == store_before:
+            return store_path
+        return None
+
+    def _release_unexposed_schema_upgrade_artifacts(
+        self,
+        coordinator: ResourceStoreCoordinator,
+        *,
+        backup_path: Path | None,
+        backup_identity: tuple[int, int] | None,
+        locator_path: Path | None,
+    ) -> None:
+        """Strictly remove failure artifacts that no locator exposes."""
+
+        snapshot = coordinator.schema_upgrade_locator_snapshot
+        if snapshot is not None and snapshot.path != locator_path:
+            coordinator.release_schema_upgrade_locator_snapshot()
+        if (
+            backup_path is not None
+            and backup_identity is not None
+            and backup_path != locator_path
+        ):
+            _remove_owned_schema_upgrade_backup(
+                backup_path,
+                backup_identity,
+            )
 
     def _build_stage(
         self,
@@ -1218,7 +1321,11 @@ class TMMigrationService:
         stage_prefix: str,
         path_salt: str | None = None,
         batch_id: str | None = None,
-    ) -> MutableStageRef:
+    ) -> tuple[
+        MutableStageRef,
+        _CreatedFileIdentity | None,
+        _CreatedFileIdentity | None,
+    ]:
         """Build or reuse one complete unpublished stage (shared builder).
 
         The stage is deterministic per (identity, source digest, prefix)
@@ -1228,7 +1335,10 @@ class TMMigrationService:
         origins use the deterministic ``migration.<source digest>`` batch
         id; explicit imports pass a fresh collision-resistant
         ``import.<uuid>`` batch id whose token also shapes the snapshot
-        receipt id.
+        receipt id.  The returned identities describe exactly the files
+        this builder created (``None`` for a reused stage), so a caller
+        that fails before a sealed artifact owns them can remove exactly
+        those paths without ever touching a foreign inode.
         """
 
         if batch_id is None:
@@ -1251,7 +1361,7 @@ class TMMigrationService:
                 snapshot_prefix=snapshot_prefix,
                 batch_id=batch_id,
             )
-            return stage
+            return stage, None, None
 
         initialize_stage_schema(
             stage,
@@ -1334,7 +1444,7 @@ class TMMigrationService:
                 )
             _remove_created_file(stage.staged_db_path, stage_identity)
             raise
-        return stage
+        return stage, stage_identity, manifest_identity
 
     def _validate_source_preconditions(self, source: Path) -> None:
         if type(source) is not _NATIVE_PATH_TYPE:
@@ -1893,6 +2003,38 @@ def _remove_created_file(
         and observed.st_ino == expected.inode
     ):
         path.unlink()
+
+
+def _remove_owned_schema_upgrade_backup(
+    path: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Safely unlink one exact owned schema-upgrade recovery backup.
+
+    Only a regular single-link file carrying the captured identity is
+    removed; a missing file is already gone and a foreign inode is never
+    unlinked but fails closed so the caller can stop instead of leaving an
+    unaccounted full DB copy.  The parent directory is fsynced after the
+    unlink.
+    """
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != identity
+    ):
+        raise MigrationPreflightError("SCHEMA.BACKUP_CLEANUP_UNSAFE")
+    try:
+        path.unlink()
+        _fsync_schema_upgrade_directory(path.parent)
+    except OSError as error:
+        raise MigrationPreflightError(
+            "SCHEMA.BACKUP_CLEANUP_FAILED"
+        ) from error
 
 
 def _snapshot_resource_identity(

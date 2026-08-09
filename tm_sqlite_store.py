@@ -917,14 +917,17 @@ class _CoordinatorStorePort:
     def notify_all(self) -> None:
         self._coordinator._condition.notify_all()
 
-    def activate_candidate_store_id(self, candidate_id: str) -> None:
-        """Narrow replacement seam: switch coordinator authority store id.
+    def _activate_candidate_store_id(self, candidate_id: str) -> None:
+        """Private replacement seam: switch coordinator authority store id.
 
         Called by recovery/publication only after the candidate generation
         is durably published (GENERATION_PUBLISHED journal, final active
         set revalidation, token consumption, and the activated-lineage
         marker).  Before that point the coordinator keeps the prior store
         id so cancellation and rollback rehydrate the prior authority.
+        The leading underscore keeps this authority mutation off the
+        public port surface: call-site discipline is replaced by the
+        module-private protocol name.
         """
 
         if type(candidate_id) is not str:
@@ -1211,6 +1214,40 @@ _SCHEMA_UPGRADE_TICKET_FACTORY_KEY = object()
 
 
 @dataclass(frozen=True)
+class _SchemaUpgradeLocatorSnapshot:
+    """One coordinator-captured byte-exact prior-store evidence copy.
+
+    Created while the resource is drained beside the Design-required
+    ``Connection.backup()`` recovery backup.  The backup is a valid
+    reopenable snapshot whose byte digest is deliberately not required to
+    equal the active DB digest; this raw byte-exact copy is the only
+    artifact whose digest can honestly back a ``RecoveryLocator`` bound to
+    the prior active-store digest when a failure contract needs one.  It
+    is deleted on success and on any failure that does not expose it, and
+    the coordinator holds at most one at a time.
+    """
+
+    path: Path
+    identity: tuple[int, int]
+    digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("locator snapshot path is invalid")
+        if not self.path.is_absolute():
+            raise ValueError("locator snapshot path must be absolute")
+        if (
+            type(self.identity) is not tuple
+            or len(self.identity) != 2
+            or type(self.identity[0]) is not int
+            or type(self.identity[1]) is not int
+        ):
+            raise TypeError("locator snapshot identity is invalid")
+        if type(self.digest) is not str or len(self.digest) != 64:
+            raise TypeError("locator snapshot digest is invalid")
+
+
+@dataclass(frozen=True)
 class _SchemaUpgradeSnapshotTicket:
     """Opaque single-use schema-upgrade stabilization ticket (Task 5.11).
 
@@ -1218,9 +1255,10 @@ class _SchemaUpgradeSnapshotTicket:
     can mint one: the factory key is module-private, and the ticket binds
     the coordinator owner nonce, resource, canonical store id, generation,
     head revision, the stabilized prior DB identity/digest, and the
-    recovery backup path/digest captured while the coordinator held the
-    resource drained.  The activation guard consumes the ticket before any
-    journal is written; a stale or foreign ticket can never be activated.
+    recovery backup path/identity/digest captured while the coordinator
+    held the resource drained.  The activation guard consumes the ticket
+    before any journal is written; a stale or foreign ticket can never be
+    activated.
     """
 
     _owner_nonce: str
@@ -1231,6 +1269,7 @@ class _SchemaUpgradeSnapshotTicket:
     db_identity: tuple[int, int]
     db_digest: str
     backup_path: Path
+    backup_identity: tuple[int, int]
     backup_digest: str
     _factory_key: object
 
@@ -1274,6 +1313,13 @@ class _SchemaUpgradeSnapshotTicket:
             raise TypeError("ticket backup path is invalid")
         if not self.backup_path.is_absolute():
             raise ValueError("ticket backup path must be absolute")
+        if (
+            type(self.backup_identity) is not tuple
+            or len(self.backup_identity) != 2
+            or type(self.backup_identity[0]) is not int
+            or type(self.backup_identity[1]) is not int
+        ):
+            raise TypeError("ticket backup identity is invalid")
         if type(self.backup_digest) is not str or len(self.backup_digest) != 64:
             raise TypeError("ticket backup digest is invalid")
 
@@ -1366,6 +1412,9 @@ class ResourceStoreCoordinator:
         self._cleanup_in_progress = False
         self._owner_nonce = uuid.uuid4().hex
         self._schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None
+        self._schema_upgrade_locator_snapshot: (
+            _SchemaUpgradeLocatorSnapshot | None
+        ) = None
 
     @property
     def resource_id(self) -> str:
@@ -1521,6 +1570,7 @@ class ResourceStoreCoordinator:
         tampering, or an unprovable order is never repaired.
         """
 
+        self.release_schema_upgrade_locator_snapshot()
         port = _CoordinatorStorePort(self)
         with self._condition:
             if (
@@ -1556,6 +1606,8 @@ class ResourceStoreCoordinator:
             deadline = time.monotonic() + self._drain_timeout_seconds
             backup_path: Path | None = None
             backup_identity: tuple[int, int] | None = None
+            locator_snapshot_path: Path | None = None
+            locator_snapshot_identity: tuple[int, int] | None = None
             try:
                 while self._active_lease_count:
                     remaining = deadline - time.monotonic()
@@ -1599,14 +1651,25 @@ class ResourceStoreCoordinator:
                     database_path
                 )
                 head_revision = _schema_upgrade_head_revision(database_path)
+                token = uuid.uuid4().hex
                 backup_path = _schema_upgrade_backup_path(
                     database_path,
-                    uuid.uuid4().hex,
+                    token,
                 )
                 backup_identity, backup_digest = (
                     _create_schema_upgrade_backup(
                         database_path,
                         backup_path,
+                    )
+                )
+                locator_snapshot_path = _schema_upgrade_locator_snapshot_path(
+                    database_path,
+                    token,
+                )
+                locator_snapshot_identity, locator_snapshot_digest = (
+                    _create_schema_upgrade_locator_snapshot(
+                        database_path,
+                        locator_snapshot_path,
                     )
                 )
                 ticket = _SchemaUpgradeSnapshotTicket(
@@ -1618,23 +1681,34 @@ class ResourceStoreCoordinator:
                     db_identity=db_identity,
                     db_digest=db_digest,
                     backup_path=backup_path,
+                    backup_identity=backup_identity,
                     backup_digest=backup_digest,
                     _factory_key=_SCHEMA_UPGRADE_TICKET_FACTORY_KEY,
                 )
                 self._schema_upgrade_ticket = ticket
+                self._schema_upgrade_locator_snapshot = (
+                    _SchemaUpgradeLocatorSnapshot(
+                        path=locator_snapshot_path,
+                        identity=locator_snapshot_identity,
+                        digest=locator_snapshot_digest,
+                    )
+                )
                 return ticket
             except BaseException:
                 if backup_path is not None and backup_identity is not None:
-                    try:
-                        observed = os.lstat(backup_path)
-                        if (
-                            stat.S_ISREG(observed.st_mode)
-                            and observed.st_dev == backup_identity[0]
-                            and observed.st_ino == backup_identity[1]
-                        ):
-                            backup_path.unlink()
-                    except OSError:
-                        pass
+                    _remove_owned_schema_upgrade_artifact(
+                        backup_path,
+                        backup_identity,
+                    )
+                if (
+                    locator_snapshot_path is not None
+                    and locator_snapshot_identity is not None
+                ):
+                    _remove_owned_schema_upgrade_artifact(
+                        locator_snapshot_path,
+                        locator_snapshot_identity,
+                    )
+                    self._schema_upgrade_locator_snapshot = None
                 raise
             finally:
                 self._state = "READY"
@@ -1657,16 +1731,71 @@ class ResourceStoreCoordinator:
                 "ACTIVATION.UPGRADE_TICKET_INVALID",
                 retryable=False,
             )
+        remove_backup = False
         with self._condition:
             if self._schema_upgrade_ticket is ticket:
                 self._schema_upgrade_ticket = None
+                remove_backup = True
+            elif self._schema_upgrade_ticket is None:
                 return
-            if self._schema_upgrade_ticket is None:
+            else:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_TICKET_INVALID",
+                    retryable=False,
+                )
+        if remove_backup:
+            _remove_schema_upgrade_backup(ticket)
+
+    @property
+    def schema_upgrade_locator_snapshot(
+        self,
+    ) -> _SchemaUpgradeLocatorSnapshot | None:
+        """The one coordinator-captured byte-exact locator snapshot, if any."""
+
+        with self._condition:
+            return self._schema_upgrade_locator_snapshot
+
+    def release_schema_upgrade_locator_snapshot(self) -> None:
+        """Strictly delete the held locator snapshot, if any.
+
+        The snapshot is deleted by its captured identity only (regular
+        single-link file); a missing file is already released, and a
+        foreign inode is never unlinked but fails closed so the caller can
+        stop instead of leaving an unaccounted artifact.  The record is
+        cleared only after the deletion is durable.
+        """
+
+        with self._condition:
+            snapshot = self._schema_upgrade_locator_snapshot
+            if snapshot is None:
                 return
-            raise ActivationPreparationError(
-                "ACTIVATION.UPGRADE_TICKET_INVALID",
-                retryable=False,
-            )
+        _remove_schema_upgrade_locator_snapshot(snapshot)
+        with self._condition:
+            self._schema_upgrade_locator_snapshot = None
+
+    def _detach_schema_upgrade_locator_snapshot(
+        self,
+        expected_path: Path,
+    ) -> None:
+        """Transfer one proven locator snapshot to the failure result.
+
+        Once a ``SchemaUpgradeFailure`` exposes the path, the coordinator
+        must stop treating the file as an unexposed temporary: a later retry
+        may create fresh evidence, but it must not silently invalidate the
+        already-returned recovery locator.  Detachment changes only the
+        in-memory ownership record and never deletes or rewrites the file.
+        """
+
+        if type(expected_path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("expected locator path must be pathlib.Path")
+        with self._condition:
+            snapshot = self._schema_upgrade_locator_snapshot
+            if snapshot is None or snapshot.path != expected_path:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_LOCATOR_INVALID",
+                    retryable=False,
+                )
+            self._schema_upgrade_locator_snapshot = None
 
     def activate(
         self,
@@ -6287,6 +6416,198 @@ def _remove_partial_schema_upgrade_backup(backup_path: Path) -> None:
             pass
 
 
+def _schema_upgrade_locator_snapshot_path(
+    store_path: Path,
+    token: str,
+) -> Path:
+    """One collision-resistant byte-exact locator snapshot path.
+
+    The name deliberately avoids the schema-upgrade backup glob
+    ``.{name}.localcat-schema-upgrade.*.bak`` and the activation recovery
+    glob ``.{name}.localcat-recovery.*.database.bak`` so backup counts and
+    recovery locators never confuse the two artifact families.
+    """
+
+    return (
+        store_path.parent
+        / f".{store_path.name}.localcat-schema-upgrade.{token}.locator"
+    ).absolute()
+
+
+def _create_schema_upgrade_locator_snapshot(
+    source_path: Path,
+    snapshot_path: Path,
+) -> tuple[tuple[int, int], str]:
+    """One strict raw byte-exact copy of the drained prior store.
+
+    The source is opened no-follow while the coordinator holds the
+    resource drained, and every byte is copied into a fresh same-directory
+    ``O_EXCL`` regular single-link file that is fsynced (file and parent).
+    The returned identity/digest describe the snapshot file itself and the
+    digest is byte-identical to the drained source, so the snapshot can
+    honestly back a ``RecoveryLocator`` bound to the prior store digest.
+    Any failure removes the partial snapshot and never touches the live
+    canonical.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    source_descriptor = -1
+    destination_descriptor = -1
+    identity: tuple[int, int] | None = None
+    try:
+        source_descriptor = os.open(source_path, os.O_RDONLY | no_follow)
+        source_observed = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_observed.st_mode)
+            or source_observed.st_nlink != 1
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_SNAPSHOT_UNSAFE",
+                retryable=False,
+            )
+        destination_descriptor = os.open(
+            snapshot_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | no_follow,
+            0o600,
+        )
+        destination_observed = os.fstat(destination_descriptor)
+        if (
+            not stat.S_ISREG(destination_observed.st_mode)
+            or destination_observed.st_nlink != 1
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_SNAPSHOT_UNSAFE",
+                retryable=False,
+            )
+        identity = (
+            destination_observed.st_dev,
+            destination_observed.st_ino,
+        )
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    raise OSError("locator snapshot write made no progress")
+                view = view[written:]
+        os.fsync(destination_descriptor)
+        os.close(destination_descriptor)
+        destination_descriptor = -1
+        _fsync_schema_upgrade_directory(snapshot_path.parent)
+        final = os.lstat(snapshot_path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_SNAPSHOT_UNSAFE",
+                retryable=False,
+            )
+        digest = _file_sha256_of_path(snapshot_path)
+        return identity, digest
+    except ActivationPreparationError:
+        _remove_partial_schema_upgrade_backup(snapshot_path)
+        raise
+    except (OSError, sqlite3.DatabaseError) as error:
+        _remove_partial_schema_upgrade_backup(snapshot_path)
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_SNAPSHOT_FAILED",
+            retryable=True,
+        ) from error
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+
+
+def _remove_owned_schema_upgrade_artifact(
+    path: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Strict best-effort removal of one owned schema-upgrade artifact."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISREG(observed.st_mode)
+        and observed.st_nlink == 1
+        and (observed.st_dev, observed.st_ino) == identity
+    ):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _remove_schema_upgrade_backup(
+    ticket: _SchemaUpgradeSnapshotTicket,
+) -> None:
+    """Safely unlink the exact owned recovery backup of one retired ticket.
+
+    Only the file created by the ticket (regular single-link file with the
+    captured identity) is removed; a missing file is already gone and a
+    foreign inode is never unlinked but fails closed so the caller can
+    stop instead of leaving an unaccounted full DB copy.
+    """
+
+    try:
+        observed = os.lstat(ticket.backup_path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != ticket.backup_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_BACKUP_CLEANUP_FAILED",
+            retryable=True,
+        )
+    try:
+        ticket.backup_path.unlink()
+        _fsync_schema_upgrade_directory(ticket.backup_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_BACKUP_CLEANUP_FAILED",
+            retryable=True,
+        ) from error
+
+
+def _remove_schema_upgrade_locator_snapshot(
+    snapshot: _SchemaUpgradeLocatorSnapshot,
+) -> None:
+    """Strictly delete one coordinator-captured locator snapshot."""
+
+    try:
+        observed = os.lstat(snapshot.path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != snapshot.identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_SNAPSHOT_INVALID",
+            retryable=False,
+        )
+    try:
+        snapshot.path.unlink()
+        _fsync_schema_upgrade_directory(snapshot.path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_SNAPSHOT_CLEANUP_FAILED",
+            retryable=True,
+        ) from error
+
+
 def _file_sha256_of_path(path: Path) -> str:
     """One strict no-follow SHA-256 of an existing regular single-link file."""
 
@@ -6531,6 +6852,9 @@ def _retire_schema_upgrade_ticket(
     with coordinator._condition:
         if coordinator._schema_upgrade_ticket is ticket:
             coordinator._schema_upgrade_ticket = None
+        else:
+            return
+    _remove_schema_upgrade_backup(ticket)
 
 
 def _require_schema_upgrade_ticket_guard(
@@ -6602,6 +6926,11 @@ def _require_schema_upgrade_ticket_guard(
                 retryable=False,
             )
         coordinator._schema_upgrade_ticket = None
+    # The stabilized prior is now proven byte-identical to the live
+    # canonical and the activation pipeline's own byte-exact recovery
+    # backup takes over as the honest locator evidence, so the extra
+    # locator snapshot is no longer needed and is strictly removed.
+    coordinator.release_schema_upgrade_locator_snapshot()
 
 
 __all__ = [
