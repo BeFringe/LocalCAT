@@ -27,6 +27,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
+import threading
 from typing import Any, Callable, cast
 import unittest
 from unittest.mock import patch
@@ -77,10 +78,27 @@ from tests.test_tm_activation import (
     _publish_prior_binding,
     _prior_stage,
 )
+from tests.test_tm_schema_upgrade import _legacy_fixture
 
 _STORE_IMPORT_RE = re.compile(r"^store\.import\.[0-9a-f]{32}$")
 _BATCH_IMPORT_RE = re.compile(r"^import\.[0-9a-f]{32}$")
 _SNAPSHOT_IMPORT_RE = re.compile(r"^snapshot\.import\.[0-9a-f]{24}$")
+
+
+def _schema_upgrade_pending_family(root: Path) -> list[Path]:
+    return list(
+        root.glob("..prior.sqlite3.localcat-schema-upgrade.*.pending")
+    )
+
+
+def _schema_upgrade_stable_bak(root: Path) -> list[Path]:
+    return list(root.glob("..prior.sqlite3.localcat-schema-upgrade.*.bak"))
+
+
+def _schema_upgrade_stable_locator(root: Path) -> list[Path]:
+    return list(
+        root.glob("..prior.sqlite3.localcat-schema-upgrade.*.locator")
+    )
 
 
 def _diverged_fixture(
@@ -2631,6 +2649,319 @@ class ExplicitImportRecoveryLocatorStrictnessTests(unittest.TestCase):
                 identity.configured_jsonl_path.read_bytes(),
                 b'{"changed":true}\n',
             )
+
+
+class ExplicitImportUpgradePendingInterleavingTests(unittest.TestCase):
+    """Cluster E P3: abandoned schema-upgrade pending artifacts vs 5.10.
+
+    A schema upgrade that crashes after minting its snapshot ticket but
+    before any activation journal leaves an owned ``.bak.pending`` and
+    ``.locator.pending`` beside the active store.  The explicit
+    replacement import/rebuild must resolve that abandoned unexposed
+    family before its own activation begins, so a later completed cold
+    recovery of the import can never promote a stale upgrade backup to an
+    unreported stable ``.bak``; a hostile abandoned entry fails closed
+    without deletion and without publishing a generation; and a live
+    Task 5.11 ticket is never swept.
+    """
+
+    def test_crash_after_upgrade_ticket_mint_import_resolves_before_publish(
+        self,
+    ) -> None:
+        for operation in ("import_snapshot", "rebuild_from_snapshot"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        coordinator,
+                        activation_digest,
+                    ) = _legacy_fixture(root, fts5_available=False)
+                    # crash/abandon after ticket mint before any journal:
+                    # a separate coordinator mints the ticket and dies
+                    # with its "process", leaving the pending family
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        crashed = ResourceStoreCoordinator(
+                            prior,
+                            canonical_store_id="store.primary",
+                            _allow_legacy_schema=True,
+                            _allow_active=True,
+                            _expected_active_generation=3,
+                            _expected_activation_digest=activation_digest,
+                        )
+                        crashed.prepare_schema_upgrade_ticket()
+                    pending = _schema_upgrade_pending_family(root)
+                    self.assertEqual(len(pending), 2)
+                    self.assertTrue(
+                        any(
+                            candidate.name.endswith(".bak.pending")
+                            for candidate in pending
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            candidate.name.endswith(".locator.pending")
+                            for candidate in pending
+                        )
+                    )
+                    self.assertEqual(
+                        _schema_upgrade_stable_bak(root),
+                        [],
+                    )
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+                    # the completed explicit import/rebuild resolves the
+                    # abandoned family before its own activation begins
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = getattr(service, operation)(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    self.assertIsInstance(outcome, MigrationReport)
+                    report = cast(MigrationReport, outcome)
+                    self.assertEqual(report.activated_generation, 4)
+                    self.assertEqual(coordinator.state, "READY")
+                    self.assertEqual(
+                        coordinator.active_store_path,
+                        identity.canonical_sidecar_path,
+                    )
+                    self.assertEqual(_schema_upgrade_pending_family(root), [])
+                    self.assertEqual(_schema_upgrade_stable_bak(root), [])
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+                    # a later cold recovery of the completed import
+                    # promotes nothing: no stale upgrade backup becomes
+                    # an unreported stable .bak and no hidden full-copy
+                    # artifacts remain
+                    fresh = ResourceStoreCoordinator(
+                        resource_identity=identity,
+                        canonical_store_id=report.canonical_store_id,
+                    )
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        recovered = fresh.recover_durable_activation()
+                    self.assertIsNotNone(recovered)
+                    recovery = cast(ActivationRecoveryReport, recovered)
+                    self.assertEqual(recovery.action, "COMPLETED")
+                    self.assertEqual(recovery.generation, 4)
+                    self.assertEqual(fresh.state, "READY")
+                    self.assertEqual(fresh.current_generation, 4)
+                    self.assertEqual(_schema_upgrade_pending_family(root), [])
+                    self.assertEqual(_schema_upgrade_stable_bak(root), [])
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+
+    def test_hostile_abandoned_pending_entry_fails_closed_without_deletion(
+        self,
+    ) -> None:
+        for kind in ("symlink", "directory", "multilink", "malformed"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    jsonl_before = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    token = "a" * 32
+                    pending_path = root / (
+                        f"..prior.sqlite3.localcat-schema-upgrade."
+                        f"{token}.bak.pending"
+                    )
+                    if kind == "symlink":
+                        os.symlink(identity.canonical_sidecar_path, pending_path)
+                    elif kind == "directory":
+                        pending_path.mkdir()
+                    elif kind == "multilink":
+                        pending_path.write_bytes(b"pending bytes")
+                        os.link(
+                            pending_path,
+                            root / "hostile-hardlink-extra",
+                        )
+                    else:
+                        pending_path = root / (
+                            "..prior.sqlite3.localcat-schema-upgrade."
+                            "nothex.bak.pending"
+                        )
+                        pending_path.write_bytes(b"malformed pending bytes")
+                    self.assertTrue(os.path.lexists(pending_path))
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    self.assertIsInstance(outcome, MigrationFailure)
+                    failure = cast(MigrationFailure, outcome)
+                    self.assertEqual(
+                        failure.error_code,
+                        "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+                    )
+                    self.assertFalse(failure.retryable)
+                    self.assertEqual(failure.stage, "ACTIVATION")
+                    # the hostile entry is never deleted and no activation
+                    # ever began: no journal, no generation, no recovery
+                    # backup, and the prior authority is byte-identical
+                    self.assertTrue(os.path.lexists(pending_path))
+                    self.assertEqual(
+                        coordinator.state,
+                        "READY",
+                    )
+                    self.assertEqual(
+                        coordinator.canonical_store_id,
+                        "store.primary",
+                    )
+                    self.assertEqual(coordinator.current_generation, 0)
+                    self.assertFalse(
+                        _activation_journal_path(identity).exists()
+                    )
+                    self.assertEqual(
+                        prior.staged_db_path.read_bytes(),
+                        store_before,
+                    )
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        jsonl_before,
+                    )
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-recovery.*.database.bak"
+                            )
+                        ),
+                        [],
+                    )
+
+    def test_live_upgrade_ticket_is_never_swept_by_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                coordinator,
+                activation_digest,
+            ) = _legacy_fixture(root, fts5_available=False)
+            store_before = prior.staged_db_path.read_bytes()
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                coordinator.prepare_schema_upgrade_ticket()
+            self.assertEqual(len(_schema_upgrade_pending_family(root)), 2)
+            # a concurrent explicit import while the Task 5.11 ticket is
+            # live fails closed before activation and never sweeps the
+            # live ticket's pending family
+            service = _service(coordinator, identity)
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            self.assertEqual(
+                failure.error_code,
+                "ACTIVATION.UPGRADE_BUSY",
+            )
+            self.assertTrue(failure.retryable)
+            self.assertEqual(len(_schema_upgrade_pending_family(root)), 2)
+            self.assertEqual(_schema_upgrade_stable_bak(root), [])
+            self.assertEqual(_schema_upgrade_stable_locator(root), [])
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(coordinator.canonical_store_id, "store.primary")
+            self.assertEqual(coordinator.current_generation, 3)
+            self.assertFalse(_activation_journal_path(identity).exists())
+            self.assertEqual(
+                prior.staged_db_path.read_bytes(),
+                store_before,
+            )
+
+    def test_import_still_drains_an_existing_operation_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+            entered = threading.Event()
+            release = threading.Event()
+            outcomes: list[Any] = []
+
+            def hold_lease() -> None:
+                with coordinator._operation_lease():
+                    entered.set()
+                    release.wait(timeout=3)
+
+            def run_import() -> None:
+                with patch(
+                    "tm_sqlite_store._probe_fts5",
+                    return_value=False,
+                ):
+                    outcomes.append(
+                        service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    )
+
+            holder = threading.Thread(target=hold_lease)
+            holder.start()
+            self.assertTrue(entered.wait(timeout=2))
+            worker = threading.Thread(target=run_import)
+            worker.start()
+            self.assertTrue(
+                coordinator.wait_for_state(
+                    "DRAINING",
+                    timeout_seconds=2,
+                )
+            )
+            release.set()
+            holder.join(timeout=3)
+            worker.join(timeout=5)
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], MigrationReport)
+            self.assertEqual(
+                cast(MigrationReport, outcomes[0]).activated_generation,
+                1,
+            )
+            self.assertEqual(coordinator.state, "READY")
 
 
 if __name__ == "__main__":

@@ -2080,6 +2080,29 @@ class ResourceStoreCoordinator:
                         "ACTIVATION.CONCURRENT_PREPARATION",
                         retryable=True,
                     )
+                if replacement:
+                    # This lock-held check+sweep is the atomic boundary
+                    # between Task 5.10 replacement and Task 5.11 ticket
+                    # minting.  A live ticket/snapshot is never swept.  An
+                    # abandoned deterministic pending family is resolved
+                    # immediately before the state becomes DRAINING, so a
+                    # later ticket mint cannot recreate it before this
+                    # activation owns the coordinator.  Existing operation
+                    # leases remain governed by the normal bounded drain
+                    # below and do not turn an import into an eager BUSY
+                    # failure.
+                    if (
+                        self._schema_upgrade_ticket is not None
+                        or self._schema_upgrade_locator_snapshot is not None
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.UPGRADE_BUSY",
+                            retryable=True,
+                        )
+                    if current_view is not None:
+                        _sweep_pending_schema_upgrade_artifacts(
+                            current_view.stage.staged_db_path
+                        )
                 self._state = "DRAINING"
                 self._condition.notify_all()
                 try:
