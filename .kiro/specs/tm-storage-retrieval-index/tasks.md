@@ -172,7 +172,7 @@
   - 完成时，并发查询和保存只观察切换前或切换后的完整版本，不出现空白、混合或过渡性版本
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
 
-- [ ] 5.8 实现同一 activation token 的幂等完成恢复
+- [x] 5.8 实现同一 activation token 的幂等完成恢复
   - 重启后复核新 DB、receipt、manifest、journal 与 token；只有全部匹配才从当前 phase 幂等继续
   - PREPARED 可安全取消，DB_REPLACED 可继续发布 manifest，MANIFEST_PUBLISHED 可发布唯一 generation
   - 完成时，各 phase 的同 token 重放只产生一个 generation，已完成 token 不可再次消费
