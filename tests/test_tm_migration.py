@@ -9,11 +9,20 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import tm_sqlite_store
 from tm_contracts import (
     CanonicalResourceIdentity,
     DiagnosticDisposition,
+    SnapshotKind,
+    SnapshotManifest,
+    contract_from_json,
 )
-from tm_migration import MigrationPreflightError, TMMigrationService
+from tm_migration import (
+    MigrationPreflightError,
+    MigrationStageBuild,
+    TMMigrationService,
+)
+from tm_sqlite_store import SQLiteTMStore
 
 
 def _identity(root: Path) -> CanonicalResourceIdentity:
@@ -301,6 +310,295 @@ class TMMigrationPreflightTests(unittest.TestCase):
                 _ = _service(identity).preflight(
                     identity.configured_jsonl_path
                 )
+
+
+class TMMigrationStageBuildTests(unittest.TestCase):
+    def test_build_writes_complete_ordered_stage_receipt_and_manifest(self) -> None:
+        source_bytes = (
+            b'{"source":"same","target":"first","speaker":"alice",'
+            b'"context_prev":"before","file_source":"chapter.json"}\n'
+            b'{bad-json}\n'
+            b'{"source":"same","target":"second","context_next":"after"}\n'
+            b'{"source":"x","target":"short"}\n'
+        )
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        result = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+
+                    self.assertIsInstance(result, MigrationStageBuild)
+                    self.assertIsNone(result.reused_completed_revision)
+                    stage = result.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    self.assertEqual(
+                        stage.staged_db_path.parent,
+                        identity.canonical_sidecar_path.parent,
+                    )
+                    self.assertEqual(
+                        stage.manifest_temp_path.parent,
+                        identity.snapshot_manifest_path.parent,
+                    )
+                    self.assertTrue(stage.staged_db_path.is_file())
+                    self.assertTrue(stage.manifest_temp_path.is_file())
+                    self.assertFalse(identity.canonical_sidecar_path.exists())
+                    self.assertFalse(identity.snapshot_manifest_path.exists())
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        source_bytes,
+                    )
+
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        store = SQLiteTMStore(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                    records = tuple(store.export_records())
+                    self.assertEqual(
+                        tuple(
+                            (
+                                record.source_raw,
+                                record.target_raw,
+                                record.speaker_raw,
+                                record.context_prev_raw,
+                                record.context_next_raw,
+                                record.file_source,
+                                record.legacy_line_no,
+                                record.origin_ordinal,
+                            )
+                            for record in records
+                        ),
+                        (
+                            (
+                                "same",
+                                "first",
+                                "alice",
+                                "before",
+                                None,
+                                "chapter.json",
+                                1,
+                                0,
+                            ),
+                            (
+                                "same",
+                                "second",
+                                None,
+                                None,
+                                "after",
+                                None,
+                                3,
+                                1,
+                            ),
+                            ("x", "short", None, None, None, None, 4, 2),
+                        ),
+                    )
+                    self.assertEqual(
+                        tuple(record.provenance for record in records),
+                        ((("source", "legacy-jsonl"),),) * 3,
+                    )
+                    self.assertEqual(store.exact_records("same")[0], records[1])
+
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        batch = connection.execute(
+                            "SELECT kind, source_digest, source_path, status, "
+                            "valid_count, invalid_count, "
+                            "duplicate_source_count, completed_revision "
+                            "FROM tm_origin_batch"
+                        ).fetchone()
+                        receipt = connection.execute(
+                            "SELECT resource_id, canonical_store_id, "
+                            "exported_revision, jsonl_digest, record_count, "
+                            "destination_jsonl_path, "
+                            "destination_manifest_path, status "
+                            "FROM tm_snapshot_receipt"
+                        ).fetchone()
+                        gram_sizes = {
+                            int(row[0])
+                            for row in connection.execute(
+                                "SELECT DISTINCT gram_size FROM tm_gram"
+                            ).fetchall()
+                        }
+                        fts_count = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_fts"
+                            ).fetchone()[0]
+                            if fts5_available
+                            else 0
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(
+                        batch,
+                        (
+                            "migration",
+                            hashlib.sha256(source_bytes).hexdigest(),
+                            str(identity.configured_jsonl_path),
+                            "completed",
+                            3,
+                            1,
+                            1,
+                            1,
+                        ),
+                    )
+                    self.assertEqual(
+                        receipt,
+                        (
+                            identity.resource_id,
+                            "store.primary",
+                            1,
+                            hashlib.sha256(source_bytes).hexdigest(),
+                            3,
+                            str(identity.configured_jsonl_path),
+                            str(identity.snapshot_manifest_path),
+                            "issued",
+                        ),
+                    )
+                    self.assertEqual(
+                        gram_sizes,
+                        {1, 2} if fts5_available else {1, 2, 3},
+                    )
+                    self.assertEqual(fts_count, 3 if fts5_available else 0)
+
+                    decoded = contract_from_json(
+                        stage.manifest_temp_path.read_text(encoding="utf-8")
+                    )
+                    self.assertIsInstance(decoded, SnapshotManifest)
+                    assert isinstance(decoded, SnapshotManifest)
+                    self.assertIs(decoded.snapshot_kind, SnapshotKind.MIGRATION_SOURCE)
+                    self.assertEqual(decoded.receipt.record_count, 3)
+                    self.assertEqual(
+                        decoded.receipt.jsonl_digest,
+                        hashlib.sha256(source_bytes).hexdigest(),
+                    )
+
+    def test_same_digest_reuses_complete_mutable_stage_without_duplicates(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            service = _service(identity)
+
+            first = service.build_mutable_stage(identity.configured_jsonl_path)
+            second = service.build_mutable_stage(identity.configured_jsonl_path)
+
+            self.assertEqual(second, first)
+            stage = first.mutable_stage
+            assert stage is not None
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                counts = (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_origin_batch"
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_record"
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_receipt"
+                    ).fetchone()[0],
+                )
+            finally:
+                connection.close()
+            self.assertEqual(counts, (1, 1, 1))
+
+    def test_same_digest_active_sidecar_returns_existing_revision(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            _write_active_sidecar(
+                identity,
+                source_digest=hashlib.sha256(source_bytes).hexdigest(),
+            )
+
+            result = _service(identity).build_mutable_stage(
+                identity.configured_jsonl_path
+            )
+
+            self.assertIsNone(result.mutable_stage)
+            self.assertEqual(result.reused_completed_revision, 1)
+
+    def test_digest_change_or_write_failure_leaves_no_stage_artifacts(self) -> None:
+        original = b'{"source":"a","target":"b"}\n'
+        changed = b'{"source":"a","target":"changed"}\n'
+        for failure_kind in ("digest-change", "append-failure"):
+            with self.subTest(failure_kind=failure_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(original)
+                    service = _service(identity)
+
+                    if failure_kind == "digest-change":
+                        preflight = service.preflight(
+                            identity.configured_jsonl_path
+                        )
+
+                        def change_after_preflight(_source: Path):
+                            identity.configured_jsonl_path.write_bytes(changed)
+                            return preflight
+
+                        context = patch.object(
+                            service,
+                            "preflight",
+                            side_effect=change_after_preflight,
+                        )
+                        expected = "MIGRATION.SOURCE_CHANGED"
+                    else:
+                        context = patch.object(
+                            SQLiteTMStore,
+                            "append_batch",
+                            side_effect=RuntimeError("injected failure"),
+                        )
+                        expected = "injected failure"
+                    with context:
+                        with self.assertRaisesRegex(Exception, expected):
+                            _ = service.build_mutable_stage(
+                                identity.configured_jsonl_path
+                            )
+
+                    self.assertFalse(identity.canonical_sidecar_path.exists())
+                    self.assertFalse(identity.snapshot_manifest_path.exists())
+                    self.assertEqual(
+                        tuple(
+                            path.name
+                            for path in Path(temporary).iterdir()
+                            if path != identity.configured_jsonl_path
+                        ),
+                        (),
+                    )
+
+    def test_issued_receipt_failure_rolls_back_all_stage_files(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            with patch.object(
+                SQLiteTMStore,
+                "register_issued_snapshot_receipt",
+                side_effect=RuntimeError("injected receipt failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "receipt failure"):
+                    _ = _service(identity).build_mutable_stage(
+                        identity.configured_jsonl_path
+                    )
+            self.assertEqual(
+                tuple(path.name for path in Path(temporary).iterdir()),
+                (identity.configured_jsonl_path.name,),
+            )
 
 
 if __name__ == "__main__":

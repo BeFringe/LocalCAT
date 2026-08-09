@@ -134,7 +134,7 @@
   - 完成时，损坏行、摘要变化、不可写目标和重复同 digest 均在任何激活前得到确定结果
   - _Requirements: 2.1, 2.2, 2.5, 2.6, 7.14_
 
-- [ ] 5.2 构建完整 mutable stage
+- [x] 5.2 构建完整 mutable stage
   - 在同目录新工作副本中按输入顺序写入 records、origin batches、全部候选索引、snapshot receipt 和 temporary manifest
   - 保留相同 source 的所有变体，不折叠或覆盖历史；同 digest 安全重试复用已完成结果
   - 完成时，尚未 sealed 的 stage 已具备记录/索引/receipt/manifest 全量内容，且记录数、顺序和逐字段内容与接受输入一致

@@ -1301,6 +1301,33 @@ def _snapshot_completed_binding(value: object) -> SnapshotBinding:
     return copied
 
 
+def _snapshot_receipt(value: object) -> SnapshotReceipt:
+    if type(value) is not SnapshotReceipt:
+        raise TypeError("receipt must be exact SnapshotReceipt")
+    scalar_values = (
+        value.snapshot_id,
+        value.resource_id,
+        value.canonical_store_id,
+        value.jsonl_digest,
+        value.format_version,
+    )
+    if any(type(item) is not str for item in scalar_values):
+        raise TypeError("receipt scalar values must use built-in strings")
+    if type(value.exported_revision) is not int:
+        raise TypeError("receipt revision must be a built-in integer")
+    if type(value.record_count) is not int:
+        raise TypeError("receipt record count must be a built-in integer")
+    return SnapshotReceipt(
+        snapshot_id=value.snapshot_id,
+        resource_id=value.resource_id,
+        canonical_store_id=value.canonical_store_id,
+        exported_revision=value.exported_revision,
+        jsonl_digest=value.jsonl_digest,
+        record_count=value.record_count,
+        format_version=value.format_version,
+    )
+
+
 def _snapshot_binding_digest(binding: SnapshotBinding) -> str:
     return hashlib.sha256(contract_to_json(binding).encode("utf-8")).hexdigest()
 
@@ -1395,6 +1422,92 @@ class SQLiteTMStore:
                     connection,
                     lease,
                 )
+
+    def register_issued_snapshot_receipt(
+        self,
+        receipt: SnapshotReceipt,
+        *,
+        destination_jsonl_path: Path,
+        destination_manifest_path: Path,
+    ) -> None:
+        """Record one unpublished migration receipt inside a mutable stage."""
+
+        private_receipt = _snapshot_receipt(receipt)
+        for path_value, field_name in (
+            (destination_jsonl_path, "destination_jsonl_path"),
+            (destination_manifest_path, "destination_manifest_path"),
+        ):
+            if type(path_value) is not _NATIVE_PATH_TYPE:
+                raise TypeError(f"{field_name} must be an exact native Path")
+        private_jsonl_path = _copy_exact_path(destination_jsonl_path)
+        private_manifest_path = _copy_exact_path(destination_manifest_path)
+
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if (
+                private_jsonl_path != identity.configured_jsonl_path
+                or private_manifest_path != identity.snapshot_manifest_path
+                or private_receipt.resource_id != identity.resource_id
+                or private_receipt.canonical_store_id
+                != lease.canonical_store_id
+            ):
+                raise ValueError("issued receipt identity does not match store")
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    revision = _canonical_revision_from_connection(
+                        connection,
+                        lease,
+                    )
+                    if (
+                        private_receipt.exported_revision
+                        != revision.head_revision
+                        or private_receipt.record_count
+                        != revision.record_count
+                    ):
+                        raise ValueError(
+                            "issued receipt must describe current revision"
+                        )
+                    receipt_count = connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_receipt"
+                    ).fetchone()
+                    binding_count = connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_binding"
+                    ).fetchone()
+                    if receipt_count != (0,) or binding_count != (0,):
+                        raise ValueError(
+                            "unpublished stage already contains snapshot state"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_receipt("
+                        "snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?)",
+                        (
+                            private_receipt.snapshot_id,
+                            private_receipt.resource_id,
+                            private_receipt.canonical_store_id,
+                            private_receipt.exported_revision,
+                            private_receipt.jsonl_digest,
+                            private_receipt.record_count,
+                            private_receipt.format_version,
+                            Path.__str__(private_jsonl_path),
+                            Path.__str__(private_manifest_path),
+                            datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
 
     def register_completed_snapshot_binding(
         self,
