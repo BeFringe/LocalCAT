@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import inspect
 import os
 from pathlib import Path
@@ -75,6 +75,182 @@ def _draft(
 
 
 class SQLiteTMStoreTests(unittest.TestCase):
+    def test_chunked_candidate_helpers_hold_one_read_snapshot(self) -> None:
+        query = "".join(chr(0x1000 + offset) for offset in range(300))
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stage = _stage(Path(temporary))
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                        store = SQLiteTMStore(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                    _ = store.append(_draft(query, "target"))
+
+                    original_read_meta = tm_sqlite_store._read_meta
+                    transaction_states: list[bool] = []
+
+                    def record_transaction_state(
+                        connection: sqlite3.Connection,
+                    ) -> dict[str, str]:
+                        transaction_states.append(connection.in_transaction)
+                        return original_read_meta(connection)
+
+                    with patch(
+                        "tm_sqlite_store._read_meta",
+                        side_effect=record_transaction_state,
+                    ):
+                        if fts5_available:
+                            _ = store.fts5_candidate_ids_for_trigrams(
+                                tm_sqlite_store.unique_character_ngrams(query, 3)
+                            )
+                        else:
+                            _ = store.gram_candidate_overlaps(
+                                tuple((1, character) for character in query),
+                                candidate_cap=10,
+                            )
+
+                    self.assertTrue(transaction_states)
+                    self.assertTrue(all(transaction_states))
+
+    def test_append_without_extension_builds_required_candidate_indexes(self) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stage = _stage(Path(temporary))
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                        store = SQLiteTMStore(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                    local = store.append(_draft("abcdef", "local"))
+                    imported = store.append_batch(
+                        batch_id="import.default-index",
+                        kind="import",
+                        drafts=(_draft("uvwxyz", "imported"),),
+                        source_digest="9" * 64,
+                        source_path=(Path(temporary) / "source.jsonl").resolve(),
+                    )[0]
+
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        gram_sizes = {
+                            row[0]
+                            for row in connection.execute(
+                                "SELECT DISTINCT gram_size FROM tm_gram"
+                            ).fetchall()
+                        }
+                        fts_count = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_fts"
+                            ).fetchone()[0]
+                            if fts5_available
+                            else 0
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(
+                        gram_sizes,
+                        {1, 2} if fts5_available else {1, 2, 3},
+                    )
+                    self.assertEqual(fts_count, 2 if fts5_available else 0)
+                    for source, record_id in (
+                        ("abcdef", local.record_id),
+                        ("uvwxyz", imported.record_id),
+                    ):
+                        from tm_candidate_index import CandidateRetriever
+                        recalled = CandidateRetriever().candidates(
+                            "tm.primary", store, source, result_limit=10
+                        )
+                        self.assertIn(
+                            record_id,
+                            tuple(item.record_id for item in recalled.candidates),
+                        )
+
+    def test_default_and_additional_plan_failures_leave_no_write_state(self) -> None:
+        for failure_kind in ("default", "additional"):
+            with self.subTest(failure_kind=failure_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stage = _stage(Path(temporary))
+                    initialize_stage_schema(
+                        stage,
+                        canonical_store_id="store.primary",
+                    )
+                    store = SQLiteTMStore(
+                        stage,
+                        canonical_store_id="store.primary",
+                    )
+
+                    def fail_additional(
+                        _records: tuple[SQLiteCandidateRecord, ...],
+                    ) -> SQLiteCandidateWritePlan:
+                        raise RuntimeError("injected additional plan failure")
+
+                    context = (
+                        patch(
+                            "tm_sqlite_store.build_candidate_write_plan",
+                            side_effect=RuntimeError("injected default plan failure"),
+                        )
+                        if failure_kind == "default"
+                        else nullcontext()
+                    )
+                    with context:
+                        with self.assertRaisesRegex(RuntimeError, "plan failure"):
+                            _ = store.append_batch(
+                                batch_id=f"import.{failure_kind}-plan-failure",
+                                kind="import",
+                                drafts=(_draft("abcdef", "target"),),
+                                source_digest=(
+                                    "a" if failure_kind == "default" else "b"
+                                )
+                                * 64,
+                                source_path=(Path(temporary) / "source.jsonl").resolve(),
+                                extension=(
+                                    fail_additional
+                                    if failure_kind == "additional"
+                                    else None
+                                ),
+                            )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        state = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_origin_batch"
+                            ).fetchone(),
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_origin_batch "
+                                "WHERE completed_revision IS NOT NULL"
+                            ).fetchone(),
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_record"
+                            ).fetchone(),
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_gram"
+                            ).fetchone(),
+                            connection.execute(
+                                "SELECT value FROM tm_meta "
+                                "WHERE key = 'head_revision'"
+                            ).fetchone(),
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(state, ((0,), (0,), (0,), (0,), ("0",)))
+
     def test_canonical_revision_concurrent_append_is_one_complete_snapshot(
         self,
     ) -> None:
@@ -674,7 +850,18 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 ).fetchall()
             finally:
                 connection.close()
-            self.assertEqual(gram_rows, [(2, "ab", records[0].record_id)])
+            self.assertEqual(
+                gram_rows,
+                [
+                    (1, "a", records[0].record_id),
+                    (1, "b", records[0].record_id),
+                    (1, "c", records[0].record_id),
+                    (1, "d", records[0].record_id),
+                    (2, "ab", records[0].record_id),
+                    (2, "bc", records[0].record_id),
+                    (2, "cd", records[0].record_id),
+                ],
+            )
 
     def test_batch_rejects_scalar_subclasses_before_extension_or_connection(
         self,

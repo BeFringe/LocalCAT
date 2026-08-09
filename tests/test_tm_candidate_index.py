@@ -937,9 +937,83 @@ class CandidateRetrieverTests(unittest.TestCase):
             with patch.object(
                 store, "candidate_recall_snapshot", return_value=forged
             ):
-                with self.assertRaises(TypeError):
+                with self.assertRaisesRegex(
+                    SQLiteStoreSchemaError,
+                    "STORE.CANDIDATE_EVIDENCE_INVALID",
+                ):
                     _ = CandidateRetriever().candidates(
                         "tm.primary", store, "abc", result_limit=10
+                    )
+
+    def test_no_fts_uses_all_unique_grams_beyond_the_old_posting_cap(self) -> None:
+        query = "".join(chr(0x10000 + offset) for offset in range(14000))
+        candidate = (
+            "".join(chr(0x20000 + offset) for offset in range(4200))
+            + query[4200:]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary), fts5_available=False, sources=(candidate,)
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, query, result_limit=10
+            )
+
+        self.assertIn(
+            record_ids[0],
+            tuple(item.record_id for item in report.candidates),
+        )
+        recalled = next(
+            item for item in report.candidates if item.record_id == record_ids[0]
+        )
+        self.assertEqual(recalled.query_grams, 14000 + 13999 + 13998)
+        self.assertGreater(recalled.overlap_ratio, 0.60)
+
+    def test_fts_long_query_is_chunked_without_losing_late_trigrams(self) -> None:
+        query = "".join(chr(0x10000 + offset) for offset in range(14000))
+        candidate = (
+            "".join(chr(0x20000 + offset) for offset in range(4200))
+            + query[4200:]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary), fts5_available=True, sources=(candidate,)
+            )
+            report = CandidateRetriever().candidates(
+                "tm.primary", store, query, result_limit=10
+            )
+
+        self.assertIn(
+            record_ids[0],
+            tuple(item.record_id for item in report.candidates),
+        )
+        recalled = next(
+            item for item in report.candidates if item.record_id == record_ids[0]
+        )
+        self.assertIn(CandidateStage.FTS_TRIGRAM, recalled.recall_stages)
+        self.assertEqual(recalled.query_grams, 13998 + 13999 + 14000)
+
+    def test_rejects_forged_gram_overlap_and_stage_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = self._store_with_records(
+                Path(temporary), fts5_available=False, sources=("queryabc",)
+            )
+            forged = SQLiteCandidateRecallSnapshot(
+                fts5_available=False,
+                stage_matches=(("GRAM_3", ((1, 1),)),),
+                folded_sources=((1, "zzz"),),
+            )
+            with patch.object(
+                store,
+                "candidate_recall_snapshot",
+                return_value=forged,
+            ):
+                with self.assertRaisesRegex(
+                    SQLiteStoreSchemaError,
+                    "STORE.CANDIDATE_EVIDENCE_INVALID",
+                ):
+                    _ = CandidateRetriever().candidates(
+                        "tm.primary", store, "queryabc", result_limit=10
                     )
 
 

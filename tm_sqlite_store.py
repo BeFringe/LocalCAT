@@ -46,6 +46,7 @@ TM_SCHEMA_VERSION = 2
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
 CANDIDATE_INDEX_VERSION = "candidate-index-v1"
 BUSY_TIMEOUT_MS = 5000
+_CANDIDATE_QUERY_CHUNK_SIZE = 256
 _NATIVE_PATH_TYPE = type(Path())
 
 _RECORD_COLUMNS = (
@@ -343,6 +344,76 @@ class SQLiteCandidateWritePlan:
             raise ValueError("fts_origin_ordinals must be unique")
 
 
+def unique_character_ngrams(
+    folded_text: str,
+    gram_size: int,
+) -> tuple[str, ...]:
+    """Return first-occurrence unique code-point grams without folding."""
+
+    if type(folded_text) is not str:
+        raise TypeError("folded_text must be a built-in string")
+    if type(gram_size) is not int:
+        raise TypeError("gram_size must be a built-in integer")
+    if gram_size not in {1, 2, 3}:
+        raise ValueError("gram_size must be 1, 2, or 3")
+    seen: set[str] = set()
+    grams: list[str] = []
+    for offset in range(max(0, len(folded_text) - gram_size + 1)):
+        gram = folded_text[offset : offset + gram_size]
+        if gram not in seen:
+            seen.add(gram)
+            grams.append(gram)
+    return tuple(grams)
+
+
+def build_candidate_write_plan(
+    records: tuple[SQLiteCandidateRecord, ...],
+    *,
+    fts5_available: bool,
+) -> SQLiteCandidateWritePlan:
+    """Build the store-owned mandatory candidate plan for one generation."""
+
+    if type(records) is not tuple:
+        raise TypeError("records must be a built-in tuple")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    prepared: list[tuple[int, str]] = []
+    for record in records:
+        if type(record) is not SQLiteCandidateRecord:
+            raise TypeError("records must contain exact SQLiteCandidateRecord values")
+        if type(record.origin_ordinal) is not int or record.origin_ordinal < 0:
+            raise ValueError("origin_ordinal must be a non-negative integer")
+        if type(record.source_fold_v1) is not str or not record.source_fold_v1:
+            raise ValueError("source_fold_v1 must be a non-empty built-in string")
+        prepared.append((record.origin_ordinal, record.source_fold_v1))
+    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    return SQLiteCandidateWritePlan(
+        gram_rows=tuple(
+            SQLiteGramRow(origin_ordinal, gram_size, gram)
+            for origin_ordinal, folded_source in prepared
+            for gram_size in gram_sizes
+            for gram in unique_character_ngrams(folded_source, gram_size)
+        ),
+        fts_origin_ordinals=(
+            tuple(origin_ordinal for origin_ordinal, _source in prepared)
+            if fts5_available
+            else ()
+        ),
+    )
+
+
+def _build_fts5_match_expression(trigrams: tuple[str, ...]) -> str:
+    return " OR ".join(
+        f'"{trigram.replace(chr(34), chr(34) * 2)}"'
+        for trigram in trigrams
+    )
+
+
+def _chunked(values: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
+    for offset in range(0, len(values), _CANDIDATE_QUERY_CHUNK_SIZE):
+        yield values[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
+
+
 @dataclass(frozen=True)
 class SQLiteCandidateRecallSnapshot:
     """Private-value snapshot returned by the leased candidate read seam."""
@@ -378,13 +449,7 @@ class SQLiteCandidateRecallSnapshot:
                     or matched_count < 0
                 ):
                     raise ValueError("candidate stage match is invalid")
-                if (
-                    stage_name == "FTS_TRIGRAM"
-                    and matched_count != 0
-                ) or (
-                    stage_name != "FTS_TRIGRAM"
-                    and matched_count < 1
-                ):
+                if matched_count < 1:
                     raise ValueError("candidate stage overlap is invalid")
                 record_ids.append(record_id)
             if len(set(record_ids)) != len(record_ids):
@@ -430,6 +495,7 @@ class _SQLiteGenerationView:
     stage: MutableStageRef
     canonical_store_id: str
     generation: int
+    fts5_available: bool
 
 
 @dataclass(frozen=True)
@@ -486,6 +552,7 @@ class ResourceStoreCoordinator:
             stage=private_stage,
             canonical_store_id=canonical_store_id,
             generation=snapshot.generation,
+            fts5_available=snapshot.fts5_available,
         )
 
     @property
@@ -635,7 +702,7 @@ class ResourceStoreCoordinator:
             self._state = "ACTIVATING"
             self._condition.notify_all()
             try:
-                _validate_next_generation_stage(
+                next_snapshot = _validate_next_generation_stage(
                     next_stage,
                     canonical_store_id=canonical_store_id,
                 )
@@ -653,6 +720,7 @@ class ResourceStoreCoordinator:
                 stage=next_stage,
                 canonical_store_id=canonical_store_id,
                 generation=next_generation,
+                fts5_available=next_snapshot.fts5_available,
             )
             self._state = "READY"
             self._condition.notify_all()
@@ -839,7 +907,7 @@ def _validate_next_generation_stage(
     stage: MutableStageRef,
     *,
     canonical_store_id: str,
-) -> None:
+) -> SQLiteSchemaSnapshot:
     """Reopen and fully validate a drained transition target in rw mode."""
 
     snapshot = inspect_stage_schema(
@@ -851,6 +919,7 @@ def _validate_next_generation_stage(
         stage=stage,
         canonical_store_id=canonical_store_id,
         generation=snapshot.generation,
+        fts5_available=snapshot.fts5_available,
     )
     with _open_configured_connection(
         stage.staged_db_path,
@@ -876,6 +945,7 @@ def _validate_next_generation_stage(
             or revision.record_count != _table_count(connection, "tm_record")
         ):
             raise SQLiteStoreSchemaError("STORE.NEXT_GENERATION_UNHEALTHY")
+    return snapshot
 
 
 @dataclass(frozen=True)
@@ -1402,6 +1472,7 @@ class SQLiteTMStore:
                 extension,
                 candidate_records,
                 batch_size=len(prepared_drafts),
+                fts5_available=lease.fts5_available,
             )
             return self._append_prepared_batch(
                 lease=lease,
@@ -1630,6 +1701,59 @@ class SQLiteTMStore:
             record_ids.add(record_id)
         return tuple(sorted(record_ids))
 
+    def fts5_candidate_ids_for_trigrams(
+        self,
+        trigrams: tuple[str, ...],
+    ) -> tuple[int, ...] | None:
+        """Return the union for all unique trigrams using bounded FTS queries."""
+
+        if type(trigrams) is not tuple:
+            raise TypeError("trigrams must be a built-in tuple")
+        seen: set[str] = set()
+        for trigram in trigrams:
+            if type(trigram) is not str:
+                raise TypeError("trigrams must contain built-in strings")
+            if len(trigram) != 3 or trigram in seen:
+                raise ValueError("trigrams must be unique trigrams")
+            seen.add(trigram)
+        if not trigrams:
+            raise ValueError("trigrams must not be empty")
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                record_ids: set[int] = set()
+                try:
+                    connection.execute("BEGIN")
+                    self._validate_identity(connection, lease)
+                    if not lease.fts5_available:
+                        connection.rollback()
+                        return None
+                    for chunk in _chunked(trigrams):
+                        rows = connection.execute(
+                            "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
+                            (_build_fts5_match_expression(chunk),),
+                        ).fetchall()
+                        for row in rows:
+                            if type(row) is not tuple or len(row) != 1:
+                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+                            value = row[0]
+                            if type(value) is int:
+                                record_id = value
+                            elif type(value) is str and value.isdecimal():
+                                record_id = int(value)
+                            else:
+                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+                            if record_id < 1:
+                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
+                            record_ids.add(record_id)
+                    connection.commit()
+                except sqlite3.Error as error:
+                    connection.rollback()
+                    raise SQLiteStoreSchemaError("STORE.FTS5_QUERY_FAILED") from error
+                except BaseException:
+                    connection.rollback()
+                    raise
+        return tuple(sorted(record_ids))
+
     def gram_candidate_overlaps(
         self,
         query_postings: tuple[tuple[int, str], ...],
@@ -1659,61 +1783,77 @@ class SQLiteTMStore:
         if not 1 <= candidate_cap <= 8192:
             raise ValueError("candidate_cap is outside the safe range")
 
-        values_sql = ",".join("(?, ?)" for _ in prepared)
-        parameters: list[int | str] = []
-        for gram_size, gram in prepared:
-            parameters.extend((gram_size, gram))
-        parameters.append(candidate_cap)
+        matched_by_id: dict[int, int] = {}
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
-                self._validate_identity(connection, lease)
                 try:
-                    rows = connection.execute(
-                        "WITH query_grams(gram_size, gram) AS (VALUES "
-                        f"{values_sql}) "
-                        "SELECT postings.record_id, COUNT(*) AS matched_count "
-                        "FROM tm_gram AS postings "
-                        "JOIN query_grams AS query "
-                        "ON query.gram_size = postings.gram_size "
-                        "AND query.gram = postings.gram "
-                        "GROUP BY postings.record_id "
-                        "ORDER BY matched_count DESC, postings.record_id ASC "
-                        "LIMIT ?",
-                        tuple(parameters),
-                    ).fetchall()
+                    connection.execute("BEGIN")
+                    self._validate_identity(connection, lease)
+                    for offset in range(0, len(prepared), _CANDIDATE_QUERY_CHUNK_SIZE):
+                        chunk = prepared[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
+                        values_sql = ",".join("(?, ?)" for _ in chunk)
+                        parameters: list[int | str] = []
+                        for gram_size, gram in chunk:
+                            parameters.extend((gram_size, gram))
+                        rows = connection.execute(
+                            "WITH query_grams(gram_size, gram) AS (VALUES "
+                            f"{values_sql}) "
+                            "SELECT postings.record_id, COUNT(*) AS matched_count "
+                            "FROM tm_gram AS postings "
+                            "JOIN query_grams AS query "
+                            "ON query.gram_size = postings.gram_size "
+                            "AND query.gram = postings.gram "
+                            "GROUP BY postings.record_id",
+                            tuple(parameters),
+                        ).fetchall()
+                        for row in rows:
+                            if (
+                                type(row) is not tuple
+                                or len(row) != 2
+                                or type(row[0]) is not int
+                                or row[0] < 1
+                                or type(row[1]) is not int
+                                or not 1 <= row[1] <= len(chunk)
+                            ):
+                                raise SQLiteStoreSchemaError("STORE.GRAM_RESULT_INVALID")
+                            matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
+                    connection.commit()
                 except sqlite3.Error as error:
+                    connection.rollback()
                     raise SQLiteStoreSchemaError(
                         "STORE.GRAM_QUERY_FAILED"
                     ) from error
-        overlaps: list[tuple[int, int]] = []
-        for row in rows:
-            if (
-                type(row) is not tuple
-                or len(row) != 2
-                or type(row[0]) is not int
-                or row[0] < 1
-                or type(row[1]) is not int
-                or not 1 <= row[1] <= len(prepared)
-            ):
-                raise SQLiteStoreSchemaError("STORE.GRAM_RESULT_INVALID")
-            overlaps.append((row[0], row[1]))
-        return tuple(overlaps)
+                except BaseException:
+                    connection.rollback()
+                    raise
+        return tuple(
+            sorted(matched_by_id.items(), key=lambda item: (-item[1], item[0]))[
+                :candidate_cap
+            ]
+        )
 
     def candidate_recall_snapshot(
         self,
         *,
-        fts_match_expression: str | None,
+        fts_query_trigrams: tuple[str, ...] | None,
         query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...],
         candidate_floor: int,
         fts_query_degenerate: bool,
     ) -> SQLiteCandidateRecallSnapshot:
         """Read one complete candidate-stage snapshot under one generation lease."""
 
-        if fts_match_expression is not None:
-            if type(fts_match_expression) is not str:
-                raise TypeError("fts_match_expression must be a built-in string")
-            if not fts_match_expression:
-                raise ValueError("fts_match_expression must not be empty")
+        if fts_query_trigrams is not None:
+            if type(fts_query_trigrams) is not tuple:
+                raise TypeError("fts_query_trigrams must be a built-in tuple")
+            seen_trigrams: set[str] = set()
+            for trigram in fts_query_trigrams:
+                if type(trigram) is not str:
+                    raise TypeError("fts query trigrams must be built-in strings")
+                if len(trigram) != 3 or trigram in seen_trigrams:
+                    raise ValueError("fts query trigrams are invalid")
+                seen_trigrams.add(trigram)
+            if not fts_query_trigrams:
+                raise ValueError("fts_query_trigrams must not be empty")
         if type(query_grams_by_size) is not tuple:
             raise TypeError("query_grams_by_size must be a built-in tuple")
         prepared_stages: list[tuple[int, tuple[str, ...]]] = []
@@ -1742,7 +1882,7 @@ class SQLiteTMStore:
             seen_sizes.add(gram_size)
             prepared_stages.append((gram_size, tuple(copied_grams)))
         prepared_sizes = tuple(size for size, _grams in prepared_stages)
-        if fts_match_expression is None:
+        if fts_query_trigrams is None:
             if prepared_sizes not in {(), (1,), (2,)}:
                 raise ValueError("short-query gram stage order is invalid")
         elif prepared_sizes != (3, 2, 1):
@@ -1761,41 +1901,44 @@ class SQLiteTMStore:
                 try:
                     connection.execute("BEGIN")
                     self._validate_identity(connection, lease)
-                    fts5_available = _meta_bool(
+                    meta_fts5_available = _meta_bool(
                         _read_meta(connection), "fts5_available"
                     )
-
-                    if fts_match_expression is not None and fts5_available:
-                        fts_rows = connection.execute(
-                            "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
-                            (fts_match_expression,),
-                        ).fetchall()
-                        fts_matches: list[tuple[int, int]] = []
-                        for row in fts_rows:
-                            if type(row) is not tuple or len(row) != 1:
-                                raise SQLiteStoreSchemaError(
-                                    "STORE.CANDIDATE_RESULT_INVALID"
-                                )
-                            value = row[0]
-                            if type(value) is int:
-                                record_id = value
-                            elif type(value) is str and value.isdecimal():
-                                record_id = int(value)
-                            else:
-                                raise SQLiteStoreSchemaError(
-                                    "STORE.CANDIDATE_RESULT_INVALID"
-                                )
-                            if record_id < 1:
-                                raise SQLiteStoreSchemaError(
-                                    "STORE.CANDIDATE_RESULT_INVALID"
-                                )
-                            fts_matches.append((record_id, 0))
-                            cumulative_ids.add(record_id)
-                        stage_matches.append(
-                            ("FTS_TRIGRAM", tuple(fts_matches))
+                    if meta_fts5_available != lease.fts5_available:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.CANDIDATE_CAPABILITY_MISMATCH"
                         )
+                    fts5_available = lease.fts5_available
 
-                    if fts_match_expression is None:
+                    fts_ids: set[int] = set()
+                    if fts_query_trigrams is not None and fts5_available:
+                        for chunk in _chunked(fts_query_trigrams):
+                            fts_rows = connection.execute(
+                                "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
+                                (_build_fts5_match_expression(chunk),),
+                            ).fetchall()
+                            for row in fts_rows:
+                                if type(row) is not tuple or len(row) != 1:
+                                    raise SQLiteStoreSchemaError(
+                                        "STORE.CANDIDATE_RESULT_INVALID"
+                                    )
+                                value = row[0]
+                                if type(value) is int:
+                                    record_id = value
+                                elif type(value) is str and value.isdecimal():
+                                    record_id = int(value)
+                                else:
+                                    raise SQLiteStoreSchemaError(
+                                        "STORE.CANDIDATE_RESULT_INVALID"
+                                    )
+                                if record_id < 1:
+                                    raise SQLiteStoreSchemaError(
+                                        "STORE.CANDIDATE_RESULT_INVALID"
+                                    )
+                                fts_ids.add(record_id)
+                                cumulative_ids.add(record_id)
+
+                    if fts_query_trigrams is None:
                         selected_stages = prepared_stages
                     elif not fts5_available:
                         selected_stages = prepared_stages
@@ -1812,37 +1955,38 @@ class SQLiteTMStore:
 
                     for gram_size, grams in selected_stages:
                         if (
-                            fts_match_expression is not None
+                            fts_query_trigrams is not None
                             and fts5_available
                             and gram_size == 1
                             and len(cumulative_ids) >= candidate_floor
                         ):
                             continue
-                        placeholders = ",".join("?" for _ in grams)
-                        rows = connection.execute(
-                            "SELECT record_id, COUNT(*) AS matched_count "
-                            "FROM tm_gram WHERE gram_size = ? "
-                            f"AND gram IN ({placeholders}) "
-                            "GROUP BY record_id",
-                            (gram_size, *grams),
-                        ).fetchall()
-                        matches: list[tuple[int, int]] = []
-                        for row in rows:
-                            if (
-                                type(row) is not tuple
-                                or len(row) != 2
-                                or type(row[0]) is not int
-                                or row[0] < 1
-                                or type(row[1]) is not int
-                                or not 1 <= row[1] <= len(grams)
-                            ):
-                                raise SQLiteStoreSchemaError(
-                                    "STORE.CANDIDATE_RESULT_INVALID"
-                                )
-                            matches.append((row[0], row[1]))
-                            cumulative_ids.add(row[0])
+                        matched_by_id: dict[int, int] = {}
+                        for chunk in _chunked(grams):
+                            placeholders = ",".join("?" for _ in chunk)
+                            rows = connection.execute(
+                                "SELECT record_id, COUNT(*) AS matched_count "
+                                "FROM tm_gram WHERE gram_size = ? "
+                                f"AND gram IN ({placeholders}) "
+                                "GROUP BY record_id",
+                                (gram_size, *chunk),
+                            ).fetchall()
+                            for row in rows:
+                                if (
+                                    type(row) is not tuple
+                                    or len(row) != 2
+                                    or type(row[0]) is not int
+                                    or row[0] < 1
+                                    or type(row[1]) is not int
+                                    or not 1 <= row[1] <= len(chunk)
+                                ):
+                                    raise SQLiteStoreSchemaError(
+                                        "STORE.CANDIDATE_RESULT_INVALID"
+                                    )
+                                matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
+                                cumulative_ids.add(row[0])
                         stage_matches.append(
-                            (f"GRAM_{gram_size}", tuple(matches))
+                            (f"GRAM_{gram_size}", tuple(matched_by_id.items()))
                         )
 
                     folded_sources: list[tuple[int, str]] = []
@@ -1872,6 +2016,27 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.CANDIDATE_SOURCE_MISSING"
                         )
+                    if fts_query_trigrams is not None and fts5_available:
+                        sources_by_id = dict(folded_sources)
+                        query_gram_set = set(fts_query_trigrams)
+                        fts_matches = tuple(
+                            (
+                                record_id,
+                                len(
+                                    query_gram_set.intersection(
+                                        unique_character_ngrams(
+                                            sources_by_id[record_id], 3
+                                        )
+                                    )
+                                ),
+                            )
+                            for record_id in sorted(fts_ids)
+                        )
+                        if any(count < 1 for _record_id, count in fts_matches):
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_RESULT_INVALID"
+                            )
+                        stage_matches.insert(0, ("FTS_TRIGRAM", fts_matches))
                     connection.commit()
                 except sqlite3.Error as error:
                     connection.rollback()
@@ -2117,15 +2282,26 @@ def _prepare_candidate_write_plan(
     candidate_records: tuple[SQLiteCandidateRecord, ...],
     *,
     batch_size: int,
+    fts5_available: bool,
 ) -> _ValidatedCandidateWritePlan:
-    candidate_plan = (
-        SQLiteCandidateWritePlan()
-        if extension is None
-        else extension(candidate_records)
-    )
-    return _validate_and_copy_candidate_plan(
-        candidate_plan,
+    default_plan = _validate_and_copy_candidate_plan(
+        build_candidate_write_plan(
+            candidate_records,
+            fts5_available=fts5_available,
+        ),
         batch_size=batch_size,
+    )
+    if extension is None:
+        return default_plan
+    additional_plan = _validate_and_copy_candidate_plan(
+        extension(candidate_records),
+        batch_size=batch_size,
+    )
+    default_grams, default_fts = default_plan
+    additional_grams, additional_fts = additional_plan
+    return (
+        tuple(dict.fromkeys((*default_grams, *additional_grams))),
+        tuple(dict.fromkeys((*default_fts, *additional_fts))),
     )
 
 

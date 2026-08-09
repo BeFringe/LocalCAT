@@ -76,7 +76,7 @@
   - 完成时，两道证据均可独立重算并阻止下游消费未验证契约或 matcher profile
   - _Requirements: 4.2, 6.10, 9.1, 9.2, 9.3, 9.4, 9.5, 9.9, 9.12_
 
-- [ ] 3. 建立事务化 SQLite canonical store
+- [x] 3. 建立事务化 SQLite canonical store
 
 - [x] 3.1 创建 per-resource schema 与安全连接策略
   - 每个 TM 资源建立独立 canonical sidecar，包含 metadata、origin batch、完整 record、snapshot ledger/binding 和候选索引所需表
@@ -105,7 +105,7 @@
   - 完成时，VERIFIED_CURRENT、VERIFIED_HISTORY、SOURCE_DIVERGED 的转换和禁止双向隐式覆盖规则全部可验证
   - _Requirements: 1.9, 2.13, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13_
 
-- [ ] 4. 建立可替换且可核对的候选索引
+- [x] 4. 建立可替换且可核对的候选索引
 
 - [x] 4.1 实现 FTS5 trigram 快速召回
   - 对已由 fold-v1 生成的索引文本建立内容型 trigram，禁止再次折叠或把 tokenizer 大小写当作产品 Match Case
@@ -125,6 +125,14 @@
   - 把 canonical record、FTS 和 gram posting 写入接到同一事务，在每个索引阶段注入失败验证整体回滚
   - 完成时，两条路径的阶段元数据可完整对账，候选顺序不受底层 SQL 返回顺序影响，record/index 不会半提交
   - _Requirements: 4.2, 4.7, 5.3, 5.4, 7.4, 7.7, 8.7_
+
+### Cluster B 实施与复审记录（2026-08-09）
+
+- 采用既有 `v4_flash_worker/high` 恢复审计作为 Cluster B 的对抗性复审输入，不再重复派发同一集群评审；审计发现已由主 agent 逐项核对并收束。
+- canonical store 无 extension 时仍建立完整的 store-owned 候选索引；调用方 extension 只作同事务的附加写计划，默认索引或附加计划任一失败均整体回滚。
+- 删除会漏召回后段 gram 的 4096 posting 截断；FTS5 与 gram fallback 均处理全部唯一 gram，并按 256 个一批执行。全部分块、identity 与 metadata 复核现在保持在同一个显式读事务快照中。
+- 两条召回路径重新核对 overlap、union、去重、稳定预排序、截断和 stage ledger 守恒；召回层仍只返回候选身份，不承担最终 CAT 评分或 global limit。
+- 新鲜验证：候选索引/SQLite 定点套件 75/75；`QT_QPA_PLATFORM=offscreen PYTHONPYCACHEPREFIX=/tmp/codex-feature5-pycache python -m unittest discover -s tests -v` 为 326/326，Qt editor smoke 通过；`basedpyright --level error` 为 0 errors。超长查询的吞吐与 RSS 风险不以有损截断规避，继续由 Task 8 的 benchmark-v1 双路径硬门裁决。
 
 - [ ] 5. 实现迁移、封存、原子激活与恢复
 
