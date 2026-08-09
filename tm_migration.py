@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import stat
+from types import MappingProxyType
 from typing import cast
 import uuid
 
@@ -49,7 +50,6 @@ from tm_sqlite_store import (
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     _APPROVED_SCHEMA_DIGESTS,
-    _promote_schema_upgrade_artifact,
     _FTS5_STATEMENT,
     _SCHEMA_STATEMENTS,
     _SCHEMA_UPGRADE_META_KEY,
@@ -63,6 +63,7 @@ from tm_sqlite_store import (
     unique_character_ngrams,
 )
 from tm_stage_sealer import StageSealer
+import tm_schema_upgrade as schema_upgrade_module
 
 
 _NATIVE_PATH_TYPE = type(Path())
@@ -2168,32 +2169,14 @@ def _remove_owned_schema_upgrade_backup(
     path: Path,
     identity: tuple[int, int],
 ) -> None:
-    """Safely unlink one exact owned schema-upgrade recovery backup.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    Only a regular single-link file carrying the captured identity is
-    removed; a missing file is already gone and a foreign inode is never
-    unlinked but fails closed so the caller can stop instead of leaving an
-    unaccounted full DB copy.  The parent directory is fsynced after the
-    unlink.
-    """
-
-    try:
-        observed = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-        or (observed.st_dev, observed.st_ino) != identity
-    ):
-        raise MigrationPreflightError("SCHEMA.BACKUP_CLEANUP_UNSAFE")
-    try:
-        path.unlink()
-        _fsync_schema_upgrade_directory(path.parent)
-    except OSError as error:
-        raise MigrationPreflightError(
-            "SCHEMA.BACKUP_CLEANUP_FAILED"
-        ) from error
+    schema_upgrade_module._remove_owned_schema_upgrade_backup(
+        path,
+        identity,
+        preflight_error_factory=MigrationPreflightError,
+        fsync_error_factory=_copy_fsync_error_factory,
+    )
 
 
 def _snapshot_resource_identity(
@@ -2317,50 +2300,12 @@ def _strict_locator_proof(
     path: Path,
     expected_digest: str,
 ) -> tuple[tuple[int, int], str] | None:
-    """One strict prove-or-reject check for a recovery locator candidate.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    A candidate is accepted only when it opens ``O_NOFOLLOW``, ``fstat``
-    reports a regular single-link file, its bytes hash to
-    ``expected_digest``, and a terminal ``lstat`` still reports the same
-    device/inode/type/nlink.  Symlink, directory, multi-link, missing,
-    swapped inode, unreadable, or digest-mismatch candidates are rejected
-    (``None``) and are never exposed as locators.
-    """
-
-    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-    descriptor = -1
-    try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            return None
-        identity = (observed.st_dev, observed.st_ino)
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        if digest.hexdigest() != expected_digest:
-            return None
-        os.close(descriptor)
-        descriptor = -1
-        final = os.lstat(path)
-        if (
-            not stat.S_ISREG(final.st_mode)
-            or final.st_nlink != 1
-            or (final.st_dev, final.st_ino) != identity
-        ):
-            return None
-        return identity, digest.hexdigest()
-    except OSError:
-        return None
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+    return schema_upgrade_module._strict_locator_proof(
+        path,
+        expected_digest,
+    )
 
 
 def _recovery_backup_candidates(
@@ -2435,6 +2380,53 @@ def _require_locator_return_proof(
         raise MigrationPreflightError(fail_stop_code)
 
 
+def _copy_fsync_error_factory(_error: OSError) -> MigrationPreflightError:
+    return MigrationPreflightError("SCHEMA.COPY_FAILED")
+
+
+def _schema_upgrade_copy_plan(
+) -> schema_upgrade_module.SchemaUpgradeCopyPlan:
+    """Snapshot the owner-provided copy boundary at each invocation.
+
+    The moved data plane receives immutable scalar/schema values and the
+    owner namespace's current ancestry/index callbacks.  Constructing the
+    plan lazily preserves the pre-extraction monkeypatch/fault-injection
+    behavior; a module-import-time captured callback would silently bypass
+    a later patch to the original ``tm_migration`` seam.
+    """
+
+    return schema_upgrade_module.SchemaUpgradeCopyPlan(
+        schema_statements=tuple(_SCHEMA_STATEMENTS),
+        fts5_statement=_FTS5_STATEMENT,
+        approved_schema_digests=MappingProxyType(
+            {
+                False: _APPROVED_SCHEMA_DIGESTS[False],
+                True: _APPROVED_SCHEMA_DIGESTS[True],
+            }
+        ),
+        schema_upgrade_meta_key=_SCHEMA_UPGRADE_META_KEY,
+        schema_upgrade_meta_value=_SCHEMA_UPGRADE_META_VALUE,
+        target_schema_version=TM_SCHEMA_VERSION,
+        completed_origin_blocks=_legacy_completed_origin_blocks,
+        revision_ancestry=_legacy_revision_ancestry,
+        unique_character_ngrams=unique_character_ngrams,
+        ancestry_error_type=SQLiteStoreSchemaError,
+        preflight_error_factory=MigrationPreflightError,
+    )
+
+
+def _promote_schema_upgrade_artifact(
+    path: Path,
+    identity: tuple[int, int],
+) -> Path:
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
+
+    return schema_upgrade_module._promote_schema_upgrade_artifact(
+        path,
+        identity,
+    )
+
+
 def _schema_upgrade_error_code(error: Exception) -> str:
     error_code = getattr(error, "error_code", None)
     if type(error_code) is str and error_code:
@@ -2451,100 +2443,43 @@ def _schema_upgrade_retryable(error: Exception) -> bool:
 
 
 def _schema_version_of_store(store_path: Path) -> int:
-    """Read the meta schema version of one existing store read-only."""
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    connection = sqlite3.connect(
-        f"{store_path.as_uri()}?mode=ro",
-        uri=True,
-        isolation_level=None,
+    return schema_upgrade_module._schema_version_of_store(
+        store_path,
+        preflight_error_factory=MigrationPreflightError,
     )
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta WHERE key = 'schema_version'"
-        ).fetchall()
-    except sqlite3.DatabaseError as error:
-        raise MigrationPreflightError(
-            "SCHEMA.SCHEMA_UNREADABLE"
-        ) from error
-    finally:
-        connection.close()
-    if len(rows) != 1:
-        raise MigrationPreflightError("SCHEMA.SCHEMA_UNREADABLE")
-    try:
-        version = int(str(rows[0][0]))
-    except (TypeError, ValueError) as error:
-        raise MigrationPreflightError(
-            "SCHEMA.SCHEMA_UNREADABLE"
-        ) from error
-    return version
 
 
 def _upgrade_source_ref(
     identity: CanonicalResourceIdentity,
     store_path: Path,
 ) -> MutableStageRef:
-    """One inspection ref over the active old-schema store path.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    The inspection only reads the database, so the structural manifest
-    temporary is a distinct adjacent placeholder (the published manifest
-    path is deliberately never reused as a stage temporary).
-    """
-
-    return MutableStageRef(
-        stage_id="stage.schema-upgrade.source",
-        resource_identity=identity,
-        staged_db_path=store_path,
-        manifest_temp_path=store_path.with_name(
-            f"{store_path.name}.localcat-schema-upgrade.inspect.tmp"
-        ),
+    return schema_upgrade_module._upgrade_source_ref(
+        identity,
+        store_path,
     )
 
 
 def _open_legacy_read_connection(
     database_path: Path,
 ) -> sqlite3.Connection:
-    """One strictly read-only connection that never mutates the source."""
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
-        isolation_level=None,
+    return schema_upgrade_module._open_legacy_read_connection(
+        database_path
     )
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        return connection
-    except BaseException:
-        connection.close()
-        raise
 
 
 def _read_active_activation_digest(store_path: Path) -> str:
-    """Read the ACTIVE old-schema canonical's activation digest.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    The digest expectation is read from the store's own durable meta
-    (never guessed) so the strict ACTIVE inspection binds the exact
-    published generation; any missing or malformed digest fails closed.
-    """
-
-    connection = _open_legacy_read_connection(store_path)
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta "
-            "WHERE key = 'activation_digest'"
-        ).fetchall()
-    finally:
-        connection.close()
-    if (
-        len(rows) != 1
-        or type(rows[0][0]) is not str
-        or len(rows[0][0]) != 64
-        or any(
-            character not in "0123456789abcdef"
-            for character in rows[0][0]
-        )
-    ):
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    return str(rows[0][0])
+    return schema_upgrade_module._read_active_activation_digest(
+        store_path,
+        preflight_error_factory=MigrationPreflightError,
+    )
 
 
 def _read_legacy_snapshot_facts(
@@ -2552,161 +2487,47 @@ def _read_legacy_snapshot_facts(
     *,
     canonical_store_id: str,
 ) -> tuple[SnapshotReceipt, SnapshotKind]:
-    """Read the one old-schema receipt and binding kind the copy re-publishes.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    The receipt fields and the binding's ``snapshot_kind`` are read
-    exactly as the v1 ledger recorded them; the binding itself is deleted
-    from the candidate and re-published identically by activation, so the
-    manifest temporary must carry the original kind.
-    """
-
-    connection = _open_legacy_read_connection(store_path)
-    try:
-        receipt_rows = connection.execute(
-            "SELECT snapshot_id, resource_id, canonical_store_id, "
-            "exported_revision, jsonl_digest, record_count, format_version "
-            "FROM tm_snapshot_receipt ORDER BY snapshot_id"
-        ).fetchall()
-        binding_rows = connection.execute(
-            "SELECT snapshot_kind FROM tm_snapshot_binding "
-            "WHERE binding_id = 1"
-        ).fetchall()
-    finally:
-        connection.close()
-    if len(receipt_rows) != 1:
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    row = receipt_rows[0]
-    scalar_values = row[:3] + (row[4], row[6])
-    if any(type(value) is not str for value in scalar_values):
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    if type(row[3]) is not int or type(row[5]) is not int:
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    receipt = SnapshotReceipt(
-        snapshot_id=str(row[0]),
-        resource_id=str(row[1]),
-        canonical_store_id=str(row[2]),
-        exported_revision=int(row[3]),
-        jsonl_digest=str(row[4]),
-        record_count=int(row[5]),
-        format_version=str(row[6]),
+    return schema_upgrade_module._read_legacy_snapshot_facts(
+        store_path,
+        canonical_store_id=canonical_store_id,
+        preflight_error_factory=MigrationPreflightError,
     )
-    if receipt.canonical_store_id != canonical_store_id:
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    if len(binding_rows) != 1 or type(binding_rows[0][0]) is not str:
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
-    try:
-        manifest_kind = SnapshotKind(str(binding_rows[0][0]))
-    except (TypeError, ValueError) as error:
-        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED") from error
-    return receipt, manifest_kind
 
 
 def _fsync_schema_upgrade_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = -1
-    try:
-        descriptor = os.open(path, flags)
-        os.fsync(descriptor)
-    except OSError as error:
-        raise MigrationPreflightError(
-            "SCHEMA.COPY_FAILED"
-        ) from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
+
+    schema_upgrade_module._fsync_schema_upgrade_directory(
+        path,
+        error_factory=_copy_fsync_error_factory,
+    )
 
 
 def _copy_store_into_stage(
     source_path: Path,
     destination_path: Path,
 ) -> _CreatedFileIdentity:
-    """One consistent old-schema copy into a fresh exclusively reserved file.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    The source is opened strictly read-only and copied through the SQLite
-    backup API into a same-directory fresh ``O_EXCL`` regular file, then
-    fsynced (file and parent).  The copy is a valid reopenable old-schema
-    store; its byte digest is deliberately not required to equal the live
-    DB's digest (``Connection.backup()`` may normalize page layout).  Any
-    failure removes the partial copy and never touches the live canonical.
-    """
-
-    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-    descriptor = -1
-    created = False
-    try:
-        descriptor = os.open(
-            destination_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | no_follow,
-            0o600,
-        )
-        created = True
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            raise MigrationPreflightError("SCHEMA.COPY_UNSAFE")
-        identity = _CreatedFileIdentity(observed.st_dev, observed.st_ino)
-        source = sqlite3.connect(
-            f"{source_path.as_uri()}?mode=ro",
-            uri=True,
-            isolation_level=None,
-        )
-        try:
-            destination = sqlite3.connect(
-                f"{destination_path.as_uri()}?mode=rw",
-                uri=True,
-                isolation_level=None,
-            )
-            try:
-                source.backup(destination)
-            finally:
-                destination.close()
-        finally:
-            source.close()
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        _fsync_schema_upgrade_directory(destination_path.parent)
-        final = os.lstat(destination_path)
-        if (
-            not stat.S_ISREG(final.st_mode)
-            or (final.st_dev, final.st_ino) != (identity.device, identity.inode)
-        ):
-            raise MigrationPreflightError("SCHEMA.COPY_UNSAFE")
-        return identity
-    except MigrationPreflightError:
-        if created:
-            try:
-                destination_path.unlink()
-            except OSError:
-                pass
-        raise
-    except (OSError, sqlite3.DatabaseError) as error:
-        if created:
-            try:
-                destination_path.unlink()
-            except OSError:
-                pass
-        raise MigrationPreflightError("SCHEMA.COPY_FAILED") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    created = schema_upgrade_module._copy_store_into_stage(
+        source_path,
+        destination_path,
+        preflight_error_type=MigrationPreflightError,
+        preflight_error_factory=MigrationPreflightError,
+        fsync_error_factory=_copy_fsync_error_factory,
+    )
+    return _CreatedFileIdentity(created.device, created.inode)
 
 
 def _ddl_for(
     statements: tuple[str, ...],
     prefix: str,
 ) -> str:
-    matches = [
-        statement
-        for statement in statements
-        if statement.lstrip().startswith(prefix)
-    ]
-    if len(matches) != 1:
-        raise ValueError("schema DDL statement set is inconsistent")
-    return matches[0]
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
+
+    return schema_upgrade_module._ddl_for(statements, prefix)
 
 
 def _migrate_schema_copy(
@@ -2714,207 +2535,13 @@ def _migrate_schema_copy(
     *,
     fts5_available: bool,
 ) -> None:
-    """Migrate one copied pre-v2 stage to the current schema in place.
+    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    The rebuild renames the legacy tables aside, recreates the v2 shape,
-    derives each completed batch's ``completed_revision`` strictly from
-    the proven record-block/origin-ordinal order (never batch-id
-    sorting), copies every record verbatim (including provenance,
-    context, usage and lineage), rebuilds ``tm_gram`` and, when
-    available, ``tm_fts`` from ``tm_record.source_fold_v1``, re-issues
-    the single receipt, removes the binding (re-published identically by
-    activation), and advances meta to the current schema version and
-    approved digest with the durable schema-upgrade origin marker.  The
-    whole rebuild is one transaction, so a failed upgrade leaves only
-    the untouched original store and its recovery backup.
-    """
-
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        try:
-            head_rows = connection.execute(
-                "SELECT value FROM tm_meta WHERE key = 'head_revision'"
-            ).fetchall()
-            if len(head_rows) != 1:
-                raise SQLiteStoreSchemaError(
-                    "STORE.REVISION_ANCESTRY_MISMATCH"
-                )
-            head_revision = int(str(head_rows[0][0]))
-            record_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM tm_record"
-                ).fetchone()[0]
-            )
-            completed_blocks = _legacy_completed_origin_blocks(connection)
-            _ = _legacy_revision_ancestry(
-                connection,
-                head_revision=head_revision,
-                record_count=record_count,
-            )
-        except SQLiteStoreSchemaError as error:
-            raise MigrationPreflightError(
-                "SCHEMA.ANCESTRY_UNPROVABLE"
-            ) from error
-        except (TypeError, ValueError) as error:
-            raise MigrationPreflightError(
-                "SCHEMA.ANCESTRY_UNPROVABLE"
-            ) from error
-        revision_by_batch = {
-            batch_id: revision
-            for batch_id, revision, _count in completed_blocks
-        }
-        for statement in (
-            "DROP INDEX idx_tm_exact",
-            "DROP INDEX idx_tm_context_speaker",
-            "DROP INDEX idx_tm_gram_lookup",
-        ):
-            connection.execute(statement)
-        connection.execute(
-            "ALTER TABLE tm_origin_batch RENAME TO tm_origin_batch_legacy"
-        )
-        connection.execute(
-            "ALTER TABLE tm_record RENAME TO tm_record_legacy"
-        )
-        connection.execute(
-            "ALTER TABLE tm_gram RENAME TO tm_gram_legacy"
-        )
-        for statement in (
-            _ddl_for(
-                _SCHEMA_STATEMENTS,
-                "CREATE TABLE tm_origin_batch (",
-            ),
-            _ddl_for(_SCHEMA_STATEMENTS, "CREATE TABLE tm_record ("),
-            _ddl_for(_SCHEMA_STATEMENTS, "CREATE TABLE tm_gram ("),
-        ):
-            connection.execute(statement)
-        legacy_batch_cursor = connection.execute(
-            "SELECT batch_id, kind, source_digest, source_path, status, "
-            "valid_count, invalid_count, duplicate_source_count, "
-            "created_at FROM tm_origin_batch_legacy ORDER BY batch_id"
-        )
-        for batch in legacy_batch_cursor:
-            batch_id = str(batch[0])
-            connection.execute(
-                "INSERT INTO tm_origin_batch("
-                "batch_id, kind, source_digest, source_path, status, "
-                "valid_count, invalid_count, duplicate_source_count, "
-                "completed_revision, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    batch_id,
-                    str(batch[1]),
-                    batch[2],
-                    batch[3],
-                    str(batch[4]),
-                    int(batch[5]),
-                    int(batch[6]),
-                    int(batch[7]),
-                    revision_by_batch.get(batch_id),
-                    str(batch[8]),
-                ),
-            )
-        connection.execute(
-            "INSERT INTO tm_record("
-            "record_id, source_raw, target_raw, source_fold_v1, "
-            "speaker_raw, context_prev_raw, context_next_raw, "
-            "file_source, provenance_json, legacy_line_no, usage_count, "
-            "last_used, origin_batch_id, origin_ordinal) "
-            "SELECT record_id, source_raw, target_raw, source_fold_v1, "
-            "speaker_raw, context_prev_raw, context_next_raw, "
-            "file_source, provenance_json, legacy_line_no, usage_count, "
-            "last_used, origin_batch_id, origin_ordinal "
-            "FROM tm_record_legacy ORDER BY record_id"
-        )
-        required_sizes = (1, 2) if fts5_available else (1, 2, 3)
-        gram_rows: list[tuple[int, str, int]] = []
-        record_cursor = connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_record "
-            "ORDER BY record_id"
-        )
-        for record_id, folded_source in record_cursor:
-            for gram_size in required_sizes:
-                for gram in unique_character_ngrams(
-                    str(folded_source),
-                    gram_size,
-                ):
-                    gram_rows.append((gram_size, gram, int(record_id)))
-                    if len(gram_rows) >= 5000:
-                        connection.executemany(
-                            "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                            "VALUES (?, ?, ?)",
-                            gram_rows,
-                        )
-                        gram_rows.clear()
-        if gram_rows:
-            connection.executemany(
-                "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                "VALUES (?, ?, ?)",
-                gram_rows,
-            )
-        for table_name in (
-            "tm_gram_legacy",
-            "tm_record_legacy",
-            "tm_origin_batch_legacy",
-        ):
-            connection.execute(f"DROP TABLE {table_name}")
-        for statement in (
-            _ddl_for(
-                _SCHEMA_STATEMENTS,
-                "CREATE INDEX idx_tm_exact",
-            ),
-            _ddl_for(
-                _SCHEMA_STATEMENTS,
-                "CREATE INDEX idx_tm_context_speaker",
-            ),
-            _ddl_for(
-                _SCHEMA_STATEMENTS,
-                "CREATE INDEX idx_tm_gram_lookup",
-            ),
-        ):
-            connection.execute(statement)
-        if fts5_available:
-            connection.execute("DROP TABLE tm_fts")
-            connection.execute(_FTS5_STATEMENT)
-            connection.execute(
-                "INSERT INTO tm_fts(source_fold_v1, record_id) "
-                "SELECT source_fold_v1, record_id FROM tm_record "
-                "ORDER BY record_id"
-            )
-        connection.execute(
-            "UPDATE tm_snapshot_receipt SET status = 'issued'"
-        )
-        connection.execute("DELETE FROM tm_snapshot_binding")
-        connection.execute(
-            "UPDATE tm_meta SET value = ? WHERE key = 'schema_version'",
-            (str(TM_SCHEMA_VERSION),),
-        )
-        connection.execute(
-            "UPDATE tm_meta SET value = ? WHERE key = 'schema_digest'",
-            (_APPROVED_SCHEMA_DIGESTS[fts5_available],),
-        )
-        connection.execute(
-            "UPDATE tm_meta SET value = ? WHERE key = 'activation_status'",
-            ("UNPUBLISHED",),
-        )
-        connection.execute(
-            "UPDATE tm_meta SET value = ? WHERE key = 'generation'",
-            ("0",),
-        )
-        connection.execute(
-            "UPDATE tm_meta SET value = ? WHERE key = 'divergence_latched'",
-            ("0",),
-        )
-        connection.execute(
-            "DELETE FROM tm_meta WHERE key = 'activation_digest'"
-        )
-        connection.execute(
-            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
-            (_SCHEMA_UPGRADE_META_KEY, _SCHEMA_UPGRADE_META_VALUE),
-        )
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
+    schema_upgrade_module._migrate_schema_copy(
+        connection,
+        fts5_available=fts5_available,
+        plan=_schema_upgrade_copy_plan(),
+    )
 
 
 def _reject_json_constant(_value: str) -> None:
