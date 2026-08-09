@@ -1,4 +1,11 @@
-"""Safe schema and connection policy for per-resource canonical TM stores."""
+"""Safe schema and connection policy for per-resource canonical TM stores.
+
+Tasks 5.6-5.9 add the durable activation journal (PREPARED -> DB_REPLACED
+-> MANIFEST_PUBLISHED -> GENERATION_PUBLISHED), idempotent recovery of one
+pending activation, and the deterministic Task 5.9 rollback that restores
+one complete prior authority (or the legacy first-activation JSONL) when a
+journal-authenticated new set cannot be proven at any phase.
+"""
 
 from __future__ import annotations
 
@@ -623,16 +630,19 @@ class ActivationPreparationError(RuntimeError):
         super().__init__(code)
 
 
-_ACTIVATION_RECOVERY_ACTIONS = frozenset({"CANCELLED", "COMPLETED"})
+_ACTIVATION_RECOVERY_ACTIONS = frozenset(
+    {"CANCELLED", "COMPLETED", "ROLLED_BACK"}
+)
 
 
 @dataclass(frozen=True)
 class ActivationRecoveryReport:
-    """Code-only outcome of one Task 5.8 activation recovery.
+    """Code-only outcome of one Task 5.8/5.9 activation recovery.
 
     The report carries only the journal phase recovered from, the action
-    taken, and the resulting generation; it never exposes filesystem paths,
-    token ids, nonces, or raw journal JSON.
+    taken (CANCELLED, COMPLETED, or ROLLED_BACK), and the resulting
+    generation; it never exposes filesystem paths, token ids, nonces, or
+    raw journal JSON.
     """
 
     phase: str
@@ -2042,6 +2052,7 @@ class ResourceStoreCoordinator:
                     journal_identity,
                 )
                 self._revalidate_recovery_authority_locked(record)
+                rollback_terminal_coexists = False
                 if terminal_identity is not None:
                     terminal_record = self._load_recovery_terminal_locked(
                         terminal_path,
@@ -2058,27 +2069,69 @@ class ResourceStoreCoordinator:
                             "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
                             retryable=False,
                         )
-                if record.phase is _ActivationJournalPhase.PREPARED:
-                    report = self._complete_prepared_cancellation_locked(
+                    if _rollback_terminal_prior_closes(
+                        terminal_record,
                         record,
-                        journal_identity,
-                    )
-                elif record.phase is _ActivationJournalPhase.DB_REPLACED:
-                    report = self._recover_manifest_publication_locked(
-                        record,
-                        journal_identity,
-                    )
-                elif (
-                    record.phase
-                    is _ActivationJournalPhase.MANIFEST_PUBLISHED
-                ):
-                    report = self._recover_generation_publication_locked(
-                        record,
-                        journal_identity,
-                        report_phase=_ActivationJournalPhase.MANIFEST_PUBLISHED,
-                    )
-                else:
-                    report = self._replay_terminal_recovery_locked(
+                    ):
+                        rollback_terminal_coexists = True
+                try:
+                    if record.phase is _ActivationJournalPhase.PREPARED:
+                        report = self._complete_prepared_cancellation_locked(
+                            record,
+                            journal_identity,
+                        )
+                    elif record.phase is _ActivationJournalPhase.DB_REPLACED:
+                        report = self._recover_manifest_publication_locked(
+                            record,
+                            journal_identity,
+                        )
+                    elif (
+                        record.phase
+                        is _ActivationJournalPhase.MANIFEST_PUBLISHED
+                    ):
+                        report = self._recover_generation_publication_locked(
+                            record,
+                            journal_identity,
+                            report_phase=_ActivationJournalPhase.MANIFEST_PUBLISHED,
+                        )
+                    else:
+                        if rollback_terminal_coexists:
+                            next_generation = (
+                                0
+                                if record.expected_prior_generation is None
+                                else record.expected_prior_generation + 1
+                            )
+                            activation_digest = _activation_publication_digest(
+                                record,
+                                next_generation=next_generation,
+                            )
+                            try:
+                                _revalidate_recovered_active_set(
+                                    record,
+                                    identity=self._resource_identity,
+                                    canonical_store_id=self._canonical_store_id,
+                                    next_generation=next_generation,
+                                    activation_digest=activation_digest,
+                                    require_manifest_published=True,
+                                )
+                            except ActivationPreparationError:
+                                pass
+                            else:
+                                raise ActivationPreparationError(
+                                    "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                                    retryable=False,
+                                )
+                        report = self._replay_terminal_recovery_locked(
+                            record,
+                            journal_identity,
+                        )
+                except ActivationPreparationError as error:
+                    if not _activation_rollback_eligible(error):
+                        raise
+                    # Task 5.9: completion cannot be proven, so restore one
+                    # complete prior authority (or the legacy first-activation
+                    # state) instead of leaving the resource fail-stopped.
+                    report = self._rollback_inconsistent_activation_locked(
                         record,
                         journal_identity,
                     )
@@ -2090,6 +2143,343 @@ class ResourceStoreCoordinator:
             except BaseException:
                 self._condition.notify_all()
                 raise
+
+
+    def rollback_durable_activation(
+        self,
+    ) -> ActivationRecoveryReport | None:
+        """Roll back one pending/inconsistent activation (Task 5.9).
+
+        Narrow coordinator entry point that restores exactly one complete
+        prior authority (or the legacy first-activation state) instead of
+        completing a pending activation.  It is usable both from ``READY``
+        (fresh start with a durable journal) and from ``ACTIVATING`` after a
+        fail-stop (for example a failed :meth:`publish_activation`), and it
+        is idempotent: repeated calls never create a generation, consume a
+        token twice, duplicate quarantine, or delete foreign files.  The
+        main journal and any coexisting terminal are re-read and
+        authenticated before any mutation, and the pending main journal
+        takes precedence under the Task 5.8 coexistence rules.  A fully
+        proven ``GENERATION_PUBLISHED`` journal (a completed activation) is
+        refused; recovery of that state is
+        :meth:`recover_durable_activation`.
+        """
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        with self._condition:
+            if (
+                self._state not in {"READY", "ACTIVATING"}
+                or self._cleanup_in_progress
+                or self._cleanup_reservation is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.ROLLBACK_STATE_INVALID",
+                    retryable=True,
+                )
+            journal_path = _activation_journal_path(self._resource_identity)
+            terminal_path = _activation_terminal_path(self._resource_identity)
+            self._state = "ACTIVATING"
+            try:
+                try:
+                    journal_identity = _lstat_activation_journal_identity(
+                        journal_path
+                    )
+                except ActivationPreparationError as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                        retryable=False,
+                        reason_code=error.code,
+                    ) from error
+                try:
+                    terminal_identity = _lstat_activation_terminal_identity(
+                        terminal_path
+                    )
+                except ActivationPreparationError as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                        retryable=False,
+                        reason_code=error.code,
+                    ) from error
+                journal_temp_path = _activation_journal_temp_path(
+                    journal_path
+                )
+                terminal_temp_path = _activation_terminal_temp_path(
+                    terminal_path
+                )
+                if _lstat_any_entry(journal_temp_path):
+                    if (
+                        journal_identity is not None
+                        or terminal_identity is None
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_JOURNAL_TEMP_CONFLICT",
+                            retryable=False,
+                        )
+                    _remove_orphaned_activation_temp(journal_temp_path)
+                if _lstat_any_entry(terminal_temp_path):
+                    if (
+                        terminal_identity is not None
+                        or journal_identity is None
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_TERMINAL_TEMP_CONFLICT",
+                            retryable=False,
+                        )
+                    _remove_orphaned_activation_temp(terminal_temp_path)
+                if journal_identity is None:
+                    if terminal_identity is None:
+                        if self._view is not None:
+                            self._state = "READY"
+                            self._condition.notify_all()
+                            return None
+                        report = self._discover_active_canonical_locked()
+                    else:
+                        terminal_record = self._load_recovery_terminal_locked(
+                            terminal_path,
+                            terminal_identity,
+                        )
+                        self._revalidate_recovery_authority_locked(
+                            terminal_record
+                        )
+                        if (
+                            terminal_record.phase
+                            is _ActivationJournalPhase.GENERATION_PUBLISHED
+                        ):
+                            report = self._replay_terminal_recovery_locked(
+                                terminal_record,
+                                terminal_identity,
+                            )
+                        elif (
+                            terminal_record.phase
+                            is _ActivationJournalPhase.PREPARED
+                        ):
+                            report = (
+                                self._replay_cancelled_terminal_recovery_locked(
+                                    terminal_record,
+                                )
+                            )
+                        else:
+                            raise ActivationPreparationError(
+                                "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                                retryable=False,
+                            )
+                    self._preparation = None
+                    self._cleanup_reservation = None
+                    self._state = "READY"
+                    self._condition.notify_all()
+                    return report
+                record = self._load_recovery_journal_locked(
+                    journal_path,
+                    journal_identity,
+                )
+                self._revalidate_recovery_authority_locked(record)
+                if terminal_identity is not None:
+                    terminal_record = self._load_recovery_terminal_locked(
+                        terminal_path,
+                        terminal_identity,
+                    )
+                    self._revalidate_recovery_authority_locked(
+                        terminal_record
+                    )
+                    if not _activation_terminal_coexistence_valid(
+                        record,
+                        terminal_record,
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                            retryable=False,
+                        )
+                if (
+                    record.phase
+                    is _ActivationJournalPhase.GENERATION_PUBLISHED
+                ):
+                    next_generation = (
+                        0
+                        if record.expected_prior_generation is None
+                        else record.expected_prior_generation + 1
+                    )
+                    activation_digest = _activation_publication_digest(
+                        record,
+                        next_generation=next_generation,
+                    )
+                    try:
+                        _revalidate_recovered_active_set(
+                            record,
+                            identity=self._resource_identity,
+                            canonical_store_id=self._canonical_store_id,
+                            next_generation=next_generation,
+                            activation_digest=activation_digest,
+                            require_manifest_published=True,
+                        )
+                    except ActivationPreparationError:
+                        pass
+                    else:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.ROLLBACK_COMPLETED_INVALID",
+                            retryable=False,
+                        )
+                if self._preparation is not None:
+                    try:
+                        entry = self._sealed_registry._token_entry(
+                            self._preparation._token
+                        )
+                    except stage_seal_error:
+                        entry = None
+                    if entry is not None and (
+                        entry.state
+                        is contract_module.ActivationCapabilityState.TOKEN_ISSUED
+                    ):
+                        try:
+                            self._sealed_registry.cancel(
+                                self._preparation._token
+                            )
+                        except stage_seal_error as error:
+                            raise ActivationPreparationError(
+                                "ACTIVATION.ROLLBACK_TOKEN_CANCEL_FAILED",
+                                retryable=True,
+                                reason_code=error.error_code,
+                            ) from error
+                report = self._rollback_inconsistent_activation_locked(
+                    record,
+                    journal_identity,
+                )
+                self._preparation = None
+                self._cleanup_reservation = None
+                self._state = "READY"
+                self._condition.notify_all()
+                return report
+            except BaseException:
+                self._condition.notify_all()
+                raise
+
+    def _rollback_inconsistent_activation_locked(
+        self,
+        record: _ActivationJournalRecord,
+        journal_identity: _ActivationFileIdentity,
+    ) -> ActivationRecoveryReport:
+        """Restore exactly one complete prior/legacy authority (Task 5.9).
+
+        Called when the durable journal authenticates but the new
+        DB/receipt/binding/manifest/effect closure cannot be proven at any
+        pending phase.  With a prior canonical generation the journal-owned
+        backups restore the prior DB and prior manifest/binding as one set
+        (atomic replace, file fsync, directory fsync, then full
+        schema/identity/integrity/FK/count/receipt/binding/index/source
+        revalidation); without a prior canonical every journal-owned failed
+        sidecar/manifest/candidate/temporary artifact is quarantined
+        deterministically and the configured JSONL remains the legacy
+        authority.  Only after the restored/legacy authority is durable and
+        revalidated is the PREPARED prior-closure terminal published, the
+        main journal retired, and the journal-owned backups removed, so a
+        crash at every boundary resumes idempotently and repeated rollback
+        never creates a generation or duplicates quarantine.
+        """
+
+        identity = self._resource_identity
+        canonical_store_id = self._canonical_store_id
+        source = _recovery_capture_journal_file(
+            identity.configured_jsonl_path
+        )
+        if (
+            (source[0].device, source[0].inode)
+            != record.source_jsonl_identity
+            or source[1] != record.source_jsonl_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                retryable=False,
+            )
+        _quarantine_failed_activation_artifacts(
+            record,
+            identity=identity,
+        )
+        if not record.had_prior_canonical:
+            try:
+                _require_first_activation_absence(identity)
+            except ActivationPreparationError as error:
+                raise _recovery_mismatch(error) from error
+            fts5_available = False
+            prior_generation = None
+            terminal_record = replace(
+                record,
+                phase=_ActivationJournalPhase.PREPARED,
+            )
+        else:
+            if (
+                record.prior_db_path is None
+                or record.prior_manifest_path is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_MISMATCH",
+                    retryable=False,
+                )
+            try:
+                fts5_available = _revalidate_recovered_prior_set(
+                    record,
+                    identity=identity,
+                    canonical_store_id=canonical_store_id,
+                    allow_restored_identities=True,
+                )
+            except ActivationPreparationError:
+                db_backup, manifest_backup = _require_rollback_backups(record)
+                _restore_activation_file(
+                    record,
+                    db_backup[0],
+                    db_backup[1],
+                    record.prior_db_path,
+                )
+                _restore_activation_file(
+                    record,
+                    manifest_backup[0],
+                    manifest_backup[1],
+                    record.prior_manifest_path,
+                )
+                fts5_available = _revalidate_recovered_prior_set(
+                    record,
+                    identity=identity,
+                    canonical_store_id=canonical_store_id,
+                    allow_restored_identities=True,
+                )
+            db_identity = _recovery_capture_journal_file(
+                record.prior_db_path
+            )[0]
+            manifest_identity = _recovery_capture_journal_file(
+                record.prior_manifest_path
+            )[0]
+            terminal_record = replace(
+                record,
+                phase=_ActivationJournalPhase.PREPARED,
+                prior_db_identity=(db_identity.device, db_identity.inode),
+                prior_manifest_identity=(
+                    manifest_identity.device,
+                    manifest_identity.inode,
+                ),
+            )
+            prior_generation = record.prior_generation
+        self._retire_coexisting_terminal_locked(record)
+        _ = self._write_activation_terminal_locked(terminal_record)
+        _remove_owned_activation_journal_final(
+            _activation_journal_path(identity),
+            journal_identity,
+        )
+        _remove_journal_proven_backups(record)
+        if record.had_prior_canonical:
+            self._view = _rollback_restored_prior_view(
+                record,
+                identity=identity,
+                canonical_store_id=canonical_store_id,
+                fts5_available=fts5_available,
+            )
+        else:
+            self._view = None
+        return ActivationRecoveryReport(
+            phase=record.phase.value,
+            action="ROLLED_BACK",
+            generation=prior_generation,
+        )
 
     def _discover_active_canonical_locked(
         self,
@@ -2781,9 +3171,17 @@ class ResourceStoreCoordinator:
                 record,
                 identity=identity,
                 canonical_store_id=self._canonical_store_id,
+                allow_restored_identities=True,
             )
         except ActivationPreparationError as error:
             raise _recovery_mismatch(error) from error
+        # A Task 5.9 rollback removes the journal-owned backups only after
+        # the restored authority and terminal are durable; a crash in that
+        # window leaves terminal-only state with backups still present, so
+        # the terminal replay cleans them idempotently.  A normal Task 5.8
+        # cancellation already removed every backup before the terminal, so
+        # this is a no-op for the unchanged-prior path.
+        _remove_journal_proven_backups(record)
         if (
             record.prior_db_path != identity.canonical_sidecar_path
             and _lstat_any_entry(identity.canonical_sidecar_path)
@@ -5971,20 +6369,73 @@ def _terminal_prior_closure_matches(
     return True
 
 
+def _rollback_terminal_prior_closes(
+    terminal_record: _ActivationJournalRecord,
+    main_record: _ActivationJournalRecord,
+) -> bool:
+    """True when a PREPARED rollback terminal closes the pending main prior.
+
+    Task 5.9 writes the prior-authority terminal only after the restored
+    prior pair is durable and revalidated, then retires the pending main
+    journal.  A crash in that window leaves a PREPARED terminal beside the
+    pending main journal; the terminal's prior identities are the restored
+    copies while the main journal records the original identities.  Both
+    close the same canonical state: the restored copies are byte-identical,
+    so every digest, the source identity/digest, the binding receipt, and
+    the generation match.  The terminal must be the same activation (same
+    journal id) and the pending main journal still takes precedence;
+    recovery re-runs the rollback idempotently and retires/rewrites the
+    terminal.  Any other difference is a foreign/tampered terminal.
+    """
+
+    if (
+        terminal_record.journal_id != main_record.journal_id
+        or terminal_record.phase is not _ActivationJournalPhase.PREPARED
+        or terminal_record.had_prior_canonical
+        != main_record.had_prior_canonical
+    ):
+        return False
+    if not main_record.had_prior_canonical:
+        return True
+    if (
+        terminal_record.expected_prior_generation
+        != main_record.expected_prior_generation
+        or terminal_record.prior_generation != main_record.prior_generation
+        or terminal_record.prior_db_path != main_record.prior_db_path
+        or terminal_record.prior_db_digest != main_record.prior_db_digest
+        or terminal_record.prior_manifest_path
+        != main_record.prior_manifest_path
+        or terminal_record.prior_manifest_digest
+        != main_record.prior_manifest_digest
+        or terminal_record.prior_receipt_digest
+        != main_record.prior_receipt_digest
+        or terminal_record.prior_binding_snapshot_id
+        != main_record.prior_binding_snapshot_id
+        or terminal_record.source_jsonl_identity
+        != main_record.source_jsonl_identity
+        or terminal_record.source_jsonl_digest
+        != main_record.source_jsonl_digest
+    ):
+        return False
+    return True
+
+
 def _activation_terminal_coexistence_valid(
     main_record: _ActivationJournalRecord,
     terminal_record: _ActivationJournalRecord,
 ) -> bool:
-    """Deterministic terminal/main coexistence rule (Task 5.8 handoff).
+    """Deterministic terminal/main coexistence rule (Task 5.8/5.9 handoff).
 
     The pending main journal always takes precedence; a coexisting terminal
     is tolerated only when it closes the same canonical state: a CONSUMED
     terminal's published closure must equal the pending main journal's prior
     closure, a CANCELLED terminal's prior closure must equal the pending main
-    journal's prior closure, and a terminal beside a terminal main journal
-    must be the identical closure (or an older CONSUMED closure of the same
-    prior).  Any other coexistence is a foreign/tampered terminal and fails
-    closed without being used or overwritten.
+    journal's prior closure, a terminal beside a terminal main journal must
+    be the identical closure (or an older CONSUMED closure of the same
+    prior), and a Task 5.9 rollback terminal (restored prior identities)
+    must close the pending main journal's prior digests.  Any other
+    coexistence is a foreign/tampered terminal and fails closed without
+    being used or overwritten.
     """
 
     if (
@@ -6000,7 +6451,10 @@ def _activation_terminal_coexistence_valid(
             terminal_record.phase
             is not _ActivationJournalPhase.GENERATION_PUBLISHED
         ):
-            return False
+            return _rollback_terminal_prior_closes(
+                terminal_record,
+                main_record,
+            )
         if terminal_record == main_record:
             return True
         return _terminal_new_authority_closes_main_prior(
@@ -6012,7 +6466,10 @@ def _activation_terminal_coexistence_valid(
             terminal_record,
             main_record,
         )
-    return _terminal_prior_closure_matches(terminal_record, main_record)
+    return (
+        _terminal_prior_closure_matches(terminal_record, main_record)
+        or _rollback_terminal_prior_closes(terminal_record, main_record)
+    )
 
 
 def _remove_journal_proven_backups(
@@ -6123,6 +6580,513 @@ def _remove_journal_proven_backups(
             ) from error
     for entry in owned:
         _require_recovery_path_absent(entry.path)
+
+_ROLLBACK_ELIGIBLE_ERROR_CODES = frozenset(
+    {
+        "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+        "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+        "ACTIVATION.RECOVERY_MISMATCH",
+        "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
+    }
+)
+
+
+def _activation_rollback_eligible(
+    error: ActivationPreparationError,
+) -> bool:
+    """True when a proven journal's new-asset/effect closure fails.
+
+    These errors mean the durable journal authenticates but the new
+    DB/receipt/binding/manifest/effect cannot be re-proven from disk, so
+    Task 5.9 must restore the prior authority or quarantine the failed
+    first activation.  Authority-level failures (tampered journal/terminal,
+    source mutation, missing or mutated backups, cleanup and durability
+    faults) are never eligible and keep the fail-stop semantics.
+    """
+
+    return error.code in _ROLLBACK_ELIGIBLE_ERROR_CODES
+
+
+def _activation_quarantine_directory(
+    identity: CanonicalResourceIdentity,
+    record: _ActivationJournalRecord,
+) -> Path:
+    """Deterministic adjacent quarantine directory for one failed activation.
+
+    The directory name is derived only from the durable journal facts
+    (journal id), so a fresh coordinator re-derives the exact same path and
+    repeated rollback never duplicates quarantine entries.
+    """
+
+    root = identity.canonical_sidecar_path.parent / (
+        ".localcat-activation-quarantine-v1"
+    )
+    return root / record.journal_id
+
+
+def _require_quarantine_directory(quarantine_dir: Path) -> None:
+    """Create (or validate) the deterministic quarantine directory durably.
+
+    The directory is created level by level with strict lstat validation:
+    an existing entry must be a real directory, never a symlink, and each
+    parent directory is fsynced so a crash after quarantine leaves durable
+    evidence.  A foreign entry at the deterministic path fails closed.
+    """
+
+    root = quarantine_dir.parent
+    for entry in (root, quarantine_dir):
+        try:
+            os.mkdir(entry)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        try:
+            observed = os.lstat(entry)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+        if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=False,
+            )
+        try:
+            _fsync_activation_directory(entry.parent)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FAILED",
+                retryable=True,
+            ) from error
+
+
+def _quarantine_owned_activation_artifact(
+    path: Path,
+    expected_identity: tuple[int, int],
+    quarantine_dir: Path,
+    *,
+    authority_path: bool,
+    allow_identity: tuple[int, int] | None = None,
+    allow_digest: str | None = None,
+) -> bool:
+    """Move one journal-owned failed artifact into quarantine; False if absent.
+
+    The artifact must be an exact regular single-link file with the
+    journal-recorded identity; a foreign, symlinked, or hardlinked entry is
+    never moved or deleted.  On an authority path (canonical sidecar or
+    manifest final) a foreign entry fails closed because it would poison the
+    restored pair; on a stage path it is left untouched.  A journal-proven
+    prior artifact at an authority path (``allow_identity``, the original
+    prior inode, or ``allow_digest``, a byte-identical prior copy restored
+    from the journal-owned backups) is the prior pair of a pending
+    pre-publication phase and is left untouched: the prior pair is what
+    Task 5.9 restores, never a failed artifact.  The move is an atomic
+    same-directory rename followed by directory fsync, and an existing
+    quarantine entry is never overwritten (an already-quarantined artifact
+    is skipped idempotently).
+    """
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        if authority_path:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FOREIGN",
+                retryable=False,
+            )
+        return False
+    observed_identity = (observed.st_dev, observed.st_ino)
+    if observed_identity != expected_identity:
+        if (
+            allow_identity is not None
+            and observed_identity == allow_identity
+        ):
+            return False
+        if allow_digest is not None and authority_path:
+            try:
+                capture = _capture_activation_file(
+                    path,
+                    asset_kind="JOURNAL_CLOSURE",
+                )
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+            if capture.digest == allow_digest:
+                return False
+        if authority_path:
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FOREIGN",
+                retryable=False,
+            )
+        return False
+    target = quarantine_dir / path.name
+    try:
+        target_observed = os.lstat(target)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    else:
+        if (
+            not stat.S_ISREG(target_observed.st_mode)
+            or (target_observed.st_dev, target_observed.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.QUARANTINE_FOREIGN",
+                retryable=False,
+            )
+        return False
+    try:
+        os.rename(path, target)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    try:
+        _fsync_activation_directory(quarantine_dir)
+        _fsync_activation_directory(path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=False,
+        )
+    try:
+        final = os.lstat(target)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=True,
+        ) from error
+    if (final.st_dev, final.st_ino) != (observed.st_dev, observed.st_ino):
+        raise ActivationPreparationError(
+            "ACTIVATION.QUARANTINE_FAILED",
+            retryable=False,
+        )
+    return True
+
+
+def _quarantine_failed_activation_artifacts(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Quarantine every journal-owned failed asset of one activation.
+
+    The set covers the deterministic canonical sidecar, the published
+    manifest final, the unpublished manifest temporary, and the candidate
+    stage database.  Each entry is identity/digest-bound, moved with strict
+    exclusivity, and never overwrites a foreign entry; authority paths fail
+    closed on foreign entries while stage paths leave them untouched.
+    """
+
+    quarantine_dir = _activation_quarantine_directory(identity, record)
+    _require_quarantine_directory(quarantine_dir)
+    prior_db_identity = (
+        record.prior_db_identity
+        if record.had_prior_canonical
+        and record.prior_db_path == identity.canonical_sidecar_path
+        else None
+    )
+    prior_manifest_identity = (
+        record.prior_manifest_identity
+        if record.had_prior_canonical
+        and record.prior_manifest_path == identity.snapshot_manifest_path
+        else None
+    )
+    prior_db_digest = (
+        record.prior_db_digest
+        if record.had_prior_canonical
+        and record.prior_db_path == identity.canonical_sidecar_path
+        else None
+    )
+    prior_manifest_digest = (
+        record.prior_manifest_digest
+        if record.had_prior_canonical
+        and record.prior_manifest_path == identity.snapshot_manifest_path
+        else None
+    )
+    for path, expected_identity, authority, allow_identity, allow_digest in (
+        (
+            identity.canonical_sidecar_path,
+            record.candidate_stage_db_identity,
+            True,
+            prior_db_identity,
+            prior_db_digest,
+        ),
+        (
+            identity.snapshot_manifest_path,
+            record.candidate_manifest_temp_identity,
+            True,
+            prior_manifest_identity,
+            prior_manifest_digest,
+        ),
+        (
+            record.candidate_manifest_temp_path,
+            record.candidate_manifest_temp_identity,
+            False,
+            None,
+            None,
+        ),
+        (
+            record.candidate_stage_db_path,
+            record.candidate_stage_db_identity,
+            False,
+            None,
+            None,
+        ),
+    ):
+        _quarantine_owned_activation_artifact(
+            path,
+            expected_identity,
+            quarantine_dir,
+            authority_path=authority,
+            allow_identity=allow_identity,
+            allow_digest=allow_digest,
+        )
+
+
+def _remove_orphaned_rollback_temp(path: Path) -> None:
+    """Strictly remove one deterministic rollback temporary after a crash.
+
+    Only an exact regular single-link file at the deterministic temporary
+    path (derived from the journal id) is removable; a foreign, linked, or
+    unprovable entry fails closed and is never removed.
+    """
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_RESTORE_FAILED",
+            retryable=True,
+        ) from error
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_RESTORE_FAILED",
+            retryable=False,
+        )
+    identity = _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+    if not _remove_owned_activation_journal_temp(path, identity):
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_RESTORE_FAILED",
+            retryable=True,
+        )
+
+
+def _restore_activation_file(
+    record: _ActivationJournalRecord,
+    backup_path: Path,
+    expected_digest: str,
+    destination: Path,
+) -> _ActivationFileIdentity:
+    """Restore one journal-owned backup to its authority path (Task 5.9).
+
+    Streams the backup into an exclusive deterministic temporary in the
+    destination directory, fsyncs the copy, atomically replaces the
+    destination, fsyncs the published file and the parent directory, and
+    re-proves the published identity.  The backup itself is never consumed,
+    so a crash at any boundary resumes idempotently from the journal; a
+    leftover temporary from a crashed restore is removed only when it is
+    an exact regular single-link file at the deterministic path.
+    """
+
+    temp_path = destination.parent / (
+        f"{destination.name}.localcat-rollback.{record.journal_id}.tmp"
+    )
+    _remove_orphaned_rollback_temp(temp_path)
+    source_descriptor = -1
+    temp_descriptor = -1
+    temp_identity: _ActivationFileIdentity | None = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        source_descriptor = os.open(backup_path, flags)
+        temp_descriptor, temp_identity = _open_activation_journal_temp(
+            temp_path
+        )
+        _write_recovery_backup(source_descriptor, temp_descriptor)
+        _fsync_recovery_backup(temp_descriptor)
+        os.close(source_descriptor)
+        source_descriptor = -1
+        os.close(temp_descriptor)
+        temp_descriptor = -1
+        assert temp_identity is not None
+        temp_capture = _capture_activation_file(
+            temp_path,
+            asset_kind="JOURNAL_CLOSURE",
+        )
+        if (
+            temp_capture.identity != temp_identity
+            or temp_capture.digest != expected_digest
+        ):
+            raise OSError("rollback temporary content mismatch")
+        os.replace(temp_path, destination)
+        published_identity = _activation_file_identity(destination)
+        _fsync_activation_file(destination, published_identity)
+        _fsync_activation_directory(destination.parent)
+        return published_identity
+    except ActivationPreparationError:
+        raise
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_RESTORE_FAILED",
+            retryable=True,
+        ) from error
+    finally:
+        if source_descriptor >= 0:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+        if temp_descriptor >= 0:
+            try:
+                os.close(temp_descriptor)
+            except OSError:
+                pass
+
+
+def _require_rollback_backups(
+    record: _ActivationJournalRecord,
+) -> tuple[tuple[Path, str], tuple[Path, str]]:
+    """Verify both journal-owned prior backups are present and intact.
+
+    The durable journal is the only surviving ownership locator, so each
+    backup path, identity, and digest comes from the journal record itself.
+    A missing or mutated backup (or a foreign/hardlinked entry) fails closed
+    before any mutation: without a restorable prior authority the pending
+    journal must stay recoverable for manual intervention.
+    """
+
+    if not record.had_prior_canonical:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_BACKUP_INVALID",
+            retryable=False,
+        )
+    owned: list[tuple[Path, str]] = []
+    for path, identity_value, digest_value in (
+        (
+            record.prior_db_backup_path,
+            record.prior_db_backup_identity,
+            record.prior_db_backup_digest,
+        ),
+        (
+            record.prior_manifest_backup_path,
+            record.prior_manifest_backup_identity,
+            record.prior_manifest_backup_digest,
+        ),
+    ):
+        if path is None or identity_value is None or digest_value is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        try:
+            observed = os.lstat(path)
+        except FileNotFoundError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            ) from error
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=True,
+            ) from error
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != identity_value
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        try:
+            capture = _capture_activation_file(
+                path,
+                asset_kind="JOURNAL_CLOSURE",
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            ) from error
+        if capture.digest != digest_value:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        owned.append((path, digest_value))
+    return owned[0], owned[1]
+
+
+def _rollback_restored_prior_view(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    fts5_available: bool,
+) -> _SQLiteGenerationView:
+    """Build the one restored prior generation view for a rollback."""
+
+    prior_db_path = record.prior_db_path
+    prior_manifest_path = record.prior_manifest_path
+    assert prior_db_path is not None
+    assert prior_manifest_path is not None
+    if prior_db_path == identity.canonical_sidecar_path:
+        prior_ref: _CanonicalStoreRef | _PriorActivationRef = (
+            _canonical_activation_ref(
+                identity,
+                journal_id=record.journal_id,
+            )
+        )
+    else:
+        prior_ref = _PriorActivationRef(
+            stage_id=f"prior.{record.journal_id}",
+            resource_identity=identity,
+            staged_db_path=prior_db_path,
+            manifest_temp_path=prior_manifest_path,
+        )
+    return _SQLiteGenerationView(
+        stage=prior_ref,
+        canonical_store_id=canonical_store_id,
+        generation=(
+            0 if record.prior_generation is None else record.prior_generation
+        ),
+        fts5_available=fts5_available,
+    )
 
 
 def _recovery_artifact_seal_digest(
@@ -6484,14 +7448,21 @@ def _revalidate_recovered_prior_set(
     *,
     identity: CanonicalResourceIdentity,
     canonical_store_id: str,
+    allow_restored_identities: bool = False,
 ) -> bool:
-    """Re-prove the unchanged prior DB/manifest/binding from disk.
+    """Re-prove the prior DB/manifest/binding from disk.
 
     The prior generation is exactly what a PREPARED cancellation restores,
     so every journal-recorded prior fact (database, manifest, source,
     binding receipt, generation) is re-captured and re-proven before the
-    journal is retired.  Returns the prior database's FTS5 capability for
-    the restored view.
+    journal is retired.  ``allow_restored_identities`` is the Task 5.9
+    rollback relaxation: a rollback restores the prior pair as byte-identical
+    copies from the journal-authenticated backups, which necessarily changes
+    the file identities while preserving every digest.  The strict mode
+    (unchanged prior, PREPARED cancellation) still binds the exact recorded
+    identities; the relaxed mode binds content digests plus the unchanged
+    source identity/digest.  Returns the prior database's FTS5 capability
+    for the restored view.
     """
 
     if not record.had_prior_canonical or record.prior_db_path is None:
@@ -6576,15 +7547,20 @@ def _revalidate_recovered_prior_set(
             reason_code=getattr(error, "error_code", None),
         ) from error
     if (
-        (database.identity.device, database.identity.inode)
-        != record.prior_db_identity
-        or database.digest != record.prior_db_digest
-        or (manifest.identity.device, manifest.identity.inode)
-        != record.prior_manifest_identity
+        database.digest != record.prior_db_digest
         or manifest.digest != record.prior_manifest_digest
         or (source.identity.device, source.identity.inode)
         != record.source_jsonl_identity
         or source.digest != record.source_jsonl_digest
+        or (
+            not allow_restored_identities
+            and (
+                (database.identity.device, database.identity.inode)
+                != record.prior_db_identity
+                or (manifest.identity.device, manifest.identity.inode)
+                != record.prior_manifest_identity
+            )
+        )
     ):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",

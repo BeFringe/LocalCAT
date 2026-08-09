@@ -178,7 +178,7 @@
   - 完成时，各 phase 的同 token 重放只产生一个 generation，已完成 token 不可再次消费
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.9 实现不一致 activation 的成套回滚
+- [x] 5.9 实现不一致 activation 的成套回滚
   - 新资产任一复核失败时同时恢复 prior DB 与 prior manifest/binding，fsync parent 并重新执行健康校验
   - 首次激活失败且没有 prior canonical 时隔离未发布资产并继续原 JSONL；已有 canonical 时继续 last-known-good generation
   - 完成时，各 journal phase 的不一致注入都恢复一个完整可查询/可保存版本，DB 与 manifest 不会跨代

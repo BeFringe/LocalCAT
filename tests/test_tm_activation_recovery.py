@@ -1,4 +1,4 @@
-"""Task 5.8 idempotent activation recovery tests.
+"""Task 5.8 idempotent activation recovery and Task 5.9 rollback tests.
 
 The suite drives every durable journal phase to a crash window, rebuilds a
 fresh coordinator over the same resource identity, and proves that recovery
@@ -10,8 +10,14 @@ monotonically, the terminal GENERATION_PUBLISHED journal is retained as the
 durable consumed marker and replayed by fresh coordinators without a second
 generation or repeated token consumption, no-journal discovery re-proves the
 completed canonical generation (or the unchanged prior/legacy state), and
-every mismatch or unproven write fail-stops in ACTIVATING with durable
-journal evidence for retry or the Task 5.9 rollback seam.
+authority-level faults (tampered journal/terminal/source, foreign files,
+backup or cleanup faults) fail-stop in ACTIVATING with durable journal
+evidence.  Task 5.9 turns the four new-set closure faults (unprovable
+DB/manifest/receipt/effect at any pending phase, missing prior pair) into a
+deterministic rollback: the journal-owned backups restore the prior
+DB/manifest pair as one set (or a first activation keeps the legacy JSONL),
+failed artifacts are quarantined, the PREPARED prior-closure terminal is
+retained, and the pending journal is retired idempotently.
 """
 
 from __future__ import annotations
@@ -2253,30 +2259,51 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             )
             self.assertFalse(identity.canonical_sidecar_path.exists())
 
-    def test_manifest_tamper_fails_before_receipt_mutation(self) -> None:
+    def test_manifest_tamper_rolls_back_before_receipt_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(
                 root
             )
             journal_path = journal.journal_path
+            record = journal._record
             with patch(
                 "tm_sqlite_store._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
                     coordinator.publish_activation(prepared, journal)
-            journal._record.candidate_manifest_temp_path.write_bytes(
-                b"tampered"
-            )
+            record.candidate_manifest_temp_path.write_bytes(b"tampered")
+            source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
-            self._assert_fail_stop(
-                recovered,
-                journal_path,
-                "ACTIVATION.RECOVERY_COMPLETION_INVALID",
-                journal_path.read_bytes(),
+            self.assertEqual(
+                _recovered_report(recovered),
+                ActivationRecoveryReport(
+                    phase="DB_REPLACED",
+                    action="ROLLED_BACK",
+                    generation=None,
+                ),
             )
-            connection = sqlite3.connect(identity.canonical_sidecar_path)
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                store_module._activation_terminal_path(identity).is_file()
+            )
+            quarantine_dir = store_module._activation_quarantine_directory(
+                identity,
+                record,
+            )
+            self.assertTrue(quarantine_dir.is_dir())
+            quarantined_db = (
+                quarantine_dir / identity.canonical_sidecar_path.name
+            )
+            connection = sqlite3.connect(quarantined_db)
             try:
                 self.assertEqual(
                     connection.execute(
@@ -2287,7 +2314,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_generation_published_journal_without_effects_fails_closed(
+    def test_generation_published_journal_without_effects_rolls_back(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2297,22 +2324,43 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             _rewrite_phase(journal_path, GENERATION_PUBLISHED)
-            journal_bytes = journal_path.read_bytes()
+            source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
-            self._assert_fail_stop(
-                recovered,
-                journal_path,
-                "ACTIVATION.RECOVERY_MISMATCH",
-                journal_bytes,
+            self.assertEqual(
+                _recovered_report(recovered),
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="ROLLED_BACK",
+                    generation=None,
+                ),
+            )
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                store_module._activation_terminal_path(identity).is_file()
+            )
+            again = _fresh(identity)
+            self.assertIsNone(again.rollback_durable_activation())
+            self.assertEqual(
+                again.recover_durable_activation(),
+                None,
             )
 
-    def test_candidate_present_in_db_replaced_window_fails_closed(self) -> None:
+    def test_candidate_reappeared_in_db_replaced_window_rolls_back(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(
                 root
             )
             journal_path = journal.journal_path
+            record = journal._record
             with patch(
                 "tm_sqlite_store._publish_activation_receipt",
                 side_effect=OSError("injected"),
@@ -2320,16 +2368,43 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     coordinator.publish_activation(prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
-            candidate_path = journal._record.candidate_stage_db_path
+            candidate_path = record.candidate_stage_db_path
             candidate_path.write_bytes(b"reappeared candidate")
-            journal_bytes = journal_path.read_bytes()
+            source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
-            self._assert_fail_stop(
-                recovered,
-                journal_path,
-                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
-                journal_bytes,
+            self.assertEqual(
+                _recovered_report(recovered),
+                ActivationRecoveryReport(
+                    phase="DB_REPLACED",
+                    action="ROLLED_BACK",
+                    generation=None,
+                ),
             )
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                store_module._activation_terminal_path(identity).is_file()
+            )
+            quarantine_dir = store_module._activation_quarantine_directory(
+                identity,
+                record,
+            )
+            self.assertTrue(
+                (
+                    quarantine_dir / identity.canonical_sidecar_path.name
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    quarantine_dir / record.candidate_manifest_temp_path.name
+                ).is_file()
+            )
+            self.assertEqual(candidate_path.read_bytes(), b"reappeared candidate")
 
     def test_source_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2355,7 +2430,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 journal_path.read_bytes(),
             )
 
-    def test_prior_missing_fails_closed(self) -> None:
+    def test_prior_missing_rolls_back_from_backups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (
@@ -2368,17 +2443,41 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             prepared = coordinator.activate(sealed)
             journal = coordinator.publish_prepared_activation(prepared)
             journal_path = journal.journal_path
-            prior_db_path = journal._record.prior_db_path
+            record = journal._record
+            prior_db_path = record.prior_db_path
             self.assertIsNotNone(prior_db_path)
             assert prior_db_path is not None
+            prior_bytes = prior_db_path.read_bytes()
+            prior_manifest_path = record.prior_manifest_path
+            self.assertIsNotNone(prior_manifest_path)
+            assert prior_manifest_path is not None
+            prior_manifest_bytes = prior_manifest_path.read_bytes()
             prior_db_path.unlink()
             recovered = _fresh(identity)
-            self._assert_fail_stop(
-                recovered,
-                journal_path,
-                "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
-                journal_path.read_bytes(),
+            self.assertEqual(
+                _recovered_report(recovered),
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="ROLLED_BACK",
+                    generation=0,
+                ),
             )
+            self.assertEqual(recovered.current_generation, 0)
+            self.assertEqual(prior_db_path.read_bytes(), prior_bytes)
+            self.assertEqual(
+                prior_manifest_path.read_bytes(),
+                prior_manifest_bytes,
+            )
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                store_module._activation_terminal_path(identity).is_file()
+            )
+            prior_db_backup_path = record.prior_db_backup_path
+            prior_manifest_backup_path = record.prior_manifest_backup_path
+            assert prior_db_backup_path is not None
+            assert prior_manifest_backup_path is not None
+            self.assertFalse(prior_db_backup_path.exists())
+            self.assertFalse(prior_manifest_backup_path.exists())
 
     def test_hardlinked_journal_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2425,7 +2524,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 "ACTIVATION.RECOVERY_PENDING",
             )
 
-    def test_prepared_phase_with_replaced_database_fails_closed(self) -> None:
+    def test_prepared_phase_with_replaced_database_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(
@@ -2441,12 +2540,25 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "ACTIVATION.DB_REPLACE_FAILED")
             self.assertIs(_phase(journal_path), PREPARED)
             self.assertTrue(identity.canonical_sidecar_path.is_file())
+            source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
-            self._assert_fail_stop(
-                recovered,
-                journal_path,
-                "ACTIVATION.RECOVERY_MISMATCH",
-                journal_path.read_bytes(),
+            self.assertEqual(
+                _recovered_report(recovered),
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="ROLLED_BACK",
+                    generation=None,
+                ),
+            )
+            self.assertIsNone(recovered.current_generation)
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                store_module._activation_terminal_path(identity).is_file()
             )
 
     def test_recovery_requires_ready_state(self) -> None:
@@ -2537,13 +2649,20 @@ class ActivationRecoveryGateTests(unittest.TestCase):
         self.assertNotIn(".jsonl", rendered)
         self.assertNotIn(".sqlite3", rendered)
         self.assertNotIn("token", rendered.lower())
-        for bad_action in ("CANCELLEDX", "ROLLED_BACK", ""):
+        for bad_action in ("CANCELLEDX", ""):
             with self.assertRaises((TypeError, ValueError)):
                 ActivationRecoveryReport(
                     phase="PREPARED",
                     action=bad_action,
                     generation=None,
                 )
+        rolled_back = ActivationRecoveryReport(
+            phase="PREPARED",
+            action="ROLLED_BACK",
+            generation=None,
+        )
+        self.assertEqual(rolled_back.action, "ROLLED_BACK")
+        self.assertNotIn("token", repr(rolled_back).lower())
         with self.assertRaises((TypeError, ValueError)):
             ActivationRecoveryReport(
                 phase="PREPARED",
