@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v5）
+# Feature 5 评审集群与推理强度指南（采纳稿 v6）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -38,7 +38,7 @@
 
 ## 评审集群地图
 
-以下 12 个集群覆盖 Task 3.3–9.6 全部剩余子任务及行为保持型结构门 5.R1。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组。
+以下 12 个功能集群与 1 个行为保持型结构门覆盖 Task 3.3–9.6 全部剩余子任务及 5.R1/5.R2。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组；结构门只证明已批准行为的移动等价性。
 
 | 集群 | 子任务 | 共享心智模型 | impl | review | 评审轮次 | 实施体量 |
 |------|--------|-------------|------|--------|---------|----------|
@@ -47,6 +47,7 @@
 | C — Stage build + seal | 5.1 + 5.2 + 5.3 + 5.4 | preflight → mutable stage → seal/integrity → Gate B 证据与 opaque artifact | `high` | `xhigh` | 1 | 中 |
 | D — Activation + recovery | 5.5 + 5.6 + 5.7 + 5.8 + 5.9 + 5.R1 | journal 状态机 `PREPARED→DB_REPLACED→MANIFEST_PUBLISHED→GENERATION_PUBLISHED` + 成套回滚 + 行为保持型模块提取 | 5.5/5.7 `xhigh`；5.6/5.8/5.9/5.R1 `high` | `xhigh` | 1 | 大 |
 | E — Divergence + upgrade | 5.10 + 5.11 | 复用 seal/activate 的显式消歧与 schema copy-switch | `high` | `high` | 1 | 小 |
+| E-R — Upgrade boundary | 5.R2 | 已批准 schema-upgrade 故障模型的等价提取 + 依赖方向守卫 | `high` | `high` | 1 | 中 |
 | F — Export + snapshot | 5.12 + 5.13 + 5.14 | 任意路径导出与配置快照发布协议 + 崩溃恢复矩阵 | `high` | `xhigh` | 1 | 中 |
 | G — Facade integration | 6.1 + 6.2 + 6.3 | 双状态激活/not 分支 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
 | H — Retrieval pipeline | 7.1 + 7.2 + 7.3 | exact/context 分类 → fuzzy 评分 → 多资源聚合排序/部分失败 | `high` | `high` | 1 | 中 |
@@ -55,7 +56,7 @@
 | K — Fault injection | 9.1 + 9.2 | 全量迁移/激活/快照故障矩阵，验证 D+F+E 的负空间 | `high` | `xhigh` | 1 | 中 |
 | L — Evidence + release | 9.3 + 9.4 + 9.5 + 9.6 | 跨域能力矩阵 + 兼容回归 + 86 条覆盖映射 + 完整发布 | `medium` | `xhigh` | 1 | 中 |
 
-复审数量从逐小节 38 次降至 12 次。
+复审数量从逐小节 38 次降至 12 个功能集群复审加 1 个等价性结构门。
 
 ---
 
@@ -69,6 +70,8 @@
 
 **D — Activation + recovery：** Feature 5 最高风险区域。journal 四阶段每个恢复分支必须产生一个完整 generation。token 单次消费、nonce 防重放、成套回滚（DB + manifest 同时恢复）是对抗向量。v4 将实施强度按任务阻力临时细分：5.5 负责 capability、lease drain 与备份 authority，5.7 定义正常激活和两条恢复路径共同依赖的发布线性化点，二者保持 `xhigh`；5.6、5.8、5.9 在这两条边界上实现有明确 phase/验收矩阵的 journal 与恢复分支，降为 `high`。v5 在 5.9 闭合恢复矩阵后加入 5.R1：只把 journal/terminal codec、durable file protocol 与逐 phase recovery/rollback 提取到设计指定模块，不改变行为。它仍共享 D 的全部故障模型，因此不另建评审簇；Cluster D reviewer 只在 5.R1 完成后读取最终模块形态一次，并同时核对 characterization/failure matrix 与依赖方向守卫。该调整不改变单次复审时机或 `xhigh` 复审强度。
 **E — Divergence + upgrade：** 复用 D 的 seal/activate 流水线。新成本仅在 divergence 清除条件和 schema upgrade 复制切换。复审者已在 D 加载激活模型，成本递减。
+
+**E-R — Upgrade boundary：** Cluster E 已先以原始模块形态闭合功能和故障矩阵；5.R2 只在此稳定基线上提取 schema-upgrade copy/artifact 数据面。实施和复审均使用 `high`，因为移动横跨 `tm_sqlite_store.py` 和 `tm_migration.py` 的 private seam，但不重新设计 coordinator 状态机。验收必须重用已批准 Cluster E 断言，检查新模块不反向导入两个 owner，并证明 patch/fault-injection seam、错误码、cleanup 顺序和磁盘效果不变。异常分支简化不属于该门，避免同时改变布局与行为而放大回归风险。
 
 **F — Export + snapshot：** 5.12 不改变活动 binding，5.13/5.14 才改变配置快照；两者共享 temporary/fsync/replace/manifest 协议但发布后果不同。复审必须分别证明任意路径损坏不污染 authority，以及 issued receipt 恢复只能完成、取消或进入 divergence。
 
@@ -150,6 +153,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v6 | 2026-08-10 | 在 Cluster E 闭合后、Cluster F 开始前增加 5.R2/E-R 等价性结构门；提取 schema-upgrade copy/artifact 数据面，保留 coordinator/migration 权威与异常分支语义。 |
 | v5 | 2026-08-09 | 在 5.9 后加入行为保持型结构门 5.R1，将 activation/recovery 提取纳入 Cluster D 的同一次最终复审；保持既有功能编号、故障模型和复审强度。 |
 | v4 | 2026-08-09 | 按实际阻力细分 Cluster D 实施强度：5.5/5.7 保持 xhigh，5.6/5.8/5.9 调整为 high；不改变共享不变量与复审时机。 |
 | v3 | 2026-08-09 | 删除与后续集群无关的一次性历史例外；以 provider adapter skill 隔离 Hook、fork、transport 与 runtime 细节；明确 impl subagent 必须直接实施而非只交付分析。 |

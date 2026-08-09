@@ -115,6 +115,7 @@ graph LR
 ├── tm_sqlite_store.py               # per-resource coordinator facade、schema、CRUD、source binding
 ├── tm_activation_journal.py         # activation journal/terminal codec 与 durable file protocol
 ├── tm_activation_recovery.py        # phase recovery、成套 publication/rollback 与窄 store-validation port
+├── tm_schema_upgrade.py             # schema upgrade copy 数据面与 pending/reported artifact 协议
 ├── tm_candidate_index.py            # FTS5/gram candidate retrievers
 ├── tm_similarity.py                 # Levenshtein、Dice、scorer-v1
 ├── tm_retrieval.py                  # exact/context/fuzzy pipeline 与聚合
@@ -145,6 +146,8 @@ graph LR
 ```
 
 Activation 模块在 Task 5.9 闭合完整恢复矩阵后、Cluster D 统一复审前做行为保持型提取。`tm_sqlite_store.py` 在 Feature 5 内继续保持既有 `ResourceStoreCoordinator` 导入入口，但不再拥有 journal/terminal canonical codec、exclusive temporary/replace/fsync 原语或逐 phase 恢复/回滚实现；新模块不得反向导入 `SQLiteTMStore`，只能消费 frozen contracts 与显式窄端口。提取不得修改 journal phase、错误码、token/nonce 单次语义、fault-injection 顺序或 public lease/activation 行为；原 Cluster D characterization/failure matrix 必须在移动前后使用同一断言通过。`tm_contracts.py` 与 `tm_stage_sealer.py` 不属于本次提取范围，待 Feature 5 契约面稳定后另行评估。
+
+Cluster E 行为闭合后、Cluster F 开始前增加 schema-upgrade 行为保持型边界提取。`tm_schema_upgrade.py` 仅拥有 v1→v2 copy 数据面、backup/locator 的 pending→reported 持久化协议、strict locator file proof 与纯候选事实校验；它不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，只通过显式值、callback/窄端口消费 schema DDL 和 canonical ancestry 证明。`ResourceStoreCoordinator` 仍在 `tm_sqlite_store.py` 独占 ticket/locator snapshot 所有权、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService.upgrade_schema()` 的公开入口、成败编排和 report/failure 构造仍在 `tm_migration.py`。原模块对已有 private 导入与 fault-injection patch seam 保留 late-bound compatibility wrapper，不得藉移动改变分支顺序、异常码、cleanup 顺序或磁盘效果。`tm_contracts.py`、`tm_stage_sealer.py`、canonical ancestry 单一证明实现与通用 coordinator 状态机不纳入此次提取；`try/except/if/raise` 简化属于正交的后续治理，不与等价移动同一提交。提取前后必须用同一 Cluster E failure/interleaving matrix、公开 API 契约、import-boundary 守卫和 fresh 全量回归证明等价。
 
 ### Modified Files
 

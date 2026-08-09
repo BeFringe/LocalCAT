@@ -203,6 +203,14 @@
   - 完成时，成功升级产生等价新 generation，每个失败阶段都能重开旧 schema
   - _Requirements: 2.4, 2.9, 2.11, 7.5, 7.14_
 
+- [ ] 5.R2 收束 schema upgrade 模块边界
+  - 在 Cluster E 行为与故障矩阵闭合后，将 v1→v2 copy 数据面、backup/locator pending→reported 持久化协议、strict locator file proof 与纯候选事实校验提取到设计指定模块
+  - coordinator 继续独占 ticket/locator snapshot、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService` 继续编排公开 schema-upgrade 成败流程
+  - 保留原导入入口、错误码、分支/cleanup/fault-injection 顺序和磁盘效果；不拆分 `tm_contracts.py` 或 `tm_stage_sealer.py`，不夹带异常分支简化或功能修改
+  - 用移动前后的同一 Cluster E failure/interleaving matrix、public API 契约、依赖方向守卫、basedpyright 和 fresh 全量回归证明等价；测试文件不设行数限制
+  - _Requirements: 2.4, 2.9, 2.11, 7.5, 7.14_
+  - _Depends: 5.11_
+
 - [ ] 5.12 实现任意路径兼容 JSONL 导出
   - 按 canonical record identity 顺序向调用方选择的非配置路径导出完整 variants、上下文和 provenance，并生成 receipt 与 adjacent manifest
   - 使用 temporary file、file fsync、atomic replace、directory fsync、manifest publish 的显式协议
