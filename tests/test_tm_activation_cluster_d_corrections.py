@@ -1295,6 +1295,167 @@ class ActivationCancellationLineageTests(unittest.TestCase):
             self.assertFalse(_activation_terminal_path(identity).exists())
             self.assertEqual(temp_path.read_bytes(), b"leftover temp")
 
+    def test_existing_prior_cancellation_foreign_regular_marker_temp_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator, _prepared, journal = (
+                self._pending_existing_prepared(root)
+            )
+            journal_path = journal.journal_path
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"conflicting marker temp")
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIs(_phase(journal_path), PREPARED)
+            self.assertFalse(_activation_terminal_path(identity).exists())
+            # The unrelated deterministic-path temp is preserved: a valid
+            # final with a non-paired temp is never a complete state.
+            self.assertEqual(
+                temp_path.read_bytes(),
+                b"conflicting marker temp",
+            )
+            self.assertEqual(os.lstat(temp_path).st_nlink, 1)
+            self.assertTrue(marker_path.is_file())
+
+    def test_existing_prior_cancellation_symlink_marker_temp_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator, _prepared, journal = (
+                self._pending_existing_prepared(root)
+            )
+            journal_path = journal.journal_path
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.symlink_to(root / ".marker-temp-target")
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIs(_phase(journal_path), PREPARED)
+            self.assertFalse(_activation_terminal_path(identity).exists())
+            self.assertTrue(temp_path.is_symlink())
+            self.assertTrue(marker_path.is_file())
+
+    def test_existing_prior_cancellation_hardlinked_marker_temp_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator, _prepared, journal = (
+                self._pending_existing_prepared(root)
+            )
+            journal_path = journal.journal_path
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            peer = root / ".cancellation-temp-peer"
+            peer.write_bytes(b"foreign peer")
+            os.link(peer, temp_path)
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIs(_phase(journal_path), PREPARED)
+            self.assertFalse(_activation_terminal_path(identity).exists())
+            self.assertEqual(os.lstat(temp_path).st_nlink, 2)
+            self.assertEqual(os.lstat(peer).st_nlink, 2)
+            self.assertTrue(marker_path.is_file())
+
+    def test_existing_prior_cancellation_paired_handoff_marker_finishes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator, _prepared, journal = (
+                self._pending_existing_prepared(root)
+            )
+            journal_path = journal.journal_path
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            os.link(marker_path, temp_path)
+            self.assertEqual(os.lstat(marker_path).st_nlink, 2)
+            recovered = _fresh(identity)
+            report = recovered.recover_durable_activation()
+            self.assertEqual(
+                report,
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="CANCELLED",
+                    generation=0,
+                ),
+            )
+            self.assertEqual(recovered.state, "READY")
+            # The exact paired two-link handoff is finished durably: the
+            # temporary is unlinked and the single-link final revalidated.
+            self.assertFalse(temp_path.exists())
+            self.assertEqual(os.lstat(marker_path).st_nlink, 1)
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(_activation_terminal_path(identity).is_file())
+
+    def test_terminal_replay_conflicting_marker_temp_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator, _prepared, journal = (
+                self._pending_existing_prepared(root)
+            )
+            journal_path = journal.journal_path
+            first = _fresh(identity)
+            self.assertEqual(
+                first.recover_durable_activation(),
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="CANCELLED",
+                    generation=0,
+                ),
+            )
+            # A durable PREPARED terminal with no main journal is the
+            # terminal-only replay authority; a conflicting temp beside
+            # the valid marker final must fail closed, never be ignored.
+            terminal_path = _activation_terminal_path(identity)
+            self.assertTrue(terminal_path.is_file())
+            self.assertFalse(journal_path.exists())
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"conflicting marker temp")
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertEqual(
+                temp_path.read_bytes(),
+                b"conflicting marker temp",
+            )
+            self.assertTrue(terminal_path.is_file())
+            self.assertTrue(marker_path.is_file())
+
 
 class ActivationLiveViewDiscoveryTests(unittest.TestCase):
     """Correction A4: a live view never bypasses marker+pair revalidation."""
@@ -1373,6 +1534,128 @@ class ActivationLiveViewDiscoveryTests(unittest.TestCase):
             self.assertEqual(coordinator.state, "READY")
             self.assertEqual(coordinator.current_generation, 0)
 
+    def _journal_free_completed(self, root: Path) -> Any:
+        identity, coordinator, journal = self._live_completed(root)
+        journal.journal_path.unlink()
+        self.assertFalse(_activation_terminal_path(identity).exists())
+        return identity, coordinator
+
+    def test_discovery_foreign_regular_marker_temp_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator = self._journal_free_completed(root)
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"conflicting marker temp")
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            # Discovery never ignores a non-paired temp beside a valid
+            # final: the temp is preserved and no COMPLETED/READY report.
+            self.assertEqual(
+                temp_path.read_bytes(),
+                b"conflicting marker temp",
+            )
+            self.assertEqual(os.lstat(temp_path).st_nlink, 1)
+            self.assertTrue(marker_path.is_file())
+
+    def test_discovery_symlink_marker_temp_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator = self._journal_free_completed(root)
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.symlink_to(root / ".marker-temp-target")
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertTrue(temp_path.is_symlink())
+            self.assertTrue(marker_path.is_file())
+
+    def test_discovery_hardlinked_marker_temp_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator = self._journal_free_completed(root)
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            peer = root / ".discovery-temp-peer"
+            peer.write_bytes(b"foreign peer")
+            os.link(peer, temp_path)
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertEqual(os.lstat(temp_path).st_nlink, 2)
+            self.assertEqual(os.lstat(peer).st_nlink, 2)
+            self.assertTrue(marker_path.is_file())
+
+    def test_discovery_paired_handoff_marker_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator = self._journal_free_completed(root)
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            os.link(marker_path, temp_path)
+            self.assertEqual(os.lstat(marker_path).st_nlink, 2)
+            recovered = _fresh(identity)
+            report = recovered.recover_durable_activation()
+            self.assertEqual(
+                report,
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="COMPLETED",
+                    generation=0,
+                ),
+            )
+            self.assertEqual(recovered.state, "READY")
+            # The exact paired two-link handoff is finished durably.
+            self.assertFalse(temp_path.exists())
+            self.assertEqual(os.lstat(marker_path).st_nlink, 1)
+
+    def test_discovery_leftover_marker_temp_without_pair_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _coordinator = self._journal_free_completed(root)
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"leftover temp")
+            identity.canonical_sidecar_path.unlink()
+            identity.snapshot_manifest_path.unlink()
+            marker_path.unlink()
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            # A marker-family temp with no pair is never silently treated
+            # as the clean never-activated legacy state.
+            self.assertEqual(temp_path.read_bytes(), b"leftover temp")
+
 
 class ActivationExternalDeletionTests(unittest.TestCase):
     """Correction A5: candidate retirement absence must be quarantine-proven."""
@@ -1425,6 +1708,112 @@ class ActivationExternalDeletionTests(unittest.TestCase):
             self.assertFalse(raised.exception.retryable)
             self.assertEqual(second.state, "ACTIVATING")
             self.assertFalse(candidate_db.exists())
+
+
+class ActivationMarkerTempGateTests(unittest.TestCase):
+    """Correction D: the activate gate never ignores a conflicting temp.
+
+    With no main journal and no terminal, a new preparation proceeds only
+    when the pair/marker/temp state is complete: a valid final is accepted
+    only with no temp (or the finished paired handoff), any conflicting
+    non-paired regular, symlink, or hardlinked temp fails closed in
+    ``RECOVERY_PENDING`` and is never deleted or overwritten, and the true
+    never-activated state (no pair, no final, no temp) stays unchanged.
+    """
+
+    def test_activate_gate_rejects_foreign_regular_marker_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _store, coordinator, _stage, sealed = _existing_fixture(
+                root,
+                fts5_available=True,
+            )
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"conflicting marker temp")
+            with self.assertRaises(ActivationPreparationError) as raised:
+                coordinator.activate(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_PENDING",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertIsNone(coordinator._preparation)
+            self.assertEqual(
+                temp_path.read_bytes(),
+                b"conflicting marker temp",
+            )
+            self.assertTrue(marker_path.is_file())
+
+    def test_activate_gate_rejects_symlink_marker_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _store, coordinator, _stage, sealed = _existing_fixture(
+                root,
+                fts5_available=True,
+            )
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.symlink_to(root / ".marker-temp-target")
+            with self.assertRaises(ActivationPreparationError) as raised:
+                coordinator.activate(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_PENDING",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertIsNone(coordinator._preparation)
+            self.assertTrue(temp_path.is_symlink())
+            self.assertTrue(marker_path.is_file())
+
+    def test_activate_gate_rejects_hardlinked_marker_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _store, coordinator, _stage, sealed = _existing_fixture(
+                root,
+                fts5_available=True,
+            )
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            peer = root / ".gate-temp-peer"
+            peer.write_bytes(b"foreign peer")
+            os.link(peer, temp_path)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                coordinator.activate(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_PENDING",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertIsNone(coordinator._preparation)
+            self.assertEqual(os.lstat(temp_path).st_nlink, 2)
+            self.assertEqual(os.lstat(peer).st_nlink, 2)
+            self.assertTrue(marker_path.is_file())
+
+    def test_activate_gate_rejects_leftover_temp_without_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, _store, coordinator, _stage, sealed = _existing_fixture(
+                root,
+                fts5_available=True,
+            )
+            marker_path = _activation_lineage_marker_path(identity)
+            temp_path = marker_path.with_name(f"{marker_path.name}.tmp")
+            temp_path.write_bytes(b"leftover temp")
+            marker_path.unlink()
+            with self.assertRaises(ActivationPreparationError) as raised:
+                coordinator.activate(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_PENDING",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertIsNone(coordinator._preparation)
+            self.assertEqual(temp_path.read_bytes(), b"leftover temp")
 
 
 class ActivationMarkerAtomicPublishTests(unittest.TestCase):

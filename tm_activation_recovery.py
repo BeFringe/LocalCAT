@@ -54,6 +54,7 @@ from tm_activation_journal import (
     _activation_journal_path,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
+    _activation_lineage_marker_state_complete,
     _activation_lineage_marker_temp_path,
     _activation_rollback_eligible,
     _activation_terminal_coexistence_valid,
@@ -73,7 +74,6 @@ from tm_activation_journal import (
     _quarantine_failed_activation_artifacts,
     _read_activation_file_bytes,
     _read_activation_journal_file,
-    _read_activation_lineage_marker,
     _remove_journal_proven_backups,
     _remove_orphaned_activation_temp,
     _remove_orphaned_rollback_temp,
@@ -2716,31 +2716,29 @@ def _require_cancelled_lineage_consistency(
     """Validate the write-once lineage fact before a PREPARED cancellation.
 
     A cancellation returns to a prior canonical generation only when the
-    durable activated-lineage marker exists and revalidates for the stable
-    identity (the resource crossed physical activation before).  A
-    cancelled first activation was genuinely never activated, so the
-    marker final and temporary must both be absent; a foreign, tampered,
-    hardlinked, or leftover marker/temp fails closed because it would
-    otherwise turn a never-activated legacy resource into a
-    claimed-activated one.
+    durable activated-lineage marker exists and the final/temp marker
+    state is complete: the temporary must be absent or the exact paired
+    two-link handoff with the deterministic payload (finished durably),
+    and any conflicting temporary fails closed and is never removed or
+    overwritten.  A cancelled first activation was genuinely never
+    activated, so the marker final and temporary must both be absent; a
+    foreign, tampered, hardlinked, or leftover marker/temp fails closed
+    because it would otherwise turn a never-activated legacy resource
+    into a claimed-activated one.
     """
 
     marker_path = _activation_lineage_marker_path(identity)
-    marker_identity = _lstat_activation_lineage_marker_identity(
-        marker_path
-    )
     if had_prior_canonical:
+        marker_identity = (
+            _activation_lineage_marker_state_complete(identity)
+        )
         if marker_identity is None:
             raise ActivationPreparationError(
                 "ACTIVATION.LINEAGE_MARKER_INVALID",
                 retryable=False,
             )
-        _read_activation_lineage_marker(
-            marker_path,
-            identity=identity,
-        )
         return
-    if marker_identity is not None:
+    if _lstat_any_entry(marker_path):
         raise ActivationPreparationError(
             "ACTIVATION.LINEAGE_MARKER_INVALID",
             retryable=False,
@@ -2766,30 +2764,36 @@ def _discover_active_canonical(
     physical activation but lost its completed authority.  A fully
     validated completed activation with a valid marker is hydrated into
     the one in-memory view and reported as a terminal COMPLETED; an
-    absent pair with no marker is the unchanged legacy state (``None``);
-    a marker with a missing/partial/tampered pair, a pair without a valid
-    marker (authority with no transition record is never silently
-    trusted), or any foreign/tampered entry fails closed in ``ACTIVATING``
-    and never authorizes a store.
+    absent pair with no marker and no marker temporary is the unchanged
+    legacy state (``None``).  The marker final/temp state must be
+    complete: a conflicting non-paired, symlink, directory, extra-link,
+    wrong-identity, or wrong-byte temporary beside a valid final fails
+    closed and is never removed or overwritten, and any marker-family
+    entry without a pair is never silently ignored.  A marker with a
+    missing/partial/tampered pair, a pair without a valid marker
+    (authority with no transition record is never silently trusted), or
+    any foreign/tampered entry fails closed in ``ACTIVATING`` and never
+    authorizes a store.
     """
 
     identity = port.resource_identity
     marker_path = _activation_lineage_marker_path(identity)
-    try:
-        marker_identity = _lstat_activation_lineage_marker_identity(
-            marker_path
-        )
-    except ActivationPreparationError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.LINEAGE_MARKER_INVALID",
-            retryable=False,
-            reason_code=error.code,
-        ) from error
+    temp_path = _activation_lineage_marker_temp_path(marker_path)
     if (
         not _lstat_any_entry(identity.canonical_sidecar_path)
         and not _lstat_any_entry(identity.snapshot_manifest_path)
     ):
-        if marker_identity is not None:
+        try:
+            marker_identity = _lstat_activation_lineage_marker_identity(
+                marker_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        if marker_identity is not None or _lstat_any_entry(temp_path):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
                 retryable=False,
@@ -2800,15 +2804,9 @@ def _discover_active_canonical(
                 retryable=False,
             )
         return None
-    if marker_identity is None:
-        raise ActivationPreparationError(
-            "ACTIVATION.LINEAGE_MARKER_INVALID",
-            retryable=False,
-        )
     try:
-        _read_activation_lineage_marker(
-            marker_path,
-            identity=identity,
+        marker_identity = _activation_lineage_marker_state_complete(
+            identity
         )
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
@@ -2816,6 +2814,11 @@ def _discover_active_canonical(
             retryable=False,
             reason_code=error.code,
         ) from error
+    if marker_identity is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
     try:
         generation, fts5_available = _revalidate_discovered_active_set(port,
             identity,

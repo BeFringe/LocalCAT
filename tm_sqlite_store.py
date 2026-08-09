@@ -93,6 +93,8 @@ from tm_activation_journal import (
     _activation_journal_record_payload,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
+    _activation_lineage_marker_state_complete,
+    _activation_lineage_marker_temp_path,
     _activation_quarantine_directory,
     _activation_rollback_eligible,
     _activation_terminal_coexistence_valid,
@@ -1265,18 +1267,6 @@ class ResourceStoreCoordinator:
                 marker_path = _activation_lineage_marker_path(
                     self._resource_identity
                 )
-                try:
-                    marker_identity = (
-                        _lstat_activation_lineage_marker_identity(
-                            marker_path
-                        )
-                    )
-                except ActivationPreparationError as error:
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECOVERY_PENDING",
-                        retryable=False,
-                        reason_code=error.code,
-                    ) from error
                 pair_present = (
                     _lstat_any_entry(
                         self._resource_identity.canonical_sidecar_path
@@ -1285,16 +1275,55 @@ class ResourceStoreCoordinator:
                         self._resource_identity.snapshot_manifest_path
                     )
                 )
-                if pair_present and marker_identity is None:
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECOVERY_PENDING",
-                        retryable=False,
-                    )
-                if marker_identity is not None and not pair_present:
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECOVERY_PENDING",
-                        retryable=False,
-                    )
+                if not pair_present:
+                    # The true never-activated legacy state has no pair,
+                    # no marker final, and no marker temporary; any
+                    # marker-family entry or leftover temporary fails
+                    # closed instead of being silently ignored.
+                    try:
+                        marker_identity = (
+                            _lstat_activation_lineage_marker_identity(
+                                marker_path
+                            )
+                        )
+                    except ActivationPreparationError as error:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_PENDING",
+                            retryable=False,
+                            reason_code=error.code,
+                        ) from error
+                    if marker_identity is not None or _lstat_any_entry(
+                        _activation_lineage_marker_temp_path(marker_path)
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_PENDING",
+                            retryable=False,
+                        )
+                else:
+                    # The final/temp marker state must be complete before a
+                    # new preparation: a valid final is accepted only when
+                    # the temporary is absent or the exact paired two-link
+                    # handoff is finished durably.  Any conflicting
+                    # non-paired regular, symlink, directory, extra-link,
+                    # wrong-identity, or wrong-byte temporary fails closed
+                    # and is never deleted or overwritten.
+                    try:
+                        marker_identity = (
+                            _activation_lineage_marker_state_complete(
+                                self._resource_identity
+                            )
+                        )
+                    except ActivationPreparationError as error:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_PENDING",
+                            retryable=False,
+                            reason_code=error.code,
+                        ) from error
+                    if marker_identity is None:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_PENDING",
+                            retryable=False,
+                        )
             initial_view = self._view
             initial_generation = (
                 None if initial_view is None else initial_view.generation

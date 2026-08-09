@@ -1348,26 +1348,22 @@ def _write_activation_lineage_marker_temp(
 
 
 
-def _ensure_activation_lineage_marker(
+def _activation_lineage_marker_state_complete(
     identity: CanonicalResourceIdentity,
-) -> None:
-    """Durably publish (or revalidate) the write-once activated-lineage marker.
+) -> _ActivationFileIdentity | None:
+    """Strictly validate that one final/temp lineage-marker state is complete.
 
-    The marker records that this resource/target has crossed physical
-    activation at least once and binds only version + resource_id +
-    target_identity + digest, so it keeps validating unchanged across
-    store ids, generations, imports, and rebuilds.  Publication is an
-    atomic no-clobber protocol: an exclusive deterministic temporary is
-    fully written and fsynced, the final is published with a hard-link
-    that fails if the final already exists, the parent is fsynced, the
-    temporary is unlinked only while it is still the exact paired inode,
-    and the parent is fsynced again.  A crash-replay may accept the
-    temporary two-link handoff only when final and temp are the same exact
-    inode with the deterministic payload, then finish the unlink; any
-    other symlink/hardlink/foreign final or temp fails closed and is never
-    removed or overwritten.  An existing valid marker is revalidated,
-    never rewritten; an interrupted owned temporary (byte-exact regular
-    single-link file) resumes publication.
+    Returns the exact final identity when a complete published marker
+    exists, or ``None`` when both the final and the temporary are absent.
+    A valid final is accepted only when the temporary is absent (the
+    single-link final is strictly revalidated) or when the final and the
+    temporary are the same exact regular inode in the expected two-link
+    handoff carrying the deterministic payload, in which case the handoff
+    is finished durably (temporary unlinked and parent fsynced) and the
+    single-link final revalidated.  Any non-paired regular, symlink,
+    directory, extra-link, wrong-identity, or wrong-byte temporary fails
+    closed and is never deleted or overwritten; a foreign final likewise
+    fails closed.
     """
 
     marker_path = _activation_lineage_marker_path(identity)
@@ -1391,25 +1387,14 @@ def _ensure_activation_lineage_marker(
             "ACTIVATION.LINEAGE_MARKER_INVALID",
             retryable=True,
         ) from error
-    if final_observed is not None:
-        if (
-            temp_observed is not None
-            and stat.S_ISREG(temp_observed.st_mode)
-            and stat.S_ISREG(final_observed.st_mode)
-            and (temp_observed.st_dev, temp_observed.st_ino)
-            == (final_observed.st_dev, final_observed.st_ino)
-        ):
-            _finish_activation_lineage_marker_handoff(
-                temp_path,
-                marker_path,
-                _ActivationFileIdentity(
-                    final_observed.st_dev,
-                    final_observed.st_ino,
-                ),
-                expected_bytes,
-                identity,
+    if final_observed is None:
+        if temp_observed is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID",
+                retryable=False,
             )
-            return
+        return None
+    if temp_observed is None:
         marker_identity = _lstat_activation_lineage_marker_identity(
             marker_path
         )
@@ -1422,7 +1407,80 @@ def _ensure_activation_lineage_marker(
             marker_path,
             identity=identity,
         )
+        return marker_identity
+    if (
+        not stat.S_ISREG(temp_observed.st_mode)
+        or not stat.S_ISREG(final_observed.st_mode)
+        or (temp_observed.st_dev, temp_observed.st_ino)
+        != (final_observed.st_dev, final_observed.st_ino)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=False,
+        )
+    _finish_activation_lineage_marker_handoff(
+        temp_path,
+        marker_path,
+        _ActivationFileIdentity(
+            final_observed.st_dev,
+            final_observed.st_ino,
+        ),
+        expected_bytes,
+        identity,
+    )
+    return _ActivationFileIdentity(
+        final_observed.st_dev,
+        final_observed.st_ino,
+    )
+
+
+
+def _ensure_activation_lineage_marker(
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Durably publish (or revalidate) the write-once activated-lineage marker.
+
+    The marker records that this resource/target has crossed physical
+    activation at least once and binds only version + resource_id +
+    target_identity + digest, so it keeps validating unchanged across
+    store ids, generations, imports, and rebuilds.  Publication is an
+    atomic no-clobber protocol: an exclusive deterministic temporary is
+    fully written and fsynced, the final is published with a hard-link
+    that fails if the final already exists, the parent is fsynced, the
+    temporary is unlinked only while it is still the exact paired inode,
+    and the parent is fsynced again.  An existing valid marker is
+    revalidated, never rewritten; an interrupted owned temporary
+    (byte-exact regular single-link file) resumes publication.  A final
+    that already exists is accepted only when the temporary is absent or
+    the exact paired two-link handoff with the deterministic payload is
+    finished durably; any other conflicting temporary fails closed and is
+    never removed or overwritten.
+    """
+
+    marker_path = _activation_lineage_marker_path(identity)
+    temp_path = _activation_lineage_marker_temp_path(marker_path)
+    expected_bytes = _activation_lineage_marker_payload(identity)
+    try:
+        final_observed = os.lstat(marker_path)
+    except FileNotFoundError:
+        final_observed = None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
+    if final_observed is not None:
+        _ = _activation_lineage_marker_state_complete(identity)
         return
+    try:
+        temp_observed = os.lstat(temp_path)
+    except FileNotFoundError:
+        temp_observed = None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID",
+            retryable=True,
+        ) from error
     if temp_observed is not None:
         if (
             not stat.S_ISREG(temp_observed.st_mode)
