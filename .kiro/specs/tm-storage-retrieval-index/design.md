@@ -71,7 +71,9 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 ```mermaid
 graph LR
     Contracts[TM contracts] --> Store[SQLite TM store]
+    Contracts --> ActivationDurability[Activation journal and recovery]
     Store --> Coordinator[Resource store coordinator]
+    ActivationDurability --> Coordinator
     Contracts --> Migration[JSONL migration]
     Contracts --> MatcherCore[Text matcher algorithm]
     MatcherEvidence[Matcher validation evidence] --> MatcherGate[Matcher capability provider]
@@ -89,7 +91,7 @@ graph LR
     MatcherGate --> ProductAdapters[Qt independent product adapters]
 ```
 
-依赖方向为 Contracts → Store/Migration/Matcher/Scorers → Retrieval/Capability Gates → Compatibility Facade。候选索引没有返回 final similarity 的权力；physical canonical activation、fuzzy benchmark 和 matcher capability 是三个独立状态机，任何一项都不得替另一项宣称就绪。
+依赖方向为 Contracts → Store/Activation Durability/Migration/Matcher/Scorers → Coordinator/Retrieval/Capability Gates → Compatibility Facade。Activation Durability 通过窄 store-validation port 服务 coordinator，不反向依赖 `SQLiteTMStore` 具体实现；候选索引没有返回 final similarity 的权力。physical canonical activation、fuzzy benchmark 和 matcher capability 是三个独立状态机，任何一项都不得替另一项宣称就绪。
 
 ### 技术栈
 
@@ -110,7 +112,9 @@ graph LR
 ```text
 /
 ├── tm_contracts.py                  # Core frozen contracts、Enums、Protocols
-├── tm_sqlite_store.py               # per-resource coordinator、schema、CRUD、backup/activation
+├── tm_sqlite_store.py               # per-resource coordinator facade、schema、CRUD、source binding
+├── tm_activation_journal.py         # activation journal/terminal codec 与 durable file protocol
+├── tm_activation_recovery.py        # phase recovery、成套 publication/rollback 与窄 store-validation port
 ├── tm_candidate_index.py            # FTS5/gram candidate retrievers
 ├── tm_similarity.py                 # Levenshtein、Dice、scorer-v1
 ├── tm_retrieval.py                  # exact/context/fuzzy pipeline 与聚合
@@ -139,6 +143,8 @@ graph LR
     ├── test_tm_engine_compat.py
     └── test_tm_benchmark_contract.py
 ```
+
+Activation 模块在 Task 5.9 闭合完整恢复矩阵后、Cluster D 统一复审前做行为保持型提取。`tm_sqlite_store.py` 在 Feature 5 内继续保持既有 `ResourceStoreCoordinator` 导入入口，但不再拥有 journal/terminal canonical codec、exclusive temporary/replace/fsync 原语或逐 phase 恢复/回滚实现；新模块不得反向导入 `SQLiteTMStore`，只能消费 frozen contracts 与显式窄端口。提取不得修改 journal phase、错误码、token/nonce 单次语义、fault-injection 顺序或 public lease/activation 行为；原 Cluster D characterization/failure matrix 必须在移动前后使用同一断言通过。`tm_contracts.py` 与 `tm_stage_sealer.py` 不属于本次提取范围，待 Feature 5 契约面稳定后另行评估。
 
 ### Modified Files
 
