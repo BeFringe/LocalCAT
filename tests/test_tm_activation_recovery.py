@@ -417,7 +417,7 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -507,7 +507,7 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -565,7 +565,7 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_manifest",
+                "tm_activation_recovery._publish_activation_manifest",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -626,7 +626,7 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
                 asset.backup_path for asset in prepared._backup_assets
             )
             with patch(
-                "tm_sqlite_store._publish_activation_manifest",
+                "tm_activation_recovery._publish_activation_manifest",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -872,7 +872,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -882,7 +882,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._write_activation_journal_bytes",
+                "tm_activation_journal._write_activation_journal_bytes",
                 side_effect=OSError("injected journal write"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -937,7 +937,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -954,7 +954,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._write_activation_journal_bytes",
+                "tm_activation_journal._write_activation_journal_bytes",
                 side_effect=fail_second_write,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -995,7 +995,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_manifest",
+                "tm_activation_recovery._publish_activation_manifest",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1005,7 +1005,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._replace_activation_file",
+                "tm_activation_recovery._replace_activation_file",
                 side_effect=OSError("injected manifest replace"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1042,7 +1042,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1051,7 +1051,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._fsync_activation_file",
+                "tm_activation_recovery._fsync_activation_file",
                 side_effect=OSError("injected receipt fsync"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1083,7 +1083,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._validate_published_activation_set",
+                "tm_activation_recovery._validate_published_activation_set",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1124,7 +1124,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1137,7 +1137,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=fail_manifest_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1170,7 +1170,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1183,7 +1183,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=fail_terminal_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1220,7 +1220,7 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -1282,7 +1282,7 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
                     ) = _first_prepared(root)
                     journal_path = journal.journal_path
                     with patch(
-                        "tm_sqlite_store._publish_activation_receipt",
+                        "tm_activation_recovery._publish_activation_receipt",
                         side_effect=OSError("injected"),
                     ):
                         with self.assertRaises(OSError):
@@ -1516,7 +1516,7 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
             sealed_two = _second_sealed(coordinator, identity, root)
             prepared_two = coordinator.activate(sealed_two)
             with patch(
-                "tm_sqlite_store._fsync_activation_journal",
+                "tm_activation_journal._fsync_activation_journal",
                 side_effect=OSError("injected terminal file fsync"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1571,7 +1571,7 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
                     raise OSError("injected terminal dir fsync")
 
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=fail_terminal_dir_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1995,7 +1995,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._unlink_recovery_backup",
+                "tm_activation_journal._unlink_recovery_backup",
                 side_effect=fail_second_backup_unlink,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -2052,7 +2052,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
                 asset.backup_path for asset in prepared._backup_assets
             )
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -2061,7 +2061,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._unlink_recovery_backup",
+                "tm_activation_journal._unlink_recovery_backup",
                 side_effect=OSError("injected backup unlink"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -2112,7 +2112,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
                 asset.backup_path for asset in prepared._backup_assets
             )
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -2120,7 +2120,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
 
             first = _fresh(identity)
             with patch(
-                "tm_sqlite_store._fsync_recovery_deletion_directory",
+                "tm_activation_journal._fsync_recovery_deletion_directory",
                 side_effect=OSError("injected cleanup fsync"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -2268,7 +2268,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             journal_path = journal.journal_path
             record = journal._record
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -2362,7 +2362,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             journal_path = journal.journal_path
             record = journal._record
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -2414,7 +2414,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._publish_activation_receipt",
+                "tm_activation_recovery._publish_activation_receipt",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -2532,7 +2532,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             )
             journal_path = journal.journal_path
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_recovery._fsync_activation_directory",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -2616,9 +2616,9 @@ class ActivationRecoveryGateTests(unittest.TestCase):
                         journal,
                     ) = _first_prepared(root)
                     target = (
-                        "tm_sqlite_store._publish_activation_receipt"
+                        "tm_activation_recovery._publish_activation_receipt"
                         if fault_path == "receipt"
-                        else "tm_sqlite_store._publish_activation_manifest"
+                        else "tm_activation_recovery._publish_activation_manifest"
                     )
                     with patch(target, side_effect=OSError("injected")):
                         with self.assertRaises(OSError):

@@ -792,7 +792,7 @@ class ActivationDrainAndFailureTests(unittest.TestCase):
                     assert prior_view is not None
                     prior = prior_view.stage.staged_db_path.read_bytes()
                     with patch(
-                        f"tm_sqlite_store.{seam}",
+                        f"tm_activation_journal.{seam}",
                         side_effect=OSError("injected"),
                     ):
                         with self.assertRaises(ActivationPreparationError) as raised:
@@ -850,7 +850,7 @@ class ActivationDrainAndFailureTests(unittest.TestCase):
                     prepared = coordinator.activate(sealed)
 
                     with patch(
-                        f"tm_sqlite_store.{seam}",
+                        f"tm_activation_journal.{seam}",
                         side_effect=OSError("injected"),
                     ):
                         with self.assertRaises(
@@ -922,7 +922,7 @@ class ActivationDrainAndFailureTests(unittest.TestCase):
                         "tm_sqlite_store._revalidate_prior_assets",
                         side_effect=validation_failure,
                     ), patch(
-                        f"tm_sqlite_store.{seam}",
+                        f"tm_activation_journal.{seam}",
                         side_effect=OSError("injected"),
                     ):
                         with self.assertRaises(

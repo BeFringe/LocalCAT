@@ -118,31 +118,31 @@ class ActivationPublicationHappyPathTests(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(
                     patch(
-                        "tm_sqlite_store._replace_activation_database",
+                        "tm_activation_recovery._replace_activation_database",
                         side_effect=replace_db,
                     )
                 )
                 stack.enter_context(
                     patch(
-                        "tm_sqlite_store._validate_replaced_activation_database",
+                        "tm_activation_recovery._validate_replaced_activation_database",
                         side_effect=validate_db,
                     )
                 )
                 stack.enter_context(
                     patch(
-                        "tm_sqlite_store._publish_activation_receipt",
+                        "tm_activation_recovery._publish_activation_receipt",
                         side_effect=publish_receipt,
                     )
                 )
                 stack.enter_context(
                     patch(
-                        "tm_sqlite_store._publish_activation_manifest",
+                        "tm_activation_recovery._publish_activation_manifest",
                         side_effect=publish_manifest,
                     )
                 )
                 stack.enter_context(
                     patch(
-                        "tm_sqlite_store._validate_published_activation_set",
+                        "tm_activation_recovery._validate_published_activation_set",
                         side_effect=validate_set,
                     )
                 )
@@ -375,7 +375,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(root)
             with patch(
-                "tm_sqlite_store._replace_activation_file",
+                "tm_activation_recovery._replace_activation_file",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError):
@@ -404,7 +404,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
             root = Path(temporary)
             identity, coordinator, _sealed, prepared, journal = _first_prepared(root)
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_recovery._fsync_activation_directory",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -425,7 +425,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
             root = Path(temporary)
             identity, coordinator, _sealed, prepared, journal = _first_prepared(root)
             with patch(
-                "tm_sqlite_store._fsync_activation_file",
+                "tm_activation_recovery._fsync_activation_file",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -461,7 +461,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 real_replace(source, destination)
 
             with patch(
-                "tm_sqlite_store._replace_activation_file",
+                "tm_activation_recovery._replace_activation_file",
                 side_effect=fail_second_replace,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -502,7 +502,10 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 real_fsync(path)
 
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_recovery._fsync_activation_directory",
+                side_effect=fail_manifest_fsync,
+            ), patch(
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=fail_manifest_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError):
@@ -532,7 +535,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 identity.snapshot_manifest_path.write_bytes(b"{}")
 
             with patch(
-                "tm_sqlite_store._publish_activation_manifest",
+                "tm_activation_recovery._publish_activation_manifest",
                 side_effect=publish_then_tamper,
             ):
                 with self.assertRaises(ActivationPreparationError):
@@ -564,7 +567,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 return real_validate(*args, **kwargs)
 
             with patch(
-                "tm_sqlite_store._validate_replaced_activation_database",
+                "tm_activation_recovery._validate_replaced_activation_database",
                 side_effect=tamper_then_validate,
             ):
                 with self.assertRaises(ActivationPreparationError):
@@ -603,7 +606,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 return real_validate(*args, **kwargs)
 
             with patch(
-                "tm_sqlite_store._validate_published_activation_set",
+                "tm_activation_recovery._validate_published_activation_set",
                 side_effect=fail_before_generation,
             ):
                 with self.assertRaises(ActivationPreparationError):
@@ -732,7 +735,7 @@ class ActivationPublicationVisibilityTests(unittest.TestCase):
             def run() -> None:
                 try:
                     with patch(
-                        "tm_sqlite_store._publish_activation_manifest",
+                        "tm_activation_recovery._publish_activation_manifest",
                         side_effect=blocked_publish,
                     ):
                         coordinator.publish_activation(prepared, journal)
@@ -771,7 +774,7 @@ class ActivationPublicationVisibilityTests(unittest.TestCase):
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(root)
             with patch(
-                "tm_sqlite_store._validate_replaced_activation_database",
+                "tm_activation_recovery._validate_replaced_activation_database",
                 side_effect=ActivationPreparationError(
                     "ACTIVATION.DB_REOPEN_INVALID",
                     retryable=False,

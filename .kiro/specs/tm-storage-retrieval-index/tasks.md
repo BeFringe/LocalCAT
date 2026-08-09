@@ -184,7 +184,7 @@
   - 完成时，各 journal phase 的不一致注入都恢复一个完整可查询/可保存版本，DB 与 manifest 不会跨代
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.R1 收束 activation/recovery 模块边界
+- [x] 5.R1 收束 activation/recovery 模块边界
   - 在 5.9 闭合完整恢复矩阵后，将 journal/terminal codec、durable file protocol 与逐 phase completion/rollback 从 `tm_sqlite_store.py` 提取到设计指定模块；coordinator 只经窄 store-validation port 编排
   - 保持既有 `ResourceStoreCoordinator` 导入入口、journal phase、错误码、token/nonce 单次语义、fault-injection 顺序和 public lease/activation 行为，不夹带功能修改，也不拆分 `tm_contracts.py` 或 `tm_stage_sealer.py`
   - 用移动前后的同一 Cluster D characterization/failure matrix、二次冷启动、架构依赖守卫和全量回归证明等价；测试文件不设行数限制，已有 `test_tm_*` 继续作为行为权威

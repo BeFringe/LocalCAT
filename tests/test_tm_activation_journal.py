@@ -610,7 +610,7 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
 
             with (
                 patch(
-                    "tm_sqlite_store._fsync_activation_journal",
+                    "tm_activation_journal._fsync_activation_journal",
                     side_effect=lambda descriptor: order.append("file-fsync"),
                 ),
                 patch(
@@ -618,7 +618,7 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
                     side_effect=recording_replace,
                 ),
                 patch(
-                    "tm_sqlite_store._fsync_activation_directory",
+                    "tm_activation_journal._fsync_activation_directory",
                     side_effect=lambda path: order.append("dir-fsync"),
                 ),
             ):
@@ -1097,7 +1097,7 @@ class ActivationJournalPhaseBoundaryTests(unittest.TestCase):
             with patch("tm_sqlite_store._probe_fts5", return_value=True):
                 prepared = coordinator.activate(sealed)
             with patch(
-                "tm_sqlite_store._write_activation_journal_bytes",
+                "tm_activation_journal._write_activation_journal_bytes",
                 side_effect=OSError("injected write failure"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1477,7 +1477,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
                     ):
                         prepared = coordinator.activate(sealed)
                     with patch(
-                        f"tm_sqlite_store.{target}",
+                        f"tm_activation_journal.{target}",
                         side_effect=error,
                     ):
                         with self.assertRaises(ActivationPreparationError) as raised:
@@ -1594,7 +1594,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
             with patch("tm_sqlite_store._probe_fts5", return_value=True):
                 prepared = coordinator.activate(sealed)
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=OSError("injected directory fsync failure"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1641,7 +1641,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
                 real_fsync(path)
 
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=one_shot_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1675,7 +1675,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
             journal_path = handle.journal_path
             payload_before = _journal_bytes(journal_path)
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=OSError("injected replay directory fsync failure"),
             ):
                 for _ in range(2):
@@ -1724,7 +1724,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
                 return real_read(path, expected_identity)
 
             with patch(
-                "tm_sqlite_store._read_activation_journal_file",
+                "tm_activation_journal._read_activation_journal_file",
                 side_effect=failing_read,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -1757,11 +1757,11 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
             with patch("tm_sqlite_store._probe_fts5", return_value=True):
                 prepared = coordinator.activate(sealed)
             with patch(
-                "tm_sqlite_store._write_activation_journal_bytes",
+                "tm_activation_journal._write_activation_journal_bytes",
                 side_effect=OSError("injected write failure"),
             ):
                 with patch(
-                    "tm_sqlite_store._remove_owned_activation_journal_temp",
+                    "tm_activation_journal._remove_owned_activation_journal_temp",
                     return_value=False,
                 ):
                     with self.assertRaises(ActivationPreparationError) as raised:
@@ -1825,7 +1825,7 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
                     handle = coordinator.publish_prepared_activation(prepared)
                     journal_path = handle.journal_path
                     with patch(
-                        f"tm_sqlite_store.{target}",
+                        f"tm_activation_journal.{target}",
                         side_effect=error,
                     ):
                         with self.assertRaises(ActivationPreparationError) as raised:

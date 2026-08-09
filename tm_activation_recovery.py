@@ -1,0 +1,4881 @@
+"""Phase recovery, publication, and rollback for durable activations (Task 5.R1).
+
+Extracted from ``tm_sqlite_store.py`` without behavior change: this module
+consumes the frozen contracts, the shared activation journal types/codec
+(``tm_activation_journal``), and a narrow ``_StoreValidationPort`` so it
+has no dependency on the store module.  The coordinator in
+``tm_sqlite_store`` implements the port and delegates
+``publish_activation``/``recover_durable_activation``/
+``rollback_durable_activation`` here.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+import sqlite3
+import stat
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+import tm_contracts as contract_module
+from tm_contracts import (
+    CanonicalResourceIdentity,
+    MutableStageRef,
+    SNAPSHOT_MANIFEST_VERSION,
+    SealedStage,
+    SnapshotBinding,
+    SnapshotKind,
+    SnapshotManifest,
+    SnapshotReceipt,
+    contract_from_json,
+    contract_to_json,
+    snapshot_receipt_digest,
+)
+from tm_activation_journal import (
+    ActivationPreparationError,
+    ActivationRecoveryReport,
+    _ACTIVATION_JOURNAL_VERSION,
+    _ActivationCleanupReservation,
+    _ActivationFileIdentity,
+    _ActivationJournalHandle,
+    _ActivationJournalPhase,
+    _ActivationJournalRecord,
+    _ActivationPreparation,
+    _CanonicalStoreRef,
+    _PHASE_SEQUENCE,
+    _PriorActivationRef,
+    _PriorAssetCapture,
+    _SQLiteGenerationView,
+    _StoreRuntimeRef,
+    _activation_file_identity,
+    _activation_journal_path,
+    _activation_journal_temp_path,
+    _activation_rollback_eligible,
+    _activation_terminal_coexistence_valid,
+    _activation_terminal_path,
+    _activation_terminal_temp_path,
+    _capture_activation_file,
+    _fsync_activation_directory,
+    _fsync_activation_file,
+    _fsync_recovery_backup,
+    _lstat_activation_journal_identity,
+    _lstat_activation_terminal_identity,
+    _lstat_any_entry,
+    _open_activation_journal_temp,
+    _parse_activation_journal_bytes,
+    _quarantine_failed_activation_artifacts,
+    _read_activation_file_bytes,
+    _read_activation_journal_file,
+    _remove_journal_proven_backups,
+    _remove_orphaned_activation_temp,
+    _remove_orphaned_rollback_temp,
+    _remove_owned_activation_journal_final,
+    _remove_owned_activation_terminal_final,
+    _replace_activation_file,
+    _replay_activation_journal,
+    _require_first_activation_absence,
+    _rollback_terminal_prior_closes,
+    _write_recovery_backup,
+)
+class _StoreValidationPort(Protocol):
+    """Narrow store-side surface consumed by the recovery functions."""
+
+    @property
+    def resource_identity(self) -> CanonicalResourceIdentity: ...
+
+    @property
+    def canonical_store_id(self) -> str: ...
+
+    @property
+    def view(self) -> _SQLiteGenerationView | None: ...
+
+    @view.setter
+    def view(self, value: _SQLiteGenerationView | None) -> None: ...
+
+    @property
+    def state(self) -> str: ...
+
+    @state.setter
+    def state(self, value: str) -> None: ...
+
+    @property
+    def preparation(self) -> _ActivationPreparation | None: ...
+
+    @preparation.setter
+    def preparation(self, value: _ActivationPreparation | None) -> None: ...
+
+    @property
+    def cleanup_reservation(self) -> _ActivationCleanupReservation | None: ...
+
+    @cleanup_reservation.setter
+    def cleanup_reservation(
+        self,
+        value: _ActivationCleanupReservation | None,
+    ) -> None: ...
+
+    @property
+    def cleanup_in_progress(self) -> bool: ...
+
+    @property
+    def sealed_registry(self) -> Any: ...
+
+    store_schema_error: type[RuntimeError]
+
+    def notify_all(self) -> None: ...
+    def open_configured_connection(
+        self,
+        database_path: Path,
+        *,
+        require_existing: bool = False,
+    ) -> Any: ...
+    def read_meta(self, connection: sqlite3.Connection) -> dict[str, str]: ...
+    def meta_int(self, meta: dict[str, str], key: str) -> int: ...
+    def meta_bool(self, meta: dict[str, str], key: str) -> bool: ...
+    def read_source_binding_facts(
+        self,
+        connection: sqlite3.Connection,
+        lease: _SQLiteGenerationView,
+    ) -> Any: ...
+    def read_source_binding_facts_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        lease: _SQLiteGenerationView,
+    ) -> Any: ...
+    def binding_from_ledger_row(self, row: tuple[object, ...]) -> SnapshotBinding: ...
+    def configured_pair_diagnostics(
+        self,
+        binding: SnapshotBinding,
+        *,
+        identity: CanonicalResourceIdentity,
+        canonical_store_id: str,
+        head_revision: int,
+        cumulative_record_counts: tuple[tuple[int, int], ...],
+    ) -> tuple[str, ...]: ...
+    def table_count(self, connection: sqlite3.Connection, table_name: str) -> int: ...
+    def validate_store_identity(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        resource_id: str,
+        canonical_store_id: str,
+        target_identity: str,
+    ) -> None: ...
+    def inspect_stage_schema(
+        self,
+        stage_ref: Any,
+        *,
+        canonical_store_id: str,
+        _allow_diverged_runtime: bool = False,
+        _allow_sealed: bool = False,
+        _allow_active: bool = False,
+        _expected_active_generation: int | None = None,
+        _expected_activation_digest: str | None = None,
+    ) -> Any: ...
+    def unique_character_ngrams(
+        self,
+        folded_text: str,
+        gram_size: int,
+    ) -> tuple[str, ...]: ...
+    def write_journal(
+        self,
+        record: _ActivationJournalRecord,
+        journal_path: Path,
+        *,
+        expected_final_identity: _ActivationFileIdentity | None,
+    ) -> _ActivationJournalHandle: ...
+    def write_terminal(
+        self,
+        record: _ActivationJournalRecord,
+    ) -> _ActivationFileIdentity: ...
+
+
+class _CoordinatorPublishPort(_StoreValidationPort, Protocol):
+    """Publish-side port that adds the coordinator's after-effect seam."""
+
+    def advance_after_effect(
+        self,
+        preparation: _ActivationPreparation,
+        handle: _ActivationJournalHandle,
+        next_phase: _ActivationJournalPhase,
+        *,
+        next_generation: int | None = None,
+        activation_digest: str | None = None,
+    ) -> _ActivationJournalHandle: ...
+
+class _ActivationGateBGrant(Protocol):
+    @property
+    def resource_id(self) -> str: ...
+
+    @property
+    def target_identity(self) -> str: ...
+
+    @property
+    def canonical_store_id(self) -> str: ...
+
+    @property
+    def expected_prior_generation(self) -> int | None: ...
+
+
+def _require_activation_grant_identity(
+    grant: _ActivationGateBGrant,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    prior_view: _SQLiteGenerationView | None,
+    current_generation: int | None,
+) -> None:
+    if (
+        grant.resource_id != identity.resource_id
+        or grant.target_identity != identity.target_identity
+        or grant.canonical_store_id != canonical_store_id
+        or grant.expected_prior_generation != current_generation
+    ):
+        code = (
+            "ACTIVATION.GENERATION_STALE"
+            if grant.expected_prior_generation != current_generation
+            else "ACTIVATION.IDENTITY_MISMATCH"
+        )
+        raise ActivationPreparationError(code, retryable=False)
+    if prior_view is not None and (
+        prior_view.canonical_store_id != canonical_store_id
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+
+
+def _require_activation_token_identity(
+    token: contract_module._ActivationToken,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    current_generation: int | None,
+) -> None:
+    if (
+        token.resource_id != identity.resource_id
+        or token.target_identity != identity.target_identity
+        or token.canonical_store_id != canonical_store_id
+        or token.expected_prior_generation != current_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+
+
+def _capture_prior_assets(
+    port: _StoreValidationPort,
+    view: _SQLiteGenerationView,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> tuple[_PriorAssetCapture, ...]:
+    if (
+        view.stage.resource_identity != identity
+        or view.stage.resource_identity.resource_id != identity.resource_id
+        or view.stage.resource_identity.target_identity != identity.target_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+    with port.open_configured_connection(
+        view.stage.staged_db_path,
+        require_existing=True,
+    ) as connection:
+        facts = port.read_source_binding_facts(connection, view)
+    binding = facts.binding
+    if (
+        facts.divergence_latched
+        or facts.diagnostic_codes
+        or binding is None
+        or port.configured_pair_diagnostics(
+            binding,
+            identity=identity,
+            canonical_store_id=view.canonical_store_id,
+            head_revision=facts.head_revision,
+            cumulative_record_counts=facts.cumulative_record_counts,
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    database = _capture_activation_file(
+        view.stage.staged_db_path,
+        asset_kind="DATABASE",
+    )
+    manifest = _capture_activation_file(
+        identity.snapshot_manifest_path,
+        asset_kind="MANIFEST",
+    )
+    source = _capture_activation_file(
+        identity.configured_jsonl_path,
+        asset_kind="SOURCE",
+    )
+    if source.digest != binding.receipt.jsonl_digest:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    manifest_payload = _read_activation_file_bytes(manifest)
+    if manifest_payload != contract_to_json(binding.manifest).encode("utf-8"):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    try:
+        decoded = contract_from_json(manifest_payload.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        ) from error
+    if type(decoded) is not SnapshotManifest or decoded != binding.manifest:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    return database, manifest, source
+
+
+def _canonical_activation_ref(
+    identity: CanonicalResourceIdentity,
+    *,
+    journal_id: str,
+) -> _CanonicalStoreRef:
+    return _CanonicalStoreRef(
+        stage_id=f"canonical.{journal_id}",
+        resource_identity=identity,
+        staged_db_path=identity.canonical_sidecar_path,
+        manifest_temp_path=identity.snapshot_manifest_path,
+    )
+
+
+def _validate_activation_publication_authority(
+    record: _ActivationJournalRecord,
+    *,
+    preparation: _ActivationPreparation,
+    registry: Any,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+) -> None:
+    """Validate token/registry/source/backup facts after candidate movement."""
+
+    stage = preparation._sealed_stage
+    token = preparation._token
+    if (
+        type(record) is not _ActivationJournalRecord
+        or type(stage) is not SealedStage
+        or type(token) is not contract_module._ActivationToken
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    try:
+        contract_module._validate_activation_token_for_stage(token, stage)
+        physical = registry.resolve_physical_readiness(stage)
+        token_entry = registry._token_entry(token)
+    except Exception as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        ) from error
+    evidence = physical.evidence
+    receipt = evidence.source_binding.receipt
+    if (
+        token_entry.state
+        is not contract_module.ActivationCapabilityState.TOKEN_ISSUED
+        or registry.registry_namespace != record.registry_namespace
+        or physical.registry_namespace != record.registry_namespace
+        or physical.artifact_id != record.artifact_id
+        or physical.artifact_seal_digest != record.artifact_seal_digest
+        or physical.sealed_stage_digest != record.sealed_stage_digest
+        or physical.resource_id != identity.resource_id
+        or physical.resource_id != record.resource_id
+        or physical.target_identity != identity.target_identity
+        or physical.target_identity != record.target_identity
+        or physical.canonical_store_id != canonical_store_id
+        or physical.canonical_store_id != record.canonical_store_id
+        or physical.expected_prior_generation
+        != record.expected_prior_generation
+        or physical.snapshot_receipt_digest
+        != record.snapshot_receipt_digest
+        or contract_module.stage_validation_evidence_digest(evidence)
+        != record.evidence_digest
+        or evidence.stage_file_digest != record.stage_db_digest
+        or evidence.manifest_temp_digest != record.manifest_temp_digest
+        or receipt.snapshot_id != record.new_receipt_id
+        or receipt.jsonl_digest != record.source_jsonl_digest
+        or physical.mutable_stage.staged_db_path
+        != record.candidate_stage_db_path
+        or physical.mutable_stage.manifest_temp_path
+        != record.candidate_manifest_temp_path
+        or (
+            physical.database_identity.device,
+            physical.database_identity.inode,
+        )
+        != record.candidate_stage_db_identity
+        or (
+            physical.manifest_identity.device,
+            physical.manifest_identity.inode,
+        )
+        != record.candidate_manifest_temp_identity
+        or preparation.preparation_id != record.preparation_id
+        or preparation.resource_id != record.resource_id
+        or preparation.target_identity != record.target_identity
+        or preparation.canonical_store_id != record.canonical_store_id
+        or preparation.expected_prior_generation
+        != record.expected_prior_generation
+        or preparation.gate_b_grant_digest != record.gate_b_grant_digest
+        or preparation.had_prior_canonical != record.had_prior_canonical
+        or record.new_manifest_path != identity.snapshot_manifest_path
+        or record.journal_path != _activation_journal_path(identity)
+        or record.new_manifest_digest != record.manifest_temp_digest
+        or token.token_id != record.token_id
+        or token.token_version != record.token_version
+        or token.activation_nonce != record.activation_nonce
+        or token.artifact_id != record.artifact_id
+        or token.artifact_seal_digest != record.artifact_seal_digest
+        or token.sealed_stage_digest != record.sealed_stage_digest
+        or token.snapshot_receipt_digest != record.snapshot_receipt_digest
+        or token.expected_prior_generation
+        != record.expected_prior_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    source = _capture_journal_closure_file(identity.configured_jsonl_path)
+    if (
+        (source[0].device, source[0].inode) != record.source_jsonl_identity
+        or source[1] != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    if record.had_prior_canonical:
+        backups = {asset.asset_kind: asset for asset in preparation._backup_assets}
+        if (
+            len(preparation._backup_assets) != 2
+            or set(backups) != {"DATABASE", "MANIFEST"}
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        for kind, path, expected_identity, expected_digest in (
+            (
+                "DATABASE",
+                record.prior_db_backup_path,
+                record.prior_db_backup_identity,
+                record.prior_db_backup_digest,
+            ),
+            (
+                "MANIFEST",
+                record.prior_manifest_backup_path,
+                record.prior_manifest_backup_identity,
+                record.prior_manifest_backup_digest,
+            ),
+        ):
+            if path is None or expected_identity is None or expected_digest is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            capture = _capture_journal_closure_file(path)
+            asset = backups[kind]
+            if (
+                (capture[0].device, capture[0].inode) != expected_identity
+                or capture[1] != expected_digest
+                or asset.backup_path != path
+                or asset.backup_identity != capture[0]
+                or asset.evidence.backup_digest != expected_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+    elif preparation._backup_assets:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+
+
+def _replace_activation_database(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Atomically move the sealed candidate into the canonical sidecar."""
+
+    candidate = _capture_journal_closure_file(record.candidate_stage_db_path)
+    if (
+        (candidate[0].device, candidate[0].inode)
+        != record.candidate_stage_db_identity
+        or candidate[1] != record.stage_db_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_CANDIDATE_INVALID",
+            retryable=False,
+        )
+    canonical = identity.canonical_sidecar_path
+    if record.had_prior_canonical:
+        if record.prior_db_path == canonical:
+            prior = _capture_journal_closure_file(canonical)
+            if (
+                (prior[0].device, prior[0].inode) != record.prior_db_identity
+                or prior[1] != record.prior_db_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PRIOR_ASSET_INVALID",
+                    retryable=False,
+                )
+        elif _lstat_any_entry(canonical):
+            raise ActivationPreparationError(
+                "ACTIVATION.CANONICAL_TARGET_OCCUPIED",
+                retryable=False,
+            )
+    elif _lstat_any_entry(canonical):
+        raise ActivationPreparationError(
+            "ACTIVATION.CANONICAL_TARGET_OCCUPIED",
+            retryable=False,
+        )
+    try:
+        _replace_activation_file(record.candidate_stage_db_path, canonical)
+        _fsync_activation_directory(canonical.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_REPLACE_FAILED",
+            retryable=True,
+        ) from error
+    published = _capture_journal_closure_file(canonical)
+    if (
+        published[0] != candidate[0]
+        or published[1] != record.stage_db_digest
+        or _lstat_any_entry(record.candidate_stage_db_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_REPLACE_UNPROVEN",
+            retryable=False,
+        )
+
+
+def _validate_replaced_activation_database(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    preparation: _ActivationPreparation,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+) -> Any:
+    """Reopen and independently revalidate the still-SEALED canonical DB."""
+
+    canonical = _capture_journal_closure_file(identity.canonical_sidecar_path)
+    if (
+        (canonical[0].device, canonical[0].inode)
+        != record.candidate_stage_db_identity
+        or canonical[1] != record.stage_db_digest
+        or _lstat_any_entry(record.candidate_stage_db_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_REOPEN_INVALID",
+            retryable=False,
+        )
+    active_ref = _canonical_activation_ref(identity, journal_id=record.journal_id)
+    try:
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        facts = stage_sealer._validate_stage_facts(
+            cast(MutableStageRef, cast(object, active_ref)),
+            canonical_store_id=canonical_store_id,
+            allow_sealed=True,
+        )
+        snapshot = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=canonical_store_id,
+            _allow_sealed=True,
+        )
+    except Exception as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_REOPEN_INVALID",
+            retryable=False,
+        ) from error
+    evidence = preparation._sealed_stage.evidence
+    if (
+        facts.resource_id != evidence.resource_id
+        or facts.target_identity != evidence.target_identity
+        or facts.schema_version != evidence.schema_version
+        or facts.fold_version != evidence.fold_version
+        or facts.index_version != evidence.index_version
+        or facts.record_count != evidence.record_count
+        or facts.origin_batch_count != evidence.origin_batch_count
+        or facts.fts_count != evidence.fts_count
+        or facts.gram_counts != evidence.gram_counts
+        or facts.exact_parity_digest != evidence.exact_parity_digest
+        or snapshot.activation_status != "SEALED"
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.DB_REOPEN_INVALID",
+            retryable=False,
+        )
+    return snapshot
+
+
+def _activation_publication_digest(
+    record: _ActivationJournalRecord,
+    *,
+    next_generation: int,
+) -> str:
+    payload = {
+        "activation_nonce": record.activation_nonce,
+        "artifact_id": record.artifact_id,
+        "evidence_digest": record.evidence_digest,
+        "generation": next_generation,
+        "journal_id": record.journal_id,
+        "manifest_digest": record.new_manifest_digest,
+        "sealed_stage_digest": record.sealed_stage_digest,
+        "token_id": record.token_id,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _publish_activation_receipt(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    preparation: _ActivationPreparation,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    next_generation: int,
+    activation_digest: str,
+) -> None:
+    """Durably complete the issued receipt/binding inside the new DB."""
+
+    evidence = preparation._sealed_stage.evidence
+    binding = evidence.source_binding
+    receipt = binding.receipt
+    canonical_capture = _capture_journal_closure_file(
+        identity.canonical_sidecar_path
+    )
+    if (
+        (canonical_capture[0].device, canonical_capture[0].inode)
+        != record.candidate_stage_db_identity
+        or canonical_capture[1] != record.stage_db_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+            retryable=False,
+        )
+    try:
+        with port.open_configured_connection(
+            identity.canonical_sidecar_path,
+            require_existing=True,
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                meta = port.read_meta(connection)
+                if (
+                    meta.get("resource_id") != identity.resource_id
+                    or meta.get("canonical_store_id") != canonical_store_id
+                    or meta.get("target_identity") != identity.target_identity
+                    or meta.get("activation_status") != "SEALED"
+                    or "activation_digest" in meta
+                    or port.meta_int(meta, "generation") != 0
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVATION_STATE_INVALID"
+                    )
+                rows = connection.execute(
+                    "SELECT snapshot_id, resource_id, canonical_store_id, "
+                    "exported_revision, jsonl_digest, record_count, "
+                    "format_version, destination_jsonl_path, "
+                    "destination_manifest_path, status "
+                    "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+                ).fetchall()
+                expected_row = (
+                    receipt.snapshot_id,
+                    receipt.resource_id,
+                    receipt.canonical_store_id,
+                    receipt.exported_revision,
+                    receipt.jsonl_digest,
+                    receipt.record_count,
+                    receipt.format_version,
+                    Path.__str__(identity.configured_jsonl_path),
+                    Path.__str__(identity.snapshot_manifest_path),
+                    "issued",
+                )
+                if rows != [expected_row]:
+                    raise port.store_schema_error("STORE.RECEIPT_INVALID")
+                if connection.execute(
+                    "SELECT COUNT(*) FROM tm_snapshot_binding"
+                ).fetchone() != (0,):
+                    raise port.store_schema_error("STORE.BINDING_INVALID")
+                updated = connection.execute(
+                    "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                    "WHERE snapshot_id = ? AND status = 'issued'",
+                    (receipt.snapshot_id,),
+                )
+                if updated.rowcount != 1:
+                    raise port.store_schema_error("STORE.RECEIPT_INVALID")
+                connection.execute(
+                    "INSERT INTO tm_snapshot_binding("
+                    "binding_id, configured_jsonl_path, manifest_path, "
+                    "snapshot_kind, snapshot_id, binding_version) "
+                    "VALUES (1, ?, ?, ?, ?, ?)",
+                    (
+                        Path.__str__(identity.configured_jsonl_path),
+                        Path.__str__(identity.snapshot_manifest_path),
+                        binding.snapshot_kind.value,
+                        receipt.snapshot_id,
+                        binding.binding_version,
+                    ),
+                )
+                status = connection.execute(
+                    "UPDATE tm_meta SET value = 'ACTIVE' "
+                    "WHERE key = 'activation_status' AND value = 'SEALED'"
+                )
+                generation = connection.execute(
+                    "UPDATE tm_meta SET value = ? "
+                    "WHERE key = 'generation' AND value = '0'",
+                    (str(next_generation),),
+                )
+                connection.execute(
+                    "INSERT INTO tm_meta(key, value) VALUES "
+                    "('activation_digest', ?)",
+                    (activation_digest,),
+                )
+                if status.rowcount != 1 or generation.rowcount != 1:
+                    raise port.store_schema_error(
+                        "STORE.ACTIVATION_STATE_INVALID"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        after = _activation_file_identity(identity.canonical_sidecar_path)
+        if after != canonical_capture[0]:
+            raise OSError("canonical identity changed")
+        _fsync_activation_file(identity.canonical_sidecar_path, after)
+    except Exception as error:
+        if isinstance(error, ActivationPreparationError):
+            raise
+        raise ActivationPreparationError(
+            "ACTIVATION.RECEIPT_PUBLICATION_FAILED",
+            retryable=True,
+        ) from error
+
+
+def _publish_activation_manifest(
+    record: _ActivationJournalRecord,
+    *,
+    preparation: _ActivationPreparation,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Atomically publish and fsync the new adjacent manifest."""
+
+    manifest_temp = _capture_journal_closure_file(
+        record.candidate_manifest_temp_path
+    )
+    if (
+        (manifest_temp[0].device, manifest_temp[0].inode)
+        != record.candidate_manifest_temp_identity
+        or manifest_temp[1] != record.manifest_temp_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_CANDIDATE_INVALID",
+            retryable=False,
+        )
+    final_path = identity.snapshot_manifest_path
+    if record.had_prior_canonical:
+        prior = _capture_journal_closure_file(final_path)
+        if (
+            (prior[0].device, prior[0].inode)
+            != record.prior_manifest_identity
+            or prior[1] != record.prior_manifest_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIOR_ASSET_INVALID",
+                retryable=False,
+            )
+    elif _lstat_any_entry(final_path):
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_TARGET_OCCUPIED",
+            retryable=False,
+        )
+    try:
+        _replace_activation_file(record.candidate_manifest_temp_path, final_path)
+        _fsync_activation_directory(final_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_PUBLICATION_FAILED",
+            retryable=True,
+        ) from error
+    final = _capture_journal_closure_file(final_path)
+    if (
+        final[0] != manifest_temp[0]
+        or final[1] != record.new_manifest_digest
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_PUBLICATION_UNPROVEN",
+            retryable=False,
+        )
+    payload = _read_activation_file_bytes(
+        _PriorAssetCapture("MANIFEST", final_path, final[0], final[1])
+    )
+    try:
+        decoded = contract_from_json(payload.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_PUBLICATION_INVALID",
+            retryable=False,
+        ) from error
+    if (
+        type(decoded) is not SnapshotManifest
+        or decoded != preparation._sealed_stage.evidence.source_binding.manifest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.MANIFEST_PUBLICATION_INVALID",
+            retryable=False,
+        )
+
+
+def _activation_exact_parity_digest(
+    port: _StoreValidationPort,connection: sqlite3.Connection) -> str:
+    winners: dict[str, str] = {}
+    for source_raw, target_raw in connection.execute(
+        "SELECT source_raw, target_raw FROM tm_record ORDER BY record_id"
+    ):
+        if type(source_raw) is not str or type(target_raw) is not str:
+            raise port.store_schema_error("STORE.RECORD_INVALID")
+        winners[source_raw] = target_raw
+    digest = hashlib.sha256()
+    for source_raw in sorted(winners):
+        for value in (source_raw, winners[source_raw]):
+            encoded = value.encode("utf-8")
+            digest.update(str(len(encoded)).encode("ascii"))
+            digest.update(b":")
+            digest.update(encoded)
+            digest.update(b";")
+    return digest.hexdigest()
+
+
+def _validate_activation_indexes(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    *,
+    evidence: contract_module.StageValidationEvidence,
+    fts5_available: bool,
+) -> None:
+    required_sizes = tuple(size for size, _count in evidence.gram_counts)
+    expected_counts = dict(evidence.gram_counts)
+    actual_counts = {size: 0 for size in required_sizes}
+    gram_cursor = connection.execute(
+        "SELECT record_id, gram_size, gram FROM tm_gram "
+        "ORDER BY record_id, gram_size, gram"
+    )
+    current_gram = gram_cursor.fetchone()
+    for record_id, folded_source in connection.execute(
+        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+    ):
+        if type(record_id) is not int or type(folded_source) is not str:
+            raise port.store_schema_error("STORE.RECORD_INVALID")
+        actual: set[tuple[int, str]] = set()
+        while current_gram is not None and current_gram[0] == record_id:
+            gram_size, gram = current_gram[1], current_gram[2]
+            if type(gram_size) is not int or type(gram) is not str:
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+            actual.add((gram_size, gram))
+            current_gram = gram_cursor.fetchone()
+        expected = {
+            (size, gram)
+            for size in required_sizes
+            for gram in port.unique_character_ngrams(folded_source, size)
+        }
+        if actual != expected:
+            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+        for size, _gram in actual:
+            if size not in actual_counts:
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+            actual_counts[size] += 1
+    if current_gram is not None or actual_counts != expected_counts:
+        raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+    if fts5_available:
+        record_cursor = connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+        )
+        fts_cursor = connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
+        )
+        fts_count = 0
+        while True:
+            record_row = record_cursor.fetchone()
+            fts_row = fts_cursor.fetchone()
+            if record_row is None or fts_row is None:
+                if record_row != fts_row:
+                    raise port.store_schema_error(
+                        "STORE.CANDIDATE_INDEX_INVALID"
+                    )
+                break
+            if fts_row != record_row:
+                raise port.store_schema_error(
+                    "STORE.CANDIDATE_INDEX_INVALID"
+                )
+            fts_count += 1
+        if fts_count != evidence.fts_count:
+            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+    elif evidence.fts_count != 0:
+        raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+
+
+def _validate_published_activation_set(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    preparation: _ActivationPreparation,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    next_generation: int,
+    activation_digest: str,
+) -> tuple[_CanonicalStoreRef, Any]:
+    """Revalidate the complete active DB/source/receipt/manifest generation."""
+
+    database = _capture_journal_closure_file(identity.canonical_sidecar_path)
+    manifest = _capture_journal_closure_file(identity.snapshot_manifest_path)
+    if (
+        (database[0].device, database[0].inode)
+        != record.candidate_stage_db_identity
+        or (manifest[0].device, manifest[0].inode)
+        != record.candidate_manifest_temp_identity
+        or manifest[1] != record.new_manifest_digest
+        or _lstat_any_entry(record.candidate_stage_db_path)
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    active_ref = _canonical_activation_ref(identity, journal_id=record.journal_id)
+    try:
+        snapshot = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=next_generation,
+            _expected_activation_digest=activation_digest,
+        )
+        with port.open_configured_connection(
+            identity.canonical_sidecar_path,
+            require_existing=True,
+        ) as connection:
+            connection.execute("BEGIN")
+            try:
+                port.validate_store_identity(
+                    connection,
+                    resource_id=identity.resource_id,
+                    canonical_store_id=canonical_store_id,
+                    target_identity=identity.target_identity,
+                )
+                if connection.execute("PRAGMA integrity_check").fetchall() != [
+                    ("ok",)
+                ]:
+                    raise port.store_schema_error("STORE.INTEGRITY_CHECK_FAILED")
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise port.store_schema_error("STORE.FOREIGN_KEY_CHECK_FAILED")
+                evidence = preparation._sealed_stage.evidence
+                if (
+                    port.table_count(connection, "tm_record")
+                    != evidence.record_count
+                    or port.table_count(connection, "tm_origin_batch")
+                    != evidence.origin_batch_count
+                    or _activation_exact_parity_digest(port, connection)
+                    != evidence.exact_parity_digest
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
+                _validate_activation_indexes(port,
+                    connection,
+                    evidence=evidence,
+                    fts5_available=snapshot.fts5_available,
+                )
+                lease = _SQLiteGenerationView(
+                    stage=active_ref,
+                    canonical_store_id=canonical_store_id,
+                    generation=next_generation,
+                    fts5_available=snapshot.fts5_available,
+                )
+                facts = port.read_source_binding_facts_in_transaction(
+                    connection,
+                    lease,
+                )
+                if (
+                    facts.binding != evidence.source_binding
+                    or facts.divergence_latched
+                    or facts.diagnostic_codes
+                    or port.configured_pair_diagnostics(
+                        evidence.source_binding,
+                        identity=identity,
+                        canonical_store_id=canonical_store_id,
+                        head_revision=facts.head_revision,
+                        cumulative_record_counts=facts.cumulative_record_counts,
+                    )
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+    except Exception as error:
+        if isinstance(error, ActivationPreparationError):
+            raise
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_SET_INVALID",
+            retryable=False,
+        ) from error
+    return active_ref, snapshot
+
+
+def _restore_activation_file(
+    record: _ActivationJournalRecord,
+    backup_path: Path,
+    expected_digest: str,
+    destination: Path,
+) -> _ActivationFileIdentity:
+    """Restore one journal-owned backup to its authority path (Task 5.9).
+
+    Streams the backup into an exclusive deterministic temporary in the
+    destination directory, fsyncs the copy, atomically replaces the
+    destination, fsyncs the published file and the parent directory, and
+    re-proves the published identity.  The backup itself is never consumed,
+    so a crash at any boundary resumes idempotently from the journal; a
+    leftover temporary from a crashed restore is removed only when it is
+    an exact regular single-link file at the deterministic path.
+    """
+
+    temp_path = destination.parent / (
+        f"{destination.name}.localcat-rollback.{record.journal_id}.tmp"
+    )
+    _remove_orphaned_rollback_temp(temp_path)
+    source_descriptor = -1
+    temp_descriptor = -1
+    temp_identity: _ActivationFileIdentity | None = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        source_descriptor = os.open(backup_path, flags)
+        temp_descriptor, temp_identity = _open_activation_journal_temp(
+            temp_path
+        )
+        _write_recovery_backup(source_descriptor, temp_descriptor)
+        _fsync_recovery_backup(temp_descriptor)
+        os.close(source_descriptor)
+        source_descriptor = -1
+        os.close(temp_descriptor)
+        temp_descriptor = -1
+        assert temp_identity is not None
+        temp_capture = _capture_activation_file(
+            temp_path,
+            asset_kind="JOURNAL_CLOSURE",
+        )
+        if (
+            temp_capture.identity != temp_identity
+            or temp_capture.digest != expected_digest
+        ):
+            raise OSError("rollback temporary content mismatch")
+        os.replace(temp_path, destination)
+        published_identity = _activation_file_identity(destination)
+        _fsync_activation_file(destination, published_identity)
+        _fsync_activation_directory(destination.parent)
+        return published_identity
+    except ActivationPreparationError:
+        raise
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_RESTORE_FAILED",
+            retryable=True,
+        ) from error
+    finally:
+        if source_descriptor >= 0:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+        if temp_descriptor >= 0:
+            try:
+                os.close(temp_descriptor)
+            except OSError:
+                pass
+
+
+def _require_rollback_backups(
+    record: _ActivationJournalRecord,
+) -> tuple[tuple[Path, str], tuple[Path, str]]:
+    """Verify both journal-owned prior backups are present and intact.
+
+    The durable journal is the only surviving ownership locator, so each
+    backup path, identity, and digest comes from the journal record itself.
+    A missing or mutated backup (or a foreign/hardlinked entry) fails closed
+    before any mutation: without a restorable prior authority the pending
+    journal must stay recoverable for manual intervention.
+    """
+
+    if not record.had_prior_canonical:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_BACKUP_INVALID",
+            retryable=False,
+        )
+    owned: list[tuple[Path, str]] = []
+    for path, identity_value, digest_value in (
+        (
+            record.prior_db_backup_path,
+            record.prior_db_backup_identity,
+            record.prior_db_backup_digest,
+        ),
+        (
+            record.prior_manifest_backup_path,
+            record.prior_manifest_backup_identity,
+            record.prior_manifest_backup_digest,
+        ),
+    ):
+        if path is None or identity_value is None or digest_value is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        try:
+            observed = os.lstat(path)
+        except FileNotFoundError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            ) from error
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=True,
+            ) from error
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != identity_value
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        try:
+            capture = _capture_activation_file(
+                path,
+                asset_kind="JOURNAL_CLOSURE",
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            ) from error
+        if capture.digest != digest_value:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_BACKUP_INVALID",
+                retryable=False,
+            )
+        owned.append((path, digest_value))
+    return owned[0], owned[1]
+
+
+def _rollback_restored_prior_view(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    fts5_available: bool,
+) -> _SQLiteGenerationView:
+    """Build the one restored prior generation view for a rollback."""
+
+    prior_db_path = record.prior_db_path
+    prior_manifest_path = record.prior_manifest_path
+    assert prior_db_path is not None
+    assert prior_manifest_path is not None
+    if prior_db_path == identity.canonical_sidecar_path:
+        prior_ref: _CanonicalStoreRef | _PriorActivationRef = (
+            _canonical_activation_ref(
+                identity,
+                journal_id=record.journal_id,
+            )
+        )
+    else:
+        prior_ref = _PriorActivationRef(
+            stage_id=f"prior.{record.journal_id}",
+            resource_identity=identity,
+            staged_db_path=prior_db_path,
+            manifest_temp_path=prior_manifest_path,
+        )
+    return _SQLiteGenerationView(
+        stage=prior_ref,
+        canonical_store_id=canonical_store_id,
+        generation=(
+            0 if record.prior_generation is None else record.prior_generation
+        ),
+        fts5_available=fts5_available,
+    )
+
+
+def _recovery_artifact_seal_digest(
+    record: _ActivationJournalRecord,
+) -> str:
+    """Re-prove the journal's artifact seal digest from its own fields.
+
+    Mirrors ``tm_contracts._artifact_seal_digest`` exactly; the durable
+    journal is the only surviving token/artifact authority after a restart,
+    so the cross-field closure must hold without any in-memory registry.
+    """
+
+    return contract_module._stable_digest(
+        {
+            "artifact_id": record.artifact_id,
+            "canonical_store_id": record.canonical_store_id,
+            "evidence_digest": record.evidence_digest,
+            "manifest_temp_path": str(record.candidate_manifest_temp_path),
+            "registry_namespace": record.registry_namespace,
+            "resource_id": record.resource_id,
+            "staged_db_path": str(record.candidate_stage_db_path),
+            "target_identity": record.target_identity,
+        }
+    )
+
+
+def _recovery_sealed_stage_digest(
+    record: _ActivationJournalRecord,
+) -> str:
+    """Re-prove the journal's sealed stage digest from its own fields.
+
+    Mirrors ``tm_contracts._sealed_stage_contract_digest`` exactly and binds
+    the token nonce, artifact, evidence, and expected generation together.
+    """
+
+    return contract_module._stable_digest(
+        {
+            "activation_nonce": record.activation_nonce,
+            "artifact_id": record.artifact_id,
+            "artifact_seal_digest": record.artifact_seal_digest,
+            "canonical_store_id": record.canonical_store_id,
+            "evidence_digest": record.evidence_digest,
+            "expected_prior_generation": record.expected_prior_generation,
+            "registry_namespace": record.registry_namespace,
+            "resource_id": record.resource_id,
+            "snapshot_receipt_digest": record.snapshot_receipt_digest,
+            "target_identity": record.target_identity,
+        }
+    )
+
+
+def _recovery_expected_manifest_bytes(
+    receipt: SnapshotReceipt,
+) -> bytes:
+    """Deterministic adjacent manifest bytes for one activation receipt."""
+
+    manifest = SnapshotManifest(
+        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+        snapshot_kind=SnapshotKind.MIGRATION_SOURCE,
+        receipt=receipt,
+        receipt_digest=snapshot_receipt_digest(receipt),
+    )
+    return contract_to_json(manifest).encode("utf-8")
+
+
+def _recovery_jsonl_winners_digest(path: Path) -> str:
+    """Last-valid-wins exact winners digest over the configured JSONL."""
+
+    stage_sealer = importlib.import_module("tm_stage_sealer")
+    accepted_row = stage_sealer._accepted_jsonl_row
+
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+    winners: dict[str, str] = {}
+    with path.open("rb") as stream:
+        for raw_line in stream:
+            try:
+                decoded_line = raw_line.decode("utf-8")
+                payload = json.loads(
+                    decoded_line,
+                    parse_constant=reject_non_finite,
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ):
+                continue
+            row = accepted_row(payload)
+            if row is None:
+                continue
+            winners[row[0]] = row[1]
+    digest = hashlib.sha256()
+    for source_raw in sorted(winners):
+        for value in (source_raw, winners[source_raw]):
+            encoded = value.encode("utf-8")
+            digest.update(str(len(encoded)).encode("ascii"))
+            digest.update(b":")
+            digest.update(encoded)
+            digest.update(b";")
+    return digest.hexdigest()
+
+
+def _recover_activation_indexes(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    *,
+    fts5_available: bool,
+) -> None:
+    """Re-prove gram/FTS index closure without in-memory sealed evidence.
+
+    Gram sizes are fixed by the schema capability (1-2 with FTS5, 1-3 with
+    the fallback index), exactly as the StageSealer derives them, so the
+    per-record expected gram set and per-size counts are independently
+    recomputable from the records themselves.
+    """
+
+    required_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    expected_counts = {size: 0 for size in required_sizes}
+    gram_cursor = connection.execute(
+        "SELECT record_id, gram_size, gram FROM tm_gram "
+        "ORDER BY record_id, gram_size, gram"
+    )
+    current_gram = gram_cursor.fetchone()
+    for record_id, folded_source in connection.execute(
+        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+    ):
+        if type(record_id) is not int or type(folded_source) is not str:
+            raise port.store_schema_error("STORE.RECORD_INVALID")
+        actual: set[tuple[int, str]] = set()
+        while current_gram is not None and current_gram[0] == record_id:
+            gram_size, gram = current_gram[1], current_gram[2]
+            if type(gram_size) is not int or type(gram) is not str:
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+            actual.add((gram_size, gram))
+            current_gram = gram_cursor.fetchone()
+        expected = {
+            (size, gram)
+            for size in required_sizes
+            for gram in port.unique_character_ngrams(folded_source, size)
+        }
+        if actual != expected:
+            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+        for size, _gram in actual:
+            if size not in expected_counts:
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+            expected_counts[size] += 1
+    if current_gram is not None:
+        raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+    if fts5_available:
+        record_cursor = connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+        )
+        fts_cursor = connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
+        )
+        while True:
+            record_row = record_cursor.fetchone()
+            fts_row = fts_cursor.fetchone()
+            if record_row is None or fts_row is None:
+                if record_row != fts_row:
+                    raise port.store_schema_error(
+                        "STORE.CANDIDATE_INDEX_INVALID"
+                    )
+                break
+            if fts_row != record_row:
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+
+
+def _recovery_receipt_row(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+) -> tuple[SnapshotReceipt, str]:
+    """Read exactly one receipt ledger row; fail closed otherwise."""
+
+    rows = connection.execute(
+        "SELECT snapshot_id, resource_id, canonical_store_id, "
+        "exported_revision, jsonl_digest, record_count, format_version, "
+        "destination_jsonl_path, destination_manifest_path, status "
+        "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+    ).fetchall()
+    if len(rows) != 1:
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    row = rows[0]
+    if (
+        type(row[0]) is not str
+        or type(row[1]) is not str
+        or type(row[2]) is not str
+        or type(row[3]) is not int
+        or type(row[4]) is not str
+        or type(row[5]) is not int
+        or type(row[6]) is not str
+        or type(row[7]) is not str
+        or type(row[8]) is not str
+        or type(row[9]) is not str
+    ):
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    receipt = SnapshotReceipt(
+        snapshot_id=row[0],
+        resource_id=row[1],
+        canonical_store_id=row[2],
+        exported_revision=row[3],
+        jsonl_digest=row[4],
+        record_count=row[5],
+        format_version=row[6],
+    )
+    return receipt, row[9]
+
+
+def _recovery_completed_binding(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    record: _ActivationJournalRecord,
+) -> SnapshotBinding:
+    """Read the single completed binding and prove its journal closure."""
+
+    rows = connection.execute(
+        "SELECT b.configured_jsonl_path, b.manifest_path, "
+        "b.snapshot_kind, b.binding_version, "
+        "r.snapshot_id, r.resource_id, r.canonical_store_id, "
+        "r.exported_revision, r.jsonl_digest, r.record_count, "
+        "r.format_version, r.destination_jsonl_path, "
+        "r.destination_manifest_path, r.status "
+        "FROM tm_snapshot_binding AS b "
+        "LEFT JOIN tm_snapshot_receipt AS r "
+        "ON r.snapshot_id = b.snapshot_id "
+        "WHERE b.binding_id = 1"
+    ).fetchall()
+    if len(rows) != 1:
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    binding = port.binding_from_ledger_row(rows[0])
+    if rows[0][13] != "completed":
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    if (
+        binding.configured_jsonl_path != identity.configured_jsonl_path
+        or binding.manifest_path != identity.snapshot_manifest_path
+        or binding.receipt.resource_id != identity.resource_id
+        or binding.receipt.canonical_store_id != canonical_store_id
+        or binding.receipt.snapshot_id != record.new_receipt_id
+        or snapshot_receipt_digest(binding.receipt)
+        != record.snapshot_receipt_digest
+        or binding.receipt.jsonl_digest != record.source_jsonl_digest
+    ):
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    return binding
+
+
+def _preflight_recovered_manifest(
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Prove the DB_REPLACED manifest window before any receipt mutation.
+
+    The candidate temporary must still be exactly the journal's file, or
+    the final manifest must already be exactly the published new file
+    (crash after the replace, before the MANIFEST_PUBLISHED journal).
+    Anything else fail-stops before the receipt is touched.
+    """
+
+    try:
+        if _lstat_any_entry(record.candidate_manifest_temp_path):
+            temporary = _capture_journal_closure_file(
+                record.candidate_manifest_temp_path
+            )
+            if (
+                (temporary[0].device, temporary[0].inode)
+                != record.candidate_manifest_temp_identity
+                or temporary[1] != record.manifest_temp_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                    retryable=False,
+                )
+            return
+        published = _capture_journal_closure_file(
+            identity.snapshot_manifest_path
+        )
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+    if (
+        (published[0].device, published[0].inode)
+        != record.candidate_manifest_temp_identity
+        or published[1] != record.new_manifest_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+
+
+def _recovery_prior_completed_binding(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    record: _ActivationJournalRecord,
+) -> SnapshotBinding:
+    """Read the single completed prior binding and prove journal closure."""
+
+    rows = connection.execute(
+        "SELECT b.configured_jsonl_path, b.manifest_path, "
+        "b.snapshot_kind, b.binding_version, "
+        "r.snapshot_id, r.resource_id, r.canonical_store_id, "
+        "r.exported_revision, r.jsonl_digest, r.record_count, "
+        "r.format_version, r.destination_jsonl_path, "
+        "r.destination_manifest_path, r.status "
+        "FROM tm_snapshot_binding AS b "
+        "LEFT JOIN tm_snapshot_receipt AS r "
+        "ON r.snapshot_id = b.snapshot_id "
+        "WHERE b.binding_id = 1"
+    ).fetchall()
+    if len(rows) != 1:
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    binding = port.binding_from_ledger_row(rows[0])
+    if rows[0][13] != "completed":
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    if (
+        binding.configured_jsonl_path != identity.configured_jsonl_path
+        or binding.manifest_path != identity.snapshot_manifest_path
+        or binding.receipt.resource_id != identity.resource_id
+        or binding.receipt.canonical_store_id != canonical_store_id
+        or binding.receipt.snapshot_id != record.prior_binding_snapshot_id
+        or snapshot_receipt_digest(binding.receipt)
+        != record.prior_receipt_digest
+    ):
+        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+    return binding
+
+
+def _recovery_mismatch(
+    error: ActivationPreparationError,
+) -> ActivationPreparationError:
+    """Re-surface one non-recovery activation error as a Task 5.8 mismatch."""
+
+    if error.code.startswith("ACTIVATION.RECOVERY"):
+        return error
+    return ActivationPreparationError(
+        "ACTIVATION.RECOVERY_MISMATCH",
+        retryable=False,
+        reason_code=error.code,
+    )
+
+
+def _recovery_capture_journal_file(
+    path: Path,
+) -> tuple[_ActivationFileIdentity, str]:
+    """Capture one journal-closure file with a Task 5.8 fail-stop code."""
+
+    try:
+        return _capture_journal_closure_file(path)
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+
+
+def _revalidate_recovered_prior_set(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    allow_restored_identities: bool = False,
+) -> bool:
+    """Re-prove the prior DB/manifest/binding from disk.
+
+    The prior generation is exactly what a PREPARED cancellation restores,
+    so every journal-recorded prior fact (database, manifest, source,
+    binding receipt, generation) is re-captured and re-proven before the
+    journal is retired.  ``allow_restored_identities`` is the Task 5.9
+    rollback relaxation: a rollback restores the prior pair as byte-identical
+    copies from the journal-authenticated backups, which necessarily changes
+    the file identities while preserving every digest.  The strict mode
+    (unchanged prior, PREPARED cancellation) still binds the exact recorded
+    identities; the relaxed mode binds content digests plus the unchanged
+    source identity/digest.  Returns the prior database's FTS5 capability
+    for the restored view.
+    """
+
+    if not record.had_prior_canonical or record.prior_db_path is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MISMATCH",
+            retryable=False,
+        )
+    if record.prior_manifest_path != identity.snapshot_manifest_path:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MISMATCH",
+            retryable=False,
+        )
+    prior_db_path = record.prior_db_path
+    assert record.prior_manifest_path is not None
+    if prior_db_path == identity.canonical_sidecar_path:
+        prior_ref: _CanonicalStoreRef | _PriorActivationRef = (
+            _canonical_activation_ref(
+                identity,
+                journal_id=record.journal_id,
+            )
+        )
+    else:
+        prior_ref = _PriorActivationRef(
+            stage_id=f"prior.{record.journal_id}",
+            resource_identity=identity,
+            staged_db_path=prior_db_path,
+            manifest_temp_path=record.prior_manifest_path,
+        )
+    prior_view = _SQLiteGenerationView(
+        stage=prior_ref,
+        canonical_store_id=canonical_store_id,
+        generation=(
+            0 if record.prior_generation is None else record.prior_generation
+        ),
+        fts5_available=False,
+    )
+    try:
+        database, manifest, source = _capture_prior_assets(port,
+            prior_view,
+            identity=identity,
+        )
+        with port.open_configured_connection(
+            prior_db_path,
+            require_existing=True,
+        ) as connection:
+            meta = port.read_meta(connection)
+            prior_status = meta.get("activation_status")
+            if prior_status == "UNPUBLISHED":
+                if (
+                    record.prior_generation != 0
+                    or "activation_digest" in meta
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVATION_STATE_INVALID"
+                    )
+            elif prior_status == "ACTIVE":
+                if (
+                    port.meta_int(meta, "generation")
+                    != record.prior_generation
+                    or meta.get("activation_digest") is None
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVATION_STATE_INVALID"
+                    )
+            else:
+                raise port.store_schema_error(
+                    "STORE.ACTIVATION_STATE_INVALID"
+                )
+            _recovery_prior_completed_binding(port,
+                connection,
+                identity=identity,
+                canonical_store_id=canonical_store_id,
+                record=record,
+            )
+            fts5_available = port.meta_bool(meta, "fts5_available")
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+    except (OSError, sqlite3.Error, port.store_schema_error) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
+            retryable=False,
+            reason_code=getattr(error, "error_code", None),
+        ) from error
+    if (
+        database.digest != record.prior_db_digest
+        or manifest.digest != record.prior_manifest_digest
+        or (source.identity.device, source.identity.inode)
+        != record.source_jsonl_identity
+        or source.digest != record.source_jsonl_digest
+        or (
+            not allow_restored_identities
+            and (
+                (database.identity.device, database.identity.inode)
+                != record.prior_db_identity
+                or (manifest.identity.device, manifest.identity.inode)
+                != record.prior_manifest_identity
+            )
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
+            retryable=False,
+        )
+    return fts5_available
+
+
+def _revalidate_recovered_sealed_database(
+    record: _ActivationJournalRecord,
+    *,
+    stage_ref: _StoreRuntimeRef,
+    database_path: Path,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+) -> None:
+    """Re-prove the full sealed evidence digest from disk for one DB.
+
+    The candidate (PREPARED) or freshly replaced (DB_REPLACED, still SEALED)
+    database is reopened and every seal-relevant fact is recomputed, the
+    receipt is read from the ledger, the temporary manifest bytes are
+    re-derived, and the complete evidence digest must equal the journal's
+    durable ``evidence_digest``.  This anchors record counts, indexes, exact
+    parity, and the source binding to the journal without any in-memory
+    sealed stage.
+    """
+
+    stage_sealer = importlib.import_module("tm_stage_sealer")
+    database_capture = _capture_journal_closure_file(database_path)
+    if (
+        (database_capture[0].device, database_capture[0].inode)
+        != record.candidate_stage_db_identity
+        or database_capture[1] != record.stage_db_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        )
+    try:
+        facts = stage_sealer._validate_stage_facts(
+            cast(MutableStageRef, cast(object, stage_ref)),
+            canonical_store_id=canonical_store_id,
+            allow_sealed=True,
+        )
+    except Exception as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+            reason_code=getattr(error, "error_code", None),
+        ) from error
+    receipt = facts.receipt
+    if (
+        receipt.snapshot_id != record.new_receipt_id
+        or snapshot_receipt_digest(receipt) != record.snapshot_receipt_digest
+        or receipt.jsonl_digest != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        )
+    manifest_capture = _capture_activation_file(
+        record.candidate_manifest_temp_path,
+        asset_kind="MANIFEST",
+    )
+    if (
+        (
+            manifest_capture.identity.device,
+            manifest_capture.identity.inode,
+        )
+        != record.candidate_manifest_temp_identity
+        or manifest_capture.digest != record.manifest_temp_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            retryable=False,
+        )
+    manifest_bytes = _read_activation_file_bytes(manifest_capture)
+    expected_manifest_bytes = _recovery_expected_manifest_bytes(receipt)
+    if manifest_bytes != expected_manifest_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        )
+    try:
+        manifest = contract_from_json(manifest_bytes.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        ) from error
+    if type(manifest) is not SnapshotManifest:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        )
+    binding = stage_sealer._build_binding(identity, receipt, manifest)
+    evidence = stage_sealer._build_evidence(
+        facts,
+        binding,
+        stage_file_digest=record.stage_db_digest,
+        manifest_temp_digest=record.manifest_temp_digest,
+    )
+    if (
+        contract_module.stage_validation_evidence_digest(evidence)
+        != record.evidence_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+            retryable=False,
+        )
+
+
+def _revalidate_recovered_active_set(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    next_generation: int,
+    activation_digest: str,
+    require_manifest_published: bool,
+) -> Any:
+    """Re-prove one complete published new DB/receipt/binding/manifest set.
+
+    Every expectation is re-derived from the durable journal and the active
+    ledger (receipt/binding), the published manifest file, and the configured
+    JSONL; record counts, exact winners parity, indexes, ancestry, and the
+    configured pair are recomputed from disk.  A manifest still waiting to be
+    published (DB_REPLACED recovery window) only skips the manifest-file
+    diagnostics.
+    """
+
+    database = _recovery_capture_journal_file(
+        identity.canonical_sidecar_path
+    )
+    if (
+        (database[0].device, database[0].inode)
+        != record.candidate_stage_db_identity
+        or _lstat_any_entry(record.candidate_stage_db_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    if require_manifest_published:
+        manifest = _recovery_capture_journal_file(
+            identity.snapshot_manifest_path
+        )
+        if (
+            (manifest[0].device, manifest[0].inode)
+            != record.candidate_manifest_temp_identity
+            or manifest[1] != record.new_manifest_digest
+            or _lstat_any_entry(record.candidate_manifest_temp_path)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                retryable=False,
+            )
+    active_ref = _canonical_activation_ref(
+        identity,
+        journal_id=record.journal_id,
+    )
+    try:
+        snapshot = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=next_generation,
+            _expected_activation_digest=activation_digest,
+        )
+        with port.open_configured_connection(
+            identity.canonical_sidecar_path,
+            require_existing=True,
+        ) as connection:
+            connection.execute("BEGIN")
+            try:
+                port.validate_store_identity(
+                    connection,
+                    resource_id=identity.resource_id,
+                    canonical_store_id=canonical_store_id,
+                    target_identity=identity.target_identity,
+                )
+                if connection.execute("PRAGMA integrity_check").fetchall() != [
+                    ("ok",)
+                ]:
+                    raise port.store_schema_error(
+                        "STORE.INTEGRITY_CHECK_FAILED"
+                    )
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise port.store_schema_error(
+                        "STORE.FOREIGN_KEY_CHECK_FAILED"
+                    )
+                lease = _SQLiteGenerationView(
+                    stage=active_ref,
+                    canonical_store_id=canonical_store_id,
+                    generation=next_generation,
+                    fts5_available=snapshot.fts5_available,
+                )
+                facts = port.read_source_binding_facts_in_transaction(
+                    connection,
+                    lease,
+                )
+                if (
+                    facts.binding is None
+                    or facts.divergence_latched
+                    or facts.diagnostic_codes
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    )
+                binding = facts.binding
+                if (
+                    binding.receipt.snapshot_id != record.new_receipt_id
+                    or snapshot_receipt_digest(binding.receipt)
+                    != record.snapshot_receipt_digest
+                    or binding.receipt.jsonl_digest
+                    != record.source_jsonl_digest
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    )
+                if port.table_count(connection, "tm_record") != (
+                    binding.receipt.record_count
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
+                jsonl_parity = _recovery_jsonl_winners_digest(
+                    identity.configured_jsonl_path
+                )
+                if (
+                    _activation_exact_parity_digest(port, connection)
+                    != jsonl_parity
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_COUNT_MISMATCH"
+                    )
+                _recover_activation_indexes(port,
+                    connection,
+                    fts5_available=snapshot.fts5_available,
+                )
+                pair_diagnostics = port.configured_pair_diagnostics(
+                    binding,
+                    identity=identity,
+                    canonical_store_id=canonical_store_id,
+                    head_revision=facts.head_revision,
+                    cumulative_record_counts=facts.cumulative_record_counts,
+                )
+                allowed_manifest_codes = (
+                    frozenset()
+                    if require_manifest_published
+                    else frozenset(
+                        {
+                            "SOURCE_BINDING.MANIFEST_MISSING",
+                            "SOURCE_BINDING.MANIFEST_UNREADABLE",
+                            "SOURCE_BINDING.MANIFEST_MISMATCH",
+                            "SOURCE_BINDING.MANIFEST_INVALID",
+                        }
+                    )
+                )
+                unexpected = tuple(
+                    code
+                    for code in pair_diagnostics
+                    if code not in allowed_manifest_codes
+                )
+                if unexpected:
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+    except Exception as error:
+        if isinstance(error, ActivationPreparationError):
+            raise
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        ) from error
+    return snapshot
+
+
+def _revalidate_discovered_active_set(
+    port: _StoreValidationPort,
+    identity: CanonicalResourceIdentity,
+    *,
+    canonical_store_id: str,
+) -> tuple[int, bool]:
+    """Re-prove one complete active canonical generation from disk alone.
+
+    Task 5.8 terminal authority when no journal survives: the deterministic
+    canonical sidecar and adjacent manifest must form one fully completed
+    activation.  Every fact (schema, meta generation/activation digest,
+    integrity, receipt/binding closure, manifest bytes, exact parity, and
+    index closure) is recomputed from disk and must agree before the
+    generation view is authorized; a foreign or tampered pair fails closed
+    and never authorizes a store.  Returns ``(generation, fts5_available)``.
+    """
+
+    try:
+        db_path = identity.canonical_sidecar_path
+        manifest_path = identity.snapshot_manifest_path
+        if not _lstat_any_entry(db_path):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                retryable=False,
+            )
+        if not _lstat_any_entry(manifest_path):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                retryable=False,
+            )
+        active_ref = _canonical_activation_ref(
+            identity,
+            journal_id="discovery",
+        )
+        with port.open_configured_connection(
+            db_path,
+            require_existing=True,
+        ) as connection:
+            meta = port.read_meta(connection)
+            if meta.get("activation_status") != "ACTIVE":
+                raise port.store_schema_error(
+                    "STORE.ACTIVATION_STATE_INVALID"
+                )
+            generation = port.meta_int(meta, "generation")
+            activation_digest = meta.get("activation_digest")
+            if (
+                type(activation_digest) is not str
+                or len(activation_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in activation_digest
+                )
+            ):
+                raise port.store_schema_error(
+                    "STORE.ACTIVATION_STATE_INVALID"
+                )
+        snapshot = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=generation,
+            _expected_activation_digest=activation_digest,
+        )
+        with port.open_configured_connection(
+            db_path,
+            require_existing=True,
+        ) as connection:
+            connection.execute("BEGIN")
+            try:
+                port.validate_store_identity(
+                    connection,
+                    resource_id=identity.resource_id,
+                    canonical_store_id=canonical_store_id,
+                    target_identity=identity.target_identity,
+                )
+                if connection.execute("PRAGMA integrity_check").fetchall() != [
+                    ("ok",)
+                ]:
+                    raise port.store_schema_error(
+                        "STORE.INTEGRITY_CHECK_FAILED"
+                    )
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise port.store_schema_error(
+                        "STORE.FOREIGN_KEY_CHECK_FAILED"
+                    )
+                lease = _SQLiteGenerationView(
+                    stage=active_ref,
+                    canonical_store_id=canonical_store_id,
+                    generation=generation,
+                    fts5_available=snapshot.fts5_available,
+                )
+                facts = port.read_source_binding_facts_in_transaction(
+                    connection,
+                    lease,
+                )
+                if (
+                    facts.binding is None
+                    or facts.divergence_latched
+                    or facts.diagnostic_codes
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    )
+                binding = facts.binding
+                receipt_row, receipt_status = _recovery_receipt_row(port,
+                    connection
+                )
+                if (
+                    receipt_status != "completed"
+                    or receipt_row != binding.receipt
+                ):
+                    raise port.store_schema_error("STORE.RECEIPT_INVALID")
+                if port.table_count(connection, "tm_record") != (
+                    binding.receipt.record_count
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
+                if _recovery_jsonl_winners_digest(
+                    identity.configured_jsonl_path
+                ) != _activation_exact_parity_digest(port, connection):
+                    raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
+                _recover_activation_indexes(port,
+                    connection,
+                    fts5_available=snapshot.fts5_available,
+                )
+                pair_diagnostics = port.configured_pair_diagnostics(
+                    binding,
+                    identity=identity,
+                    canonical_store_id=canonical_store_id,
+                    head_revision=facts.head_revision,
+                    cumulative_record_counts=facts.cumulative_record_counts,
+                )
+                if pair_diagnostics:
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+    except ActivationPreparationError as error:
+        raise error
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_DISCOVERY_FAILED",
+            retryable=True,
+        ) from error
+    except Exception as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+            reason_code=getattr(error, "error_code", None),
+        ) from error
+    return generation, snapshot.fts5_available
+
+
+def _complete_recovered_receipt(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    next_generation: int,
+    activation_digest: str,
+) -> None:
+    """Idempotently finish the issued receipt/binding publication.
+
+    A SEALED database still holding the exact issued receipt is completed in
+    one transaction (receipt completed, binding inserted, ACTIVE, generation,
+    activation digest); an already ACTIVE database whose completed
+    receipt/binding and meta exactly match the journal is accepted without
+    rewriting.  Both branches fsync the database and revalidate its identity.
+    """
+
+    canonical_capture = _capture_journal_closure_file(
+        identity.canonical_sidecar_path
+    )
+    if (
+        (canonical_capture[0].device, canonical_capture[0].inode)
+        != record.candidate_stage_db_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+    try:
+        with port.open_configured_connection(
+            identity.canonical_sidecar_path,
+            require_existing=True,
+        ) as connection:
+            connection.execute("BEGIN")
+            try:
+                meta = port.read_meta(connection)
+                status = meta.get("activation_status")
+                if status == "SEALED":
+                    if canonical_capture[1] != record.stage_db_digest:
+                        raise port.store_schema_error(
+                            "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    receipt, receipt_status = _recovery_receipt_row(port,
+                        connection
+                    )
+                    if receipt_status != "issued":
+                        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+                    if (
+                        receipt.snapshot_id != record.new_receipt_id
+                        or snapshot_receipt_digest(receipt)
+                        != record.snapshot_receipt_digest
+                        or receipt.jsonl_digest != record.source_jsonl_digest
+                        or receipt.resource_id != identity.resource_id
+                        or receipt.canonical_store_id != canonical_store_id
+                    ):
+                        raise port.store_schema_error("STORE.RECEIPT_INVALID")
+                    if connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_binding"
+                    ).fetchone() != (0,):
+                        raise port.store_schema_error("STORE.BINDING_INVALID")
+                    if (
+                        port.meta_int(meta, "generation") != 0
+                        or "activation_digest" in meta
+                    ):
+                        raise port.store_schema_error(
+                            "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    connection.commit()
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        current_meta = port.read_meta(connection)
+                        if (
+                            current_meta.get("activation_status")
+                            != "SEALED"
+                            or port.meta_int(current_meta, "generation") != 0
+                            or "activation_digest" in current_meta
+                        ):
+                            raise port.store_schema_error(
+                                "STORE.ACTIVATION_STATE_INVALID"
+                            )
+                        current_receipt, current_status = (
+                            _recovery_receipt_row(port, connection)
+                        )
+                        if (
+                            current_receipt != receipt
+                            or current_status != "issued"
+                        ):
+                            raise port.store_schema_error(
+                                "STORE.RECEIPT_INVALID"
+                            )
+                        updated = connection.execute(
+                            "UPDATE tm_snapshot_receipt SET status = "
+                            "'completed' WHERE snapshot_id = ? "
+                            "AND status = 'issued'",
+                            (receipt.snapshot_id,),
+                        )
+                        if updated.rowcount != 1:
+                            raise port.store_schema_error(
+                                "STORE.RECEIPT_INVALID"
+                            )
+                        connection.execute(
+                            "INSERT INTO tm_snapshot_binding("
+                            "binding_id, configured_jsonl_path, "
+                            "manifest_path, snapshot_kind, snapshot_id, "
+                            "binding_version) VALUES (1, ?, ?, ?, ?, ?)",
+                            (
+                                Path.__str__(identity.configured_jsonl_path),
+                                Path.__str__(
+                                    identity.snapshot_manifest_path
+                                ),
+                                SnapshotKind.MIGRATION_SOURCE.value,
+                                receipt.snapshot_id,
+                                contract_module.SNAPSHOT_BINDING_VERSION,
+                            ),
+                        )
+                        status = connection.execute(
+                            "UPDATE tm_meta SET value = 'ACTIVE' "
+                            "WHERE key = 'activation_status' "
+                            "AND value = 'SEALED'"
+                        )
+                        generation = connection.execute(
+                            "UPDATE tm_meta SET value = ? "
+                            "WHERE key = 'generation' AND value = '0'",
+                            (str(next_generation),),
+                        )
+                        connection.execute(
+                            "INSERT INTO tm_meta(key, value) VALUES "
+                            "('activation_digest', ?)",
+                            (activation_digest,),
+                        )
+                        if status.rowcount != 1 or generation.rowcount != 1:
+                            raise port.store_schema_error(
+                                "STORE.ACTIVATION_STATE_INVALID"
+                            )
+                        connection.commit()
+                    except BaseException:
+                        connection.rollback()
+                        raise
+                elif status == "ACTIVE":
+                    _ = _recovery_completed_binding(port,
+                        connection,
+                        identity=identity,
+                        canonical_store_id=canonical_store_id,
+                        record=record,
+                    )
+                    if (
+                        port.meta_int(meta, "generation") != next_generation
+                        or meta.get("activation_digest") != activation_digest
+                    ):
+                        raise port.store_schema_error(
+                            "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                else:
+                    raise port.store_schema_error(
+                        "STORE.ACTIVATION_STATE_INVALID"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        after = _activation_file_identity(identity.canonical_sidecar_path)
+        if after != canonical_capture[0]:
+            raise OSError("canonical identity changed")
+        _fsync_activation_file(identity.canonical_sidecar_path, after)
+    except Exception as error:
+        if isinstance(error, ActivationPreparationError):
+            raise
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_RECEIPT_FAILED",
+            retryable=True,
+        ) from error
+
+
+def _complete_recovered_manifest(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+) -> None:
+    """Idempotently finish the adjacent manifest publication.
+
+    The candidate temporary manifest must match the journal exactly and its
+    bytes must equal the deterministic manifest for the completed ledger
+    receipt.  An already-published manifest (crash after the replace, before
+    the MANIFEST_PUBLISHED journal) is revalidated in place without the
+    temporary; otherwise the temporary is atomically replaced, fsynced, and
+    revalidated.  A missing temporary with a missing or prior-owned final is
+    tamper and fails closed, preserving the journal and backups.
+    """
+
+    with port.open_configured_connection(
+        identity.canonical_sidecar_path,
+        require_existing=True,
+    ) as connection:
+        connection.execute("BEGIN")
+        try:
+            receipt, receipt_status = _recovery_receipt_row(port, connection)
+            if receipt_status != "completed":
+                raise port.store_schema_error("STORE.RECEIPT_INVALID")
+            if (
+                receipt.snapshot_id != record.new_receipt_id
+                or snapshot_receipt_digest(receipt)
+                != record.snapshot_receipt_digest
+                or receipt.jsonl_digest != record.source_jsonl_digest
+            ):
+                raise port.store_schema_error("STORE.RECEIPT_INVALID")
+        finally:
+            connection.rollback()
+    expected_bytes = _recovery_expected_manifest_bytes(receipt)
+    final_path = identity.snapshot_manifest_path
+    if not _lstat_any_entry(record.candidate_manifest_temp_path):
+        try:
+            final_capture = _capture_activation_file(
+                final_path,
+                asset_kind="MANIFEST",
+            )
+            final_bytes = _read_activation_file_bytes(final_capture)
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                retryable=False,
+            ) from error
+        if (
+            (
+                final_capture.identity.device,
+                final_capture.identity.inode,
+            )
+            != record.candidate_manifest_temp_identity
+            or final_capture.digest != record.new_manifest_digest
+            or final_bytes != expected_bytes
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                retryable=False,
+            )
+        _fsync_activation_file(final_path, final_capture.identity)
+        return
+    manifest_temp = _capture_activation_file(
+        record.candidate_manifest_temp_path,
+        asset_kind="MANIFEST",
+    )
+    if (
+        (
+            manifest_temp.identity.device,
+            manifest_temp.identity.inode,
+        )
+        != record.candidate_manifest_temp_identity
+        or manifest_temp.digest != record.manifest_temp_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+    temp_bytes = _read_activation_file_bytes(manifest_temp)
+    if temp_bytes != expected_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+    if _lstat_any_entry(final_path):
+        final_capture = _capture_activation_file(
+            final_path,
+            asset_kind="MANIFEST",
+        )
+        published = (
+            (
+                final_capture.identity.device,
+                final_capture.identity.inode,
+            )
+            == record.candidate_manifest_temp_identity
+            and final_capture.digest == record.new_manifest_digest
+        )
+        if published:
+            if _read_activation_file_bytes(final_capture) != expected_bytes:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                    retryable=False,
+                )
+            _fsync_activation_file(final_path, final_capture.identity)
+            return
+        if record.had_prior_canonical:
+            if (
+                (
+                    final_capture.identity.device,
+                    final_capture.identity.inode,
+                )
+                != record.prior_manifest_identity
+                or final_capture.digest != record.prior_manifest_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                    retryable=False,
+                )
+        else:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+                retryable=False,
+            )
+    elif record.had_prior_canonical:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+    try:
+        _replace_activation_file(record.candidate_manifest_temp_path, final_path)
+        _fsync_activation_directory(final_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MANIFEST_FAILED",
+            retryable=True,
+        ) from error
+    final_capture = _capture_activation_file(
+        final_path,
+        asset_kind="MANIFEST",
+    )
+    if (
+        final_capture.identity != manifest_temp.identity
+        or final_capture.digest != record.new_manifest_digest
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+    if _read_activation_file_bytes(final_capture) != expected_bytes:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_COMPLETION_INVALID",
+            retryable=False,
+        )
+
+
+def _capture_journal_closure_file(
+    path: Path,
+) -> tuple[_ActivationFileIdentity, str]:
+    try:
+        capture = _capture_activation_file(path, asset_kind="JOURNAL_CLOSURE")
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    return capture.identity, capture.digest
+
+
+def _rollback_inconsistent_activation(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    journal_identity: _ActivationFileIdentity,
+) -> ActivationRecoveryReport:
+    """Restore exactly one complete prior/legacy authority (Task 5.9).
+
+    Called when the durable journal authenticates but the new
+    DB/receipt/binding/manifest/effect closure cannot be proven at any
+    pending phase.  With a prior canonical generation the journal-owned
+    backups restore the prior DB and prior manifest/binding as one set
+    (atomic replace, file fsync, directory fsync, then full
+    schema/identity/integrity/FK/count/receipt/binding/index/source
+    revalidation); without a prior canonical every journal-owned failed
+    sidecar/manifest/candidate/temporary artifact is quarantined
+    deterministically and the configured JSONL remains the legacy
+    authority.  Only after the restored/legacy authority is durable and
+    revalidated is the PREPARED prior-closure terminal published, the
+    main journal retired, and the journal-owned backups removed, so a
+    crash at every boundary resumes idempotently and repeated rollback
+    never creates a generation or duplicates quarantine.
+    """
+
+    identity = port.resource_identity
+    canonical_store_id = port.canonical_store_id
+    source = _recovery_capture_journal_file(
+        identity.configured_jsonl_path
+    )
+    if (
+        (source[0].device, source[0].inode)
+        != record.source_jsonl_identity
+        or source[1] != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            retryable=False,
+        )
+    _quarantine_failed_activation_artifacts(
+        record,
+        identity=identity,
+    )
+    if not record.had_prior_canonical:
+        try:
+            _require_first_activation_absence(identity)
+        except ActivationPreparationError as error:
+            raise _recovery_mismatch(error) from error
+        fts5_available = False
+        prior_generation = None
+        terminal_record = replace(
+            record,
+            phase=_ActivationJournalPhase.PREPARED,
+        )
+    else:
+        if (
+            record.prior_db_path is None
+            or record.prior_manifest_path is None
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_MISMATCH",
+                retryable=False,
+            )
+        try:
+            fts5_available = _revalidate_recovered_prior_set(port,
+                record,
+                identity=identity,
+                canonical_store_id=canonical_store_id,
+                allow_restored_identities=True,
+            )
+        except ActivationPreparationError:
+            db_backup, manifest_backup = _require_rollback_backups(record)
+            _restore_activation_file(
+                record,
+                db_backup[0],
+                db_backup[1],
+                record.prior_db_path,
+            )
+            _restore_activation_file(
+                record,
+                manifest_backup[0],
+                manifest_backup[1],
+                record.prior_manifest_path,
+            )
+            fts5_available = _revalidate_recovered_prior_set(port,
+                record,
+                identity=identity,
+                canonical_store_id=canonical_store_id,
+                allow_restored_identities=True,
+            )
+        db_identity = _recovery_capture_journal_file(
+            record.prior_db_path
+        )[0]
+        manifest_identity = _recovery_capture_journal_file(
+            record.prior_manifest_path
+        )[0]
+        terminal_record = replace(
+            record,
+            phase=_ActivationJournalPhase.PREPARED,
+            prior_db_identity=(db_identity.device, db_identity.inode),
+            prior_manifest_identity=(
+                manifest_identity.device,
+                manifest_identity.inode,
+            ),
+        )
+        prior_generation = record.prior_generation
+    _retire_coexisting_terminal(port, record)
+    _ = port.write_terminal(terminal_record)
+    _remove_owned_activation_journal_final(
+        _activation_journal_path(identity),
+        journal_identity,
+    )
+    _remove_journal_proven_backups(record)
+    if record.had_prior_canonical:
+        port.view = _rollback_restored_prior_view(
+            record,
+            identity=identity,
+            canonical_store_id=canonical_store_id,
+            fts5_available=fts5_available,
+        )
+    else:
+        port.view = None
+    return ActivationRecoveryReport(
+        phase=record.phase.value,
+        action="ROLLED_BACK",
+        generation=prior_generation,
+    )
+
+
+def _discover_active_canonical(
+    port: _StoreValidationPort,
+) -> ActivationRecoveryReport | None:
+    """Re-prove and rehydrate the active canonical generation (no journal).
+
+    With no journal on disk the deterministic canonical sidecar/manifest
+    pair is the only surviving authority.  A fully validated completed
+    activation is hydrated into the one in-memory view and reported as a
+    terminal COMPLETED; an absent pair is the unchanged legacy state
+    (``None``); anything partial, foreign, or tampered fails closed in
+    ``ACTIVATING`` and never authorizes a store.
+    """
+
+    identity = port.resource_identity
+    if (
+        not _lstat_any_entry(identity.canonical_sidecar_path)
+        and not _lstat_any_entry(identity.snapshot_manifest_path)
+    ):
+        return None
+    try:
+        generation, fts5_available = _revalidate_discovered_active_set(port,
+            identity,
+            canonical_store_id=port.canonical_store_id,
+        )
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_DISCOVERY_FAILED",
+            retryable=True,
+        ) from error
+    port.view = _SQLiteGenerationView(
+        stage=_canonical_activation_ref(
+            identity,
+            journal_id="discovery",
+        ),
+        canonical_store_id=port.canonical_store_id,
+        generation=generation,
+        fts5_available=fts5_available,
+    )
+    return ActivationRecoveryReport(
+        phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
+        action="COMPLETED",
+        generation=generation,
+    )
+
+
+def _load_recovery_journal(
+    port: _StoreValidationPort,
+    journal_path: Path,
+    journal_identity: _ActivationFileIdentity,
+    *,
+    expected_record_journal_path: Path | None = None,
+) -> _ActivationJournalRecord:
+    """Durably read and strictly parse one pending recovery journal."""
+
+    if expected_record_journal_path is None:
+        expected_record_journal_path = journal_path
+    try:
+        disk_bytes, disk_identity = _read_activation_journal_file(
+            journal_path,
+            journal_identity,
+        )
+        disk_record = _parse_activation_journal_bytes(
+            disk_bytes,
+            expected_journal_path=expected_record_journal_path,
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    try:
+        _fsync_activation_directory(journal_path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        fsynced_bytes, fsynced_identity = _read_activation_journal_file(
+            journal_path,
+            disk_identity,
+        )
+        fsynced_record = _parse_activation_journal_bytes(
+            fsynced_bytes,
+            expected_journal_path=expected_record_journal_path,
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if (
+        fsynced_bytes != disk_bytes
+        or fsynced_identity != disk_identity
+        or fsynced_record != disk_record
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            retryable=False,
+        )
+    return fsynced_record
+
+
+def _load_recovery_terminal(
+    port: _StoreValidationPort,
+    terminal_path: Path,
+    terminal_identity: _ActivationFileIdentity,
+) -> _ActivationJournalRecord:
+    """Durably read and strictly parse one terminal record.
+
+    The terminal file mirrors the full authenticated main journal
+    closure, so the record's own ``journal_path`` must still close the
+    deterministic main journal path; the terminal file's own identity is
+    proven by the caller-provided lstat identity.
+    """
+
+    try:
+        return _load_recovery_journal(port,
+            terminal_path,
+            terminal_identity,
+            expected_record_journal_path=_activation_journal_path(
+                port.resource_identity
+            ),
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+
+
+def _coexisting_terminal(
+    port: _StoreValidationPort,
+    main_record: _ActivationJournalRecord,
+) -> tuple[_ActivationFileIdentity, _ActivationJournalRecord] | None:
+    """Load and rule-validate a coexisting terminal record, if any.
+
+    Returns ``None`` when no terminal file exists; otherwise the exact
+    terminal identity plus its fully re-proven record.  A foreign or
+    tampered terminal (or any coexistence that does not close the same
+    canonical state) fails closed and is never used or overwritten.
+    """
+
+    terminal_path = _activation_terminal_path(port.resource_identity)
+    try:
+        terminal_identity = _lstat_activation_terminal_identity(
+            terminal_path
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if terminal_identity is None:
+        return None
+    terminal_record = _load_recovery_terminal(port,
+        terminal_path,
+        terminal_identity,
+    )
+    _revalidate_recovery_authority(port,
+        terminal_record,
+        check_view=False,
+    )
+    if not _activation_terminal_coexistence_valid(
+        main_record,
+        terminal_record,
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+            retryable=False,
+        )
+    return terminal_identity, terminal_record
+
+
+def _retire_coexisting_terminal(
+    port: _StoreValidationPort,
+    main_record: _ActivationJournalRecord,
+) -> None:
+    """Strictly retire a validated coexisting terminal record.
+
+    Called only after the pending main journal (or the new CANCELLED
+    terminal) is durable and revalidated, so the prior terminal may be
+    retired without ever leaving the resource without a valid authority.
+    """
+
+    coexisting = _coexisting_terminal(port, main_record)
+    if coexisting is None:
+        return
+    terminal_identity, _terminal_record = coexisting
+    _remove_owned_activation_terminal_final(
+        _activation_terminal_path(port.resource_identity),
+        terminal_identity,
+    )
+
+
+def _revalidate_recovery_authority(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    *,
+    check_view: bool = True,
+) -> None:
+    """Re-prove the journal's coordinator and token authority.
+
+    The journal is the only surviving authority after a restart, so its
+    identity bindings, nonce/artifact/sealed-stage digest closure, prior
+    coherence, path containment, and any live view lineage are re-proven
+    before any phase may mutate disk state.  ``check_view`` may be
+    disabled only for a coexisting terminal record whose consistency is
+    already governed by the deterministic coexistence rule against the
+    validated pending main journal.
+    """
+
+    identity = port.resource_identity
+    if (
+        record.journal_version != _ACTIVATION_JOURNAL_VERSION
+        or record.journal_id != f"journal.{record.preparation_id}"
+        or record.journal_path != _activation_journal_path(identity)
+        or record.resource_id != identity.resource_id
+        or record.target_identity != identity.target_identity
+        or record.canonical_store_id != port.canonical_store_id
+        or record.registry_namespace
+        != f"coordinator.{identity.target_identity}"
+        or record.new_manifest_path != identity.snapshot_manifest_path
+        or record.expected_prior_generation != record.prior_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MISMATCH",
+            retryable=False,
+        )
+    if record.had_prior_canonical:
+        if (
+            record.expected_prior_generation is None
+            or record.prior_db_path is None
+            or record.prior_db_digest is None
+            or record.prior_db_identity is None
+            or record.prior_manifest_path is None
+            or record.prior_manifest_digest is None
+            or record.prior_manifest_identity is None
+            or record.prior_binding_snapshot_id is None
+            or record.prior_receipt_digest is None
+            or record.prior_db_backup_path is None
+            or record.prior_db_backup_digest is None
+            or record.prior_db_backup_identity is None
+            or record.prior_manifest_backup_path is None
+            or record.prior_manifest_backup_digest is None
+            or record.prior_manifest_backup_identity is None
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_MISMATCH",
+                retryable=False,
+            )
+    else:
+        for value in (
+            record.expected_prior_generation,
+            record.prior_generation,
+            record.prior_db_path,
+            record.prior_db_digest,
+            record.prior_db_identity,
+            record.prior_manifest_path,
+            record.prior_manifest_digest,
+            record.prior_manifest_identity,
+            record.prior_binding_snapshot_id,
+            record.prior_receipt_digest,
+            record.prior_db_backup_path,
+            record.prior_db_backup_digest,
+            record.prior_db_backup_identity,
+            record.prior_manifest_backup_path,
+            record.prior_manifest_backup_digest,
+            record.prior_manifest_backup_identity,
+        ):
+            if value is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_MISMATCH",
+                    retryable=False,
+                )
+    canonical_dir = identity.canonical_sidecar_path.parent
+    manifest_dir = identity.snapshot_manifest_path.parent
+    if (
+        record.candidate_stage_db_path.parent != canonical_dir
+        or record.candidate_manifest_temp_path.parent != manifest_dir
+        or (
+            record.prior_db_path is not None
+            and record.prior_db_path.parent != canonical_dir
+        )
+        or (
+            record.prior_manifest_path is not None
+            and record.prior_manifest_path.parent != manifest_dir
+        )
+        or (
+            record.prior_db_backup_path is not None
+            and record.prior_db_backup_path.parent != canonical_dir
+        )
+        or (
+            record.prior_manifest_backup_path is not None
+            and record.prior_manifest_backup_path.parent != manifest_dir
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MISMATCH",
+            retryable=False,
+        )
+    if (
+        _recovery_artifact_seal_digest(record)
+        != record.artifact_seal_digest
+        or _recovery_sealed_stage_digest(record)
+        != record.sealed_stage_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TOKEN_AUTHORITY_INVALID",
+            retryable=False,
+        )
+    if check_view and port.view is not None:
+        if record.phase is _ActivationJournalPhase.GENERATION_PUBLISHED:
+            expected_view_generation = (
+                0
+                if record.expected_prior_generation is None
+                else record.expected_prior_generation + 1
+            )
+            if (
+                port.view.stage.staged_db_path
+                != identity.canonical_sidecar_path
+                or port.view.generation != expected_view_generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_VIEW_MISMATCH",
+                    retryable=False,
+                )
+        elif (
+            not record.had_prior_canonical
+            or record.prior_db_path is None
+            or port.view.stage.staged_db_path != record.prior_db_path
+            or port.view.generation != record.prior_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_VIEW_MISMATCH",
+                retryable=False,
+            )
+
+
+def _complete_prepared_cancellation(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    journal_identity: _ActivationFileIdentity,
+) -> ActivationRecoveryReport:
+    """Cancel exactly one still-PREPARED activation (Task 5.8).
+
+    The candidate DB/manifest must still be exactly the journal's files
+    (nothing was replaced), the source must be unchanged, and the prior
+    generation must be intact and healthy.  Only then is the CANCELLED
+    terminal record durably published (retaining the full authenticated
+    closure as the prior authority), the journal durably retired, and
+    the prior view restored; the candidate assets stay owned by the
+    sealed stage and no generation is published.
+    """
+
+    identity = port.resource_identity
+    source = _recovery_capture_journal_file(
+        identity.configured_jsonl_path
+    )
+    if (
+        (source[0].device, source[0].inode)
+        != record.source_jsonl_identity
+        or source[1] != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            retryable=False,
+        )
+    candidate_ref = MutableStageRef(
+        stage_id=f"candidate.{record.journal_id}",
+        resource_identity=identity,
+        staged_db_path=record.candidate_stage_db_path,
+        manifest_temp_path=record.candidate_manifest_temp_path,
+    )
+    try:
+        _revalidate_recovered_sealed_database(
+            record,
+            stage_ref=candidate_ref,
+            database_path=record.candidate_stage_db_path,
+            identity=identity,
+            canonical_store_id=port.canonical_store_id,
+        )
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+    if record.had_prior_canonical:
+        fts5_available = _revalidate_recovered_prior_set(port,
+            record,
+            identity=identity,
+            canonical_store_id=port.canonical_store_id,
+        )
+        if (
+            record.prior_db_path != identity.canonical_sidecar_path
+            and _lstat_any_entry(identity.canonical_sidecar_path)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_MISMATCH",
+                retryable=False,
+            )
+    else:
+        try:
+            _require_first_activation_absence(identity)
+        except ActivationPreparationError as error:
+            raise _recovery_mismatch(error) from error
+        fts5_available = False
+    _remove_journal_proven_backups(record)
+    _retire_coexisting_terminal(port, record)
+    _ = port.write_terminal(record)
+    _remove_owned_activation_journal_final(
+        _activation_journal_path(identity),
+        journal_identity,
+    )
+    if record.had_prior_canonical:
+        prior_db_path = record.prior_db_path
+        prior_manifest_path = record.prior_manifest_path
+        assert prior_db_path is not None
+        assert prior_manifest_path is not None
+        if prior_db_path == identity.canonical_sidecar_path:
+            prior_ref: _CanonicalStoreRef | _PriorActivationRef = (
+                _canonical_activation_ref(
+                    identity,
+                    journal_id=record.journal_id,
+                )
+            )
+        else:
+            prior_ref = _PriorActivationRef(
+                stage_id=f"prior.{record.journal_id}",
+                resource_identity=identity,
+                staged_db_path=prior_db_path,
+                manifest_temp_path=prior_manifest_path,
+            )
+        port.view = _SQLiteGenerationView(
+            stage=prior_ref,
+            canonical_store_id=port.canonical_store_id,
+            generation=(
+                0
+                if record.prior_generation is None
+                else record.prior_generation
+            ),
+            fts5_available=fts5_available,
+        )
+    return ActivationRecoveryReport(
+        phase=_ActivationJournalPhase.PREPARED.value,
+        action="CANCELLED",
+        generation=record.prior_generation,
+    )
+
+
+def _recover_manifest_publication(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    journal_identity: _ActivationFileIdentity,
+) -> ActivationRecoveryReport:
+    """Finish the DB_REPLACED window one truthful phase at a time.
+
+    The canonical DB must already be exactly the journal's candidate
+    with the candidate path consumed.  The issued receipt is completed
+    durably, the new manifest is published durably, and the full active
+    set is re-proven before the journal is advanced to
+    MANIFEST_PUBLISHED; only then is the one generation view built and
+    the journal advanced to GENERATION_PUBLISHED.  A failure at any
+    boundary leaves the journal at the last truthful durable phase, so a
+    restart resumes idempotently and never produces a second generation.
+    """
+
+    identity = port.resource_identity
+    canonical = _recovery_capture_journal_file(
+        identity.canonical_sidecar_path
+    )
+    if (
+        (canonical[0].device, canonical[0].inode)
+        != record.candidate_stage_db_identity
+        or _lstat_any_entry(record.candidate_stage_db_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    try:
+        _preflight_recovered_manifest(record, identity=identity)
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+    source = _recovery_capture_journal_file(
+        identity.configured_jsonl_path
+    )
+    if (
+        (source[0].device, source[0].inode)
+        != record.source_jsonl_identity
+        or source[1] != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            retryable=False,
+        )
+    next_generation = (
+        0
+        if record.expected_prior_generation is None
+        else record.expected_prior_generation + 1
+    )
+    activation_digest = _activation_publication_digest(
+        record,
+        next_generation=next_generation,
+    )
+    _complete_recovered_receipt(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    _complete_recovered_manifest(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+    )
+    _ = _revalidate_recovered_active_set(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+        require_manifest_published=True,
+    )
+    journal_path = _activation_journal_path(identity)
+    manifest_record = replace(record, phase=_ActivationJournalPhase.MANIFEST_PUBLISHED)
+    journal_identity = port.write_journal(
+        manifest_record,
+        journal_path,
+        expected_final_identity=journal_identity,
+    ).file_identity
+    return _recover_generation_publication(port,
+        manifest_record,
+        journal_identity,
+        report_phase=_ActivationJournalPhase.DB_REPLACED,
+    )
+
+
+def _recover_generation_publication(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    journal_identity: _ActivationFileIdentity,
+    *,
+    report_phase: _ActivationJournalPhase,
+) -> ActivationRecoveryReport:
+    """Publish the one generation only after MANIFEST_PUBLISHED is durable.
+
+    The complete published active set is re-proven from disk against the
+    journal's exact generation and activation digest, the one in-memory
+    view is built, and only then is the journal advanced to
+    GENERATION_PUBLISHED and the same set re-proven once more.  On any
+    journal-write failure the in-memory view is withdrawn and the
+    journal stays at the truthful MANIFEST_PUBLISHED phase.  The token
+    is never re-consumed and no second generation is ever created; the
+    terminal journal is retained as the durable consumed marker.
+    """
+
+    identity = port.resource_identity
+    next_generation = (
+        0
+        if record.expected_prior_generation is None
+        else record.expected_prior_generation + 1
+    )
+    activation_digest = _activation_publication_digest(
+        record,
+        next_generation=next_generation,
+    )
+    snapshot = _revalidate_recovered_active_set(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+        require_manifest_published=True,
+    )
+    port.view = _SQLiteGenerationView(
+        stage=_canonical_activation_ref(
+            identity,
+            journal_id=record.journal_id,
+        ),
+        canonical_store_id=port.canonical_store_id,
+        generation=next_generation,
+        fts5_available=snapshot.fts5_available,
+    )
+    try:
+        _retire_coexisting_terminal(port, record)
+        terminal_record = replace(
+            record,
+            phase=_ActivationJournalPhase.GENERATION_PUBLISHED,
+        )
+        journal_path = _activation_journal_path(identity)
+        journal_identity = port.write_journal(
+            terminal_record,
+            journal_path,
+            expected_final_identity=journal_identity,
+        ).file_identity
+    except BaseException:
+        port.view = None
+        raise
+    _ = _revalidate_recovered_active_set(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+        require_manifest_published=True,
+    )
+    _remove_journal_proven_backups(record)
+    return ActivationRecoveryReport(
+        phase=report_phase.value,
+        action="COMPLETED",
+        generation=next_generation,
+    )
+
+
+def _replay_terminal_recovery(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+    journal_identity: _ActivationFileIdentity,
+) -> ActivationRecoveryReport:
+    """Idempotently replay a durable terminal GENERATION_PUBLISHED journal.
+
+    The complete published active set is re-proven from disk against the
+    journal's exact generation and activation digest and the one
+    in-memory view is rehydrated; journal-owned backups are cleaned once
+    (idempotently) and the terminal journal is retained as the durable
+    consumed marker.  The token is never re-consumed and the terminal
+    phase is never advanced, so repeated replays (same or fresh
+    coordinator) observe exactly one completed canonical generation.
+    """
+
+    identity = port.resource_identity
+    next_generation = (
+        0
+        if record.expected_prior_generation is None
+        else record.expected_prior_generation + 1
+    )
+    activation_digest = _activation_publication_digest(
+        record,
+        next_generation=next_generation,
+    )
+    snapshot = _revalidate_recovered_active_set(port,
+        record,
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+        require_manifest_published=True,
+    )
+    port.view = _SQLiteGenerationView(
+        stage=_canonical_activation_ref(
+            identity,
+            journal_id=record.journal_id,
+        ),
+        canonical_store_id=port.canonical_store_id,
+        generation=next_generation,
+        fts5_available=snapshot.fts5_available,
+    )
+    _remove_journal_proven_backups(record)
+    return ActivationRecoveryReport(
+        phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
+        action="COMPLETED",
+        generation=next_generation,
+    )
+
+
+def _replay_cancelled_terminal_recovery(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> ActivationRecoveryReport | None:
+    """Idempotently replay a durable CANCELLED terminal (PREPARED closure).
+
+    The unchanged prior generation recorded by the terminal is re-proven
+    from disk (database, manifest, source, binding receipt, generation)
+    and rehydrated as the one in-memory view.  No generation is
+    published, no token is resumed or replayed, and the terminal record
+    is retained so any number of fresh coordinators authenticate and
+    rehydrate the same prior authority.  A cancelled first activation
+    (no prior) re-proves the absent legacy state and reports ``None``.
+    """
+
+    identity = port.resource_identity
+    if record.phase is not _ActivationJournalPhase.PREPARED:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+            retryable=False,
+        )
+    if not record.had_prior_canonical:
+        try:
+            _require_first_activation_absence(identity)
+        except ActivationPreparationError as error:
+            raise _recovery_mismatch(error) from error
+        return None
+    try:
+        fts5_available = _revalidate_recovered_prior_set(port,
+            record,
+            identity=identity,
+            canonical_store_id=port.canonical_store_id,
+            allow_restored_identities=True,
+        )
+    except ActivationPreparationError as error:
+        raise _recovery_mismatch(error) from error
+    # A Task 5.9 rollback removes the journal-owned backups only after
+    # the restored authority and terminal are durable; a crash in that
+    # window leaves terminal-only state with backups still present, so
+    # the terminal replay cleans them idempotently.  A normal Task 5.8
+    # cancellation already removed every backup before the terminal, so
+    # this is a no-op for the unchanged-prior path.
+    _remove_journal_proven_backups(record)
+    if (
+        record.prior_db_path != identity.canonical_sidecar_path
+        and _lstat_any_entry(identity.canonical_sidecar_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MISMATCH",
+            retryable=False,
+        )
+    prior_db_path = record.prior_db_path
+    prior_manifest_path = record.prior_manifest_path
+    assert prior_db_path is not None
+    assert prior_manifest_path is not None
+    if prior_db_path == identity.canonical_sidecar_path:
+        prior_ref: _CanonicalStoreRef | _PriorActivationRef = (
+            _canonical_activation_ref(
+                identity,
+                journal_id=record.journal_id,
+            )
+        )
+    else:
+        prior_ref = _PriorActivationRef(
+            stage_id=f"prior.{record.journal_id}",
+            resource_identity=identity,
+            staged_db_path=prior_db_path,
+            manifest_temp_path=prior_manifest_path,
+        )
+    port.view = _SQLiteGenerationView(
+        stage=prior_ref,
+        canonical_store_id=port.canonical_store_id,
+        generation=(
+            0
+            if record.prior_generation is None
+            else record.prior_generation
+        ),
+        fts5_available=fts5_available,
+    )
+    return ActivationRecoveryReport(
+        phase=_ActivationJournalPhase.PREPARED.value,
+        action="CANCELLED",
+        generation=record.prior_generation,
+    )
+
+
+def _load_activation_transition_record(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+    handle: _ActivationJournalHandle,
+    next_phase: _ActivationJournalPhase,
+) -> _ActivationJournalRecord:
+    """Load one exact current journal record and enforce phase order."""
+
+    if (
+        port.state != "ACTIVATING"
+        or port.preparation is not preparation
+        or port.cleanup_reservation is not None
+        or port.cleanup_in_progress
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_STATE_INVALID",
+            retryable=True,
+        )
+    if (
+        handle.journal_path
+        != _activation_journal_path(port.resource_identity)
+        or handle.preparation_id != preparation.preparation_id
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_HANDLE_INVALID",
+            retryable=False,
+        )
+    try:
+        disk_bytes, _disk_identity = _read_activation_journal_file(
+            handle.journal_path,
+            handle.file_identity,
+        )
+        disk_record = _parse_activation_journal_bytes(
+            disk_bytes,
+            expected_journal_path=handle.journal_path,
+        )
+    except ActivationPreparationError as error:
+        if error.code == "ACTIVATION.JOURNAL_HANDLE_STALE":
+            raise
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_HANDLE_STALE",
+            retryable=False,
+        ) from error
+    if (
+        disk_record != handle._record
+        or disk_record.phase is not handle.phase
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_HANDLE_STALE",
+            retryable=False,
+        )
+    current = disk_record.phase
+    if next_phase is current:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PHASE_REPEATED",
+            retryable=False,
+        )
+    if _PHASE_SEQUENCE.index(next_phase) < _PHASE_SEQUENCE.index(current):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PHASE_BACKWARD",
+            retryable=False,
+        )
+    if (
+        _PHASE_SEQUENCE.index(next_phase)
+        > _PHASE_SEQUENCE.index(current) + 1
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PHASE_SKIP",
+            retryable=False,
+        )
+    return disk_record
+
+
+def _advance_activation_journal_after_effect(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+    handle: _ActivationJournalHandle,
+    next_phase: _ActivationJournalPhase,
+    *,
+    next_generation: int | None = None,
+    activation_digest: str | None = None,
+) -> _ActivationJournalHandle:
+    """Advance only after re-proving the phase-specific durable effect."""
+
+    disk_record = _load_activation_transition_record(port,
+        preparation,
+        handle,
+        next_phase,
+    )
+    _revalidate_activation_effect_closure(port,
+        preparation,
+        disk_record,
+        next_phase=next_phase,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    next_record = replace(disk_record, phase=next_phase)
+    return port.write_journal(
+        next_record,
+        handle.journal_path,
+        expected_final_identity=handle.file_identity,
+    )
+
+
+def _publish_activation_journal(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+) -> _ActivationJournalHandle:
+    """Write PREPARED, replay it, or supersede a proven terminal record.
+
+    An existing byte-identical PREPARED journal for the same closure is
+    replayed.  A durable terminal record (``GENERATION_PUBLISHED`` =
+    CONSUMED or ``PREPARED`` = CANCELLED) is superseded atomically: the
+    old terminal authority is first mirrored to the deterministic
+    terminal path (or validated when already there), the occupied main
+    journal path is then retired only after that copy is durable, the
+    new PREPARED journal is written/fsynced/revalidated, and only then is
+    the prior terminal strictly retired.  A crash at every point leaves
+    at least one valid authority.  Any mid-flight journal, foreign
+    terminal, or unparsable file fail-stops without being clobbered.
+    """
+
+    journal_path = _activation_journal_path(port.resource_identity)
+    terminal_path = _activation_terminal_path(port.resource_identity)
+    record = _build_activation_journal_record(port, preparation)
+    existing = _lstat_activation_journal_identity(journal_path)
+    if existing is None:
+        coexisting = _coexisting_terminal(port, record)
+        handle = port.write_journal(
+            record,
+            journal_path,
+            expected_final_identity=None,
+        )
+        if coexisting is not None:
+            _remove_owned_activation_terminal_final(
+                terminal_path,
+                coexisting[0],
+            )
+        return handle
+    try:
+        disk_bytes, _disk_identity = _read_activation_journal_file(
+            journal_path,
+            existing,
+        )
+        disk_record = _parse_activation_journal_bytes(
+            disk_bytes,
+            expected_journal_path=journal_path,
+        )
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_REPLAY_MISMATCH",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if disk_record.phase is _ActivationJournalPhase.PREPARED:
+        coexisting = _coexisting_terminal(port, record)
+        handle = _replay_activation_journal(
+            preparation,
+            record,
+            journal_path,
+            existing,
+        )
+        if coexisting is not None:
+            _remove_owned_activation_terminal_final(
+                terminal_path,
+                coexisting[0],
+            )
+        return handle
+    identity = port.resource_identity
+    if (
+        disk_record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED
+        or disk_record.journal_path != journal_path
+        or disk_record.resource_id != identity.resource_id
+        or disk_record.target_identity != identity.target_identity
+        or disk_record.canonical_store_id != port.canonical_store_id
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_REPLAY_MISMATCH",
+            retryable=False,
+        )
+    coexisting = _coexisting_terminal(port, disk_record)
+    if coexisting is None:
+        terminal_identity = port.write_terminal(
+            disk_record
+        )
+    else:
+        terminal_identity = coexisting[0]
+    _remove_owned_activation_journal_final(journal_path, existing)
+    handle = port.write_journal(
+        record,
+        journal_path,
+        expected_final_identity=None,
+    )
+    _remove_owned_activation_terminal_final(
+        terminal_path,
+        terminal_identity,
+    )
+    return handle
+
+
+def _build_activation_journal_record(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+) -> _ActivationJournalRecord:
+    """Derive the complete PREPARED closure from live registry facts.
+
+    Every fact comes from coordinator-owned state: the registry's sealed
+    entry and physical readiness snapshot, the registry token, the
+    preparation's backups, the prior generation view, and the canonical
+    resource identity.  No caller-supplied path, grant, token, nonce,
+    phase, or mapping is accepted as authority.
+    """
+
+    stage_seal_error = getattr(
+        importlib.import_module("tm_stage_sealer"),
+        "StageSealError",
+    )
+    stage = preparation._sealed_stage
+    token = preparation._token
+    registry = cast(Any, port.sealed_registry)
+    try:
+        contract_module._validate_activation_token_for_stage(token, stage)
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        physical = registry.resolve_physical_readiness(stage)
+    except stage_seal_error as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        ) from error
+    identity = port.resource_identity
+    evidence = physical.evidence
+    receipt = evidence.source_binding.receipt
+    if (
+        physical.registry_namespace != registry.registry_namespace
+        or physical.resource_id != identity.resource_id
+        or physical.target_identity != identity.target_identity
+        or physical.canonical_store_id != port.canonical_store_id
+        or physical.mutable_stage.resource_identity != identity
+        or physical.expected_prior_generation
+        != preparation.expected_prior_generation
+        or physical.snapshot_receipt_digest
+        != contract_module.snapshot_receipt_digest(receipt)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    db_capture = _capture_journal_closure_file(
+        physical.mutable_stage.staged_db_path
+    )
+    if (
+        (db_capture[0].device, db_capture[0].inode)
+        != (physical.database_identity.device, physical.database_identity.inode)
+        or db_capture[1] != evidence.stage_file_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    manifest_capture = _capture_journal_closure_file(
+        physical.mutable_stage.manifest_temp_path
+    )
+    if (
+        (manifest_capture[0].device, manifest_capture[0].inode)
+        != (
+            physical.manifest_identity.device,
+            physical.manifest_identity.inode,
+        )
+        or manifest_capture[1] != evidence.manifest_temp_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    source_capture = _capture_journal_closure_file(
+        identity.configured_jsonl_path
+    )
+    if source_capture[1] != receipt.jsonl_digest:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    journal_path = _activation_journal_path(identity)
+    prior_view = preparation._prior_view
+    had_prior = preparation.had_prior_canonical
+    prior_generation: int | None = None
+    prior_binding_snapshot_id: str | None = None
+    prior_receipt_digest_value: str | None = None
+    prior_manifest_digest_value: str | None = None
+    prior_db_path: Path | None = None
+    prior_manifest_path: Path | None = None
+    prior_db_digest_value: str | None = None
+    prior_db_identity_value: tuple[int, int] | None = None
+    prior_manifest_identity_value: tuple[int, int] | None = None
+    prior_db_backup_path: Path | None = None
+    prior_manifest_backup_path: Path | None = None
+    prior_db_backup_digest_value: str | None = None
+    prior_manifest_backup_digest_value: str | None = None
+    prior_db_backup_identity_value: tuple[int, int] | None = None
+    prior_manifest_backup_identity_value: tuple[int, int] | None = None
+    if had_prior:
+        if prior_view is None or port.view is not prior_view:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        try:
+            captures = _capture_prior_assets(port,
+                prior_view,
+                identity=identity,
+            )
+            with port.open_configured_connection(
+                prior_view.stage.staged_db_path,
+                require_existing=True,
+            ) as connection:
+                facts = port.read_source_binding_facts(connection, prior_view)
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        database, manifest, source = captures
+        if (
+            facts.binding is None
+            or facts.divergence_latched
+            or facts.diagnostic_codes
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        binding = facts.binding
+        backups_by_kind = {
+            asset.asset_kind: asset for asset in preparation._backup_assets
+        }
+        if set(backups_by_kind) != {"DATABASE", "MANIFEST"}:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        prior_db_asset = backups_by_kind["DATABASE"]
+        prior_manifest_asset = backups_by_kind["MANIFEST"]
+        if (
+            database.identity != prior_db_asset.original_identity
+            or database.digest
+            != prior_db_asset.evidence.original_digest
+            or manifest.identity != prior_manifest_asset.original_identity
+            or manifest.digest
+            != prior_manifest_asset.evidence.original_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        prior_db_backup_capture = _capture_journal_closure_file(
+            prior_db_asset.backup_path
+        )
+        prior_manifest_backup_capture = _capture_journal_closure_file(
+            prior_manifest_asset.backup_path
+        )
+        if (
+            prior_db_backup_capture
+            != (
+                prior_db_asset.backup_identity,
+                prior_db_asset.evidence.backup_digest,
+            )
+            or prior_manifest_backup_capture
+            != (
+                prior_manifest_asset.backup_identity,
+                prior_manifest_asset.evidence.backup_digest,
+            )
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        if (
+            preparation.expected_prior_generation
+            != prior_view.generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        prior_generation = prior_view.generation
+        prior_binding_snapshot_id = binding.receipt.snapshot_id
+        prior_receipt_digest_value = contract_module.snapshot_receipt_digest(
+            binding.receipt
+        )
+        prior_manifest_digest_value = manifest.digest
+        prior_db_path = database.path
+        prior_manifest_path = identity.snapshot_manifest_path
+        prior_db_digest_value = database.digest
+        prior_db_identity_value = (
+            database.identity.device,
+            database.identity.inode,
+        )
+        prior_manifest_identity_value = (
+            manifest.identity.device,
+            manifest.identity.inode,
+        )
+        prior_db_backup_path = prior_db_asset.backup_path
+        prior_manifest_backup_path = prior_manifest_asset.backup_path
+        prior_db_backup_digest_value = (
+            prior_db_asset.evidence.backup_digest
+        )
+        prior_manifest_backup_digest_value = (
+            prior_manifest_asset.evidence.backup_digest
+        )
+        prior_db_backup_identity_value = (
+            prior_db_asset.backup_identity.device,
+            prior_db_asset.backup_identity.inode,
+        )
+        prior_manifest_backup_identity_value = (
+            prior_manifest_asset.backup_identity.device,
+            prior_manifest_asset.backup_identity.inode,
+        )
+    else:
+        if port.view is not None or prior_view is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        try:
+            _require_first_activation_absence(identity)
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+    try:
+        state = registry.state(stage)
+        registry._token_entry(token)
+    except stage_seal_error as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        ) from error
+    if state is not contract_module.ActivationCapabilityState.TOKEN_ISSUED:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        )
+    record = _ActivationJournalRecord(
+        journal_id=f"journal.{preparation.preparation_id}",
+        journal_version=_ACTIVATION_JOURNAL_VERSION,
+        journal_path=journal_path,
+        phase=_ActivationJournalPhase.PREPARED,
+        preparation_id=preparation.preparation_id,
+        registry_namespace=registry.registry_namespace,
+        token_id=token.token_id,
+        token_version=token.token_version,
+        activation_nonce=token.activation_nonce,
+        artifact_id=physical.artifact_id,
+        artifact_seal_digest=physical.artifact_seal_digest,
+        sealed_stage_digest=physical.sealed_stage_digest,
+        resource_id=physical.resource_id,
+        target_identity=physical.target_identity,
+        canonical_store_id=physical.canonical_store_id,
+        expected_prior_generation=preparation.expected_prior_generation,
+        prior_generation=prior_generation,
+        gate_b_grant_digest=preparation.gate_b_grant_digest,
+        evidence_digest=contract_module.stage_validation_evidence_digest(
+            evidence
+        ),
+        snapshot_receipt_digest=physical.snapshot_receipt_digest,
+        stage_db_digest=evidence.stage_file_digest,
+        manifest_temp_digest=evidence.manifest_temp_digest,
+        source_jsonl_digest=receipt.jsonl_digest,
+        new_receipt_id=receipt.snapshot_id,
+        new_manifest_path=identity.snapshot_manifest_path,
+        new_manifest_digest=evidence.manifest_temp_digest,
+        candidate_stage_db_path=physical.mutable_stage.staged_db_path,
+        candidate_manifest_temp_path=(
+            physical.mutable_stage.manifest_temp_path
+        ),
+        candidate_stage_db_identity=(
+            physical.database_identity.device,
+            physical.database_identity.inode,
+        ),
+        candidate_manifest_temp_identity=(
+            physical.manifest_identity.device,
+            physical.manifest_identity.inode,
+        ),
+        source_jsonl_identity=(
+            source_capture[0].device,
+            source_capture[0].inode,
+        ),
+        had_prior_canonical=had_prior,
+        prior_binding_snapshot_id=prior_binding_snapshot_id,
+        prior_receipt_digest=prior_receipt_digest_value,
+        prior_manifest_digest=prior_manifest_digest_value,
+        prior_db_path=prior_db_path,
+        prior_manifest_path=prior_manifest_path,
+        prior_db_digest=prior_db_digest_value,
+        prior_db_identity=prior_db_identity_value,
+        prior_manifest_identity=prior_manifest_identity_value,
+        prior_db_backup_path=prior_db_backup_path,
+        prior_manifest_backup_path=prior_manifest_backup_path,
+        prior_db_backup_digest=prior_db_backup_digest_value,
+        prior_manifest_backup_digest=prior_manifest_backup_digest_value,
+        prior_db_backup_identity=prior_db_backup_identity_value,
+        prior_manifest_backup_identity=(
+            prior_manifest_backup_identity_value
+        ),
+    )
+    return record
+
+
+def _revalidate_activation_journal_closure(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+    record: _ActivationJournalRecord,
+) -> None:
+    """Re-prove one durable journal record against live facts.
+
+    The caller must hold the coordinator condition lock.  Registry-owned
+    token and preparation facts are revalidated; candidate, prior,
+    backup, source, view, and generation facts are re-captured from disk.
+    Any mutation, token cancellation/consumption, inode swap, or
+    coordinator/preparation change invalidates the journal.
+    """
+
+    stage_seal_error = getattr(
+        importlib.import_module("tm_stage_sealer"),
+        "StageSealError",
+    )
+    stage = preparation._sealed_stage
+    token = preparation._token
+    if type(stage) is not SealedStage:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    if type(token) is not contract_module._ActivationToken:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        )
+    registry = cast(Any, port.sealed_registry)
+    if registry.registry_namespace != record.registry_namespace:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    try:
+        contract_module._validate_activation_token_for_stage(token, stage)
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        physical = registry.resolve_physical_readiness(stage)
+    except stage_seal_error as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        ) from error
+    evidence = physical.evidence
+    receipt = evidence.source_binding.receipt
+    if (
+        physical.artifact_id != record.artifact_id
+        or physical.artifact_seal_digest != record.artifact_seal_digest
+        or physical.sealed_stage_digest != record.sealed_stage_digest
+        or physical.resource_id != record.resource_id
+        or physical.target_identity != record.target_identity
+        or physical.canonical_store_id != record.canonical_store_id
+        or physical.snapshot_receipt_digest
+        != record.snapshot_receipt_digest
+        or physical.expected_prior_generation
+        != record.expected_prior_generation
+        or contract_module.stage_validation_evidence_digest(evidence)
+        != record.evidence_digest
+        or evidence.stage_file_digest != record.stage_db_digest
+        or evidence.manifest_temp_digest != record.manifest_temp_digest
+        or receipt.snapshot_id != record.new_receipt_id
+        or receipt.jsonl_digest != record.source_jsonl_digest
+        or physical.mutable_stage.staged_db_path
+        != record.candidate_stage_db_path
+        or physical.mutable_stage.manifest_temp_path
+        != record.candidate_manifest_temp_path
+        or (physical.database_identity.device, physical.database_identity.inode)
+        != record.candidate_stage_db_identity
+        or (
+            physical.manifest_identity.device,
+            physical.manifest_identity.inode,
+        )
+        != record.candidate_manifest_temp_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    identity = port.resource_identity
+    if (
+        record.new_manifest_path != identity.snapshot_manifest_path
+        or record.journal_path != _activation_journal_path(identity)
+        or record.preparation_id != preparation.preparation_id
+        or record.gate_b_grant_digest != preparation.gate_b_grant_digest
+        or record.had_prior_canonical != preparation.had_prior_canonical
+        or record.resource_id != preparation.resource_id
+        or record.target_identity != preparation.target_identity
+        or record.canonical_store_id != preparation.canonical_store_id
+        or record.expected_prior_generation
+        != preparation.expected_prior_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    db_capture = _capture_journal_closure_file(
+        physical.mutable_stage.staged_db_path
+    )
+    if (
+        (db_capture[0].device, db_capture[0].inode)
+        != record.candidate_stage_db_identity
+        or db_capture[1] != record.stage_db_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    manifest_capture = _capture_journal_closure_file(
+        physical.mutable_stage.manifest_temp_path
+    )
+    if (
+        (manifest_capture[0].device, manifest_capture[0].inode)
+        != record.candidate_manifest_temp_identity
+        or manifest_capture[1] != record.manifest_temp_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    source_capture = _capture_journal_closure_file(
+        identity.configured_jsonl_path
+    )
+    if (
+        (source_capture[0].device, source_capture[0].inode)
+        != record.source_jsonl_identity
+        or source_capture[1] != record.source_jsonl_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+        )
+    view = port.view
+    if record.had_prior_canonical:
+        if (
+            view is None
+            or view is not preparation._prior_view
+            or view.generation != record.prior_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        try:
+            database = _capture_activation_file(
+                view.stage.staged_db_path,
+                asset_kind="DATABASE",
+            )
+            manifest = _capture_activation_file(
+                identity.snapshot_manifest_path,
+                asset_kind="MANIFEST",
+            )
+            with port.open_configured_connection(
+                view.stage.staged_db_path,
+                require_existing=True,
+            ) as connection:
+                facts = port.read_source_binding_facts(connection, view)
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        if (
+            (database.identity.device, database.identity.inode)
+            != record.prior_db_identity
+            or database.digest != record.prior_db_digest
+            or (manifest.identity.device, manifest.identity.inode)
+            != record.prior_manifest_identity
+            or manifest.digest != record.prior_manifest_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        if (
+            facts.binding is None
+            or facts.divergence_latched
+            or facts.diagnostic_codes
+            or port.configured_pair_diagnostics(
+                facts.binding,
+                identity=identity,
+                canonical_store_id=view.canonical_store_id,
+                head_revision=facts.head_revision,
+                cumulative_record_counts=facts.cumulative_record_counts,
+            )
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        binding = facts.binding
+        if (
+            binding.receipt.snapshot_id
+            != record.prior_binding_snapshot_id
+            or contract_module.snapshot_receipt_digest(binding.receipt)
+            != record.prior_receipt_digest
+            or database.path != record.prior_db_path
+            or manifest.path != record.prior_manifest_path
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        manifest_payload = _read_activation_file_bytes(manifest)
+        if manifest_payload != contract_to_json(
+            binding.manifest
+        ).encode("utf-8"):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        backups_by_kind = {
+            asset.asset_kind: asset for asset in preparation._backup_assets
+        }
+        if set(backups_by_kind) != {"DATABASE", "MANIFEST"}:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        prior_db_asset = backups_by_kind["DATABASE"]
+        prior_manifest_asset = backups_by_kind["MANIFEST"]
+        db_backup_capture = _capture_journal_closure_file(
+            prior_db_asset.backup_path
+        )
+        manifest_backup_capture = _capture_journal_closure_file(
+            prior_manifest_asset.backup_path
+        )
+        if (
+            (
+                db_backup_capture[0].device,
+                db_backup_capture[0].inode,
+            )
+            != record.prior_db_backup_identity
+            or db_backup_capture[1] != record.prior_db_backup_digest
+            or (
+                manifest_backup_capture[0].device,
+                manifest_backup_capture[0].inode,
+            )
+            != record.prior_manifest_backup_identity
+            or manifest_backup_capture[1]
+            != record.prior_manifest_backup_digest
+            or db_backup_capture
+            != (
+                prior_db_asset.backup_identity,
+                prior_db_asset.evidence.backup_digest,
+            )
+            or manifest_backup_capture
+            != (
+                prior_manifest_asset.backup_identity,
+                prior_manifest_asset.evidence.backup_digest,
+            )
+            or prior_db_asset.backup_path != record.prior_db_backup_path
+            or prior_manifest_asset.backup_path
+            != record.prior_manifest_backup_path
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+    else:
+        if view is not None or record.prior_generation is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        try:
+            _require_first_activation_absence(identity)
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+    try:
+        state = registry.state(stage)
+        registry._token_entry(token)
+    except stage_seal_error as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        ) from error
+    if state is not contract_module.ActivationCapabilityState.TOKEN_ISSUED:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        )
+    if (
+        token.token_id != record.token_id
+        or token.token_version != record.token_version
+        or token.activation_nonce != record.activation_nonce
+        or token.artifact_id != record.artifact_id
+        or token.artifact_seal_digest != record.artifact_seal_digest
+        or token.sealed_stage_digest != record.sealed_stage_digest
+        or token.snapshot_receipt_digest != record.snapshot_receipt_digest
+        or token.expected_prior_generation
+        != record.expected_prior_generation
+        or token.resource_id != record.resource_id
+        or token.target_identity != record.target_identity
+        or token.canonical_store_id != record.canonical_store_id
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_TOKEN_INVALID",
+            retryable=False,
+        )
+
+
+def _revalidate_activation_effect_closure(
+    port: _StoreValidationPort,
+    preparation: _ActivationPreparation,
+    record: _ActivationJournalRecord,
+    *,
+    next_phase: _ActivationJournalPhase,
+    next_generation: int | None,
+    activation_digest: str | None,
+) -> None:
+    """Re-prove immutable authority plus the already-durable effect.
+
+    PREPARED validation intentionally follows the older candidate/prior
+    closure above.  Once the candidate DB has moved, this validator uses
+    the canonical path and the phase's actual durable facts; it never
+    pretends that the consumed candidate path or replaced prior inode is
+    still present.
+    """
+
+    _validate_activation_publication_authority(
+        record,
+        preparation=preparation,
+        registry=cast(Any, port.sealed_registry),
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+    )
+    if next_phase is _ActivationJournalPhase.DB_REPLACED:
+        if next_generation is not None or activation_digest is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        _validate_replaced_activation_database(port,
+            record,
+            preparation=preparation,
+            identity=port.resource_identity,
+            canonical_store_id=port.canonical_store_id,
+        )
+        return
+    if (
+        type(next_generation) is not int
+        or isinstance(next_generation, bool)
+        or next_generation < 0
+        or type(activation_digest) is not str
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+            retryable=False,
+        )
+    active_ref, _snapshot = _validate_published_activation_set(port,
+        record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    if next_phase is _ActivationJournalPhase.MANIFEST_PUBLISHED:
+        return
+    if next_phase is not _ActivationJournalPhase.GENERATION_PUBLISHED:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PHASE_INVALID",
+            retryable=False,
+        )
+    view = port.view
+    if (
+        view is None
+        or type(view.stage) is not _CanonicalStoreRef
+        or view.stage != active_ref
+        or view.canonical_store_id != port.canonical_store_id
+        or view.generation != next_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.GENERATION_PUBLICATION_INVALID",
+            retryable=False,
+        )
+
+
+def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecoveryReport | None:
+    """Idempotently finish exactly one durable activation (Task 5.8).
+
+    Reconstructs the activation authority from the adjacent durable
+    journal after a restart: no live preparation, token, or registry is
+    required.  A journal is continued only when every phase-relevant
+    fact matches disk, and each next journal phase is published only
+    after its matching effect is durable and independently revalidated
+    (DB_REPLACED -> receipt/manifest -> MANIFEST_PUBLISHED -> the one
+    in-memory generation -> GENERATION_PUBLISHED).  Every mismatch or
+    unproven write fail-stops in ``ACTIVATING`` with the journal at the
+    last truthful durable phase (the Task 5.9 rollback seam).
+
+    A terminal ``GENERATION_PUBLISHED`` journal is retained as the
+    durable consumed marker: replay re-proves the completed canonical
+    generation, hydrates the view, never re-consumes the token, and
+    never creates a second generation.  When no journal survives, the
+    separate deterministic terminal record retains the full
+    authenticated closure: a ``PREPARED`` terminal means CANCELLED/prior
+    authority (re-proven and rehydrated without any generation
+    publication or token replay), a ``GENERATION_PUBLISHED`` terminal
+    means CONSUMED/new canonical authority.  A pending main journal
+    always takes precedence, and terminal/main coexistence is accepted
+    only under the deterministic closure rule.  When neither authority
+    survives, the deterministic active canonical pair is discovered and
+    re-proven from disk alone, so a fresh coordinator rehydrates exactly
+    the completed canonical generation or the unchanged prior/legacy
+    state without relying on bare absence or caller memory.
+    """
+
+    if (
+        port.state != "READY"
+        or port.preparation is not None
+        or port.cleanup_reservation is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_STATE_INVALID",
+            retryable=True,
+        )
+    journal_path = _activation_journal_path(port.resource_identity)
+    terminal_path = _activation_terminal_path(port.resource_identity)
+    port.state = "ACTIVATING"
+    try:
+        try:
+            journal_identity = _lstat_activation_journal_identity(
+                journal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        try:
+            terminal_identity = _lstat_activation_terminal_identity(
+                terminal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        journal_temp_path = _activation_journal_temp_path(
+            journal_path
+        )
+        terminal_temp_path = _activation_terminal_temp_path(
+            terminal_path
+        )
+        if _lstat_any_entry(journal_temp_path):
+            if (
+                journal_identity is not None
+                or terminal_identity is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_JOURNAL_TEMP_CONFLICT",
+                    retryable=False,
+                )
+            _remove_orphaned_activation_temp(journal_temp_path)
+        if _lstat_any_entry(terminal_temp_path):
+            if (
+                terminal_identity is not None
+                or journal_identity is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_TERMINAL_TEMP_CONFLICT",
+                    retryable=False,
+                )
+            _remove_orphaned_activation_temp(terminal_temp_path)
+        if journal_identity is None:
+            if terminal_identity is None:
+                if port.view is not None:
+                    port.state = "READY"
+                    port.notify_all()
+                    return None
+                report = _discover_active_canonical(port)
+            else:
+                terminal_record = _load_recovery_terminal(port,
+                    terminal_path,
+                    terminal_identity,
+                )
+                _revalidate_recovery_authority(port,
+                    terminal_record
+                )
+                if (
+                    terminal_record.phase
+                    is _ActivationJournalPhase.GENERATION_PUBLISHED
+                ):
+                    report = _replay_terminal_recovery(port,
+                        terminal_record,
+                        terminal_identity,
+                    )
+                elif (
+                    terminal_record.phase
+                    is _ActivationJournalPhase.PREPARED
+                ):
+                    report = (
+                        _replay_cancelled_terminal_recovery(port,
+                            terminal_record,
+                        )
+                    )
+                else:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                        retryable=False,
+                    )
+            port.preparation = None
+            port.cleanup_reservation = None
+            port.state = "READY"
+            port.notify_all()
+            return report
+        record = _load_recovery_journal(port,
+            journal_path,
+            journal_identity,
+        )
+        _revalidate_recovery_authority(port, record)
+        rollback_terminal_coexists = False
+        if terminal_identity is not None:
+            terminal_record = _load_recovery_terminal(port,
+                terminal_path,
+                terminal_identity,
+            )
+            _revalidate_recovery_authority(port,
+                terminal_record
+            )
+            if not _activation_terminal_coexistence_valid(
+                record,
+                terminal_record,
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                    retryable=False,
+                )
+            if _rollback_terminal_prior_closes(
+                terminal_record,
+                record,
+            ):
+                rollback_terminal_coexists = True
+        try:
+            if record.phase is _ActivationJournalPhase.PREPARED:
+                report = _complete_prepared_cancellation(port,
+                    record,
+                    journal_identity,
+                )
+            elif record.phase is _ActivationJournalPhase.DB_REPLACED:
+                report = _recover_manifest_publication(port,
+                    record,
+                    journal_identity,
+                )
+            elif (
+                record.phase
+                is _ActivationJournalPhase.MANIFEST_PUBLISHED
+            ):
+                report = _recover_generation_publication(port,
+                    record,
+                    journal_identity,
+                    report_phase=_ActivationJournalPhase.MANIFEST_PUBLISHED,
+                )
+            else:
+                if rollback_terminal_coexists:
+                    next_generation = (
+                        0
+                        if record.expected_prior_generation is None
+                        else record.expected_prior_generation + 1
+                    )
+                    activation_digest = _activation_publication_digest(
+                        record,
+                        next_generation=next_generation,
+                    )
+                    try:
+                        _revalidate_recovered_active_set(port,
+                            record,
+                            identity=port.resource_identity,
+                            canonical_store_id=port.canonical_store_id,
+                            next_generation=next_generation,
+                            activation_digest=activation_digest,
+                            require_manifest_published=True,
+                        )
+                    except ActivationPreparationError:
+                        pass
+                    else:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                            retryable=False,
+                        )
+                report = _replay_terminal_recovery(port,
+                    record,
+                    journal_identity,
+                )
+        except ActivationPreparationError as error:
+            if not _activation_rollback_eligible(error):
+                raise
+            # Task 5.9: completion cannot be proven, so restore one
+            # complete prior authority (or the legacy first-activation
+            # state) instead of leaving the resource fail-stopped.
+            report = _rollback_inconsistent_activation(port,
+                record,
+                journal_identity,
+            )
+        port.preparation = None
+        port.cleanup_reservation = None
+        port.state = "READY"
+        port.notify_all()
+        return report
+    except BaseException:
+        port.notify_all()
+        raise
+
+
+def rollback_durable_activation(
+    port: _StoreValidationPort,
+) -> ActivationRecoveryReport | None:
+    """Roll back one pending/inconsistent activation (Task 5.9).
+
+    Narrow coordinator entry point that restores exactly one complete
+    prior authority (or the legacy first-activation state) instead of
+    completing a pending activation.  It is usable both from ``READY``
+    (fresh start with a durable journal) and from ``ACTIVATING`` after a
+    fail-stop (for example a failed :meth:`publish_activation`), and it
+    is idempotent: repeated calls never create a generation, consume a
+    token twice, duplicate quarantine, or delete foreign files.  The
+    main journal and any coexisting terminal are re-read and
+    authenticated before any mutation, and the pending main journal
+    takes precedence under the Task 5.8 coexistence rules.  A fully
+    proven ``GENERATION_PUBLISHED`` journal (a completed activation) is
+    refused; recovery of that state is
+    :meth:`recover_durable_activation`.
+    """
+
+    stage_seal_error = getattr(
+    importlib.import_module("tm_stage_sealer"),
+    "StageSealError",
+    )
+    if (
+        port.state not in {"READY", "ACTIVATING"}
+        or port.cleanup_in_progress
+        or port.cleanup_reservation is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.ROLLBACK_STATE_INVALID",
+            retryable=True,
+        )
+    journal_path = _activation_journal_path(port.resource_identity)
+    terminal_path = _activation_terminal_path(port.resource_identity)
+    port.state = "ACTIVATING"
+    try:
+        try:
+            journal_identity = _lstat_activation_journal_identity(
+                journal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        try:
+            terminal_identity = _lstat_activation_terminal_identity(
+                terminal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        journal_temp_path = _activation_journal_temp_path(
+            journal_path
+        )
+        terminal_temp_path = _activation_terminal_temp_path(
+            terminal_path
+        )
+        if _lstat_any_entry(journal_temp_path):
+            if (
+                journal_identity is not None
+                or terminal_identity is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_JOURNAL_TEMP_CONFLICT",
+                    retryable=False,
+                )
+            _remove_orphaned_activation_temp(journal_temp_path)
+        if _lstat_any_entry(terminal_temp_path):
+            if (
+                terminal_identity is not None
+                or journal_identity is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_TERMINAL_TEMP_CONFLICT",
+                    retryable=False,
+                )
+            _remove_orphaned_activation_temp(terminal_temp_path)
+        if journal_identity is None:
+            if terminal_identity is None:
+                if port.view is not None:
+                    port.state = "READY"
+                    port.notify_all()
+                    return None
+                report = _discover_active_canonical(port)
+            else:
+                terminal_record = _load_recovery_terminal(port,
+                    terminal_path,
+                    terminal_identity,
+                )
+                _revalidate_recovery_authority(port,
+                    terminal_record
+                )
+                if (
+                    terminal_record.phase
+                    is _ActivationJournalPhase.GENERATION_PUBLISHED
+                ):
+                    report = _replay_terminal_recovery(port,
+                        terminal_record,
+                        terminal_identity,
+                    )
+                elif (
+                    terminal_record.phase
+                    is _ActivationJournalPhase.PREPARED
+                ):
+                    report = (
+                        _replay_cancelled_terminal_recovery(port,
+                            terminal_record,
+                        )
+                    )
+                else:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                        retryable=False,
+                    )
+            port.preparation = None
+            port.cleanup_reservation = None
+            port.state = "READY"
+            port.notify_all()
+            return report
+        record = _load_recovery_journal(port,
+            journal_path,
+            journal_identity,
+        )
+        _revalidate_recovery_authority(port, record)
+        if terminal_identity is not None:
+            terminal_record = _load_recovery_terminal(port,
+                terminal_path,
+                terminal_identity,
+            )
+            _revalidate_recovery_authority(port,
+                terminal_record
+            )
+            if not _activation_terminal_coexistence_valid(
+                record,
+                terminal_record,
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                    retryable=False,
+                )
+        if (
+            record.phase
+            is _ActivationJournalPhase.GENERATION_PUBLISHED
+        ):
+            next_generation = (
+                0
+                if record.expected_prior_generation is None
+                else record.expected_prior_generation + 1
+            )
+            activation_digest = _activation_publication_digest(
+                record,
+                next_generation=next_generation,
+            )
+            try:
+                _revalidate_recovered_active_set(port,
+                    record,
+                    identity=port.resource_identity,
+                    canonical_store_id=port.canonical_store_id,
+                    next_generation=next_generation,
+                    activation_digest=activation_digest,
+                    require_manifest_published=True,
+                )
+            except ActivationPreparationError:
+                pass
+            else:
+                raise ActivationPreparationError(
+                    "ACTIVATION.ROLLBACK_COMPLETED_INVALID",
+                    retryable=False,
+                )
+        if port.preparation is not None:
+            try:
+                entry = port.sealed_registry._token_entry(
+                    port.preparation._token
+                )
+            except stage_seal_error:
+                entry = None
+            if entry is not None and (
+                entry.state
+                is contract_module.ActivationCapabilityState.TOKEN_ISSUED
+            ):
+                try:
+                    port.sealed_registry.cancel(
+                        port.preparation._token
+                    )
+                except stage_seal_error as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.ROLLBACK_TOKEN_CANCEL_FAILED",
+                        retryable=True,
+                        reason_code=error.error_code,
+                    ) from error
+        report = _rollback_inconsistent_activation(port,
+            record,
+            journal_identity,
+        )
+        port.preparation = None
+        port.cleanup_reservation = None
+        port.state = "READY"
+        port.notify_all()
+        return report
+    except BaseException:
+        port.notify_all()
+        raise
+
+
+def publish_activation(
+    port: _CoordinatorPublishPort,
+    preparation: _ActivationPreparation,
+    handle: _ActivationJournalHandle,
+) -> int:
+    """Publish one sealed DB/manifest set and exactly one generation.
+
+    The caller must first obtain ``preparation`` from :meth:`activate`
+    and a durable PREPARED ``handle`` from
+    :meth:`publish_prepared_activation`.  Every journal phase is written
+    only after its matching file effect is durable and independently
+    revalidated.  Any failure leaves the coordinator fail-stopped in
+    ``ACTIVATING`` with the last truthful journal phase for Tasks 5.8/5.9;
+    this method never rewinds or claims READY on a partial publication.
+    """
+
+    if type(preparation) is not _ActivationPreparation:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PREPARATION_INVALID",
+            retryable=False,
+        )
+    if type(handle) is not _ActivationJournalHandle:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_HANDLE_INVALID",
+            retryable=False,
+        )
+    stage_seal_error = getattr(
+        importlib.import_module("tm_stage_sealer"),
+        "StageSealError",
+    )
+    prepared_record = _load_activation_transition_record(port,
+        preparation,
+        handle,
+        _ActivationJournalPhase.DB_REPLACED,
+    )
+    # PREPARED keeps the full candidate/prior closure.  It is the
+    # last point at which that validation is meaningful because the
+    # following atomic replace consumes the candidate path.
+    _revalidate_activation_journal_closure(port,
+        preparation,
+        prepared_record,
+    )
+
+    _replace_activation_database(
+        prepared_record,
+        identity=port.resource_identity,
+    )
+    _validate_replaced_activation_database(port,
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+    )
+    handle = port.advance_after_effect(
+        preparation,
+        handle,
+        _ActivationJournalPhase.DB_REPLACED,
+    )
+
+    next_generation = (
+        0
+        if prepared_record.expected_prior_generation is None
+        else prepared_record.expected_prior_generation + 1
+    )
+    activation_digest = _activation_publication_digest(
+        prepared_record,
+        next_generation=next_generation,
+    )
+    _publish_activation_receipt(port,
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    _publish_activation_manifest(
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+    )
+    active_ref, active_snapshot = _validate_published_activation_set(port,
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    handle = port.advance_after_effect(
+        preparation,
+        handle,
+        _ActivationJournalPhase.MANIFEST_PUBLISHED,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+
+    # Revalidate the same full active set immediately before the one
+    # in-memory generation switch.  State remains ACTIVATING, so no
+    # operation can observe this view until the final phase and token
+    # consumption are both durable/complete.
+    active_ref, active_snapshot = _validate_published_activation_set(port,
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    prior_view = port.view
+    port.view = _SQLiteGenerationView(
+        stage=active_ref,
+        canonical_store_id=port.canonical_store_id,
+        generation=next_generation,
+        fts5_available=active_snapshot.fts5_available,
+    )
+    try:
+        _retire_coexisting_terminal(port, prepared_record)
+        handle = port.advance_after_effect(
+            preparation,
+            handle,
+            _ActivationJournalPhase.GENERATION_PUBLISHED,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+        )
+    except BaseException:
+        # The final journal did not durably acknowledge the in-memory
+        # publication.  State is still ACTIVATING and no lease could
+        # observe it, so restore the prior visible generation while
+        # leaving the durable DB/manifest set for recovery.
+        port.view = prior_view
+        raise
+    final_ref, _final_snapshot = _validate_published_activation_set(port,
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
+    )
+    if port.view is None or port.view.stage != final_ref:
+        raise ActivationPreparationError(
+            "ACTIVATION.GENERATION_PUBLICATION_INVALID",
+            retryable=False,
+        )
+    try:
+        port.sealed_registry.consume(preparation._token)
+    except stage_seal_error as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.TOKEN_CONSUME_FAILED",
+            retryable=True,
+            reason_code=error.error_code,
+        ) from error
+    port.preparation = None
+    port.state = "READY"
+    port.notify_all()
+    return next_generation

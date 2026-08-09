@@ -68,7 +68,7 @@ def _db_replaced_window(
     """Drive the durable journal to DB_REPLACED and stop before the receipt."""
 
     with patch(
-        "tm_sqlite_store._publish_activation_receipt",
+        "tm_activation_recovery._publish_activation_receipt",
         side_effect=OSError("injected"),
     ):
         try:
@@ -176,7 +176,7 @@ class RollbackFirstActivationTests(unittest.TestCase):
             journal_path = journal.journal_path
             record = journal._record
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_recovery._fsync_activation_directory",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -815,7 +815,7 @@ class RollbackCrashResumeTests(unittest.TestCase):
                     raise OSError("injected quarantine fsync")
 
             with patch(
-                "tm_sqlite_store._fsync_activation_directory",
+                "tm_activation_journal._fsync_activation_directory",
                 side_effect=fail_quarantine_fsync,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -858,7 +858,7 @@ class RollbackCrashResumeTests(unittest.TestCase):
             ) = self._existing_prior_missing_base(root)
             recovered = _fresh(identity)
             with patch(
-                "tm_sqlite_store._fsync_recovery_backup",
+                "tm_activation_recovery._fsync_recovery_backup",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
@@ -935,7 +935,7 @@ class RollbackCrashResumeTests(unittest.TestCase):
             ) = self._existing_prior_missing_base(root)
             recovered = _fresh(identity)
             with patch(
-                "tm_sqlite_store._remove_owned_activation_journal_final",
+                "tm_activation_recovery._remove_owned_activation_journal_final",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(OSError):
@@ -975,7 +975,7 @@ class RollbackCrashResumeTests(unittest.TestCase):
             ) = self._existing_prior_missing_base(root)
             recovered = _fresh(identity)
             with patch(
-                "tm_sqlite_store._unlink_recovery_backup",
+                "tm_activation_journal._unlink_recovery_backup",
                 side_effect=OSError("injected"),
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
