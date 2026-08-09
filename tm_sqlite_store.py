@@ -1591,6 +1591,14 @@ class ResourceStoreCoordinator:
                     retryable=False,
                 )
             _require_no_pending_activation_assets(self._resource_identity)
+            # Fresh v1 ticket mint: strictly sweep only unexposed pending
+            # schema-upgrade crash orphans of the deterministic naming
+            # family (never stable reported backups or exposed failure
+            # locators), so a crash after a previous ticket mint or after
+            # guard consumption cannot accumulate hidden full DB copies.
+            _sweep_pending_schema_upgrade_artifacts(
+                view.stage.staged_db_path
+            )
             initial_generation = view.generation
             _require_schema_upgrade_ancestry_provable(
                 view.stage.staged_db_path
@@ -2590,7 +2598,24 @@ class ResourceStoreCoordinator:
         """
 
         with self._condition:
-            return recover_durable_activation(_CoordinatorStorePort(self))
+            port = _CoordinatorStorePort(self)
+            report = recover_durable_activation(port)
+            view = self._view
+            if report is not None and view is not None:
+                # A recovered v2 store will not mint another upgrade
+                # ticket, so the cold terminal completion path resolves
+                # any pending schema-upgrade artifacts deterministically:
+                # completed activations retain one stable reported backup,
+                # cancelled/rolled-back outcomes leave no hidden copies.
+                # A completed recovery rehydrates the view at the
+                # canonical sidecar, so the pending family is resolved
+                # against the original store path of the retained
+                # terminal closure.
+                _finish_cold_schema_upgrade_pending(
+                    _recovered_schema_upgrade_pending_root(port, view),
+                    completed=(report.action == "COMPLETED"),
+                )
+            return report
 
     def rollback_durable_activation(
         self,
@@ -2613,7 +2638,19 @@ class ResourceStoreCoordinator:
         """
 
         with self._condition:
-            return rollback_durable_activation(_CoordinatorStorePort(self))
+            port = _CoordinatorStorePort(self)
+            report = rollback_durable_activation(port)
+            view = self._view
+            if report is not None and view is not None:
+                # A cold rollback restores the prior authority: any
+                # pending schema-upgrade crash orphans are strictly swept
+                # (proven-unchanged outcomes leave no pending or stable
+                # hidden full-copy artifacts).
+                _finish_cold_schema_upgrade_pending(
+                    _recovered_schema_upgrade_pending_root(port, view),
+                    completed=False,
+                )
+            return report
 
     def adopt_recovered_authority(
         self,
@@ -6290,16 +6327,22 @@ def _schema_upgrade_backup_path(
     store_path: Path,
     token: str,
 ) -> Path:
-    """One collision-resistant recovery backup path for one upgrade.
+    """One collision-resistant *pending* recovery backup path for one upgrade.
 
     The name deliberately avoids the activation recovery glob
     ``.{name}.localcat-recovery.*.database.bak`` so recovery locators
-    never confuse the two backup families.
+    never confuse the two backup families.  The ``.pending`` suffix marks
+    the file as an unexposed pending artifact: it is atomically renamed
+    to the stable ``.bak`` reported suffix only immediately before a
+    ``SchemaUpgradeReport`` or a failure ``RecoveryLocator`` is returned,
+    so a crash can never turn an unreported full DB copy into permanent
+    stable evidence, and the strictly validated pending family can be
+    swept by the next fresh ticket mint or by cold recovery.
     """
 
     return (
         store_path.parent
-        / f".{store_path.name}.localcat-schema-upgrade.{token}.bak"
+        / f".{store_path.name}.localcat-schema-upgrade.{token}.bak.pending"
     ).absolute()
 
 
@@ -6420,17 +6463,21 @@ def _schema_upgrade_locator_snapshot_path(
     store_path: Path,
     token: str,
 ) -> Path:
-    """One collision-resistant byte-exact locator snapshot path.
+    """One collision-resistant *pending* byte-exact locator snapshot path.
 
     The name deliberately avoids the schema-upgrade backup glob
     ``.{name}.localcat-schema-upgrade.*.bak`` and the activation recovery
     glob ``.{name}.localcat-recovery.*.database.bak`` so backup counts and
-    recovery locators never confuse the two artifact families.
+    recovery locators never confuse the two artifact families.  The
+    ``.pending`` suffix marks the unexposed pending state: the snapshot
+    is atomically renamed to the stable ``.locator`` reported suffix only
+    when a failure exposes it as a ``RecoveryLocator``, and is otherwise
+    strictly removed on success or on any failure that does not expose it.
     """
 
     return (
         store_path.parent
-        / f".{store_path.name}.localcat-schema-upgrade.{token}.locator"
+        / f".{store_path.name}.localcat-schema-upgrade.{token}.locator.pending"
     ).absolute()
 
 
@@ -6544,6 +6591,340 @@ def _remove_owned_schema_upgrade_artifact(
             path.unlink()
         except OSError:
             pass
+
+
+def _schema_upgrade_reported_path(pending_path: Path) -> Path:
+    """The stable reported sibling of one pending schema-upgrade artifact.
+
+    The reported suffix is the pending name without the ``.pending``
+    marker: ``*.bak.pending`` promotes to the stable success ``*.bak``
+    and ``*.locator.pending`` promotes to the stable exposed-failure
+    ``*.locator``.  Stable reported artifacts are never swept by pending
+    cleanup, so an exposed locator or reported success backup survives
+    every later retry and cold recovery.
+    """
+
+    if type(pending_path) is not _NATIVE_PATH_TYPE:
+        raise TypeError("pending artifact path must be pathlib.Path")
+    if not pending_path.name.endswith(".pending"):
+        raise ValueError("schema-upgrade artifact path is not pending")
+    return pending_path.with_name(pending_path.name[: -len(".pending")])
+
+
+def _promote_schema_upgrade_artifact(
+    path: Path,
+    identity: tuple[int, int],
+) -> Path:
+    """Atomically promote one owned pending artifact to its stable suffix.
+
+    Only the exact regular single-link file carrying the captured
+    identity is renamed (parent fsynced); a missing pending file whose
+    stable sibling still carries the captured identity is already
+    promoted (idempotent cold-recovery replay), and a symlink, directory,
+    multi-link, missing, or foreign inode is never renamed but fails
+    closed so the caller stops instead of exposing or deleting an
+    unaccounted artifact.
+    """
+
+    if (
+        type(identity) is not tuple
+        or len(identity) != 2
+        or type(identity[0]) is not int
+        or type(identity[1]) is not int
+    ):
+        raise TypeError("pending artifact identity is invalid")
+    stable_path = _schema_upgrade_reported_path(path)
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            stable_observed = os.lstat(stable_path)
+        except FileNotFoundError:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+                retryable=False,
+            )
+        if (
+            not stat.S_ISREG(stable_observed.st_mode)
+            or stable_observed.st_nlink != 1
+            or (stable_observed.st_dev, stable_observed.st_ino) != identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+                retryable=False,
+            )
+        return stable_path
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            retryable=False,
+        )
+    try:
+        stable_observed = os.lstat(stable_path)
+    except FileNotFoundError:
+        stable_observed = None
+    if stable_observed is not None:
+        # A coexisting stable sibling can never be the same single-link
+        # file (that would make the pending entry multi-link), so it is a
+        # foreign artifact and must never be replaced by the rename.
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            retryable=False,
+        )
+    try:
+        os.rename(path, stable_path)
+        _fsync_schema_upgrade_directory(path.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            retryable=False,
+        ) from error
+    return stable_path
+
+
+def _pending_schema_upgrade_family(store_path: Path) -> list[Path]:
+    """The deterministic unexposed pending schema-upgrade artifact names.
+
+    Only the ``.{name}.localcat-schema-upgrade.*.pending`` family is ever
+    a crash-orphan candidate; stable reported ``*.bak`` / ``*.locator``
+    artifacts and the journal-owned activation recovery glob are never
+    matched.
+    """
+
+    return sorted(
+        store_path.parent.glob(
+            f".{store_path.name}.localcat-schema-upgrade.*.pending"
+        ),
+        key=str,
+    )
+
+
+def _require_owned_pending_schema_upgrade_name(
+    path: Path,
+    store_path: Path,
+) -> None:
+    """Strict deterministic-family validation for one pending name.
+
+    A pending entry must be ``.{store name}.localcat-schema-upgrade.``
+    followed by a 32-hex token and exactly ``.bak.pending`` or
+    ``.locator.pending``; any other name is foreign and fails closed.
+    """
+
+    prefix = f".{store_path.name}.localcat-schema-upgrade."
+    name = path.name
+    if not name.startswith(prefix):
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+            retryable=False,
+        )
+    remainder = name[len(prefix):]
+    for stable_suffix in (".bak", ".locator"):
+        pending_suffix = f"{stable_suffix}.pending"
+        if remainder.endswith(pending_suffix):
+            token = remainder[: -len(pending_suffix)]
+            if (
+                len(token) == 32
+                and all(ch in "0123456789abcdef" for ch in token)
+            ):
+                return
+    raise ActivationPreparationError(
+        "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+        retryable=False,
+    )
+
+
+def _sweep_pending_schema_upgrade_artifacts(store_path: Path) -> None:
+    """Strictly remove crash-orphan pending schema-upgrade artifacts.
+
+    Every ``*.pending`` entry of the deterministic family is validated
+    (name pattern plus regular single-link file) immediately before it is
+    unlinked; a symlink, directory, multi-link, or foreign entry is never
+    unlinked but fails closed so the caller stops instead of deleting an
+    unaccounted file.  Stable reported artifacts are never matched, so an
+    exposed locator or reported success backup always survives cleanup.
+    The parent directory is fsynced once after all removals.
+    """
+
+    candidates = _pending_schema_upgrade_family(store_path)
+    if not candidates:
+        return
+    for candidate in candidates:
+        _require_owned_pending_schema_upgrade_name(candidate, store_path)
+        try:
+            observed = os.lstat(candidate)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+                retryable=False,
+            ) from error
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+                retryable=False,
+            )
+        try:
+            candidate.unlink()
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_PENDING_CLEANUP_FAILED",
+                retryable=True,
+            ) from error
+    _fsync_schema_upgrade_directory(store_path.parent)
+
+
+def _promote_pending_schema_upgrade_backup(
+    store_path: Path,
+) -> Path | None:
+    """Promote the one pending Connection.backup to the stable suffix.
+
+    A completed cold recovery of a schema upgrade (a recovered v2 store
+    mints no further upgrade ticket) must still retain exactly one stable
+    reported backup: the sole pending ``.bak.pending`` is atomically
+    renamed to ``.bak`` after strict deterministic-family and
+    regular-single-link validation.  No pending backup is a no-op; more
+    than one pending backup or any unsafe entry fails closed.
+    """
+
+    candidates = [
+        candidate
+        for candidate in _pending_schema_upgrade_family(store_path)
+        if candidate.name.endswith(".bak.pending")
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+            retryable=False,
+        )
+    candidate = candidates[0]
+    _require_owned_pending_schema_upgrade_name(candidate, store_path)
+    try:
+        observed = os.lstat(candidate)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+            retryable=False,
+        ) from error
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+            retryable=False,
+        )
+    stable_path = _schema_upgrade_reported_path(candidate)
+    try:
+        stable_observed = os.lstat(stable_path)
+    except FileNotFoundError:
+        stable_observed = None
+    if stable_observed is not None:
+        # The stable reported suffix is never overwritten: a coexisting
+        # stable sibling is either already-promoted evidence (never to be
+        # replaced) or a foreign artifact, so the cold completion fails
+        # closed instead of clobbering it.
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            retryable=False,
+        )
+    try:
+        os.rename(candidate, stable_path)
+        _fsync_schema_upgrade_directory(candidate.parent)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            retryable=False,
+        ) from error
+    return stable_path
+
+
+def _finish_cold_schema_upgrade_pending(
+    store_path: Path,
+    *,
+    completed: bool,
+) -> None:
+    """Deterministic pending-artifact resolution after cold recovery.
+
+    A completed activation retains the Design-required schema success
+    backup as exactly one stable reported ``.bak`` (promoting the pending
+    copy); any cancelled or rolled-back outcome leaves no pending or
+    stable hidden full-copy artifacts.  Remaining pending entries (for
+    example an abandoned byte-exact locator snapshot) are strictly
+    swept, and stable reported artifacts always survive.
+    """
+
+    if completed:
+        _promote_pending_schema_upgrade_backup(store_path)
+    _sweep_pending_schema_upgrade_artifacts(store_path)
+
+
+def _recovered_schema_upgrade_pending_root(
+    port: _CoordinatorStorePort,
+    view: _SQLiteGenerationView,
+) -> Path:
+    """The store path owning the pending family of one cold recovery.
+
+    A completed cold recovery rehydrates the view at the canonical
+    sidecar, while the unexposed pending schema-upgrade artifacts were
+    minted next to the pre-activation store path captured in the retained
+    terminal closure (``prior_db_path``); cancelled/rolled-back outcomes
+    already restore that prior path as the view.  Only a recovered view
+    sitting at the canonical sidecar consults the terminal, and any
+    terminal anomaly falls back to that view path instead of sweeping or
+    promoting artifacts next to the wrong store.
+    """
+
+    if (
+        view.stage.staged_db_path
+        != port.resource_identity.canonical_sidecar_path
+    ):
+        return view.stage.staged_db_path
+    identity = port.resource_identity
+    prior_db_path: Path | None = None
+    journal_path = _activation_journal_path(identity)
+    try:
+        journal_identity = _lstat_activation_journal_identity(journal_path)
+    except ActivationPreparationError:
+        journal_identity = None
+    if journal_identity is not None:
+        try:
+            journal_record = _load_recovery_journal(
+                port,
+                journal_path,
+                journal_identity,
+            )
+        except ActivationPreparationError:
+            journal_record = None
+        if journal_record is not None:
+            prior_db_path = journal_record.prior_db_path
+    if prior_db_path is None:
+        terminal_path = _activation_terminal_path(identity)
+        try:
+            terminal_identity = _lstat_activation_terminal_identity(
+                terminal_path
+            )
+        except ActivationPreparationError:
+            terminal_identity = None
+        if terminal_identity is not None:
+            try:
+                terminal_record = _load_recovery_terminal(
+                    port,
+                    terminal_path,
+                    terminal_identity,
+                )
+            except ActivationPreparationError:
+                terminal_record = None
+            if terminal_record is not None:
+                prior_db_path = terminal_record.prior_db_path
+    if (
+        prior_db_path is not None
+        and type(prior_db_path) is _NATIVE_PATH_TYPE
+        and prior_db_path.is_absolute()
+    ):
+        return prior_db_path
+    return view.stage.staged_db_path
 
 
 def _remove_schema_upgrade_backup(

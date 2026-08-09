@@ -44,10 +44,12 @@ from tm_contracts import (
 from tm_sqlite_store import (
     TM_LEGACY_SCHEMA_VERSION,
     TM_SCHEMA_VERSION,
+    ActivationPreparationError,
     ResourceStoreCoordinator,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     _APPROVED_SCHEMA_DIGESTS,
+    _promote_schema_upgrade_artifact,
     _FTS5_STATEMENT,
     _SCHEMA_STATEMENTS,
     _SCHEMA_UPGRADE_META_KEY,
@@ -144,6 +146,31 @@ class _StreamingBuildObservation:
 class _CreatedFileIdentity:
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class _LocatorSelection:
+    """One strictly proven recovery-locator candidate and its identity.
+
+    The identity is the ``(device, inode)`` proven by the shared strict
+    proof at selection time; the return-boundary re-proof requires the
+    exact same inode immediately before the locator is exposed, so a
+    swap between selection and return fails stop.
+    """
+
+    path: Path
+    identity: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if type(self.path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("locator selection path must be pathlib.Path")
+        if (
+            type(self.identity) is not tuple
+            or len(self.identity) != 2
+            or type(self.identity[0]) is not int
+            or type(self.identity[1]) is not int
+        ):
+            raise TypeError("locator selection identity is invalid")
 
 
 class MigrationPreflightError(RuntimeError):
@@ -398,13 +425,18 @@ class TMMigrationService:
                 raise MigrationPreflightError(
                     "SCHEMA.SUCCESS_UNVERIFIABLE"
                 )
-            if backup_path is None or backup_digest is None:
+            if (
+                backup_path is None
+                or backup_identity is None
+                or backup_digest is None
+            ):
                 raise MigrationPreflightError(
                     "SCHEMA.BACKUP_UNVERIFIABLE"
                 )
             return self._schema_upgrade_report(
                 generation=generation,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
                 backup_digest=backup_digest,
                 success_digest=success_digest,
             )
@@ -824,7 +856,15 @@ class TMMigrationService:
         ``force_unverified`` marks the active store UNVERIFIED with a
         recovery locator and non-retryable when the rollback outcome could
         not be proven: an unprovable rollback never claims
-        VERIFIED_UNCHANGED.
+        VERIFIED_UNCHANGED.  Every recovery locator is built through the
+        shared strict prove-or-fail-stop protocol: candidates are the
+        activation pipeline's byte-exact recovery backups first, then the
+        live path only when its current bytes are strictly proven to
+        equal the preserved ``before_digest``, and the same strict proof
+        is repeated immediately before each locator is returned.  When an
+        asset that requires recovery has no honest path the failure stops
+        explicitly (``IMPORT.PRIOR_STATE_UNRECOVERABLE``) instead of
+        exposing a fabricated live-path locator.
         """
 
         identity = self._resource_identity
@@ -839,6 +879,32 @@ class TMMigrationService:
         )
         store_observed = _try_file_digest(store_path)
         locators: list[RecoveryLocator] = []
+
+        def require_locator(
+            *,
+            asset_kind: AssetKind,
+            expected_digest: str,
+            selection: _LocatorSelection | None,
+        ) -> None:
+            nonlocal retryable
+            if selection is None:
+                raise MigrationPreflightError(
+                    "IMPORT.PRIOR_STATE_UNRECOVERABLE"
+                )
+            _require_locator_return_proof(
+                selection,
+                expected_digest,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            locators.append(
+                RecoveryLocator(
+                    path=selection.path,
+                    asset_kind=asset_kind,
+                    expected_digest=expected_digest,
+                )
+            )
+            retryable = False
+
         if source_observed == source_before:
             source_evidence = _unchanged_preservation(
                 AssetKind.ORIGINAL_SOURCE,
@@ -850,39 +916,40 @@ class TMMigrationService:
                 source_before,
                 source_observed,
             )
+            require_locator(
+                asset_kind=AssetKind.ORIGINAL_SOURCE,
+                expected_digest=source_before,
+                selection=_proven_live_locator(
+                    identity.configured_jsonl_path,
+                    source_before,
+                ),
+            )
         else:
             source_evidence = _unverified_preservation(
                 AssetKind.ORIGINAL_SOURCE,
                 source_before,
             )
-            locators.append(
-                RecoveryLocator(
-                    path=identity.configured_jsonl_path,
-                    asset_kind=AssetKind.ORIGINAL_SOURCE,
-                    expected_digest=source_before,
-                )
+            require_locator(
+                asset_kind=AssetKind.ORIGINAL_SOURCE,
+                expected_digest=source_before,
+                selection=_proven_live_locator(
+                    identity.configured_jsonl_path,
+                    source_before,
+                ),
             )
-            retryable = False
         if force_unverified:
             store_evidence = _unverified_preservation(
                 AssetKind.ACTIVE_STORE,
                 store_before,
             )
-            backup_path = _find_recovery_backup(
-                store_path,
-                label="database",
+            require_locator(
+                asset_kind=AssetKind.ACTIVE_STORE,
                 expected_digest=store_before,
+                selection=_proven_store_locator(
+                    store_path,
+                    store_before,
+                ),
             )
-            if backup_path is None:
-                backup_path = store_path
-            locators.append(
-                RecoveryLocator(
-                    path=backup_path,
-                    asset_kind=AssetKind.ACTIVE_STORE,
-                    expected_digest=store_before,
-                )
-            )
-            retryable = False
         elif store_observed == store_before:
             store_evidence = _unchanged_preservation(
                 AssetKind.ACTIVE_STORE,
@@ -894,26 +961,27 @@ class TMMigrationService:
                 store_before,
                 store_observed,
             )
+            require_locator(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                expected_digest=store_before,
+                selection=_proven_store_locator(
+                    store_path,
+                    store_before,
+                ),
+            )
         else:
             store_evidence = _unverified_preservation(
                 AssetKind.ACTIVE_STORE,
                 store_before,
             )
-            backup_path = _find_recovery_backup(
-                store_path,
-                label="database",
+            require_locator(
+                asset_kind=AssetKind.ACTIVE_STORE,
                 expected_digest=store_before,
+                selection=_proven_store_locator(
+                    store_path,
+                    store_before,
+                ),
             )
-            if backup_path is None:
-                backup_path = store_path
-            locators.append(
-                RecoveryLocator(
-                    path=backup_path,
-                    asset_kind=AssetKind.ACTIVE_STORE,
-                    expected_digest=store_before,
-                )
-            )
-            retryable = False
         locators.sort(
             key=lambda locator: locator.asset_kind.value
         )
@@ -933,16 +1001,38 @@ class TMMigrationService:
         *,
         generation: int,
         backup_path: Path,
+        backup_identity: tuple[int, int],
         backup_digest: str,
         success_digest: str,
     ) -> SchemaUpgradeReport:
-        """Build one completed schema upgrade report from durable facts."""
+        """Build one completed schema upgrade report from durable facts.
 
+        Immediately before the report is returned, the exact owned
+        pending ``Connection.backup()`` is atomically promoted to the
+        stable reported ``.bak`` suffix (idempotent when a cold recovery
+        already promoted it) and its bytes are re-proven to equal the
+        ticket's ``backup_digest``, so the report always references
+        exactly one stable reported backup that survives later cleanup.
+        """
+
+        try:
+            stable_path = _promote_schema_upgrade_artifact(
+                backup_path,
+                backup_identity,
+            )
+        except ActivationPreparationError as error:
+            raise MigrationPreflightError(
+                "SCHEMA.BACKUP_UNVERIFIABLE"
+            ) from error
+        if _strict_locator_proof(stable_path, backup_digest) is None:
+            raise MigrationPreflightError(
+                "SCHEMA.BACKUP_UNVERIFIABLE"
+            )
         return SchemaUpgradeReport(
             canonical_store_id=self._canonical_store_id,
             from_version=TM_LEGACY_SCHEMA_VERSION,
             to_version=TM_SCHEMA_VERSION,
-            backup_path=backup_path,
+            backup_path=stable_path,
             backup_digest=backup_digest,
             success_digest=success_digest,
             activated_generation=generation,
@@ -1070,7 +1160,11 @@ class TMMigrationService:
                     backup_identity=backup_identity,
                     force_unverified=True,
                 )
-            if backup_path is None or backup_digest is None:
+            if (
+                backup_path is None
+                or backup_identity is None
+                or backup_digest is None
+            ):
                 return self._schema_upgrade_failure(
                     error,
                     stage_label=stage_label,
@@ -1113,6 +1207,7 @@ class TMMigrationService:
             return self._schema_upgrade_report(
                 generation=report.generation,
                 backup_path=backup_path,
+                backup_identity=backup_identity,
                 backup_digest=backup_digest,
                 success_digest=success_digest,
             )
@@ -1199,13 +1294,13 @@ class TMMigrationService:
             )
             needs_recovery = True
         if needs_recovery:
-            locator_path = self._proven_schema_upgrade_locator(
+            selection = self._proven_schema_upgrade_locator(
                 coordinator,
                 store_path=store_path,
                 store_before=store_before,
                 backup_path=backup_path,
             )
-            if locator_path is None:
+            if selection is None:
                 self._release_unexposed_schema_upgrade_artifacts(
                     coordinator,
                     backup_path=backup_path,
@@ -1215,6 +1310,25 @@ class TMMigrationService:
                 raise MigrationPreflightError(
                     "SCHEMA.PRIOR_STATE_UNRECOVERABLE"
                 )
+            locator_path = self._promote_schema_upgrade_locator(
+                coordinator,
+                selection,
+                backup_path=backup_path,
+                backup_identity=backup_identity,
+            )
+            if locator_path is None:
+                raise MigrationPreflightError(
+                    "SCHEMA.PRIOR_STATE_UNRECOVERABLE"
+                )
+            # Return-boundary re-proof: the exact path about to be exposed
+            # must still pass the shared strict proof with the identity
+            # proven at selection; a swap (symlink, directory, multi-link,
+            # or foreign inode) fails stop and is never deleted or exposed.
+            _require_locator_return_proof(
+                _LocatorSelection(locator_path, selection.identity),
+                store_before,
+                "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+            )
             locators.append(
                 RecoveryLocator(
                     path=locator_path,
@@ -1253,38 +1367,83 @@ class TMMigrationService:
         store_path: Path,
         store_before: str,
         backup_path: Path | None,
-    ) -> Path | None:
-        """One rehash-proven byte-exact recovery locator for the prior store.
+    ) -> _LocatorSelection | None:
+        """One strictly proven byte-exact recovery locator for the prior store.
 
         Candidates are the activation pipeline's journal-owned byte-exact
         ``.localcat-recovery.*.database.bak`` (the Task 5.10 locator
         family), the Design-required ``Connection.backup()`` schema
         backup, the coordinator-captured byte-exact locator snapshot, and
-        finally the live canonical -- each accepted only after re-hashing
-        proves its current bytes equal ``store_before``.
+        finally the live canonical -- each accepted only when the shared
+        strict proof (O_NOFOLLOW regular single-link file, bytes equal
+        ``store_before``, stable terminal identity) passes at selection
+        time.  No unproved fallback exists.
         """
 
-        journal_backup = _find_recovery_backup(
+        for candidate in _recovery_backup_candidates(
             store_path,
             label="database",
-            expected_digest=store_before,
-        )
-        if journal_backup is not None:
-            return journal_backup
+        ):
+            proof = _strict_locator_proof(candidate, store_before)
+            if proof is not None:
+                return _LocatorSelection(candidate, proof[0])
+        if backup_path is not None:
+            proof = _strict_locator_proof(backup_path, store_before)
+            if proof is not None:
+                return _LocatorSelection(backup_path, proof[0])
+        snapshot = coordinator.schema_upgrade_locator_snapshot
+        if snapshot is not None:
+            proof = _strict_locator_proof(snapshot.path, store_before)
+            if proof is not None:
+                return _LocatorSelection(snapshot.path, proof[0])
+        proof = _strict_locator_proof(store_path, store_before)
+        if proof is not None:
+            return _LocatorSelection(store_path, proof[0])
+        return None
+
+    def _promote_schema_upgrade_locator(
+        self,
+        coordinator: ResourceStoreCoordinator,
+        selection: _LocatorSelection,
+        *,
+        backup_path: Path | None,
+        backup_identity: tuple[int, int] | None,
+    ) -> Path | None:
+        """Promote one selected pending artifact to its stable reported suffix.
+
+        When the selected locator is the current attempt's pending
+        ``Connection.backup()`` or pending byte-exact locator snapshot,
+        the exact owned file is atomically renamed to its stable reported
+        suffix (``.bak`` / ``.locator``) and the stable path is returned;
+        any other selected candidate (journal-owned recovery backup or
+        the live canonical) is already stable and is returned unchanged.
+        ``None`` means the pending artifact could not be promoted safely
+        (foreign inode, symlink, directory, multi-link, or missing) and
+        the failure must stop without exposing anything.
+        """
+
         if (
             backup_path is not None
-            and _try_file_digest(backup_path) == store_before
+            and backup_identity is not None
+            and selection.path == backup_path
         ):
-            return backup_path
+            try:
+                return _promote_schema_upgrade_artifact(
+                    backup_path,
+                    backup_identity,
+                )
+            except ActivationPreparationError:
+                return None
         snapshot = coordinator.schema_upgrade_locator_snapshot
-        if (
-            snapshot is not None
-            and _try_file_digest(snapshot.path) == store_before
-        ):
-            return snapshot.path
-        if _try_file_digest(store_path) == store_before:
-            return store_path
-        return None
+        if snapshot is not None and selection.path == snapshot.path:
+            try:
+                return _promote_schema_upgrade_artifact(
+                    snapshot.path,
+                    snapshot.identity,
+                )
+            except ActivationPreparationError:
+                return None
+        return selection.path
 
     def _release_unexposed_schema_upgrade_artifacts(
         self,
@@ -2154,24 +2313,126 @@ def _disambiguation_retryable(error: Exception) -> bool:
     return retryable if type(retryable) is bool else False
 
 
-def _find_recovery_backup(
-    sidecar: Path,
-    *,
-    label: str,
+def _strict_locator_proof(
+    path: Path,
     expected_digest: str,
-) -> Path | None:
-    """Locate one journal-owned recovery backup by its exact bytes."""
+) -> tuple[tuple[int, int], str] | None:
+    """One strict prove-or-reject check for a recovery locator candidate.
 
-    candidates = sorted(
+    A candidate is accepted only when it opens ``O_NOFOLLOW``, ``fstat``
+    reports a regular single-link file, its bytes hash to
+    ``expected_digest``, and a terminal ``lstat`` still reports the same
+    device/inode/type/nlink.  Symlink, directory, multi-link, missing,
+    swapped inode, unreadable, or digest-mismatch candidates are rejected
+    (``None``) and are never exposed as locators.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            return None
+        identity = (observed.st_dev, observed.st_ino)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != expected_digest:
+            return None
+        os.close(descriptor)
+        descriptor = -1
+        final = os.lstat(path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != identity
+        ):
+            return None
+        return identity, digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _recovery_backup_candidates(
+    sidecar: Path,
+    label: str,
+) -> Iterator[Path]:
+    """Sorted journal-owned byte-exact recovery backup candidate names."""
+
+    yield from sorted(
         sidecar.parent.glob(
             f".{sidecar.name}.localcat-recovery.*.{label}.bak"
         ),
         key=str,
     )
-    for candidate in candidates:
-        if _try_file_digest(candidate) == expected_digest:
-            return candidate
+
+
+def _proven_live_locator(
+    path: Path,
+    expected_digest: str,
+) -> _LocatorSelection | None:
+    """One strictly proven byte-exact live-path locator, if any."""
+
+    proof = _strict_locator_proof(path, expected_digest)
+    if proof is None:
+        return None
+    return _LocatorSelection(path, proof[0])
+
+
+def _proven_store_locator(
+    store_path: Path,
+    expected_digest: str,
+) -> _LocatorSelection | None:
+    """One strictly proven byte-exact locator for the active store.
+
+    Candidates are the activation pipeline's journal-owned byte-exact
+    recovery backups first, then the live canonical path -- each accepted
+    only when the shared strict proof (O_NOFOLLOW regular single-link
+    file, bytes equal ``expected_digest``, stable terminal identity)
+    passes at selection time.  No unproved live-path fallback exists.
+    """
+
+    for candidate in _recovery_backup_candidates(
+        store_path,
+        label="database",
+    ):
+        proof = _strict_locator_proof(candidate, expected_digest)
+        if proof is not None:
+            return _LocatorSelection(candidate, proof[0])
+    proof = _strict_locator_proof(store_path, expected_digest)
+    if proof is not None:
+        return _LocatorSelection(store_path, proof[0])
     return None
+
+
+def _require_locator_return_proof(
+    selection: _LocatorSelection,
+    expected_digest: str,
+    fail_stop_code: str,
+) -> None:
+    """Fail-stop re-proof immediately before one locator is returned.
+
+    The shared strict proof runs again on the exact path about to be
+    exposed: strict file kind, single link, identity stability, and
+    digest must all still hold, and the inode must equal the one proven
+    at selection.  A swap between selection and return (symlink,
+    directory, multi-link, or foreign inode) therefore fails stop with
+    ``fail_stop_code`` and never deletes or exposes the swapped path.
+    """
+
+    proof = _strict_locator_proof(selection.path, expected_digest)
+    if proof is None or proof[0] != selection.identity:
+        raise MigrationPreflightError(fail_stop_code)
 
 
 def _schema_upgrade_error_code(error: Exception) -> str:

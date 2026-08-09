@@ -24,7 +24,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import tempfile
-from typing import Any, cast
+from typing import Any, Callable, cast
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +39,7 @@ from tm_activation_journal import (
     _CanonicalStoreRef,
     _ensure_activation_lineage_marker,
     ActivationPreparationError,
+    ActivationRecoveryReport,
 )
 from tm_contracts import (
     AssetPreservationState,
@@ -534,9 +535,16 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                         ),
                         [],
                     )
+                    # the candidate is built from the pending backup of the
+                    # same token; the report references its stable promoted
+                    # sibling (pending -> reported suffix protocol)
                     self.assertEqual(
-                        copy_store.call_args.args[0],
-                        report.backup_path,
+                        copy_store.call_args.args[0].parent,
+                        report.backup_path.parent,
+                    )
+                    self.assertEqual(
+                        copy_store.call_args.args[0].name,
+                        f"{report.backup_path.name}.pending",
                     )
                     self.assertEqual(
                         _file_digest(report.backup_path),
@@ -1385,6 +1393,14 @@ class SchemaUpgradeConcurrencyTests(unittest.TestCase):
                 ),
                 [],
             )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
+                    )
+                ),
+                [],
+            )
             locator_snapshots = list(
                 root.glob(
                     "..prior.sqlite3.localcat-schema-upgrade.*.locator"
@@ -1545,6 +1561,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 root.glob("..prior.sqlite3.localcat-schema-upgrade.*.bak")
             )
             self.assertEqual(backups, [])
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
+                    )
+                ),
+                [],
+            )
             locator_snapshots = list(
                 root.glob("..prior.sqlite3.localcat-schema-upgrade.*.locator")
             )
@@ -1571,6 +1595,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 list(
                     root.glob(
                         "..prior.sqlite3.localcat-schema-upgrade.*.bak"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
                     )
                 ),
                 [],
@@ -1904,6 +1936,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
             self.assertEqual(
                 list(
                     root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
                         "..prior.sqlite3.localcat-schema-upgrade.*.locator"
                     )
                 ),
@@ -1992,6 +2032,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
             self.assertEqual(
                 list(
                     root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
                         "..prior.sqlite3.localcat-schema-upgrade.*.locator"
                     )
                 ),
@@ -2038,6 +2086,15 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                     list(
                         root.glob(
                             "..prior.sqlite3."
+                            "localcat-schema-upgrade.*.pending"
+                        )
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    list(
+                        root.glob(
+                            "..prior.sqlite3."
                             "localcat-schema-upgrade.*.locator"
                         )
                     ),
@@ -2063,6 +2120,15 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                         root.glob(
                             "..prior.sqlite3."
                             "localcat-schema-upgrade.*.bak"
+                        )
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    list(
+                        root.glob(
+                            "..prior.sqlite3."
+                            "localcat-schema-upgrade.*.pending"
                         )
                     ),
                     [],
@@ -2100,6 +2166,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 list(
                     root.glob(
                         "..prior.sqlite3.localcat-schema-upgrade.*.locator"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.pending"
                     )
                 ),
                 [],
@@ -2177,6 +2251,879 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
             self.assertIsInstance(retry, SchemaUpgradeReport)
             report = cast(SchemaUpgradeReport, retry)
             self.assertEqual(report.activated_generation, 4)
+
+
+class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
+    """Cluster E re-review: strict schema-upgrade locator/pending protocol.
+
+    Task 5.11 failure/success builders never fabricate or clobber
+    recovery evidence: a recovery locator is accepted only through the
+    shared strict proof (O_NOFOLLOW regular single-link file whose bytes
+    equal the preserved digest with a stable terminal identity), searched
+    as journal-owned byte-exact recovery backups first and the live path
+    only when the same strict proof passes.  A DB_REPLACED failure whose
+    rollback cannot be proven and whose byte-exact candidates are missing
+    stops explicitly with ``SCHEMA.PRIOR_STATE_UNRECOVERABLE`` instead of
+    exposing a false locator; symlink/multi-link candidates are never
+    accepted; a swap between selection and return fails stop without
+    deleting or exposing the swapped path; the success backup promotion
+    fails closed on any swapped or foreign pending artifact; and a crash
+    at the ticket-mint or post-publish window is resolved by the next
+    fresh attempt or cold recovery without accumulating pending or stable
+    copies.
+    """
+
+    def _drive_db_replaced_unprovable_rollback(
+        self,
+        root: Path,
+        *,
+        manifest_failure: Callable[[], None],
+    ) -> tuple[
+        CanonicalResourceIdentity,
+        ResourceStoreCoordinator,
+        bytes,
+        MigrationPreflightError,
+    ]:
+        """One upgrade driven to durable DB_REPLACED with an injected rollback.
+
+        The manifest publish side effect first mutates the recovery
+        backup/pending/live assets as requested, then raises so the
+        journal stays durably at DB_REPLACED; the rollback is injected to
+        fail so the failure builder runs with ``force_unverified``.
+        """
+
+        identity, prior, coordinator, _digest = _legacy_fixture(
+            root,
+            fts5_available=False,
+        )
+        store_before = prior.staged_db_path.read_bytes()
+        service = _service(coordinator, identity)
+
+        def fail_manifest(*args: object, **kwargs: object) -> None:
+            manifest_failure()
+            raise OSError("injected manifest publish")
+
+        with (
+            patch("tm_sqlite_store._probe_fts5", return_value=False),
+            patch(
+                "tm_activation_recovery._publish_activation_manifest",
+                side_effect=fail_manifest,
+            ),
+            patch.object(
+                tm_sqlite_store.ResourceStoreCoordinator,
+                "rollback_durable_activation",
+                side_effect=OSError("injected rollback"),
+            ),
+        ):
+            with self.assertRaises(MigrationPreflightError) as raised:
+                service.upgrade_schema(prior.staged_db_path)
+        return identity, coordinator, store_before, raised.exception
+
+    def _recovery_backups(self, root: Path) -> list[Path]:
+        return list(
+            root.glob("..prior.sqlite3.localcat-recovery.*.database.bak")
+        )
+
+    def _pending_family(self, root: Path) -> list[Path]:
+        return list(
+            root.glob(
+                "..prior.sqlite3.localcat-schema-upgrade.*.pending"
+            )
+        )
+
+    def _crashed_coordinator(
+        self,
+        prior: MutableStageRef,
+        identity: CanonicalResourceIdentity,
+        activation_digest: str,
+    ) -> ResourceStoreCoordinator:
+        """One stage-bound coordinator simulating a fresh process state.
+
+        The coordinator binds the same active v1 stage the way the
+        fixture does, so it can mint a ticket without a journal; when the
+        test drops it, its in-memory ticket dies with the "process".
+        """
+
+        return ResourceStoreCoordinator(
+            prior,
+            canonical_store_id="store.primary",
+            _allow_legacy_schema=True,
+            _allow_active=True,
+            _expected_active_generation=3,
+            _expected_activation_digest=activation_digest,
+        )
+
+    def test_db_replaced_failed_rollback_with_deleted_backup_fails_stop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def delete_all_prior_evidence() -> None:
+                for candidate in self._recovery_backups(root):
+                    candidate.unlink()
+                for candidate in self._pending_family(root):
+                    candidate.unlink()
+                # the live prior path no longer carries the prior bytes
+                (root / ".prior.sqlite3").unlink()
+
+            identity, coordinator, store_before, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=delete_all_prior_evidence,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            # the durable DB_REPLACED candidate is the v2 live canonical
+            # and is never fabricated into a locator
+            self.assertTrue(identity.canonical_sidecar_path.is_file())
+            self.assertEqual(
+                _active_meta(identity.canonical_sidecar_path)[
+                    "schema_version"
+                ],
+                "2",
+            )
+            self.assertNotEqual(
+                hashlib.sha256(
+                    identity.canonical_sidecar_path.read_bytes()
+                ).hexdigest(),
+                hashlib.sha256(store_before).hexdigest(),
+            )
+            self.assertEqual(self._recovery_backups(root), [])
+            self.assertEqual(self._pending_family(root), [])
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.bak"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.locator"
+                    )
+                ),
+                [],
+            )
+
+    def test_symlink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_symlink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                target = root / "byte-exact-prior.copy"
+                target.write_bytes(
+                    (root / ".prior.sqlite3").read_bytes()
+                )
+                candidates[0].unlink()
+                os.symlink(target, candidates[0])
+                for candidate in self._pending_family(root):
+                    candidate.unlink()
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_symlink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the symlink candidate is never unlinked and never exposed
+            symlinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.path.islink(candidate)
+            ]
+            self.assertEqual(len(symlinks), 1)
+
+    def test_multilink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_multilink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                hard = root / "byte-exact-prior.hard"
+                os.link(candidates[0], hard)
+                for candidate in self._pending_family(root):
+                    candidate.unlink()
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_multilink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the multi-link candidate is never unlinked and never exposed
+            multilinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.lstat(candidate).st_nlink != 1
+            ]
+            self.assertEqual(len(multilinks), 1)
+
+    def test_swap_between_selection_and_return_fails_stop(self) -> None:
+        swap_kinds = ("symlink", "directory", "multilink", "foreign")
+        for kind in swap_kinds:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    identity, prior, coordinator, _digest = _legacy_fixture(
+                        root,
+                        fts5_available=False,
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    byte_exact = root / "byte-exact-prior.copy"
+                    byte_exact.write_bytes(store_before)
+                    service = _service(coordinator, identity)
+                    original_proof = (
+                        tm_migration._require_locator_return_proof
+                    )
+
+                    def swap_then_prove(
+                        selection: Any,
+                        expected_digest: str,
+                        fail_stop_code: str,
+                    ) -> None:
+                        path = selection.path
+                        if kind == "symlink":
+                            path.unlink()
+                            os.symlink(byte_exact, path)
+                        elif kind == "directory":
+                            path.unlink()
+                            path.mkdir()
+                        elif kind == "multilink":
+                            os.link(
+                                path,
+                                path.with_name(path.name + ".x"),
+                            )
+                        else:
+                            path.unlink()
+                            path.write_bytes(b"foreign inode bytes")
+                        original_proof(
+                            selection,
+                            expected_digest,
+                            fail_stop_code,
+                        )
+
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=False,
+                        ),
+                        patch(
+                            "tm_activation_recovery."
+                            "_publish_activation_manifest",
+                            side_effect=OSError("injected"),
+                        ),
+                        patch.object(
+                            tm_sqlite_store.ResourceStoreCoordinator,
+                            "rollback_durable_activation",
+                            side_effect=OSError("injected rollback"),
+                        ),
+                        patch(
+                            "tm_migration._require_locator_return_proof",
+                            side_effect=swap_then_prove,
+                        ),
+                    ):
+                        with self.assertRaises(
+                            MigrationPreflightError
+                        ) as raised:
+                            service.upgrade_schema(
+                                prior.staged_db_path
+                            )
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+                    )
+                    # the swapped path is never deleted and never exposed:
+                    # the fail-stop propagates instead of a
+                    # SchemaUpgradeFailure
+                    backups = self._recovery_backups(root)
+                    self.assertEqual(len(backups), 1)
+                    if kind == "symlink":
+                        self.assertTrue(os.path.islink(backups[0]))
+                    elif kind == "directory":
+                        self.assertTrue(backups[0].is_dir())
+                    elif kind == "multilink":
+                        self.assertEqual(
+                            os.lstat(backups[0]).st_nlink,
+                            2,
+                        )
+                    else:
+                        self.assertEqual(
+                            backups[0].read_bytes(),
+                            b"foreign inode bytes",
+                        )
+                    # the unexposed pending backup is never deleted by the
+                    # fail-stop either (the activation guard already
+                    # retired the locator snapshot, so only the pending
+                    # backup remains)
+                    pending = self._pending_family(root)
+                    self.assertEqual(len(pending), 1)
+                    self.assertTrue(pending[0].name.endswith(".bak.pending"))
+
+    def test_success_backup_promotion_rejects_swapped_pending_fail_closed(
+        self,
+    ) -> None:
+        swap_kinds = ("symlink", "directory", "multilink", "foreign")
+        for kind in swap_kinds:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    identity, prior, coordinator, _digest = _legacy_fixture(
+                        root,
+                        fts5_available=False,
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    byte_exact = root / "byte-exact-prior.copy"
+                    byte_exact.write_bytes(store_before)
+                    service = _service(coordinator, identity)
+                    original_promote = (
+                        tm_migration._promote_schema_upgrade_artifact
+                    )
+
+                    def swap_then_promote(
+                        path: Path,
+                        artifact_identity: tuple[int, int],
+                    ) -> Path:
+                        if os.path.lexists(path):
+                            if kind == "symlink":
+                                path.unlink()
+                                os.symlink(byte_exact, path)
+                            elif kind == "directory":
+                                path.unlink()
+                                path.mkdir()
+                            elif kind == "multilink":
+                                os.link(
+                                    path,
+                                    path.with_name(path.name + ".x"),
+                                )
+                            else:
+                                path.unlink()
+                                path.write_bytes(b"foreign inode bytes")
+                        return original_promote(
+                            path,
+                            artifact_identity,
+                        )
+
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=False,
+                        ),
+                        patch(
+                            "tm_migration._promote_schema_upgrade_artifact",
+                            side_effect=swap_then_promote,
+                        ),
+                    ):
+                        with self.assertRaises(Exception) as raised:
+                            service.upgrade_schema(
+                                prior.staged_db_path
+                            )
+                    fail_stop = cast(Any, raised.exception)
+                    if kind == "foreign":
+                        # the cold completion moved the foreign bytes to
+                        # the stable suffix, so the report replay cannot
+                        # re-prove the captured identity and stops
+                        self.assertEqual(
+                            fail_stop.error_code,
+                            "SCHEMA.BACKUP_UNVERIFIABLE",
+                        )
+                    else:
+                        self.assertEqual(
+                            fail_stop.code,
+                            "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+                        )
+                    # the durable publish is on disk, but no report was
+                    # returned and nothing was clobbered
+                    self.assertTrue(identity.canonical_sidecar_path.is_file())
+                    if kind == "foreign":
+                        # the durable authority was adopted before the
+                        # report replay failed stop
+                        self.assertEqual(coordinator.state, "READY")
+                        self.assertEqual(coordinator.current_generation, 4)
+                    else:
+                        self.assertEqual(coordinator.state, "ACTIVATING")
+                    if kind == "foreign":
+                        # the foreign bytes survive intact at the stable
+                        # suffix: renamed, never overwritten
+                        stable = list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.bak"
+                            )
+                        )
+                        self.assertEqual(len(stable), 1)
+                        self.assertEqual(
+                            stable[0].read_bytes(),
+                            b"foreign inode bytes",
+                        )
+                        self.assertEqual(self._pending_family(root), [])
+                        self.assertEqual(
+                            list(
+                                root.glob(
+                                    "..prior.sqlite3."
+                                    "localcat-schema-upgrade.*.locator"
+                                )
+                            ),
+                            [],
+                        )
+                    else:
+                        # the swapped pending artifact is never renamed or
+                        # deleted; no stable backup was ever promoted
+                        pending = self._pending_family(root)
+                        self.assertEqual(len(pending), 1)
+                        bak_pending = pending[0]
+                        self.assertTrue(
+                            bak_pending.name.endswith(".bak.pending")
+                        )
+                        if kind == "symlink":
+                            self.assertTrue(os.path.islink(bak_pending))
+                        elif kind == "directory":
+                            self.assertTrue(bak_pending.is_dir())
+                        else:
+                            self.assertEqual(
+                                os.lstat(bak_pending).st_nlink,
+                                2,
+                            )
+                        self.assertEqual(
+                            list(
+                                root.glob(
+                                    "..prior.sqlite3."
+                                    "localcat-schema-upgrade.*.bak"
+                                )
+                            ),
+                            [],
+                        )
+                        self.assertEqual(
+                            list(
+                                root.glob(
+                                    "..prior.sqlite3."
+                                    "localcat-schema-upgrade.*.locator"
+                                )
+                            ),
+                            [],
+                        )
+
+    def test_success_backup_promotion_fails_closed_on_foreign_stable_sibling(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, prior, coordinator, _digest = _legacy_fixture(
+                root,
+                fts5_available=False,
+            )
+            service = _service(coordinator, identity)
+            original_backup_path = (
+                tm_sqlite_store._schema_upgrade_backup_path
+            )
+
+            def backup_path_with_foreign_stable_sibling(
+                store_path: Path,
+                token: str,
+            ) -> Path:
+                pending_path = original_backup_path(store_path, token)
+                stable_path = pending_path.with_name(
+                    pending_path.name[: -len(".pending")]
+                )
+                stable_path.write_bytes(b"foreign stable sibling bytes")
+                return pending_path
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._schema_upgrade_backup_path",
+                    side_effect=backup_path_with_foreign_stable_sibling,
+                ),
+            ):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    service.upgrade_schema(prior.staged_db_path)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.UPGRADE_PROMOTE_UNSAFE",
+            )
+            # the foreign stable sibling is never clobbered and the owned
+            # pending backup is never renamed away or deleted
+            stable = list(
+                root.glob(
+                    "..prior.sqlite3.localcat-schema-upgrade.*.bak"
+                )
+            )
+            self.assertEqual(len(stable), 1)
+            self.assertEqual(
+                stable[0].read_bytes(),
+                b"foreign stable sibling bytes",
+            )
+            pending = self._pending_family(root)
+            self.assertEqual(len(pending), 1)
+            bak_pending = pending[0]
+            self.assertTrue(bak_pending.name.endswith(".bak.pending"))
+            observed = os.lstat(bak_pending)
+            self.assertTrue(stat.S_ISREG(observed.st_mode))
+            self.assertEqual(observed.st_nlink, 1)
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.locator"
+                    )
+                ),
+                [],
+            )
+            self.assertTrue(identity.canonical_sidecar_path.is_file())
+            self.assertEqual(coordinator.state, "ACTIVATING")
+
+    def test_crash_after_ticket_mint_next_attempt_sweeps_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                coordinator,
+                activation_digest,
+            ) = _legacy_fixture(root, fts5_available=False)
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                crashed = self._crashed_coordinator(
+                    prior,
+                    identity,
+                    activation_digest,
+                )
+                ticket = crashed.prepare_schema_upgrade_ticket()
+                # crash: the ticket is never retired or consumed, so the
+                # backup and locator snapshot stay pending
+                pending = self._pending_family(root)
+                self.assertEqual(len(pending), 2)
+                self.assertTrue(
+                    any(
+                        candidate.name.endswith(".bak.pending")
+                        for candidate in pending
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        candidate.name.endswith(".locator.pending")
+                        for candidate in pending
+                    )
+                )
+                self.assertEqual(
+                    list(
+                        root.glob(
+                            "..prior.sqlite3."
+                            "localcat-schema-upgrade.*.bak"
+                        )
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    list(
+                        root.glob(
+                            "..prior.sqlite3."
+                            "localcat-schema-upgrade.*.locator"
+                        )
+                    ),
+                    [],
+                )
+                # the next v1 attempt sweeps the crash orphans and
+                # succeeds with exactly one reported backup
+                service = _service(coordinator, identity)
+                outcome = service.upgrade_schema(prior.staged_db_path)
+            self.assertIsInstance(outcome, SchemaUpgradeReport)
+            report = cast(SchemaUpgradeReport, outcome)
+            self.assertEqual(report.activated_generation, 4)
+            self.assertEqual(self._pending_family(root), [])
+            backups = list(
+                root.glob(
+                    "..prior.sqlite3.localcat-schema-upgrade.*.bak"
+                )
+            )
+            self.assertEqual(backups, [report.backup_path])
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.locator"
+                    )
+                ),
+                [],
+            )
+            _assert_v2_active_store(
+                self,
+                identity.canonical_sidecar_path,
+                identity,
+                fts5_available=False,
+            )
+
+    def test_repeated_ticket_mint_crashes_do_not_accumulate_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                coordinator,
+                activation_digest,
+            ) = _legacy_fixture(root, fts5_available=False)
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                for _round in range(3):
+                    crashed = self._crashed_coordinator(
+                        prior,
+                        identity,
+                        activation_digest,
+                    )
+                    ticket = crashed.prepare_schema_upgrade_ticket()
+                    # each fresh mint sweeps the previous crash orphans
+                    # first, so the pending family never accumulates
+                    self.assertEqual(len(self._pending_family(root)), 2)
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.bak"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.locator"
+                            )
+                        ),
+                        [],
+                    )
+                # the final fresh attempt sweeps the last orphans and
+                # succeeds with exactly one stable reported backup
+                service = _service(coordinator, identity)
+                outcome = service.upgrade_schema(prior.staged_db_path)
+            self.assertIsInstance(outcome, SchemaUpgradeReport)
+            report = cast(SchemaUpgradeReport, outcome)
+            self.assertEqual(report.activated_generation, 4)
+            self.assertEqual(self._pending_family(root), [])
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.bak"
+                    )
+                ),
+                [report.backup_path],
+            )
+            self.assertEqual(
+                list(
+                    root.glob(
+                        "..prior.sqlite3.localcat-schema-upgrade.*.locator"
+                    )
+                ),
+                [],
+            )
+            _assert_v2_active_store(
+                self,
+                identity.canonical_sidecar_path,
+                identity,
+                fts5_available=False,
+            )
+
+    def test_crash_after_publish_cold_recovery_promotes_exactly_one_backup(
+        self,
+    ) -> None:
+        for fts5_available in (True, False):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    identity, prior, coordinator, _digest = _legacy_fixture(
+                        root,
+                        fts5_available=fts5_available,
+                    )
+                    service = _service(coordinator, identity)
+                    calls = {"count": 0}
+                    original_publish = (
+                        tm_sqlite_store.ResourceStoreCoordinator.
+                        publish_activation
+                    )
+
+                    def crash_after_publish(
+                        self_ref: ResourceStoreCoordinator,
+                        preparation: _ActivationPreparation,
+                        handle: _ActivationJournalHandle,
+                    ) -> int:
+                        calls["count"] += 1
+                        if calls["count"] == 1:
+                            generation = original_publish(
+                                self_ref,
+                                preparation,
+                                handle,
+                            )
+                            raise SystemExit(
+                                "injected crash after durable publish"
+                            )
+                        return original_publish(
+                            self_ref,
+                            preparation,
+                            handle,
+                        )
+
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=fts5_available,
+                        ),
+                        patch.object(
+                            tm_sqlite_store.ResourceStoreCoordinator,
+                            "publish_activation",
+                            crash_after_publish,
+                        ),
+                    ):
+                        with self.assertRaises(SystemExit):
+                            service.upgrade_schema(prior.staged_db_path)
+                    # crash-window disk state: the durable publish is
+                    # done, the pending backup is still unreported (the
+                    # guard already retired the locator snapshot), and
+                    # nothing stable was promoted
+                    pending = self._pending_family(root)
+                    self.assertEqual(len(pending), 1)
+                    self.assertTrue(pending[0].name.endswith(".bak.pending"))
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.bak"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.locator"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertTrue(identity.canonical_sidecar_path.is_file())
+                    # a fresh coordinator cold-recovers the completed
+                    # publication and promotes exactly one stable backup
+                    fresh = ResourceStoreCoordinator(
+                        canonical_store_id="store.primary",
+                        resource_identity=identity,
+                    )
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        recovered = fresh.recover_durable_activation()
+                    self.assertIsNotNone(recovered)
+                    recovery = cast(ActivationRecoveryReport, recovered)
+                    self.assertEqual(recovery.action, "COMPLETED")
+                    self.assertEqual(recovery.generation, 4)
+                    self.assertEqual(fresh.state, "READY")
+                    self.assertEqual(fresh.current_generation, 4)
+                    backups = list(
+                        root.glob(
+                            "..prior.sqlite3."
+                            "localcat-schema-upgrade.*.bak"
+                        )
+                    )
+                    self.assertEqual(len(backups), 1)
+                    observed = os.lstat(backups[0])
+                    self.assertTrue(stat.S_ISREG(observed.st_mode))
+                    self.assertEqual(observed.st_nlink, 1)
+                    _assert_legacy_reopenable(
+                        self,
+                        backups[0],
+                        identity,
+                        fts5_available=fts5_available,
+                    )
+                    self.assertEqual(self._pending_family(root), [])
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.locator"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(self._recovery_backups(root), [])
+                    _assert_v2_active_store(
+                        self,
+                        identity.canonical_sidecar_path,
+                        identity,
+                        fts5_available=fts5_available,
+                    )
+                    # an idempotent replay of the retained completed
+                    # journal never promotes or accumulates a second
+                    # stable backup
+                    replay = ResourceStoreCoordinator(
+                        canonical_store_id="store.primary",
+                        resource_identity=identity,
+                    )
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        replayed = replay.recover_durable_activation()
+                    self.assertIsNotNone(replayed)
+                    replay_report = cast(
+                        ActivationRecoveryReport,
+                        replayed,
+                    )
+                    self.assertEqual(replay_report.action, "COMPLETED")
+                    backup_before = backups[0].read_bytes()
+                    self.assertEqual(
+                        len(
+                            list(
+                                root.glob(
+                                    "..prior.sqlite3."
+                                    "localcat-schema-upgrade.*.bak"
+                                )
+                            )
+                        ),
+                        1,
+                    )
+                    self.assertEqual(self._pending_family(root), [])
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-schema-upgrade.*.locator"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        backups[0].read_bytes(),
+                        backup_before,
+                    )
 
 
 if __name__ == "__main__":

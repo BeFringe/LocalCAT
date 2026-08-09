@@ -31,9 +31,10 @@ from typing import Any, Callable, cast
 import unittest
 from unittest.mock import patch
 
+import tm_activation_recovery
 import tm_contracts as contract_module
 import tm_gate_b
-import tm_activation_recovery
+import tm_migration
 import tm_sqlite_store
 from tm_activation_journal import (
     _ActivationFileIdentity,
@@ -2282,6 +2283,353 @@ class ExplicitImportIdentityGuardTests(unittest.TestCase):
             self.assertEqual(
                 store.source_binding_monitor.observe().state,
                 SourceBindingState.VERIFIED_CURRENT,
+            )
+
+
+class ExplicitImportRecoveryLocatorStrictnessTests(unittest.TestCase):
+    """Cluster E re-review: strict prove-or-fail-stop locator protocol.
+
+    Task 5.10 failure builders never fabricate live-path locators: a
+    recovery locator is accepted only through the shared strict proof
+    (O_NOFOLLOW regular single-link file whose bytes equal the preserved
+    digest with a stable terminal identity), searched as activation
+    byte-exact recovery backups first and the live path only when the
+    same strict proof passes.  A DB_REPLACED failure whose rollback
+    cannot be proven and whose byte-exact backup is missing stops
+    explicitly with ``IMPORT.PRIOR_STATE_UNRECOVERABLE`` instead of
+    exposing a false locator, symlink/multi-link candidates are never
+    accepted, and a swap between selection and return fails stop without
+    deleting or exposing the swapped path.
+    """
+
+    def _drive_db_replaced_unprovable_rollback(
+        self,
+        root: Path,
+        *,
+        manifest_failure: Callable[[], None],
+    ) -> tuple[
+        CanonicalResourceIdentity,
+        ResourceStoreCoordinator,
+        bytes,
+        MigrationPreflightError,
+    ]:
+        """One import driven to durable DB_REPLACED with an injected rollback.
+
+        The manifest publish side effect first mutates the recovery
+        backup/live assets as requested, then raises so the journal stays
+        durably at DB_REPLACED; the rollback is injected to fail so the
+        failure builder runs with ``force_unverified``.
+        """
+
+        identity, _prior, _store, coordinator = _diverged_fixture(
+            root,
+            fts5_available=False,
+        )
+        store_before = _prior.staged_db_path.read_bytes()
+        service = _service(coordinator, identity)
+
+        def fail_manifest(*args: object, **kwargs: object) -> None:
+            manifest_failure()
+            raise OSError("injected manifest publish")
+
+        with (
+            patch("tm_sqlite_store._probe_fts5", return_value=False),
+            patch(
+                "tm_activation_recovery._publish_activation_manifest",
+                side_effect=fail_manifest,
+            ),
+            patch.object(
+                tm_sqlite_store.ResourceStoreCoordinator,
+                "rollback_durable_activation",
+                side_effect=OSError("injected rollback"),
+            ),
+        ):
+            with self.assertRaises(MigrationPreflightError) as raised:
+                service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+        return identity, coordinator, store_before, raised.exception
+
+    def _recovery_backups(self, root: Path) -> list[Path]:
+        return list(
+            root.glob(".*.localcat-recovery.*.database.bak")
+        )
+
+    def test_db_replaced_failed_rollback_with_deleted_backup_fails_stop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def delete_backup_and_live_prior() -> None:
+                for candidate in self._recovery_backups(root):
+                    candidate.unlink()
+                # the live store path no longer carries the prior bytes
+                # (production: DB_REPLACED moved the candidate there)
+                (root / ".prior.sqlite3").unlink()
+
+            identity, coordinator, store_before, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=delete_backup_and_live_prior,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            # the durable DB_REPLACED candidate is the live canonical and
+            # is never fabricated into a locator
+            self.assertTrue(identity.canonical_sidecar_path.is_file())
+            self.assertNotEqual(
+                hashlib.sha256(
+                    identity.canonical_sidecar_path.read_bytes()
+                ).hexdigest(),
+                hashlib.sha256(store_before).hexdigest(),
+            )
+            self.assertEqual(self._recovery_backups(root), [])
+
+    def test_symlink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_symlink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                target = root / "byte-exact-prior.copy"
+                target.write_bytes(
+                    (root / ".prior.sqlite3").read_bytes()
+                )
+                candidates[0].unlink()
+                os.symlink(target, candidates[0])
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_symlink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the symlink candidate is never unlinked and never exposed
+            symlinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.path.islink(candidate)
+            ]
+            self.assertEqual(len(symlinks), 1)
+
+    def test_multilink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_multilink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                hard = root / "byte-exact-prior.hard"
+                os.link(candidates[0], hard)
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_multilink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the multi-link candidate is never unlinked and never exposed
+            multilinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.lstat(candidate).st_nlink != 1
+            ]
+            self.assertEqual(len(multilinks), 1)
+
+    def test_swap_between_selection_and_return_fails_stop(self) -> None:
+        swap_kinds = ("symlink", "directory", "multilink", "foreign")
+        for kind in swap_kinds:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        _prior,
+                        _store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    store_before = _prior.staged_db_path.read_bytes()
+                    byte_exact = root / "byte-exact-prior.copy"
+                    byte_exact.write_bytes(store_before)
+                    service = _service(coordinator, identity)
+                    original_proof = (
+                        tm_migration._require_locator_return_proof
+                    )
+
+                    def swap_then_prove(
+                        selection: Any,
+                        expected_digest: str,
+                        fail_stop_code: str,
+                    ) -> None:
+                        path = selection.path
+                        if kind == "symlink":
+                            path.unlink()
+                            os.symlink(byte_exact, path)
+                        elif kind == "directory":
+                            path.unlink()
+                            path.mkdir()
+                        elif kind == "multilink":
+                            os.link(path, path.with_name(path.name + ".x"))
+                        else:
+                            path.unlink()
+                            path.write_bytes(b"foreign inode bytes")
+                        original_proof(selection, expected_digest, fail_stop_code)
+
+                    with (
+                        patch("tm_sqlite_store._probe_fts5", return_value=False),
+                        patch(
+                            "tm_sqlite_store._write_activation_journal",
+                            side_effect=OSError("injected"),
+                        ),
+                        patch(
+                            "tm_sqlite_store.ResourceStoreCoordinator."
+                            "cancel_prepared_activation",
+                            side_effect=OSError("injected"),
+                        ),
+                        patch(
+                            "tm_migration._require_locator_return_proof",
+                            side_effect=swap_then_prove,
+                        ),
+                    ):
+                        with self.assertRaises(
+                            MigrationPreflightError
+                        ) as raised:
+                            service.import_snapshot(
+                                identity.configured_jsonl_path,
+                                identity.resource_id,
+                            )
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+                    )
+                    # the swapped path is never deleted and never exposed:
+                    # the fail-stop propagates instead of a MigrationFailure
+                    backups = self._recovery_backups(root)
+                    self.assertEqual(len(backups), 1)
+                    if kind == "symlink":
+                        self.assertTrue(os.path.islink(backups[0]))
+                    elif kind == "directory":
+                        self.assertTrue(backups[0].is_dir())
+                    elif kind == "multilink":
+                        self.assertEqual(
+                            os.lstat(backups[0]).st_nlink,
+                            2,
+                        )
+                    else:
+                        self.assertEqual(
+                            backups[0].read_bytes(),
+                            b"foreign inode bytes",
+                        )
+
+    def test_unreadable_source_at_failure_time_fails_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+
+            def delete_source_and_fail(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                identity.configured_jsonl_path.unlink()
+                raise OSError("injected journal write")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=delete_source_and_fail,
+                ),
+                patch(
+                    "tm_sqlite_store.ResourceStoreCoordinator."
+                    "cancel_prepared_activation",
+                    side_effect=OSError("injected cancel"),
+                ),
+            ):
+                with self.assertRaises(MigrationPreflightError) as raised:
+                    service.import_snapshot(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+            # the unreadable source has no honest locator: the live path
+            # cannot be proven byte-exact, so the failure stops instead of
+            # fabricating a source locator
+            self.assertEqual(
+                raised.exception.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertFalse(identity.configured_jsonl_path.exists())
+
+    def test_changed_source_without_prior_copy_fails_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+
+            def change_source_and_fail(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                identity.configured_jsonl_path.write_bytes(
+                    b'{"changed":true}\n'
+                )
+                raise OSError("injected journal write")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=change_source_and_fail,
+                ),
+                patch(
+                    "tm_sqlite_store.ResourceStoreCoordinator."
+                    "cancel_prepared_activation",
+                    side_effect=OSError("injected cancel"),
+                ),
+            ):
+                with self.assertRaises(MigrationPreflightError) as raised:
+                    service.import_snapshot(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+            self.assertEqual(
+                raised.exception.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                b'{"changed":true}\n',
             )
 
 
