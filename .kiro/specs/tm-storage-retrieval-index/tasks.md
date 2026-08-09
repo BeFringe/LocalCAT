@@ -166,7 +166,7 @@
   - 完成时，重放、错配或已消费 token 无法推进 journal，正常路径留下可恢复的逐阶段证据
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.7 实现 DB/manifest 成套替换与 generation 发布
+- [x] 5.7 实现 DB/manifest 成套替换与 generation 发布
   - 只有 PREPARED 已持久化后才替换 DB、fsync parent、重开并校验 schema/digest/integrity/foreign key/count，再推进 DB_REPLACED
   - DB 验证后发布 receipt 与 manifest 并推进 MANIFEST_PUBLISHED，全部复核成功才发布 generation 并推进最终阶段
   - 完成时，并发查询和保存只观察切换前或切换后的完整版本，不出现空白、混合或过渡性版本
