@@ -126,14 +126,6 @@
   - 完成时，两条路径的阶段元数据可完整对账，候选顺序不受底层 SQL 返回顺序影响，record/index 不会半提交
   - _Requirements: 4.2, 4.7, 5.3, 5.4, 7.4, 7.7, 8.7_
 
-### Cluster B 实施与复审记录（2026-08-09）
-
-- 采用既有 `v4_flash_worker/high` 恢复审计作为 Cluster B 的对抗性复审输入，不再重复派发同一集群评审；审计发现已由主 agent 逐项核对并收束。
-- canonical store 无 extension 时仍建立完整的 store-owned 候选索引；调用方 extension 只作同事务的附加写计划，默认索引或附加计划任一失败均整体回滚。
-- 删除会漏召回后段 gram 的 4096 posting 截断；FTS5 与 gram fallback 均处理全部唯一 gram，并按 256 个一批执行。全部分块、identity 与 metadata 复核现在保持在同一个显式读事务快照中。
-- 两条召回路径重新核对 overlap、union、去重、稳定预排序、截断和 stage ledger 守恒；召回层仍只返回候选身份，不承担最终 CAT 评分或 global limit。
-- 新鲜验证：候选索引/SQLite 定点套件 75/75；`QT_QPA_PLATFORM=offscreen PYTHONPYCACHEPREFIX=/tmp/codex-feature5-pycache python -m unittest discover -s tests -v` 为 326/326，Qt editor smoke 通过；`basedpyright --level error` 为 0 errors。超长查询的吞吐与 RSS 风险不以有损截断规避，继续由 Task 8 的 benchmark-v1 双路径硬门裁决。
-
 - [ ] 5. 实现迁移、封存、原子激活与恢复
 
 - [ ] 5.1 实现流式 JSONL 预检和幂等迁移计划
