@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 from typing import Protocol, cast
 import uuid
 
@@ -116,6 +117,7 @@ class _RegistryEntry:
     state: ActivationCapabilityState
     database_identity: _ArtifactFileIdentity
     manifest_identity: _ArtifactFileIdentity
+    token: contract_module._ActivationToken | None = None
 
 
 @dataclass(frozen=True)
@@ -1675,9 +1677,10 @@ class SealedArtifactRegistry:
     The registry is created and owned by the coordinator; the StageSealer
     registers only through the reservation/commit/release seam, which
     carries the sealer's creation-time no-follow file identities so a
-    byte-identical path swap can never be registered.  Token issuance,
-    consumption, and cancellation belong to Task 5.5 and fail closed until
-    that exists.
+    byte-identical path swap can never be registered.  Task 5.5 adds the
+    exact SEALED -> TOKEN_ISSUED -> CONSUMED/CANCELLED lifecycle here, with
+    namespace-global nonce replay protection that is never released by a
+    terminal transition.
     """
 
     def __init__(self, *, registry_namespace: str) -> None:
@@ -1689,6 +1692,12 @@ class SealedArtifactRegistry:
         self._entries: dict[str, _RegistryEntry] = {}
         self._reservations: dict[tuple[str, str], _RegistryReservation] = {}
         self._sealed_paths: dict[tuple[str, str], str] = {}
+        self._tokens: dict[
+            str,
+            tuple[str, contract_module._ActivationToken],
+        ] = {}
+        self._claimed_nonces: dict[str, str] = {}
+        self._lock = threading.RLock()
 
     @property
     def registry_namespace(self) -> str:
@@ -1746,47 +1755,48 @@ class SealedArtifactRegistry:
         reservation denies instead of being registered.
         """
 
-        try:
-            stage = _snapshot_stage(mutable_stage)
-        except (TypeError, ValueError) as error:
-            raise StageSealError("SEALER.TYPE_INVALID") from error
-        if (
-            type(database_identity) is not _ArtifactFileIdentity
-            or type(manifest_identity) is not _ArtifactFileIdentity
-        ):
-            raise StageSealError("SEALER.TYPE_INVALID")
-        self._reject_second_seal(stage)
-        key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
-        if key in self._reservations:
-            raise StageSealError("SEALER.ALREADY_RESERVED")
-        observed_database = _artifact_file_identity(
-            stage.staged_db_path,
-            missing_code="SEALER.STAGE_DATABASE_MISSING",
-            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
-        )
-        if (observed_database.device, observed_database.inode) != (
-            database_identity.device,
-            database_identity.inode,
-        ):
-            raise StageSealError("SEALER.STAGE_DATABASE_UNSAFE")
-        observed_manifest = _artifact_file_identity(
-            stage.manifest_temp_path,
-            missing_code="SEALER.STAGE_MANIFEST_MISSING",
-            unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
-        )
-        if (observed_manifest.device, observed_manifest.inode) != (
-            manifest_identity.device,
-            manifest_identity.inode,
-        ):
-            raise StageSealError("SEALER.STAGE_MANIFEST_UNSAFE")
-        reservation = _RegistryReservation(
-            reservation_id=f"reservation.{uuid.uuid4().hex}",
-            mutable=stage,
-            database_identity=database_identity,
-            manifest_identity=manifest_identity,
-        )
-        self._reservations[reservation.key] = reservation
-        return reservation
+        with self._lock:
+            try:
+                stage = _snapshot_stage(mutable_stage)
+            except (TypeError, ValueError) as error:
+                raise StageSealError("SEALER.TYPE_INVALID") from error
+            if (
+                type(database_identity) is not _ArtifactFileIdentity
+                or type(manifest_identity) is not _ArtifactFileIdentity
+            ):
+                raise StageSealError("SEALER.TYPE_INVALID")
+            self._reject_second_seal(stage)
+            key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
+            if key in self._reservations:
+                raise StageSealError("SEALER.ALREADY_RESERVED")
+            observed_database = _artifact_file_identity(
+                stage.staged_db_path,
+                missing_code="SEALER.STAGE_DATABASE_MISSING",
+                unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+            )
+            if (observed_database.device, observed_database.inode) != (
+                database_identity.device,
+                database_identity.inode,
+            ):
+                raise StageSealError("SEALER.STAGE_DATABASE_UNSAFE")
+            observed_manifest = _artifact_file_identity(
+                stage.manifest_temp_path,
+                missing_code="SEALER.STAGE_MANIFEST_MISSING",
+                unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+            )
+            if (observed_manifest.device, observed_manifest.inode) != (
+                manifest_identity.device,
+                manifest_identity.inode,
+            ):
+                raise StageSealError("SEALER.STAGE_MANIFEST_UNSAFE")
+            reservation = _RegistryReservation(
+                reservation_id=f"reservation.{uuid.uuid4().hex}",
+                mutable=stage,
+                database_identity=database_identity,
+                manifest_identity=manifest_identity,
+            )
+            self._reservations[reservation.key] = reservation
+            return reservation
 
     def commit(
         self,
@@ -1802,94 +1812,96 @@ class SealedArtifactRegistry:
         recording the entry; any mismatch denies without recording anything.
         """
 
-        if type(reservation) is not _RegistryReservation:
-            raise StageSealError("SEALER.TYPE_INVALID")
-        existing = self._reservations.get(reservation.key)
-        if (
-            existing is None
-            or existing.reservation_id != reservation.reservation_id
-        ):
-            raise StageSealError("SEALER.RESERVATION_MISMATCH")
-        try:
-            claim = _snapshot_evidence(evidence)
-            expected_generation = _snapshot_generation(generation)
-        except (TypeError, ValueError) as error:
-            raise StageSealError("SEALER.TYPE_INVALID") from error
-        stage = reservation.mutable
-        try:
-            contract_module._validate_stage_validation_evidence(claim)
-            identity = stage.resource_identity
+        with self._lock:
+            if type(reservation) is not _RegistryReservation:
+                raise StageSealError("SEALER.TYPE_INVALID")
+            existing = self._reservations.get(reservation.key)
             if (
-                claim.resource_id != identity.resource_id
-                or claim.target_identity != identity.target_identity
-                or claim.source_binding.configured_jsonl_path
-                != identity.configured_jsonl_path
-                or claim.source_binding.manifest_path
-                != identity.snapshot_manifest_path
+                existing is None
+                or existing.reservation_id != reservation.reservation_id
             ):
-                raise StageSealError("SEALER.EVIDENCE_MISMATCH")
-            _require_generation_closure(expected_generation, claim)
-            _require_identity_unchanged(
-                stage.staged_db_path,
-                reservation.database_identity,
-                unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+                raise StageSealError("SEALER.RESERVATION_MISMATCH")
+            try:
+                claim = _snapshot_evidence(evidence)
+                expected_generation = _snapshot_generation(generation)
+            except (TypeError, ValueError) as error:
+                raise StageSealError("SEALER.TYPE_INVALID") from error
+            stage = reservation.mutable
+            try:
+                contract_module._validate_stage_validation_evidence(claim)
+                identity = stage.resource_identity
+                if (
+                    claim.resource_id != identity.resource_id
+                    or claim.target_identity != identity.target_identity
+                    or claim.source_binding.configured_jsonl_path
+                    != identity.configured_jsonl_path
+                    or claim.source_binding.manifest_path
+                    != identity.snapshot_manifest_path
+                ):
+                    raise StageSealError("SEALER.EVIDENCE_MISMATCH")
+                _require_generation_closure(expected_generation, claim)
+                _require_identity_unchanged(
+                    stage.staged_db_path,
+                    reservation.database_identity,
+                    unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+                )
+                _require_identity_unchanged(
+                    stage.manifest_temp_path,
+                    reservation.manifest_identity,
+                    unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+                )
+                _require_stage_sealed_marker(stage.staged_db_path)
+                if _file_sha256(
+                    stage.staged_db_path,
+                    reservation.database_identity,
+                ) != claim.stage_file_digest:
+                    raise StageSealError("SEALER.EVIDENCE_MISMATCH")
+                if _file_sha256(
+                    stage.manifest_temp_path,
+                    reservation.manifest_identity,
+                ) != claim.manifest_temp_digest:
+                    raise StageSealError("SEALER.EVIDENCE_MISMATCH")
+                artifact_id = f"artifact.{uuid.uuid4().hex}"
+                sealed_stage = contract_module._create_sealed_stage(
+                    registry_namespace=self._registry_namespace,
+                    artifact_id=artifact_id,
+                    mutable_stage=stage,
+                    evidence=claim,
+                    generation=expected_generation,
+                    activation_nonce=f"nonce.{uuid.uuid4().hex}",
+                )
+            except StageSealError:
+                raise
+            except (
+                OSError,
+                sqlite3.DatabaseError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise StageSealError("SEALER.STAGE_INVALID") from error
+            self._entries[artifact_id] = _RegistryEntry(
+                mutable=stage,
+                stage=sealed_stage,
+                state=ActivationCapabilityState.SEALED,
+                database_identity=reservation.database_identity,
+                manifest_identity=reservation.manifest_identity,
             )
-            _require_identity_unchanged(
-                stage.manifest_temp_path,
-                reservation.manifest_identity,
-                unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
-            )
-            _require_stage_sealed_marker(stage.staged_db_path)
-            if _file_sha256(
-                stage.staged_db_path,
-                reservation.database_identity,
-            ) != claim.stage_file_digest:
-                raise StageSealError("SEALER.EVIDENCE_MISMATCH")
-            if _file_sha256(
-                stage.manifest_temp_path,
-                reservation.manifest_identity,
-            ) != claim.manifest_temp_digest:
-                raise StageSealError("SEALER.EVIDENCE_MISMATCH")
-            artifact_id = f"artifact.{uuid.uuid4().hex}"
-            sealed_stage = contract_module._create_sealed_stage(
-                registry_namespace=self._registry_namespace,
-                artifact_id=artifact_id,
-                mutable_stage=stage,
-                evidence=claim,
-                generation=expected_generation,
-                activation_nonce=f"nonce.{uuid.uuid4().hex}",
-            )
-        except StageSealError:
-            raise
-        except (
-            OSError,
-            sqlite3.DatabaseError,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise StageSealError("SEALER.STAGE_INVALID") from error
-        self._entries[artifact_id] = _RegistryEntry(
-            mutable=stage,
-            stage=sealed_stage,
-            state=ActivationCapabilityState.SEALED,
-            database_identity=reservation.database_identity,
-            manifest_identity=reservation.manifest_identity,
-        )
-        self._sealed_paths[reservation.key] = artifact_id
-        del self._reservations[reservation.key]
-        return sealed_stage
+            self._sealed_paths[reservation.key] = artifact_id
+            del self._reservations[reservation.key]
+            return sealed_stage
 
     def release(self, reservation: _RegistryReservation) -> None:
         """Release one uncommitted reservation; never touches committed entries."""
 
-        if type(reservation) is not _RegistryReservation:
-            return
-        existing = self._reservations.get(reservation.key)
-        if (
-            existing is not None
-            and existing.reservation_id == reservation.reservation_id
-        ):
-            del self._reservations[reservation.key]
+        with self._lock:
+            if type(reservation) is not _RegistryReservation:
+                return
+            existing = self._reservations.get(reservation.key)
+            if (
+                existing is not None
+                and existing.reservation_id == reservation.reservation_id
+            ):
+                del self._reservations[reservation.key]
 
     def _reject_second_seal(self, stage: MutableStageRef) -> None:
         key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
@@ -1985,39 +1997,42 @@ class SealedArtifactRegistry:
         accepts caller-provided paths or evidence objects.
         """
 
-        entry = self._match_entry(stage)
-        artifact = entry.stage.artifact
-        receipt = entry.stage.evidence.source_binding.receipt
-        return _PhysicalReadinessSnapshot(
-            registry_namespace=self._registry_namespace,
-            artifact_id=artifact.artifact_id,
-            artifact_seal_digest=artifact.seal_digest,
-            sealed_stage_digest=entry.stage.sealed_stage_digest,
-            resource_id=entry.stage.evidence.resource_id,
-            target_identity=entry.stage.evidence.target_identity,
-            canonical_store_id=receipt.canonical_store_id,
-            snapshot_receipt_digest=(
-                entry.stage.evidence.snapshot_receipt_digest
-            ),
-            expected_prior_generation=(
-                entry.stage.generation.expected_prior_generation
-            ),
-            mutable_stage=entry.mutable,
-            evidence=entry.stage.evidence,
-            generation=entry.stage.generation,
-            database_identity=entry.database_identity,
-            manifest_identity=entry.manifest_identity,
-        )
+        with self._lock:
+            entry = self._match_entry(stage)
+            artifact = entry.stage.artifact
+            receipt = entry.stage.evidence.source_binding.receipt
+            return _PhysicalReadinessSnapshot(
+                registry_namespace=self._registry_namespace,
+                artifact_id=artifact.artifact_id,
+                artifact_seal_digest=artifact.seal_digest,
+                sealed_stage_digest=entry.stage.sealed_stage_digest,
+                resource_id=entry.stage.evidence.resource_id,
+                target_identity=entry.stage.evidence.target_identity,
+                canonical_store_id=receipt.canonical_store_id,
+                snapshot_receipt_digest=(
+                    entry.stage.evidence.snapshot_receipt_digest
+                ),
+                expected_prior_generation=(
+                    entry.stage.generation.expected_prior_generation
+                ),
+                mutable_stage=entry.mutable,
+                evidence=entry.stage.evidence,
+                generation=entry.stage.generation,
+                database_identity=entry.database_identity,
+                manifest_identity=entry.manifest_identity,
+            )
 
     def contains(self, stage: SealedStage) -> bool:
-        try:
-            self._entry(stage)
-        except (StageSealError, TypeError, ValueError, AttributeError):
-            return False
-        return True
+        with self._lock:
+            try:
+                self._entry(stage)
+            except (StageSealError, TypeError, ValueError, AttributeError):
+                return False
+            return True
 
     def state(self, stage: SealedStage) -> ActivationCapabilityState:
-        return self._entry(stage).state
+        with self._lock:
+            return self._entry(stage).state
 
     def issue_token(
         self,
@@ -2025,17 +2040,78 @@ class SealedArtifactRegistry:
         *,
         current_generation: int | None,
     ) -> contract_module._ActivationToken:
-        _ = stage
-        _ = current_generation
-        raise StageSealError("SEALER.TOKEN_LIFECYCLE_PENDING")
+        with self._lock:
+            if current_generation is not None and (
+                type(current_generation) is not int
+                or isinstance(current_generation, bool)
+            ):
+                raise StageSealError("SEALER.GENERATION_INVALID")
+            if current_generation is not None and current_generation < 0:
+                raise StageSealError("SEALER.GENERATION_INVALID")
+            entry = self._entry(stage)
+            if entry.state is not ActivationCapabilityState.SEALED:
+                raise StageSealError("SEALER.TOKEN_ALREADY_ISSUED")
+            if current_generation != entry.stage.expected_prior_generation:
+                raise StageSealError("SEALER.GENERATION_MISMATCH")
+            nonce = entry.stage.activation_nonce
+            if nonce in self._claimed_nonces:
+                raise StageSealError("SEALER.NONCE_REPLAY")
+            token = contract_module._create_activation_token(
+                token_id=f"token.{uuid.uuid4().hex}",
+                stage=entry.stage,
+            )
+            self._claimed_nonces[nonce] = entry.stage.artifact.artifact_id
+            self._tokens[token.token_id] = (
+                entry.stage.artifact.artifact_id,
+                token,
+            )
+            self._entries[entry.stage.artifact.artifact_id] = replace(
+                entry,
+                state=ActivationCapabilityState.TOKEN_ISSUED,
+                token=token,
+            )
+            return token
+
+    def _token_entry(
+        self,
+        token: contract_module._ActivationToken,
+    ) -> _RegistryEntry:
+        if type(token) is not contract_module._ActivationToken:
+            raise StageSealError("SEALER.TOKEN_INVALID")
+        registered = self._tokens.get(token.token_id)
+        if registered is None or registered[1] is not token:
+            raise StageSealError("SEALER.TOKEN_INVALID")
+        entry = self._entries.get(registered[0])
+        if entry is None or entry.token is not token:
+            raise StageSealError("SEALER.TOKEN_INVALID")
+        try:
+            contract_module._validate_activation_token_for_stage(
+                token,
+                entry.stage,
+            )
+        except (TypeError, ValueError) as error:
+            raise StageSealError("SEALER.TOKEN_INVALID") from error
+        return entry
 
     def consume(self, token: contract_module._ActivationToken) -> None:
-        _ = token
-        raise StageSealError("SEALER.TOKEN_LIFECYCLE_PENDING")
+        with self._lock:
+            entry = self._token_entry(token)
+            if entry.state is not ActivationCapabilityState.TOKEN_ISSUED:
+                raise StageSealError("SEALER.TOKEN_NOT_ACTIVE")
+            self._entries[entry.stage.artifact.artifact_id] = replace(
+                entry,
+                state=ActivationCapabilityState.CONSUMED,
+            )
 
     def cancel(self, token: contract_module._ActivationToken) -> None:
-        _ = token
-        raise StageSealError("SEALER.TOKEN_LIFECYCLE_PENDING")
+        with self._lock:
+            entry = self._token_entry(token)
+            if entry.state is not ActivationCapabilityState.TOKEN_ISSUED:
+                raise StageSealError("SEALER.TOKEN_NOT_ACTIVE")
+            self._entries[entry.stage.artifact.artifact_id] = replace(
+                entry,
+                state=ActivationCapabilityState.CANCELLED,
+            )
 
 
 def _require_stage_sealed_marker(path: Path) -> None:

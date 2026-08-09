@@ -153,7 +153,7 @@
   - 完成时，Gate B 证据可独立重算，且只证明待激活版本完整，不提前发布 generation
   - _Requirements: 1.1, 1.2, 2.3, 2.9, 7.5, 7.14_
 
-- [ ] 5.5 实现唯一协调器的激活准备与排空
+- [x] 5.5 实现唯一协调器的激活准备与排空
   - 仅在 Gate B 通过后接受登记且未消费的 sealed stage，并从证据生成绑定同一 artifact 的单次 token
   - 排空旧 lease，复核 prior generation、资源、目标、DB/manifest digest 和 source binding，并在修改资产前形成恢复备份
   - 完成时，token 重用、nonce 重放、过期 generation、错资源和 drain 失败都在 replace 前被拒绝

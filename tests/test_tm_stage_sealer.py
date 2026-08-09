@@ -1531,35 +1531,116 @@ class StageSealerRegistryTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_token_lifecycle_fails_closed_until_task_5_5(self) -> None:
+    def test_token_lifecycle_is_exact_single_use_and_terminal(self) -> None:
         temporary, sealer, _, sealed = self._sealed_fixture()
         try:
-            for generation in (None, 2):
-                with self.subTest(current_generation=generation):
-                    _expect_seal_code(
-                        self,
-                        lambda: sealer.registry.issue_token(
-                            sealed,
-                            current_generation=generation,
-                        ),
-                        "SEALER.TOKEN_LIFECYCLE_PENDING",
-                    )
-            _expect_seal_code(
-                self,
-                lambda: sealer.registry.consume(
-                    cast(contract_module._ActivationToken, object())
-                ),
-                "SEALER.TOKEN_LIFECYCLE_PENDING",
+            registry = _registry(sealer)
+            self.assertIs(
+                registry.state(sealed),
+                ActivationCapabilityState.SEALED,
             )
             _expect_seal_code(
                 self,
-                lambda: sealer.registry.cancel(
+                lambda: registry.issue_token(
+                    sealed,
+                    current_generation=2,
+                ),
+                "SEALER.GENERATION_MISMATCH",
+            )
+            token = registry.issue_token(
+                sealed,
+                current_generation=None,
+            )
+            self.assertIs(
+                registry.state(sealed),
+                ActivationCapabilityState.TOKEN_ISSUED,
+            )
+            _expect_seal_code(
+                self,
+                lambda: registry.issue_token(
+                    sealed,
+                    current_generation=None,
+                ),
+                "SEALER.TOKEN_ALREADY_ISSUED",
+            )
+            registry.consume(token)
+            self.assertIs(
+                registry.state(sealed),
+                ActivationCapabilityState.CONSUMED,
+            )
+            _expect_seal_code(
+                self,
+                lambda: registry.consume(token),
+                "SEALER.TOKEN_NOT_ACTIVE",
+            )
+            _expect_seal_code(
+                self,
+                lambda: registry.cancel(token),
+                "SEALER.TOKEN_NOT_ACTIVE",
+            )
+            _expect_seal_code(
+                self,
+                lambda: registry.cancel(
                     cast(contract_module._ActivationToken, object())
                 ),
-                "SEALER.TOKEN_LIFECYCLE_PENDING",
+                "SEALER.TOKEN_INVALID",
             )
         finally:
             temporary.cleanup()
+
+    def test_activation_nonce_replay_is_global_across_registry_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = SealedArtifactRegistry(
+                registry_namespace="coordinator.primary"
+            )
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+            )
+            (root / "first").mkdir()
+            _, first_stage = _build_stage(
+                root / "first",
+                fts5_available=True,
+            )
+            first = _seal(sealer, first_stage, fts5_available=True)
+            first_token = registry.issue_token(
+                first,
+                current_generation=None,
+            )
+            registry.cancel(first_token)
+
+            (root / "second").mkdir()
+            _, second_stage = _build_stage(
+                root / "second",
+                fts5_available=True,
+            )
+            second = _seal(sealer, second_stage, fts5_available=True)
+            second_entry = registry._entries[second.artifact.artifact_id]
+            replay = contract_module._create_sealed_stage(
+                registry_namespace=registry.registry_namespace,
+                artifact_id=second.artifact.artifact_id,
+                mutable_stage=second_entry.mutable,
+                evidence=second.evidence,
+                generation=second.generation,
+                activation_nonce=first.activation_nonce,
+            )
+            object.__setattr__(second_entry, "stage", replay)
+
+            _expect_seal_code(
+                self,
+                lambda: registry.issue_token(
+                    replay,
+                    current_generation=None,
+                ),
+                "SEALER.NONCE_REPLAY",
+            )
+            self.assertIs(
+                registry.state(replay),
+                ActivationCapabilityState.SEALED,
+            )
 
 
 class StageSealerInputValidationTests(unittest.TestCase):

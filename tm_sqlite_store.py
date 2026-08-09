@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
+import importlib
 import itertools
 import json
 import math
@@ -16,10 +17,11 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import cast
+from typing import Any, Protocol, cast
 import unicodedata
 import uuid
 
+import tm_contracts as contract_module
 from text_matcher import (
     TEXT_MATCHER_SEMANTICS_VERSION,
     UNICODE_VERSION,
@@ -34,6 +36,7 @@ from tm_contracts import (
     SnapshotKind,
     SnapshotManifest,
     SnapshotReceipt,
+    SealedStage,
     SourceBindingState,
     TMRecord,
     TMRecordDraft,
@@ -41,7 +44,6 @@ from tm_contracts import (
     contract_to_json,
     snapshot_receipt_digest,
 )
-
 
 TM_SCHEMA_VERSION = 2
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
@@ -523,47 +525,267 @@ class SourceBindingObservation:
     diagnostic_codes: tuple[str, ...]
 
 
-class ResourceStoreCoordinator:
-    """Own one resource's operation leases and active generation view."""
+class ActivationPreparationError(RuntimeError):
+    """Stable code-only Task 5.5 failure with no path or TM payload."""
 
     def __init__(
         self,
-        stage: MutableStageRef,
+        code: str,
+        *,
+        retryable: bool,
+        reason_code: str | None = None,
+    ) -> None:
+        if type(code) is not str or not code.startswith("ACTIVATION."):
+            raise TypeError("activation error code is invalid")
+        if type(retryable) is not bool:
+            raise TypeError("activation retryable flag is invalid")
+        if reason_code is not None and type(reason_code) is not str:
+            raise TypeError("activation reason code is invalid")
+        self.code = code
+        self.retryable = retryable
+        self.reason_code = reason_code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ActivationBackupEvidence:
+    """Code-only, digest-backed evidence for one same-directory backup."""
+
+    asset_kind: str
+    original_digest: str
+    backup_digest: str
+    original_identity: tuple[int, int]
+    backup_identity: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if self.asset_kind not in {"DATABASE", "MANIFEST"}:
+            raise ValueError("activation backup asset kind is invalid")
+        for digest in (self.original_digest, self.backup_digest):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("activation backup digest is invalid")
+        for identity in (self.original_identity, self.backup_identity):
+            if (
+                type(identity) is not tuple
+                or len(identity) != 2
+                or any(type(value) is not int or value < 0 for value in identity)
+            ):
+                raise ValueError("activation backup identity is invalid")
+        if self.original_digest != self.backup_digest:
+            raise ValueError("activation backup digest does not close")
+        if self.original_identity == self.backup_identity:
+            raise ValueError("activation backup must be a distinct file")
+
+
+@dataclass(frozen=True)
+class _ActivationFileIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _PriorAssetCapture:
+    asset_kind: str
+    path: Path = field(repr=False, compare=False)
+    identity: _ActivationFileIdentity = field(repr=False, compare=False)
+    digest: str
+
+
+@dataclass(frozen=True)
+class _RecoveryBackupAsset:
+    asset_kind: str
+    original_path: Path = field(repr=False, compare=False)
+    backup_path: Path = field(repr=False, compare=False)
+    original_identity: _ActivationFileIdentity = field(
+        repr=False,
+        compare=False,
+    )
+    backup_identity: _ActivationFileIdentity = field(
+        repr=False,
+        compare=False,
+    )
+    evidence: ActivationBackupEvidence
+
+
+@dataclass(frozen=True)
+class _OwnedRecoveryPath:
+    path: Path = field(repr=False, compare=False)
+    identity: _ActivationFileIdentity = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _ActivationCleanupReservation:
+    token: contract_module._ActivationToken | None = field(
+        repr=False,
+        compare=False,
+    )
+    prior_view: _SQLiteGenerationView | None = field(
+        repr=False,
+        compare=False,
+    )
+    owned_paths: tuple[_OwnedRecoveryPath, ...] = field(
+        repr=False,
+        compare=False,
+    )
+
+
+_ACTIVATION_PREPARATION_FACTORY_KEY = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _ActivationPreparation:
+    """Single-use coordinator-held capability for Tasks 5.6-5.9.
+
+    Its repr is deliberately code-only.  Path-bearing registry snapshots,
+    tokens, prior views, and backup paths remain hidden implementation state.
+    """
+
+    preparation_id: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    expected_prior_generation: int | None
+    gate_b_grant_digest: str
+    had_prior_canonical: bool
+    backup_evidence: tuple[ActivationBackupEvidence, ...]
+    _token: contract_module._ActivationToken = field(
+        repr=False,
+        compare=False,
+    )
+    _physical_snapshot: object = field(
+        repr=False,
+        compare=False,
+    )
+    _prior_view: _SQLiteGenerationView | None = field(
+        repr=False,
+        compare=False,
+    )
+    _backup_assets: tuple[_RecoveryBackupAsset, ...] = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        *,
+        preparation_id: str,
+        resource_id: str,
+        target_identity: str,
+        canonical_store_id: str,
+        expected_prior_generation: int | None,
+        gate_b_grant_digest: str,
+        had_prior_canonical: bool,
+        backup_evidence: tuple[ActivationBackupEvidence, ...],
+        _token: contract_module._ActivationToken,
+        _physical_snapshot: object,
+        _prior_view: _SQLiteGenerationView | None,
+        _backup_assets: tuple[_RecoveryBackupAsset, ...],
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _ACTIVATION_PREPARATION_FACTORY_KEY:
+            raise TypeError("activation preparations require the Core factory")
+        if type(preparation_id) is not str or not preparation_id:
+            raise TypeError("activation preparation id is invalid")
+        if type(had_prior_canonical) is not bool:
+            raise TypeError("activation prior-presence flag is invalid")
+        if had_prior_canonical != bool(_backup_assets):
+            raise ValueError("activation prior asset state is inconsistent")
+        if had_prior_canonical and len(_backup_assets) != 2:
+            raise ValueError("activation prior asset set is incomplete")
+        if backup_evidence != tuple(
+            asset.evidence for asset in _backup_assets
+        ):
+            raise ValueError("activation backup evidence is inconsistent")
+        for name, value in (
+            ("preparation_id", preparation_id),
+            ("resource_id", resource_id),
+            ("target_identity", target_identity),
+            ("canonical_store_id", canonical_store_id),
+            ("expected_prior_generation", expected_prior_generation),
+            ("gate_b_grant_digest", gate_b_grant_digest),
+            ("had_prior_canonical", had_prior_canonical),
+            ("backup_evidence", backup_evidence),
+            ("_token", _token),
+            ("_physical_snapshot", _physical_snapshot),
+            ("_prior_view", _prior_view),
+            ("_backup_assets", _backup_assets),
+        ):
+            object.__setattr__(self, name, value)
+
+
+class ResourceStoreCoordinator:
+    """Own one resource's leases, sealed registry, and activation authority."""
+
+    def __init__(
+        self,
+        stage: MutableStageRef | None = None,
         *,
         canonical_store_id: str,
+        resource_identity: CanonicalResourceIdentity | None = None,
+        drain_timeout_seconds: float = 5.0,
     ) -> None:
+        if (stage is None) == (resource_identity is None):
+            raise TypeError(
+                "exactly one active stage or unactivated resource identity "
+                "is required"
+            )
         if type(canonical_store_id) is not str:
             raise TypeError("canonical_store_id must be a built-in string")
         if not canonical_store_id.strip():
             raise ValueError("canonical_store_id must not be empty")
-        private_stage = _snapshot_store_stage(stage)
-        snapshot = inspect_stage_schema(
-            private_stage,
-            canonical_store_id=canonical_store_id,
-            _allow_diverged_runtime=True,
-        )
-        self._resource_id = private_stage.resource_identity.resource_id
-        self._target_identity = (
-            private_stage.resource_identity.target_identity
-        )
+        timeout = _require_timeout(drain_timeout_seconds)
+        if stage is not None:
+            private_stage = _snapshot_store_stage(stage)
+            identity = private_stage.resource_identity
+            snapshot = inspect_stage_schema(
+                private_stage,
+                canonical_store_id=canonical_store_id,
+                _allow_diverged_runtime=True,
+            )
+            view: _SQLiteGenerationView | None = _SQLiteGenerationView(
+                stage=private_stage,
+                canonical_store_id=canonical_store_id,
+                generation=snapshot.generation,
+                fts5_available=snapshot.fts5_available,
+            )
+        else:
+            identity = _snapshot_store_identity(resource_identity)
+            view = None
+        self._resource_identity = identity
+        self._resource_id = identity.resource_id
+        self._target_identity = identity.target_identity
+        self._canonical_store_id = canonical_store_id
         self._condition = threading.Condition()
         self._state = "READY"
         self._active_lease_count = 0
-        self._view = _SQLiteGenerationView(
-            stage=private_stage,
-            canonical_store_id=canonical_store_id,
-            generation=snapshot.generation,
-            fts5_available=snapshot.fts5_available,
+        self._view = view
+        self._drain_timeout_seconds = timeout
+        registry_type = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "SealedArtifactRegistry",
         )
+        self._sealed_registry = registry_type(
+            registry_namespace=f"coordinator.{identity.target_identity}",
+        )
+        self._preparation: _ActivationPreparation | None = None
+        self._cleanup_reservation: _ActivationCleanupReservation | None = None
+        self._cleanup_in_progress = False
 
     @property
     def resource_id(self) -> str:
         return self._resource_id
 
     @property
-    def current_generation(self) -> int:
+    def current_generation(self) -> int | None:
         with self._condition:
-            return self._view.generation
+            return None if self._view is None else self._view.generation
+
+    @property
+    def sealed_registry(self) -> contract_module._SealedArtifactRegistryPort:
+        return self._sealed_registry
 
     @property
     def state(self) -> str:
@@ -601,8 +823,15 @@ class ResourceStoreCoordinator:
                 raise SQLiteStoreLifecycleError(
                     "STORE.RESOURCE_DRAINING",
                     resource_id=self._resource_id,
-                    generation=view.generation,
+                    generation=0 if view is None else view.generation,
                     retryable=True,
+                )
+            if view is None:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.CANONICAL_UNAVAILABLE",
+                    resource_id=self._resource_id,
+                    generation=0,
+                    retryable=False,
                 )
             self._active_lease_count += 1
         try:
@@ -617,6 +846,383 @@ class ResourceStoreCoordinator:
                     raise RuntimeError("operation lease count underflow")
                 if self._active_lease_count == 0:
                     self._condition.notify_all()
+
+    def activate(self, sealed_stage: SealedStage) -> _ActivationPreparation:
+        """Prepare exactly one registered sealed stage for later activation.
+
+        This Task 5.5 seam performs fresh Gate B evaluation, issues the
+        registry token, drains leases, repeats Gate B after the drain, and
+        creates a same-directory recovery backup of an existing canonical
+        DB/manifest pair.  It deliberately does not replace, journal,
+        publish a manifest, mutate DB metadata, or advance generation.
+        """
+
+        gate_b_evaluator = getattr(
+            importlib.import_module("tm_gate_b"),
+            "GateBEvaluator",
+        )
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        registry = cast(Any, self._sealed_registry)
+
+        if type(sealed_stage) is not SealedStage:
+            raise ActivationPreparationError(
+                "ACTIVATION.TYPE_INVALID",
+                retryable=False,
+            )
+        with self._condition:
+            if self._state != "READY" or self._preparation is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.CONCURRENT_PREPARATION",
+                    retryable=True,
+                )
+            initial_view = self._view
+            initial_generation = (
+                None if initial_view is None else initial_view.generation
+            )
+
+        first_report = gate_b_evaluator(
+            registry=registry
+        ).evaluate(sealed_stage)
+        if not first_report.granted or first_report.grant is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.GATE_B_DENIED",
+                retryable=False,
+                reason_code=first_report.error_code,
+            )
+        first_grant = first_report.grant
+        _require_activation_grant_identity(
+            first_grant,
+            identity=self._resource_identity,
+            canonical_store_id=self._canonical_store_id,
+            prior_view=initial_view,
+            current_generation=initial_generation,
+        )
+        pre_drain_captures = _capture_pre_drain_assets(
+            initial_view,
+            identity=self._resource_identity,
+        )
+
+        token: contract_module._ActivationToken | None = None
+        backups: tuple[_RecoveryBackupAsset, ...] = ()
+        owned_paths: list[_OwnedRecoveryPath] = []
+        deadline = time.monotonic() + self._drain_timeout_seconds
+        try:
+            with self._condition:
+                current_view = self._view
+                current_generation = (
+                    None if current_view is None else current_view.generation
+                )
+                if (
+                    self._state != "READY"
+                    or self._preparation is not None
+                    or current_view is not initial_view
+                    or current_generation != initial_generation
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.CONCURRENT_PREPARATION",
+                        retryable=True,
+                    )
+                self._state = "DRAINING"
+                self._condition.notify_all()
+                try:
+                    token = registry.issue_token(
+                        sealed_stage,
+                        current_generation=current_generation,
+                    )
+                except stage_seal_error as error:
+                    self._state = "READY"
+                    self._condition.notify_all()
+                    raise ActivationPreparationError(
+                        "ACTIVATION.TOKEN_REJECTED",
+                        retryable=False,
+                        reason_code=error.error_code,
+                    ) from error
+                while self._active_lease_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.DRAIN_TIMEOUT",
+                            retryable=True,
+                        )
+                    self._condition.wait(remaining)
+                if self._view is not initial_view:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+                observed_generation = (
+                    None if self._view is None else self._view.generation
+                )
+                if observed_generation != initial_generation:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+
+            second_report = gate_b_evaluator(
+                registry=registry
+            ).evaluate(sealed_stage)
+            if not second_report.granted or second_report.grant is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+                    retryable=False,
+                    reason_code=second_report.error_code,
+                )
+            second_grant = second_report.grant
+            if second_grant.grant_digest != first_grant.grant_digest:
+                raise ActivationPreparationError(
+                    "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+                    retryable=False,
+                )
+            _require_activation_grant_identity(
+                second_grant,
+                identity=self._resource_identity,
+                canonical_store_id=self._canonical_store_id,
+                prior_view=initial_view,
+                current_generation=initial_generation,
+            )
+            assert token is not None
+            contract_module._validate_activation_token_for_stage(
+                token,
+                sealed_stage,
+            )
+            _require_activation_token_identity(
+                token,
+                identity=self._resource_identity,
+                canonical_store_id=self._canonical_store_id,
+                current_generation=initial_generation,
+            )
+            physical_snapshot = registry.resolve_physical_readiness(
+                sealed_stage
+            )
+            if (
+                physical_snapshot.mutable_stage.resource_identity
+                != self._resource_identity
+                or physical_snapshot.canonical_store_id
+                != self._canonical_store_id
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.IDENTITY_MISMATCH",
+                    retryable=False,
+                )
+            preparation_id = f"preparation.{uuid.uuid4().hex}"
+            if initial_view is None:
+                _require_first_activation_absence(self._resource_identity)
+                source_capture = _capture_activation_file(
+                    self._resource_identity.configured_jsonl_path,
+                    asset_kind="SOURCE",
+                )
+                if source_capture.digest != (
+                    sealed_stage.evidence.source_binding.receipt.jsonl_digest
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+                        retryable=False,
+                    )
+                _require_first_activation_absence(self._resource_identity)
+                _require_same_asset_captures(
+                    pre_drain_captures,
+                    (source_capture,),
+                )
+            else:
+                captures = _capture_prior_assets(
+                    initial_view,
+                    identity=self._resource_identity,
+                )
+                _require_same_asset_captures(
+                    pre_drain_captures,
+                    captures,
+                )
+                backups = _create_recovery_backups(
+                    captures,
+                    preparation_id=preparation_id,
+                    owned_paths=owned_paths,
+                )
+                _revalidate_prior_assets(captures)
+            with self._condition:
+                if (
+                    self._state != "ACTIVATING"
+                    or self._view is not initial_view
+                    or self._preparation is not None
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+                preparation = _ActivationPreparation(
+                    preparation_id=preparation_id,
+                    resource_id=second_grant.resource_id,
+                    target_identity=second_grant.target_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    expected_prior_generation=initial_generation,
+                    gate_b_grant_digest=second_grant.grant_digest,
+                    had_prior_canonical=initial_view is not None,
+                    backup_evidence=tuple(
+                        asset.evidence for asset in backups
+                    ),
+                    _token=token,
+                    _physical_snapshot=physical_snapshot,
+                    _prior_view=initial_view,
+                    _backup_assets=backups,
+                    _factory_key=_ACTIVATION_PREPARATION_FACTORY_KEY,
+                )
+                self._preparation = preparation
+                return preparation
+        except BaseException as error:
+            failure = (
+                error
+                if isinstance(error, ActivationPreparationError)
+                else ActivationPreparationError(
+                    "ACTIVATION.BACKUP_FAILED",
+                    retryable=True,
+                )
+            )
+            cleanup_reservation = _ActivationCleanupReservation(
+                token=token,
+                prior_view=initial_view,
+                owned_paths=tuple(owned_paths),
+            )
+            try:
+                _remove_recovery_backups(cleanup_reservation.owned_paths)
+                if token is not None:
+                    registry.cancel(token)
+            except (ActivationPreparationError, stage_seal_error) as cleanup_error:
+                with self._condition:
+                    self._view = initial_view
+                    self._preparation = None
+                    self._cleanup_reservation = cleanup_reservation
+                    self._state = "ACTIVATING"
+                    self._condition.notify_all()
+                reason_code = (
+                    failure.code
+                    if isinstance(cleanup_error, ActivationPreparationError)
+                    else cast(str, getattr(cleanup_error, "error_code"))
+                )
+                raise ActivationPreparationError(
+                    "ACTIVATION.CLEANUP_FAILED",
+                    retryable=True,
+                    reason_code=reason_code,
+                ) from cleanup_error
+            with self._condition:
+                self._view = initial_view
+                self._preparation = None
+                self._cleanup_reservation = None
+                self._state = "READY"
+                self._condition.notify_all()
+            if failure is error:
+                raise
+            raise failure from error
+
+    def cancel_prepared_activation(
+        self,
+        preparation: _ActivationPreparation,
+    ) -> None:
+        """Fail-safe cancellation before Task 5.6 writes a journal."""
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+
+        if type(preparation) is not _ActivationPreparation:
+            raise ActivationPreparationError(
+                "ACTIVATION.PREPARATION_INVALID",
+                retryable=False,
+            )
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not preparation
+                or self._cleanup_reservation is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PREPARATION_NOT_ACTIVE",
+                    retryable=False,
+                )
+            if self._cleanup_in_progress:
+                raise ActivationPreparationError(
+                    "ACTIVATION.CLEANUP_IN_PROGRESS",
+                    retryable=True,
+                )
+            self._cleanup_in_progress = True
+        owned_paths = tuple(
+            _OwnedRecoveryPath(
+                path=backup.backup_path,
+                identity=backup.backup_identity,
+            )
+            for backup in preparation._backup_assets
+        )
+        try:
+            _remove_recovery_backups(owned_paths)
+            self._sealed_registry.cancel(preparation._token)
+        except ActivationPreparationError:
+            raise
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.CLEANUP_FAILED",
+                retryable=True,
+                reason_code=error.error_code,
+            ) from error
+        else:
+            with self._condition:
+                self._preparation = None
+                self._view = preparation._prior_view
+                self._state = "READY"
+        finally:
+            with self._condition:
+                self._cleanup_in_progress = False
+                self._condition.notify_all()
+
+    def retry_failed_activation_cleanup(self) -> None:
+        """Retry strict cleanup for a preparation that failed before return."""
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        with self._condition:
+            reservation = self._cleanup_reservation
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not None
+                or reservation is None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.CLEANUP_NOT_PENDING",
+                    retryable=False,
+                )
+            if self._cleanup_in_progress:
+                raise ActivationPreparationError(
+                    "ACTIVATION.CLEANUP_IN_PROGRESS",
+                    retryable=True,
+                )
+            self._cleanup_in_progress = True
+        try:
+            _remove_recovery_backups(reservation.owned_paths)
+            if reservation.token is not None:
+                self._sealed_registry.cancel(reservation.token)
+        except ActivationPreparationError:
+            raise
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.CLEANUP_FAILED",
+                retryable=True,
+                reason_code=error.error_code,
+            ) from error
+        else:
+            with self._condition:
+                self._cleanup_reservation = None
+                self._view = reservation.prior_view
+                self._state = "READY"
+        finally:
+            with self._condition:
+                self._cleanup_in_progress = False
+                self._condition.notify_all()
 
     def _transition_generation(
         self,
@@ -647,15 +1253,25 @@ class ResourceStoreCoordinator:
             next_identity.resource_id != self._resource_id
             or next_identity.target_identity != self._target_identity
         ):
+            observed_generation = self.current_generation
             raise SQLiteStoreLifecycleError(
                 "STORE.IDENTITY_MISMATCH",
                 resource_id=self._resource_id,
-                generation=self.current_generation,
+                generation=(
+                    0 if observed_generation is None else observed_generation
+                ),
                 retryable=False,
             )
 
         with self._condition:
             current_view = self._view
+        if current_view is None:
+            raise SQLiteStoreLifecycleError(
+                "STORE.CANONICAL_UNAVAILABLE",
+                resource_id=self._resource_id,
+                generation=0,
+                retryable=False,
+            )
         if canonical_store_id != current_view.canonical_store_id:
             raise SQLiteStoreLifecycleError(
                 "STORE.IDENTITY_MISMATCH",
@@ -672,6 +1288,13 @@ class ResourceStoreCoordinator:
         deadline = time.monotonic() + timeout
         with self._condition:
             current_view = self._view
+            if current_view is None:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.CANONICAL_UNAVAILABLE",
+                    resource_id=self._resource_id,
+                    generation=0,
+                    retryable=False,
+                )
             if self._state != "READY":
                 raise SQLiteStoreLifecycleError(
                     "STORE.RESOURCE_DRAINING",
@@ -726,6 +1349,565 @@ class ResourceStoreCoordinator:
             self._state = "READY"
             self._condition.notify_all()
             return next_generation
+
+
+class _ActivationGateBGrant(Protocol):
+    @property
+    def resource_id(self) -> str: ...
+
+    @property
+    def target_identity(self) -> str: ...
+
+    @property
+    def canonical_store_id(self) -> str: ...
+
+    @property
+    def expected_prior_generation(self) -> int | None: ...
+
+
+def _require_activation_grant_identity(
+    grant: _ActivationGateBGrant,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    prior_view: _SQLiteGenerationView | None,
+    current_generation: int | None,
+) -> None:
+    if (
+        grant.resource_id != identity.resource_id
+        or grant.target_identity != identity.target_identity
+        or grant.canonical_store_id != canonical_store_id
+        or grant.expected_prior_generation != current_generation
+    ):
+        code = (
+            "ACTIVATION.GENERATION_STALE"
+            if grant.expected_prior_generation != current_generation
+            else "ACTIVATION.IDENTITY_MISMATCH"
+        )
+        raise ActivationPreparationError(code, retryable=False)
+    if prior_view is not None and (
+        prior_view.canonical_store_id != canonical_store_id
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+
+
+def _require_activation_token_identity(
+    token: contract_module._ActivationToken,
+    *,
+    identity: CanonicalResourceIdentity,
+    canonical_store_id: str,
+    current_generation: int | None,
+) -> None:
+    if (
+        token.resource_id != identity.resource_id
+        or token.target_identity != identity.target_identity
+        or token.canonical_store_id != canonical_store_id
+        or token.expected_prior_generation != current_generation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+
+
+def _activation_file_identity(path: Path) -> _ActivationFileIdentity:
+    try:
+        observed = os.lstat(path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    if not stat.S_ISREG(observed.st_mode):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        )
+    return _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+
+
+def _capture_activation_file(
+    path: Path,
+    *,
+    asset_kind: str,
+) -> _PriorAssetCapture:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIOR_ASSET_INVALID",
+                retryable=False,
+            )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        identity = _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    finally:
+        os.close(descriptor)
+    if _activation_file_identity(path) != identity:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        )
+    return _PriorAssetCapture(
+        asset_kind=asset_kind,
+        path=path,
+        identity=identity,
+        digest=digest.hexdigest(),
+    )
+
+
+def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(capture.path, flags)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or (observed.st_dev, observed.st_ino)
+            != (capture.identity.device, capture.identity.inode)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIOR_ASSET_INVALID",
+                retryable=False,
+            )
+        payload = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            payload.extend(chunk)
+        return bytes(payload)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_INVALID",
+            retryable=False,
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _capture_pre_drain_assets(
+    view: _SQLiteGenerationView | None,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> tuple[_PriorAssetCapture, ...]:
+    if view is None:
+        _require_first_activation_absence(identity)
+        return (
+            _capture_activation_file(
+                identity.configured_jsonl_path,
+                asset_kind="SOURCE",
+            ),
+        )
+    return (
+        _capture_activation_file(
+            view.stage.staged_db_path,
+            asset_kind="DATABASE",
+        ),
+        _capture_activation_file(
+            identity.snapshot_manifest_path,
+            asset_kind="MANIFEST",
+        ),
+        _capture_activation_file(
+            identity.configured_jsonl_path,
+            asset_kind="SOURCE",
+        ),
+    )
+
+
+def _require_same_asset_captures(
+    before: tuple[_PriorAssetCapture, ...],
+    after: tuple[_PriorAssetCapture, ...],
+) -> None:
+    before_facts = tuple(
+        (item.asset_kind, item.identity, item.digest) for item in before
+    )
+    after_facts = tuple(
+        (item.asset_kind, item.identity, item.digest) for item in after
+    )
+    if before_facts != after_facts:
+        raise ActivationPreparationError(
+            "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+            retryable=False,
+        )
+
+
+def _capture_prior_assets(
+    view: _SQLiteGenerationView,
+    *,
+    identity: CanonicalResourceIdentity,
+) -> tuple[_PriorAssetCapture, ...]:
+    if (
+        view.stage.resource_identity != identity
+        or view.stage.resource_identity.resource_id != identity.resource_id
+        or view.stage.resource_identity.target_identity != identity.target_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.IDENTITY_MISMATCH",
+            retryable=False,
+        )
+    with _open_configured_connection(
+        view.stage.staged_db_path,
+        require_existing=True,
+    ) as connection:
+        facts = _read_source_binding_facts(connection, view)
+    binding = facts.binding
+    if (
+        facts.divergence_latched
+        or facts.diagnostic_codes
+        or binding is None
+        or _configured_pair_diagnostics(
+            binding,
+            identity=identity,
+            canonical_store_id=view.canonical_store_id,
+            head_revision=facts.head_revision,
+            cumulative_record_counts=facts.cumulative_record_counts,
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    database = _capture_activation_file(
+        view.stage.staged_db_path,
+        asset_kind="DATABASE",
+    )
+    manifest = _capture_activation_file(
+        identity.snapshot_manifest_path,
+        asset_kind="MANIFEST",
+    )
+    source = _capture_activation_file(
+        identity.configured_jsonl_path,
+        asset_kind="SOURCE",
+    )
+    if source.digest != binding.receipt.jsonl_digest:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    manifest_payload = _read_activation_file_bytes(manifest)
+    if manifest_payload != contract_to_json(binding.manifest).encode("utf-8"):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    try:
+        decoded = contract_from_json(manifest_payload.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        ) from error
+    if type(decoded) is not SnapshotManifest or decoded != binding.manifest:
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_BINDING_INVALID",
+            retryable=False,
+        )
+    return database, manifest, source
+
+
+def _require_first_activation_absence(
+    identity: CanonicalResourceIdentity,
+) -> None:
+    for path in (
+        identity.canonical_sidecar_path,
+        identity.snapshot_manifest_path,
+    ):
+        try:
+            _ = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIOR_ASSET_INVALID",
+                retryable=False,
+            ) from error
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_UNEXPECTED",
+            retryable=False,
+        )
+
+
+def _open_recovery_backup(path: Path) -> int:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags, 0o600)
+
+
+def _write_recovery_backup(source_descriptor: int, backup_descriptor: int) -> None:
+    while True:
+        chunk = os.read(source_descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(backup_descriptor, view)
+            if written <= 0:
+                raise OSError("recovery backup write made no progress")
+            view = view[written:]
+
+
+def _fsync_recovery_backup(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _fsync_activation_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_recovery_directory(path: Path) -> None:
+    _fsync_activation_directory(path)
+
+
+def _unlink_recovery_backup(path: Path) -> None:
+    os.unlink(path)
+
+
+def _fsync_recovery_deletion_directory(path: Path) -> None:
+    _fsync_activation_directory(path)
+
+
+def _require_recovery_path_absent(path: Path) -> None:
+    try:
+        _ = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.CLEANUP_FAILED",
+            retryable=True,
+        ) from error
+    raise ActivationPreparationError(
+        "ACTIVATION.CLEANUP_FAILED",
+        retryable=True,
+    )
+
+
+def _remove_recovery_path(owned: _OwnedRecoveryPath) -> None:
+    try:
+        observed = os.lstat(owned.path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.CLEANUP_FAILED",
+            retryable=True,
+        ) from error
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or (observed.st_dev, observed.st_ino)
+        != (owned.identity.device, owned.identity.inode)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.CLEANUP_FAILED",
+            retryable=True,
+        )
+    try:
+        _unlink_recovery_backup(owned.path)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.CLEANUP_FAILED",
+            retryable=True,
+        ) from error
+    _require_recovery_path_absent(owned.path)
+
+
+def _create_recovery_backup(
+    capture: _PriorAssetCapture,
+    *,
+    backup_path: Path,
+    owned_paths: list[_OwnedRecoveryPath],
+) -> _RecoveryBackupAsset:
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    source_descriptor = -1
+    backup_descriptor = -1
+    backup_identity: _ActivationFileIdentity | None = None
+    try:
+        source_descriptor = os.open(capture.path, source_flags)
+        source_observed = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_observed.st_mode)
+            or (source_observed.st_dev, source_observed.st_ino)
+            != (capture.identity.device, capture.identity.inode)
+        ):
+            raise OSError("source identity changed")
+        backup_descriptor = _open_recovery_backup(backup_path)
+        backup_observed = os.fstat(backup_descriptor)
+        if not stat.S_ISREG(backup_observed.st_mode):
+            raise OSError("backup is not regular")
+        backup_identity = _ActivationFileIdentity(
+            backup_observed.st_dev,
+            backup_observed.st_ino,
+        )
+        owned_paths.append(
+            _OwnedRecoveryPath(
+                path=backup_path,
+                identity=backup_identity,
+            )
+        )
+        _write_recovery_backup(source_descriptor, backup_descriptor)
+        _fsync_recovery_backup(backup_descriptor)
+        os.close(source_descriptor)
+        source_descriptor = -1
+        os.close(backup_descriptor)
+        backup_descriptor = -1
+        backup_capture = _capture_activation_file(
+            backup_path,
+            asset_kind=capture.asset_kind,
+        )
+        if backup_capture.identity != backup_identity:
+            raise OSError("backup identity changed")
+        current = _capture_activation_file(
+            capture.path,
+            asset_kind=capture.asset_kind,
+        )
+        if current.identity != capture.identity or current.digest != capture.digest:
+            raise ActivationPreparationError(
+                "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+                retryable=False,
+            )
+        evidence = ActivationBackupEvidence(
+            asset_kind=capture.asset_kind,
+            original_digest=capture.digest,
+            backup_digest=backup_capture.digest,
+            original_identity=(capture.identity.device, capture.identity.inode),
+            backup_identity=(
+                backup_capture.identity.device,
+                backup_capture.identity.inode,
+            ),
+        )
+        return _RecoveryBackupAsset(
+            asset_kind=capture.asset_kind,
+            original_path=capture.path,
+            backup_path=backup_path,
+            original_identity=capture.identity,
+            backup_identity=backup_capture.identity,
+            evidence=evidence,
+        )
+    finally:
+        if source_descriptor >= 0:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+        if backup_descriptor >= 0:
+            try:
+                os.close(backup_descriptor)
+            except OSError:
+                pass
+
+
+def _create_recovery_backups(
+    captures: tuple[_PriorAssetCapture, ...],
+    *,
+    preparation_id: str,
+    owned_paths: list[_OwnedRecoveryPath],
+) -> tuple[_RecoveryBackupAsset, ...]:
+    backup_captures = tuple(
+        capture
+        for capture in captures
+        if capture.asset_kind in {"DATABASE", "MANIFEST"}
+    )
+    if tuple(capture.asset_kind for capture in backup_captures) != (
+        "DATABASE",
+        "MANIFEST",
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.PRIOR_ASSET_SET_INCOMPLETE",
+            retryable=False,
+        )
+    suffix = preparation_id.removeprefix("preparation.")
+    created: list[_RecoveryBackupAsset] = []
+    for capture in backup_captures:
+        label = capture.asset_kind.lower()
+        backup_path = capture.path.with_name(
+            f".{capture.path.name}.localcat-recovery.{suffix}.{label}.bak"
+        )
+        created.append(
+            _create_recovery_backup(
+                capture,
+                backup_path=backup_path,
+                owned_paths=owned_paths,
+            )
+        )
+    parents = {asset.backup_path.parent for asset in created}
+    if len(parents) != 1:
+        raise OSError("recovery backups are not adjacent")
+    _fsync_recovery_directory(next(iter(parents)))
+    return tuple(created)
+
+
+def _revalidate_prior_assets(captures: tuple[_PriorAssetCapture, ...]) -> None:
+    for capture in captures:
+        current = _capture_activation_file(
+            capture.path,
+            asset_kind=capture.asset_kind,
+        )
+        if current.identity != capture.identity or current.digest != capture.digest:
+            raise ActivationPreparationError(
+                "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
+                retryable=False,
+            )
+
+
+def _remove_recovery_backups(
+    owned_paths: tuple[_OwnedRecoveryPath, ...],
+) -> None:
+    parents = {owned.path.parent for owned in owned_paths}
+    for owned in owned_paths:
+        _remove_recovery_path(owned)
+    for parent in parents:
+        try:
+            _fsync_recovery_deletion_directory(parent)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.CLEANUP_FAILED",
+                retryable=True,
+            ) from error
+    for owned in owned_paths:
+        _require_recovery_path_absent(owned.path)
 
 
 class SourceBindingMonitor:
@@ -1394,6 +2576,7 @@ class SQLiteTMStore:
         stage: MutableStageRef,
         *,
         canonical_store_id: str,
+        drain_timeout_seconds: float = 5.0,
     ) -> None:
         if type(canonical_store_id) is not str:
             raise TypeError("canonical_store_id must be a built-in string")
@@ -1403,6 +2586,7 @@ class SQLiteTMStore:
         self._coordinator = ResourceStoreCoordinator(
             stage,
             canonical_store_id=self._canonical_store_id,
+            drain_timeout_seconds=drain_timeout_seconds,
         )
         self._source_binding_monitor = SourceBindingMonitor(
             self._coordinator
@@ -3564,6 +4748,33 @@ def _schema_object_names(
     return {str(row[0]) for row in rows}
 
 
+def _snapshot_store_identity(
+    value: CanonicalResourceIdentity | None,
+) -> CanonicalResourceIdentity:
+    if type(value) is not CanonicalResourceIdentity:
+        raise TypeError(
+            "resource_identity must be exact CanonicalResourceIdentity"
+        )
+    for path_value, field_name in (
+        (value.configured_jsonl_path, "configured_jsonl_path"),
+        (value.canonical_sidecar_path, "canonical_sidecar_path"),
+        (value.snapshot_manifest_path, "snapshot_manifest_path"),
+    ):
+        if type(path_value) is not _NATIVE_PATH_TYPE:
+            raise TypeError(f"{field_name} must be an exact native Path")
+    private = CanonicalResourceIdentity(
+        resource_id=value.resource_id,
+        configured_jsonl_path=_copy_exact_path(value.configured_jsonl_path),
+        canonical_sidecar_path=_copy_exact_path(value.canonical_sidecar_path),
+        snapshot_manifest_path=_copy_exact_path(value.snapshot_manifest_path),
+        target_identity=value.target_identity,
+        identity_version=value.identity_version,
+    )
+    if private != value:
+        raise ValueError("resource_identity is not canonical")
+    return private
+
+
 def _snapshot_store_stage(value: object) -> MutableStageRef:
     if type(value) is not MutableStageRef:
         raise TypeError("stage must be exact MutableStageRef")
@@ -3596,14 +4807,7 @@ def _snapshot_store_stage(value: object) -> MutableStageRef:
     ):
         if type(path_value) is not _NATIVE_PATH_TYPE:
             raise TypeError(f"{field_name} must be an exact native Path")
-    safe_identity = CanonicalResourceIdentity(
-        resource_id=resource_id,
-        configured_jsonl_path=_copy_exact_path(configured_jsonl_path),
-        canonical_sidecar_path=_copy_exact_path(canonical_sidecar_path),
-        snapshot_manifest_path=_copy_exact_path(snapshot_manifest_path),
-        target_identity=target_identity,
-        identity_version=identity_version,
-    )
+    safe_identity = _snapshot_store_identity(identity)
     safe_stage = MutableStageRef(
         stage_id=stage_id,
         resource_identity=safe_identity,
@@ -3795,6 +4999,8 @@ def _meta_bool(meta: dict[str, str], key: str) -> bool:
 
 
 __all__ = [
+    "ActivationBackupEvidence",
+    "ActivationPreparationError",
     "BUSY_TIMEOUT_MS",
     "CANDIDATE_INDEX_VERSION",
     "CanonicalRevisionSnapshot",

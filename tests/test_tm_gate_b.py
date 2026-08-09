@@ -37,7 +37,6 @@ from tm_migration import TMMigrationService
 from tm_sqlite_store import unique_character_ngrams
 from tm_stage_sealer import (
     SealedArtifactRegistry,
-    StageSealError,
     StageSealer,
 )
 
@@ -444,14 +443,8 @@ class GateBNoStateAdvanceTests(unittest.TestCase):
                 registry.state(sealed),
                 contract_module.ActivationCapabilityState.SEALED,
             )
-            with self.assertRaisesRegex(
-                StageSealError,
-                "^SEALER\\.TOKEN_LIFECYCLE_PENDING$",
-            ):
-                registry.issue_token(
-                    sealed,
-                    current_generation=sealed.expected_prior_generation,
-                )
+            second_report = _evaluate(registry, sealed, fts5_available=True)
+            self.assertTrue(second_report.granted)
             self.assertEqual(
                 registry.state(sealed),
                 contract_module.ActivationCapabilityState.SEALED,
