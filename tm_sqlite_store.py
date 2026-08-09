@@ -246,6 +246,12 @@ _RECORD_COLUMNS = (
     "origin_batch_id, origin_ordinal"
 )
 
+_EXPORT_RECORD_COLUMNS = (
+    "record_id, source_raw, target_raw, speaker_raw, context_prev_raw, "
+    "context_next_raw, file_source, provenance_json, legacy_line_no, "
+    "origin_batch_id, origin_ordinal, usage_count, last_used"
+)
+
 _BASE_TABLES = frozenset(
     {
         "tm_gram",
@@ -827,6 +833,49 @@ class CanonicalRevisionSnapshot:
     generation: int
     head_revision: int
     record_count: int
+
+
+@dataclass(frozen=True)
+class CanonicalExportRecord:
+    """One record plus its usage facts inside one export snapshot."""
+
+    record: TMRecord
+    usage_count: int
+    last_used: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.record) is not TMRecord:
+            raise TypeError("export record must be exact TMRecord")
+        if type(self.usage_count) is not int or self.usage_count < 0:
+            raise ValueError("export usage count is invalid")
+        if self.last_used is not None and type(self.last_used) is not str:
+            raise TypeError("export last_used must be a built-in string or None")
+
+
+@dataclass(frozen=True)
+class CanonicalExportSnapshot:
+    """Revision and complete record order observed in one read snapshot."""
+
+    revision: CanonicalRevisionSnapshot
+    records: tuple[CanonicalExportRecord, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.revision) is not CanonicalRevisionSnapshot:
+            raise TypeError(
+                "export snapshot revision must be CanonicalRevisionSnapshot"
+            )
+        if type(self.records) is not tuple:
+            raise TypeError("export snapshot records must be a built-in tuple")
+        for item in self.records:
+            if type(item) is not CanonicalExportRecord:
+                raise TypeError(
+                    "export snapshot records must contain "
+                    "CanonicalExportRecord values"
+                )
+        if self.revision.record_count != len(self.records):
+            raise ValueError(
+                "export snapshot record count does not match revision"
+            )
 
 
 @dataclass(frozen=True)
@@ -3866,6 +3915,36 @@ class SQLiteTMStore:
                     lease,
                 )
 
+    def capture_export_snapshot(self) -> CanonicalExportSnapshot:
+        """Capture revision and complete record order in one read snapshot.
+
+        Task 5.12 export seam: the revision (generation, canonical store
+        id, head revision, record count) and every canonical record are
+        observed inside one operation lease and one read transaction, so
+        an export can never mix bytes from two different revisions.
+        """
+
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN")
+                try:
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    rows = connection.execute(
+                        f"SELECT {_EXPORT_RECORD_COLUMNS} FROM tm_record "
+                        "ORDER BY record_id ASC"
+                    ).fetchall()
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        return CanonicalExportSnapshot(
+            revision=revision,
+            records=tuple(_export_record_from_row(row) for row in rows),
+        )
+
     def register_issued_snapshot_receipt(
         self,
         receipt: SnapshotReceipt,
@@ -3947,6 +4026,250 @@ class SQLiteTMStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def register_issued_export_receipt(
+        self,
+        receipt: SnapshotReceipt,
+        *,
+        destination_jsonl_path: Path,
+        destination_manifest_path: Path,
+        expected_generation: int,
+    ) -> None:
+        """Atomically register one arbitrary-destination issued receipt.
+
+        Task 5.12 ledger seam: the receipt must describe exactly the
+        captured revision (generation, canonical store id, revision
+        ancestry and record count) of the live canonical store.  The
+        destination paths are caller-chosen arbitrary paths and must not
+        alias the configured JSONL or its manifest; they are stored only
+        in the ledger and never enter the portable receipt digest.  The
+        snapshot binding, divergence latch, head revision and generation
+        are never modified.
+        """
+
+        private_receipt = _snapshot_receipt(receipt)
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        for path_value, field_name in (
+            (destination_jsonl_path, "destination_jsonl_path"),
+            (destination_manifest_path, "destination_manifest_path"),
+        ):
+            if type(path_value) is not _NATIVE_PATH_TYPE:
+                raise TypeError(f"{field_name} must be an exact native Path")
+        private_jsonl_path = _copy_exact_path(destination_jsonl_path)
+        private_manifest_path = _copy_exact_path(destination_manifest_path)
+        _require_absolute_path(
+            private_jsonl_path,
+            "export destination jsonl path",
+        )
+        _require_absolute_path(
+            private_manifest_path,
+            "export destination manifest path",
+        )
+        if private_jsonl_path == private_manifest_path:
+            raise ValueError("export destination paths must differ")
+        if private_manifest_path != private_jsonl_path.with_name(
+            f"{private_jsonl_path.name}.localcat-snapshot.json"
+        ):
+            raise ValueError(
+                "export destination manifest path is not deterministic"
+            )
+
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if (
+                private_jsonl_path == identity.configured_jsonl_path
+                or private_jsonl_path == identity.snapshot_manifest_path
+                or private_manifest_path == identity.snapshot_manifest_path
+                or private_jsonl_path == identity.canonical_sidecar_path
+                or private_receipt.resource_id != identity.resource_id
+                or private_receipt.canonical_store_id
+                != lease.canonical_store_id
+            ):
+                raise ValueError(
+                    "issued export receipt identity does not match store"
+                )
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    if (
+                        private_receipt.exported_revision
+                        > revision.head_revision
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_REVISION_STALE"
+                        )
+                    counts = _revision_record_counts(
+                        connection,
+                        head_revision=revision.head_revision,
+                        record_count=revision.record_count,
+                    )
+                    expected_count = counts.get(
+                        private_receipt.exported_revision
+                    )
+                    if (
+                        expected_count is None
+                        or private_receipt.record_count != expected_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_ANCESTRY_INVALID"
+                        )
+                    existing = connection.execute(
+                        "SELECT 1 FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id = ?",
+                        (private_receipt.snapshot_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_DUPLICATE"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_receipt("
+                        "snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?)",
+                        (
+                            private_receipt.snapshot_id,
+                            private_receipt.resource_id,
+                            private_receipt.canonical_store_id,
+                            private_receipt.exported_revision,
+                            private_receipt.jsonl_digest,
+                            private_receipt.record_count,
+                            private_receipt.format_version,
+                            Path.__str__(private_jsonl_path),
+                            Path.__str__(private_manifest_path),
+                            datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def complete_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Mark exactly one issued arbitrary-destination receipt completed.
+
+        Existing completed/cancelled receipts and all other ledger
+        history remain immutable; a receipt that is unknown, foreign, or
+        no longer ``issued`` is rejected.
+        """
+
+        self._transition_issued_export_receipt(
+            snapshot_id,
+            expected_generation=expected_generation,
+            target_status="completed",
+        )
+
+    def cancel_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Mark exactly one issued arbitrary-destination receipt cancelled."""
+
+        self._transition_issued_export_receipt(
+            snapshot_id,
+            expected_generation=expected_generation,
+            target_status="cancelled",
+        )
+
+    def _transition_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        target_status: str,
+    ) -> None:
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        if target_status not in {"completed", "cancelled"}:
+            raise ValueError("target status is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = ? "
+                        "WHERE snapshot_id = ?",
+                        (target_status, snapshot_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4757,6 +5080,33 @@ def _canonical_revision_from_transaction(
     )
 
 
+def _revision_record_counts(
+    connection: sqlite3.Connection,
+    *,
+    head_revision: int,
+    record_count: int,
+) -> dict[int, int]:
+    """Return the proven cumulative record count for each revision."""
+
+    if not connection.in_transaction:
+        raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_MISSING")
+    meta = _read_meta(connection)
+    schema_version = _meta_int(meta, "schema_version")
+    if schema_version == TM_LEGACY_SCHEMA_VERSION:
+        cumulative = _legacy_revision_ancestry(
+            connection,
+            head_revision=head_revision,
+            record_count=record_count,
+        )
+    else:
+        cumulative = _validate_revision_ancestry_rows(
+            _origin_ancestry_rows(connection),
+            head_revision=head_revision,
+            record_count=record_count,
+        )
+    return dict(cumulative)
+
+
 def _table_count(connection: sqlite3.Connection, table_name: str) -> int:
     if table_name not in _BASE_TABLES:
         raise ValueError("table name is not approved")
@@ -4764,6 +5114,28 @@ def _table_count(connection: sqlite3.Connection, table_name: str) -> int:
     if row is None or type(row[0]) is not int or row[0] < 0:
         raise SQLiteStoreSchemaError("STORE.TABLE_COUNT_INVALID")
     return row[0]
+
+
+def _export_record_from_row(
+    row: tuple[object, ...],
+) -> CanonicalExportRecord:
+    """Build one export record from the 13-column export projection."""
+
+    try:
+        if len(row) != 13:
+            raise ValueError("export record row is invalid")
+        record = _record_from_row(row[:11])
+        usage_count = _row_int(row[11])
+        if usage_count < 0:
+            raise ValueError("export usage count is invalid")
+        last_used = None if row[12] is None else str(row[12])
+    except (TypeError, ValueError, IndexError) as error:
+        raise SQLiteStoreSchemaError("STORE.RECORD_CORRUPT") from error
+    return CanonicalExportRecord(
+        record=record,
+        usage_count=usage_count,
+        last_used=last_used,
+    )
 
 
 def _record_from_row(row: tuple[object, ...]) -> TMRecord:

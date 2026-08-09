@@ -14,7 +14,13 @@ from types import MappingProxyType
 from typing import cast
 import uuid
 
-from tm_activation_journal import _ActivationPreparation
+from tm_activation_journal import (
+    _ActivationPreparation,
+    _activation_journal_path,
+    _activation_journal_temp_path,
+    _activation_lineage_marker_path,
+    _activation_lineage_marker_temp_path,
+)
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
@@ -23,6 +29,10 @@ from tm_contracts import (
     AssetPreservationState,
     CanonicalResourceIdentity,
     DiagnosticDisposition,
+    ExportDiagnostic,
+    ExportFailure,
+    ExportOutcome,
+    ExportReport,
     MigrationDiagnostic,
     MigrationFailure,
     MigrationOutcome,
@@ -46,7 +56,10 @@ from tm_sqlite_store import (
     TM_LEGACY_SCHEMA_VERSION,
     TM_SCHEMA_VERSION,
     ActivationPreparationError,
+    CanonicalExportRecord,
+    CanonicalExportSnapshot,
     ResourceStoreCoordinator,
+    SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     _APPROVED_SCHEMA_DIGESTS,
@@ -68,6 +81,12 @@ import tm_schema_upgrade as schema_upgrade_module
 
 _NATIVE_PATH_TYPE = type(Path())
 MIGRATION_STREAM_CHUNK_SIZE = 5000
+
+_EXPORT_MANIFEST_SUFFIX = ".localcat-snapshot.json"
+_EXPORT_JSONL_TEMP_SUFFIX = ".localcat-export.jsonl.tmp"
+_EXPORT_MANIFEST_TEMP_SUFFIX = ".localcat-export.manifest.tmp"
+_EXPORT_JSONL_RECOVERY_SUFFIX = ".localcat-export-recovery.jsonl.bak"
+_EXPORT_MANIFEST_RECOVERY_SUFFIX = ".localcat-export-recovery.manifest.bak"
 
 _REJECTION_DIAGNOSTICS = {
     "ROW.INVALID_UTF8": (
@@ -149,6 +168,13 @@ class _CreatedFileIdentity:
     inode: int
 
 
+class _NoDestinationProof:
+    """Sentinel for internal restore moves that do not publish a new file."""
+
+
+_NO_DESTINATION_PROOF = _NoDestinationProof()
+
+
 @dataclass(frozen=True)
 class _LocatorSelection:
     """One strictly proven recovery-locator candidate and its identity.
@@ -182,6 +208,997 @@ class MigrationPreflightError(RuntimeError):
             raise TypeError("error_code must be a built-in string")
         self.error_code = error_code
         super().__init__(error_code)
+
+
+class ExportPreflightError(RuntimeError):
+    """Stable export failure that never includes TM text or local paths."""
+
+    def __init__(self, error_code: str) -> None:
+        if type(error_code) is not str:
+            raise TypeError("error_code must be a built-in string")
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+@dataclass(frozen=True)
+class _ExportArtifactPaths:
+    """Deterministic same-directory artifact family for one destination."""
+
+    destination: Path
+    manifest: Path
+    jsonl_temp: Path
+    manifest_temp: Path
+    jsonl_recovery: Path
+    manifest_recovery: Path
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.destination, "destination"),
+            (self.manifest, "manifest"),
+            (self.jsonl_temp, "jsonl_temp"),
+            (self.manifest_temp, "manifest_temp"),
+            (self.jsonl_recovery, "jsonl_recovery"),
+            (self.manifest_recovery, "manifest_recovery"),
+        ):
+            if type(value) is not _NATIVE_PATH_TYPE:
+                raise TypeError(f"{field_name} must be an exact native Path")
+        if self.manifest != self.destination.with_name(
+            f"{self.destination.name}{_EXPORT_MANIFEST_SUFFIX}"
+        ):
+            raise ValueError("export manifest path is not deterministic")
+
+
+def _export_artifact_paths(destination: Path) -> _ExportArtifactPaths:
+    if type(destination) is not _NATIVE_PATH_TYPE:
+        raise TypeError("destination must be an exact native Path")
+    return _ExportArtifactPaths(
+        destination=destination,
+        manifest=destination.with_name(
+            f"{destination.name}{_EXPORT_MANIFEST_SUFFIX}"
+        ),
+        jsonl_temp=destination.with_name(
+            f".{destination.name}{_EXPORT_JSONL_TEMP_SUFFIX}"
+        ),
+        manifest_temp=destination.with_name(
+            f".{destination.name}{_EXPORT_MANIFEST_TEMP_SUFFIX}"
+        ),
+        jsonl_recovery=destination.with_name(
+            f".{destination.name}{_EXPORT_JSONL_RECOVERY_SUFFIX}"
+        ),
+        manifest_recovery=destination.with_name(
+            f".{destination.name}{_EXPORT_MANIFEST_RECOVERY_SUFFIX}"
+        ),
+    )
+
+
+def _export_authority_paths(
+    identity: CanonicalResourceIdentity,
+) -> frozenset[Path]:
+    """Deterministic authority paths this export must never touch."""
+
+    journal = _activation_journal_path(identity)
+    marker = _activation_lineage_marker_path(identity)
+    return frozenset(
+        {
+            identity.configured_jsonl_path,
+            identity.snapshot_manifest_path,
+            identity.canonical_sidecar_path,
+            journal,
+            _activation_journal_temp_path(journal),
+            marker,
+            _activation_lineage_marker_temp_path(marker),
+        }
+    )
+
+
+def _export_path_in_authority_family(
+    identity: CanonicalResourceIdentity,
+    path: Path,
+) -> bool:
+    """True when ``path`` is a deterministic artifact of this resource.
+
+    The sidecar directory holds the activation journal/lineage/recovery
+    and schema-upgrade artifact families plus every deterministic stage
+    file; all of them embed either the sidecar name or the canonical
+    target identity fragment.  A destination that collides with any of
+    those names in the same directory is an authority-path alias.
+    """
+
+    sidecar = identity.canonical_sidecar_path
+    if path.parent != sidecar.parent:
+        return False
+    name = path.name
+    if name.startswith(f".{sidecar.name}.localcat-"):
+        return True
+    return name.startswith(".localcat-") and (
+        identity.target_identity[:16] in name
+    )
+
+
+def _require_export_parent_safe(destination: Path) -> None:
+    """Fail closed on missing, symlinked, or unwritable parent chains."""
+
+    parent = destination.parent
+    if parent == destination:
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    chain = [parent]
+    chain.extend(parent.parents)
+    for candidate in reversed(chain):
+        try:
+            observed = os.lstat(candidate)
+        except (OSError, ValueError):
+            raise ExportPreflightError("EXPORT.PARENT_UNSAFE") from None
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+    try:
+        observed = os.lstat(parent)
+    except (OSError, ValueError):
+        raise ExportPreflightError("EXPORT.PARENT_UNSAFE") from None
+    if not (
+        observed.st_mode
+        & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        and observed.st_mode
+        & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    ):
+        raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+
+
+def _export_existing_digest(
+    path: Path,
+    *,
+    unsafe_code: str,
+) -> str | None:
+    """Digest of an existing regular single-link file, or None when absent."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        raise ExportPreflightError(unsafe_code) from None
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise ExportPreflightError(unsafe_code)
+    digest = _try_file_digest(path)
+    if digest is None:
+        raise ExportPreflightError(unsafe_code)
+    return digest
+
+
+def _export_existing_state(
+    path: Path,
+    *,
+    unsafe_code: str,
+) -> tuple[str, tuple[int, int]] | None:
+    """Strict digest and inode proof for an existing export entry."""
+
+    digest = _export_existing_digest(path, unsafe_code=unsafe_code)
+    if digest is None:
+        return None
+    proof = _strict_locator_proof(path, digest)
+    if proof is None:
+        raise ExportPreflightError(unsafe_code)
+    return (digest, proof[0])
+
+
+def _validate_export_destination(
+    identity: CanonicalResourceIdentity,
+    paths: _ExportArtifactPaths,
+) -> tuple[
+    str | None,
+    str | None,
+    tuple[int, int] | None,
+    tuple[int, int] | None,
+]:
+    """Fail closed on any alias, unsafe parent, or conflicting path state.
+
+    Returns the exact prior digests of the destination and its adjacent
+    manifest (``None`` when the file is absent) so the caller can prove
+    preservation and restore on failure.
+    """
+
+    destination = paths.destination
+    if not destination.is_absolute():
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    if ".." in destination.parts or destination.name in {"", ".", ".."}:
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    authority = _export_authority_paths(identity)
+    for candidate in (destination, paths.manifest):
+        if candidate in authority:
+            raise ExportPreflightError("EXPORT.PATH_ALIASED")
+        if _export_path_in_authority_family(identity, candidate):
+            raise ExportPreflightError("EXPORT.PATH_ALIASED")
+    if destination == paths.manifest:
+        raise ExportPreflightError("EXPORT.PATH_ALIASED")
+    for artifact in (
+        paths.jsonl_temp,
+        paths.manifest_temp,
+        paths.jsonl_recovery,
+        paths.manifest_recovery,
+    ):
+        if artifact in authority:
+            raise ExportPreflightError("EXPORT.PATH_ALIASED")
+    _require_export_parent_safe(destination)
+    destination_state = _export_existing_state(
+        paths.destination,
+        unsafe_code="EXPORT.DESTINATION_UNSAFE",
+    )
+    manifest_state = _export_existing_state(
+        paths.manifest,
+        unsafe_code="EXPORT.MANIFEST_UNSAFE",
+    )
+    destination_before = (
+        None if destination_state is None else destination_state[0]
+    )
+    destination_identity = (
+        None if destination_state is None else destination_state[1]
+    )
+    manifest_before = None if manifest_state is None else manifest_state[0]
+    manifest_identity = None if manifest_state is None else manifest_state[1]
+    if destination_before is None and manifest_before is not None:
+        raise ExportPreflightError("EXPORT.PAIR_INCONSISTENT")
+    for artifact, code in (
+        (paths.jsonl_temp, "EXPORT.TEMP_CONFLICT"),
+        (paths.manifest_temp, "EXPORT.TEMP_CONFLICT"),
+        (paths.jsonl_recovery, "EXPORT.RECOVERY_CONFLICT"),
+        (paths.manifest_recovery, "EXPORT.RECOVERY_CONFLICT"),
+    ):
+        if _path_exists(artifact):
+            raise ExportPreflightError(code)
+    return (
+        destination_before,
+        manifest_before,
+        destination_identity,
+        manifest_identity,
+    )
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        raise ExportPreflightError("EXPORT.PATH_UNREADABLE") from None
+
+
+def _fsync_file(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _created_export_identity(
+    descriptor: int,
+) -> tuple[_CreatedFileIdentity, OSError | None]:
+    """Read a creation handle identity, retaining one transient failure.
+
+    A second read through the still-open handle establishes safe unlink
+    authority without trusting the pathname.  The caller then reports the
+    first failure after cleaning the inode it can now prove it created.
+    """
+
+    first_error: OSError | None = None
+    try:
+        observed = os.fstat(descriptor)
+    except OSError as error:
+        first_error = error
+        observed = os.fstat(descriptor)
+    return (
+        _CreatedFileIdentity(observed.st_dev, observed.st_ino),
+        first_error,
+    )
+
+
+def _replace_path(
+    source: Path,
+    destination: Path,
+    *,
+    expected_destination_digest: str | None | _NoDestinationProof = (
+        _NO_DESTINATION_PROOF
+    ),
+    expected_destination_identity: (
+        tuple[int, int] | None | _NoDestinationProof
+    ) = _NO_DESTINATION_PROOF,
+) -> None:
+    digest_unset = isinstance(
+        expected_destination_digest,
+        _NoDestinationProof,
+    )
+    identity_unset = isinstance(
+        expected_destination_identity,
+        _NoDestinationProof,
+    )
+    if digest_unset != identity_unset:
+        raise ValueError("destination publication proof is incomplete")
+    if not digest_unset:
+        observed = _export_existing_state(
+            destination,
+            unsafe_code="EXPORT.PRIOR_PAIR_CHANGED",
+        )
+        expected = (
+            None
+            if expected_destination_digest is None
+            else (
+                expected_destination_digest,
+                expected_destination_identity,
+            )
+        )
+        if observed != expected:
+            raise ExportPreflightError("EXPORT.PRIOR_PAIR_CHANGED")
+    os.replace(source, destination)
+
+
+def _export_jsonl_row(item: object) -> dict[str, object]:
+    """One deterministic canonical JSONL row in fixed field order."""
+
+    if type(item) is not CanonicalExportRecord:
+        raise TypeError("export row requires one CanonicalExportRecord")
+    record = item.record
+    return {
+        "record_id": record.record_id,
+        "source": record.source_raw,
+        "target": record.target_raw,
+        "speaker": record.speaker_raw,
+        "context_prev": record.context_prev_raw,
+        "context_next": record.context_next_raw,
+        "file_source": record.file_source,
+        "provenance": [
+            [key, value] for key, value in record.provenance
+        ],
+        "legacy_line_no": record.legacy_line_no,
+        "usage_count": item.usage_count,
+        "last_used": item.last_used,
+        "origin_batch_id": record.origin_batch_id,
+        "origin_ordinal": record.origin_ordinal,
+    }
+
+
+def _stream_export_jsonl_temp(
+    path: Path,
+    records: tuple[object, ...],
+) -> tuple[str, int, _CreatedFileIdentity]:
+    """Stream one exclusive JSONL temporary file and fsync it."""
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ExportPreflightError("EXPORT.TEMP_CONFLICT") from error
+    identity: _CreatedFileIdentity | None = None
+    try:
+        identity, identity_error = _created_export_identity(descriptor)
+        if identity_error is not None:
+            raise ExportPreflightError(
+                "EXPORT.TEMP_IDENTITY_FAILED"
+            ) from identity_error
+        os.fchmod(descriptor, 0o600)
+        digest = hashlib.sha256()
+        count = 0
+        for item in records:
+            payload = (
+                json.dumps(
+                    _export_jsonl_row(item),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            digest.update(payload)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("export write made no progress")
+                view = view[written:]
+            count += 1
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ExportPreflightError("EXPORT.TEMP_UNSAFE")
+        try:
+            _fsync_file(descriptor)
+        except OSError as error:
+            raise ExportPreflightError(
+                "EXPORT.JSONL_FSYNC_FAILED"
+            ) from error
+        return (
+            digest.hexdigest(),
+            count,
+            identity,
+        )
+    except ExportPreflightError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            path,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.TEMP_CLEANUP_FAILED"
+            ) from error
+        raise
+    except OSError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            path,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.TEMP_CLEANUP_FAILED"
+            ) from error
+        raise ExportPreflightError("EXPORT.JSONL_WRITE_FAILED") from error
+    finally:
+        os.close(descriptor)
+
+
+def _verify_export_jsonl_temp(
+    path: Path,
+    *,
+    expected_digest: str,
+    expected_count: int,
+    identity: _CreatedFileIdentity,
+) -> None:
+    """Re-open and re-validate one JSONL temporary before publication."""
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except OSError as error:
+        raise ExportPreflightError("EXPORT.TEMP_UNREADABLE") from error
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino)
+            != (identity.device, identity.inode)
+        ):
+            raise ExportPreflightError("EXPORT.TEMP_SWAPPED")
+        digest = hashlib.sha256()
+        count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            count += chunk.count(b"\n")
+        if (
+            digest.hexdigest() != expected_digest
+            or count != expected_count
+        ):
+            raise ExportPreflightError("EXPORT.JSONL_VERIFY_FAILED")
+        final = os.lstat(path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino)
+            != (identity.device, identity.inode)
+        ):
+            raise ExportPreflightError("EXPORT.TEMP_SWAPPED")
+    finally:
+        os.close(descriptor)
+
+
+def _write_export_payload_temp(
+    path: Path,
+    payload: bytes,
+) -> _CreatedFileIdentity:
+    """Write one exclusive manifest temporary file and fsync it."""
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ExportPreflightError("EXPORT.TEMP_CONFLICT") from error
+    identity: _CreatedFileIdentity | None = None
+    try:
+        identity, identity_error = _created_export_identity(descriptor)
+        if identity_error is not None:
+            raise ExportPreflightError(
+                "EXPORT.TEMP_IDENTITY_FAILED"
+            ) from identity_error
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("export write made no progress")
+            view = view[written:]
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ExportPreflightError("EXPORT.TEMP_UNSAFE")
+        try:
+            _fsync_file(descriptor)
+        except OSError as error:
+            raise ExportPreflightError(
+                "EXPORT.MANIFEST_FSYNC_FAILED"
+            ) from error
+        return identity
+    except ExportPreflightError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            path,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.TEMP_CLEANUP_FAILED"
+            ) from error
+        raise
+    except OSError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            path,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.TEMP_CLEANUP_FAILED"
+            ) from error
+        raise ExportPreflightError(
+            "EXPORT.MANIFEST_WRITE_FAILED"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _verify_export_payload_temp(
+    path: Path,
+    *,
+    expected_bytes: bytes,
+    identity: _CreatedFileIdentity,
+) -> None:
+    """Re-open and re-validate one manifest temporary before publication."""
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except OSError as error:
+        raise ExportPreflightError("EXPORT.TEMP_UNREADABLE") from error
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino)
+            != (identity.device, identity.inode)
+        ):
+            raise ExportPreflightError("EXPORT.TEMP_SWAPPED")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if b"".join(chunks) != expected_bytes:
+            raise ExportPreflightError("EXPORT.MANIFEST_VERIFY_FAILED")
+        final = os.lstat(path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino)
+            != (identity.device, identity.inode)
+        ):
+            raise ExportPreflightError("EXPORT.TEMP_SWAPPED")
+    finally:
+        os.close(descriptor)
+
+
+def _remove_exported_if_owned(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None,
+    expected_digest: str | None,
+) -> bool:
+    """Unlink one published file only when its exact identity still holds.
+
+    Returns True when the path was never published by us (nothing to
+    restore), is already absent, or was removed by us.  A foreign swap
+    (different inode or digest) fails closed without deleting anything.
+    """
+
+    if expected_identity is None or expected_digest is None:
+        return not _path_exists(path)
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != expected_identity
+    ):
+        return False
+    if _try_file_digest(path) != expected_digest:
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _copy_export_prior_pair(
+    paths: _ExportArtifactPaths,
+    *,
+    destination_before: str | None,
+    manifest_before: str | None,
+) -> tuple[
+    _CreatedFileIdentity | None,
+    _CreatedFileIdentity | None,
+]:
+    """Stream-copy the exact prior pair into exclusive recovery files.
+
+    Returns the (jsonl, manifest) recovery identities.  A digest mismatch
+    between validation and copy means the prior pair changed under us;
+    that fails stop before any publication side effect.
+    """
+
+    jsonl_identity: _CreatedFileIdentity | None = None
+    manifest_identity: _CreatedFileIdentity | None = None
+    if destination_before is not None:
+        jsonl_identity = _copy_export_recovery_file(
+            paths.destination,
+            paths.jsonl_recovery,
+            expected_digest=destination_before,
+            code="EXPORT.JSONL_RECOVERY_COPY_FAILED",
+        )
+    if manifest_before is not None:
+        try:
+            manifest_identity = _copy_export_recovery_file(
+                paths.manifest,
+                paths.manifest_recovery,
+                expected_digest=manifest_before,
+                code="EXPORT.MANIFEST_RECOVERY_COPY_FAILED",
+            )
+        except ExportPreflightError as error:
+            if (
+                jsonl_identity is not None
+                and not _remove_failed_export_artifact(
+                    paths.jsonl_recovery,
+                    jsonl_identity,
+                )
+            ):
+                raise ExportPreflightError(
+                    "EXPORT.RECOVERY_CLEANUP_FAILED"
+                ) from error
+            raise
+    return jsonl_identity, manifest_identity
+
+
+def _copy_export_recovery_file(
+    source: Path,
+    recovery: Path,
+    *,
+    expected_digest: str,
+    code: str,
+) -> _CreatedFileIdentity:
+    """Copy one prior file into an owned exclusive recovery file."""
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(recovery, flags, 0o600)
+    except OSError as error:
+        raise ExportPreflightError("EXPORT.RECOVERY_CONFLICT") from error
+    identity: _CreatedFileIdentity | None = None
+    source_descriptor = -1
+    try:
+        identity, identity_error = _created_export_identity(descriptor)
+        if identity_error is not None:
+            raise ExportPreflightError(
+                "EXPORT.RECOVERY_IDENTITY_FAILED"
+            ) from identity_error
+        os.fchmod(descriptor, 0o600)
+        no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+        source_descriptor = os.open(source, os.O_RDONLY | no_follow)
+        observed = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+        ):
+            raise ExportPreflightError(code)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("export recovery copy made no progress")
+                view = view[written:]
+        if digest.hexdigest() != expected_digest:
+            raise ExportPreflightError("EXPORT.PRIOR_PAIR_CHANGED")
+        os.close(source_descriptor)
+        source_descriptor = -1
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ExportPreflightError("EXPORT.RECOVERY_UNSAFE")
+        try:
+            _fsync_file(descriptor)
+        except OSError as error:
+            raise ExportPreflightError(code) from error
+        return identity
+    except ExportPreflightError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            recovery,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.RECOVERY_CLEANUP_FAILED"
+            ) from error
+        raise
+    except OSError as error:
+        if identity is None or not _remove_failed_export_artifact(
+            recovery,
+            identity,
+        ):
+            raise ExportPreflightError(
+                "EXPORT.RECOVERY_CLEANUP_FAILED"
+            ) from error
+        raise ExportPreflightError(code) from error
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        os.close(descriptor)
+
+
+def _entry_is_owned(
+    path: Path,
+    *,
+    identity: tuple[int, int] | None,
+    digest: str | None,
+) -> bool:
+    """Prove one published file by both exact content and created inode."""
+
+    if (
+        identity is None
+        or digest is None
+        or _try_file_digest(path) != digest
+    ):
+        return False
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(observed.st_mode)
+        and (observed.st_dev, observed.st_ino) == identity
+    )
+
+
+def _restore_export_pair(
+    paths: _ExportArtifactPaths,
+    *,
+    destination_before: str | None,
+    manifest_before: str | None,
+    jsonl_published_identity: tuple[int, int] | None,
+    manifest_published_identity: tuple[int, int] | None,
+    jsonl_digest: str | None,
+    manifest_digest: str | None,
+) -> None:
+    """Restore the exact prior pair or the original absence, then fsync.
+
+    The destination is only replaced from the owned recovery copy when
+    the current entry is still provably this export's publication; a
+    foreign entry is left untouched and fails stop.
+    """
+
+    if destination_before is not None:
+        if _try_file_digest(paths.destination) != destination_before:
+            if not _entry_is_owned(
+                paths.destination,
+                identity=jsonl_published_identity,
+                digest=jsonl_digest,
+            ):
+                raise ExportPreflightError("EXPORT.JSONL_RESTORE_FAILED")
+            assert jsonl_digest is not None
+            assert jsonl_published_identity is not None
+            _restore_export_from_recovery(
+                paths.jsonl_recovery,
+                paths.destination,
+                expected_digest=destination_before,
+                expected_destination_digest=jsonl_digest,
+                expected_destination_identity=jsonl_published_identity,
+                code="EXPORT.JSONL_RESTORE_FAILED",
+            )
+    elif not _remove_exported_if_owned(
+        paths.destination,
+        expected_identity=jsonl_published_identity,
+        expected_digest=jsonl_digest,
+    ):
+        raise ExportPreflightError("EXPORT.JSONL_RESTORE_FAILED")
+    if manifest_before is not None:
+        if _try_file_digest(paths.manifest) != manifest_before:
+            if not _entry_is_owned(
+                paths.manifest,
+                identity=manifest_published_identity,
+                digest=manifest_digest,
+            ):
+                raise ExportPreflightError("EXPORT.MANIFEST_RESTORE_FAILED")
+            assert manifest_digest is not None
+            assert manifest_published_identity is not None
+            _restore_export_from_recovery(
+                paths.manifest_recovery,
+                paths.manifest,
+                expected_digest=manifest_before,
+                expected_destination_digest=manifest_digest,
+                expected_destination_identity=manifest_published_identity,
+                code="EXPORT.MANIFEST_RESTORE_FAILED",
+            )
+    elif not _remove_exported_if_owned(
+        paths.manifest,
+        expected_identity=manifest_published_identity,
+        expected_digest=manifest_digest,
+    ):
+        raise ExportPreflightError("EXPORT.MANIFEST_RESTORE_FAILED")
+    try:
+        _fsync_directory(paths.destination.parent)
+    except OSError as error:
+        raise ExportPreflightError(
+            "EXPORT.RESTORE_FSYNC_FAILED"
+        ) from error
+
+
+def _restore_export_from_recovery(
+    recovery: Path,
+    destination: Path,
+    *,
+    expected_digest: str,
+    expected_destination_digest: str,
+    expected_destination_identity: tuple[int, int],
+    code: str,
+) -> None:
+    """Replace one owned published file with the prior-bytes recovery copy.
+
+    The recovery copy must still pass the strict no-follow, regular,
+    single-link, digest and stable-identity proof; an unprovable or
+    swapped recovery file fails stop and is never used to overwrite.
+    """
+
+    proof = _strict_locator_proof(recovery, expected_digest)
+    if proof is None:
+        raise ExportPreflightError(code)
+    try:
+        _replace_path(
+            recovery,
+            destination,
+            expected_destination_digest=expected_destination_digest,
+            expected_destination_identity=expected_destination_identity,
+        )
+    except OSError as error:
+        raise ExportPreflightError(code) from error
+
+
+def _published_file_identity(
+    path: Path,
+    expected_digest: str,
+) -> tuple[int, int]:
+    """Prove the just-published file still holds our exact bytes."""
+
+    try:
+        observed = os.lstat(path)
+    except OSError as error:
+        raise ExportPreflightError(
+            "EXPORT.PUBLISH_VERIFY_FAILED"
+        ) from error
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+    ):
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+    if _try_file_digest(path) != expected_digest:
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+    return (observed.st_dev, observed.st_ino)
+
+
+def _verify_export_pair(
+    paths: _ExportArtifactPaths,
+    *,
+    jsonl_digest: str,
+    manifest_bytes: bytes,
+) -> None:
+    """Re-open and re-validate the published destination pair."""
+
+    observed_jsonl = _export_existing_digest(
+        paths.destination,
+        unsafe_code="EXPORT.PUBLISH_VERIFY_FAILED",
+    )
+    if observed_jsonl != jsonl_digest:
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+    observed_manifest = _export_existing_digest(
+        paths.manifest,
+        unsafe_code="EXPORT.PUBLISH_VERIFY_FAILED",
+    )
+    if observed_manifest != hashlib.sha256(manifest_bytes).hexdigest():
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+
+
+def _cleanup_export_artifacts(
+    paths: _ExportArtifactPaths,
+    *,
+    jsonl_temp_identity: _CreatedFileIdentity | None,
+    manifest_temp_identity: _CreatedFileIdentity | None,
+    jsonl_recovery_identity: _CreatedFileIdentity | None,
+    manifest_recovery_identity: _CreatedFileIdentity | None,
+) -> tuple[Path, ...]:
+    """Remove only artifacts whose creation identity we still own.
+
+    Returns the paths that could not be removed (hostile swap or I/O
+    failure); those are never deleted and fail the next export closed.
+    """
+
+    remaining: list[Path] = []
+    for path, identity in (
+        (paths.jsonl_temp, jsonl_temp_identity),
+        (paths.manifest_temp, manifest_temp_identity),
+        (paths.jsonl_recovery, jsonl_recovery_identity),
+        (paths.manifest_recovery, manifest_recovery_identity),
+    ):
+        if identity is None:
+            continue
+        try:
+            _remove_created_file(path, identity)
+            if _path_exists(path):
+                remaining.append(path)
+        except (OSError, ExportPreflightError):
+            remaining.append(path)
+    return tuple(remaining)
+
+
+def _remove_failed_export_artifact(
+    path: Path,
+    identity: _CreatedFileIdentity,
+) -> bool:
+    """Remove an artifact created by this call after an ordinary exception.
+
+    Process termination can still leave the deterministic temp for the
+    cross-call recovery protocol, but a caught write/fsync failure must not
+    turn an otherwise retryable export into a permanent TEMP_CONFLICT.
+    """
+
+    try:
+        _remove_created_file(path, identity)
+        return not _path_exists(path)
+    except (OSError, ExportPreflightError):
+        return False
+
+
+def _export_diagnostic(
+    code: str,
+    summary: str,
+) -> ExportDiagnostic:
+    return ExportDiagnostic(
+        code=code,
+        record_id=None,
+        disposition=DiagnosticDisposition.WARNING,
+        safe_summary=summary,
+    )
+
+
+def _export_error_code(error: Exception) -> str:
+    error_code = getattr(error, "error_code", None)
+    if type(error_code) is str and error_code:
+        return error_code
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    return "EXPORT.FAILED"
+
+
+def _export_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    return retryable if type(retryable) is bool else False
 
 
 class TMMigrationService:
@@ -241,6 +1258,388 @@ class TMMigrationService:
             preflight=preflight,
             mutable_stage=stage,
             reused_completed_revision=None,
+        )
+
+    def export_jsonl(
+        self,
+        store: SQLiteTMStore,
+        destination: Path,
+    ) -> ExportOutcome:
+        """Export the active canonical store to one caller-chosen path.
+
+        Task 5.12 arbitrary-path export: the destination must be a
+        non-configured absolute path that does not alias the configured
+        JSONL, its manifest, the canonical sidecar, activation/schema
+        artifacts, or the adjacent export family.  The export captures
+        the canonical generation, store id, head revision, and every
+        record from one stable coordinator lease/read snapshot, publishes
+        the JSONL and adjacent manifest with same-directory exclusive
+        temporaries, file/directory fsync, atomic replace and re-open
+        validation, and registers an ``issued -> completed`` receipt in
+        the canonical ledger against exactly the captured revision.  The
+        active snapshot binding, divergence latch, head revision and
+        generation are never modified, and a successful export leaves
+        ``SOURCE_DIVERGED`` unchanged.  Every failure restores the exact
+        prior destination pair (or original absence) and returns an
+        honest ``ExportFailure``.
+        """
+
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        return self._run_arbitrary_export(store, destination)
+
+    def _run_arbitrary_export(
+        self,
+        store: SQLiteTMStore,
+        destination: Path,
+    ) -> ExportOutcome:
+        identity = self._resource_identity
+        paths = _export_artifact_paths(destination)
+        destination_before: str | None = None
+        manifest_before: str | None = None
+        destination_identity: tuple[int, int] | None = None
+        manifest_identity: tuple[int, int] | None = None
+        try:
+            (
+                destination_before,
+                manifest_before,
+                destination_identity,
+                manifest_identity,
+            ) = _validate_export_destination(identity, paths)
+            snapshot = store.capture_export_snapshot()
+        except (
+            ExportPreflightError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            observed = _try_file_digest(paths.destination)
+            return self._export_failure(
+                error,
+                stage_label="EXPORT.PREFLIGHT",
+                destination_before=destination_before,
+                destination_observed=observed,
+            )
+        if (
+            snapshot.revision.resource_id != identity.resource_id
+            or snapshot.revision.canonical_store_id
+            != self._canonical_store_id
+        ):
+            observed = _try_file_digest(paths.destination)
+            return self._export_failure(
+                ExportPreflightError("EXPORT.STORE_IDENTITY_MISMATCH"),
+                stage_label="EXPORT.PREFLIGHT",
+                destination_before=destination_before,
+                destination_observed=observed,
+            )
+        jsonl_temp_identity: _CreatedFileIdentity | None = None
+        manifest_temp_identity: _CreatedFileIdentity | None = None
+        jsonl_recovery_identity: _CreatedFileIdentity | None = None
+        manifest_recovery_identity: _CreatedFileIdentity | None = None
+        jsonl_published_identity: tuple[int, int] | None = None
+        manifest_published_identity: tuple[int, int] | None = None
+        jsonl_digest: str | None = None
+        manifest_digest: str | None = None
+        record_count = len(snapshot.records)
+        issued = False
+        receipt: SnapshotReceipt | None = None
+        try:
+            jsonl_digest, record_count, jsonl_temp_identity = (
+                _stream_export_jsonl_temp(
+                    paths.jsonl_temp,
+                    snapshot.records,
+                )
+            )
+            _verify_export_jsonl_temp(
+                paths.jsonl_temp,
+                expected_digest=jsonl_digest,
+                expected_count=record_count,
+                identity=jsonl_temp_identity,
+            )
+            receipt = SnapshotReceipt(
+                snapshot_id=f"snapshot.export.{uuid.uuid4().hex}",
+                resource_id=snapshot.revision.resource_id,
+                canonical_store_id=snapshot.revision.canonical_store_id,
+                exported_revision=snapshot.revision.head_revision,
+                jsonl_digest=jsonl_digest,
+                record_count=record_count,
+            )
+            manifest = SnapshotManifest(
+                manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                receipt=receipt,
+                receipt_digest=snapshot_receipt_digest(receipt),
+            )
+            manifest_bytes = contract_to_json(manifest).encode("utf-8")
+            manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+            manifest_temp_identity = _write_export_payload_temp(
+                paths.manifest_temp,
+                manifest_bytes,
+            )
+            _verify_export_payload_temp(
+                paths.manifest_temp,
+                expected_bytes=manifest_bytes,
+                identity=manifest_temp_identity,
+            )
+            store.register_issued_export_receipt(
+                receipt,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                expected_generation=snapshot.revision.generation,
+            )
+            issued = True
+            jsonl_recovery_identity, manifest_recovery_identity = (
+                _copy_export_prior_pair(
+                    paths,
+                    destination_before=destination_before,
+                    manifest_before=manifest_before,
+                )
+            )
+            _replace_path(
+                paths.jsonl_temp,
+                paths.destination,
+                expected_destination_digest=destination_before,
+                expected_destination_identity=destination_identity,
+            )
+            jsonl_published_identity = _published_file_identity(
+                paths.destination,
+                jsonl_digest,
+            )
+            _fsync_directory(paths.destination.parent)
+            _replace_path(
+                paths.manifest_temp,
+                paths.manifest,
+                expected_destination_digest=manifest_before,
+                expected_destination_identity=manifest_identity,
+            )
+            manifest_published_identity = _published_file_identity(
+                paths.manifest,
+                manifest_digest,
+            )
+            _fsync_directory(paths.destination.parent)
+            _verify_export_pair(
+                paths,
+                jsonl_digest=jsonl_digest,
+                manifest_bytes=manifest_bytes,
+            )
+            store.complete_issued_export_receipt(
+                receipt.snapshot_id,
+                expected_generation=snapshot.revision.generation,
+            )
+        except (
+            ExportPreflightError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+            OSError,
+        ) as error:
+            restore_error: Exception | None = None
+            failure_stage = "EXPORT.PUBLISH"
+            if issued:
+                try:
+                    _restore_export_pair(
+                        paths,
+                        destination_before=destination_before,
+                        manifest_before=manifest_before,
+                        jsonl_published_identity=(
+                            jsonl_published_identity
+                        ),
+                        manifest_published_identity=(
+                            manifest_published_identity
+                        ),
+                        jsonl_digest=jsonl_digest,
+                        manifest_digest=manifest_digest,
+                    )
+                except Exception as restore_exception:
+                    restore_error = restore_exception
+                    failure_stage = "EXPORT.RESTORE"
+            observed = _try_file_digest(paths.destination)
+            keep_recovery = restore_error is not None
+            cleanup_remaining = _cleanup_export_artifacts(
+                paths,
+                jsonl_temp_identity=jsonl_temp_identity,
+                manifest_temp_identity=manifest_temp_identity,
+                jsonl_recovery_identity=(
+                    None
+                    if keep_recovery
+                    else jsonl_recovery_identity
+                ),
+                manifest_recovery_identity=(
+                    None
+                    if keep_recovery
+                    else manifest_recovery_identity
+                ),
+            )
+            ledger_error: Exception | None = None
+            if issued and restore_error is None:
+                assert receipt is not None
+                try:
+                    store.cancel_issued_export_receipt(
+                        receipt.snapshot_id,
+                        expected_generation=(
+                            snapshot.revision.generation
+                        ),
+                    )
+                except Exception as cancel_exception:
+                    ledger_error = cancel_exception
+                    failure_stage = "EXPORT.LEDGER"
+            diagnostics: list[ExportDiagnostic] = []
+            if cleanup_remaining:
+                diagnostics.append(
+                    _export_diagnostic(
+                        "EXPORT.CLEANUP_PENDING",
+                        "EXPORT_ARTIFACTS_REMAIN",
+                    )
+                )
+            if restore_error is not None:
+                diagnostics.append(
+                    _export_diagnostic(
+                        "EXPORT.RESTORE_FAILED",
+                        "EXPORT_RESTORE_INCOMPLETE",
+                    )
+                )
+            diagnostics.sort(key=lambda item: item.code)
+            return self._export_failure(
+                (
+                    restore_error
+                    if restore_error is not None
+                    else ledger_error
+                    if ledger_error is not None
+                    else error
+                ),
+                stage_label=failure_stage,
+                destination_before=destination_before,
+                destination_observed=observed,
+                diagnostics=tuple(diagnostics),
+                recovery_candidate=paths.jsonl_recovery,
+            )
+        remaining = _cleanup_export_artifacts(
+            paths,
+            jsonl_temp_identity=None,
+            manifest_temp_identity=None,
+            jsonl_recovery_identity=jsonl_recovery_identity,
+            manifest_recovery_identity=manifest_recovery_identity,
+        )
+        success_diagnostics = (
+            ()
+            if not remaining
+            else (
+                _export_diagnostic(
+                    "EXPORT.CLEANUP_PENDING",
+                    "EXPORT_ARTIFACTS_REMAIN",
+                ),
+            )
+        )
+        assert jsonl_digest is not None
+        assert receipt is not None
+        return ExportReport(
+            exported_count=record_count,
+            skipped_count=0,
+            destination_digest=jsonl_digest,
+            canonical_generation=snapshot.revision.generation,
+            exported_revision=snapshot.revision.head_revision,
+            snapshot_id=receipt.snapshot_id,
+            snapshot_receipt_digest=snapshot_receipt_digest(receipt),
+            snapshot_receipt=receipt,
+            diagnostics=success_diagnostics,
+        )
+
+    def _export_failure(
+        self,
+        error: Exception,
+        *,
+        stage_label: str,
+        destination_before: str | None,
+        destination_observed: str | None,
+        diagnostics: tuple[ExportDiagnostic, ...] = (),
+        recovery_candidate: Path | None = None,
+    ) -> ExportFailure:
+        """Build one digest-backed export failure without leaking paths.
+
+        The destination preservation evidence is derived from the exact
+        before/observed digests; when the prior bytes cannot be proven at
+        the destination, the only honest locator is the owned recovery
+        copy holding the exact prior digest.  An unprovable locator for a
+        changed/unverified destination fails stop
+        (``EXPORT.PRIOR_STATE_UNRECOVERABLE``) instead of fabricating one.
+        """
+
+        error_code = _export_error_code(error)
+        retryable = _export_retryable(error)
+        locators: list[RecoveryLocator] = []
+        recovery_digest = destination_before
+
+        def require_locator(selection: _LocatorSelection | None) -> None:
+            nonlocal retryable
+            if selection is None or recovery_digest is None:
+                raise ExportPreflightError(
+                    "EXPORT.PRIOR_STATE_UNRECOVERABLE"
+                )
+            _require_locator_return_proof(
+                selection,
+                recovery_digest,
+                "EXPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            locators.append(
+                RecoveryLocator(
+                    path=selection.path,
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    expected_digest=recovery_digest,
+                )
+            )
+            retryable = False
+
+        if destination_before is None:
+            if destination_observed is None:
+                evidence = AssetPreservationEvidence(
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    state=AssetPreservationState.NOT_APPLICABLE,
+                    before_digest=None,
+                    observed_digest=None,
+                )
+            else:
+                raise ExportPreflightError(
+                    "EXPORT.PRIOR_STATE_UNRECOVERABLE"
+                )
+        elif destination_observed == destination_before:
+            evidence = _unchanged_preservation(
+                AssetKind.EXPORT_DESTINATION,
+                destination_before,
+            )
+        elif destination_observed is not None:
+            evidence = _changed_preservation(
+                AssetKind.EXPORT_DESTINATION,
+                destination_before,
+                destination_observed,
+            )
+            require_locator(
+                None
+                if recovery_candidate is None
+                else _proven_live_locator(
+                    recovery_candidate,
+                    destination_before,
+                )
+            )
+        else:
+            evidence = _unverified_preservation(
+                AssetKind.EXPORT_DESTINATION,
+                destination_before,
+            )
+            require_locator(
+                None
+                if recovery_candidate is None
+                else _proven_live_locator(
+                    recovery_candidate,
+                    destination_before,
+                )
+            )
+        return ExportFailure(
+            stage=stage_label,
+            error_code=error_code,
+            retryable=retryable,
+            diagnostics=diagnostics,
+            previous_destination_preservation=evidence,
+            recovery_locators=tuple(locators),
         )
 
     def import_snapshot(
@@ -1857,8 +3256,34 @@ def _draft_from_jsonl(row: dict[str, object]) -> TMRecordDraft:
         context_prev_raw=optional_text("context_prev"),
         context_next_raw=optional_text("context_next"),
         file_source=optional_text("file_source"),
-        provenance=(("source", "legacy-jsonl"),),
+        provenance=_compatible_provenance(row),
     )
+
+
+def _compatible_provenance(row: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    """Parse the export provenance representation, or the legacy default.
+
+    Only a well-formed list of two-item ``[key, value]`` string pairs is
+    accepted; any other present value degrades to the legacy provenance
+    exactly as before, so legacy row validation is never weakened.
+    """
+
+    if "provenance" not in row:
+        return (("source", "legacy-jsonl"),)
+    value = row["provenance"]
+    if type(value) is not list:
+        return (("source", "legacy-jsonl"),)
+    items: list[tuple[str, str]] = []
+    for entry in value:
+        if (
+            type(entry) is not list
+            or len(entry) != 2
+            or type(entry[0]) is not str
+            or type(entry[1]) is not str
+        ):
+            return (("source", "legacy-jsonl"),)
+        items.append((entry[0], entry[1]))
+    return tuple(items)
 
 
 def _deterministic_stage_ref(
@@ -2240,7 +3665,7 @@ def _try_file_digest(path: Path) -> str | None:
                     break
                 digest.update(chunk)
         return digest.hexdigest()
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -2567,6 +3992,7 @@ def _rejected_diagnostic(
 
 __all__ = [
     "MIGRATION_STREAM_CHUNK_SIZE",
+    "ExportPreflightError",
     "MigrationPreflightError",
     "MigrationStageBuild",
     "TMMigrationService",
