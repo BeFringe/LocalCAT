@@ -160,7 +160,7 @@
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
   - _Depends: 5.4_
 
-- [ ] 5.6 实现 durable activation journal
+- [x] 5.6 实现 durable activation journal
   - 在任何替换前持久化 PREPARED，并为 DB_REPLACED、MANIFEST_PUBLISHED、GENERATION_PUBLISHED 定义单调阶段转换
   - 每个阶段落盘并 fsync，journal 与 token、nonce、artifact、new/prior receipt 和 manifest digest 必须一致
   - 完成时，重放、错配或已消费 token 无法推进 journal，正常路径留下可恢复的逐阶段证据

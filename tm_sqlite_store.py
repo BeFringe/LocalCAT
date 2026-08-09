@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 import hashlib
 import importlib
 import itertools
@@ -667,6 +668,10 @@ class _ActivationPreparation:
         repr=False,
         compare=False,
     )
+    _sealed_stage: SealedStage = field(
+        repr=False,
+        compare=False,
+    )
 
     def __init__(
         self,
@@ -683,6 +688,7 @@ class _ActivationPreparation:
         _physical_snapshot: object,
         _prior_view: _SQLiteGenerationView | None,
         _backup_assets: tuple[_RecoveryBackupAsset, ...],
+        _sealed_stage: SealedStage,
         _factory_key: object | None = None,
     ) -> None:
         if _factory_key is not _ACTIVATION_PREPARATION_FACTORY_KEY:
@@ -699,6 +705,8 @@ class _ActivationPreparation:
             asset.evidence for asset in _backup_assets
         ):
             raise ValueError("activation backup evidence is inconsistent")
+        if type(_sealed_stage) is not SealedStage:
+            raise TypeError("activation sealed stage is invalid")
         for name, value in (
             ("preparation_id", preparation_id),
             ("resource_id", resource_id),
@@ -712,6 +720,278 @@ class _ActivationPreparation:
             ("_physical_snapshot", _physical_snapshot),
             ("_prior_view", _prior_view),
             ("_backup_assets", _backup_assets),
+            ("_sealed_stage", _sealed_stage),
+        ):
+            object.__setattr__(self, name, value)
+
+
+class _ActivationJournalPhase(str, Enum):
+    """Module-private strict activation journal phase (Task 5.6).
+
+    Phases are strictly monotonic and code-only: callers may never pass a
+    phase string or an arbitrary phase object as authority.
+    """
+
+    PREPARED = "PREPARED"
+    DB_REPLACED = "DB_REPLACED"
+    MANIFEST_PUBLISHED = "MANIFEST_PUBLISHED"
+    GENERATION_PUBLISHED = "GENERATION_PUBLISHED"
+
+
+_PHASE_SEQUENCE = (
+    _ActivationJournalPhase.PREPARED,
+    _ActivationJournalPhase.DB_REPLACED,
+    _ActivationJournalPhase.MANIFEST_PUBLISHED,
+    _ActivationJournalPhase.GENERATION_PUBLISHED,
+)
+
+_ACTIVATION_JOURNAL_VERSION = "activation-journal-v1"
+_ACTIVATION_JOURNAL_FACTORY_KEY = object()
+
+_ACTIVATION_JOURNAL_DIGEST_FIELDS = frozenset(
+    {
+        "artifact_seal_digest",
+        "evidence_digest",
+        "gate_b_grant_digest",
+        "manifest_temp_digest",
+        "new_manifest_digest",
+        "sealed_stage_digest",
+        "snapshot_receipt_digest",
+        "source_jsonl_digest",
+        "stage_db_digest",
+        "target_identity",
+    }
+)
+
+_ACTIVATION_JOURNAL_OPTIONAL_DIGEST_FIELDS = frozenset(
+    {
+        "prior_db_backup_digest",
+        "prior_db_digest",
+        "prior_manifest_backup_digest",
+        "prior_manifest_digest",
+        "prior_receipt_digest",
+    }
+)
+
+_ACTIVATION_JOURNAL_IDENTITY_FIELDS = frozenset(
+    {
+        "activation_nonce",
+        "artifact_id",
+        "canonical_store_id",
+        "journal_id",
+        "journal_version",
+        "new_receipt_id",
+        "preparation_id",
+        "registry_namespace",
+        "resource_id",
+        "token_id",
+        "token_version",
+    }
+)
+
+_ACTIVATION_JOURNAL_PATH_FIELDS = frozenset(
+    {
+        "candidate_manifest_temp_path",
+        "candidate_stage_db_path",
+        "journal_path",
+        "new_manifest_path",
+    }
+)
+
+_ACTIVATION_JOURNAL_OPTIONAL_PATH_FIELDS = frozenset(
+    {
+        "prior_db_backup_path",
+        "prior_db_path",
+        "prior_manifest_backup_path",
+        "prior_manifest_path",
+    }
+)
+
+_ACTIVATION_JOURNAL_IDENTITY_PAIR_FIELDS = frozenset(
+    {
+        "candidate_manifest_temp_identity",
+        "candidate_stage_db_identity",
+        "source_jsonl_identity",
+    }
+)
+
+_ACTIVATION_JOURNAL_OPTIONAL_IDENTITY_PAIR_FIELDS = frozenset(
+    {
+        "prior_db_backup_identity",
+        "prior_db_identity",
+        "prior_manifest_backup_identity",
+        "prior_manifest_identity",
+    }
+)
+
+_ACTIVATION_JOURNAL_PRIOR_OPTIONAL_FIELDS = frozenset(
+    {
+        "prior_binding_snapshot_id",
+        "prior_db_backup_digest",
+        "prior_db_backup_identity",
+        "prior_db_backup_path",
+        "prior_db_digest",
+        "prior_db_identity",
+        "prior_db_path",
+        "prior_manifest_backup_digest",
+        "prior_manifest_backup_identity",
+        "prior_manifest_backup_path",
+        "prior_manifest_digest",
+        "prior_manifest_identity",
+        "prior_manifest_path",
+        "prior_receipt_digest",
+    }
+)
+
+_ACTIVATION_JOURNAL_RECORD_FIELDS = frozenset(
+    _ACTIVATION_JOURNAL_DIGEST_FIELDS
+    | _ACTIVATION_JOURNAL_IDENTITY_FIELDS
+    | _ACTIVATION_JOURNAL_PATH_FIELDS
+    | _ACTIVATION_JOURNAL_IDENTITY_PAIR_FIELDS
+    | _ACTIVATION_JOURNAL_PRIOR_OPTIONAL_FIELDS
+    | {
+        "expected_prior_generation",
+        "had_prior_canonical",
+        "phase",
+        "prior_generation",
+    }
+)
+_ACTIVATION_JOURNAL_ENVELOPE_FIELDS = (
+    _ACTIVATION_JOURNAL_RECORD_FIELDS | {"record_digest"}
+)
+
+
+@dataclass(frozen=True)
+class _ActivationJournalRecord:
+    """Frozen strict closure for one durable activation journal phase.
+
+    The record is the on-disk canonical JSON payload's in-memory mirror; it
+    carries no path authority by itself.  The coordinator derives every
+    field from registry-owned and preparation-owned facts, and every
+    reload/advance re-proves the closure against those live facts.
+    """
+
+    journal_id: str
+    journal_version: str
+    journal_path: Path
+    phase: _ActivationJournalPhase
+    preparation_id: str
+    registry_namespace: str
+    token_id: str
+    token_version: str
+    activation_nonce: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    expected_prior_generation: int | None
+    prior_generation: int | None
+    gate_b_grant_digest: str
+    evidence_digest: str
+    snapshot_receipt_digest: str
+    stage_db_digest: str
+    manifest_temp_digest: str
+    source_jsonl_digest: str
+    new_receipt_id: str
+    new_manifest_path: Path
+    new_manifest_digest: str
+    candidate_stage_db_path: Path
+    candidate_manifest_temp_path: Path
+    candidate_stage_db_identity: tuple[int, int]
+    candidate_manifest_temp_identity: tuple[int, int]
+    source_jsonl_identity: tuple[int, int]
+    had_prior_canonical: bool
+    prior_binding_snapshot_id: str | None
+    prior_receipt_digest: str | None
+    prior_manifest_digest: str | None
+    prior_db_path: Path | None
+    prior_manifest_path: Path | None
+    prior_db_digest: str | None
+    prior_db_identity: tuple[int, int] | None
+    prior_manifest_identity: tuple[int, int] | None
+    prior_db_backup_path: Path | None
+    prior_manifest_backup_path: Path | None
+    prior_db_backup_digest: str | None
+    prior_manifest_backup_digest: str | None
+    prior_db_backup_identity: tuple[int, int] | None
+    prior_manifest_backup_identity: tuple[int, int] | None
+
+    def __post_init__(self) -> None:
+        _validate_activation_journal_record(self)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _ActivationJournalHandle:
+    """Factory-gated journal capability returned by Task 5.6.
+
+    The handle binds one exact on-disk journal file: its deterministic path,
+    its published file identity, its phase, and its record digest.  It is
+    never the authority; every transition re-reads and re-validates the
+    durable journal and the coordinator's live preparation/registry facts.
+    Its repr is deliberately code-only.
+    """
+
+    journal_id: str
+    phase: _ActivationJournalPhase
+    record_digest: str
+    preparation_id: str
+    journal_path: Path = field(repr=False, compare=False)
+    file_identity: _ActivationFileIdentity = field(repr=False, compare=False)
+    _record: _ActivationJournalRecord = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        *,
+        journal_id: str,
+        journal_path: Path,
+        file_identity: _ActivationFileIdentity,
+        phase: _ActivationJournalPhase,
+        record_digest: str,
+        preparation_id: str,
+        _record: _ActivationJournalRecord,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _ACTIVATION_JOURNAL_FACTORY_KEY:
+            raise TypeError(
+                "activation journal handles require the Core factory"
+            )
+        if type(journal_id) is not str or not journal_id.strip():
+            raise TypeError("activation journal id is invalid")
+        if type(journal_path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("activation journal path is invalid")
+        if not journal_path.is_absolute() or ".." in journal_path.parts:
+            raise ValueError("activation journal path must be absolute")
+        if type(file_identity) is not _ActivationFileIdentity:
+            raise TypeError("activation journal file identity is invalid")
+        if type(phase) is not _ActivationJournalPhase:
+            raise TypeError("activation journal phase is invalid")
+        _require_activation_journal_digest(record_digest, "activation journal digest")
+        if type(preparation_id) is not str or not preparation_id.strip():
+            raise TypeError("activation journal preparation id is invalid")
+        if type(_record) is not _ActivationJournalRecord:
+            raise TypeError("activation journal record is invalid")
+        if (
+            _record.journal_id != journal_id
+            or _record.journal_path != journal_path
+            or _record.phase is not phase
+            or _record.preparation_id != preparation_id
+        ):
+            raise ValueError("activation journal handle does not close")
+        if _activation_journal_digest(_record) != record_digest:
+            raise ValueError("activation journal handle digest mismatch")
+        for name, value in (
+            ("journal_id", journal_id),
+            ("journal_path", journal_path),
+            ("file_identity", file_identity),
+            ("phase", phase),
+            ("record_digest", record_digest),
+            ("preparation_id", preparation_id),
+            ("_record", _record),
         ):
             object.__setattr__(self, name, value)
 
@@ -1069,6 +1349,7 @@ class ResourceStoreCoordinator:
                     _physical_snapshot=physical_snapshot,
                     _prior_view=initial_view,
                     _backup_assets=backups,
+                    _sealed_stage=sealed_stage,
                     _factory_key=_ACTIVATION_PREPARATION_FACTORY_KEY,
                 )
                 self._preparation = preparation
@@ -1223,6 +1504,1034 @@ class ResourceStoreCoordinator:
             with self._condition:
                 self._cleanup_in_progress = False
                 self._condition.notify_all()
+
+    def publish_prepared_activation(
+        self,
+        preparation: _ActivationPreparation,
+    ) -> _ActivationJournalHandle:
+        """Durably publish the PREPARED activation journal (Task 5.6).
+
+        Accepts only the coordinator's exact live ``_ActivationPreparation``
+        capability and writes a canonical, fully fsynced journal adjacent to
+        the canonical sidecar before any DB/manifest replacement.  On success
+        the coordinator stays ACTIVATING, the token stays TOKEN_ISSUED, the
+        recovery backups stay present, and no DB/manifest/generation asset
+        changes.  An already-durable byte-identical PREPARED journal for the
+        same preparation is replayed into a fresh handle without rewriting.
+        """
+
+        if type(preparation) is not _ActivationPreparation:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PREPARATION_INVALID",
+                retryable=False,
+            )
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not preparation
+                or self._cleanup_reservation is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_STATE_INVALID",
+                    retryable=True,
+                )
+            if self._cleanup_in_progress:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_STATE_INVALID",
+                    retryable=True,
+                )
+            return self._publish_activation_journal_locked(preparation)
+
+    def _advance_activation_journal(
+        self,
+        preparation: _ActivationPreparation,
+        handle: _ActivationJournalHandle,
+        next_phase: _ActivationJournalPhase,
+    ) -> _ActivationJournalHandle:
+        """Monotonically advance one durable journal phase (Tasks 5.7-5.9).
+
+        Module-private primitive for the later replacement/publication
+        tasks.  It re-reads and strictly validates the durable journal,
+        requires the exact live preparation plus the exact handle bound to
+        the current file, checks that ``next_phase`` is exactly the next
+        phase in the fixed sequence, revalidates token and full closure
+        against registry-owned facts, then durably publishes the next phase.
+        It never touches DB, manifest, backup, or generation assets.
+        """
+
+        if type(preparation) is not _ActivationPreparation:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PREPARATION_INVALID",
+                retryable=False,
+            )
+        if type(handle) is not _ActivationJournalHandle:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_HANDLE_INVALID",
+                retryable=False,
+            )
+        if type(next_phase) is not _ActivationJournalPhase:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PHASE_INVALID",
+                retryable=False,
+            )
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not preparation
+                or self._cleanup_reservation is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_STATE_INVALID",
+                    retryable=True,
+                )
+            if self._cleanup_in_progress:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_STATE_INVALID",
+                    retryable=True,
+                )
+            if (
+                handle.journal_path
+                != _activation_journal_path(self._resource_identity)
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_HANDLE_INVALID",
+                    retryable=False,
+                )
+            if handle.preparation_id != preparation.preparation_id:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_HANDLE_INVALID",
+                    retryable=False,
+                )
+            try:
+                disk_bytes, _disk_identity = _read_activation_journal_file(
+                    handle.journal_path,
+                    handle.file_identity,
+                )
+            except ActivationPreparationError as error:
+                if error.code == "ACTIVATION.JOURNAL_HANDLE_STALE":
+                    raise
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_HANDLE_STALE",
+                    retryable=False,
+                ) from error
+            try:
+                disk_record = _parse_activation_journal_bytes(
+                    disk_bytes,
+                    expected_journal_path=handle.journal_path,
+                )
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_HANDLE_STALE",
+                    retryable=False,
+                ) from error
+            if (
+                disk_record != handle._record
+                or disk_record.phase is not handle.phase
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_HANDLE_STALE",
+                    retryable=False,
+                )
+            current = disk_record.phase
+            if next_phase is current:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_PHASE_REPEATED",
+                    retryable=False,
+                )
+            if _PHASE_SEQUENCE.index(next_phase) < _PHASE_SEQUENCE.index(
+                current
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_PHASE_BACKWARD",
+                    retryable=False,
+                )
+            if _PHASE_SEQUENCE.index(next_phase) > _PHASE_SEQUENCE.index(
+                current
+            ) + 1:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_PHASE_SKIP",
+                    retryable=False,
+                )
+            self._revalidate_activation_journal_closure(
+                preparation,
+                disk_record,
+            )
+            next_record = replace(disk_record, phase=next_phase)
+            return self._write_activation_journal_locked(
+                next_record,
+                handle.journal_path,
+                expected_final_identity=handle.file_identity,
+            )
+
+    def _publish_activation_journal_locked(
+        self,
+        preparation: _ActivationPreparation,
+    ) -> _ActivationJournalHandle:
+        """Write PREPARED or replay a byte-identical durable journal."""
+
+        journal_path = _activation_journal_path(self._resource_identity)
+        record = self._build_activation_journal_record(preparation)
+        existing = _lstat_activation_journal_identity(journal_path)
+        if existing is not None:
+            return self._replay_activation_journal_locked(
+                preparation,
+                record,
+                journal_path,
+                existing,
+            )
+        return self._write_activation_journal_locked(
+            record,
+            journal_path,
+            expected_final_identity=None,
+        )
+
+    def _replay_activation_journal_locked(
+        self,
+        preparation: _ActivationPreparation,
+        record: _ActivationJournalRecord,
+        journal_path: Path,
+        existing_identity: _ActivationFileIdentity,
+    ) -> _ActivationJournalHandle:
+        """Replay only an exact durable PREPARED journal for the same closure."""
+
+        try:
+            disk_bytes, disk_identity = _read_activation_journal_file(
+                journal_path,
+                existing_identity,
+            )
+            disk_record = _parse_activation_journal_bytes(
+                disk_bytes,
+                expected_journal_path=journal_path,
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_REPLAY_MISMATCH",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        if (
+            disk_record != record
+            or disk_record.phase is not _ActivationJournalPhase.PREPARED
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_REPLAY_MISMATCH",
+                retryable=False,
+            )
+        try:
+            _fsync_activation_directory(journal_path.parent)
+        except OSError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                retryable=False,
+            ) from error
+        try:
+            fsynced_bytes, fsynced_identity = _read_activation_journal_file(
+                journal_path,
+                disk_identity,
+            )
+            fsynced_record = _parse_activation_journal_bytes(
+                fsynced_bytes,
+                expected_journal_path=journal_path,
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        if (
+            fsynced_bytes != disk_bytes
+            or fsynced_identity != disk_identity
+            or fsynced_record != disk_record
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                retryable=False,
+            )
+        return _ActivationJournalHandle(
+            journal_id=record.journal_id,
+            journal_path=journal_path,
+            file_identity=fsynced_identity,
+            phase=record.phase,
+            record_digest=_activation_journal_digest(record),
+            preparation_id=record.preparation_id,
+            _record=record,
+            _factory_key=_ACTIVATION_JOURNAL_FACTORY_KEY,
+        )
+
+    def _write_activation_journal_locked(
+        self,
+        record: _ActivationJournalRecord,
+        journal_path: Path,
+        *,
+        expected_final_identity: _ActivationFileIdentity | None,
+    ) -> _ActivationJournalHandle:
+        """Publish one journal record with strict exclusive temp + fsync order.
+
+        ``expected_final_identity is None`` requires the final path to be
+        absent (first publication); otherwise the final must still be exactly
+        the given file (phase advance).  Failures before final publication
+        remove only the owned temporary with strict identity and directory
+        fsync; failures after publication fail-stop with a code-only error.
+        """
+
+        expected_bytes = _serialize_activation_journal_record(
+            record
+        ).encode("utf-8")
+        temp_path = _activation_journal_temp_path(journal_path)
+        descriptor = -1
+        temp_identity: _ActivationFileIdentity | None = None
+        published = False
+        try:
+            if _lstat_any_entry(temp_path):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_TEMP_EXISTS",
+                    retryable=False,
+                )
+            try:
+                descriptor, temp_identity = _open_activation_journal_temp(
+                    temp_path
+                )
+            except OSError as error:
+                if _lstat_any_entry(temp_path):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_TEMP_EXISTS",
+                        retryable=False,
+                    ) from error
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_WRITE_FAILED",
+                    retryable=True,
+                ) from error
+            assert temp_identity is not None
+            _write_activation_journal_bytes(descriptor, expected_bytes)
+            _fsync_activation_journal(descriptor)
+            _close_activation_journal(descriptor)
+            descriptor = -1
+            temp_bytes, _temp_observed = _read_activation_journal_file(
+                temp_path,
+                temp_identity,
+            )
+            if temp_bytes != expected_bytes:
+                raise OSError("activation journal temporary content mismatch")
+            if expected_final_identity is None:
+                if (
+                    _lstat_activation_journal_identity(journal_path)
+                    is not None
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_FINAL_EXISTS",
+                        retryable=False,
+                    )
+            else:
+                observed_final = _lstat_activation_journal_identity(
+                    journal_path
+                )
+                if observed_final != expected_final_identity:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_HANDLE_STALE",
+                        retryable=False,
+                    )
+            os.replace(temp_path, journal_path)
+            published = True
+            final_identity = _lstat_activation_journal_identity(journal_path)
+            if final_identity != temp_identity:
+                raise OSError(
+                    "activation journal final identity changed after publish"
+                )
+            _fsync_activation_directory(journal_path.parent)
+        except ActivationPreparationError:
+            raise
+        except FileExistsError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TEMP_EXISTS",
+                retryable=False,
+            ) from error
+        except OSError as error:
+            if published:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                    retryable=False,
+                ) from error
+            cleaned = (
+                temp_identity is not None
+                and _remove_owned_activation_journal_temp(
+                    temp_path,
+                    temp_identity,
+                )
+            )
+            if not cleaned:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLEANUP_FAILED",
+                    retryable=True,
+                ) from error
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_WRITE_FAILED",
+                retryable=True,
+            ) from error
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        try:
+            final_bytes, final_observed = _read_activation_journal_file(
+                journal_path,
+                final_identity,
+            )
+            if final_bytes != expected_bytes:
+                raise OSError("activation journal final content mismatch")
+            final_record = _parse_activation_journal_bytes(
+                final_bytes,
+                expected_journal_path=journal_path,
+            )
+        except (ActivationPreparationError, OSError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                retryable=False,
+            ) from error
+        if final_record != record:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
+                retryable=False,
+            )
+        return _ActivationJournalHandle(
+            journal_id=record.journal_id,
+            journal_path=journal_path,
+            file_identity=final_observed,
+            phase=record.phase,
+            record_digest=_activation_journal_digest(record),
+            preparation_id=record.preparation_id,
+            _record=record,
+            _factory_key=_ACTIVATION_JOURNAL_FACTORY_KEY,
+        )
+
+    def _build_activation_journal_record(
+        self,
+        preparation: _ActivationPreparation,
+    ) -> _ActivationJournalRecord:
+        """Derive the complete PREPARED closure from live registry facts.
+
+        Every fact comes from coordinator-owned state: the registry's sealed
+        entry and physical readiness snapshot, the registry token, the
+        preparation's backups, the prior generation view, and the canonical
+        resource identity.  No caller-supplied path, grant, token, nonce,
+        phase, or mapping is accepted as authority.
+        """
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        stage = preparation._sealed_stage
+        token = preparation._token
+        registry = cast(Any, self._sealed_registry)
+        try:
+            contract_module._validate_activation_token_for_stage(token, stage)
+        except (TypeError, ValueError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            ) from error
+        try:
+            physical = registry.resolve_physical_readiness(stage)
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            ) from error
+        identity = self._resource_identity
+        evidence = physical.evidence
+        receipt = evidence.source_binding.receipt
+        if (
+            physical.registry_namespace != registry.registry_namespace
+            or physical.resource_id != identity.resource_id
+            or physical.target_identity != identity.target_identity
+            or physical.canonical_store_id != self._canonical_store_id
+            or physical.mutable_stage.resource_identity != identity
+            or physical.expected_prior_generation
+            != preparation.expected_prior_generation
+            or physical.snapshot_receipt_digest
+            != contract_module.snapshot_receipt_digest(receipt)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        db_capture = _capture_journal_closure_file(
+            physical.mutable_stage.staged_db_path
+        )
+        if (
+            (db_capture[0].device, db_capture[0].inode)
+            != (physical.database_identity.device, physical.database_identity.inode)
+            or db_capture[1] != evidence.stage_file_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        manifest_capture = _capture_journal_closure_file(
+            physical.mutable_stage.manifest_temp_path
+        )
+        if (
+            (manifest_capture[0].device, manifest_capture[0].inode)
+            != (
+                physical.manifest_identity.device,
+                physical.manifest_identity.inode,
+            )
+            or manifest_capture[1] != evidence.manifest_temp_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        source_capture = _capture_journal_closure_file(
+            identity.configured_jsonl_path
+        )
+        if source_capture[1] != receipt.jsonl_digest:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        journal_path = _activation_journal_path(identity)
+        prior_view = preparation._prior_view
+        had_prior = preparation.had_prior_canonical
+        prior_generation: int | None = None
+        prior_binding_snapshot_id: str | None = None
+        prior_receipt_digest_value: str | None = None
+        prior_manifest_digest_value: str | None = None
+        prior_db_path: Path | None = None
+        prior_manifest_path: Path | None = None
+        prior_db_digest_value: str | None = None
+        prior_db_identity_value: tuple[int, int] | None = None
+        prior_manifest_identity_value: tuple[int, int] | None = None
+        prior_db_backup_path: Path | None = None
+        prior_manifest_backup_path: Path | None = None
+        prior_db_backup_digest_value: str | None = None
+        prior_manifest_backup_digest_value: str | None = None
+        prior_db_backup_identity_value: tuple[int, int] | None = None
+        prior_manifest_backup_identity_value: tuple[int, int] | None = None
+        if had_prior:
+            if prior_view is None or self._view is not prior_view:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            try:
+                captures = _capture_prior_assets(
+                    prior_view,
+                    identity=identity,
+                )
+                with _open_configured_connection(
+                    prior_view.stage.staged_db_path,
+                    require_existing=True,
+                ) as connection:
+                    facts = _read_source_binding_facts(connection, prior_view)
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+            database, manifest, source = captures
+            if (
+                facts.binding is None
+                or facts.divergence_latched
+                or facts.diagnostic_codes
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            binding = facts.binding
+            backups_by_kind = {
+                asset.asset_kind: asset for asset in preparation._backup_assets
+            }
+            if set(backups_by_kind) != {"DATABASE", "MANIFEST"}:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            prior_db_asset = backups_by_kind["DATABASE"]
+            prior_manifest_asset = backups_by_kind["MANIFEST"]
+            if (
+                database.identity != prior_db_asset.original_identity
+                or database.digest
+                != prior_db_asset.evidence.original_digest
+                or manifest.identity != prior_manifest_asset.original_identity
+                or manifest.digest
+                != prior_manifest_asset.evidence.original_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+            prior_db_backup_capture = _capture_journal_closure_file(
+                prior_db_asset.backup_path
+            )
+            prior_manifest_backup_capture = _capture_journal_closure_file(
+                prior_manifest_asset.backup_path
+            )
+            if (
+                prior_db_backup_capture
+                != (
+                    prior_db_asset.backup_identity,
+                    prior_db_asset.evidence.backup_digest,
+                )
+                or prior_manifest_backup_capture
+                != (
+                    prior_manifest_asset.backup_identity,
+                    prior_manifest_asset.evidence.backup_digest,
+                )
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+            if (
+                preparation.expected_prior_generation
+                != prior_view.generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            prior_generation = prior_view.generation
+            prior_binding_snapshot_id = binding.receipt.snapshot_id
+            prior_receipt_digest_value = contract_module.snapshot_receipt_digest(
+                binding.receipt
+            )
+            prior_manifest_digest_value = manifest.digest
+            prior_db_path = database.path
+            prior_manifest_path = identity.snapshot_manifest_path
+            prior_db_digest_value = database.digest
+            prior_db_identity_value = (
+                database.identity.device,
+                database.identity.inode,
+            )
+            prior_manifest_identity_value = (
+                manifest.identity.device,
+                manifest.identity.inode,
+            )
+            prior_db_backup_path = prior_db_asset.backup_path
+            prior_manifest_backup_path = prior_manifest_asset.backup_path
+            prior_db_backup_digest_value = (
+                prior_db_asset.evidence.backup_digest
+            )
+            prior_manifest_backup_digest_value = (
+                prior_manifest_asset.evidence.backup_digest
+            )
+            prior_db_backup_identity_value = (
+                prior_db_asset.backup_identity.device,
+                prior_db_asset.backup_identity.inode,
+            )
+            prior_manifest_backup_identity_value = (
+                prior_manifest_asset.backup_identity.device,
+                prior_manifest_asset.backup_identity.inode,
+            )
+        else:
+            if self._view is not None or prior_view is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            try:
+                _require_first_activation_absence(identity)
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+        try:
+            state = registry.state(stage)
+            registry._token_entry(token)
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            ) from error
+        if state is not contract_module.ActivationCapabilityState.TOKEN_ISSUED:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            )
+        record = _ActivationJournalRecord(
+            journal_id=f"journal.{preparation.preparation_id}",
+            journal_version=_ACTIVATION_JOURNAL_VERSION,
+            journal_path=journal_path,
+            phase=_ActivationJournalPhase.PREPARED,
+            preparation_id=preparation.preparation_id,
+            registry_namespace=registry.registry_namespace,
+            token_id=token.token_id,
+            token_version=token.token_version,
+            activation_nonce=token.activation_nonce,
+            artifact_id=physical.artifact_id,
+            artifact_seal_digest=physical.artifact_seal_digest,
+            sealed_stage_digest=physical.sealed_stage_digest,
+            resource_id=physical.resource_id,
+            target_identity=physical.target_identity,
+            canonical_store_id=physical.canonical_store_id,
+            expected_prior_generation=preparation.expected_prior_generation,
+            prior_generation=prior_generation,
+            gate_b_grant_digest=preparation.gate_b_grant_digest,
+            evidence_digest=contract_module.stage_validation_evidence_digest(
+                evidence
+            ),
+            snapshot_receipt_digest=physical.snapshot_receipt_digest,
+            stage_db_digest=evidence.stage_file_digest,
+            manifest_temp_digest=evidence.manifest_temp_digest,
+            source_jsonl_digest=receipt.jsonl_digest,
+            new_receipt_id=receipt.snapshot_id,
+            new_manifest_path=identity.snapshot_manifest_path,
+            new_manifest_digest=evidence.manifest_temp_digest,
+            candidate_stage_db_path=physical.mutable_stage.staged_db_path,
+            candidate_manifest_temp_path=(
+                physical.mutable_stage.manifest_temp_path
+            ),
+            candidate_stage_db_identity=(
+                physical.database_identity.device,
+                physical.database_identity.inode,
+            ),
+            candidate_manifest_temp_identity=(
+                physical.manifest_identity.device,
+                physical.manifest_identity.inode,
+            ),
+            source_jsonl_identity=(
+                source_capture[0].device,
+                source_capture[0].inode,
+            ),
+            had_prior_canonical=had_prior,
+            prior_binding_snapshot_id=prior_binding_snapshot_id,
+            prior_receipt_digest=prior_receipt_digest_value,
+            prior_manifest_digest=prior_manifest_digest_value,
+            prior_db_path=prior_db_path,
+            prior_manifest_path=prior_manifest_path,
+            prior_db_digest=prior_db_digest_value,
+            prior_db_identity=prior_db_identity_value,
+            prior_manifest_identity=prior_manifest_identity_value,
+            prior_db_backup_path=prior_db_backup_path,
+            prior_manifest_backup_path=prior_manifest_backup_path,
+            prior_db_backup_digest=prior_db_backup_digest_value,
+            prior_manifest_backup_digest=prior_manifest_backup_digest_value,
+            prior_db_backup_identity=prior_db_backup_identity_value,
+            prior_manifest_backup_identity=(
+                prior_manifest_backup_identity_value
+            ),
+        )
+        return record
+
+    def _revalidate_activation_journal_closure(
+        self,
+        preparation: _ActivationPreparation,
+        record: _ActivationJournalRecord,
+    ) -> None:
+        """Re-prove one durable journal record against live facts.
+
+        The caller must hold the coordinator condition lock.  Registry-owned
+        token and preparation facts are revalidated; candidate, prior,
+        backup, source, view, and generation facts are re-captured from disk.
+        Any mutation, token cancellation/consumption, inode swap, or
+        coordinator/preparation change invalidates the journal.
+        """
+
+        stage_seal_error = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealError",
+        )
+        stage = preparation._sealed_stage
+        token = preparation._token
+        if type(stage) is not SealedStage:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        if type(token) is not contract_module._ActivationToken:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            )
+        registry = cast(Any, self._sealed_registry)
+        if registry.registry_namespace != record.registry_namespace:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        try:
+            contract_module._validate_activation_token_for_stage(token, stage)
+        except (TypeError, ValueError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            ) from error
+        try:
+            physical = registry.resolve_physical_readiness(stage)
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            ) from error
+        evidence = physical.evidence
+        receipt = evidence.source_binding.receipt
+        if (
+            physical.artifact_id != record.artifact_id
+            or physical.artifact_seal_digest != record.artifact_seal_digest
+            or physical.sealed_stage_digest != record.sealed_stage_digest
+            or physical.resource_id != record.resource_id
+            or physical.target_identity != record.target_identity
+            or physical.canonical_store_id != record.canonical_store_id
+            or physical.snapshot_receipt_digest
+            != record.snapshot_receipt_digest
+            or physical.expected_prior_generation
+            != record.expected_prior_generation
+            or contract_module.stage_validation_evidence_digest(evidence)
+            != record.evidence_digest
+            or evidence.stage_file_digest != record.stage_db_digest
+            or evidence.manifest_temp_digest != record.manifest_temp_digest
+            or receipt.snapshot_id != record.new_receipt_id
+            or receipt.jsonl_digest != record.source_jsonl_digest
+            or physical.mutable_stage.staged_db_path
+            != record.candidate_stage_db_path
+            or physical.mutable_stage.manifest_temp_path
+            != record.candidate_manifest_temp_path
+            or (physical.database_identity.device, physical.database_identity.inode)
+            != record.candidate_stage_db_identity
+            or (
+                physical.manifest_identity.device,
+                physical.manifest_identity.inode,
+            )
+            != record.candidate_manifest_temp_identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        identity = self._resource_identity
+        if (
+            record.new_manifest_path != identity.snapshot_manifest_path
+            or record.journal_path != _activation_journal_path(identity)
+            or record.preparation_id != preparation.preparation_id
+            or record.gate_b_grant_digest != preparation.gate_b_grant_digest
+            or record.had_prior_canonical != preparation.had_prior_canonical
+            or record.resource_id != preparation.resource_id
+            or record.target_identity != preparation.target_identity
+            or record.canonical_store_id != preparation.canonical_store_id
+            or record.expected_prior_generation
+            != preparation.expected_prior_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        db_capture = _capture_journal_closure_file(
+            physical.mutable_stage.staged_db_path
+        )
+        if (
+            (db_capture[0].device, db_capture[0].inode)
+            != record.candidate_stage_db_identity
+            or db_capture[1] != record.stage_db_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        manifest_capture = _capture_journal_closure_file(
+            physical.mutable_stage.manifest_temp_path
+        )
+        if (
+            (manifest_capture[0].device, manifest_capture[0].inode)
+            != record.candidate_manifest_temp_identity
+            or manifest_capture[1] != record.manifest_temp_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        source_capture = _capture_journal_closure_file(
+            identity.configured_jsonl_path
+        )
+        if (
+            (source_capture[0].device, source_capture[0].inode)
+            != record.source_jsonl_identity
+            or source_capture[1] != record.source_jsonl_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                retryable=False,
+            )
+        view = self._view
+        if record.had_prior_canonical:
+            if (
+                view is None
+                or view is not preparation._prior_view
+                or view.generation != record.prior_generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            try:
+                database = _capture_activation_file(
+                    view.stage.staged_db_path,
+                    asset_kind="DATABASE",
+                )
+                manifest = _capture_activation_file(
+                    identity.snapshot_manifest_path,
+                    asset_kind="MANIFEST",
+                )
+                with _open_configured_connection(
+                    view.stage.staged_db_path,
+                    require_existing=True,
+                ) as connection:
+                    facts = _read_source_binding_facts(connection, view)
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+            if (
+                (database.identity.device, database.identity.inode)
+                != record.prior_db_identity
+                or database.digest != record.prior_db_digest
+                or (manifest.identity.device, manifest.identity.inode)
+                != record.prior_manifest_identity
+                or manifest.digest != record.prior_manifest_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+            if (
+                facts.binding is None
+                or facts.divergence_latched
+                or facts.diagnostic_codes
+                or _configured_pair_diagnostics(
+                    facts.binding,
+                    identity=identity,
+                    canonical_store_id=view.canonical_store_id,
+                    head_revision=facts.head_revision,
+                    cumulative_record_counts=facts.cumulative_record_counts,
+                )
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            binding = facts.binding
+            if (
+                binding.receipt.snapshot_id
+                != record.prior_binding_snapshot_id
+                or contract_module.snapshot_receipt_digest(binding.receipt)
+                != record.prior_receipt_digest
+                or database.path != record.prior_db_path
+                or manifest.path != record.prior_manifest_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            manifest_payload = _read_activation_file_bytes(manifest)
+            if manifest_payload != contract_to_json(
+                binding.manifest
+            ).encode("utf-8"):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+            backups_by_kind = {
+                asset.asset_kind: asset for asset in preparation._backup_assets
+            }
+            if set(backups_by_kind) != {"DATABASE", "MANIFEST"}:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            prior_db_asset = backups_by_kind["DATABASE"]
+            prior_manifest_asset = backups_by_kind["MANIFEST"]
+            db_backup_capture = _capture_journal_closure_file(
+                prior_db_asset.backup_path
+            )
+            manifest_backup_capture = _capture_journal_closure_file(
+                prior_manifest_asset.backup_path
+            )
+            if (
+                (
+                    db_backup_capture[0].device,
+                    db_backup_capture[0].inode,
+                )
+                != record.prior_db_backup_identity
+                or db_backup_capture[1] != record.prior_db_backup_digest
+                or (
+                    manifest_backup_capture[0].device,
+                    manifest_backup_capture[0].inode,
+                )
+                != record.prior_manifest_backup_identity
+                or manifest_backup_capture[1]
+                != record.prior_manifest_backup_digest
+                or db_backup_capture
+                != (
+                    prior_db_asset.backup_identity,
+                    prior_db_asset.evidence.backup_digest,
+                )
+                or manifest_backup_capture
+                != (
+                    prior_manifest_asset.backup_identity,
+                    prior_manifest_asset.evidence.backup_digest,
+                )
+                or prior_db_asset.backup_path != record.prior_db_backup_path
+                or prior_manifest_asset.backup_path
+                != record.prior_manifest_backup_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                )
+        else:
+            if view is not None or record.prior_generation is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            try:
+                _require_first_activation_absence(identity)
+            except ActivationPreparationError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                    reason_code=error.code,
+                ) from error
+        try:
+            state = registry.state(stage)
+            registry._token_entry(token)
+        except stage_seal_error as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            ) from error
+        if state is not contract_module.ActivationCapabilityState.TOKEN_ISSUED:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            )
+        if (
+            token.token_id != record.token_id
+            or token.token_version != record.token_version
+            or token.activation_nonce != record.activation_nonce
+            or token.artifact_id != record.artifact_id
+            or token.artifact_seal_digest != record.artifact_seal_digest
+            or token.sealed_stage_digest != record.sealed_stage_digest
+            or token.snapshot_receipt_digest != record.snapshot_receipt_digest
+            or token.expected_prior_generation
+            != record.expected_prior_generation
+            or token.resource_id != record.resource_id
+            or token.target_identity != record.target_identity
+            or token.canonical_store_id != record.canonical_store_id
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_TOKEN_INVALID",
+                retryable=False,
+            )
 
     def _transition_generation(
         self,
@@ -1908,6 +3217,833 @@ def _remove_recovery_backups(
             ) from error
     for owned in owned_paths:
         _require_recovery_path_absent(owned.path)
+
+
+def _require_activation_journal_digest(
+    value: object,
+    field_name: str,
+) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+
+
+def _validate_journal_native_path(value: object, field_name: str) -> None:
+    if (
+        type(value) is not _NATIVE_PATH_TYPE
+        or not value.is_absolute()
+        or ".." in value.parts
+    ):
+        raise TypeError(
+            f"{field_name} must be an absolute normalized Path"
+        )
+
+
+def _validate_journal_native_identity_pair(
+    value: object,
+    field_name: str,
+) -> None:
+    if type(value) is not tuple or len(value) != 2:
+        raise TypeError(f"{field_name} must be an identity pair")
+    first, second = value
+    if (
+        type(first) is not int
+        or isinstance(first, bool)
+        or type(second) is not int
+        or isinstance(second, bool)
+        or first < 0
+        or second < 0
+    ):
+        raise ValueError(
+            f"{field_name} must contain non-negative integers"
+        )
+
+
+def _activation_journal_path(identity: CanonicalResourceIdentity) -> Path:
+    """Deterministic journal path adjacent to the canonical sidecar."""
+
+    return identity.canonical_sidecar_path.with_name(
+        f".{identity.canonical_sidecar_path.name}.localcat-activation-journal.json"
+    )
+
+
+def _activation_journal_temp_path(journal_path: Path) -> Path:
+    return journal_path.with_name(f"{journal_path.name}.tmp")
+
+
+def _lstat_any_entry(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_STATE_INVALID",
+            retryable=False,
+        ) from error
+    return True
+
+
+def _lstat_activation_journal_identity(
+    path: Path,
+) -> _ActivationFileIdentity | None:
+    """Regular-file identity, None when absent, fail-closed for other kinds."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_STATE_INVALID",
+            retryable=False,
+        ) from error
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_FINAL_EXISTS",
+            retryable=False,
+        )
+    return _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+
+
+def _open_activation_journal_temp(
+    path: Path,
+) -> tuple[int, _ActivationFileIdentity]:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        observed = os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+    ):
+        os.close(descriptor)
+        raise OSError(
+            "activation journal temporary is not an exclusive regular file"
+        )
+    return descriptor, _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+
+
+def _write_activation_journal_bytes(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("activation journal write made no progress")
+        view = view[written:]
+
+
+def _fsync_activation_journal(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _close_activation_journal(descriptor: int) -> None:
+    os.close(descriptor)
+
+
+def _read_activation_journal_file(
+    path: Path,
+    expected_identity: _ActivationFileIdentity | None,
+) -> tuple[bytes, _ActivationFileIdentity]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PARSE_INVALID",
+                retryable=False,
+            )
+        identity = _ActivationFileIdentity(observed.st_dev, observed.st_ino)
+        if (
+            expected_identity is not None
+            and identity != expected_identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_HANDLE_STALE",
+                retryable=False,
+            )
+        payload = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            payload.extend(chunk)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    finally:
+        os.close(descriptor)
+    if _lstat_activation_journal_identity(path) != identity:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_HANDLE_STALE",
+            retryable=False,
+        )
+    return bytes(payload), identity
+
+
+def _remove_owned_activation_journal_temp(
+    path: Path,
+    expected_identity: _ActivationFileIdentity,
+) -> bool:
+    """Remove exactly the owned temporary; return True only when provable."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino)
+        != (expected_identity.device, expected_identity.inode)
+    ):
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    try:
+        _fsync_activation_directory(path.parent)
+    except OSError:
+        return False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _capture_journal_closure_file(
+    path: Path,
+) -> tuple[_ActivationFileIdentity, str]:
+    try:
+        capture = _capture_activation_file(path, asset_kind="JOURNAL_CLOSURE")
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_ASSET_MUTATED",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    return capture.identity, capture.digest
+
+
+def _activation_journal_record_payload(
+    record: _ActivationJournalRecord,
+) -> dict[str, object]:
+    def identity_pair(
+        value: tuple[int, int] | None,
+    ) -> list[int] | None:
+        if value is None:
+            return None
+        return [value[0], value[1]]
+
+    def optional_str(value: Path | None) -> str | None:
+        return None if value is None else str(value)
+
+    return {
+        "activation_nonce": record.activation_nonce,
+        "artifact_id": record.artifact_id,
+        "artifact_seal_digest": record.artifact_seal_digest,
+        "candidate_manifest_temp_identity": identity_pair(
+            record.candidate_manifest_temp_identity
+        ),
+        "candidate_manifest_temp_path": str(
+            record.candidate_manifest_temp_path
+        ),
+        "candidate_stage_db_identity": identity_pair(
+            record.candidate_stage_db_identity
+        ),
+        "candidate_stage_db_path": str(record.candidate_stage_db_path),
+        "canonical_store_id": record.canonical_store_id,
+        "evidence_digest": record.evidence_digest,
+        "expected_prior_generation": record.expected_prior_generation,
+        "gate_b_grant_digest": record.gate_b_grant_digest,
+        "had_prior_canonical": record.had_prior_canonical,
+        "journal_id": record.journal_id,
+        "journal_path": str(record.journal_path),
+        "journal_version": record.journal_version,
+        "manifest_temp_digest": record.manifest_temp_digest,
+        "new_manifest_digest": record.new_manifest_digest,
+        "new_manifest_path": str(record.new_manifest_path),
+        "new_receipt_id": record.new_receipt_id,
+        "phase": record.phase.value,
+        "preparation_id": record.preparation_id,
+        "prior_binding_snapshot_id": record.prior_binding_snapshot_id,
+        "prior_db_backup_digest": record.prior_db_backup_digest,
+        "prior_db_backup_identity": identity_pair(
+            record.prior_db_backup_identity
+        ),
+        "prior_db_backup_path": optional_str(record.prior_db_backup_path),
+        "prior_db_digest": record.prior_db_digest,
+        "prior_db_identity": identity_pair(record.prior_db_identity),
+        "prior_db_path": optional_str(record.prior_db_path),
+        "prior_generation": record.prior_generation,
+        "prior_manifest_backup_digest": record.prior_manifest_backup_digest,
+        "prior_manifest_backup_identity": identity_pair(
+            record.prior_manifest_backup_identity
+        ),
+        "prior_manifest_backup_path": optional_str(
+            record.prior_manifest_backup_path
+        ),
+        "prior_manifest_digest": record.prior_manifest_digest,
+        "prior_manifest_identity": identity_pair(
+            record.prior_manifest_identity
+        ),
+        "prior_manifest_path": optional_str(record.prior_manifest_path),
+        "prior_receipt_digest": record.prior_receipt_digest,
+        "registry_namespace": record.registry_namespace,
+        "resource_id": record.resource_id,
+        "sealed_stage_digest": record.sealed_stage_digest,
+        "snapshot_receipt_digest": record.snapshot_receipt_digest,
+        "source_jsonl_digest": record.source_jsonl_digest,
+        "source_jsonl_identity": identity_pair(record.source_jsonl_identity),
+        "stage_db_digest": record.stage_db_digest,
+        "target_identity": record.target_identity,
+        "token_id": record.token_id,
+        "token_version": record.token_version,
+    }
+
+
+def _activation_journal_digest(record: _ActivationJournalRecord) -> str:
+    return contract_module._stable_digest(
+        _activation_journal_record_payload(record)
+    )
+
+
+def _serialize_activation_journal_record(
+    record: _ActivationJournalRecord,
+) -> str:
+    envelope = _activation_journal_record_payload(record)
+    envelope["record_digest"] = _activation_journal_digest(record)
+    return json.dumps(
+        envelope,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _decode_journal_string(value: object, field_name: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise TypeError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _decode_journal_digest(value: object, field_name: str) -> str:
+    decoded = _decode_journal_string(value, field_name)
+    _require_activation_journal_digest(decoded, field_name)
+    return decoded
+
+
+def _decode_journal_int(value: object, field_name: str) -> int:
+    if type(value) is not int or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    return value
+
+
+def _decode_journal_optional_int(
+    value: object,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    decoded = _decode_journal_int(value, field_name)
+    if decoded < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return decoded
+
+
+def _decode_journal_bool(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{field_name} must be a boolean")
+    return value
+
+
+def _decode_journal_path(value: object, field_name: str) -> Path:
+    decoded = _decode_journal_string(value, field_name)
+    path = Path(decoded)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{field_name} must be an absolute normalized path")
+    return path
+
+
+def _decode_journal_optional_path(
+    value: object,
+    field_name: str,
+) -> Path | None:
+    if value is None:
+        return None
+    return _decode_journal_path(value, field_name)
+
+
+def _decode_journal_identity_pair(
+    value: object,
+    field_name: str,
+) -> tuple[int, int]:
+    if type(value) is not list or len(value) != 2:
+        raise TypeError(f"{field_name} must be a two-item array")
+    first = _decode_journal_int(value[0], f"{field_name} device")
+    second = _decode_journal_int(value[1], f"{field_name} inode")
+    if first < 0 or second < 0:
+        raise ValueError(f"{field_name} must contain non-negative integers")
+    return (first, second)
+
+
+def _decode_journal_optional_identity_pair(
+    value: object,
+    field_name: str,
+) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    return _decode_journal_identity_pair(value, field_name)
+
+
+def _decode_journal_phase(value: object) -> _ActivationJournalPhase:
+    if type(value) is not str:
+        raise TypeError("journal phase must be a string")
+    for member in _PHASE_SEQUENCE:
+        if member.value == value:
+            return member
+    raise ValueError("journal phase is not a supported activation phase")
+
+
+def _decode_optional_journal_identity(
+    value: object,
+    field_name: str,
+) -> str | None:
+    if value is None:
+        return None
+    return _decode_journal_string(value, field_name)
+
+
+def _decode_optional_journal_digest(
+    value: object,
+    field_name: str,
+) -> str | None:
+    if value is None:
+        return None
+    return _decode_journal_digest(value, field_name)
+
+
+def _decode_activation_journal_record(
+    mapping: dict[str, object],
+    *,
+    expected_journal_path: Path,
+) -> _ActivationJournalRecord:
+    journal_path = _decode_journal_path(
+        mapping["journal_path"],
+        "journal_path",
+    )
+    if journal_path != expected_journal_path:
+        raise ValueError("journal path does not match the expected path")
+    phase = _decode_journal_phase(mapping["phase"])
+    record = _ActivationJournalRecord(
+        journal_id=_decode_journal_string(mapping["journal_id"], "journal_id"),
+        journal_version=_decode_journal_string(
+            mapping["journal_version"],
+            "journal_version",
+        ),
+        journal_path=journal_path,
+        phase=phase,
+        preparation_id=_decode_journal_string(
+            mapping["preparation_id"],
+            "preparation_id",
+        ),
+        registry_namespace=_decode_journal_string(
+            mapping["registry_namespace"],
+            "registry_namespace",
+        ),
+        token_id=_decode_journal_string(mapping["token_id"], "token_id"),
+        token_version=_decode_journal_string(
+            mapping["token_version"],
+            "token_version",
+        ),
+        activation_nonce=_decode_journal_string(
+            mapping["activation_nonce"],
+            "activation_nonce",
+        ),
+        artifact_id=_decode_journal_string(
+            mapping["artifact_id"],
+            "artifact_id",
+        ),
+        artifact_seal_digest=_decode_journal_digest(
+            mapping["artifact_seal_digest"],
+            "artifact_seal_digest",
+        ),
+        sealed_stage_digest=_decode_journal_digest(
+            mapping["sealed_stage_digest"],
+            "sealed_stage_digest",
+        ),
+        resource_id=_decode_journal_string(
+            mapping["resource_id"],
+            "resource_id",
+        ),
+        target_identity=_decode_journal_digest(
+            mapping["target_identity"],
+            "target_identity",
+        ),
+        canonical_store_id=_decode_journal_string(
+            mapping["canonical_store_id"],
+            "canonical_store_id",
+        ),
+        expected_prior_generation=_decode_journal_optional_int(
+            mapping["expected_prior_generation"],
+            "expected_prior_generation",
+        ),
+        prior_generation=_decode_journal_optional_int(
+            mapping["prior_generation"],
+            "prior_generation",
+        ),
+        gate_b_grant_digest=_decode_journal_digest(
+            mapping["gate_b_grant_digest"],
+            "gate_b_grant_digest",
+        ),
+        evidence_digest=_decode_journal_digest(
+            mapping["evidence_digest"],
+            "evidence_digest",
+        ),
+        snapshot_receipt_digest=_decode_journal_digest(
+            mapping["snapshot_receipt_digest"],
+            "snapshot_receipt_digest",
+        ),
+        stage_db_digest=_decode_journal_digest(
+            mapping["stage_db_digest"],
+            "stage_db_digest",
+        ),
+        manifest_temp_digest=_decode_journal_digest(
+            mapping["manifest_temp_digest"],
+            "manifest_temp_digest",
+        ),
+        source_jsonl_digest=_decode_journal_digest(
+            mapping["source_jsonl_digest"],
+            "source_jsonl_digest",
+        ),
+        new_receipt_id=_decode_journal_string(
+            mapping["new_receipt_id"],
+            "new_receipt_id",
+        ),
+        new_manifest_path=_decode_journal_path(
+            mapping["new_manifest_path"],
+            "new_manifest_path",
+        ),
+        new_manifest_digest=_decode_journal_digest(
+            mapping["new_manifest_digest"],
+            "new_manifest_digest",
+        ),
+        candidate_stage_db_path=_decode_journal_path(
+            mapping["candidate_stage_db_path"],
+            "candidate_stage_db_path",
+        ),
+        candidate_manifest_temp_path=_decode_journal_path(
+            mapping["candidate_manifest_temp_path"],
+            "candidate_manifest_temp_path",
+        ),
+        candidate_stage_db_identity=_decode_journal_identity_pair(
+            mapping["candidate_stage_db_identity"],
+            "candidate_stage_db_identity",
+        ),
+        candidate_manifest_temp_identity=_decode_journal_identity_pair(
+            mapping["candidate_manifest_temp_identity"],
+            "candidate_manifest_temp_identity",
+        ),
+        source_jsonl_identity=_decode_journal_identity_pair(
+            mapping["source_jsonl_identity"],
+            "source_jsonl_identity",
+        ),
+        had_prior_canonical=_decode_journal_bool(
+            mapping["had_prior_canonical"],
+            "had_prior_canonical",
+        ),
+        prior_binding_snapshot_id=_decode_optional_journal_identity(
+            mapping["prior_binding_snapshot_id"],
+            "prior_binding_snapshot_id",
+        ),
+        prior_receipt_digest=_decode_optional_journal_digest(
+            mapping["prior_receipt_digest"],
+            "prior_receipt_digest",
+        ),
+        prior_manifest_digest=_decode_optional_journal_digest(
+            mapping["prior_manifest_digest"],
+            "prior_manifest_digest",
+        ),
+        prior_db_path=_decode_journal_optional_path(
+            mapping["prior_db_path"],
+            "prior_db_path",
+        ),
+        prior_manifest_path=_decode_journal_optional_path(
+            mapping["prior_manifest_path"],
+            "prior_manifest_path",
+        ),
+        prior_db_digest=_decode_optional_journal_digest(
+            mapping["prior_db_digest"],
+            "prior_db_digest",
+        ),
+        prior_db_identity=_decode_journal_optional_identity_pair(
+            mapping["prior_db_identity"],
+            "prior_db_identity",
+        ),
+        prior_manifest_identity=_decode_journal_optional_identity_pair(
+            mapping["prior_manifest_identity"],
+            "prior_manifest_identity",
+        ),
+        prior_db_backup_path=_decode_journal_optional_path(
+            mapping["prior_db_backup_path"],
+            "prior_db_backup_path",
+        ),
+        prior_manifest_backup_path=_decode_journal_optional_path(
+            mapping["prior_manifest_backup_path"],
+            "prior_manifest_backup_path",
+        ),
+        prior_db_backup_digest=_decode_optional_journal_digest(
+            mapping["prior_db_backup_digest"],
+            "prior_db_backup_digest",
+        ),
+        prior_manifest_backup_digest=_decode_optional_journal_digest(
+            mapping["prior_manifest_backup_digest"],
+            "prior_manifest_backup_digest",
+        ),
+        prior_db_backup_identity=_decode_journal_optional_identity_pair(
+            mapping["prior_db_backup_identity"],
+            "prior_db_backup_identity",
+        ),
+        prior_manifest_backup_identity=_decode_journal_optional_identity_pair(
+            mapping["prior_manifest_backup_identity"],
+            "prior_manifest_backup_identity",
+        ),
+    )
+    return record
+
+
+def _parse_activation_journal_bytes(
+    payload: bytes,
+    *,
+    expected_journal_path: Path,
+) -> _ActivationJournalRecord:
+    """Strictly parse one durable journal file into its frozen record."""
+
+    if type(payload) is not bytes:
+        raise TypeError("activation journal payload must be bytes")
+    try:
+        serialized = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate journal key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            serialized,
+            parse_constant=reject_non_finite,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    if type(value) is not dict:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        )
+    mapping: dict[str, object] = value
+    if set(mapping) != _ACTIVATION_JOURNAL_ENVELOPE_FIELDS:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        )
+    try:
+        canonical = json.dumps(
+            mapping,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    if canonical != serialized:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        )
+    digest_field = mapping["record_digest"]
+    _require_activation_journal_digest(digest_field, "record_digest")
+    payload_mapping = {
+        key: value
+        for key, value in mapping.items()
+        if key != "record_digest"
+    }
+    if contract_module._stable_digest(payload_mapping) != digest_field:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        )
+    try:
+        record = _decode_activation_journal_record(
+            payload_mapping,
+            expected_journal_path=expected_journal_path,
+        )
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    return record
+
+
+def _validate_activation_journal_record(
+    record: _ActivationJournalRecord,
+) -> None:
+    if record.journal_version != _ACTIVATION_JOURNAL_VERSION:
+        raise ValueError("unsupported activation journal version")
+    for field_name in _ACTIVATION_JOURNAL_IDENTITY_FIELDS:
+        value = getattr(record, field_name)
+        if type(value) is not str or not value.strip():
+            raise TypeError(f"{field_name} must be a non-empty string")
+    for field_name in _ACTIVATION_JOURNAL_DIGEST_FIELDS:
+        _require_activation_journal_digest(
+            getattr(record, field_name),
+            field_name,
+        )
+    for field_name in _ACTIVATION_JOURNAL_OPTIONAL_DIGEST_FIELDS:
+        value = getattr(record, field_name)
+        if value is not None:
+            _require_activation_journal_digest(value, field_name)
+    for field_name in _ACTIVATION_JOURNAL_PATH_FIELDS:
+        _validate_journal_native_path(
+            getattr(record, field_name),
+            field_name,
+        )
+    for field_name in _ACTIVATION_JOURNAL_OPTIONAL_PATH_FIELDS:
+        value = getattr(record, field_name)
+        if value is not None:
+            _validate_journal_native_path(value, field_name)
+    for field_name in _ACTIVATION_JOURNAL_IDENTITY_PAIR_FIELDS:
+        _validate_journal_native_identity_pair(
+            getattr(record, field_name),
+            field_name,
+        )
+    for field_name in _ACTIVATION_JOURNAL_OPTIONAL_IDENTITY_PAIR_FIELDS:
+        value = getattr(record, field_name)
+        if value is not None:
+            _validate_journal_native_identity_pair(value, field_name)
+    if record.expected_prior_generation is not None and (
+        record.expected_prior_generation < 0
+    ):
+        raise ValueError("expected prior generation must be non-negative")
+    if record.prior_generation is not None and record.prior_generation < 0:
+        raise ValueError("prior generation must be non-negative")
+    if type(record.phase) is not _ActivationJournalPhase:
+        raise TypeError("journal phase must be a code-only activation phase")
+    if record.phase not in _PHASE_SEQUENCE:
+        raise ValueError("journal phase is not in the fixed sequence")
+    if record.new_manifest_digest != record.manifest_temp_digest:
+        raise ValueError(
+            "new final manifest digest must match the temporary manifest digest"
+        )
+    if record.had_prior_canonical:
+        if (
+            record.prior_generation is None
+            or record.expected_prior_generation != record.prior_generation
+            or record.prior_binding_snapshot_id is None
+            or record.prior_receipt_digest is None
+            or record.prior_manifest_digest is None
+            or record.prior_db_path is None
+            or record.prior_manifest_path is None
+            or record.prior_db_digest is None
+            or record.prior_db_identity is None
+            or record.prior_manifest_identity is None
+            or record.prior_db_backup_path is None
+            or record.prior_manifest_backup_path is None
+            or record.prior_db_backup_digest is None
+            or record.prior_manifest_backup_digest is None
+            or record.prior_db_backup_identity is None
+            or record.prior_manifest_backup_identity is None
+        ):
+            raise ValueError(
+                "activation journal prior facts are incomplete"
+            )
+        if record.prior_db_digest != record.prior_db_backup_digest:
+            raise ValueError(
+                "activation journal prior database digest does not close"
+            )
+        if (
+            record.prior_manifest_digest
+            != record.prior_manifest_backup_digest
+        ):
+            raise ValueError(
+                "activation journal prior manifest digest does not close"
+            )
+    else:
+        if (
+            record.prior_generation is not None
+            or record.expected_prior_generation is not None
+            or record.prior_binding_snapshot_id is not None
+            or record.prior_receipt_digest is not None
+            or record.prior_manifest_digest is not None
+            or record.prior_db_path is not None
+            or record.prior_manifest_path is not None
+            or record.prior_db_digest is not None
+            or record.prior_db_identity is not None
+            or record.prior_manifest_identity is not None
+            or record.prior_db_backup_path is not None
+            or record.prior_manifest_backup_path is not None
+            or record.prior_db_backup_digest is not None
+            or record.prior_manifest_backup_digest is not None
+            or record.prior_db_backup_identity is not None
+            or record.prior_manifest_backup_identity is not None
+        ):
+            raise ValueError(
+                "first activation journal must explicitly encode absence"
+            )
 
 
 class SourceBindingMonitor:
