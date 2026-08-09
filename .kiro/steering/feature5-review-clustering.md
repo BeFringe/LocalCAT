@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v2）
+# Feature 5 评审集群与推理强度指南（采纳稿 v3）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -26,13 +26,13 @@
 
 | 集群强度 | 默认 agent 与 effort | 用途约束 |
 |----------|----------------------|----------|
-| `medium` | `v4_flash_worker` / `high` | 适合有明确输入与验收标准的实现分析、机械核对和有界复审；必须使用 plaintext Hook 且 `fork_turns="none"`。 |
-| `high` | `v4_flash_worker` / `max` | 用于状态机、不变量和故障路径密集但仍可形成自包含 plaintext assignment 的工作；必须使用 plaintext Hook 且 `fork_turns="none"`。 |
+| `medium` | `v4_flash_worker` / `high` | 在 impl 列直接负责有明确边界与验收标准的实现，在 review 列负责机械核对和有界复审；任务输入必须自包含，并通过该 worker 当前适配 skill 交付。 |
+| `high` | `v4_flash_worker` / `max` | 在 impl 列直接负责状态机、不变量和故障路径密集但仍可形成自包含 assignment 的实现，在 review 列执行相应复审；任务输入必须自包含，并通过该 worker 当前适配 skill 交付。 |
 | `xhigh` | 原生 subagent / `xhigh` | 实施使用职责明确的 worker，复审使用 code-reviewer；允许读取当前任务上下文，但 assignment 仍须给出集群 base/tip、闭包和验证证据。 |
 
-向 DeepSeek provider 发送私有源码、测试或规格前，必须已有用户对该 provider/data boundary 的明确授权；Hook staging 成功不等于已发送，只有原生 spawn 成功才算真正 dispatch。不得用继承上下文、V2 message-only delivery 或其他 provider fallback 绕过该边界。
+向外部 provider 发送私有源码、测试或规格前，必须已有用户对该 provider/data boundary 的明确授权。集群治理只依赖统一的 subagent 适配边界：自包含 assignment、明确读写权限与所有权、实际 agent/model/effort 记录、可靠的一次交付和原生结果回传。Hook、fork、transport 版本、provider API 或 runtime 调用方式均封装在对应适配 skill 内，不进入本集群地图；替换 agent/runtime 时只更新适配 skill，不改 Requirements、Design、Tasks 或集群安全不变量。
 
-Cluster B 的恢复审计发生在本映射定稿前，实际使用 `v4_flash_worker/high`。用户已明确接受它作为该集群既有复审输入，并要求不重复派发 Cluster B review；此一次性迁移裁决不降低后续 `high→v4/max` 的默认映射。
+`impl` dispatch 必须由对应 subagent 在获分配的文件边界内直接实现并运行定点验证；只返回实施分析或蓝图不算完成 impl dispatch。主 agent 保留变更核验、跨任务整合、显式暂存与提交责任。
 
 ---
 
@@ -150,5 +150,6 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| v2 | 2026-08-09 | 固化跨 provider 调度语义：`medium→v4/high`、`high→v4/max`、`xhigh→原生/xhigh`；加入 plaintext Hook、私有源码授权、实际 dispatch 记录要求，并记录 Cluster B 既有审计的一次性迁移裁决。 |
+| v3 | 2026-08-09 | 删除与后续集群无关的一次性历史例外；以 provider adapter skill 隔离 Hook、fork、transport 与 runtime 细节；明确 impl subagent 必须直接实施而非只交付分析。 |
+| v2 | 2026-08-09 | 固化跨 provider 调度语义：`medium→v4/high`、`high→v4/max`、`xhigh→原生/xhigh`；加入 plaintext Hook、私有源码授权和实际 dispatch 记录要求。 |
 | v1 | 2026-08-01 | 确立 A→L 集群边界与三级推理强度；加入 Task 3.2 exact-type、私有快照和值闭包复盘，以及集群闭合门、提交/审批解耦和 Feature 3 外部失败基线。 |
