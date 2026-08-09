@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v1）
+# Feature 5 评审集群与推理强度指南（采纳稿 v2）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -19,6 +19,20 @@
 | `medium` | 确定性算法、golden 向量、阶段守恒计数、覆盖映射、纯套件执行 | `medium` | `medium` |
 
 复审强度不低于实施强度；崩溃恢复任务的复审比实施更难，因为复审者必须枚举实施者可能遗漏的故障路径。
+
+### Subagent 模型与 effort 映射
+
+表内三级强度是 Feature 5 的任务语义，不直接等同于不同 provider 的同名 effort。自 v2 起统一按下表 dispatch，并在每次集群证据中记录实际 agent type、provider/model 和 effort，禁止只写抽象强度：
+
+| 集群强度 | 默认 agent 与 effort | 用途约束 |
+|----------|----------------------|----------|
+| `medium` | `v4_flash_worker` / `high` | 适合有明确输入与验收标准的实现分析、机械核对和有界复审；必须使用 plaintext Hook 且 `fork_turns="none"`。 |
+| `high` | `v4_flash_worker` / `max` | 用于状态机、不变量和故障路径密集但仍可形成自包含 plaintext assignment 的工作；必须使用 plaintext Hook 且 `fork_turns="none"`。 |
+| `xhigh` | 原生 subagent / `xhigh` | 实施使用职责明确的 worker，复审使用 code-reviewer；允许读取当前任务上下文，但 assignment 仍须给出集群 base/tip、闭包和验证证据。 |
+
+向 DeepSeek provider 发送私有源码、测试或规格前，必须已有用户对该 provider/data boundary 的明确授权；Hook staging 成功不等于已发送，只有原生 spawn 成功才算真正 dispatch。不得用继承上下文、V2 message-only delivery 或其他 provider fallback 绕过该边界。
+
+Cluster B 的恢复审计发生在本映射定稿前，实际使用 `v4_flash_worker/high`。用户已明确接受它作为该集群既有复审输入，并要求不重复派发 Cluster B review；此一次性迁移裁决不降低后续 `high→v4/max` 的默认映射。
 
 ---
 
@@ -136,4 +150,5 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v2 | 2026-08-09 | 固化跨 provider 调度语义：`medium→v4/high`、`high→v4/max`、`xhigh→原生/xhigh`；加入 plaintext Hook、私有源码授权、实际 dispatch 记录要求，并记录 Cluster B 既有审计的一次性迁移裁决。 |
 | v1 | 2026-08-01 | 确立 A→L 集群边界与三级推理强度；加入 Task 3.2 exact-type、私有快照和值闭包复盘，以及集群闭合门、提交/审批解耦和 Feature 3 外部失败基线。 |
