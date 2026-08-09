@@ -25,7 +25,7 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import Any, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 import unicodedata
 import uuid
 
@@ -229,6 +229,9 @@ from tm_activation_recovery import (
 )
 
 TM_SCHEMA_VERSION = 2
+TM_LEGACY_SCHEMA_VERSION = 1
+_SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
+_SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
 CANDIDATE_INDEX_VERSION = "candidate-index-v1"
 BUSY_TIMEOUT_MS = 5000
@@ -270,6 +273,10 @@ _FTS5_SHADOW_TABLES = frozenset(
 _APPROVED_SCHEMA_DIGESTS = {
     False: "d807116c449da67b6186a64c500def04923eaecc9eed8edf47aa9cebeac3d751",
     True: "a8925fe918c9394684eeb61b74052719480f7259cf2fa2ad3322704db21c5b1d",
+}
+_APPROVED_LEGACY_SCHEMA_DIGESTS = {
+    False: "725b94300abd64b5c06824ecb63357e2f737111e9fbd42094796183b924532a7",
+    True: "8d093e3e7db360c2b8510ef524ca05170c187a9a2dd4c1f7326dec0a7df89da6",
 }
 _REQUIRED_META_KEYS = frozenset(
     {
@@ -427,6 +434,126 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+_LEGACY_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE tm_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE tm_origin_batch (
+        batch_id TEXT PRIMARY KEY CHECK(length(batch_id) > 0),
+        kind TEXT NOT NULL
+            CHECK(kind IN ('migration', 'local_write', 'import')),
+        source_digest TEXT,
+        source_path TEXT,
+        status TEXT NOT NULL
+            CHECK(status IN ('staged', 'completed', 'failed')),
+        valid_count INTEGER NOT NULL CHECK(valid_count >= 0),
+        invalid_count INTEGER NOT NULL CHECK(invalid_count >= 0),
+        duplicate_source_count INTEGER NOT NULL
+            CHECK(duplicate_source_count >= 0),
+        created_at TEXT NOT NULL CHECK(length(created_at) > 0),
+        CHECK(
+            (
+                kind = 'local_write'
+                AND source_digest IS NULL
+                AND source_path IS NULL
+            )
+            OR
+            (
+                kind IN ('migration', 'import')
+                AND source_digest IS NOT NULL
+                AND length(source_digest) = 64
+                AND source_path IS NOT NULL
+                AND length(source_path) > 0
+            )
+        ),
+        UNIQUE(kind, source_digest)
+    )
+    """,
+    """
+    CREATE TABLE tm_snapshot_receipt (
+        snapshot_id TEXT PRIMARY KEY CHECK(length(snapshot_id) > 0),
+        resource_id TEXT NOT NULL CHECK(length(resource_id) > 0),
+        canonical_store_id TEXT NOT NULL
+            CHECK(length(canonical_store_id) > 0),
+        exported_revision INTEGER NOT NULL CHECK(exported_revision >= 0),
+        jsonl_digest TEXT NOT NULL CHECK(length(jsonl_digest) = 64),
+        record_count INTEGER NOT NULL CHECK(record_count >= 0),
+        format_version TEXT NOT NULL CHECK(length(format_version) > 0),
+        destination_jsonl_path TEXT NOT NULL
+            CHECK(length(destination_jsonl_path) > 0),
+        destination_manifest_path TEXT NOT NULL
+            CHECK(length(destination_manifest_path) > 0),
+        status TEXT NOT NULL
+            CHECK(status IN ('issued', 'completed', 'cancelled')),
+        created_at TEXT NOT NULL CHECK(length(created_at) > 0)
+    )
+    """,
+    """
+    CREATE TABLE tm_snapshot_binding (
+        binding_id INTEGER PRIMARY KEY CHECK(binding_id = 1),
+        configured_jsonl_path TEXT NOT NULL
+            CHECK(length(configured_jsonl_path) > 0),
+        manifest_path TEXT NOT NULL CHECK(length(manifest_path) > 0),
+        snapshot_kind TEXT NOT NULL
+            CHECK(snapshot_kind IN ('MIGRATION_SOURCE', 'EXPLICIT_EXPORT')),
+        snapshot_id TEXT NOT NULL,
+        binding_version TEXT NOT NULL CHECK(length(binding_version) > 0),
+        FOREIGN KEY(snapshot_id)
+            REFERENCES tm_snapshot_receipt(snapshot_id)
+    )
+    """,
+    """
+    CREATE TABLE tm_record (
+        record_id INTEGER PRIMARY KEY,
+        source_raw TEXT NOT NULL CHECK(length(source_raw) > 0),
+        target_raw TEXT NOT NULL CHECK(length(target_raw) > 0),
+        source_fold_v1 TEXT NOT NULL CHECK(length(source_fold_v1) > 0),
+        speaker_raw TEXT,
+        context_prev_raw TEXT,
+        context_next_raw TEXT,
+        file_source TEXT,
+        provenance_json TEXT NOT NULL CHECK(length(provenance_json) > 0),
+        legacy_line_no INTEGER CHECK(
+            legacy_line_no IS NULL OR legacy_line_no >= 1
+        ),
+        usage_count INTEGER NOT NULL DEFAULT 0 CHECK(usage_count >= 0),
+        last_used TEXT,
+        origin_batch_id TEXT NOT NULL,
+        origin_ordinal INTEGER NOT NULL CHECK(origin_ordinal >= 0),
+        UNIQUE(origin_batch_id, origin_ordinal),
+        FOREIGN KEY(origin_batch_id)
+            REFERENCES tm_origin_batch(batch_id)
+    )
+    """,
+    """
+    CREATE INDEX idx_tm_exact
+    ON tm_record(source_raw, record_id DESC)
+    """,
+    """
+    CREATE INDEX idx_tm_context_speaker
+    ON tm_record(source_raw, speaker_raw, record_id DESC)
+    """,
+    """
+    CREATE TABLE tm_gram (
+        gram_size INTEGER NOT NULL CHECK(gram_size IN (1, 2, 3)),
+        gram TEXT NOT NULL CHECK(length(gram) > 0),
+        record_id INTEGER NOT NULL,
+        PRIMARY KEY(gram_size, gram, record_id),
+        FOREIGN KEY(record_id)
+            REFERENCES tm_record(record_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_tm_gram_lookup
+    ON tm_gram(gram_size, gram, record_id)
+    """,
+)
+
 _FTS5_STATEMENT = """
 CREATE VIRTUAL TABLE tm_fts USING fts5(
     source_fold_v1,
@@ -456,6 +583,19 @@ class SQLiteStoreLifecycleError(SQLiteStoreSchemaError):
         self.resource_id = resource_id
         self.generation = generation
         self.retryable = retryable
+
+
+class SchemaUpgradeAncestryError(SQLiteStoreSchemaError):
+    """Fail-closed Task 5.11 ancestry failure carrying a stable code."""
+
+    def __init__(self, code: str, *, retryable: bool) -> None:
+        if type(code) is not str or not code:
+            raise TypeError("schema upgrade ancestry code is invalid")
+        if type(retryable) is not bool:
+            raise TypeError("schema upgrade ancestry retryable flag is invalid")
+        self.code = code
+        self.retryable = retryable
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
@@ -1067,6 +1207,77 @@ class _CoordinatorStorePort:
         )
 
 
+_SCHEMA_UPGRADE_TICKET_FACTORY_KEY = object()
+
+
+@dataclass(frozen=True)
+class _SchemaUpgradeSnapshotTicket:
+    """Opaque single-use schema-upgrade stabilization ticket (Task 5.11).
+
+    Only :meth:`ResourceStoreCoordinator.prepare_schema_upgrade_ticket`
+    can mint one: the factory key is module-private, and the ticket binds
+    the coordinator owner nonce, resource, canonical store id, generation,
+    head revision, the stabilized prior DB identity/digest, and the
+    recovery backup path/digest captured while the coordinator held the
+    resource drained.  The activation guard consumes the ticket before any
+    journal is written; a stale or foreign ticket can never be activated.
+    """
+
+    _owner_nonce: str
+    resource_id: str
+    canonical_store_id: str
+    generation: int
+    head_revision: int
+    db_identity: tuple[int, int]
+    db_digest: str
+    backup_path: Path
+    backup_digest: str
+    _factory_key: object
+
+    def __post_init__(self) -> None:
+        if self._factory_key is not _SCHEMA_UPGRADE_TICKET_FACTORY_KEY:
+            raise TypeError(
+                "schema-upgrade snapshot tickets require the module-private "
+                "factory"
+            )
+        if type(self._owner_nonce) is not str or not self._owner_nonce:
+            raise TypeError("ticket owner nonce is invalid")
+        if type(self.resource_id) is not str or not self.resource_id.strip():
+            raise TypeError("ticket resource id is invalid")
+        if (
+            type(self.canonical_store_id) is not str
+            or not self.canonical_store_id.strip()
+        ):
+            raise TypeError("ticket canonical store id is invalid")
+        if (
+            type(self.generation) is not int
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+        ):
+            raise TypeError("ticket generation is invalid")
+        if (
+            type(self.head_revision) is not int
+            or isinstance(self.head_revision, bool)
+            or self.head_revision < 0
+        ):
+            raise TypeError("ticket head revision is invalid")
+        if (
+            type(self.db_identity) is not tuple
+            or len(self.db_identity) != 2
+            or type(self.db_identity[0]) is not int
+            or type(self.db_identity[1]) is not int
+        ):
+            raise TypeError("ticket database identity is invalid")
+        if type(self.db_digest) is not str or len(self.db_digest) != 64:
+            raise TypeError("ticket database digest is invalid")
+        if type(self.backup_path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("ticket backup path is invalid")
+        if not self.backup_path.is_absolute():
+            raise ValueError("ticket backup path must be absolute")
+        if type(self.backup_digest) is not str or len(self.backup_digest) != 64:
+            raise TypeError("ticket backup digest is invalid")
+
+
 class ResourceStoreCoordinator:
     """Own one resource's leases, sealed registry, and activation authority."""
 
@@ -1077,6 +1288,10 @@ class ResourceStoreCoordinator:
         canonical_store_id: str,
         resource_identity: CanonicalResourceIdentity | None = None,
         drain_timeout_seconds: float = 5.0,
+        _allow_legacy_schema: bool = False,
+        _allow_active: bool = False,
+        _expected_active_generation: int | None = None,
+        _expected_activation_digest: str | None = None,
     ) -> None:
         if (stage is None) == (resource_identity is None):
             raise TypeError(
@@ -1088,6 +1303,27 @@ class ResourceStoreCoordinator:
         if not canonical_store_id.strip():
             raise ValueError("canonical_store_id must not be empty")
         timeout = _require_timeout(drain_timeout_seconds)
+        if type(_allow_legacy_schema) is not bool:
+            raise TypeError(
+                "_allow_legacy_schema must be a built-in bool"
+            )
+        if type(_allow_active) is not bool:
+            raise TypeError("_allow_active must be a built-in bool")
+        if _allow_active and (
+            type(_expected_active_generation) is not int
+            or isinstance(_expected_active_generation, bool)
+            or _expected_active_generation < 0
+        ):
+            raise TypeError("active generation expectation is invalid")
+        if _allow_active and (
+            type(_expected_activation_digest) is not str
+            or len(_expected_activation_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in _expected_activation_digest
+            )
+        ):
+            raise TypeError("activation digest expectation is invalid")
         if stage is not None:
             private_stage = _snapshot_store_stage(stage)
             identity = private_stage.resource_identity
@@ -1095,6 +1331,10 @@ class ResourceStoreCoordinator:
                 private_stage,
                 canonical_store_id=canonical_store_id,
                 _allow_diverged_runtime=True,
+                _allow_legacy_schema=_allow_legacy_schema,
+                _allow_active=_allow_active,
+                _expected_active_generation=_expected_active_generation,
+                _expected_activation_digest=_expected_activation_digest,
             )
             view: _SQLiteGenerationView | None = _SQLiteGenerationView(
                 stage=private_stage,
@@ -1124,6 +1364,8 @@ class ResourceStoreCoordinator:
         self._preparation: _ActivationPreparation | None = None
         self._cleanup_reservation: _ActivationCleanupReservation | None = None
         self._cleanup_in_progress = False
+        self._owner_nonce = uuid.uuid4().hex
+        self._schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None
 
     @property
     def resource_id(self) -> str:
@@ -1257,20 +1499,216 @@ class ResourceStoreCoordinator:
                 if self._active_lease_count == 0:
                     self._condition.notify_all()
 
-    def activate(self, sealed_stage: SealedStage) -> _ActivationPreparation:
+    def prepare_schema_upgrade_ticket(
+        self,
+    ) -> _SchemaUpgradeSnapshotTicket:
+        """Stabilize the resource and mint one opaque upgrade snapshot ticket.
+
+        Task 5.11 coordinator-owned seam: before draining it proves the
+        prior v1 revision ancestry from the strict record-block proof
+        (``SCHEMA.ANCESTRY_UNPROVABLE`` on any unprovable order) and
+        validates the complete prior binding/manifest/receipt/source/
+        divergence closure, then enters DRAINING (new leases are
+        rejected), waits for all old leases to drain within the bounded
+        timeout, proves the active view is unchanged, and re-proves the
+        same ancestry and prior-asset captures.  It then runs
+        ``sqlite3.Connection.backup()`` into a fresh same-directory
+        exclusively reserved regular file while the resource is stable.
+        The file and parent directory are fsynced, the exact prior active
+        DB identity/digest and head revision are captured, READY is
+        restored, and the single-use ticket is returned.  Any failure
+        restores READY and never mutates the live canonical; divergence,
+        tampering, or an unprovable order is never repaired.
+        """
+
+        port = _CoordinatorStorePort(self)
+        with self._condition:
+            if (
+                self._state != "READY"
+                or self._preparation is not None
+                or self._cleanup_reservation is not None
+                or self._cleanup_in_progress
+                or self._schema_upgrade_ticket is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_BUSY",
+                    retryable=True,
+                )
+            view = self._view
+            if view is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_ACTIVE_RESOURCE_REQUIRED",
+                    retryable=False,
+                )
+            _require_no_pending_activation_assets(self._resource_identity)
+            initial_generation = view.generation
+            _require_schema_upgrade_ancestry_provable(
+                view.stage.staged_db_path
+            )
+            pre_drain_captures = _capture_prior_assets(
+                port,
+                view,
+                identity=self._resource_identity,
+                replacement=False,
+            )
+            self._state = "DRAINING"
+            self._condition.notify_all()
+            deadline = time.monotonic() + self._drain_timeout_seconds
+            backup_path: Path | None = None
+            backup_identity: tuple[int, int] | None = None
+            try:
+                while self._active_lease_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.DRAIN_TIMEOUT",
+                            retryable=True,
+                        )
+                    self._condition.wait(remaining)
+                if self._view is not view:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+                if view.generation != initial_generation:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE",
+                        retryable=False,
+                    )
+                _require_schema_upgrade_ancestry_provable(
+                    view.stage.staged_db_path
+                )
+                post_drain_captures = _capture_prior_assets(
+                    port,
+                    view,
+                    identity=self._resource_identity,
+                    replacement=False,
+                )
+                try:
+                    _require_same_asset_captures(
+                        pre_drain_captures,
+                        post_drain_captures,
+                    )
+                except ActivationPreparationError as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.UPGRADE_SNAPSHOT_STALE",
+                        retryable=True,
+                    ) from error
+                database_path = view.stage.staged_db_path
+                db_identity, db_digest = _schema_upgrade_db_capture(
+                    database_path
+                )
+                head_revision = _schema_upgrade_head_revision(database_path)
+                backup_path = _schema_upgrade_backup_path(
+                    database_path,
+                    uuid.uuid4().hex,
+                )
+                backup_identity, backup_digest = (
+                    _create_schema_upgrade_backup(
+                        database_path,
+                        backup_path,
+                    )
+                )
+                ticket = _SchemaUpgradeSnapshotTicket(
+                    _owner_nonce=self._owner_nonce,
+                    resource_id=self._resource_id,
+                    canonical_store_id=self._canonical_store_id,
+                    generation=view.generation,
+                    head_revision=head_revision,
+                    db_identity=db_identity,
+                    db_digest=db_digest,
+                    backup_path=backup_path,
+                    backup_digest=backup_digest,
+                    _factory_key=_SCHEMA_UPGRADE_TICKET_FACTORY_KEY,
+                )
+                self._schema_upgrade_ticket = ticket
+                return ticket
+            except BaseException:
+                if backup_path is not None and backup_identity is not None:
+                    try:
+                        observed = os.lstat(backup_path)
+                        if (
+                            stat.S_ISREG(observed.st_mode)
+                            and observed.st_dev == backup_identity[0]
+                            and observed.st_ino == backup_identity[1]
+                        ):
+                            backup_path.unlink()
+                    except OSError:
+                        pass
+                raise
+            finally:
+                self._state = "READY"
+                self._condition.notify_all()
+
+    def retire_schema_upgrade_ticket(
+        self,
+        ticket: _SchemaUpgradeSnapshotTicket,
+    ) -> None:
+        """Safely retire one unused upgrade ticket (Task 5.11).
+
+        Failures between ticket minting and the activation guard must not
+        block a later fresh snapshot: this seam consumes the exact live
+        ticket.  An already-consumed or foreign ticket is rejected so the
+        single-use contract cannot be silently violated.
+        """
+
+        if type(ticket) is not _SchemaUpgradeSnapshotTicket:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID",
+                retryable=False,
+            )
+        with self._condition:
+            if self._schema_upgrade_ticket is ticket:
+                self._schema_upgrade_ticket = None
+                return
+            if self._schema_upgrade_ticket is None:
+                return
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID",
+                retryable=False,
+            )
+
+    def activate(
+        self,
+        sealed_stage: SealedStage,
+        *,
+        _schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
+    ) -> _ActivationPreparation:
         """Prepare one registered same-store-id sealed stage (Task 5.5).
 
         Ordinary activation retains the same-id rule: the sealed stage's
         canonical store id must equal the coordinator's current id.
         Explicit replacement of an already-active resource (a fresh
         canonical store id) must use :meth:`activate_replacement`.
+
+        The private Task 5.11 schema-upgrade guard accepts exactly one
+        coordinator-minted snapshot ticket.  The guard runs after the
+        normal drain and before any journal: it proves the ticket is the
+        coordinator's live unused ticket bound to this resource/store/
+        generation and that the active canonical is byte- and revision-
+        identical to the stabilized snapshot, then consumes the ticket.
+        A save/import in the window fails the stale candidate before any
+        journal, restores READY, and requires a fresh snapshot for retry.
         """
 
-        return self._activate(sealed_stage, replacement=False)
+        if _schema_upgrade_ticket is not None and type(
+            _schema_upgrade_ticket
+        ) is not _SchemaUpgradeSnapshotTicket:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID",
+                retryable=False,
+            )
+        return self._activate(
+            sealed_stage,
+            replacement=False,
+            schema_upgrade_ticket=_schema_upgrade_ticket,
+        )
 
     def activate_replacement(
         self,
         sealed_stage: SealedStage,
+        *,
+        _schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
     ) -> _ActivationPreparation:
         """Explicitly prepare a replacement stage with a different store id.
 
@@ -1280,9 +1718,15 @@ class ResourceStoreCoordinator:
         exactly like an ordinary activation.  Everything else (Gate B,
         token, drain, backups) follows the same preparation pipeline, and
         the coordinator keeps the prior store id until the candidate
-        generation is durably published.
+        generation is durably published.  Schema-upgrade tickets are
+        same-id activations only and are rejected here.
         """
 
+        if _schema_upgrade_ticket is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID",
+                retryable=False,
+            )
         return self._activate(sealed_stage, replacement=True)
 
     def _activate(
@@ -1290,6 +1734,7 @@ class ResourceStoreCoordinator:
         sealed_stage: SealedStage,
         *,
         replacement: bool,
+        schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
     ) -> _ActivationPreparation:
         """Shared preparation pipeline for ordinary and replacement stages.
 
@@ -1606,6 +2051,10 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.IDENTITY_MISMATCH",
                     retryable=False,
                 )
+            _require_schema_upgrade_mode_closure(
+                physical_snapshot,
+                schema_upgrade_ticket=schema_upgrade_ticket,
+            )
             preparation_id = f"preparation.{uuid.uuid4().hex}"
             if initial_view is None:
                 _require_first_activation_absence(self._resource_identity)
@@ -1637,6 +2086,13 @@ class ResourceStoreCoordinator:
                     pre_drain_captures,
                     captures,
                 )
+                if schema_upgrade_ticket is not None:
+                    _require_schema_upgrade_ticket_guard(
+                        self,
+                        initial_view,
+                        schema_upgrade_ticket,
+                        captures,
+                    )
                 prior_manifest_absent = all(
                     asset.asset_kind != "MANIFEST"
                     for asset in captures
@@ -2591,26 +3047,31 @@ def _read_source_binding_facts_in_transaction(
         or meta["target_identity"] != identity.target_identity
     ):
         raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+    schema_version = _meta_int(meta, "schema_version")
     head_revision = _meta_int(meta, "head_revision")
     record_count = _table_count(connection, "tm_record")
-    ancestry_rows = connection.execute(
-        "SELECT b.batch_id, b.status, b.completed_revision, "
-        "b.valid_count, COUNT(r.record_id) "
-        "FROM tm_origin_batch AS b "
-        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
-        "GROUP BY b.batch_id, b.status, b.completed_revision, b.valid_count "
-        "ORDER BY b.batch_id"
-    ).fetchall()
     diagnostics: list[str] = []
     cumulative_record_counts: tuple[tuple[int, int], ...] = ()
-    try:
-        cumulative_record_counts = _validate_revision_ancestry_rows(
-            ancestry_rows,
-            head_revision=head_revision,
-            record_count=record_count,
-        )
-    except SQLiteStoreSchemaError:
-        diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    if schema_version == TM_LEGACY_SCHEMA_VERSION:
+        ancestry_rows = _legacy_ancestry_fingerprint_rows(connection)
+        try:
+            cumulative_record_counts = _legacy_revision_ancestry(
+                connection,
+                head_revision=head_revision,
+                record_count=record_count,
+            )
+        except SQLiteStoreSchemaError:
+            diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
+    else:
+        ancestry_rows = _origin_ancestry_rows(connection)
+        try:
+            cumulative_record_counts = _validate_revision_ancestry_rows(
+                ancestry_rows,
+                head_revision=head_revision,
+                record_count=record_count,
+            )
+        except SQLiteStoreSchemaError:
+            diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
     rows = connection.execute(
         "SELECT b.configured_jsonl_path, b.manifest_path, "
@@ -2662,6 +3123,193 @@ def _read_source_binding_facts_in_transaction(
         diagnostic_codes=tuple(sorted(set(diagnostics))),
         canonical_fingerprint=canonical_fingerprint,
     )
+
+
+def _origin_ancestry_rows(
+    connection: sqlite3.Connection,
+) -> list[tuple[object, ...]]:
+    """Read one canonical batch ancestry under the current schema version.
+
+    The pre-v2 legacy schema has no ``completed_revision`` column and is
+    never a runtime canonical: legacy stores are read through the strict
+    record-block proof in :func:`_legacy_revision_ancestry` (Task 5.11)
+    instead of this v2-only helper.
+    """
+
+    return connection.execute(
+        "SELECT b.batch_id, b.status, b.completed_revision, "
+        "b.valid_count, COUNT(r.record_id) "
+        "FROM tm_origin_batch AS b "
+        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
+        "GROUP BY b.batch_id, b.status, b.completed_revision, b.valid_count "
+        "ORDER BY b.batch_id"
+    ).fetchall()
+
+
+def _legacy_ancestry_fingerprint_rows(
+    connection: sqlite3.Connection,
+) -> list[tuple[object, ...]]:
+    """Deterministic v1 ancestry rows for binding-fingerprint evidence only.
+
+    The legacy rows expose a NULL revision (the v1 schema has no
+    ``completed_revision`` column); ordering is by batch id purely for a
+    stable fingerprint payload.  Ordering facts are never derived from
+    these rows: :func:`_legacy_revision_ancestry` is the only authority
+    for v1 completion order and raises when the order is unprovable.
+    """
+
+    return connection.execute(
+        "SELECT b.batch_id, b.status, NULL, b.valid_count, "
+        "COUNT(r.record_id) "
+        "FROM tm_origin_batch AS b "
+        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
+        "GROUP BY b.batch_id, b.status, b.valid_count "
+        "ORDER BY b.batch_id"
+    ).fetchall()
+
+
+def _legacy_completed_origin_blocks(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, int, int], ...]:
+    """Prove one pre-v2 store's true completion order from durable facts.
+
+    Every completed v1 batch is one head-revision advance, but the v1
+    schema records no completion revision.  The only durable facts that
+    prove actual append/completion order are the strictly contiguous
+    record-id blocks and per-batch origin-ordinal blocks: record ids are
+    assigned in append order by the single-writer store, so the block
+    order (never batch-id sorting) reconstructs the true revision order.
+
+    Returns ``(batch_id, revision, valid_count)`` ordered by the proven
+    append order.  Any of the following fails closed with
+    ``STORE.REVISION_ANCESTRY_MISMATCH``: a zero-record completed batch
+    (its position is unprovable), a non-contiguous or interleaved record
+    block, a non-contiguous origin-ordinal block, a non-completed batch
+    carrying records, or a block range that leaves gaps.  Deliberately
+    scrambled batch ids never change the proven order.
+    """
+
+    rows = connection.execute(
+        "SELECT b.batch_id, b.status, b.valid_count, "
+        "COUNT(r.record_id), MIN(r.record_id), MAX(r.record_id), "
+        "MIN(r.origin_ordinal), MAX(r.origin_ordinal), "
+        "COUNT(DISTINCT r.origin_ordinal), COUNT(DISTINCT r.record_id) "
+        "FROM tm_origin_batch AS b "
+        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
+        "GROUP BY b.batch_id, b.status, b.valid_count "
+        "ORDER BY b.batch_id"
+    ).fetchall()
+    blocks: list[tuple[str, int, int, int]] = []
+    for row in rows:
+        if len(row) != 10:
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        (
+            batch_id,
+            status,
+            valid_count,
+            record_count,
+            min_record_id,
+            max_record_id,
+            min_ordinal,
+            max_ordinal,
+            distinct_ordinals,
+            distinct_record_ids,
+        ) = row
+        if (
+            type(batch_id) is not str
+            or type(status) is not str
+            or type(valid_count) is not int
+            or type(record_count) is not int
+            or valid_count < 0
+            or record_count < 0
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        if status not in {"staged", "failed", "completed"}:
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        if status != "completed":
+            if record_count != 0 or min_record_id is not None:
+                raise SQLiteStoreSchemaError(
+                    "STORE.REVISION_ANCESTRY_MISMATCH"
+                )
+            continue
+        if (
+            record_count < 1
+            or record_count != valid_count
+            or type(min_record_id) is not int
+            or type(max_record_id) is not int
+            or type(min_ordinal) is not int
+            or type(max_ordinal) is not int
+            or type(distinct_ordinals) is not int
+            or type(distinct_record_ids) is not int
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        if (
+            min_ordinal != 0
+            or max_ordinal != record_count - 1
+            or distinct_ordinals != record_count
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        if (
+            max_record_id - min_record_id + 1 != record_count
+            or distinct_record_ids != record_count
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        blocks.append((batch_id, record_count, min_record_id, max_record_id))
+    blocks.sort(key=lambda item: item[2])
+    cursor = 0
+    result: list[tuple[str, int, int]] = []
+    for batch_id, block_count, min_record_id, max_record_id in blocks:
+        if min_record_id != cursor + 1 or max_record_id != cursor + block_count:
+            raise SQLiteStoreSchemaError(
+                "STORE.REVISION_ANCESTRY_MISMATCH"
+            )
+        cursor = max_record_id
+        result.append((batch_id, len(result) + 1, block_count))
+    return tuple(result)
+
+
+def _legacy_revision_ancestry(
+    connection: sqlite3.Connection,
+    *,
+    head_revision: int,
+    record_count: int,
+) -> tuple[tuple[int, int], ...]:
+    """Derive v1 cumulative record counts from the strict block proof.
+
+    The completion order and the head/count facts must agree exactly:
+    one completed batch per revision up to ``head_revision`` and a total
+    record count that matches the proven block partition.
+    """
+
+    if type(head_revision) is not int or head_revision < 0:
+        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    if type(record_count) is not int or record_count < 0:
+        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    blocks = _legacy_completed_origin_blocks(connection)
+    if (
+        len(blocks) != head_revision
+        or sum(count for _batch_id, _revision, count in blocks)
+        != record_count
+    ):
+        raise SQLiteStoreSchemaError("STORE.REVISION_ANCESTRY_MISMATCH")
+    cumulative = 0
+    result: list[tuple[int, int]] = []
+    for _batch_id, revision, batch_count in blocks:
+        cumulative += batch_count
+        result.append((revision, cumulative))
+    return tuple(result)
 
 
 def _validate_revision_ancestry_rows(
@@ -3893,21 +4541,22 @@ def _canonical_revision_from_transaction(
         target_identity=identity.target_identity,
     )
     meta = _read_meta(connection)
+    schema_version = _meta_int(meta, "schema_version")
     head_revision = _meta_int(meta, "head_revision")
     record_count = _table_count(connection, "tm_record")
-    ancestry_rows = connection.execute(
-        "SELECT b.batch_id, b.status, b.completed_revision, "
-        "b.valid_count, COUNT(r.record_id) "
-        "FROM tm_origin_batch AS b "
-        "LEFT JOIN tm_record AS r ON r.origin_batch_id = b.batch_id "
-        "GROUP BY b.batch_id, b.status, b.completed_revision, b.valid_count "
-        "ORDER BY b.batch_id"
-    ).fetchall()
-    _ = _validate_revision_ancestry_rows(
-        ancestry_rows,
-        head_revision=head_revision,
-        record_count=record_count,
-    )
+    if schema_version == TM_LEGACY_SCHEMA_VERSION:
+        _ = _legacy_revision_ancestry(
+            connection,
+            head_revision=head_revision,
+            record_count=record_count,
+        )
+    else:
+        ancestry_rows = _origin_ancestry_rows(connection)
+        _ = _validate_revision_ancestry_rows(
+            ancestry_rows,
+            head_revision=head_revision,
+            record_count=record_count,
+        )
     return CanonicalRevisionSnapshot(
         resource_id=identity.resource_id,
         canonical_store_id=lease.canonical_store_id,
@@ -4804,9 +5453,17 @@ def initialize_stage_schema(
     stage: MutableStageRef,
     *,
     canonical_store_id: str,
+    _legacy_schema: bool = False,
 ) -> SQLiteSchemaSnapshot:
-    """Create a new unpublished stage; never create the canonical path."""
+    """Create a new unpublished stage; never create the canonical path.
 
+    The private legacy mode creates the pre-v2 schema shape (Task 5.11
+    copy-and-switch): a fresh mutable copy starts as the old schema and is
+    migrated to the current schema in place before it can be sealed.
+    """
+
+    if type(_legacy_schema) is not bool:
+        raise TypeError("_legacy_schema must be a built-in bool")
     validated_stage = _require_stage(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
     path = validated_stage.staged_db_path
@@ -4823,7 +5480,12 @@ def initialize_stage_schema(
             expected_file=reservation,
         ) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for statement in _SCHEMA_STATEMENTS:
+            schema_statements = (
+                _LEGACY_SCHEMA_STATEMENTS
+                if _legacy_schema
+                else _SCHEMA_STATEMENTS
+            )
+            for statement in schema_statements:
                 connection.execute(statement)
             if runtime.fts5_available:
                 connection.execute(_FTS5_STATEMENT)
@@ -4831,9 +5493,12 @@ def initialize_stage_schema(
                 connection,
                 fts5_available=runtime.fts5_available,
             )
-            if schema_digest != _APPROVED_SCHEMA_DIGESTS[
-                runtime.fts5_available
-            ]:
+            approved_digests = (
+                _APPROVED_LEGACY_SCHEMA_DIGESTS
+                if _legacy_schema
+                else _APPROVED_SCHEMA_DIGESTS
+            )
+            if schema_digest != approved_digests[runtime.fts5_available]:
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_ROOT_MISMATCH")
             meta = _initial_meta(
                 stage=validated_stage,
@@ -4841,6 +5506,8 @@ def initialize_stage_schema(
                 runtime=runtime,
                 schema_digest=schema_digest,
             )
+            if _legacy_schema:
+                meta["schema_version"] = str(TM_LEGACY_SCHEMA_VERSION)
             connection.executemany(
                 "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
                 tuple(sorted(meta.items())),
@@ -4849,6 +5516,7 @@ def initialize_stage_schema(
         return inspect_stage_schema(
             validated_stage,
             canonical_store_id=canonical_store_id,
+            _allow_legacy_schema=_legacy_schema,
         )
     except Exception:
         _remove_reserved_stage_file(path, reservation)
@@ -4862,6 +5530,7 @@ def inspect_stage_schema(
     _allow_diverged_runtime: bool = False,
     _allow_sealed: bool = False,
     _allow_active: bool = False,
+    _allow_legacy_schema: bool = False,
     _expected_active_generation: int | None = None,
     _expected_activation_digest: str | None = None,
 ) -> SQLiteSchemaSnapshot:
@@ -4869,9 +5538,15 @@ def inspect_stage_schema(
 
     The private sealed-inspection mode accepts a closed SEALED stage (Gate B
     recomputation) without weakening normal mutable-stage inspection or the
-    future ACTIVE semantics.
+    future ACTIVE semantics.  The private legacy mode accepts the exact
+    pre-v2 schema shape (Task 5.11) so an old-schema canonical can be
+    reopened and upgraded; it never accepts an unknown or too-new version
+    and still enforces identity, meta, runtime, index, foreign-key and
+    digest closure.
     """
 
+    if type(_allow_legacy_schema) is not bool:
+        raise TypeError("_allow_legacy_schema must be a built-in bool")
     validated_stage = _require_inspectable_store_ref(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
     if not validated_stage.staged_db_path.is_file():
@@ -4885,7 +5560,11 @@ def inspect_stage_schema(
         if schema_version > TM_SCHEMA_VERSION:
             raise SQLiteStoreSchemaError("STORE.SCHEMA_TOO_NEW")
         if schema_version != TM_SCHEMA_VERSION:
-            raise SQLiteStoreSchemaError("STORE.SCHEMA_UNSUPPORTED")
+            if (
+                not _allow_legacy_schema
+                or schema_version != TM_LEGACY_SCHEMA_VERSION
+            ):
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_UNSUPPORTED")
         identity = validated_stage.resource_identity
         if (
             meta["resource_id"] != identity.resource_id
@@ -4925,7 +5604,12 @@ def inspect_stage_schema(
             connection,
             fts5_available=fts5_available,
         )
-        approved_schema_digest = _APPROVED_SCHEMA_DIGESTS[fts5_available]
+        approved_schema_digests = (
+            _APPROVED_LEGACY_SCHEMA_DIGESTS
+            if schema_version == TM_LEGACY_SCHEMA_VERSION
+            else _APPROVED_SCHEMA_DIGESTS
+        )
+        approved_schema_digest = approved_schema_digests[fts5_available]
         if (
             meta["schema_digest"] != approved_schema_digest
             or actual_schema_digest != approved_schema_digest
@@ -5473,6 +6157,453 @@ def _meta_bool(meta: dict[str, str], key: str) -> bool:
     return value == "1"
 
 
+def _schema_upgrade_backup_path(
+    store_path: Path,
+    token: str,
+) -> Path:
+    """One collision-resistant recovery backup path for one upgrade.
+
+    The name deliberately avoids the activation recovery glob
+    ``.{name}.localcat-recovery.*.database.bak`` so recovery locators
+    never confuse the two backup families.
+    """
+
+    return (
+        store_path.parent
+        / f".{store_path.name}.localcat-schema-upgrade.{token}.bak"
+    ).absolute()
+
+
+def _fsync_schema_upgrade_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_BACKUP_FAILED",
+            retryable=True,
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _create_schema_upgrade_backup(
+    source_path: Path,
+    backup_path: Path,
+) -> tuple[tuple[int, int], str]:
+    """One consistent recovery backup via ``Connection.backup()``.
+
+    The source is opened strictly read-only while the coordinator holds
+    the resource drained (no leases), and the backup is written through
+    the SQLite backup API into a fresh same-directory exclusively
+    reserved regular file, then fsynced (file and parent).  The returned
+    ``(device, inode)`` identity and SHA-256 digest describe the backup
+    file itself; the backup is a valid reopenable old-schema store whose
+    byte digest is deliberately not required to equal the active DB's
+    byte digest.  Any failure removes the partially created backup and
+    never touches the live canonical.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    created = False
+    try:
+        descriptor = os.open(
+            backup_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | no_follow,
+            0o600,
+        )
+        created = True
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_BACKUP_UNSAFE",
+                retryable=False,
+            )
+        destination = sqlite3.connect(
+            f"{backup_path.as_uri()}?mode=rw",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            destination.enable_load_extension(False)
+            destination.execute("PRAGMA journal_mode=DELETE")
+            destination.execute("PRAGMA synchronous=FULL")
+            source = sqlite3.connect(
+                f"{source_path.as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+            )
+            try:
+                source.backup(destination)
+            finally:
+                source.close()
+        finally:
+            destination.close()
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        _fsync_schema_upgrade_directory(backup_path.parent)
+        final = os.lstat(backup_path)
+        if not stat.S_ISREG(final.st_mode) or final.st_nlink != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_BACKUP_UNSAFE",
+                retryable=False,
+            )
+        backup_digest = _file_sha256_of_path(backup_path)
+        return (final.st_dev, final.st_ino), backup_digest
+    except ActivationPreparationError:
+        _remove_partial_schema_upgrade_backup(backup_path)
+        raise
+    except (OSError, sqlite3.DatabaseError) as error:
+        _remove_partial_schema_upgrade_backup(backup_path)
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_BACKUP_FAILED",
+            retryable=True,
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _remove_partial_schema_upgrade_backup(backup_path: Path) -> None:
+    """Best-effort removal of one exclusively created backup after failure."""
+
+    try:
+        observed = os.lstat(backup_path)
+    except OSError:
+        return
+    if stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1:
+        try:
+            backup_path.unlink()
+        except OSError:
+            pass
+
+
+def _file_sha256_of_path(path: Path) -> str:
+    """One strict no-follow SHA-256 of an existing regular single-link file."""
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = os.open(path, os.O_RDONLY | no_follow)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_BACKUP_UNSAFE",
+                retryable=False,
+            )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _schema_upgrade_db_capture(
+    database_path: Path,
+) -> tuple[tuple[int, int], str]:
+    """Capture the exact prior active DB identity and digest (no-follow)."""
+
+    capture = _capture_activation_file(database_path, asset_kind="DATABASE")
+    return (
+        (capture.identity.device, capture.identity.inode),
+        capture.digest,
+    )
+
+
+def _schema_upgrade_head_revision(database_path: Path) -> int:
+    """Read the active store's head revision strictly read-only."""
+
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        rows = connection.execute(
+            "SELECT value FROM tm_meta WHERE key = 'head_revision'"
+        ).fetchall()
+    except sqlite3.DatabaseError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+            retryable=False,
+        ) from error
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+            retryable=False,
+        )
+    try:
+        value = int(str(rows[0][0]))
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+            retryable=False,
+        ) from error
+    if value < 0:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+            retryable=False,
+        )
+    return value
+
+
+def _read_schema_upgrade_marker(database_path: Path) -> str | None:
+    """Read the durable schema-upgrade origin marker, or None when absent."""
+
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        rows = connection.execute(
+            "SELECT value FROM tm_meta "
+            "WHERE key = 'schema_upgrade_origin'"
+        ).fetchall()
+    except sqlite3.DatabaseError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_CANDIDATE_UNREADABLE",
+            retryable=False,
+        ) from error
+    finally:
+        connection.close()
+    if len(rows) == 0:
+        return None
+    if len(rows) != 1 or type(rows[0][0]) is not str:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_CANDIDATE_INVALID",
+            retryable=False,
+        )
+    return str(rows[0][0])
+
+
+
+def _require_schema_upgrade_ancestry_provable(database_path: Path) -> None:
+    """Prove one pre-v2 store's completion order from the strict block proof.
+
+    Task 5.11 fail-closed preflight: the legacy schema records no
+    ``completed_revision``, so revision order is derived only from the
+    strictly contiguous record-id blocks and per-batch origin ordinals.
+    Any zero-record completed batch, interleaved block, non-contiguous
+    ordinal block, or head/count mismatch raises the specific
+    ``SCHEMA.ANCESTRY_UNPROVABLE`` code and never falls back to batch-id
+    sorting.  The store is opened strictly read-only and never mutated.
+    """
+
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        try:
+            meta_rows = connection.execute(
+                "SELECT key, value FROM tm_meta"
+            ).fetchall()
+            meta = {str(row[0]): str(row[1]) for row in meta_rows}
+            head_revision = int(str(meta["head_revision"]))
+            record_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM tm_record"
+                ).fetchone()[0]
+            )
+            _legacy_revision_ancestry(
+                connection,
+                head_revision=head_revision,
+                record_count=record_count,
+            )
+        except SQLiteStoreSchemaError as error:
+            raise SchemaUpgradeAncestryError(
+                "SCHEMA.ANCESTRY_UNPROVABLE",
+                retryable=False,
+            ) from error
+        except (TypeError, ValueError, KeyError, sqlite3.DatabaseError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+                retryable=False,
+            ) from error
+    finally:
+        connection.close()
+
+
+def _require_no_pending_activation_assets(
+    identity: CanonicalResourceIdentity,
+) -> None:
+    """Fail closed when any durable activation asset is pending.
+
+    Mirrors the preparation prechecks for the Task 5.11 ticket seam: a
+    journal, journal temporary, or incomplete lineage marker means a
+    pending activation authority exists and a new stabilization must not
+    proceed.  A valid regular terminal is the closed record of a finished
+    cancellation or rollback (the prior authority is already closed, so a
+    fresh stabilization may proceed); a malformed or foreign terminal
+    fails closed exactly like the preparation prechecks.
+    """
+
+    journal_path = _activation_journal_path(identity)
+    try:
+        journal_identity = _lstat_activation_journal_identity(journal_path)
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PENDING",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if journal_identity is not None or _lstat_any_entry(
+        _activation_journal_temp_path(journal_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PENDING",
+            retryable=False,
+        )
+    terminal_path = _activation_terminal_path(identity)
+    try:
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PENDING",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    try:
+        marker_identity = _activation_lineage_marker_state_complete(identity)
+    except ActivationPreparationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PENDING",
+            retryable=False,
+            reason_code=error.code,
+        ) from error
+    if marker_identity is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PENDING",
+            retryable=False,
+        )
+
+
+def _require_schema_upgrade_mode_closure(
+    physical_snapshot: Any,
+    *,
+    schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None,
+) -> None:
+    """Bind the durable candidate marker to the activation guard.
+
+    A schema-upgrade candidate (meta carries the durable upgrade-origin
+    marker that its sealed closure covers) may only be activated with the
+    coordinator-minted ticket; an ordinary candidate may never be
+    activated under a ticket.  Either mismatch fails closed before any
+    journal.
+    """
+
+    candidate_path = physical_snapshot.mutable_stage.staged_db_path
+    marker = _read_schema_upgrade_marker(candidate_path)
+    if schema_upgrade_ticket is None:
+        if marker is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_REQUIRED",
+                retryable=False,
+            )
+        return
+    if marker != _SCHEMA_UPGRADE_META_VALUE:
+        raise ActivationPreparationError(
+            "ACTIVATION.UPGRADE_TICKET_INVALID",
+            retryable=False,
+        )
+
+
+def _retire_schema_upgrade_ticket(
+    coordinator: ResourceStoreCoordinator,
+    ticket: _SchemaUpgradeSnapshotTicket,
+) -> None:
+    with coordinator._condition:
+        if coordinator._schema_upgrade_ticket is ticket:
+            coordinator._schema_upgrade_ticket = None
+
+
+def _require_schema_upgrade_ticket_guard(
+    coordinator: ResourceStoreCoordinator,
+    view: _SQLiteGenerationView,
+    ticket: _SchemaUpgradeSnapshotTicket,
+    captures: tuple[_PriorAssetCapture, ...],
+) -> None:
+    """Prove the ticket and the stabilized prior active canonical unchanged.
+
+    Runs after the normal drain and before any journal.  The ticket must
+    be the coordinator's live unused ticket bound to this resource,
+    canonical store id, and generation; the active DB must still carry
+    the exact identity/digest/head revision captured while drained; and
+    the recovery backup must still be intact.  Any stale/foreign state
+    consumes the ticket and fails the stale candidate before journal so
+    the coordinator restores READY and a later fresh snapshot can retry.
+    """
+
+    def fail(code: str, *, retryable: bool) -> NoReturn:
+        _retire_schema_upgrade_ticket(coordinator, ticket)
+        raise ActivationPreparationError(code, retryable=retryable)
+
+    with coordinator._condition:
+        if coordinator._schema_upgrade_ticket is not ticket:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_STALE",
+                retryable=False,
+            )
+        if (
+            ticket._owner_nonce != coordinator._owner_nonce
+            or ticket.resource_id != coordinator._resource_id
+            or ticket.canonical_store_id != coordinator._canonical_store_id
+            or ticket.generation != view.generation
+        ):
+            fail("ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False)
+        database_capture: _PriorAssetCapture | None = None
+        for capture in captures:
+            if capture.asset_kind == "DATABASE":
+                database_capture = capture
+                break
+        if database_capture is None:
+            fail("ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False)
+        if (
+            (
+                database_capture.identity.device,
+                database_capture.identity.inode,
+            )
+            != ticket.db_identity
+            or database_capture.digest != ticket.db_digest
+        ):
+            fail("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=True)
+    live_head = _schema_upgrade_head_revision(view.stage.staged_db_path)
+    if live_head != ticket.head_revision:
+        fail("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=True)
+    try:
+        backup_capture = _capture_activation_file(
+            ticket.backup_path,
+            asset_kind="DATABASE",
+        )
+    except ActivationPreparationError:
+        fail("ACTIVATION.UPGRADE_BACKUP_INVALID", retryable=False)
+    if backup_capture.digest != ticket.backup_digest:
+        fail("ACTIVATION.UPGRADE_BACKUP_INVALID", retryable=False)
+    with coordinator._condition:
+        if coordinator._schema_upgrade_ticket is not ticket:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_STALE",
+                retryable=False,
+            )
+        coordinator._schema_upgrade_ticket = None
+
+
 __all__ = [
     "ActivationBackupEvidence",
     "ActivationPreparationError",
@@ -5493,6 +6624,7 @@ __all__ = [
     "SQLiteTMStore",
     "SourceBindingMonitor",
     "SourceBindingObservation",
+    "TM_LEGACY_SCHEMA_VERSION",
     "TM_SCHEMA_VERSION",
     "detect_sqlite_runtime",
     "initialize_stage_schema",

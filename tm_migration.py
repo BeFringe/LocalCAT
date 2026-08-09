@@ -29,6 +29,9 @@ from tm_contracts import (
     MigrationReport,
     MutableStageRef,
     RecoveryLocator,
+    SchemaUpgradeFailure,
+    SchemaUpgradeOutcome,
+    SchemaUpgradeReport,
     SealedStage,
     SnapshotKind,
     SnapshotManifest,
@@ -39,9 +42,20 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
+    TM_LEGACY_SCHEMA_VERSION,
+    TM_SCHEMA_VERSION,
     ResourceStoreCoordinator,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
+    _APPROVED_SCHEMA_DIGESTS,
+    _FTS5_STATEMENT,
+    _SCHEMA_STATEMENTS,
+    _SCHEMA_UPGRADE_META_KEY,
+    _SCHEMA_UPGRADE_META_VALUE,
+    _SchemaUpgradeSnapshotTicket,
+    _legacy_completed_origin_blocks,
+    _legacy_revision_ancestry,
+    _open_configured_connection,
     initialize_stage_schema,
     inspect_stage_schema,
     unique_character_ngrams,
@@ -233,6 +247,222 @@ class TMMigrationService:
         """
 
         return self._explicit_disambiguation(source, resource_id)
+
+    def upgrade_schema(
+        self,
+        store_path: Path,
+    ) -> SchemaUpgradeOutcome:
+        """Copy-switch one old-schema canonical to the current schema.
+
+        Task 5.11 entry point: the coordinator proves the prior v1
+        ancestry and validates the complete binding/manifest/receipt/
+        source/divergence closure, then mints one single-use snapshot
+        ticket backed by a ``Connection.backup()`` recovery backup of
+        the active old-schema store.  A fresh mutable copy of the live
+        store is migrated in place (proven completion order, records
+        preserved verbatim, candidate indexes rebuilt) and sealed in the
+        private schema-upgrade mode; the existing seal/activate pipeline
+        then publishes the equivalent new generation under the same
+        canonical store id guarded by the ticket.  The old store is never
+        mutated in place; every failure stage leaves it byte-identical
+        and reopenable, divergence/tampering/unprovable order fails
+        closed and is never repaired, and the recovery backup is
+        reported as digest-backed restoration evidence.
+        """
+
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
+        active_store_path = coordinator.active_store_path
+        if (
+            type(store_path) is not _NATIVE_PATH_TYPE
+            or active_store_path is None
+            or store_path != active_store_path
+        ):
+            raise MigrationPreflightError("SCHEMA.ACTIVE_STORE_REQUIRED")
+        store_before = _try_file_digest(store_path)
+        if store_before is None:
+            raise MigrationPreflightError("SCHEMA.ACTIVE_STORE_UNREADABLE")
+        prior_generation = coordinator.current_generation
+        if prior_generation is None:
+            raise MigrationPreflightError("SCHEMA.ACTIVE_RESOURCE_REQUIRED")
+
+        stage_label = "PREFLIGHT"
+        ticket: _SchemaUpgradeSnapshotTicket | None = None
+        backup_path: Path | None = None
+        backup_digest: str | None = None
+        prepared: _ActivationPreparation | None = None
+        sealed: SealedStage | None = None
+        copy_stage: MutableStageRef | None = None
+        stage_identity: _CreatedFileIdentity | None = None
+        manifest_identity: _CreatedFileIdentity | None = None
+        try:
+            if coordinator.canonical_store_id != self._canonical_store_id:
+                raise MigrationPreflightError("SCHEMA.COORDINATOR_MISMATCH")
+            if _schema_version_of_store(store_path) == TM_SCHEMA_VERSION:
+                raise MigrationPreflightError(
+                    "SCHEMA.SCHEMA_ALREADY_CURRENT"
+                )
+            activation_digest = _read_active_activation_digest(store_path)
+            schema = inspect_stage_schema(
+                _upgrade_source_ref(
+                    self._resource_identity,
+                    store_path,
+                ),
+                canonical_store_id=self._canonical_store_id,
+                _allow_legacy_schema=True,
+                _allow_active=True,
+                _expected_active_generation=prior_generation,
+                _expected_activation_digest=activation_digest,
+            )
+            if schema.schema_version != TM_LEGACY_SCHEMA_VERSION:
+                raise MigrationPreflightError("SCHEMA.SCHEMA_UNSUPPORTED")
+            receipt, manifest_kind = _read_legacy_snapshot_facts(
+                store_path,
+                canonical_store_id=self._canonical_store_id,
+            )
+            ticket = coordinator.prepare_schema_upgrade_ticket()
+            backup_path = ticket.backup_path
+            backup_digest = ticket.backup_digest
+            # The ticket seam is the stabilization point.  Build and inspect
+            # the candidate only from that durable recovery snapshot; the
+            # live canonical is used again solely by the post-drain ticket
+            # guard, which rejects any write that happened after capture.
+            activation_digest = _read_active_activation_digest(backup_path)
+            stage_label = "COPY"
+            copy_stage = _deterministic_stage_ref(
+                self._resource_identity,
+                source_digest=receipt.jsonl_digest,
+                stage_prefix="schema-upgrade",
+                path_salt=f"upgrade.{uuid.uuid4().hex}",
+            )
+            stage_identity = _copy_store_into_stage(
+                backup_path,
+                copy_stage.staged_db_path,
+            )
+            inspect_stage_schema(
+                copy_stage,
+                canonical_store_id=self._canonical_store_id,
+                _allow_legacy_schema=True,
+                _allow_active=True,
+                _expected_active_generation=prior_generation,
+                _expected_activation_digest=activation_digest,
+            )
+            with _open_configured_connection(
+                copy_stage.staged_db_path,
+                require_existing=True,
+            ) as connection:
+                _migrate_schema_copy(
+                    connection,
+                    fts5_available=schema.fts5_available,
+                )
+            inspect_stage_schema(
+                copy_stage,
+                canonical_store_id=self._canonical_store_id,
+            )
+            manifest = SnapshotManifest(
+                manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                snapshot_kind=manifest_kind,
+                receipt=receipt,
+                receipt_digest=snapshot_receipt_digest(receipt),
+            )
+            manifest_identity = _write_new_file(
+                copy_stage.manifest_temp_path,
+                contract_to_json(manifest).encode("utf-8"),
+            )
+            stage_label = "ACTIVATION"
+            sealed = StageSealer(
+                registry=coordinator.sealed_registry,
+                canonical_store_id=self._canonical_store_id,
+            ).seal(
+                copy_stage,
+                expected_prior_generation=prior_generation,
+                schema_upgrade=True,
+            )
+            prepared = coordinator.activate(
+                sealed,
+                _schema_upgrade_ticket=ticket,
+            )
+            ticket = None
+            handle = coordinator.publish_prepared_activation(prepared)
+            generation = coordinator.publish_activation(prepared, handle)
+            published_store_path = coordinator.active_store_path
+            if published_store_path is None:
+                raise MigrationPreflightError(
+                    "SCHEMA.SUCCESS_UNVERIFIABLE"
+                )
+            success_digest = _try_file_digest(published_store_path)
+            if success_digest is None:
+                raise MigrationPreflightError(
+                    "SCHEMA.SUCCESS_UNVERIFIABLE"
+                )
+            if backup_path is None or backup_digest is None:
+                raise MigrationPreflightError(
+                    "SCHEMA.BACKUP_UNVERIFIABLE"
+                )
+            return self._schema_upgrade_report(
+                generation=generation,
+                backup_path=backup_path,
+                backup_digest=backup_digest,
+                success_digest=success_digest,
+            )
+        except BaseException as error:
+            if ticket is not None:
+                try:
+                    coordinator.retire_schema_upgrade_ticket(ticket)
+                except Exception as retire_error:
+                    if isinstance(error, Exception):
+                        error = retire_error
+            if (
+                copy_stage is not None
+                and stage_identity is not None
+                and sealed is None
+            ):
+                if manifest_identity is not None:
+                    _remove_created_file(
+                        copy_stage.manifest_temp_path,
+                        manifest_identity,
+                    )
+                _remove_created_file(
+                    copy_stage.staged_db_path,
+                    stage_identity,
+                )
+            if not isinstance(error, Exception):
+                raise
+            if prepared is not None:
+                return self._reconcile_failed_upgrade_activation(
+                    error,
+                    prepared=prepared,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                    backup_digest=backup_digest,
+                )
+            if coordinator.state == "ACTIVATING":
+                # The preparation failed before any durable journal but
+                # its cleanup reservation is still pending: retry the
+                # narrow cleanup (or honestly fail stop on that cleanup).
+                try:
+                    coordinator.retry_failed_activation_cleanup()
+                except Exception as cleanup_error:
+                    return self._schema_upgrade_failure(
+                        cleanup_error,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        store_before=store_before,
+                        store_path=store_path,
+                        backup_path=backup_path,
+                    )
+            return self._schema_upgrade_failure(
+                error,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                store_before=store_before,
+                store_path=store_path,
+                backup_path=backup_path,
+            )
 
     def _explicit_disambiguation(
         self,
@@ -672,6 +902,306 @@ class TMMigrationService:
             diagnostics=diagnostics,
             active_generation=active_generation,
             original_source_preservation=source_evidence,
+            active_store_preservation=store_evidence,
+            recovery_locators=tuple(locators),
+        )
+
+    def _schema_upgrade_report(
+        self,
+        *,
+        generation: int,
+        backup_path: Path,
+        backup_digest: str,
+        success_digest: str,
+    ) -> SchemaUpgradeReport:
+        """Build one completed schema upgrade report from durable facts."""
+
+        return SchemaUpgradeReport(
+            canonical_store_id=self._canonical_store_id,
+            from_version=TM_LEGACY_SCHEMA_VERSION,
+            to_version=TM_SCHEMA_VERSION,
+            backup_path=backup_path,
+            backup_digest=backup_digest,
+            success_digest=success_digest,
+            activated_generation=generation,
+        )
+
+    def _reconcile_failed_upgrade_activation(
+        self,
+        error: Exception,
+        *,
+        prepared: _ActivationPreparation,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        store_before: str,
+        store_path: Path,
+        backup_path: Path | None,
+        backup_digest: str | None,
+    ) -> SchemaUpgradeOutcome:
+        """Auto-restore the prior READY service after one failed upgrade.
+
+        Schema upgrade reuses the activation pipeline, so its failure
+        reconciliation follows Task 5.10 exactly: a failure before any
+        durable journal cancels the live preparation (nothing was
+        replaced), a durable pending journal is rolled back, and a
+        durable ``GENERATION_PUBLISHED`` journal whose candidate active
+        set is provable completes via fresh-coordinator recovery and
+        reports the completed upgrade.  A rollback that cannot be proven
+        fails stop with honest unverified preservation evidence and
+        never claims VERIFIED_UNCHANGED.
+        """
+
+        try:
+            journal_phase = coordinator.durable_activation_phase
+        except Exception as phase_error:
+            return self._schema_upgrade_failure(
+                phase_error,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                store_before=store_before,
+                store_path=store_path,
+                backup_path=backup_path,
+                force_unverified=True,
+            )
+        if journal_phase is None:
+            try:
+                coordinator.cancel_prepared_activation(prepared)
+            except Exception as cancel_error:
+                if _schema_upgrade_error_code(
+                    cancel_error
+                ) != "ACTIVATION.PREPARATION_NOT_ACTIVE":
+                    return self._schema_upgrade_failure(
+                        cancel_error,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        store_before=store_before,
+                        store_path=store_path,
+                        backup_path=backup_path,
+                        force_unverified=True,
+                    )
+            return self._schema_upgrade_failure(
+                error,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                store_before=store_before,
+                store_path=store_path,
+                backup_path=backup_path,
+            )
+        if journal_phase == "GENERATION_PUBLISHED":
+            try:
+                coordinator.rollback_durable_activation()
+            except Exception as rollback_error:
+                if _schema_upgrade_error_code(
+                    rollback_error
+                ) != "ACTIVATION.ROLLBACK_COMPLETED_INVALID":
+                    return self._schema_upgrade_failure(
+                        rollback_error,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        store_before=store_before,
+                        store_path=store_path,
+                        backup_path=backup_path,
+                        force_unverified=True,
+                    )
+            else:
+                return self._schema_upgrade_failure(
+                    error,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                )
+            # The candidate active set is proven and the completed
+            # journal is the cold-recovery authority: a fresh coordinator
+            # bound to the unchanged store id re-proves and completes the
+            # candidate publication (crash-window recovery), then the
+            # high-level operation reports the completed upgrade.
+            recovery_coordinator = ResourceStoreCoordinator(
+                canonical_store_id=coordinator.canonical_store_id,
+                resource_identity=self._resource_identity,
+            )
+            report = recovery_coordinator.recover_durable_activation()
+            if (
+                report is None
+                or getattr(report, "action", None) != "COMPLETED"
+                or report.generation is None
+                or recovery_coordinator.state != "READY"
+                or recovery_coordinator.canonical_store_id
+                != self._canonical_store_id
+                or recovery_coordinator.current_generation
+                != report.generation
+            ):
+                return self._schema_upgrade_failure(
+                    error,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                    force_unverified=True,
+                )
+            if backup_path is None or backup_digest is None:
+                return self._schema_upgrade_failure(
+                    error,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                    force_unverified=True,
+                )
+            new_store_path = recovery_coordinator.active_store_path
+            if new_store_path is None:
+                return self._schema_upgrade_failure(
+                    error,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                    force_unverified=True,
+                )
+            success_digest = _try_file_digest(new_store_path)
+            if success_digest is None:
+                return self._schema_upgrade_failure(
+                    error,
+                    stage_label=stage_label,
+                    coordinator=coordinator,
+                    store_before=store_before,
+                    store_path=store_path,
+                    backup_path=backup_path,
+                    force_unverified=True,
+                )
+            # The recovered publication is durably READY: the same
+            # service instance keeps the preserved canonical store id and
+            # adopts the recovered view, so a subsequent upgrade call
+            # observes the current schema without a caller-side renewal.
+            coordinator.adopt_recovered_authority(recovery_coordinator)
+            return self._schema_upgrade_report(
+                generation=report.generation,
+                backup_path=backup_path,
+                backup_digest=backup_digest,
+                success_digest=success_digest,
+            )
+        try:
+            coordinator.rollback_durable_activation()
+        except Exception as rollback_error:
+            return self._schema_upgrade_failure(
+                rollback_error,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                store_before=store_before,
+                store_path=store_path,
+                backup_path=backup_path,
+                force_unverified=True,
+            )
+        return self._schema_upgrade_failure(
+            error,
+            stage_label=stage_label,
+            coordinator=coordinator,
+            store_before=store_before,
+            store_path=store_path,
+            backup_path=backup_path,
+        )
+
+    def _schema_upgrade_failure(
+        self,
+        error: Exception,
+        *,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        store_before: str,
+        store_path: Path,
+        backup_path: Path | None = None,
+        force_unverified: bool = False,
+    ) -> SchemaUpgradeFailure:
+        """Build one preservation-backed schema upgrade failure.
+
+        ``force_unverified`` marks the active store UNVERIFIED with a
+        recovery locator and non-retryable when the rollback outcome could
+        not be proven: an unprovable rollback never claims
+        VERIFIED_UNCHANGED.
+        """
+
+        error_code = _schema_upgrade_error_code(error)
+        retryable = _schema_upgrade_retryable(error)
+        active_generation = coordinator.current_generation
+        if active_generation is None:
+            active_generation = 0
+        store_observed = _try_file_digest(store_path)
+        locators: list[RecoveryLocator] = []
+        if force_unverified:
+            store_evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            if (
+                backup_path is not None
+                and _try_file_digest(backup_path) == store_before
+            ):
+                locator_path = backup_path
+            else:
+                locator_path = store_path
+            locators.append(
+                RecoveryLocator(
+                    path=locator_path,
+                    asset_kind=AssetKind.ACTIVE_STORE,
+                    expected_digest=store_before,
+                )
+            )
+            retryable = False
+        elif store_observed == store_before:
+            store_evidence = _unchanged_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+        elif store_observed is not None:
+            store_evidence = _changed_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+                store_observed,
+            )
+            if (
+                backup_path is not None
+                and _try_file_digest(backup_path) == store_before
+            ):
+                locator_path = backup_path
+            else:
+                locator_path = store_path
+            locators.append(
+                RecoveryLocator(
+                    path=locator_path,
+                    asset_kind=AssetKind.ACTIVE_STORE,
+                    expected_digest=store_before,
+                )
+            )
+            retryable = False
+        else:
+            store_evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            if (
+                backup_path is not None
+                and _try_file_digest(backup_path) == store_before
+            ):
+                locator_path = backup_path
+            else:
+                locator_path = store_path
+            locators.append(
+                RecoveryLocator(
+                    path=locator_path,
+                    asset_kind=AssetKind.ACTIVE_STORE,
+                    expected_digest=store_before,
+                )
+            )
+            retryable = False
+        return SchemaUpgradeFailure(
+            stage=stage_label,
+            error_code=error_code,
+            retryable=retryable,
+            active_generation=active_generation,
             active_store_preservation=store_evidence,
             recovery_locators=tuple(locators),
         )
@@ -1500,6 +2030,488 @@ def _find_recovery_backup(
         if _try_file_digest(candidate) == expected_digest:
             return candidate
     return None
+
+
+def _schema_upgrade_error_code(error: Exception) -> str:
+    error_code = getattr(error, "error_code", None)
+    if type(error_code) is str and error_code:
+        return error_code
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    return "SCHEMA.FAILED"
+
+
+def _schema_upgrade_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    return retryable if type(retryable) is bool else False
+
+
+def _schema_version_of_store(store_path: Path) -> int:
+    """Read the meta schema version of one existing store read-only."""
+
+    connection = sqlite3.connect(
+        f"{store_path.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        rows = connection.execute(
+            "SELECT value FROM tm_meta WHERE key = 'schema_version'"
+        ).fetchall()
+    except sqlite3.DatabaseError as error:
+        raise MigrationPreflightError(
+            "SCHEMA.SCHEMA_UNREADABLE"
+        ) from error
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        raise MigrationPreflightError("SCHEMA.SCHEMA_UNREADABLE")
+    try:
+        version = int(str(rows[0][0]))
+    except (TypeError, ValueError) as error:
+        raise MigrationPreflightError(
+            "SCHEMA.SCHEMA_UNREADABLE"
+        ) from error
+    return version
+
+
+def _upgrade_source_ref(
+    identity: CanonicalResourceIdentity,
+    store_path: Path,
+) -> MutableStageRef:
+    """One inspection ref over the active old-schema store path.
+
+    The inspection only reads the database, so the structural manifest
+    temporary is a distinct adjacent placeholder (the published manifest
+    path is deliberately never reused as a stage temporary).
+    """
+
+    return MutableStageRef(
+        stage_id="stage.schema-upgrade.source",
+        resource_identity=identity,
+        staged_db_path=store_path,
+        manifest_temp_path=store_path.with_name(
+            f"{store_path.name}.localcat-schema-upgrade.inspect.tmp"
+        ),
+    )
+
+
+def _open_legacy_read_connection(
+    database_path: Path,
+) -> sqlite3.Connection:
+    """One strictly read-only connection that never mutates the source."""
+
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _read_active_activation_digest(store_path: Path) -> str:
+    """Read the ACTIVE old-schema canonical's activation digest.
+
+    The digest expectation is read from the store's own durable meta
+    (never guessed) so the strict ACTIVE inspection binds the exact
+    published generation; any missing or malformed digest fails closed.
+    """
+
+    connection = _open_legacy_read_connection(store_path)
+    try:
+        rows = connection.execute(
+            "SELECT value FROM tm_meta "
+            "WHERE key = 'activation_digest'"
+        ).fetchall()
+    finally:
+        connection.close()
+    if (
+        len(rows) != 1
+        or type(rows[0][0]) is not str
+        or len(rows[0][0]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in rows[0][0]
+        )
+    ):
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    return str(rows[0][0])
+
+
+def _read_legacy_snapshot_facts(
+    store_path: Path,
+    *,
+    canonical_store_id: str,
+) -> tuple[SnapshotReceipt, SnapshotKind]:
+    """Read the one old-schema receipt and binding kind the copy re-publishes.
+
+    The receipt fields and the binding's ``snapshot_kind`` are read
+    exactly as the v1 ledger recorded them; the binding itself is deleted
+    from the candidate and re-published identically by activation, so the
+    manifest temporary must carry the original kind.
+    """
+
+    connection = _open_legacy_read_connection(store_path)
+    try:
+        receipt_rows = connection.execute(
+            "SELECT snapshot_id, resource_id, canonical_store_id, "
+            "exported_revision, jsonl_digest, record_count, format_version "
+            "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+        ).fetchall()
+        binding_rows = connection.execute(
+            "SELECT snapshot_kind FROM tm_snapshot_binding "
+            "WHERE binding_id = 1"
+        ).fetchall()
+    finally:
+        connection.close()
+    if len(receipt_rows) != 1:
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    row = receipt_rows[0]
+    scalar_values = row[:3] + (row[4], row[6])
+    if any(type(value) is not str for value in scalar_values):
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    if type(row[3]) is not int or type(row[5]) is not int:
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    receipt = SnapshotReceipt(
+        snapshot_id=str(row[0]),
+        resource_id=str(row[1]),
+        canonical_store_id=str(row[2]),
+        exported_revision=int(row[3]),
+        jsonl_digest=str(row[4]),
+        record_count=int(row[5]),
+        format_version=str(row[6]),
+    )
+    if receipt.canonical_store_id != canonical_store_id:
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    if len(binding_rows) != 1 or type(binding_rows[0][0]) is not str:
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED")
+    try:
+        manifest_kind = SnapshotKind(str(binding_rows[0][0]))
+    except (TypeError, ValueError) as error:
+        raise MigrationPreflightError("SCHEMA.UPGRADE_UNSUPPORTED") from error
+    return receipt, manifest_kind
+
+
+def _fsync_schema_upgrade_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise MigrationPreflightError(
+            "SCHEMA.COPY_FAILED"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _copy_store_into_stage(
+    source_path: Path,
+    destination_path: Path,
+) -> _CreatedFileIdentity:
+    """One consistent old-schema copy into a fresh exclusively reserved file.
+
+    The source is opened strictly read-only and copied through the SQLite
+    backup API into a same-directory fresh ``O_EXCL`` regular file, then
+    fsynced (file and parent).  The copy is a valid reopenable old-schema
+    store; its byte digest is deliberately not required to equal the live
+    DB's digest (``Connection.backup()`` may normalize page layout).  Any
+    failure removes the partial copy and never touches the live canonical.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    created = False
+    try:
+        descriptor = os.open(
+            destination_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | no_follow,
+            0o600,
+        )
+        created = True
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise MigrationPreflightError("SCHEMA.COPY_UNSAFE")
+        identity = _CreatedFileIdentity(observed.st_dev, observed.st_ino)
+        source = sqlite3.connect(
+            f"{source_path.as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            destination = sqlite3.connect(
+                f"{destination_path.as_uri()}?mode=rw",
+                uri=True,
+                isolation_level=None,
+            )
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+        finally:
+            source.close()
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        _fsync_schema_upgrade_directory(destination_path.parent)
+        final = os.lstat(destination_path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or (final.st_dev, final.st_ino) != (identity.device, identity.inode)
+        ):
+            raise MigrationPreflightError("SCHEMA.COPY_UNSAFE")
+        return identity
+    except MigrationPreflightError:
+        if created:
+            try:
+                destination_path.unlink()
+            except OSError:
+                pass
+        raise
+    except (OSError, sqlite3.DatabaseError) as error:
+        if created:
+            try:
+                destination_path.unlink()
+            except OSError:
+                pass
+        raise MigrationPreflightError("SCHEMA.COPY_FAILED") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _ddl_for(
+    statements: tuple[str, ...],
+    prefix: str,
+) -> str:
+    matches = [
+        statement
+        for statement in statements
+        if statement.lstrip().startswith(prefix)
+    ]
+    if len(matches) != 1:
+        raise ValueError("schema DDL statement set is inconsistent")
+    return matches[0]
+
+
+def _migrate_schema_copy(
+    connection: sqlite3.Connection,
+    *,
+    fts5_available: bool,
+) -> None:
+    """Migrate one copied pre-v2 stage to the current schema in place.
+
+    The rebuild renames the legacy tables aside, recreates the v2 shape,
+    derives each completed batch's ``completed_revision`` strictly from
+    the proven record-block/origin-ordinal order (never batch-id
+    sorting), copies every record verbatim (including provenance,
+    context, usage and lineage), rebuilds ``tm_gram`` and, when
+    available, ``tm_fts`` from ``tm_record.source_fold_v1``, re-issues
+    the single receipt, removes the binding (re-published identically by
+    activation), and advances meta to the current schema version and
+    approved digest with the durable schema-upgrade origin marker.  The
+    whole rebuild is one transaction, so a failed upgrade leaves only
+    the untouched original store and its recovery backup.
+    """
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        try:
+            head_rows = connection.execute(
+                "SELECT value FROM tm_meta WHERE key = 'head_revision'"
+            ).fetchall()
+            if len(head_rows) != 1:
+                raise SQLiteStoreSchemaError(
+                    "STORE.REVISION_ANCESTRY_MISMATCH"
+                )
+            head_revision = int(str(head_rows[0][0]))
+            record_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM tm_record"
+                ).fetchone()[0]
+            )
+            completed_blocks = _legacy_completed_origin_blocks(connection)
+            _ = _legacy_revision_ancestry(
+                connection,
+                head_revision=head_revision,
+                record_count=record_count,
+            )
+        except SQLiteStoreSchemaError as error:
+            raise MigrationPreflightError(
+                "SCHEMA.ANCESTRY_UNPROVABLE"
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise MigrationPreflightError(
+                "SCHEMA.ANCESTRY_UNPROVABLE"
+            ) from error
+        revision_by_batch = {
+            batch_id: revision
+            for batch_id, revision, _count in completed_blocks
+        }
+        for statement in (
+            "DROP INDEX idx_tm_exact",
+            "DROP INDEX idx_tm_context_speaker",
+            "DROP INDEX idx_tm_gram_lookup",
+        ):
+            connection.execute(statement)
+        connection.execute(
+            "ALTER TABLE tm_origin_batch RENAME TO tm_origin_batch_legacy"
+        )
+        connection.execute(
+            "ALTER TABLE tm_record RENAME TO tm_record_legacy"
+        )
+        connection.execute(
+            "ALTER TABLE tm_gram RENAME TO tm_gram_legacy"
+        )
+        for statement in (
+            _ddl_for(
+                _SCHEMA_STATEMENTS,
+                "CREATE TABLE tm_origin_batch (",
+            ),
+            _ddl_for(_SCHEMA_STATEMENTS, "CREATE TABLE tm_record ("),
+            _ddl_for(_SCHEMA_STATEMENTS, "CREATE TABLE tm_gram ("),
+        ):
+            connection.execute(statement)
+        legacy_batch_cursor = connection.execute(
+            "SELECT batch_id, kind, source_digest, source_path, status, "
+            "valid_count, invalid_count, duplicate_source_count, "
+            "created_at FROM tm_origin_batch_legacy ORDER BY batch_id"
+        )
+        for batch in legacy_batch_cursor:
+            batch_id = str(batch[0])
+            connection.execute(
+                "INSERT INTO tm_origin_batch("
+                "batch_id, kind, source_digest, source_path, status, "
+                "valid_count, invalid_count, duplicate_source_count, "
+                "completed_revision, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    str(batch[1]),
+                    batch[2],
+                    batch[3],
+                    str(batch[4]),
+                    int(batch[5]),
+                    int(batch[6]),
+                    int(batch[7]),
+                    revision_by_batch.get(batch_id),
+                    str(batch[8]),
+                ),
+            )
+        connection.execute(
+            "INSERT INTO tm_record("
+            "record_id, source_raw, target_raw, source_fold_v1, "
+            "speaker_raw, context_prev_raw, context_next_raw, "
+            "file_source, provenance_json, legacy_line_no, usage_count, "
+            "last_used, origin_batch_id, origin_ordinal) "
+            "SELECT record_id, source_raw, target_raw, source_fold_v1, "
+            "speaker_raw, context_prev_raw, context_next_raw, "
+            "file_source, provenance_json, legacy_line_no, usage_count, "
+            "last_used, origin_batch_id, origin_ordinal "
+            "FROM tm_record_legacy ORDER BY record_id"
+        )
+        required_sizes = (1, 2) if fts5_available else (1, 2, 3)
+        gram_rows: list[tuple[int, str, int]] = []
+        record_cursor = connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_record "
+            "ORDER BY record_id"
+        )
+        for record_id, folded_source in record_cursor:
+            for gram_size in required_sizes:
+                for gram in unique_character_ngrams(
+                    str(folded_source),
+                    gram_size,
+                ):
+                    gram_rows.append((gram_size, gram, int(record_id)))
+                    if len(gram_rows) >= 5000:
+                        connection.executemany(
+                            "INSERT INTO tm_gram(gram_size, gram, record_id) "
+                            "VALUES (?, ?, ?)",
+                            gram_rows,
+                        )
+                        gram_rows.clear()
+        if gram_rows:
+            connection.executemany(
+                "INSERT INTO tm_gram(gram_size, gram, record_id) "
+                "VALUES (?, ?, ?)",
+                gram_rows,
+            )
+        for table_name in (
+            "tm_gram_legacy",
+            "tm_record_legacy",
+            "tm_origin_batch_legacy",
+        ):
+            connection.execute(f"DROP TABLE {table_name}")
+        for statement in (
+            _ddl_for(
+                _SCHEMA_STATEMENTS,
+                "CREATE INDEX idx_tm_exact",
+            ),
+            _ddl_for(
+                _SCHEMA_STATEMENTS,
+                "CREATE INDEX idx_tm_context_speaker",
+            ),
+            _ddl_for(
+                _SCHEMA_STATEMENTS,
+                "CREATE INDEX idx_tm_gram_lookup",
+            ),
+        ):
+            connection.execute(statement)
+        if fts5_available:
+            connection.execute("DROP TABLE tm_fts")
+            connection.execute(_FTS5_STATEMENT)
+            connection.execute(
+                "INSERT INTO tm_fts(source_fold_v1, record_id) "
+                "SELECT source_fold_v1, record_id FROM tm_record "
+                "ORDER BY record_id"
+            )
+        connection.execute(
+            "UPDATE tm_snapshot_receipt SET status = 'issued'"
+        )
+        connection.execute("DELETE FROM tm_snapshot_binding")
+        connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = 'schema_version'",
+            (str(TM_SCHEMA_VERSION),),
+        )
+        connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = 'schema_digest'",
+            (_APPROVED_SCHEMA_DIGESTS[fts5_available],),
+        )
+        connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = 'activation_status'",
+            ("UNPUBLISHED",),
+        )
+        connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = 'generation'",
+            ("0",),
+        )
+        connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = 'divergence_latched'",
+            ("0",),
+        )
+        connection.execute(
+            "DELETE FROM tm_meta WHERE key = 'activation_digest'"
+        )
+        connection.execute(
+            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
+            (_SCHEMA_UPGRADE_META_KEY, _SCHEMA_UPGRADE_META_VALUE),
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def _reject_json_constant(_value: str) -> None:

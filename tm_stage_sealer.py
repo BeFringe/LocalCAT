@@ -36,6 +36,10 @@ from tm_contracts import (
 from tm_sqlite_store import (
     SQLiteSchemaSnapshot,
     SQLiteStoreSchemaError,
+    _SCHEMA_UPGRADE_META_KEY,
+    _SCHEMA_UPGRADE_META_VALUE,
+    _legacy_completed_origin_blocks,
+    _legacy_revision_ancestry,
     _schema_digest,
     inspect_stage_schema,
     unique_character_ngrams,
@@ -87,6 +91,9 @@ class _StageFacts:
     receipt: SnapshotReceipt
     exact_parity_digest: str
     closure_digest: str
+    schema_upgrade: bool = False
+    receipt_boundary_record_count: int | None = None
+    fts_boundary_record_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -589,11 +596,21 @@ def _validate_stage_facts(
     *,
     canonical_store_id: str,
     allow_sealed: bool = False,
+    schema_upgrade: bool | None = None,
 ) -> _StageFacts:
     """Independently validate every seal-relevant fact from disk once.
 
     The private sealed mode (Gate B) validates the same closure on an already
-    closed SEALED stage; it never weakens mutable-stage inspection.
+    closed SEALED stage; it never weakens mutable-stage inspection.  The
+    private Task 5.11 schema-upgrade mode validates a v2 candidate that
+    carries the durable ``schema_upgrade_origin`` marker: multiple proven
+    origin batches and head revisions, an issued historical receipt, no
+    binding, records with preserved provenance/context/usage, and candidate
+    indexes recomputed from ``tm_record.source_fold_v1``.  The marker and
+    the explicit mode must agree in both directions; when the mode is left
+    as ``None`` it is auto-detected from the durable marker so Gate B's
+    sealed recomputation observes the identical closure; ordinary
+    migration/import sealing rejects marker-bearing stages unchanged.
     """
 
     identity = stage.resource_identity
@@ -610,10 +627,30 @@ def _validate_stage_facts(
         try:
             connection.execute("BEGIN")
             try:
+                marker = _read_upgrade_marker(connection)
+                if marker is not None and marker != _SCHEMA_UPGRADE_META_VALUE:
+                    raise StageSealError(
+                        "SEALER.SCHEMA_UPGRADE_MARKER_INVALID"
+                    )
+                effective_schema_upgrade = marker is not None
+                if (
+                    schema_upgrade is not None
+                    and schema_upgrade != effective_schema_upgrade
+                ):
+                    raise StageSealError(
+                        "SEALER.SCHEMA_UPGRADE_MARKER_INVALID"
+                    )
                 _require_stage_meta_unpublished(
                     connection,
                     allow_sealed=allow_sealed,
+                    schema_upgrade=effective_schema_upgrade,
                 )
+                if effective_schema_upgrade:
+                    return _validate_schema_upgrade_stage_facts(
+                        connection,
+                        schema,
+                        identity,
+                    )
                 _require_schema_facts_consistent(connection, schema)
                 integrity_rows = connection.execute(
                     "PRAGMA integrity_check"
@@ -862,6 +899,7 @@ def _validate_stage_facts(
             receipt=receipt,
             exact_parity_digest=exact_parity_digest,
             closure_digest=closure_digest,
+            schema_upgrade=False,
         )
     except StageSealError:
         raise
@@ -878,10 +916,438 @@ def _validate_stage_facts(
         raise StageSealError("SEALER.STAGE_INVALID") from error
 
 
+def _read_upgrade_marker(connection: sqlite3.Connection) -> str | None:
+    """Read the durable schema-upgrade origin marker inside one snapshot."""
+
+    rows = connection.execute(
+        "SELECT value FROM tm_meta WHERE key = ?",
+        (_SCHEMA_UPGRADE_META_KEY,),
+    ).fetchall()
+    if len(rows) == 0:
+        return None
+    if len(rows) != 1 or type(rows[0][0]) is not str:
+        raise StageSealError("SEALER.SCHEMA_UPGRADE_MARKER_INVALID")
+    return str(rows[0][0])
+
+
+def _legacy_snapshot_id_for_first_batch(
+    batch_id: str,
+    batch_kind: str,
+    jsonl_digest: str,
+) -> str:
+    """Derive the binding receipt id one migration/import-born store must carry.
+
+    The canonical is born by its first completed batch: a ``migration``
+    batch binds ``snapshot.migration.<source digest[:24]>`` and an
+    ``import`` batch binds ``snapshot.import.<token[:24]>`` where the
+    token is the import batch id's 32-hex suffix.  Any other shape fails
+    closed so an externally forged receipt id is never re-published.
+    """
+
+    if batch_kind == "migration":
+        if batch_id != f"migration.{jsonl_digest}":
+            raise StageSealError("SEALER.RECEIPT_INVALID")
+        return f"snapshot.migration.{jsonl_digest[:24]}"
+    if batch_kind == "import":
+        token = batch_id[len("import."):]
+        if (
+            len(token) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in token
+            )
+        ):
+            raise StageSealError("SEALER.RECEIPT_INVALID")
+        return f"snapshot.import.{token[:24]}"
+    raise StageSealError("SEALER.RECEIPT_INVALID")
+
+
+def _validate_schema_upgrade_stage_facts(
+    connection: sqlite3.Connection,
+    schema: SQLiteSchemaSnapshot,
+    identity: CanonicalResourceIdentity,
+) -> _StageFacts:
+    """Validate one marker-bearing v2 schema-upgrade candidate in full.
+
+    The candidate is the migrated copy of a realistic ACTIVE v1 store:
+    every completed origin batch carries the ``completed_revision``
+    derived from the strict record-block proof (never batch-id order),
+    every record is preserved verbatim (provenance, context, usage,
+    last-used, lineage), the single receipt is re-issued exactly as the
+    legacy ledger described it (an issued historical export is allowed,
+    and its JSONL must be a byte-consistent export of the store at that
+    revision), the binding is empty until activation re-publishes the
+    identical binding, and the candidate gram/FTS indexes are rebuilt
+    from ``tm_record.source_fold_v1``.  Divergence, tampering, or any
+    unprovable ordering fails closed.
+    """
+
+    _require_schema_facts_consistent(connection, schema)
+    integrity_rows = connection.execute(
+        "PRAGMA integrity_check"
+    ).fetchall()
+    if integrity_rows != [("ok",)]:
+        raise StageSealError("SEALER.INTEGRITY_FAILED")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise StageSealError("SEALER.FOREIGN_KEY_FAILED")
+    if schema.head_revision < 1:
+        raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+
+    record_count = _int_row(
+        connection.execute("SELECT COUNT(*) FROM tm_record").fetchone()[0],
+        "record count",
+    )
+    try:
+        completed_blocks = _legacy_completed_origin_blocks(connection)
+        cumulative = _legacy_revision_ancestry(
+            connection,
+            head_revision=schema.head_revision,
+            record_count=record_count,
+        )
+    except SQLiteStoreSchemaError as error:
+        raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID") from error
+    if (
+        len(completed_blocks) != schema.head_revision
+        or tuple(revision for _batch_id, revision, _count in completed_blocks)
+        != tuple(range(1, schema.head_revision + 1))
+    ):
+        raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+    revision_by_batch = {
+        batch_id: revision for batch_id, revision, _count in completed_blocks
+    }
+    cumulative_by_revision = dict(cumulative)
+
+    batch_rows = connection.execute(
+        "SELECT batch_id, kind, source_digest, source_path, status, "
+        "valid_count, invalid_count, duplicate_source_count, "
+        "completed_revision FROM tm_origin_batch ORDER BY batch_id"
+    ).fetchall()
+    if not batch_rows:
+        raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+    kind_by_batch: dict[str, str] = {}
+    for batch in batch_rows:
+        batch_id = _text_row(batch[0], "batch_id")
+        batch_kind = _text_row(batch[1], "batch kind")
+        batch_source_digest = _optional_text_row(
+            batch[2],
+            "batch source_digest",
+        )
+        batch_source_path = _optional_text_row(batch[3], "batch source_path")
+        batch_status = _text_row(batch[4], "batch status")
+        batch_valid_count = _int_row(batch[5], "batch valid_count")
+        batch_invalid_count = _int_row(batch[6], "batch invalid_count")
+        batch_duplicate_count = _int_row(
+            batch[7],
+            "batch duplicate_source_count",
+        )
+        batch_completed_revision = batch[8]
+        if batch_kind not in {"migration", "local_write", "import"}:
+            raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+        if (
+            batch_valid_count < 0
+            or batch_invalid_count < 0
+            or batch_duplicate_count < 0
+        ):
+            raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+        if batch_status == "completed":
+            if batch_completed_revision is not None:
+                batch_completed_revision = _int_row(
+                    batch_completed_revision,
+                    "batch completed_revision",
+                )
+            if (
+                revision_by_batch.get(batch_id) != batch_completed_revision
+            ):
+                raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+        else:
+            if batch_status not in {"staged", "failed"}:
+                raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+            if batch_completed_revision is not None:
+                raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+        if batch_kind == "local_write":
+            if batch_source_digest is not None or batch_source_path is not None:
+                raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+        elif (
+            type(batch_source_digest) is not str
+            or len(batch_source_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in batch_source_digest
+            )
+            or type(batch_source_path) is not str
+            or not batch_source_path
+        ):
+            raise StageSealError("SEALER.MIGRATION_BATCH_INVALID")
+        kind_by_batch[batch_id] = batch_kind
+
+    first_batch_id, first_batch_revision, _first_count = completed_blocks[0]
+    if first_batch_revision != 1:
+        raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
+
+    record_cursor = connection.execute(
+        "SELECT record_id, source_raw, target_raw, source_fold_v1, "
+        "speaker_raw, context_prev_raw, context_next_raw, file_source, "
+        "provenance_json, legacy_line_no, usage_count, last_used, "
+        "origin_batch_id, origin_ordinal "
+        "FROM tm_record ORDER BY record_id"
+    )
+    stage_winners: dict[str, str] = {}
+    ordinal = 0
+    for record in record_cursor:
+        record_id = _int_row(record[0], "record_id")
+        if record_id != ordinal + 1:
+            raise StageSealError("SEALER.RECORD_IDENTITY_INVALID")
+        source_raw = _text_row(record[1], "record source_raw")
+        target_raw = _text_row(record[2], "record target_raw")
+        stored_fold = _text_row(record[3], "record source_fold_v1")
+        provenance_json = _text_row(record[8], "record provenance_json")
+        legacy_line_no = record[9]
+        if legacy_line_no is not None:
+            legacy_line_no = _int_row(
+                legacy_line_no,
+                "record legacy_line_no",
+            )
+            if legacy_line_no < 1:
+                raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+        usage_count = _int_row(record[10], "record usage_count")
+        if usage_count < 0:
+            raise StageSealError("SEALER.RECORD_INVALID")
+        last_used = record[11]
+        if last_used is not None and type(last_used) is not str:
+            raise StageSealError("SEALER.RECORD_INVALID")
+        origin_batch_id = _text_row(record[12], "record origin_batch_id")
+        origin_ordinal = _int_row(record[13], "record origin_ordinal")
+        if origin_ordinal < 0:
+            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+        batch_kind = kind_by_batch.get(origin_batch_id)
+        if batch_kind is None:
+            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+        if batch_kind in {"migration", "import"}:
+            if legacy_line_no is None:
+                raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+        elif legacy_line_no is not None:
+            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+        projected = fold_text_v1(source_raw)
+        if (
+            type(projected.folded_text) is not str
+            or projected.folded_text != stored_fold
+        ):
+            raise StageSealError("SEALER.FOLD_MISMATCH")
+        if provenance_json != _EXPECTED_PROVENANCE_JSON:
+            raise StageSealError("SEALER.PROVENANCE_MISMATCH")
+        stage_winners[source_raw] = target_raw
+        ordinal += 1
+    if ordinal != record_count:
+        raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+
+    receipt_rows = connection.execute(
+        "SELECT snapshot_id, resource_id, canonical_store_id, "
+        "exported_revision, jsonl_digest, record_count, format_version, "
+        "destination_jsonl_path, destination_manifest_path, status "
+        "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+    ).fetchall()
+    if len(receipt_rows) != 1:
+        raise StageSealError("SEALER.RECEIPT_LEDGER_INVALID")
+    receipt_row = receipt_rows[0]
+    receipt = _receipt_from_ledger_row(receipt_row)
+    if (
+        receipt.resource_id != identity.resource_id
+        or receipt.canonical_store_id != schema.canonical_store_id
+        or receipt.format_version != SNAPSHOT_FORMAT_VERSION
+        or _text_row(
+            receipt_row[7],
+            "destination_jsonl_path",
+        )
+        != str(identity.configured_jsonl_path)
+        or _text_row(
+            receipt_row[8],
+            "destination_manifest_path",
+        )
+        != str(identity.snapshot_manifest_path)
+        or _text_row(receipt_row[9], "receipt status") != "issued"
+    ):
+        raise StageSealError("SEALER.RECEIPT_INVALID")
+    first_batch_kind = kind_by_batch[first_batch_id]
+    first_batch_source_digest = _optional_text_row(
+        connection.execute(
+            "SELECT source_digest FROM tm_origin_batch WHERE batch_id = ?",
+            (first_batch_id,),
+        ).fetchone()[0],
+        "first batch source_digest",
+    )
+    if (
+        first_batch_kind not in {"migration", "import"}
+        or first_batch_source_digest != receipt.jsonl_digest
+        or receipt.exported_revision not in cumulative_by_revision
+        or receipt.record_count
+        != cumulative_by_revision[receipt.exported_revision]
+    ):
+        raise StageSealError("SEALER.RECEIPT_INVALID")
+    receipt_boundary = cumulative_by_revision[receipt.exported_revision]
+    fts_boundary_record_count = 0
+    if schema.fts5_available:
+        fts_boundary_record_count = _int_row(
+            connection.execute(
+                "SELECT COUNT(*) FROM tm_fts WHERE record_id <= ?",
+                (receipt_boundary,),
+            ).fetchone()[0],
+            "fts boundary record count",
+        )
+
+    scan_digest = hashlib.sha256()
+    jsonl_winners: dict[str, str] = {}
+    valid_count = 0
+    matched_count = 0
+    boundary_cursor = connection.execute(
+        "SELECT record_id, source_raw, target_raw, speaker_raw, "
+        "context_prev_raw, context_next_raw, file_source "
+        "FROM tm_record WHERE record_id <= ? ORDER BY record_id",
+        (receipt_boundary,),
+    )
+    record = boundary_cursor.fetchone()
+    with identity.configured_jsonl_path.open("rb") as stream:
+        for _line_number, raw_line in enumerate(stream, start=1):
+            scan_digest.update(raw_line)
+            try:
+                decoded_line = raw_line.decode("utf-8")
+                payload = json.loads(
+                    decoded_line,
+                    parse_constant=_reject_json_constant,
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ):
+                continue
+            accepted = _accepted_jsonl_row(payload)
+            if accepted is None:
+                continue
+            (
+                source_raw,
+                target_raw,
+                speaker_raw,
+                context_prev_raw,
+                context_next_raw,
+                file_source,
+            ) = accepted
+            jsonl_winners[source_raw] = target_raw
+            valid_count += 1
+            if record is None:
+                raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+            if (
+                _text_row(record[1], "record source_raw") != source_raw
+                or _text_row(record[2], "record target_raw") != target_raw
+                or _optional_text_row(record[3], "record speaker_raw")
+                != speaker_raw
+                or _optional_text_row(record[4], "record context_prev_raw")
+                != context_prev_raw
+                or _optional_text_row(record[5], "record context_next_raw")
+                != context_next_raw
+                or _optional_text_row(record[6], "record file_source")
+                != file_source
+            ):
+                raise StageSealError("SEALER.RECORD_MISMATCH")
+            matched_count += 1
+            record = boundary_cursor.fetchone()
+    if record is not None:
+        raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+    source_digest = scan_digest.hexdigest()
+    if (
+        source_digest != receipt.jsonl_digest
+        or valid_count != receipt.record_count
+        or matched_count != receipt.record_count
+    ):
+        raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
+    restricted_winners: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT source_raw, target_raw FROM tm_record "
+        "WHERE record_id <= ? ORDER BY record_id",
+        (receipt_boundary,),
+    ):
+        restricted_winners[_text_row(row[0], "source_raw")] = _text_row(
+            row[1],
+            "target_raw",
+        )
+    if jsonl_winners != restricted_winners:
+        raise StageSealError("SEALER.EXACT_PARITY_MISMATCH")
+
+    if receipt.snapshot_id != _legacy_snapshot_id_for_first_batch(
+        first_batch_id,
+        first_batch_kind,
+        receipt.jsonl_digest,
+    ):
+        raise StageSealError("SEALER.RECEIPT_INVALID")
+
+    required_sizes = (1, 2) if schema.fts5_available else (1, 2, 3)
+    gram_counts = _validate_gram_index(
+        connection,
+        required_sizes=required_sizes,
+    )
+    fts_count = 0
+    if schema.fts5_available:
+        fts_count = _validate_fts_index(connection)
+    schema_digest_row = connection.execute(
+        "SELECT value FROM tm_meta "
+        "WHERE key = 'schema_digest'"
+    ).fetchone()
+    if (
+        schema_digest_row is None
+        or type(schema_digest_row[0]) is not str
+    ):
+        raise StageSealError("SEALER.STAGE_INVALID")
+    schema_digest = _schema_digest(
+        connection,
+        fts5_available=schema.fts5_available,
+    )
+    if schema_digest != schema_digest_row[0]:
+        raise StageSealError("SEALER.STAGE_INVALID")
+    if connection.execute(
+        "SELECT COUNT(*) FROM tm_snapshot_binding"
+    ).fetchone() != (0,):
+        raise StageSealError("SEALER.BINDING_NOT_UNPUBLISHED")
+    closure_digest = _stage_closure_digest(connection)
+    connection.commit()
+
+    return _StageFacts(
+        resource_id=identity.resource_id,
+        target_identity=identity.target_identity,
+        schema_version=schema.schema_version,
+        schema_digest=schema_digest,
+        fold_version=schema.fold_version,
+        index_version=schema.candidate_index_version,
+        candidate_index_kind=schema.candidate_index_kind,
+        fts5_available=schema.fts5_available,
+        sqlite_runtime_version=schema.sqlite_runtime_version,
+        unicode_runtime_version=schema.unicode_runtime_version,
+        journal_mode=schema.journal_mode,
+        synchronous=schema.synchronous,
+        foreign_keys=schema.foreign_keys,
+        busy_timeout_ms=schema.busy_timeout_ms,
+        wal_enabled=schema.wal_enabled,
+        extension_loading_enabled=schema.extension_loading_enabled,
+        record_count=record_count,
+        origin_batch_count=len(batch_rows),
+        origin_batch_id=first_batch_id,
+        origin_batch_kind=first_batch_kind,
+        fts_count=fts_count,
+        gram_counts=tuple(
+            (size, gram_counts[size]) for size in required_sizes
+        ),
+        receipt=receipt,
+        exact_parity_digest=_winners_parity_digest(stage_winners),
+        closure_digest=closure_digest,
+        schema_upgrade=True,
+        receipt_boundary_record_count=receipt_boundary,
+        fts_boundary_record_count=fts_boundary_record_count,
+    )
+
+
 def _require_stage_meta_unpublished(
     connection: sqlite3.Connection,
     *,
     allow_sealed: bool = False,
+    schema_upgrade: bool = False,
 ) -> None:
     meta_rows = connection.execute(
         "SELECT key, value FROM tm_meta"
@@ -900,7 +1366,7 @@ def _require_stage_meta_unpublished(
         raise StageSealError("SEALER.STAGE_GENERATION_ACTIVE")
     if meta.get("divergence_latched") != "0":
         raise StageSealError("SEALER.STAGE_DIVERGED")
-    if meta.get("head_revision") != "1":
+    if not schema_upgrade and meta.get("head_revision") != "1":
         raise StageSealError("SEALER.REVISION_ANCESTRY_INVALID")
 
 
@@ -1312,6 +1778,8 @@ def _verify_manifest_at_digest(
     path: Path,
     expected: _ArtifactFileIdentity,
     receipt: SnapshotReceipt,
+    *,
+    upgrade_manifest: bool = False,
 ) -> tuple[str, SnapshotManifest]:
     """Read, digest, and close the sealed manifest temporary in one pass."""
 
@@ -1350,11 +1818,19 @@ def _verify_manifest_at_digest(
     if (
         manifest.manifest_version != SNAPSHOT_MANIFEST_VERSION
         or type(manifest.snapshot_kind) is not SnapshotKind
-        or manifest.snapshot_kind is not SnapshotKind.MIGRATION_SOURCE
         or manifest.receipt != receipt
         or manifest.receipt_digest
         != snapshot_receipt_digest(manifest.receipt)
     ):
+        raise StageSealError("SEALER.MANIFEST_MISMATCH")
+    if not upgrade_manifest and manifest.snapshot_kind is not (
+        SnapshotKind.MIGRATION_SOURCE
+    ):
+        raise StageSealError("SEALER.MANIFEST_MISMATCH")
+    if upgrade_manifest and manifest.snapshot_kind not in {
+        SnapshotKind.MIGRATION_SOURCE,
+        SnapshotKind.EXPLICIT_EXPORT,
+    }:
         raise StageSealError("SEALER.MANIFEST_MISMATCH")
     return hashlib.sha256(bytes(payload)).hexdigest(), manifest
 
@@ -1363,6 +1839,8 @@ def _verify_sealed_stage(
     stage: MutableStageRef,
     *,
     record_count: int,
+    origin_batch_count: int,
+    receipt_count: int,
     database_identity: _ArtifactFileIdentity,
 ) -> None:
     """Reopen after fsync and confirm the sealed state closed on disk."""
@@ -1393,7 +1871,11 @@ def _verify_sealed_stage(
                 "(SELECT COUNT(*) FROM tm_origin_batch), "
                 "(SELECT COUNT(*) FROM tm_snapshot_receipt)"
             ).fetchone()
-            if counts != (record_count, 1, 1):
+            if counts != (
+                record_count,
+                origin_batch_count,
+                receipt_count,
+            ):
                 raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
             connection.commit()
         except BaseException:
@@ -1411,7 +1893,7 @@ def _build_binding(
     return SnapshotBinding(
         configured_jsonl_path=identity.configured_jsonl_path,
         manifest_path=identity.snapshot_manifest_path,
-        snapshot_kind=SnapshotKind.MIGRATION_SOURCE,
+        snapshot_kind=manifest.snapshot_kind,
         receipt=receipt,
         manifest=manifest,
         binding_version=SNAPSHOT_BINDING_VERSION,
@@ -1425,6 +1907,17 @@ def _build_evidence(
     stage_file_digest: str,
     manifest_temp_digest: str,
 ) -> StageValidationEvidence:
+    if facts.schema_upgrade:
+        if (
+            facts.receipt_boundary_record_count is None
+            or facts.fts_boundary_record_count is None
+        ):
+            raise StageSealError("SEALER.STAGE_INVALID")
+        record_count = facts.receipt_boundary_record_count
+        fts_count = facts.fts_boundary_record_count
+    else:
+        record_count = facts.record_count
+        fts_count = facts.fts_count
     return StageValidationEvidence(
         evidence_version=STAGE_VALIDATION_EVIDENCE_VERSION,
         resource_id=facts.resource_id,
@@ -1435,9 +1928,9 @@ def _build_evidence(
         schema_version=facts.schema_version,
         fold_version=facts.fold_version,
         index_version=facts.index_version,
-        record_count=facts.record_count,
+        record_count=record_count,
         origin_batch_count=facts.origin_batch_count,
-        fts_count=facts.fts_count,
+        fts_count=fts_count,
         gram_counts=facts.gram_counts,
         exact_parity_digest=facts.exact_parity_digest,
         integrity_ok=True,
@@ -1615,6 +2108,7 @@ def _recompute_sealed_facts(
         stage.manifest_temp_path,
         manifest_identity,
         facts.receipt,
+        upgrade_manifest=facts.schema_upgrade,
     )
     binding = _build_binding(
         stage.resource_identity,
@@ -2210,6 +2704,7 @@ class StageSealer:
         mutable_stage: MutableStageRef,
         *,
         expected_prior_generation: int | None = None,
+        schema_upgrade: bool = False,
     ) -> SealedStage:
         """Seal one complete migration stage into one opaque artifact.
 
@@ -2222,8 +2717,14 @@ class StageSealer:
         and releases the reservation, so the same completed stage
         deterministically retries without rebuilding or duplicating records.
         A path swap during the seal denies and never mints an entry.
+
+        The private Task 5.11 ``schema_upgrade`` mode seals a marker-bearing
+        v2 candidate through the upgrade fact validation; the marker and
+        the explicit mode must agree.
         """
 
+        if type(schema_upgrade) is not bool:
+            raise StageSealError("SEALER.TYPE_INVALID")
         if expected_prior_generation is not None:
             if (
                 type(expected_prior_generation) is not int
@@ -2246,6 +2747,7 @@ class StageSealer:
         facts = _validate_stage_facts(
             stage,
             canonical_store_id=self._canonical_store_id,
+            schema_upgrade=schema_upgrade,
         )
         _fsync_stage_assets(stage, database_identity, manifest_identity)
         lifecycle = self._lifecycle_registry()
@@ -2272,10 +2774,13 @@ class StageSealer:
                 stage.manifest_temp_path,
                 manifest_identity,
                 facts.receipt,
+                upgrade_manifest=facts.schema_upgrade,
             )
             _verify_sealed_stage(
                 stage,
                 record_count=facts.record_count,
+                origin_batch_count=facts.origin_batch_count,
+                receipt_count=1,
                 database_identity=database_identity,
             )
             binding = _build_binding(

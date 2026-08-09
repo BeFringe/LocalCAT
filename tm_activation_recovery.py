@@ -87,6 +87,11 @@ from tm_activation_journal import (
     _rollback_terminal_prior_closes,
     _write_recovery_backup,
 )
+
+_SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
+_SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
+
+
 class _StoreValidationPort(Protocol):
     """Narrow store-side surface consumed by the recovery functions."""
 
@@ -845,9 +850,15 @@ def _validate_replaced_activation_database(
         or facts.schema_version != evidence.schema_version
         or facts.fold_version != evidence.fold_version
         or facts.index_version != evidence.index_version
-        or facts.record_count != evidence.record_count
+        or (
+            facts.record_count != evidence.record_count
+            and not facts.schema_upgrade
+        )
         or facts.origin_batch_count != evidence.origin_batch_count
-        or facts.fts_count != evidence.fts_count
+        or (
+            facts.fts_count != evidence.fts_count
+            and not facts.schema_upgrade
+        )
         or facts.gram_counts != evidence.gram_counts
         or facts.exact_parity_digest != evidence.exact_parity_digest
         or snapshot.activation_status != "SEALED"
@@ -1094,10 +1105,37 @@ def _publish_activation_manifest(
 
 def _activation_exact_parity_digest(
     port: _StoreValidationPort,connection: sqlite3.Connection) -> str:
+    return _activation_winners_parity_digest(port, connection)
+
+
+def _activation_winners_parity_digest(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    *,
+    boundary: int | None = None,
+) -> str:
+    """Last-valid-wins exact winners digest over one record set.
+
+    Without a boundary the full store is covered; with a boundary the
+    digest covers records up to ``boundary`` so a schema-upgrade
+    canonical whose binding receipt describes a historical export
+    (``VERIFIED_HISTORY``) can be re-proven against its configured
+    JSONL snapshot without comparing the full store.
+    """
+
+    if boundary is None:
+        rows = connection.execute(
+            "SELECT source_raw, target_raw FROM tm_record "
+            "ORDER BY record_id"
+        )
+    else:
+        rows = connection.execute(
+            "SELECT source_raw, target_raw FROM tm_record "
+            "WHERE record_id <= ? ORDER BY record_id",
+            (boundary,),
+        )
     winners: dict[str, str] = {}
-    for source_raw, target_raw in connection.execute(
-        "SELECT source_raw, target_raw FROM tm_record ORDER BY record_id"
-    ):
+    for source_raw, target_raw in rows:
         if type(source_raw) is not str or type(target_raw) is not str:
             raise port.store_schema_error("STORE.RECORD_INVALID")
         winners[source_raw] = target_raw
@@ -1110,6 +1148,59 @@ def _activation_exact_parity_digest(
             digest.update(encoded)
             digest.update(b";")
     return digest.hexdigest()
+
+
+def _activation_boundary_parity_digest(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+    boundary: int,
+) -> str:
+    """Winners parity digest over the records at one exported revision."""
+
+    return _activation_winners_parity_digest(
+        port,
+        connection,
+        boundary=boundary,
+    )
+
+
+def _schema_upgrade_marker(
+    port: _StoreValidationPort,
+    connection: sqlite3.Connection,
+) -> str | None:
+    """The durable schema-upgrade origin marker, or None when absent.
+
+    A marker-bearing canonical was published by the Task 5.11 schema
+    upgrade: its binding receipt legitimately describes a historical
+    export whose record count and JSONL parity are a subset of the
+    current store, so the record-count and JSONL-parity closures below
+    compare against the exported-revision boundary instead of the full
+    store.  Any malformed or foreign marker fails closed.
+    """
+
+    marker = port.read_meta(connection).get(_SCHEMA_UPGRADE_META_KEY)
+    if marker is None:
+        return None
+    if marker != _SCHEMA_UPGRADE_META_VALUE:
+        raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+    return marker
+
+
+def _receipt_boundary_record_count(
+    port: _StoreValidationPort,
+    facts: Any,
+    receipt: SnapshotReceipt,
+) -> int:
+    """The proven record count at one receipt's exported revision."""
+
+    record_count_at_revision = {0: 0}
+    record_count_at_revision.update(
+        dict(getattr(facts, "cumulative_record_counts", ()))
+    )
+    boundary = record_count_at_revision.get(receipt.exported_revision)
+    if type(boundary) is not int or boundary < 0:
+        raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+    return boundary
 
 
 def _validate_activation_indexes(
@@ -1152,6 +1243,7 @@ def _validate_activation_indexes(
             actual_counts[size] += 1
     if current_gram is not None or actual_counts != expected_counts:
         raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+    schema_upgrade = _schema_upgrade_marker(port, connection)
     if fts5_available:
         record_cursor = connection.execute(
             "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
@@ -1174,7 +1266,13 @@ def _validate_activation_indexes(
                     "STORE.CANDIDATE_INDEX_INVALID"
                 )
             fts_count += 1
-        if fts_count != evidence.fts_count:
+        if schema_upgrade is not None:
+            if connection.execute(
+                "SELECT COUNT(*) FROM tm_fts WHERE record_id <= ?",
+                (evidence.source_binding.receipt.record_count,),
+            ).fetchone() != (evidence.fts_count,):
+                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+        elif fts_count != evidence.fts_count:
             raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
     elif evidence.fts_count != 0:
         raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
@@ -1236,9 +1334,13 @@ def _validate_published_activation_set(
                 if connection.execute("PRAGMA foreign_key_check").fetchall():
                     raise port.store_schema_error("STORE.FOREIGN_KEY_CHECK_FAILED")
                 evidence = preparation._sealed_stage.evidence
+                schema_upgrade = _schema_upgrade_marker(port, connection)
                 if (
-                    port.table_count(connection, "tm_record")
-                    != evidence.record_count
+                    (
+                        schema_upgrade is None
+                        and port.table_count(connection, "tm_record")
+                        != evidence.record_count
+                    )
                     or port.table_count(connection, "tm_origin_batch")
                     != evidence.origin_batch_count
                     or _activation_exact_parity_digest(port, connection)
@@ -2225,17 +2327,36 @@ def _revalidate_recovered_active_set(
                     raise port.store_schema_error(
                         "STORE.ACTIVE_BINDING_INVALID"
                     )
-                if port.table_count(connection, "tm_record") != (
-                    binding.receipt.record_count
+                schema_upgrade = _schema_upgrade_marker(port, connection)
+                if (
+                    schema_upgrade is None
+                    and port.table_count(connection, "tm_record")
+                    != binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
                 jsonl_parity = _recovery_jsonl_winners_digest(port,
                     identity.configured_jsonl_path
                 )
-                if (
-                    _activation_exact_parity_digest(port, connection)
-                    != jsonl_parity
-                ):
+                if schema_upgrade is not None:
+                    boundary = _receipt_boundary_record_count(
+                        port,
+                        facts,
+                        binding.receipt,
+                    )
+                    parity_matches = (
+                        _activation_boundary_parity_digest(
+                            port,
+                            connection,
+                            boundary,
+                        )
+                        == jsonl_parity
+                    )
+                else:
+                    parity_matches = (
+                        _activation_exact_parity_digest(port, connection)
+                        == jsonl_parity
+                    )
+                if not parity_matches:
                     raise port.store_schema_error(
                         "STORE.ACTIVE_COUNT_MISMATCH"
                     )
@@ -2398,13 +2519,36 @@ def _revalidate_discovered_active_set(
                     or receipt_row != binding.receipt
                 ):
                     raise port.store_schema_error("STORE.RECEIPT_INVALID")
-                if port.table_count(connection, "tm_record") != (
-                    binding.receipt.record_count
+                schema_upgrade = _schema_upgrade_marker(port, connection)
+                if (
+                    schema_upgrade is None
+                    and port.table_count(connection, "tm_record")
+                    != binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
-                if _recovery_jsonl_winners_digest(port,
+                jsonl_parity = _recovery_jsonl_winners_digest(port,
                     identity.configured_jsonl_path
-                ) != _activation_exact_parity_digest(port, connection):
+                )
+                if schema_upgrade is not None:
+                    boundary = _receipt_boundary_record_count(
+                        port,
+                        facts,
+                        binding.receipt,
+                    )
+                    parity_matches = (
+                        _activation_boundary_parity_digest(
+                            port,
+                            connection,
+                            boundary,
+                        )
+                        == jsonl_parity
+                    )
+                else:
+                    parity_matches = (
+                        _activation_exact_parity_digest(port, connection)
+                        == jsonl_parity
+                    )
+                if not parity_matches:
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
                 _recover_activation_indexes(port,
                     connection,
