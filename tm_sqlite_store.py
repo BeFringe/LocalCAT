@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -1617,9 +1618,6 @@ class SQLiteTMStore:
         validated_candidate_plan: _ValidatedCandidateWritePlan,
     ) -> tuple[TMRecord, ...]:
         validate_store_identity = _validate_store_identity
-        apply_candidate_write_plan = _apply_candidate_write_plan
-        inserted: list[TMRecord] = []
-        record_ids_by_ordinal: dict[int, int] = {}
         with _open_leased_connection(lease) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -1653,70 +1651,11 @@ class SQLiteTMStore:
                         timestamp,
                     ),
                 )
-                for draft in prepared_drafts:
-                    (
-                        source_raw,
-                        target_raw,
-                        source_fold_v1,
-                        speaker_raw,
-                        context_prev_raw,
-                        context_next_raw,
-                        file_source,
-                        provenance,
-                        provenance_json,
-                        legacy_line_no,
-                        origin_ordinal,
-                    ) = draft
-                    cursor = connection.execute(
-                        "INSERT INTO tm_record("
-                        "source_raw, target_raw, source_fold_v1, "
-                        "speaker_raw, context_prev_raw, context_next_raw, "
-                        "file_source, provenance_json, legacy_line_no, "
-                        "origin_batch_id, origin_ordinal) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            source_raw,
-                            target_raw,
-                            source_fold_v1,
-                            speaker_raw,
-                            context_prev_raw,
-                            context_next_raw,
-                            file_source,
-                            provenance_json,
-                            legacy_line_no,
-                            prepared_batch_id,
-                            origin_ordinal,
-                        ),
-                    )
-                    record_id = cursor.lastrowid
-                    if record_id is None:
-                        raise SQLiteStoreSchemaError(
-                            "STORE.RECORD_ID_MISSING"
-                        )
-                    record_ids_by_ordinal[origin_ordinal] = record_id
-                    inserted.append(
-                        TMRecord(
-                            record_id=record_id,
-                            source_raw=source_raw,
-                            target_raw=target_raw,
-                            speaker_raw=speaker_raw,
-                            context_prev_raw=context_prev_raw,
-                            context_next_raw=context_next_raw,
-                            file_source=file_source,
-                            provenance=provenance,
-                            legacy_line_no=legacy_line_no,
-                            origin_batch_id=prepared_batch_id,
-                            origin_ordinal=origin_ordinal,
-                        )
-                    )
-                apply_candidate_write_plan(
+                inserted = _insert_prepared_records_and_indexes(
                     connection,
+                    prepared_drafts,
                     validated_candidate_plan,
-                    record_ids_by_ordinal=record_ids_by_ordinal,
-                    folded_sources_by_ordinal={
-                        draft[10]: draft[2]
-                        for draft in prepared_drafts
-                    },
+                    batch_id=prepared_batch_id,
                 )
                 completed_batch = connection.execute(
                     "UPDATE tm_origin_batch "
@@ -1741,7 +1680,119 @@ class SQLiteTMStore:
             except Exception:
                 connection.rollback()
                 raise
-        return tuple(inserted)
+        return inserted
+
+    def append_streamed_batch(
+        self,
+        *,
+        batch_id: str,
+        kind: str,
+        drafts: Iterator[tuple[TMRecordDraft, int | None]],
+        source_digest: str,
+        source_path: Path,
+        invalid_count: int,
+        duplicate_source_count: int,
+        chunk_size: int,
+    ) -> None:
+        """Append one ordered origin batch from a bounded draft stream.
+
+        The stream is consumed in fixed-size chunks. Each chunk is committed
+        in its own transaction; the batch row starts as ``staged`` and is
+        completed with the final counts in the last chunk's transaction. Any
+        failure raises without a completed revision, so the caller must
+        discard the stage (the migration build deletes both stage files).
+        """
+
+        _validate_batch_scalars(
+            batch_id=batch_id,
+            kind=kind,
+            source_digest=source_digest,
+            source_path=source_path,
+            invalid_count=invalid_count,
+            duplicate_source_count=duplicate_source_count,
+            created_at=None,
+            extension=None,
+        )
+        if kind == "local_write":
+            raise ValueError("streamed batches cannot be local_write")
+        if not isinstance(drafts, Iterator):
+            raise TypeError("drafts must be an iterator")
+        if type(chunk_size) is not int:
+            raise TypeError("chunk_size must be a built-in integer")
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
+        timestamp = datetime.now(UTC).isoformat()
+
+        with self._coordinator._operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                chunk_index = 0
+                completed_revision = 0
+                prior_head_revision = 0
+                while True:
+                    chunk = _next_draft_chunk(drafts, chunk_size)
+                    is_last = len(chunk) < chunk_size
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        if chunk_index == 0:
+                            _validate_store_identity(
+                                connection,
+                                resource_id=(
+                                    lease.stage.resource_identity.resource_id
+                                ),
+                                canonical_store_id=lease.canonical_store_id,
+                                target_identity=(
+                                    lease.stage.resource_identity.target_identity
+                                ),
+                            )
+                            prior_head_revision = _meta_int(
+                                _read_meta(connection),
+                                "head_revision",
+                            )
+                            completed_revision = prior_head_revision + 1
+                            connection.execute(
+                                "INSERT INTO tm_origin_batch("
+                                "batch_id, kind, source_digest, source_path, "
+                                "status, valid_count, invalid_count, "
+                                "duplicate_source_count, completed_revision, "
+                                "created_at) "
+                                "VALUES (?, ?, ?, ?, 'staged', 0, 0, 0, "
+                                "NULL, ?)",
+                                (
+                                    batch_id,
+                                    kind,
+                                    source_digest,
+                                    Path.__str__(source_path),
+                                    timestamp,
+                                ),
+                            )
+                        if chunk:
+                            _insert_streamed_chunk(
+                                connection,
+                                chunk,
+                                batch_id=batch_id,
+                                fts5_available=lease.fts5_available,
+                                ordinal_offset=(
+                                    chunk_index * chunk_size
+                                ),
+                            )
+                        if is_last:
+                            _complete_streamed_batch(
+                                connection,
+                                batch_id=batch_id,
+                                completed_revision=completed_revision,
+                                prior_head_revision=prior_head_revision,
+                                invalid_count=invalid_count,
+                                duplicate_source_count=(
+                                    duplicate_source_count
+                                ),
+                            )
+                    except Exception:
+                        connection.rollback()
+                        raise
+                    connection.commit()
+                    chunk_index += 1
+                    if is_last:
+                        return
 
     def records_by_id(
         self,
@@ -2398,6 +2449,7 @@ def _prepare_candidate_write_plan(
     *,
     batch_size: int,
     fts5_available: bool,
+    ordinal_base: int = 0,
 ) -> _ValidatedCandidateWritePlan:
     default_plan = _validate_and_copy_candidate_plan(
         build_candidate_write_plan(
@@ -2405,12 +2457,14 @@ def _prepare_candidate_write_plan(
             fts5_available=fts5_available,
         ),
         batch_size=batch_size,
+        ordinal_base=ordinal_base,
     )
     if extension is None:
         return default_plan
     additional_plan = _validate_and_copy_candidate_plan(
         extension(candidate_records),
         batch_size=batch_size,
+        ordinal_base=ordinal_base,
     )
     default_grams, default_fts = default_plan
     additional_grams, additional_fts = additional_plan
@@ -2423,10 +2477,15 @@ def _prepare_candidate_write_plan(
 def _prepare_record_drafts(
     drafts: tuple[TMRecordDraft, ...],
     legacy_line_nos: tuple[int | None, ...],
+    *,
+    ordinal_offset: int = 0,
 ) -> tuple[_PreparedRecordDraft, ...]:
+    if type(ordinal_offset) is not int or ordinal_offset < 0:
+        raise ValueError("ordinal_offset must be a non-negative integer")
     prepared: list[_PreparedRecordDraft] = []
     for ordinal, (draft, legacy_line_no) in enumerate(
-        zip(drafts, legacy_line_nos, strict=True)
+        zip(drafts, legacy_line_nos, strict=True),
+        start=ordinal_offset,
     ):
         source_raw = draft.source_raw
         provenance = draft.provenance
@@ -2456,11 +2515,14 @@ def _validate_and_copy_candidate_plan(
     plan: object,
     *,
     batch_size: int,
+    ordinal_base: int = 0,
 ) -> _ValidatedCandidateWritePlan:
     if type(plan) is not SQLiteCandidateWritePlan:
         raise TypeError("extension must return SQLiteCandidateWritePlan")
     if type(plan.gram_rows) is not tuple:
         raise TypeError("gram_rows must be a built-in tuple")
+    if type(ordinal_base) is not int or ordinal_base < 0:
+        raise ValueError("ordinal_base must be a non-negative integer")
     gram_rows: list[tuple[int, int, str]] = []
     gram_keys: set[tuple[int, int, str]] = set()
     for row in plan.gram_rows:
@@ -2469,7 +2531,12 @@ def _validate_and_copy_candidate_plan(
         origin_ordinal = row.origin_ordinal
         gram_size = row.gram_size
         gram = row.gram
-        if type(origin_ordinal) is not int or not 0 <= origin_ordinal < batch_size:
+        if (
+            type(origin_ordinal) is not int
+            or not ordinal_base
+            <= origin_ordinal
+            < ordinal_base + batch_size
+        ):
             raise ValueError(
                 "candidate rows must reference a current batch ordinal"
             )
@@ -2487,7 +2554,12 @@ def _validate_and_copy_candidate_plan(
     fts_origin_ordinals: list[int] = []
     seen_fts_ordinals: set[int] = set()
     for origin_ordinal in plan.fts_origin_ordinals:
-        if type(origin_ordinal) is not int or not 0 <= origin_ordinal < batch_size:
+        if (
+            type(origin_ordinal) is not int
+            or not ordinal_base
+            <= origin_ordinal
+            < ordinal_base + batch_size
+        ):
             raise ValueError(
                 "FTS rows must reference a current batch ordinal"
             )
@@ -2505,12 +2577,15 @@ def _apply_candidate_write_plan(
     record_ids_by_ordinal: dict[int, int],
     folded_sources_by_ordinal: dict[int, str],
 ) -> None:
+    """Validate the complete bounded plan, then bulk-insert it atomically."""
+
     if type(plan) is not tuple or len(plan) != 2:
         raise TypeError("validated candidate plan is invalid")
     gram_rows, fts_origin_ordinals = plan
     if type(gram_rows) is not tuple or type(fts_origin_ordinals) is not tuple:
         raise TypeError("validated candidate plan is invalid")
     seen_grams: set[tuple[int, int, str]] = set()
+    validated_gram_rows: list[tuple[int, str, int]] = []
     for row in gram_rows:
         if type(row) is not tuple or len(row) != 3:
             raise TypeError("validated gram row is invalid")
@@ -2526,12 +2601,15 @@ def _apply_candidate_write_plan(
         ):
             raise ValueError("validated gram row is invalid")
         seen_grams.add(row)
-        connection.execute(
-            "INSERT INTO tm_gram(gram_size, gram, record_id) "
-            "VALUES (?, ?, ?)",
-            (gram_size, gram, record_ids_by_ordinal[origin_ordinal]),
+        validated_gram_rows.append(
+            (gram_size, gram, record_ids_by_ordinal[origin_ordinal])
         )
+    connection.executemany(
+        "INSERT INTO tm_gram(gram_size, gram, record_id) VALUES (?, ?, ?)",
+        validated_gram_rows,
+    )
     seen_fts_ordinals: set[int] = set()
+    validated_fts_rows: list[tuple[str, int]] = []
     for origin_ordinal in fts_origin_ordinals:
         if (
             type(origin_ordinal) is not int
@@ -2541,16 +2619,291 @@ def _apply_candidate_write_plan(
         ):
             raise ValueError("validated FTS row is invalid")
         seen_fts_ordinals.add(origin_ordinal)
+        validated_fts_rows.append(
+            (
+                folded_sources_by_ordinal[origin_ordinal],
+                record_ids_by_ordinal[origin_ordinal],
+            )
+        )
+    if validated_fts_rows:
         try:
-            connection.execute(
+            connection.executemany(
                 "INSERT INTO tm_fts(source_fold_v1, record_id) VALUES (?, ?)",
-                (
-                    folded_sources_by_ordinal[origin_ordinal],
-                    record_ids_by_ordinal[origin_ordinal],
-                ),
+                validated_fts_rows,
             )
         except sqlite3.OperationalError as error:
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+
+
+def _next_draft_chunk(
+    drafts: Iterator[tuple[TMRecordDraft, int | None]],
+    chunk_size: int,
+) -> tuple[tuple[TMRecordDraft, int | None], ...]:
+    """Pull one bounded chunk from the draft stream with exact shape checks."""
+
+    chunk = tuple(itertools.islice(drafts, chunk_size))
+    for pair in chunk:
+        if type(pair) is not tuple or len(pair) != 2:
+            raise TypeError("draft stream entries must be (draft, line) pairs")
+        draft, line_number = pair
+        if type(draft) is not TMRecordDraft:
+            raise TypeError(
+                "draft stream must contain exact TMRecordDraft values"
+            )
+        if line_number is not None and type(line_number) is not int:
+            raise TypeError("draft stream line numbers must be int or None")
+    return chunk
+
+
+def _insert_prepared_records_and_indexes(
+    connection: sqlite3.Connection,
+    prepared_drafts: tuple[_PreparedRecordDraft, ...],
+    validated_candidate_plan: _ValidatedCandidateWritePlan,
+    *,
+    batch_id: str,
+) -> tuple[TMRecord, ...]:
+    """Insert one bounded prepared batch with its candidate indexes."""
+
+    inserted: list[TMRecord] = []
+    record_ids_by_ordinal: dict[int, int] = {}
+    for draft in prepared_drafts:
+        (
+            source_raw,
+            target_raw,
+            source_fold_v1,
+            speaker_raw,
+            context_prev_raw,
+            context_next_raw,
+            file_source,
+            provenance,
+            provenance_json,
+            legacy_line_no,
+            origin_ordinal,
+        ) = draft
+        cursor = connection.execute(
+            "INSERT INTO tm_record("
+            "source_raw, target_raw, source_fold_v1, "
+            "speaker_raw, context_prev_raw, context_next_raw, "
+            "file_source, provenance_json, legacy_line_no, "
+            "origin_batch_id, origin_ordinal) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                source_raw,
+                target_raw,
+                source_fold_v1,
+                speaker_raw,
+                context_prev_raw,
+                context_next_raw,
+                file_source,
+                provenance_json,
+                legacy_line_no,
+                batch_id,
+                origin_ordinal,
+            ),
+        )
+        record_id = cursor.lastrowid
+        if record_id is None:
+            raise SQLiteStoreSchemaError("STORE.RECORD_ID_MISSING")
+        record_ids_by_ordinal[origin_ordinal] = record_id
+        inserted.append(
+            TMRecord(
+                record_id=record_id,
+                source_raw=source_raw,
+                target_raw=target_raw,
+                speaker_raw=speaker_raw,
+                context_prev_raw=context_prev_raw,
+                context_next_raw=context_next_raw,
+                file_source=file_source,
+                provenance=provenance,
+                legacy_line_no=legacy_line_no,
+                origin_batch_id=batch_id,
+                origin_ordinal=origin_ordinal,
+            )
+        )
+    _apply_candidate_write_plan(
+        connection,
+        validated_candidate_plan,
+        record_ids_by_ordinal=record_ids_by_ordinal,
+        folded_sources_by_ordinal={
+            draft[10]: draft[2]
+            for draft in prepared_drafts
+        },
+    )
+    return tuple(inserted)
+
+
+def _insert_streamed_chunk(
+    connection: sqlite3.Connection,
+    chunk: tuple[tuple[TMRecordDraft, int | None], ...],
+    *,
+    batch_id: str,
+    fts5_available: bool,
+    ordinal_offset: int,
+) -> None:
+    """Validate and insert one bounded streamed chunk in its transaction.
+
+    Candidate rows are constructed directly in primary-key order (bounded by
+    the chunk) instead of materializing a whole-generation write plan, so
+    memory stays flat while the bulk insert stays btree-friendly.
+    """
+
+    draft_values = tuple(pair[0] for pair in chunk)
+    line_numbers = tuple(pair[1] for pair in chunk)
+    for draft in draft_values:
+        _validate_draft_exact(draft)
+    for line_number in line_numbers:
+        _validate_legacy_line_number(line_number)
+    prepared_drafts = _prepare_record_drafts(
+        draft_values,
+        line_numbers,
+        ordinal_offset=ordinal_offset,
+    )
+    record_ids_by_ordinal = _insert_streamed_records(
+        connection,
+        prepared_drafts,
+        batch_id=batch_id,
+    )
+    _insert_streamed_candidate_index(
+        connection,
+        prepared_drafts,
+        record_ids_by_ordinal,
+        fts5_available=fts5_available,
+    )
+
+
+def _insert_streamed_records(
+    connection: sqlite3.Connection,
+    prepared_drafts: tuple[_PreparedRecordDraft, ...],
+    *,
+    batch_id: str,
+) -> dict[int, int]:
+    """Insert one bounded chunk of records and return ordinal-to-id mapping."""
+
+    record_ids_by_ordinal: dict[int, int] = {}
+    for draft in prepared_drafts:
+        (
+            source_raw,
+            target_raw,
+            source_fold_v1,
+            speaker_raw,
+            context_prev_raw,
+            context_next_raw,
+            file_source,
+            provenance,
+            _provenance_json,
+            legacy_line_no,
+            origin_ordinal,
+        ) = draft
+        cursor = connection.execute(
+            "INSERT INTO tm_record("
+            "source_raw, target_raw, source_fold_v1, "
+            "speaker_raw, context_prev_raw, context_next_raw, "
+            "file_source, provenance_json, legacy_line_no, "
+            "origin_batch_id, origin_ordinal) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                source_raw,
+                target_raw,
+                source_fold_v1,
+                speaker_raw,
+                context_prev_raw,
+                context_next_raw,
+            file_source,
+            _provenance_json,
+            legacy_line_no,
+            batch_id,
+            origin_ordinal,
+            ),
+        )
+        record_id = cursor.lastrowid
+        if record_id is None:
+            raise SQLiteStoreSchemaError("STORE.RECORD_ID_MISSING")
+        record_ids_by_ordinal[origin_ordinal] = record_id
+    return record_ids_by_ordinal
+
+
+def _insert_streamed_candidate_index(
+    connection: sqlite3.Connection,
+    prepared_drafts: tuple[_PreparedRecordDraft, ...],
+    record_ids_by_ordinal: dict[int, int],
+    *,
+    fts5_available: bool,
+) -> None:
+    """Bulk-insert one bounded chunk's grams and FTS rows in PK order."""
+
+    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    grams_by_size: dict[int, dict[str, list[int]]] = {
+        gram_size: {} for gram_size in gram_sizes
+    }
+    fts_rows: list[tuple[str, int]] = []
+    for draft in prepared_drafts:
+        origin_ordinal = draft[10]
+        folded_source = draft[2]
+        record_id = record_ids_by_ordinal[origin_ordinal]
+        for gram_size in gram_sizes:
+            bucket = grams_by_size[gram_size]
+            for gram in unique_character_ngrams(folded_source, gram_size):
+                bucket.setdefault(gram, []).append(record_id)
+        if fts5_available:
+            fts_rows.append((folded_source, record_id))
+    for gram_size in gram_sizes:
+        bucket = grams_by_size[gram_size]
+        rows = [
+            (gram_size, gram, record_id)
+            for gram in sorted(bucket)
+            for record_id in bucket[gram]
+        ]
+        connection.executemany(
+            "INSERT INTO tm_gram(gram_size, gram, record_id) "
+            "VALUES (?, ?, ?)",
+            rows,
+        )
+    if fts_rows:
+        try:
+            connection.executemany(
+                "INSERT INTO tm_fts(source_fold_v1, record_id) "
+                "VALUES (?, ?)",
+                fts_rows,
+            )
+        except sqlite3.OperationalError as error:
+            raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+
+
+def _complete_streamed_batch(
+    connection: sqlite3.Connection,
+    *,
+    batch_id: str,
+    completed_revision: int,
+    prior_head_revision: int,
+    invalid_count: int,
+    duplicate_source_count: int,
+) -> None:
+    """Close the staged batch with final counts and the head revision."""
+
+    completed_batch = connection.execute(
+        "UPDATE tm_origin_batch "
+        "SET status = 'completed', completed_revision = ?, "
+        "valid_count = (SELECT COUNT(*) FROM tm_record "
+        "WHERE origin_batch_id = ?), "
+        "invalid_count = ?, duplicate_source_count = ? "
+        "WHERE batch_id = ? AND status = 'staged'",
+        (
+            completed_revision,
+            batch_id,
+            invalid_count,
+            duplicate_source_count,
+            batch_id,
+        ),
+    )
+    if completed_batch.rowcount != 1:
+        raise SQLiteStoreSchemaError("STORE.BATCH_COMPLETION_MISSING")
+    updated = connection.execute(
+        "UPDATE tm_meta SET value = ? "
+        "WHERE key = 'head_revision' AND value = ?",
+        (str(completed_revision), str(prior_head_revision)),
+    )
+    if updated.rowcount != 1:
+        raise SQLiteStoreSchemaError("STORE.HEAD_REVISION_MISSING")
 
 
 def _validate_batch_arguments(
@@ -2566,6 +2919,43 @@ def _validate_batch_arguments(
     created_at: str | None,
     extension: object,
 ) -> None:
+    _validate_batch_scalars(
+        batch_id=batch_id,
+        kind=kind,
+        source_digest=source_digest,
+        source_path=source_path,
+        invalid_count=invalid_count,
+        duplicate_source_count=duplicate_source_count,
+        created_at=created_at,
+        extension=extension,
+    )
+    if type(drafts) is not tuple:
+        raise TypeError("drafts must be a built-in tuple")
+    for draft in drafts:
+        _validate_draft_exact(draft)
+    if kind == "local_write":
+        if len(drafts) != 1:
+            raise ValueError("local_write batch must contain one draft")
+    if legacy_line_nos is not None:
+        if type(legacy_line_nos) is not tuple:
+            raise TypeError("legacy_line_nos must be a built-in tuple or None")
+        if len(legacy_line_nos) != len(drafts):
+            raise ValueError("legacy_line_nos must align with drafts")
+        for line_number in legacy_line_nos:
+            _validate_legacy_line_number(line_number)
+
+
+def _validate_batch_scalars(
+    *,
+    batch_id: str,
+    kind: str,
+    source_digest: str | None,
+    source_path: Path | None,
+    invalid_count: int,
+    duplicate_source_count: int,
+    created_at: str | None,
+    extension: object,
+) -> None:
     if type(batch_id) is not str:
         raise TypeError("batch_id must be a built-in string")
     if not batch_id.strip():
@@ -2574,46 +2964,7 @@ def _validate_batch_arguments(
         raise TypeError("kind must be a built-in string")
     if kind not in {"migration", "local_write", "import"}:
         raise ValueError("kind must be migration, local_write, or import")
-    if type(drafts) is not tuple:
-        raise TypeError("drafts must be a built-in tuple")
-    for draft in drafts:
-        if type(draft) is not TMRecordDraft:
-            raise TypeError("drafts must contain exact TMRecordDraft values")
-        if type(draft.source_raw) is not str:
-            raise TypeError("draft source_raw must be a built-in string")
-        if not draft.source_raw:
-            raise ValueError("draft source_raw must not be empty")
-        if type(draft.target_raw) is not str:
-            raise TypeError("draft target_raw must be a built-in string")
-        if not draft.target_raw:
-            raise ValueError("draft target_raw must not be empty")
-        for value, field_name in (
-            (draft.speaker_raw, "speaker_raw"),
-            (draft.context_prev_raw, "context_prev_raw"),
-            (draft.context_next_raw, "context_next_raw"),
-            (draft.file_source, "file_source"),
-        ):
-            if value is not None and type(value) is not str:
-                raise TypeError(
-                    f"draft {field_name} must be a built-in string or None"
-                )
-        if type(draft.provenance) is not tuple:
-            raise TypeError("draft provenance must be a built-in tuple")
-        for pair in draft.provenance:
-            if type(pair) is not tuple or len(pair) != 2:
-                raise TypeError(
-                    "draft provenance entries must be exact two-item tuples"
-                )
-            key, value = pair
-            if type(key) is not str or type(value) is not str:
-                raise TypeError(
-                    "draft provenance keys and values must be built-in strings"
-                )
-            if not key.strip():
-                raise ValueError("draft provenance keys must not be empty")
     if kind == "local_write":
-        if len(drafts) != 1:
-            raise ValueError("local_write batch must contain one draft")
         if source_digest is not None or source_path is not None:
             raise ValueError("local_write batch cannot bind a source")
     else:
@@ -2629,22 +2980,6 @@ def _validate_batch_arguments(
         assert source_path is not None
         if not source_path.is_absolute():
             raise ValueError("source_path must be absolute")
-    if legacy_line_nos is not None:
-        if type(legacy_line_nos) is not tuple:
-            raise TypeError("legacy_line_nos must be a built-in tuple or None")
-        if len(legacy_line_nos) != len(drafts):
-            raise ValueError("legacy_line_nos must align with drafts")
-        for line_number in legacy_line_nos:
-            if line_number is None:
-                continue
-            if type(line_number) is not int:
-                raise TypeError(
-                    "legacy line numbers must be built-in integers or None"
-                )
-            if line_number < 1:
-                raise ValueError(
-                    "legacy line numbers must be positive integers"
-                )
     for value, field_name in (
         (invalid_count, "invalid_count"),
         (duplicate_source_count, "duplicate_source_count"),
@@ -2660,6 +2995,52 @@ def _validate_batch_arguments(
             raise ValueError("created_at must be a non-empty string or None")
     if extension is not None and not callable(extension):
         raise TypeError("extension must be callable or None")
+
+
+def _validate_draft_exact(draft: object) -> None:
+    if type(draft) is not TMRecordDraft:
+        raise TypeError("drafts must contain exact TMRecordDraft values")
+    if type(draft.source_raw) is not str:
+        raise TypeError("draft source_raw must be a built-in string")
+    if not draft.source_raw:
+        raise ValueError("draft source_raw must not be empty")
+    if type(draft.target_raw) is not str:
+        raise TypeError("draft target_raw must be a built-in string")
+    if not draft.target_raw:
+        raise ValueError("draft target_raw must not be empty")
+    for value, field_name in (
+        (draft.speaker_raw, "speaker_raw"),
+        (draft.context_prev_raw, "context_prev_raw"),
+        (draft.context_next_raw, "context_next_raw"),
+        (draft.file_source, "file_source"),
+    ):
+        if value is not None and type(value) is not str:
+            raise TypeError(
+                f"draft {field_name} must be a built-in string or None"
+            )
+    if type(draft.provenance) is not tuple:
+        raise TypeError("draft provenance must be a built-in tuple")
+    for pair in draft.provenance:
+        if type(pair) is not tuple or len(pair) != 2:
+            raise TypeError(
+                "draft provenance entries must be exact two-item tuples"
+            )
+        key, value = pair
+        if type(key) is not str or type(value) is not str:
+            raise TypeError(
+                "draft provenance keys and values must be built-in strings"
+            )
+        if not key.strip():
+            raise ValueError("draft provenance keys must not be empty")
+
+
+def _validate_legacy_line_number(line_number: object) -> None:
+    if line_number is None:
+        return
+    if type(line_number) is not int:
+        raise TypeError("legacy line numbers must be built-in integers or None")
+    if line_number < 1:
+        raise ValueError("legacy line numbers must be positive integers")
 
 
 @dataclass(frozen=True)

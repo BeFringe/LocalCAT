@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
+import random
 import sqlite3
+import subprocess
+import sys
 import tempfile
-from typing import cast
+import time
+from collections.abc import Iterator
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -18,11 +24,12 @@ from tm_contracts import (
     contract_from_json,
 )
 from tm_migration import (
+    MIGRATION_STREAM_CHUNK_SIZE,
     MigrationPreflightError,
     MigrationStageBuild,
     TMMigrationService,
 )
-from tm_sqlite_store import SQLiteTMStore
+from tm_sqlite_store import SQLiteTMStore, SQLiteStoreSchemaError
 
 
 def _identity(root: Path) -> CanonicalResourceIdentity:
@@ -246,10 +253,15 @@ class TMMigrationPreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "exact native Path"):
                 _ = _service(identity).preflight(cast(Path, deceptive))
 
-    def test_preflight_recognizes_only_same_digest_completed_migration(self) -> None:
+    def test_preflight_fails_closed_on_every_sidecar_claim(self) -> None:
         source_bytes = b'{"source":"a","target":"b"}\n'
         source_digest = hashlib.sha256(source_bytes).hexdigest()
-        for case in ("same", "different", "failed", "wrong-identity"):
+        for case, expected in (
+            ("same", "MIGRATION.SIDECAR_NOT_REUSABLE"),
+            ("different", "MIGRATION.SIDECAR_DIFFERENT_SOURCE"),
+            ("failed", "MIGRATION.SIDECAR_NOT_REUSABLE"),
+            ("wrong-identity", "MIGRATION.SIDECAR_IDENTITY_MISMATCH"),
+        ):
             with self.subTest(case=case):
                 with tempfile.TemporaryDirectory() as temporary:
                     identity = _identity(Path(temporary))
@@ -267,24 +279,13 @@ class TMMigrationPreflightTests(unittest.TestCase):
                         ),
                     )
 
-                    if case == "same":
-                        result = _service(identity).preflight(
+                    with self.assertRaisesRegex(
+                        MigrationPreflightError,
+                        expected,
+                    ):
+                        _ = _service(identity).preflight(
                             identity.configured_jsonl_path
                         )
-                        self.assertEqual(result.source_digest, source_digest)
-                    else:
-                        expected = {
-                            "different": "MIGRATION.SIDECAR_DIFFERENT_SOURCE",
-                            "failed": "MIGRATION.SIDECAR_NOT_REUSABLE",
-                            "wrong-identity": "MIGRATION.SIDECAR_IDENTITY_MISMATCH",
-                        }[case]
-                        with self.assertRaisesRegex(
-                            MigrationPreflightError,
-                            expected,
-                        ):
-                            _ = _service(identity).preflight(
-                                identity.configured_jsonl_path
-                            )
 
     def test_preflight_rejects_empty_source_and_manifest_without_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -515,7 +516,9 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(counts, (1, 1, 1))
 
-    def test_same_digest_active_sidecar_returns_existing_revision(self) -> None:
+    def test_naked_sidecar_is_not_authority_and_never_reports_reuse(
+        self,
+    ) -> None:
         source_bytes = b'{"source":"a","target":"b"}\n'
         with tempfile.TemporaryDirectory() as temporary:
             identity = _identity(Path(temporary))
@@ -525,12 +528,71 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                 source_digest=hashlib.sha256(source_bytes).hexdigest(),
             )
 
-            result = _service(identity).build_mutable_stage(
-                identity.configured_jsonl_path
+            with self.assertRaisesRegex(
+                MigrationPreflightError,
+                "MIGRATION.SIDECAR_NOT_REUSABLE",
+            ):
+                _ = _service(identity).build_mutable_stage(
+                    identity.configured_jsonl_path
+                )
+            self.assertEqual(
+                tuple(
+                    path.name
+                    for path in Path(temporary).iterdir()
+                    if path != identity.configured_jsonl_path
+                ),
+                (identity.canonical_sidecar_path.name,),
             )
 
-            self.assertIsNone(result.mutable_stage)
-            self.assertEqual(result.reused_completed_revision, 1)
+    def test_symlinked_foreign_sidecar_is_rejected_before_reuse(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            foreign = root / "foreign.jsonl"
+            foreign.write_bytes(b'{"source":"x","target":"y"}\n')
+            identity.canonical_sidecar_path.symlink_to(foreign)
+
+            with self.assertRaisesRegex(
+                MigrationPreflightError,
+                "MIGRATION.SIDECAR_INVALID",
+            ):
+                _ = _service(identity).preflight(
+                    identity.configured_jsonl_path
+                )
+
+    def test_incomplete_sidecar_schema_is_rejected_as_invalid(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            connection = sqlite3.connect(identity.canonical_sidecar_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE tm_meta("
+                    "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.executemany(
+                    "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
+                    (
+                        ("activation_status", "ACTIVE"),
+                        ("canonical_store_id", "store.primary"),
+                        ("resource_id", identity.resource_id),
+                        ("target_identity", identity.target_identity),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(
+                MigrationPreflightError,
+                "MIGRATION.SIDECAR_INVALID",
+            ):
+                _ = _service(identity).preflight(
+                    identity.configured_jsonl_path
+                )
 
     def test_digest_change_or_write_failure_leaves_no_stage_artifacts(self) -> None:
         original = b'{"source":"a","target":"b"}\n'
@@ -560,7 +622,7 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                     else:
                         context = patch.object(
                             SQLiteTMStore,
-                            "append_batch",
+                            "append_streamed_batch",
                             side_effect=RuntimeError("injected failure"),
                         )
                         expected = "injected failure"
@@ -601,5 +663,517 @@ class TMMigrationStageBuildTests(unittest.TestCase):
             )
 
 
+    def test_reuse_rejects_missing_or_wrong_temporary_manifest(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for tamper in ("missing", "wrong-content"):
+            with self.subTest(tamper=tamper):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+                    first = service.build_mutable_stage(
+                        identity.configured_jsonl_path
+                    )
+                    stage = first.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    if tamper == "missing":
+                        stage.manifest_temp_path.unlink()
+                    else:
+                        stage.manifest_temp_path.write_text(
+                            "{}",
+                            encoding="utf-8",
+                        )
+                    with self.assertRaisesRegex(
+                        MigrationPreflightError,
+                        "MIGRATION.STAGE_CONFLICT",
+                    ):
+                        _ = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+
+    def test_reuse_rejects_tampered_batch_receipt_or_binding(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for tamper in ("batch", "receipt", "binding"):
+            with self.subTest(tamper=tamper):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+                    first = service.build_mutable_stage(
+                        identity.configured_jsonl_path
+                    )
+                    stage = first.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        if tamper == "batch":
+                            connection.execute(
+                                "UPDATE tm_origin_batch SET source_digest = ?",
+                                ("0" * 64,),
+                            )
+                        elif tamper == "receipt":
+                            connection.execute(
+                                "UPDATE tm_snapshot_receipt "
+                                "SET jsonl_digest = ?",
+                                ("0" * 64,),
+                            )
+                        else:
+                            connection.execute(
+                                "INSERT INTO tm_snapshot_binding("
+                                "binding_id, configured_jsonl_path, "
+                                "manifest_path, snapshot_kind, snapshot_id, "
+                                "binding_version) VALUES (1, 'configured', "
+                                "'manifest', 'MIGRATION_SOURCE', "
+                                "'snapshot.migration.0', 'binding-v1')"
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(
+                        MigrationPreflightError,
+                        "MIGRATION.STAGE_CONFLICT",
+                    ):
+                        _ = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+
+    def test_reuse_rejects_incomplete_candidate_index(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for fts5_available, deletion in (
+            (False, "gram"),
+            (True, "fts"),
+        ):
+            with self.subTest(
+                fts5_available=fts5_available,
+                deletion=deletion,
+            ):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        first = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+                    stage = first.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        if deletion == "gram":
+                            connection.execute(
+                                "DELETE FROM tm_gram "
+                                "WHERE gram_size = 1 AND gram = 'a'"
+                            )
+                        else:
+                            connection.execute("DELETE FROM tm_fts")
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=fts5_available,
+                        ),
+                        self.assertRaisesRegex(
+                            MigrationPreflightError,
+                            "MIGRATION.STAGE_CONFLICT",
+                        ),
+                    ):
+                        _ = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+
+    def test_reuse_rejects_schema_or_runtime_tamper(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for tamper in ("schema", "runtime"):
+            with self.subTest(tamper=tamper):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        first = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+                    stage = first.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    if tamper == "schema":
+                        connection = sqlite3.connect(stage.staged_db_path)
+                        try:
+                            connection.execute("DROP INDEX idx_tm_exact")
+                            connection.commit()
+                        finally:
+                            connection.close()
+                        with self.assertRaises(
+                            SQLiteStoreSchemaError
+                        ):
+                            _ = service.build_mutable_stage(
+                                identity.configured_jsonl_path
+                            )
+                    else:
+                        with self.assertRaises(
+                            SQLiteStoreSchemaError
+                        ):
+                            with patch(
+                                "tm_sqlite_store._probe_fts5",
+                                return_value=True,
+                            ):
+                                _ = service.build_mutable_stage(
+                                    identity.configured_jsonl_path
+                                )
+
+    def test_reuse_rejects_symlinked_stage_files(self) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for target in ("db", "manifest"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity = _identity(Path(temporary))
+                    identity.configured_jsonl_path.write_bytes(source_bytes)
+                    service = _service(identity)
+                    first = service.build_mutable_stage(
+                        identity.configured_jsonl_path
+                    )
+                    stage = first.mutable_stage
+                    self.assertIsNotNone(stage)
+                    assert stage is not None
+                    if target == "db":
+                        stage.staged_db_path.unlink()
+                        stage.staged_db_path.symlink_to(
+                            identity.configured_jsonl_path
+                        )
+                    else:
+                        stage.manifest_temp_path.unlink()
+                        stage.manifest_temp_path.symlink_to(
+                            identity.configured_jsonl_path
+                        )
+                    with self.assertRaisesRegex(
+                        MigrationPreflightError,
+                        "MIGRATION.STAGE_CONFLICT",
+                    ):
+                        _ = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+
+    def test_build_streams_bounded_batches_and_preserves_order(self) -> None:
+        source_lines = [
+            {
+                "source": f"source-{index:05d}-" + "x" * (index % 40),
+                "target": f"target-{index:05d}",
+            }
+            for index in range(1, 12_501)
+        ]
+        source_bytes = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n"
+            for line in source_lines
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            observed_sizes: list[int] = []
+            observed_calls = 0
+            original_prepare = tm_sqlite_store._prepare_record_drafts
+
+            def recording_prepare(
+                drafts: tuple[Any, ...],
+                legacy_line_nos: tuple[Any, ...],
+                **kwargs: int,
+            ):
+                nonlocal observed_calls
+                observed_calls += 1
+                observed_sizes.append(len(drafts))
+                return original_prepare(
+                    drafts,
+                    legacy_line_nos,
+                    **kwargs,
+                )
+
+            with (
+                patch(
+                    "tm_sqlite_store._prepare_record_drafts",
+                    side_effect=recording_prepare,
+                ),
+                patch(
+                    "tm_sqlite_store._probe_fts5",
+                    return_value=False,
+                ),
+            ):
+                result = _service(identity).build_mutable_stage(
+                    identity.configured_jsonl_path
+                )
+                stage = result.mutable_stage
+                self.assertIsNotNone(stage)
+                assert stage is not None
+                self.assertGreater(observed_calls, 2)
+                self.assertLessEqual(
+                    max(observed_sizes),
+                    MIGRATION_STREAM_CHUNK_SIZE,
+                )
+                store = SQLiteTMStore(
+                    stage,
+                    canonical_store_id="store.primary",
+                )
+                records = tuple(store.export_records())
+            self.assertEqual(len(records), 12_500)
+            self.assertEqual(
+                tuple(record.source_raw for record in records),
+                tuple(line["source"] for line in source_lines),
+            )
+            self.assertEqual(
+                tuple(record.legacy_line_no for record in records),
+                tuple(range(1, 12_501)),
+            )
+            self.assertEqual(
+                tuple(record.origin_ordinal for record in records),
+                tuple(range(0, 12_500)),
+            )
+            self.assertEqual(
+                tuple(record.record_id for record in records),
+                tuple(range(1, 12_501)),
+            )
+
+    def test_stream_failure_mid_build_discards_partial_stage(self) -> None:
+        source_bytes = "".join(
+            json.dumps({"source": f"s{i}", "target": f"t{i}"}) + "\n"
+            for i in range(600)
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            service = _service(identity)
+            original_append = SQLiteTMStore.append_streamed_batch
+
+            def failing_append(
+                store: SQLiteTMStore,
+                *,
+                drafts: Iterator[tuple[Any, int | None]],
+                **kwargs: Any,
+            ):
+                consumed = 0
+
+                def broken() -> Iterator[tuple[Any, int | None]]:
+                    nonlocal consumed
+                    for pair in drafts:
+                        consumed += 1
+                        if consumed == 550:
+                            raise RuntimeError(
+                                "injected mid-stream failure"
+                            )
+                        yield pair
+
+                return original_append(
+                    store,
+                    drafts=broken(),
+                    **kwargs,
+                )
+
+            with patch.object(
+                SQLiteTMStore,
+                "append_streamed_batch",
+                new=failing_append,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "injected mid-stream failure",
+                ):
+                    _ = service.build_mutable_stage(
+                        identity.configured_jsonl_path
+                    )
+            self.assertEqual(
+                tuple(
+                    path.name
+                    for path in Path(temporary).iterdir()
+                    if path != identity.configured_jsonl_path
+                ),
+                (),
+            )
+
+
+def _write_envelope_corpus(
+    path: Path,
+    record_count: int,
+) -> None:
+    """Write a deterministic 100k-record fallback corpus with mixed rows."""
+
+    rng = random.Random(0x5EED_1001)
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        for index in range(record_count):
+            source = "".join(
+                rng.choice("abcdefghijklmnopqrstuvwxyz ")
+                for _ in range(rng.randint(12, 64))
+            )
+            target = "".join(
+                rng.choice("abcdefghijklmnopqrstuvwxyz ")
+                for _ in range(rng.randint(12, 64))
+            )
+            if index != 0 and index % 997 == 0:
+                stream.write("{not-json}\n")
+            elif index % 991 == 0:
+                stream.write(
+                    json.dumps(
+                        {
+                            "source": "envelope-shared-source",
+                            "target": target,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            else:
+                stream.write(
+                    json.dumps(
+                        {"source": source, "target": target},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+
+def _run_envelope_build(corpus: Path) -> dict[str, int]:
+    """Build one 100k fallback stage and return measured facts."""
+
+    import resource
+
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        "tm.primary",
+        corpus.resolve(),
+    )
+    service = TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id="store.primary",
+    )
+    with patch("tm_sqlite_store._probe_fts5", return_value=False):
+        result = service.build_mutable_stage(corpus.resolve())
+    stage = result.mutable_stage
+    if stage is None:
+        raise AssertionError("envelope build returned no mutable stage")
+    connection = sqlite3.connect(stage.staged_db_path)
+    try:
+        record_bounds = connection.execute(
+            "SELECT COUNT(*), MIN(record_id), MAX(record_id) "
+            "FROM tm_record"
+        ).fetchone()
+        gram_sizes = {
+            int(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT gram_size FROM tm_gram"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+    if record_bounds != (
+        result.preflight.valid_count,
+        1,
+        result.preflight.valid_count,
+    ):
+        raise AssertionError("envelope record identity does not close")
+    if gram_sizes != {1, 2, 3}:
+        raise AssertionError("envelope fallback gram index is incomplete")
+    rss_kib = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return {
+        "rss_kib": rss_kib,
+        "record_count": int(result.preflight.valid_count),
+        "valid_count": int(result.preflight.valid_count),
+        "invalid_count": int(result.preflight.invalid_count),
+        "duplicate_source_count": int(
+            result.preflight.duplicate_source_count
+        ),
+    }
+
+
+@unittest.skipUnless(
+    os.environ.get("TMMIGRATION_RESOURCE_ENVELOPE") == "1",
+    "set TMMIGRATION_RESOURCE_ENVELOPE=1 to run the 100k envelope test",
+)
+class TMMigrationResourceEnvelopeTests(unittest.TestCase):
+    def test_100k_fallback_build_stays_below_512MiB_in_subprocess(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            corpus = Path(temporary) / "envelope-100k.jsonl"
+            _write_envelope_corpus(corpus, 100_000)
+            environment = dict(os.environ)
+            environment["TMMIGRATION_ENVELOPE_BUILD"] = "1"
+            environment["TMMIGRATION_ENVELOPE_CORPUS"] = str(corpus)
+            repository_root = Path(__file__).resolve().parent.parent
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.test_tm_migration",
+                ],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            output = completed.stdout
+            facts = {}
+            for line in output.splitlines():
+                if line.startswith("ENVELOPE_"):
+                    key, value = line.split("=", 1)
+                    facts[key] = int(value)
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=output + completed.stderr,
+            )
+            self.assertEqual(facts.get("ENVELOPE_RECORD_COUNT"), 99_900)
+            self.assertEqual(facts.get("ENVELOPE_INVALID_COUNT"), 100)
+            self.assertEqual(facts.get("ENVELOPE_DUPLICATE_COUNT"), 1)
+            self.assertLessEqual(
+                facts.get("ENVELOPE_RSS_KIB", 0),
+                524288,
+                msg=output + completed.stderr,
+            )
+            self.assertLessEqual(
+                facts.get("ENVELOPE_ELAPSED_MS", 0),
+                120_000,
+                msg=output + completed.stderr,
+            )
+
+
+def _main_envelope_build() -> None:
+    corpus_env = os.environ.get("TMMIGRATION_ENVELOPE_CORPUS")
+    if corpus_env:
+        corpus = Path(corpus_env)
+        if not corpus.is_file():
+            raise SystemExit(f"missing envelope corpus: {corpus}")
+    else:
+        with tempfile.TemporaryDirectory() as temporary:
+            corpus = Path(temporary) / "envelope-100k.jsonl"
+            _write_envelope_corpus(corpus, 100_000)
+            _report_envelope(corpus)
+        return
+    _report_envelope(corpus)
+
+
+def _report_envelope(corpus: Path) -> None:
+    started = time.monotonic()
+    facts = _run_envelope_build(corpus)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    print(f"ENVELOPE_ELAPSED_MS={elapsed_ms}")
+    print(f"ENVELOPE_RSS_KIB={facts['rss_kib']}")
+    print(f"ENVELOPE_RECORD_COUNT={facts['record_count']}")
+    print(f"ENVELOPE_VALID_COUNT={facts['valid_count']}")
+    print(f"ENVELOPE_INVALID_COUNT={facts['invalid_count']}")
+    print(f"ENVELOPE_DUPLICATE_COUNT={facts['duplicate_source_count']}")
+
+
+
 if __name__ == "__main__":
+    if os.environ.get("TMMIGRATION_ENVELOPE_BUILD") == "1":
+        _main_envelope_build()
+        raise SystemExit(0)
     unittest.main()

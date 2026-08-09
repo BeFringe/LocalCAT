@@ -1418,6 +1418,9 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 def execute(self, *args: Any, **kwargs: Any):
                     return self._connection.execute(*args, **kwargs)
 
+                def executemany(self, *args: Any, **kwargs: Any):
+                    return self._connection.executemany(*args, **kwargs)
+
                 def commit(self) -> None:
                     raise sqlite3.OperationalError("injected commit failure")
 
@@ -1968,6 +1971,270 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 blocker.rollback()
                 blocker.close()
             self.assertEqual(primary.exact_records("locked"), ())
+
+
+    def test_streamed_append_completes_one_batch_across_bounded_chunks(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    stage = _stage(root)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                        store = SQLiteTMStore(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                    drafts = (
+                        _draft(f"source-{index:04d}", f"target-{index:04d}")
+                        for index in range(1250)
+                    )
+                    stream = ((draft, index + 1) for index, draft in enumerate(drafts))
+                    store.append_streamed_batch(
+                        batch_id="migration.streamed",
+                        kind="migration",
+                        drafts=stream,
+                        source_digest="a" * 64,
+                        source_path=(root / "streamed.jsonl").resolve(),
+                        invalid_count=0,
+                        duplicate_source_count=0,
+                        chunk_size=500,
+                    )
+                    revision = store.canonical_revision()
+                    self.assertEqual(revision.head_revision, 1)
+                    self.assertEqual(revision.record_count, 1250)
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        batch = connection.execute(
+                            "SELECT batch_id, kind, status, valid_count, "
+                            "invalid_count, duplicate_source_count, "
+                            "completed_revision FROM tm_origin_batch"
+                        ).fetchone()
+                        bounds = connection.execute(
+                            "SELECT COUNT(*), MIN(record_id), MAX(record_id), "
+                            "MIN(origin_ordinal), MAX(origin_ordinal) "
+                            "FROM tm_record"
+                        ).fetchone()
+                        gram_sizes = {
+                            int(row[0])
+                            for row in connection.execute(
+                                "SELECT DISTINCT gram_size FROM tm_gram"
+                            ).fetchall()
+                        }
+                    finally:
+                        connection.close()
+                    self.assertEqual(
+                        batch,
+                        (
+                            "migration.streamed",
+                            "migration",
+                            "completed",
+                            1250,
+                            0,
+                            0,
+                            1,
+                        ),
+                    )
+                    self.assertEqual(
+                        bounds,
+                        (1250, 1, 1250, 0, 1249),
+                    )
+                    self.assertEqual(
+                        gram_sizes,
+                        {1, 2} if fts5_available else {1, 2, 3},
+                    )
+                    records = tuple(store.export_records())
+                    self.assertEqual(
+                        tuple(
+                            (
+                                record.record_id,
+                                record.origin_ordinal,
+                                record.legacy_line_no,
+                            )
+                            for record in (records[0], records[-1])
+                        ),
+                        ((1, 0, 1), (1250, 1249, 1250)),
+                    )
+
+    def test_streamed_append_mid_stream_failure_never_completes_batch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+
+            def broken_stream():
+                for index in range(600):
+                    if index == 550:
+                        raise RuntimeError("injected mid-stream failure")
+                    yield _draft(f"s{index}", f"t{index}"), index + 1
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "injected mid-stream failure",
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.streamed-failure",
+                    kind="migration",
+                    drafts=broken_stream(),
+                    source_digest="b" * 64,
+                    source_path=(root / "streamed-failure.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=500,
+                )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                state = (
+                    connection.execute(
+                        "SELECT status, completed_revision FROM tm_origin_batch"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_record"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = 'head_revision'"
+                    ).fetchone(),
+                )
+            finally:
+                connection.close()
+            self.assertEqual(
+                state,
+                (("staged", None), (500,), ("0",)),
+            )
+
+    def test_streamed_append_empty_stream_completes_zero_record_batch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store.append_streamed_batch(
+                batch_id="migration.streamed-empty",
+                kind="migration",
+                drafts=iter(()),
+                source_digest="c" * 64,
+                source_path=(root / "streamed-empty.jsonl").resolve(),
+                invalid_count=1,
+                duplicate_source_count=0,
+                chunk_size=500,
+            )
+            revision = store.canonical_revision()
+            self.assertEqual(revision.head_revision, 1)
+            self.assertEqual(revision.record_count, 0)
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                batch = connection.execute(
+                    "SELECT status, valid_count, invalid_count, "
+                    "completed_revision FROM tm_origin_batch"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                batch,
+                ("completed", 0, 1, 1),
+            )
+
+    def test_streamed_append_rejects_deceptive_values_before_completion(
+        self,
+    ) -> None:
+        class DeceptiveStr(str):
+            pass
+
+        class DraftSubclass(TMRecordDraft):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+
+            def stream() -> Iterator[tuple[TMRecordDraft, int]]:
+                yield _draft("ok", "target"), 1
+                yield cast(
+                    TMRecordDraft,
+                    DraftSubclass(
+                        "bad",
+                        "target",
+                        None,
+                        None,
+                        None,
+                        None,
+                        (("source", "test"),),
+                    ),
+                ), 2
+
+            with self.assertRaises(TypeError):
+                store.append_streamed_batch(
+                    batch_id="migration.streamed-strict",
+                    kind="migration",
+                    drafts=stream(),
+                    source_digest=DeceptiveStr("d" * 64),
+                    source_path=(root / "strict.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=500,
+                )
+            with self.assertRaisesRegex(
+                TypeError,
+                "draft stream entries",
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.streamed-shape",
+                    kind="migration",
+                    drafts=iter(
+                        cast(tuple[tuple[Any, Any], ...], (("not", "a", "pair"),))
+                    ),
+                    source_digest="e" * 64,
+                    source_path=(root / "shape.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=500,
+                )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                counts = (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_origin_batch"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_record"
+                    ).fetchone(),
+                )
+            finally:
+                connection.close()
+            self.assertEqual(counts, ((0,), (0,)))
 
 
 class SQLiteSchemaTests(unittest.TestCase):

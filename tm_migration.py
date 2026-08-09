@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import stat
 from typing import cast
 
 from tm_contracts import (
+    SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
     CanonicalResourceIdentity,
     DiagnosticDisposition,
@@ -36,11 +38,31 @@ from tm_sqlite_store import (
 
 
 _NATIVE_PATH_TYPE = type(Path())
+MIGRATION_STREAM_CHUNK_SIZE = 5000
+
+_REJECTION_DIAGNOSTICS = {
+    "ROW.INVALID_UTF8": (
+        "PREFLIGHT.DECODE",
+        "ROW_SKIPPED_INVALID_UTF8",
+    ),
+    "ROW.INVALID_JSON": (
+        "PREFLIGHT.PARSE",
+        "ROW_SKIPPED_INVALID_JSON",
+    ),
+    "ROW.INVALID_SHAPE": (
+        "PREFLIGHT.VALIDATE",
+        "ROW_SKIPPED_INVALID_SHAPE",
+    ),
+    "ROW.INVALID_REQUIRED_FIELD": (
+        "PREFLIGHT.VALIDATE",
+        "ROW_SKIPPED_INVALID_REQUIRED_FIELD",
+    ),
+}
 
 
 @dataclass(frozen=True)
 class MigrationStageBuild:
-    """Either one unpublished mutable stage or an active idempotent hit."""
+    """One unpublished mutable stage; no sidecar reuse before activation."""
 
     preflight: MigrationPreflight
     mutable_stage: MutableStageRef | None
@@ -71,11 +93,25 @@ class MigrationStageBuild:
             )
 
 
-@dataclass(frozen=True)
-class _JSONLScan:
-    preflight: MigrationPreflight
-    drafts: tuple[TMRecordDraft, ...]
-    legacy_line_nos: tuple[int, ...]
+class _StreamingBuildObservation:
+    """Mutable counters and digest accumulated while re-streaming the source."""
+
+    __slots__ = (
+        "digest",
+        "valid_count",
+        "invalid_count",
+        "duplicate_source_count",
+        "variant_count",
+        "source_counts",
+    )
+
+    def __init__(self) -> None:
+        self.digest = hashlib.sha256()
+        self.valid_count = 0
+        self.invalid_count = 0
+        self.duplicate_source_count = 0
+        self.variant_count = 0
+        self.source_counts: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -122,27 +158,14 @@ class TMMigrationService:
         """Stream exact source bytes and return safe, deterministic facts."""
 
         self._validate_source_preconditions(source)
-        scan = _scan_jsonl(source, collect_drafts=False)
-        _ = self._completed_migration_revision(scan.preflight.source_digest)
-        return scan.preflight
+        preflight = _scan_jsonl(source)
+        self._reject_sidecar_reuse(preflight.source_digest)
+        return preflight
 
     def build_mutable_stage(self, source: Path) -> MigrationStageBuild:
         """Build or reuse one complete unpublished migration stage."""
 
         preflight = self.preflight(source)
-        completed_revision = self._completed_migration_revision(
-            preflight.source_digest
-        )
-        if completed_revision is not None:
-            return MigrationStageBuild(
-                preflight=preflight,
-                mutable_stage=None,
-                reused_completed_revision=completed_revision,
-            )
-
-        scan = _scan_jsonl(source, collect_drafts=True)
-        if scan.preflight != preflight:
-            raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
         stage = _migration_stage_ref(
             self._resource_identity,
             source_digest=preflight.source_digest,
@@ -170,16 +193,19 @@ class TMMigrationService:
                 stage,
                 canonical_store_id=self._canonical_store_id,
             )
-            _ = store.append_batch(
+            observation = _StreamingBuildObservation()
+            store.append_streamed_batch(
                 batch_id=f"migration.{preflight.source_digest}",
                 kind="migration",
-                drafts=scan.drafts,
+                drafts=_iter_draft_pairs(source, observation),
                 source_digest=preflight.source_digest,
                 source_path=source,
-                legacy_line_nos=scan.legacy_line_nos,
                 invalid_count=preflight.invalid_count,
                 duplicate_source_count=preflight.duplicate_source_count,
+                chunk_size=MIGRATION_STREAM_CHUNK_SIZE,
             )
+            if not _observation_matches(observation, preflight):
+                raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
             revision = store.canonical_revision()
             if (
                 revision.head_revision != 1
@@ -246,11 +272,13 @@ class TMMigrationService:
         _require_target_parent_writable(self._resource_identity)
         _require_source_readable(source)
 
-    def _completed_migration_revision(
-        self,
-        source_digest: str,
-    ) -> int | None:
-        """Return the reusable completed revision, if no sidecar conflict."""
+    def _reject_sidecar_reuse(self, source_digest: str) -> None:
+        """Fail closed on any sidecar claim before activation authority.
+
+        No completed reuse is ever reported from the sidecar within
+        Tasks 5.1-5.2: a naked structural sidecar is not canonical
+        authority. Deterministic conflicts still surface as stable codes.
+        """
 
         identity = self._resource_identity
         sidecar = identity.canonical_sidecar_path
@@ -260,7 +288,7 @@ class TMMigrationService:
                 raise MigrationPreflightError(
                     "MIGRATION.MANIFEST_WITHOUT_SIDECAR"
                 )
-            return None
+            return
         if sidecar.is_symlink() or not sidecar.is_file():
             raise MigrationPreflightError("MIGRATION.SIDECAR_INVALID")
 
@@ -281,14 +309,11 @@ class TMMigrationService:
                     meta.get("resource_id") != identity.resource_id
                     or meta.get("canonical_store_id")
                     != self._canonical_store_id
-                    or meta.get("target_identity") != identity.target_identity
+                    or meta.get("target_identity")
+                    != identity.target_identity
                 ):
                     raise MigrationPreflightError(
                         "MIGRATION.SIDECAR_IDENTITY_MISMATCH"
-                    )
-                if meta.get("activation_status") != "ACTIVE":
-                    raise MigrationPreflightError(
-                        "MIGRATION.SIDECAR_NOT_REUSABLE"
                     )
                 rows = connection.execute(
                     "SELECT source_digest, status, completed_revision "
@@ -312,7 +337,9 @@ class TMMigrationService:
                 and type(revision_value) is int
                 and revision_value >= 1
             ):
-                return revision_value
+                raise MigrationPreflightError(
+                    "MIGRATION.SIDECAR_NOT_REUSABLE"
+                )
         if any(
             status_value == "completed"
             and type(revision_value) is int
@@ -325,7 +352,9 @@ class TMMigrationService:
         raise MigrationPreflightError("MIGRATION.SIDECAR_NOT_REUSABLE")
 
 
-def _scan_jsonl(source: Path, *, collect_drafts: bool) -> _JSONLScan:
+def _scan_jsonl(source: Path) -> MigrationPreflight:
+    """One bounded streaming pass producing preflight facts and diagnostics."""
+
     digest = hashlib.sha256()
     valid_count = 0
     invalid_count = 0
@@ -334,74 +363,26 @@ def _scan_jsonl(source: Path, *, collect_drafts: bool) -> _JSONLScan:
     row_count = 0
     source_counts: dict[str, int] = {}
     diagnostics: list[MigrationDiagnostic] = []
-    drafts: list[TMRecordDraft] = []
-    legacy_line_nos: list[int] = []
 
     try:
         with source.open("rb") as stream:
             for line_number, raw_line in enumerate(stream, start=1):
                 row_count += 1
                 digest.update(raw_line)
-                try:
-                    decoded_line = raw_line.decode("utf-8")
-                except UnicodeDecodeError:
+                rejection_code, payload = _classify_jsonl_line(raw_line)
+                if rejection_code is not None:
                     invalid_count += 1
                     diagnostics.append(
                         _rejected_diagnostic(
                             line_number,
-                            code="ROW.INVALID_UTF8",
-                            stage="PREFLIGHT.DECODE",
-                            summary="ROW_SKIPPED_INVALID_UTF8",
-                        )
-                    )
-                    continue
-                try:
-                    payload = json.loads(
-                        decoded_line,
-                        parse_constant=_reject_json_constant,
-                    )
-                except (json.JSONDecodeError, ValueError):
-                    invalid_count += 1
-                    diagnostics.append(
-                        _rejected_diagnostic(
-                            line_number,
-                            code="ROW.INVALID_JSON",
-                            stage="PREFLIGHT.PARSE",
-                            summary="ROW_SKIPPED_INVALID_JSON",
-                        )
-                    )
-                    continue
-                if type(payload) is not dict:
-                    invalid_count += 1
-                    diagnostics.append(
-                        _rejected_diagnostic(
-                            line_number,
-                            code="ROW.INVALID_SHAPE",
-                            stage="PREFLIGHT.VALIDATE",
-                            summary="ROW_SKIPPED_INVALID_SHAPE",
+                            code=rejection_code,
+                            stage=_REJECTION_DIAGNOSTICS[rejection_code][0],
+                            summary=_REJECTION_DIAGNOSTICS[rejection_code][1],
                         )
                     )
                     continue
                 row = cast(dict[str, object], payload)
-                source_raw = row.get("source")
-                target_raw = row.get("target")
-                if (
-                    type(source_raw) is not str
-                    or source_raw == ""
-                    or type(target_raw) is not str
-                    or target_raw == ""
-                ):
-                    invalid_count += 1
-                    diagnostics.append(
-                        _rejected_diagnostic(
-                            line_number,
-                            code="ROW.INVALID_REQUIRED_FIELD",
-                            stage="PREFLIGHT.VALIDATE",
-                            summary="ROW_SKIPPED_INVALID_REQUIRED_FIELD",
-                        )
-                    )
-                    continue
-
+                source_raw = cast(str, row["source"])
                 prior_count = source_counts.get(source_raw, 0)
                 source_counts[source_raw] = prior_count + 1
                 if prior_count == 1:
@@ -419,9 +400,6 @@ def _scan_jsonl(source: Path, *, collect_drafts: bool) -> _JSONLScan:
                         )
                     )
                 valid_count += 1
-                if collect_drafts:
-                    drafts.append(_draft_from_jsonl(row))
-                    legacy_line_nos.append(line_number)
     except OSError as error:
         raise MigrationPreflightError(
             "MIGRATION.SOURCE_UNREADABLE"
@@ -429,7 +407,7 @@ def _scan_jsonl(source: Path, *, collect_drafts: bool) -> _JSONLScan:
 
     if row_count == 0:
         raise MigrationPreflightError("MIGRATION.SOURCE_EMPTY")
-    preflight = MigrationPreflight(
+    return MigrationPreflight(
         source_digest=digest.hexdigest(),
         valid_count=valid_count,
         invalid_count=invalid_count,
@@ -437,10 +415,84 @@ def _scan_jsonl(source: Path, *, collect_drafts: bool) -> _JSONLScan:
         variant_count=variant_count,
         diagnostics=tuple(diagnostics),
     )
-    return _JSONLScan(
-        preflight=preflight,
-        drafts=tuple(drafts),
-        legacy_line_nos=tuple(legacy_line_nos),
+
+
+def _classify_jsonl_line(
+    raw_line: bytes,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Return (rejection code, payload) with no retained line state."""
+
+    try:
+        decoded_line = raw_line.decode("utf-8")
+    except UnicodeDecodeError:
+        return "ROW.INVALID_UTF8", None
+    try:
+        payload = json.loads(
+            decoded_line,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError):
+        return "ROW.INVALID_JSON", None
+    if type(payload) is not dict:
+        return "ROW.INVALID_SHAPE", None
+    row = cast(dict[str, object], payload)
+    source_raw = row.get("source")
+    target_raw = row.get("target")
+    if (
+        type(source_raw) is not str
+        or source_raw == ""
+        or type(target_raw) is not str
+        or target_raw == ""
+    ):
+        return "ROW.INVALID_REQUIRED_FIELD", None
+    return None, row
+
+
+def _iter_draft_pairs(
+    source: Path,
+    observation: _StreamingBuildObservation,
+) -> Iterator[tuple[TMRecordDraft, int | None]]:
+    """Re-stream the source into a draft pair stream with live counting.
+
+    The store seam groups the pairs into bounded chunks, so no per-record
+    state is retained here beyond the running digest and counters.
+    """
+
+    try:
+        with source.open("rb") as stream:
+            for line_number, raw_line in enumerate(stream, start=1):
+                observation.digest.update(raw_line)
+                rejection_code, payload = _classify_jsonl_line(raw_line)
+                if rejection_code is not None:
+                    observation.invalid_count += 1
+                    continue
+                row = cast(dict[str, object], payload)
+                source_raw = cast(str, row["source"])
+                prior_count = observation.source_counts.get(source_raw, 0)
+                observation.source_counts[source_raw] = prior_count + 1
+                if prior_count == 1:
+                    observation.duplicate_source_count += 1
+                if prior_count >= 1:
+                    observation.variant_count += 1
+                observation.valid_count += 1
+                yield (_draft_from_jsonl(row), line_number)
+    except OSError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.SOURCE_UNREADABLE"
+        ) from error
+
+
+def _observation_matches(
+    observation: _StreamingBuildObservation,
+    preflight: MigrationPreflight,
+) -> bool:
+    return (
+        observation.digest.hexdigest() == preflight.source_digest
+        and observation.valid_count == preflight.valid_count
+        and observation.invalid_count == preflight.invalid_count
+        and observation.duplicate_source_count
+        == preflight.duplicate_source_count
+        and observation.variant_count == preflight.variant_count
     )
 
 
@@ -477,10 +529,10 @@ def _migration_stage_ref(
         resource_identity=identity,
         staged_db_path=(
             parent / f".localcat-migration.{name_key}.sqlite3.stage"
-        ).resolve(),
+        ).absolute(),
         manifest_temp_path=(
             parent / f".localcat-migration.{name_key}.manifest.tmp"
-        ).resolve(),
+        ).absolute(),
     )
 
 
@@ -490,6 +542,8 @@ def _validate_reusable_stage(
     canonical_store_id: str,
     preflight: MigrationPreflight,
 ) -> None:
+    """Validate a completed mutable stage with bounded streaming checks."""
+
     try:
         if (
             stage.staged_db_path.is_symlink()
@@ -533,11 +587,9 @@ def _validate_reusable_stage(
             )
             if batch_rows != [expected_batch]:
                 raise ValueError("migration batch does not close")
-            record_rows = connection.execute(
-                "SELECT record_id, source_fold_v1 FROM tm_record "
-                "ORDER BY record_id"
-            ).fetchall()
-            if len(record_rows) != preflight.valid_count:
+            if connection.execute(
+                "SELECT COUNT(*) FROM tm_record"
+            ).fetchone() != (preflight.valid_count,):
                 raise ValueError("record count does not close")
             receipt_rows = connection.execute(
                 "SELECT snapshot_id, resource_id, canonical_store_id, "
@@ -559,6 +611,7 @@ def _validate_reusable_stage(
                 or receipt_row[3] != 1
                 or receipt_row[4] != preflight.source_digest
                 or receipt_row[5] != preflight.valid_count
+                or receipt_row[6] != SNAPSHOT_FORMAT_VERSION
                 or receipt_row[7]
                 != str(stage.resource_identity.configured_jsonl_path)
                 or receipt_row[8]
@@ -572,36 +625,11 @@ def _validate_reusable_stage(
                 raise ValueError("unpublished stage must not bind snapshot")
 
             required_sizes = (1, 2) if schema.fts5_available else (1, 2, 3)
-            expected_grams = {
-                (int(record_id), gram_size, gram)
-                for record_id, folded_source in record_rows
-                for gram_size in required_sizes
-                for gram in unique_character_ngrams(
-                    str(folded_source),
-                    gram_size,
-                )
-            }
-            actual_grams = {
-                (int(record_id), int(gram_size), str(gram))
-                for record_id, gram_size, gram in connection.execute(
-                    "SELECT record_id, gram_size, gram FROM tm_gram"
-                ).fetchall()
-            }
-            if actual_grams != expected_grams:
-                raise ValueError("candidate gram index is incomplete")
-            if schema.fts5_available:
-                expected_fts = {
-                    (int(record_id), str(folded_source))
-                    for record_id, folded_source in record_rows
-                }
-                actual_fts = {
-                    (int(record_id), str(folded_source))
-                    for record_id, folded_source in connection.execute(
-                        "SELECT record_id, source_fold_v1 FROM tm_fts"
-                    ).fetchall()
-                }
-                if actual_fts != expected_fts:
-                    raise ValueError("candidate FTS index is incomplete")
+            _validate_stage_indexes(
+                connection,
+                required_sizes=required_sizes,
+                fts5_available=schema.fts5_available,
+            )
         finally:
             connection.close()
 
@@ -629,6 +657,71 @@ def _validate_reusable_stage(
         raise
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as error:
         raise MigrationPreflightError("MIGRATION.STAGE_CONFLICT") from error
+
+
+def _validate_stage_indexes(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+) -> None:
+    """Stream-compare record, gram, and FTS rows with bounded per-record sets."""
+
+    folded_cursor = connection.execute(
+        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+    )
+    gram_cursor = connection.execute(
+        "SELECT record_id, gram_size, gram FROM tm_gram "
+        "ORDER BY record_id, gram_size, gram"
+    )
+    fts_cursor = (
+        connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts "
+            "ORDER BY record_id"
+        )
+        if fts5_available
+        else None
+    )
+    current_gram = gram_cursor.fetchone()
+    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
+    expected_record_id = 1
+    for folded_row in folded_cursor:
+        record_id = int(folded_row[0])
+        folded_source = str(folded_row[1])
+        if record_id != expected_record_id:
+            raise ValueError("record ids are not contiguous")
+        expected_record_id += 1
+        actual_grams: set[tuple[int, str]] = set()
+        while current_gram is not None and int(current_gram[0]) == record_id:
+            actual_grams.add((int(current_gram[1]), str(current_gram[2])))
+            current_gram = gram_cursor.fetchone()
+        if current_gram is not None and int(current_gram[0]) < record_id:
+            raise ValueError("candidate gram index is out of order")
+        expected_grams: set[tuple[int, str]] = set()
+        for gram_size in required_sizes:
+            expected_grams.update(
+                (gram_size, gram)
+                for gram in unique_character_ngrams(
+                    folded_source,
+                    gram_size,
+                )
+            )
+        if actual_grams != expected_grams:
+            raise ValueError("candidate gram index is incomplete")
+        if fts5_available:
+            assert fts_cursor is not None
+            actual_fts: set[tuple[int, str]] = set()
+            while current_fts is not None and int(current_fts[0]) == record_id:
+                actual_fts.add((int(current_fts[0]), str(current_fts[1])))
+                current_fts = fts_cursor.fetchone()
+            if current_fts is not None and int(current_fts[0]) < record_id:
+                raise ValueError("candidate FTS index is out of order")
+            if actual_fts != {(record_id, folded_source)}:
+                raise ValueError("candidate FTS index is incomplete")
+    if current_gram is not None:
+        raise ValueError("candidate gram index has extra rows")
+    if current_fts is not None:
+        raise ValueError("candidate FTS index has extra rows")
 
 
 def _created_file_identity(path: Path) -> _CreatedFileIdentity:
@@ -756,6 +849,7 @@ def _rejected_diagnostic(
 
 
 __all__ = [
+    "MIGRATION_STREAM_CHUNK_SIZE",
     "MigrationPreflightError",
     "MigrationStageBuild",
     "TMMigrationService",
