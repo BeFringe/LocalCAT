@@ -147,7 +147,7 @@
   - 完成时，未闭合索引的工作副本无法 seal，已 seal artifact 无法继续写入或以裸路径激活
   - _Requirements: 2.3, 2.4, 2.9, 7.5, 7.14_
 
-- [ ] 5.4 建立 Gate B canonical physical readiness
+- [x] 5.4 建立 Gate B canonical physical readiness
   - 汇总 schema/runtime、迁移、完整候选索引、sealed evidence、来源绑定和 exact parity 证据
   - 未闭合索引、错 binding、无效 artifact 或 parity 失败都使 Gate B fail-closed，不允许进入激活
   - 完成时，Gate B 证据可独立重算，且只证明待激活版本完整，不提前发布 generation

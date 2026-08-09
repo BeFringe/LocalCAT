@@ -35,6 +35,7 @@ from tm_contracts import (
 from tm_sqlite_store import (
     SQLiteSchemaSnapshot,
     SQLiteStoreSchemaError,
+    _schema_digest,
     inspect_stage_schema,
     unique_character_ngrams,
 )
@@ -63,9 +64,19 @@ class _StageFacts:
     resource_id: str
     target_identity: str
     schema_version: int
+    schema_digest: str
     fold_version: str
     index_version: str
+    candidate_index_kind: str
     fts5_available: bool
+    sqlite_runtime_version: str
+    unicode_runtime_version: str
+    journal_mode: str
+    synchronous: str
+    foreign_keys: bool
+    busy_timeout_ms: int
+    wal_enabled: bool
+    extension_loading_enabled: bool
     record_count: int
     origin_batch_count: int
     fts_count: int
@@ -86,6 +97,24 @@ class _RegistryEntry:
     mutable: MutableStageRef
     stage: SealedStage
     state: ActivationCapabilityState
+
+
+@dataclass(frozen=True)
+class _PhysicalReadinessSnapshot:
+    """Registry-owned path-bearing facts and sealed claims for Gate B."""
+
+    registry_namespace: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    mutable_stage: MutableStageRef
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
 
 
 def _snapshot_str(value: object, field_name: str) -> str:
@@ -513,14 +542,20 @@ def _validate_stage_facts(
     stage: MutableStageRef,
     *,
     canonical_store_id: str,
+    allow_sealed: bool = False,
 ) -> _StageFacts:
-    """Independently validate every seal-relevant fact from disk once."""
+    """Independently validate every seal-relevant fact from disk once.
+
+    The private sealed mode (Gate B) validates the same closure on an already
+    closed SEALED stage; it never weakens mutable-stage inspection.
+    """
 
     identity = stage.resource_identity
     try:
         schema = inspect_stage_schema(
             stage,
             canonical_store_id=canonical_store_id,
+            _allow_sealed=allow_sealed,
         )
         if type(schema.activation_status) is not str:
             raise StageSealError("SEALER.STAGE_INVALID")
@@ -529,7 +564,10 @@ def _validate_stage_facts(
         try:
             connection.execute("BEGIN")
             try:
-                _require_stage_meta_unpublished(connection)
+                _require_stage_meta_unpublished(
+                    connection,
+                    allow_sealed=allow_sealed,
+                )
                 _require_schema_facts_consistent(connection, schema)
                 integrity_rows = connection.execute(
                     "PRAGMA integrity_check"
@@ -713,6 +751,22 @@ def _validate_stage_facts(
                 fts_count = 0
                 if schema.fts5_available:
                     fts_count = _validate_fts_index(connection)
+                schema_digest_row = connection.execute(
+                    "SELECT value FROM tm_meta "
+                    "WHERE key = 'schema_digest'"
+                ).fetchone()
+                if (
+                    schema_digest_row is None
+                    or type(schema_digest_row[0]) is not str
+                ):
+                    raise StageSealError("SEALER.STAGE_INVALID")
+                meta_schema_digest = schema_digest_row[0]
+                schema_digest = _schema_digest(
+                    connection,
+                    fts5_available=schema.fts5_available,
+                )
+                if schema_digest != meta_schema_digest:
+                    raise StageSealError("SEALER.STAGE_INVALID")
                 closure_digest = _stage_closure_digest(connection)
                 connection.commit()
             except BaseException:
@@ -725,9 +779,19 @@ def _validate_stage_facts(
             resource_id=identity.resource_id,
             target_identity=identity.target_identity,
             schema_version=schema.schema_version,
+            schema_digest=schema_digest,
             fold_version=schema.fold_version,
             index_version=schema.candidate_index_version,
+            candidate_index_kind=schema.candidate_index_kind,
             fts5_available=schema.fts5_available,
+            sqlite_runtime_version=schema.sqlite_runtime_version,
+            unicode_runtime_version=schema.unicode_runtime_version,
+            journal_mode=schema.journal_mode,
+            synchronous=schema.synchronous,
+            foreign_keys=schema.foreign_keys,
+            busy_timeout_ms=schema.busy_timeout_ms,
+            wal_enabled=schema.wal_enabled,
+            extension_loading_enabled=schema.extension_loading_enabled,
             record_count=valid_count,
             origin_batch_count=1,
             fts_count=fts_count,
@@ -748,18 +812,27 @@ def _validate_stage_facts(
         ValueError,
         RuntimeError,
     ) as error:
+        if allow_sealed and isinstance(error, SQLiteStoreSchemaError):
+            raise StageSealError(str(error)) from error
         raise StageSealError("SEALER.STAGE_INVALID") from error
 
 
 def _require_stage_meta_unpublished(
     connection: sqlite3.Connection,
+    *,
+    allow_sealed: bool = False,
 ) -> None:
     meta_rows = connection.execute(
         "SELECT key, value FROM tm_meta"
     ).fetchall()
     meta = {str(row[0]): str(row[1]) for row in meta_rows}
-    if meta.get("activation_status") != "UNPUBLISHED":
-        raise StageSealError("SEALER.STAGE_NOT_UNPUBLISHED")
+    expected_status = "SEALED" if allow_sealed else "UNPUBLISHED"
+    if meta.get("activation_status") != expected_status:
+        raise StageSealError(
+            "SEALER.STAGE_NOT_SEALED"
+            if allow_sealed
+            else "SEALER.STAGE_NOT_UNPUBLISHED"
+        )
     if "activation_digest" in meta:
         raise StageSealError("SEALER.STAGE_ALREADY_ACTIVATED")
     if meta.get("generation") != "0":
@@ -1282,6 +1355,90 @@ def _require_generation_closure(
         raise StageSealError("SEALER.GENERATION_MISMATCH")
 
 
+@dataclass(frozen=True)
+class _SealedRecomputation:
+    """Freshly recomputed physical facts and rebuilt sealed claims."""
+
+    facts: _StageFacts
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
+    stage_file_digest: str
+    manifest_temp_digest: str
+
+
+def _recompute_sealed_facts(
+    stage: MutableStageRef,
+    *,
+    canonical_store_id: str,
+    expected_prior_generation: int | None,
+) -> _SealedRecomputation:
+    """Recompute every physical fact of one SEALED stage from disk.
+
+    Gate B consumes this fresh snapshot; it never re-serializes the sealed
+    evidence.  File identities are captured before validation and rechecked
+    before hashing, so any mutation or path swap during evaluation denies.
+    """
+
+    database_identity = _artifact_file_identity(
+        stage.staged_db_path,
+        missing_code="SEALER.STAGE_DATABASE_MISSING",
+        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+    )
+    manifest_identity = _artifact_file_identity(
+        stage.manifest_temp_path,
+        missing_code="SEALER.STAGE_MANIFEST_MISSING",
+        unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+    )
+    facts = _validate_stage_facts(
+        stage,
+        canonical_store_id=canonical_store_id,
+        allow_sealed=True,
+    )
+    _require_identity_unchanged(
+        stage.staged_db_path,
+        database_identity,
+        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+    )
+    _require_identity_unchanged(
+        stage.manifest_temp_path,
+        manifest_identity,
+        unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+    )
+    stage_file_digest = _file_sha256(
+        stage.staged_db_path,
+        database_identity,
+    )
+    manifest_temp_digest, manifest = _verify_manifest_at_digest(
+        stage.manifest_temp_path,
+        manifest_identity,
+        facts.receipt,
+    )
+    binding = _build_binding(
+        stage.resource_identity,
+        facts.receipt,
+        manifest,
+    )
+    evidence = _build_evidence(
+        facts,
+        binding,
+        stage_file_digest=stage_file_digest,
+        manifest_temp_digest=manifest_temp_digest,
+    )
+    generation = _build_generation(
+        facts,
+        canonical_store_id=canonical_store_id,
+        expected_prior_generation=expected_prior_generation,
+    )
+    _require_generation_closure(generation, evidence)
+    return _SealedRecomputation(
+        facts=facts,
+        evidence=evidence,
+        generation=generation,
+        stage_file_digest=stage_file_digest,
+        manifest_temp_digest=manifest_temp_digest,
+    )
+
+
 class SealedArtifactRegistry:
     """Coordinator-owned sealed artifact authority for one namespace.
 
@@ -1369,7 +1526,13 @@ class SealedArtifactRegistry:
         if key in self._sealed_paths:
             raise StageSealError("SEALER.ALREADY_SEALED")
 
-    def _entry(self, stage: SealedStage) -> _RegistryEntry:
+    def _match_entry(self, stage: SealedStage) -> _RegistryEntry:
+        """Registry membership and full contract chain, without file effects.
+
+        Gate B resolves path-bearing facts only through this narrow seam; the
+        caller-provided stage is never a source of paths or evidence claims.
+        """
+
         if type(stage) is not SealedStage:
             raise StageSealError("SEALER.REGISTRY_MISMATCH")
         artifact = stage.artifact
@@ -1403,6 +1566,13 @@ class SealedArtifactRegistry:
             != identity.snapshot_manifest_path
         ):
             raise StageSealError("SEALER.REGISTRY_MISMATCH")
+        return entry
+
+    def _entry(self, stage: SealedStage) -> _RegistryEntry:
+        """Registry authority check that also re-proves the sealed file digests."""
+
+        entry = self._match_entry(stage)
+        evidence = entry.stage.evidence
         if _file_sha256(entry.mutable.staged_db_path) != (
             evidence.stage_file_digest
         ):
@@ -1412,6 +1582,38 @@ class SealedArtifactRegistry:
         ):
             raise StageSealError("SEALER.ARTIFACT_MUTATED")
         return entry
+
+    def resolve_physical_readiness(
+        self,
+        stage: SealedStage,
+    ) -> _PhysicalReadinessSnapshot:
+        """Resolve one registered sealed artifact for Gate B recomputation.
+
+        Returns only registry-owned paths and sealed claims; Gate B never
+        accepts caller-provided paths or evidence objects.
+        """
+
+        entry = self._match_entry(stage)
+        artifact = entry.stage.artifact
+        receipt = entry.stage.evidence.source_binding.receipt
+        return _PhysicalReadinessSnapshot(
+            registry_namespace=self._registry_namespace,
+            artifact_id=artifact.artifact_id,
+            artifact_seal_digest=artifact.seal_digest,
+            sealed_stage_digest=entry.stage.sealed_stage_digest,
+            resource_id=entry.stage.evidence.resource_id,
+            target_identity=entry.stage.evidence.target_identity,
+            canonical_store_id=receipt.canonical_store_id,
+            snapshot_receipt_digest=(
+                entry.stage.evidence.snapshot_receipt_digest
+            ),
+            expected_prior_generation=(
+                entry.stage.generation.expected_prior_generation
+            ),
+            mutable_stage=entry.mutable,
+            evidence=entry.stage.evidence,
+            generation=entry.stage.generation,
+        )
 
     def contains(self, stage: SealedStage) -> bool:
         try:

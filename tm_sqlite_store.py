@@ -2876,8 +2876,14 @@ def inspect_stage_schema(
     *,
     canonical_store_id: str,
     _allow_diverged_runtime: bool = False,
+    _allow_sealed: bool = False,
 ) -> SQLiteSchemaSnapshot:
-    """Strictly inspect one stage without publishing physical readiness."""
+    """Strictly inspect one stage without publishing physical readiness.
+
+    The private sealed-inspection mode accepts a closed SEALED stage (Gate B
+    recomputation) without weakening normal mutable-stage inspection or the
+    future ACTIVE semantics.
+    """
 
     validated_stage = _require_stage(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
@@ -2905,6 +2911,7 @@ def inspect_stage_schema(
             meta,
             runtime=runtime,
             allow_diverged_runtime=_allow_diverged_runtime,
+            allow_sealed=_allow_sealed,
         )
         table_names = _schema_object_names(connection, "table")
         index_names = _schema_object_names(connection, "index")
@@ -3070,6 +3077,7 @@ def _validate_stage_meta(
     *,
     runtime: SQLiteRuntimeCapability,
     allow_diverged_runtime: bool = False,
+    allow_sealed: bool = False,
 ) -> None:
     expected_versions = {
         "fold_version": FOLD_VERSION_V1,
@@ -3086,8 +3094,13 @@ def _validate_stage_meta(
         raise SQLiteStoreSchemaError("STORE.CANDIDATE_INDEX_MISMATCH")
     if meta.get("journal_mode") != "delete":
         raise SQLiteStoreSchemaError("STORE.JOURNAL_MODE_UNSAFE")
-    if meta.get("activation_status") != "UNPUBLISHED":
-        raise SQLiteStoreSchemaError("STORE.STAGE_PUBLISHED")
+    expected_status = "SEALED" if allow_sealed else "UNPUBLISHED"
+    if meta.get("activation_status") != expected_status:
+        raise SQLiteStoreSchemaError(
+            "STORE.STAGE_NOT_SEALED"
+            if allow_sealed
+            else "STORE.STAGE_PUBLISHED"
+        )
     if "activation_digest" in meta:
         raise SQLiteStoreSchemaError("STORE.STAGE_PUBLISHED")
     if (
