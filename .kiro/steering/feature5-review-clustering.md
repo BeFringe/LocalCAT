@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v6）
+# Feature 5 评审集群与推理强度指南（采纳稿 v7）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -38,7 +38,7 @@
 
 ## 评审集群地图
 
-以下 12 个功能集群与 1 个行为保持型结构门覆盖 Task 3.3–9.6 全部剩余子任务及 5.R1/5.R2。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组；结构门只证明已批准行为的移动等价性。
+以下 12 个功能集群与 2 个行为保持型结构门覆盖 Task 3.3–9.6 全部剩余子任务及 5.R1/5.R2/5.R3。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组；结构门只证明已批准行为的移动等价性。
 
 | 集群 | 子任务 | 共享心智模型 | impl | review | 评审轮次 | 实施体量 |
 |------|--------|-------------|------|--------|---------|----------|
@@ -49,6 +49,7 @@
 | E — Divergence + upgrade | 5.10 + 5.11 | 复用 seal/activate 的显式消歧与 schema copy-switch | `high` | `high` | 1 | 小 |
 | E-R — Upgrade boundary | 5.R2 | 已批准 schema-upgrade 故障模型的等价提取 + 依赖方向守卫 | `high` | `high` | 1 | 中 |
 | F — Export + snapshot | 5.12 + 5.13 + 5.14 | 任意路径导出与配置快照发布协议 + 崩溃恢复矩阵 | `high` | `xhigh` | 1 | 中 |
+| F-R — Snapshot artifact boundary | 5.R3 | 已批准 export/refresh/recovery 命名空间故障模型的纯等价提取 + mutation-proof 依赖守卫 | `high` | `high` | 1 | 大 |
 | G — Facade integration | 6.1 + 6.2 + 6.3 | 双状态激活/not 分支 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
 | H — Retrieval pipeline | 7.1 + 7.2 + 7.3 | exact/context 分类 → fuzzy 评分 → 多资源聚合排序/部分失败 | `high` | `high` | 1 | 中 |
 | I — Capability gate C | 7.4 + 7.5 | 独立 CONTEXT/FUZZY 可用性门 + 证据聚合且不撤销 exact/save | `medium` | `high` | 1 | 小 |
@@ -56,7 +57,7 @@
 | K — Fault injection | 9.1 + 9.2 | 全量迁移/激活/快照故障矩阵，验证 D+F+E 的负空间 | `high` | `xhigh` | 1 | 中 |
 | L — Evidence + release | 9.3 + 9.4 + 9.5 + 9.6 | 跨域能力矩阵 + 兼容回归 + 86 条覆盖映射 + 完整发布 | `medium` | `xhigh` | 1 | 中 |
 
-复审数量从逐小节 38 次降至 12 个功能集群复审加 1 个等价性结构门。
+复审数量从逐小节 38 次降至 12 个功能集群复审加 2 个等价性结构门。
 
 ---
 
@@ -74,6 +75,8 @@
 **E-R — Upgrade boundary：** Cluster E 已先以原始模块形态闭合功能和故障矩阵；5.R2 只在此稳定基线上提取 schema-upgrade copy/artifact 数据面。实施和复审均使用 `high`，因为移动横跨 `tm_sqlite_store.py` 和 `tm_migration.py` 的 private seam，但不重新设计 coordinator 状态机。验收必须重用已批准 Cluster E 断言，检查新模块不反向导入两个 owner，并证明 patch/fault-injection seam、错误码、cleanup 顺序和磁盘效果不变。异常分支简化不属于该门，避免同时改变布局与行为而放大回归风险。
 
 **F — Export + snapshot：** 5.12 不改变活动 binding，5.13/5.14 才改变配置快照；两者共享 temporary/fsync/replace/manifest 协议但发布后果不同。复审必须分别证明任意路径损坏不污染 authority，以及 issued receipt 恢复只能完成、取消或进入 divergence。
+
+**F-R — Snapshot artifact boundary：** Cluster F 先以原模块形态闭合发布/恢复状态机和命名空间故障矩阵；5.R3 才把 deterministic artifact family、root→parent no-follow dirfd 绑定、strict single-link identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码移入独立模块。`tm_migration.py` 仍拥有对外导出/刷新编排与成败 outcome，`tm_snapshot_recovery.py` 仍拥有 receipt 分类、reconciliation 和 terminal replay 状态机，`tm_sqlite_store.py` 仍独占 ledger/binding/transaction/coordinator 权威。实施和复审均使用 `high`；必须保留全部 error code、fault seam、mutation 顺序、durable handoff 生命周期和磁盘效果。异常分支简化属于正交治理，禁止混入该门。
 
 **G — Facade integration：** 导入接缝切换、exact 查询切换和三态兼容验证。6.3 不是新代码，是回归断言。双状态分支是认知成本来源。
 
@@ -139,7 +142,8 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 2. 集群共享状态机、故障模型或流水线的正向与失败分支已经实现，不以“后续任务会补”作为当前不变量；
 3. task-focused mechanical checks 全绿，且不存在未分类的新失败；
 4. 主 agent 提供 cluster base commit、tip commit、累计 diff、共享不变量清单、故障矩阵和已知外部基线；
-5. reviewer 使用表中 `review` 强度，对累计补丁和最终状态做一次对抗性复审。
+5. 含 file replace/rename/delete 或 journal recovery 的集群提供 mutation-proof ledger：每个变更点都列出 authority snapshot、parent/path identity、最后一次 pre-mutation 复证、线性化变更、post-mutation durability/proof 和 crash replay 结果；任一格缺失都表明不变量尚未闭合；
+6. reviewer 使用表中 `review` 强度，对累计补丁和最终状态做一次对抗性复审。
 
 复审发现问题后只实施 concrete findings，形成独立修正提交并复用同一 reviewer 心智模型做定点复验。复审通过后，主 agent 才运行一次 fresh full suite 并记录集群验证证据；不在每个子任务重复 full suite + adversarial review。
 
@@ -153,6 +157,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v7 | 2026-08-11 | Cluster F 闭合后增加 5.R3/F-R 纯等价快照 artifact 边界提取；将 mutation-proof ledger 加入所有文件发布/恢复集群的闭合门，异常分支简化保持正交。 |
 | v6 | 2026-08-10 | 在 Cluster E 闭合后、Cluster F 开始前增加 5.R2/E-R 等价性结构门；提取 schema-upgrade copy/artifact 数据面，保留 coordinator/migration 权威与异常分支语义。 |
 | v5 | 2026-08-09 | 在 5.9 后加入行为保持型结构门 5.R1，将 activation/recovery 提取纳入 Cluster D 的同一次最终复审；保持既有功能编号、故障模型和复审强度。 |
 | v4 | 2026-08-09 | 按实际阻力细分 Cluster D 实施强度：5.5/5.7 保持 xhigh，5.6/5.8/5.9 调整为 high；不改变共享不变量与复审时机。 |

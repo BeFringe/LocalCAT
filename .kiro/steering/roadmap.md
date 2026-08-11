@@ -43,7 +43,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
   - `LocalCAT-logo-silver.png` 与竖版“…”宽度维护。
 - **Now — Feature 5**:
   - SQLite TM、版本化记录、多译文/context/provenance；
-  - JSONL 安全迁移与兼容导出；
+  - JSONL 安全迁移、兼容导出与可崩溃恢复的快照发布；
   - Levenshtein 和 Dice scorer；
   - exact → context → fuzzy 的确定性排序；
   - 供 TM、项目搜索和术语搜索消费的 Match Case / Whole Word 兼容内核。
@@ -76,6 +76,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 ## Boundary Strategy
 
 - **Feature 5 shared seam**: `SearchOptions(match_case, whole_word)`、文本规范化/词界判断和稳定 hit offsets；UI/Glossary/TM 只消费，不复制实现。
+- **Durable snapshot seam**: export/refresh/recovery 以 durable receipt/handoff 为状态权威，文件变更必须绑定完整 parent chain 与 exact inode identity，在最后一次 mutation 前复证 source/destination，并以 post-mutation fsync/身份复核和冷恢复共同闭合；任何调用方不得以相同字节代替该命名空间证明。
 - **CJK Whole Word**: 对纯 CJK 查询不施加额外词界过滤，结果与未勾选 Whole Word 的连续文本匹配相同；该退化必须是明示、版本化且有 golden cases 的兼容语义。
 - **Qt Stage A**: 搜索 UI、结果模型和导航可以先实施，但基础搜索只有在 Feature 5 legacy matcher 达到 `BASIC_VALIDATED` 后才能完成验收；两个高级选项保持 disabled，且不得写入持久记录。
 - **Qt Stage B**: 合并 Feature 5 后启用 Match Case / Whole Word，并用跨 source/target/speaker/术语 fixture 验证一致结果。
@@ -113,7 +114,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 
 ## Merge Contract
 
-1. **Feature 5 gate**：Levenshtein/Dice、exact parity、SQLite migration、Match Case / Whole Word Unicode/CJK fixtures、无 Qt import 全部通过。
+1. **Feature 5 gate**：Levenshtein/Dice、exact parity、SQLite migration、snapshot namespace/crash-recovery 故障矩阵、Match Case / Whole Word Unicode/CJK fixtures、无 Qt import 全部通过。
 2. **Qt gate**：单 JSON 的基础搜索/预处理/术语 CRUD、raw speaker、silver logo 和 disabled 选项通过；既有 JSON/TXT、TMX/CSV/XLSX 资源、Excel 三态回归保持。
 3. **Merge direction**：`feature5` 从最新已验收 `ui-mvp` 基线分叉；活动期间的共享更新通过 merge/rebase 继承，不重建等价提交。Feature 5 通过独立 gate 后合并回 `ui-mvp`，再由 UI 线新增 Controller adapter 并启用两个控件。
 4. **Integration anchor**：相同 `SearchOptions` 对项目 source/target/speaker、术语和 TM 候选产生一致的 case/word-boundary 语义；exact TM 与 legacy Excel 输出不变。
