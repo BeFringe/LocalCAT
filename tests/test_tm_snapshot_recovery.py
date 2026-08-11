@@ -20,6 +20,8 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +32,10 @@ from unittest.mock import patch
 import tm_migration
 import tm_snapshot_recovery
 import tm_sqlite_store
+from tm_activation_journal import (
+    _activation_terminal_path,
+    _activation_terminal_temp_path,
+)
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     CanonicalResourceIdentity,
@@ -228,22 +234,111 @@ def _current_receipt(
     )
 
 
+def _prior_state(
+    path: Path,
+) -> tuple[tuple[int, int] | None, str | None, bool]:
+    """One (identity, digest, absent) prior-entry record for a path."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return (None, None, True)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return ((observed.st_dev, observed.st_ino), digest, False)
+
+
+def _identity_of(path: Path) -> tuple[int, int]:
+    """The exact device/inode identity of one existing entry."""
+
+    observed = os.lstat(path)
+    return (observed.st_dev, observed.st_ino)
+
+
 def _register_refresh(
     store: SQLiteTMStore,
     receipt: SnapshotReceipt,
+    *,
+    jsonl_temp_identity: tuple[int, int] | None = None,
+    manifest_temp_identity: tuple[int, int] | None = None,
+    payload: bytes = _NEW_JSONL,
 ) -> None:
+    """Register one issued refresh with a durable handoff journal.
+
+    The registration durably records the current configured pair as the
+    prior pair (digest+identity or explicit absence) and the exclusive
+    deterministic temporary identities.  The deterministic temporaries
+    are created with the exact bytes the recovery protocol expects (the
+    receipt JSONL payload and the deterministic adjacent manifest), so
+    registration's descriptor-relative temp proof passes and recovery
+    cleanup can prove and remove them by digest plus handoff identity.
+    Callers that need a foreign/same-byte entry later replace the inode.
+    """
+
     revision = store.capture_export_snapshot().revision
+    identity = store._coordinator._resource_identity
+    paths = _paths(identity)
+    prior_jsonl = _prior_state(identity.configured_jsonl_path)
+    prior_manifest = _prior_state(identity.snapshot_manifest_path)
+    if jsonl_temp_identity is None:
+        paths.jsonl_temp.write_bytes(payload)
+        jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+    if manifest_temp_identity is None:
+        paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+        manifest_temp_identity = _identity_of(paths.manifest_temp)
     store.register_issued_refresh_receipt(
         receipt,
         expected_generation=revision.generation,
+        jsonl_temp_identity=jsonl_temp_identity,
+        manifest_temp_identity=manifest_temp_identity,
+        artifact_parent_identity=_identity_of(
+            identity.configured_jsonl_path.parent
+        ),
+        prior_jsonl_identity=prior_jsonl[0],
+        prior_jsonl_digest=prior_jsonl[1],
+        prior_jsonl_absent=prior_jsonl[2],
+        prior_manifest_identity=prior_manifest[0],
+        prior_manifest_digest=prior_manifest[1],
+        prior_manifest_absent=prior_manifest[2],
     )
 
 
 def _write_new_pair(identity: Any, receipt: SnapshotReceipt, payload: bytes) -> None:
-    identity.configured_jsonl_path.write_bytes(payload)
-    identity.snapshot_manifest_path.write_bytes(
-        _manifest_bytes_for(receipt)
+    """Publish one full new pair exactly like the crashed publisher.
+
+    The deterministic temporary entries are renamed into the final
+    slots so the final inodes are the handed-off temp inodes (rename is
+    inode-preserving); writing fresh files here would simulate a
+    same-byte foreign inode at the final slot and must fail closed.
+    """
+
+    paths = _paths(identity)
+    paths.jsonl_temp.write_bytes(payload)
+    paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+    os.replace(paths.jsonl_temp, identity.configured_jsonl_path)
+    os.replace(
+        paths.manifest_temp,
+        identity.snapshot_manifest_path,
     )
+
+
+def _publish_registered_pair(
+    destination: Path,
+    receipt: SnapshotReceipt,
+    payload: bytes,
+) -> None:
+    """Rename a registered export's deterministic temps into the final
+    slots exactly like the crashed publisher.
+
+    The final inodes are then the handed-off temp inodes (rename is
+    inode-preserving); writing fresh files at the final slots would
+    simulate a same-byte foreign inode and must fail closed.
+    """
+
+    paths = _export_artifact_paths(destination)
+    paths.jsonl_temp.write_bytes(payload)
+    paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+    os.replace(paths.jsonl_temp, paths.destination)
+    os.replace(paths.manifest_temp, paths.manifest)
 
 
 def _ledger_rows(
@@ -289,6 +384,21 @@ def _issued_refresh_snapshot_id(store_path: Path) -> str:
         connection.close()
     if row is None:
         raise AssertionError("issued refresh receipt row is missing")
+    return str(row[0])
+
+
+def _refresh_snapshot_id(store_path: Path) -> str:
+    connection = sqlite3.connect(store_path)
+    try:
+        row = connection.execute(
+            "SELECT snapshot_id FROM tm_snapshot_receipt "
+            "WHERE snapshot_id LIKE 'snapshot.refresh.%' "
+            "ORDER BY snapshot_id"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise AssertionError("refresh receipt row is missing")
     return str(row[0])
 
 
@@ -472,6 +582,102 @@ def _simulate_crash(
     raise AssertionError(f"refresh did not crash at {crash_at!r}")
 
 
+_RECOVERY_CHILD_SCRIPT = r'''
+import json
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import tm_snapshot_recovery
+from tm_contracts import CanonicalResourceIdentity, MutableStageRef
+from tm_sqlite_store import SQLiteTMStore
+
+mode = sys.argv[1]
+resource_id = sys.argv[2]
+configured = sys.argv[3]
+staged_db = sys.argv[4]
+manifest_temp = sys.argv[5]
+marker = sys.argv[6]
+
+stage = MutableStageRef(
+    stage_id="stage." + resource_id,
+    resource_identity=CanonicalResourceIdentity.from_configured_jsonl(
+        resource_id,
+        Path(configured),
+    ),
+    staged_db_path=Path(staged_db),
+    manifest_temp_path=Path(manifest_temp),
+)
+with patch("tm_sqlite_store._probe_fts5", return_value=False):
+    store = SQLiteTMStore(stage, canonical_store_id="store.primary")
+if mode == "crash":
+    original_capture = tm_snapshot_recovery._recovery_parent_capture
+
+    def capture_then_die(parent, name, asset_kind):
+        result = original_capture(parent, name, asset_kind)
+        Path(marker).write_text(asset_kind, encoding="utf-8")
+        os._exit(86)
+
+    with patch(
+        "tm_snapshot_recovery._recovery_parent_capture",
+        side_effect=capture_then_die,
+    ):
+        store.recover_configured_refresh()
+    os._exit(0)
+first = store.recover_configured_refresh()
+second = store.recover_configured_refresh()
+observed = os.lstat(stage.resource_identity.snapshot_manifest_path)
+print(
+    json.dumps(
+        {
+            "first_state": first.state,
+            "first_receipts": [
+                [item.snapshot_id, item.state, list(item.diagnostics)]
+                for item in first.receipts
+            ],
+            "second_state": second.state,
+            "second_receipts": [
+                [item.snapshot_id, item.state, list(item.diagnostics)]
+                for item in second.receipts
+            ],
+            "manifest_device": observed.st_dev,
+            "manifest_inode": observed.st_ino,
+        }
+    )
+)
+'''
+
+
+def _run_recovery_child(
+    stage: Any,
+    marker: Path,
+    mode: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run one recovery in a real child process over the same stage."""
+
+    identity = stage.resource_identity
+    repository_root = Path(__file__).resolve().parent.parent
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _RECOVERY_CHILD_SCRIPT,
+            mode,
+            identity.resource_id,
+            str(identity.configured_jsonl_path),
+            str(stage.staged_db_path),
+            str(stage.manifest_temp_path),
+            str(marker),
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
 def _assert_recovery_outcome_shape(
     testcase: unittest.TestCase,
     outcome: RefreshRecoveryOutcome,
@@ -550,7 +756,10 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
             prior_manifest = identity.snapshot_manifest_path.read_bytes()
 
             outcome = store.recover_configured_refresh()
@@ -1337,6 +1546,138 @@ class TMRecoveryCrashBoundaryTests(unittest.TestCase):
             ):
                 self.assertFalse(artifact.exists(), artifact.name)
 
+    def test_process_death_after_reconstruction_temp_fsync_replays_to_completion(
+        self,
+    ) -> None:
+        """Recovery-within-recovery process death (reviewer P1 regression).
+
+        The first recovery runs in a real child process and aborts via
+        ``os._exit`` (bypassing every ``finally``) immediately after the
+        reconstruction manifest temp has been re-proven/fsynced and
+        before the manifest replace or receipt completion.  A fresh
+        child-process recovery must reuse the exact same handed-off
+        inode for the atomic replace and complete deterministically
+        (second recovery NOOP, no issued/handoff wedge, canonical
+        generation and records preserved) instead of permanently
+        BLOCKing on ``RECOVERY.ARTIFACT_UNPROVEN``.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="jsonl")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            paths = _paths(identity)
+            meta_key = "artifact_handoff." + snapshot_id
+            handoff_value = _meta_value(stage.staged_db_path, meta_key)
+            self.assertIsNotNone(handoff_value)
+            assert handoff_value is not None
+            handoff = json.loads(handoff_value)
+            handed_off_identity = (
+                handoff["manifest_temp_device"],
+                handoff["manifest_temp_inode"],
+            )
+            self.assertEqual(
+                _identity_of(paths.manifest_temp),
+                handed_off_identity,
+            )
+            canonical_before = store.capture_export_snapshot().revision
+            prior_manifest = identity.snapshot_manifest_path.read_bytes()
+            marker = root / "reconstruction-crash.marker"
+
+            crashed = _run_recovery_child(stage, marker, mode="crash")
+
+            self.assertEqual(
+                crashed.returncode,
+                86,
+                msg=crashed.stdout + crashed.stderr,
+            )
+            self.assertEqual(
+                marker.read_text(encoding="utf-8"),
+                "RECOVERY_MANIFEST_TEMP",
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "issued",
+            )
+            self.assertIsNotNone(
+                _meta_value(stage.staged_db_path, meta_key)
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                prior_manifest,
+            )
+            self.assertEqual(
+                _identity_of(paths.manifest_temp),
+                handed_off_identity,
+            )
+
+            replayed = _run_recovery_child(stage, marker, mode="finish")
+
+            self.assertEqual(
+                replayed.returncode,
+                0,
+                msg=replayed.stdout + replayed.stderr,
+            )
+            facts = json.loads(replayed.stdout)
+            self.assertEqual(facts["first_state"], "COMPLETED")
+            self.assertEqual(
+                facts["first_receipts"],
+                [[snapshot_id, "COMPLETED", []]],
+            )
+            self.assertEqual(facts["second_state"], "NOOP")
+            self.assertEqual(facts["second_receipts"], [])
+            self.assertEqual(
+                (facts["manifest_device"], facts["manifest_inode"]),
+                handed_off_identity,
+            )
+            row = _refresh_rows(
+                stage.staged_db_path,
+                identity.configured_jsonl_path,
+            )[0]
+            issued_receipt = SnapshotReceipt(
+                snapshot_id=str(row[0]),
+                resource_id=str(row[1]),
+                canonical_store_id=str(row[2]),
+                exported_revision=int(str(row[3])),
+                jsonl_digest=str(row[4]),
+                record_count=int(str(row[5])),
+                format_version=str(row[6]),
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                _manifest_bytes_for(issued_receipt),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNone(
+                _meta_value(stage.staged_db_path, meta_key)
+            )
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                snapshot_id,
+            )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
+            )
+            canonical_after = store.capture_export_snapshot().revision
+            self.assertEqual(canonical_after.generation, canonical_before.generation)
+            self.assertEqual(canonical_after.record_count, canonical_before.record_count)
+            self.assertEqual(canonical_after.head_revision, canonical_before.head_revision)
+
     def test_crash_after_manifest_replace_completes_on_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1370,7 +1711,9 @@ class TMRecoveryCrashBoundaryTests(unittest.TestCase):
                 "0",
             )
 
-    def test_crash_after_complete_commit_reports_success(self) -> None:
+    def test_crash_after_complete_commit_fails_closed_then_recovery_finishes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1398,9 +1741,13 @@ class TMRecoveryCrashBoundaryTests(unittest.TestCase):
             ):
                 result = service.refresh_configured_snapshot(store)
 
-            self.assertIsInstance(result, ExportReport)
-            assert isinstance(result, ExportReport)
-            self.assertEqual(result.exported_count, 6)
+            self.assertIsInstance(result, ExportFailure)
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.stage, "REFRESH.LEDGER")
+            self.assertIn(
+                "EXPORT.LEDGER_UNCLEAN",
+                tuple(d.code for d in result.diagnostics),
+            )
             refresh_rows = _refresh_rows(
                 stage.staged_db_path,
                 identity.configured_jsonl_path,
@@ -1411,15 +1758,29 @@ class TMRecoveryCrashBoundaryTests(unittest.TestCase):
                 _binding_row(stage.staged_db_path)[4],
                 str(refresh_rows[0][0]),
             )
-            self.assertEqual(
-                store.source_binding_monitor.observe().state,
-                SourceBindingState.VERIFIED_CURRENT,
-            )
             fresh = _fresh_store(stage)
             replay = fresh.recover_configured_refresh()
             _assert_recovery_outcome_shape(self, replay)
-            self.assertIs(replay.state, RefreshRecoveryState.NOOP)
+            self.assertIs(replay.state, RefreshRecoveryState.COMPLETED)
+            self.assertEqual(
+                replay.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        str(refresh_rows[0][0]),
+                        RefreshRecoveryState.COMPLETED,
+                    ),
+                ),
+            )
             self.assertEqual(replay.diagnostics, ())
+            self.assertEqual(
+                fresh.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+            second = fresh.recover_configured_refresh()
+            self.assertIs(second.state, RefreshRecoveryState.NOOP)
+            self.assertEqual(second.diagnostics, ())
+            follow_up = service.refresh_configured_snapshot(fresh)
+            self.assertIsInstance(follow_up, ExportReport)
 
     def test_observe_recovers_before_misclassifying_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1492,7 +1853,10 @@ class TMRecoveryIdempotencyTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
 
             first = store.recover_configured_refresh()
             second = store.recover_configured_refresh()
@@ -1522,7 +1886,10 @@ class TMRecoveryIdempotencyTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
 
             first = store.recover_configured_refresh()
             fresh = _fresh_store(stage)
@@ -1599,7 +1966,19 @@ class TMRecoveryExportTests(unittest.TestCase):
         store: SQLiteTMStore,
         destination: Path,
         payload: bytes,
+        *,
+        jsonl_temp_identity: tuple[int, int] | None = None,
+        manifest_temp_identity: tuple[int, int] | None = None,
     ) -> SnapshotReceipt:
+        """Register one issued export with a durable handoff journal.
+
+        The deterministic temporaries are created with the exact bytes
+        the recovery protocol expects (the exported JSONL payload and
+        the deterministic adjacent manifest) so registration's
+        descriptor-relative temp proof passes and recovery cleanup can
+        prove and remove them by digest plus handoff identity.
+        """
+
         paths = _export_artifact_paths(destination)
         revision = store.capture_export_snapshot().revision
         receipt = SnapshotReceipt(
@@ -1610,11 +1989,28 @@ class TMRecoveryExportTests(unittest.TestCase):
             jsonl_digest=hashlib.sha256(payload).hexdigest(),
             record_count=revision.record_count,
         )
+        prior_jsonl = _prior_state(paths.destination)
+        prior_manifest = _prior_state(paths.manifest)
+        if jsonl_temp_identity is None:
+            paths.jsonl_temp.write_bytes(payload)
+            jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+        if manifest_temp_identity is None:
+            paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+            manifest_temp_identity = _identity_of(paths.manifest_temp)
         store.register_issued_export_receipt(
             receipt,
             destination_jsonl_path=paths.destination,
             destination_manifest_path=paths.manifest,
             expected_generation=revision.generation,
+            jsonl_temp_identity=jsonl_temp_identity,
+            manifest_temp_identity=manifest_temp_identity,
+            artifact_parent_identity=_identity_of(destination.parent),
+            prior_jsonl_identity=prior_jsonl[0],
+            prior_jsonl_digest=prior_jsonl[1],
+            prior_jsonl_absent=prior_jsonl[2],
+            prior_manifest_identity=prior_manifest[0],
+            prior_manifest_digest=prior_manifest[1],
+            prior_manifest_absent=prior_manifest[2],
         )
         return receipt
 
@@ -1628,8 +2024,8 @@ class TMRecoveryExportTests(unittest.TestCase):
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             receipt = self._register_export(store, destination, _NEW_JSONL)
-            paths.destination.write_bytes(_NEW_JSONL)
-            paths.manifest.write_bytes(_manifest_bytes_for(receipt))
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
 
             outcome = store.recover_configured_refresh()
 
@@ -1667,7 +2063,7 @@ class TMRecoveryExportTests(unittest.TestCase):
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             receipt = self._register_export(store, destination, _NEW_JSONL)
-            paths.destination.write_bytes(_NEW_JSONL)
+            os.replace(paths.jsonl_temp, paths.destination)
 
             outcome = store.recover_configured_refresh()
 
@@ -1699,13 +2095,16 @@ class TMRecoveryExportTests(unittest.TestCase):
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             first = self._register_export(store, destination, _NEW_JSONL)
-            paths.destination.write_bytes(_NEW_JSONL)
-            paths.manifest.write_bytes(_manifest_bytes_for(first))
+            _publish_registered_pair(destination, first, _NEW_JSONL)
+
             revision = store.capture_export_snapshot().revision
             store.complete_issued_export_receipt(
                 first.snapshot_id,
                 expected_generation=revision.generation,
+                jsonl_identity=_identity_of(paths.destination),
+                manifest_identity=_identity_of(paths.manifest),
             )
+            store.recover_configured_refresh()
             second = self._register_export(store, destination, b'{"source":"later"}\n')
 
             outcome = store.recover_configured_refresh()
@@ -1747,13 +2146,16 @@ class TMRecoveryExportTests(unittest.TestCase):
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             first = self._register_export(store, destination, _NEW_JSONL)
-            paths.destination.write_bytes(_NEW_JSONL)
-            paths.manifest.write_bytes(_manifest_bytes_for(first))
+            _publish_registered_pair(destination, first, _NEW_JSONL)
+
             revision = store.capture_export_snapshot().revision
             store.complete_issued_export_receipt(
                 first.snapshot_id,
                 expected_generation=revision.generation,
+                jsonl_identity=_identity_of(paths.destination),
+                manifest_identity=_identity_of(paths.manifest),
             )
+            store.recover_configured_refresh()
             second = self._register_export(
                 store,
                 destination,
@@ -1898,7 +2300,22 @@ class TMRecoveryExportTests(unittest.TestCase):
             link = (root / "link").resolve()
             link.symlink_to(real)
             destination = link / "out.jsonl"
-            receipt = self._register_export(store, destination, _NEW_JSONL)
+            receipt = _current_receipt(
+                store,
+                prefix="snapshot.export.",
+                payload=_NEW_JSONL,
+            )
+            _insert_ledger_row(
+                stage.staged_db_path,
+                receipt,
+                destination_jsonl_path=destination,
+                destination_manifest_path=(
+                    destination.with_name(
+                        f"{destination.name}.localcat-snapshot.json"
+                    )
+                ),
+                status="issued",
+            )
 
             outcome = store.recover_configured_refresh()
 
@@ -2019,8 +2436,8 @@ class TMRecoveryExportTests(unittest.TestCase):
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             receipt = self._register_export(store, destination, _NEW_JSONL)
-            paths.destination.write_bytes(_NEW_JSONL)
-            paths.manifest.write_bytes(_manifest_bytes_for(receipt))
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
             original_complete = store.complete_issued_export_receipt
             swapped = False
 
@@ -2083,12 +2500,19 @@ class TMRecoveryExportTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             refresh = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, refresh)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
             destination = self._destination(root)
             paths = _export_artifact_paths(destination)
             export = self._register_export(store, destination, b'{"source":"exported"}\n')
-            paths.destination.write_bytes(b'{"source":"exported"}\n')
-            paths.manifest.write_bytes(_manifest_bytes_for(export))
+            _publish_registered_pair(
+                destination,
+                export,
+                b'{"source":"exported"}\n',
+            )
+
 
             outcome = store.recover_configured_refresh()
 
@@ -2140,13 +2564,32 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.COMPLETED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_CONFLICT",),
+                    ),
+                ),
+            )
             self.assertIn("RECOVERY.ARTIFACT_CONFLICT", outcome.diagnostics)
             self.assertEqual(paths.jsonl_temp.read_bytes(), foreign)
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
                 "completed",
             )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+            replay = store.recover_configured_refresh()
+            self.assertIs(replay.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(paths.jsonl_temp.read_bytes(), foreign)
 
     def test_foreign_recovery_copy_never_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2156,7 +2599,10 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
             paths = _paths(identity)
             foreign = b"foreign recovery bytes\n"
             paths.jsonl_recovery.write_bytes(foreign)
@@ -2164,13 +2610,32 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.COMPLETED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_CONFLICT",),
+                    ),
+                ),
+            )
             self.assertIn("RECOVERY.ARTIFACT_CONFLICT", outcome.diagnostics)
             self.assertEqual(paths.jsonl_recovery.read_bytes(), foreign)
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
                 "completed",
             )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+            replay = store.recover_configured_refresh()
+            self.assertIs(replay.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(paths.jsonl_recovery.read_bytes(), foreign)
 
     def test_foreign_manifest_temp_blocks_reconstruction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2223,7 +2688,9 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             _register_refresh(store, receipt)
             identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
             paths = _paths(identity)
-            paths.jsonl_temp.write_bytes(_NEW_JSONL)
+            foreign = paths.jsonl_temp.with_name("foreign-same-bytes.jsonl")
+            foreign.write_bytes(_NEW_JSONL)
+            os.replace(foreign, paths.jsonl_temp)
             temp_before = os.lstat(paths.jsonl_temp)
             manifest_before = identity.snapshot_manifest_path.read_bytes()
 
@@ -2266,6 +2733,71 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
                 "0",
             )
 
+    def test_missing_handed_off_manifest_temp_blocks_closed(self) -> None:
+        """Absent durable handed-off temp fails closed without recreation.
+
+        A JSONL-only published state whose deterministic manifest temp
+        is missing cannot prove the durable handoff inode, so
+        reconstruction must fail closed with
+        ``RECOVERY.MANIFEST_TEMP_UNPROVEN`` and must never create an
+        unjournaled replacement; the destination, receipt and handoff
+        stay untouched for a later replay.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            receipt = _current_receipt(
+                store,
+                prefix="snapshot.refresh.",
+                payload=_NEW_JSONL,
+            )
+            _register_refresh(store, receipt)
+            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            prior_manifest = identity.snapshot_manifest_path.read_bytes()
+            paths = _paths(identity)
+            paths.manifest_temp.unlink()
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.MANIFEST_TEMP_UNPROVEN",),
+                    ),
+                ),
+            )
+            self.assertFalse(paths.manifest_temp.exists())
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                prior_manifest,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
+            )
+
     def test_same_byte_foreign_manifest_temp_blocks_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2277,7 +2809,11 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
             paths = _paths(identity)
             foreign = _manifest_bytes_for(receipt)
-            paths.manifest_temp.write_bytes(foreign)
+            replacement = paths.manifest_temp.with_name(
+                "foreign-same-bytes.manifest"
+            )
+            replacement.write_bytes(foreign)
+            os.replace(replacement, paths.manifest_temp)
             temp_before = os.lstat(paths.manifest_temp)
             manifest_before = identity.snapshot_manifest_path.read_bytes()
 
@@ -2421,6 +2957,169 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
                 "0",
             )
 
+    def test_terminal_replay_different_byte_foreign_temp_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            paths = _paths(identity)
+            foreign = b"foreign terminal temp bytes\n"
+            paths.jsonl_temp.write_bytes(foreign)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_CONFLICT",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.ARTIFACT_CONFLICT",
+                outcome.diagnostics,
+            )
+            self.assertEqual(paths.jsonl_temp.read_bytes(), foreign)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
+    def test_terminal_replay_different_byte_foreign_recovery_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            paths = _paths(identity)
+            foreign = b"foreign terminal recovery bytes\n"
+            paths.jsonl_recovery.write_bytes(foreign)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_CONFLICT",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.ARTIFACT_CONFLICT",
+                outcome.diagnostics,
+            )
+            self.assertEqual(paths.jsonl_recovery.read_bytes(), foreign)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
+    def test_terminal_replay_same_byte_foreign_recovery_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            paths = _paths(identity)
+            foreign = paths.jsonl_recovery.with_name("foreign-same-bytes")
+            foreign.write_bytes(_PRIOR_JSONL)
+            os.replace(foreign, paths.jsonl_recovery)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_UNPROVEN",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.ARTIFACT_UNPROVEN",
+                outcome.diagnostics,
+            )
+            self.assertEqual(paths.jsonl_recovery.read_bytes(), _PRIOR_JSONL)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
     def test_same_byte_foreign_swap_at_complete_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2492,7 +3191,10 @@ class TMRecoveryServiceTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
 
             outcome = service.recover_configured_refresh(store)
 
@@ -2556,7 +3258,10 @@ class TMRecoverySerializationTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
 
             with store.configured_refresh_reservation():
                 outcome = store.recover_configured_refresh()
@@ -2575,7 +3280,10 @@ class TMRecoverySerializationTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
             held = threading.Event()
             release = threading.Event()
             holder_error: list[Exception] = []
@@ -2626,7 +3334,10 @@ class TMRecoveryCanonicalInvariantTests(unittest.TestCase):
             _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             receipt = _current_receipt(store, prefix="snapshot.refresh.", payload=_NEW_JSONL)
             _register_refresh(store, receipt)
-            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            os.replace(
+                _paths(identity).jsonl_temp,
+                identity.configured_jsonl_path,
+            )
             before_snapshot = store.capture_export_snapshot()
             before_records = _record_dump(stage.staged_db_path)
             before_head = _meta_value(stage.staged_db_path, "head_revision")
@@ -2646,6 +3357,2099 @@ class TMRecoveryCanonicalInvariantTests(unittest.TestCase):
             self.assertEqual(
                 store.coordinator.current_generation,
                 before_generation,
+            )
+
+
+class TMClusterFRegressionTests(unittest.TestCase):
+    """Cluster F regressions: durable handoff, prior records, closure."""
+
+    def _destination(self, root: Path) -> Path:
+        destination = (root / "exports" / "out.jsonl").resolve()
+        destination.parent.mkdir(parents=True)
+        return destination
+
+
+    def _register_export(
+        self,
+        store: SQLiteTMStore,
+        destination: Path,
+        payload: bytes,
+    ) -> SnapshotReceipt:
+        """Register one issued export with a durable handoff journal.
+
+        The deterministic temporaries are created with the exact bytes
+        the recovery protocol expects (the exported JSONL payload and
+        the deterministic adjacent manifest) so registration's
+        descriptor-relative temp proof passes and recovery cleanup can
+        prove and remove them by digest plus handoff identity.
+        """
+
+        paths = _export_artifact_paths(destination)
+        revision = store.capture_export_snapshot().revision
+        receipt = SnapshotReceipt(
+            snapshot_id=(
+                "snapshot.export."
+                + hashlib.sha256(payload).hexdigest()[:12]
+            ),
+            resource_id=revision.resource_id,
+            canonical_store_id=revision.canonical_store_id,
+            exported_revision=revision.head_revision,
+            jsonl_digest=hashlib.sha256(payload).hexdigest(),
+            record_count=revision.record_count,
+        )
+        prior_jsonl = _prior_state(paths.destination)
+        prior_manifest = _prior_state(paths.manifest)
+        paths.jsonl_temp.write_bytes(payload)
+        jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+        paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+        manifest_temp_identity = _identity_of(paths.manifest_temp)
+        store.register_issued_export_receipt(
+            receipt,
+            destination_jsonl_path=paths.destination,
+            destination_manifest_path=paths.manifest,
+            expected_generation=revision.generation,
+            jsonl_temp_identity=jsonl_temp_identity,
+            manifest_temp_identity=manifest_temp_identity,
+            artifact_parent_identity=_identity_of(destination.parent),
+            prior_jsonl_identity=prior_jsonl[0],
+            prior_jsonl_digest=prior_jsonl[1],
+            prior_jsonl_absent=prior_jsonl[2],
+            prior_manifest_identity=prior_manifest[0],
+            prior_manifest_digest=prior_manifest[1],
+            prior_manifest_absent=prior_manifest[2],
+        )
+        return receipt
+
+    def _complete_export(
+        self,
+        store: SQLiteTMStore,
+        receipt: SnapshotReceipt,
+        destination: Path,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Complete one issued export with the live published pair."""
+
+        paths = _export_artifact_paths(destination)
+        store.complete_issued_export_receipt(
+            receipt.snapshot_id,
+            expected_generation=expected_generation,
+            jsonl_identity=_identity_of(paths.destination),
+            manifest_identity=_identity_of(paths.manifest),
+        )
+
+    def test_export_issued_to_reserved_authority_blocks_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            terminal = _activation_terminal_path(identity)
+            configured = _export_artifact_paths(
+                identity.configured_jsonl_path
+            )
+            reserved = (
+                terminal,
+                _activation_terminal_temp_path(terminal),
+                configured.jsonl_temp,
+                configured.manifest_temp,
+                configured.jsonl_recovery,
+                configured.manifest_recovery,
+            )
+            for destination in reserved:
+                with self.subTest(destination=destination.name):
+                    manifest = destination.with_name(
+                        f"{destination.name}.localcat-snapshot.json"
+                    )
+                    revision = store.capture_export_snapshot().revision
+                    receipt = SnapshotReceipt(
+                        snapshot_id=(
+                            "snapshot.export."
+                            + hashlib.sha256(
+                                destination.name.encode("utf-8")
+                            ).hexdigest()[:24]
+                        ),
+                        resource_id=revision.resource_id,
+                        canonical_store_id=revision.canonical_store_id,
+                        exported_revision=revision.head_revision,
+                        jsonl_digest=hashlib.sha256(
+                            _NEW_JSONL
+                        ).hexdigest(),
+                        record_count=revision.record_count,
+                    )
+                    _insert_ledger_row(
+                        stage.staged_db_path,
+                        receipt,
+                        destination_jsonl_path=destination,
+                        destination_manifest_path=manifest,
+                        status="issued",
+                    )
+                    outcome = store.recover_configured_refresh()
+                    _assert_recovery_outcome_shape(self, outcome)
+                    self.assertIs(
+                        outcome.state,
+                        RefreshRecoveryState.BLOCKED,
+                    )
+                    self.assertTrue(
+                        any(
+                            result.snapshot_id == receipt.snapshot_id
+                            and result.state
+                            is RefreshRecoveryState.BLOCKED
+                            and result.diagnostics
+                            == ("RECOVERY.EXPORT_PATH_ALIASED",)
+                            for result in outcome.receipts
+                        ),
+                        outcome.receipts,
+                    )
+                    self.assertEqual(
+                        _status_for(
+                            stage.staged_db_path,
+                            receipt.snapshot_id,
+                        ),
+                        "issued",
+                    )
+
+    def test_same_byte_foreign_manifest_blocks_reconstruction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            receipt = _current_receipt(
+                store,
+                prefix="snapshot.refresh.",
+                payload=_NEW_JSONL,
+            )
+            _register_refresh(store, receipt)
+            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            prior_manifest = identity.snapshot_manifest_path.read_bytes()
+            swap = identity.snapshot_manifest_path.with_name(
+                "swap-manifest.json"
+            )
+            swap.write_bytes(prior_manifest)
+            os.replace(swap, identity.snapshot_manifest_path)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertIn(
+                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                prior_manifest,
+            )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+
+    def test_manifest_slot_absent_without_explicit_absence_never_completes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            receipt = _current_receipt(
+                store,
+                prefix="snapshot.refresh.",
+                payload=_NEW_JSONL,
+            )
+            _register_refresh(store, receipt)
+            identity.configured_jsonl_path.write_bytes(_NEW_JSONL)
+            identity.snapshot_manifest_path.unlink()
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertIn(
+                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertFalse(
+                identity.snapshot_manifest_path.exists()
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    f"artifact_handoff.{receipt.snapshot_id}",
+                )
+            )
+
+    def test_cancelled_export_prior_never_cancels_later_issued(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            revision = store.capture_export_snapshot().revision
+            first = SnapshotReceipt(
+                snapshot_id="snapshot.export.cancelled-a",
+                resource_id=revision.resource_id,
+                canonical_store_id=revision.canonical_store_id,
+                exported_revision=revision.head_revision,
+                jsonl_digest=hashlib.sha256(_NEW_JSONL).hexdigest(),
+                record_count=revision.record_count,
+            )
+            paths.destination.write_bytes(_NEW_JSONL)
+            paths.manifest.write_bytes(_manifest_bytes_for(first))
+            _insert_ledger_row(
+                stage.staged_db_path,
+                first,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                status="issued",
+            )
+            store.cancel_issued_export_receipt(
+                first.snapshot_id,
+                expected_generation=revision.generation,
+            )
+            second = SnapshotReceipt(
+                snapshot_id="snapshot.export.issued-b",
+                resource_id=revision.resource_id,
+                canonical_store_id=revision.canonical_store_id,
+                exported_revision=revision.head_revision,
+                jsonl_digest=hashlib.sha256(
+                    b'{"source":"pending"}\n'
+                ).hexdigest(),
+                record_count=revision.record_count,
+            )
+            _insert_ledger_row(
+                stage.staged_db_path,
+                second,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                status="issued",
+            )
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        second.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PAIR_UNPROVABLE",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, first.snapshot_id),
+                "cancelled",
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, second.snapshot_id),
+                "issued",
+            )
+            self.assertEqual(paths.destination.read_bytes(), _NEW_JSONL)
+            self.assertEqual(
+                paths.manifest.read_bytes(),
+                _manifest_bytes_for(first),
+            )
+
+    def test_terminal_replay_foreign_victim_inode_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            paths = _paths(identity)
+            payload = identity.configured_jsonl_path.read_bytes()
+            foreign = paths.jsonl_temp.with_name("foreign-victim.jsonl")
+            foreign.write_bytes(payload)
+            os.replace(foreign, paths.jsonl_temp)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_UNPROVEN",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.ARTIFACT_UNPROVEN",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                paths.jsonl_temp.read_bytes(),
+                payload,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
+    def test_terminal_replay_parent_symlink_blocks_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(paths.jsonl_recovery),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            real_parent = (root / "exports-real").resolve()
+            destination.parent.rename(real_parent)
+            os.symlink(real_parent, destination.parent)
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PARENT_UNSAFE",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.EXPORT_PARENT_UNSAFE",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                paths.jsonl_recovery.read_bytes(),
+                prior_jsonl,
+            )
+            self.assertEqual(
+                paths.manifest_recovery.read_bytes(),
+                prior_manifest,
+            )
+            self.assertEqual(paths.destination.read_bytes(), _NEW_JSONL)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+
+    def test_terminal_replay_identity_invalid_blocks_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute(
+                    "UPDATE tm_snapshot_receipt SET "
+                    "canonical_store_id = ? WHERE snapshot_id = ?",
+                    ("store.foreign", receipt.snapshot_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_LEDGER_IDENTITY_INVALID",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.EXPORT_LEDGER_IDENTITY_INVALID",
+                outcome.diagnostics,
+            )
+            self.assertEqual(paths.destination.read_bytes(), _NEW_JSONL)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+
+    def test_terminal_replay_fsync_failure_keeps_handoff_then_replays(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            paths = _paths(identity)
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                if artifact.exists():
+                    artifact.unlink()
+            original_fsync = tm_snapshot_recovery._fsync_artifact_parent
+            original_clear = store.clear_issued_receipt_handoff
+            events: list[str] = []
+
+            def failing_first_fsync(
+                destination: Path,
+                expected_identity: tuple[int, int] | None,
+                parent: Any = None,
+            ) -> None:
+                events.append("fsync")
+                raise OSError("injected first replay fsync failure")
+
+            def recording_clear(snapshot_id: str, **kwargs: Any) -> None:
+                events.append("clear")
+                original_clear(snapshot_id, **kwargs)
+
+            with patch(
+                "tm_snapshot_recovery._fsync_artifact_parent",
+                side_effect=failing_first_fsync,
+            ), patch.object(
+                store,
+                "clear_issued_receipt_handoff",
+                side_effect=recording_clear,
+            ):
+                first = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, first)
+            self.assertIs(first.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                first.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.IO_FAILED",),
+                    ),
+                ),
+            )
+            self.assertIn("RECOVERY.IO_FAILED", first.diagnostics)
+            self.assertEqual(events, ["fsync"])
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
+            events.clear()
+            with patch(
+                "tm_snapshot_recovery._fsync_artifact_parent",
+                side_effect=lambda destination, expected_identity, parent=None: (
+                    events.append("fsync")
+                    or original_fsync(
+                        destination,
+                        expected_identity,
+                        parent=parent,
+                    )
+                ),
+            ), patch.object(
+                store,
+                "clear_issued_receipt_handoff",
+                side_effect=recording_clear,
+            ):
+                second = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, second)
+            self.assertIs(second.state, RefreshRecoveryState.COMPLETED)
+            self.assertEqual(
+                second.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.COMPLETED,
+                    ),
+                ),
+            )
+            self.assertEqual(second.diagnostics, ())
+            self.assertEqual(events, ["fsync", "clear"])
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            follow_up = service.refresh_configured_snapshot(
+                _fresh_store(stage)
+            )
+            self.assertIsInstance(follow_up, ExportReport)
+
+    def test_export_release_fsync_failure_blocks_then_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            original_fsync = tm_snapshot_recovery._fsync_artifact_parent
+            original_clear = store.clear_issued_receipt_handoff
+            events: list[str] = []
+
+            def failing_release_fsync(
+                destination_path: Path,
+                expected_identity: tuple[int, int] | None,
+                parent: Any = None,
+            ) -> None:
+                events.append("fsync")
+                raise OSError("injected release fsync failure")
+
+            def recording_clear(snapshot_id: str, **kwargs: Any) -> None:
+                events.append("clear")
+                original_clear(snapshot_id, **kwargs)
+
+            with patch(
+                "tm_snapshot_recovery._fsync_artifact_parent",
+                side_effect=failing_release_fsync,
+            ), patch.object(
+                store,
+                "clear_issued_receipt_handoff",
+                side_effect=recording_clear,
+            ):
+                first = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, first)
+            self.assertIs(first.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                first.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_IO_FAILED",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                first.receipts[0].diagnostics,
+                ("RECOVERY.EXPORT_IO_FAILED",),
+            )
+            self.assertEqual(events, ["fsync"])
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+
+            events.clear()
+            with patch(
+                "tm_snapshot_recovery._fsync_artifact_parent",
+                side_effect=lambda destination_path, expected_identity, parent=None: (
+                    events.append("fsync")
+                    or original_fsync(
+                        destination_path,
+                        expected_identity,
+                        parent=parent,
+                    )
+                ),
+            ), patch.object(
+                store,
+                "clear_issued_receipt_handoff",
+                side_effect=recording_clear,
+            ):
+                second = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, second)
+            self.assertIs(second.state, RefreshRecoveryState.COMPLETED)
+            self.assertEqual(
+                second.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.COMPLETED,
+                    ),
+                ),
+            )
+            self.assertEqual(second.diagnostics, ())
+            self.assertEqual(events, ["fsync", "clear"])
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + receipt.snapshot_id,
+                )
+            )
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+
+    def test_terminal_handoff_replay_cleans_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            original_complete = store.complete_issued_refresh_receipt
+
+            def commit_then_raise(
+                snapshot_id: str,
+                **kwargs: Any,
+            ) -> None:
+                original_complete(snapshot_id, **kwargs)
+                raise SQLiteStoreLifecycleError(
+                    "STORE.LEDGER_UNAVAILABLE",
+                    resource_id="tm.primary",
+                    generation=0,
+                    retryable=True,
+                )
+
+            with patch.object(
+                store,
+                "complete_issued_refresh_receipt",
+                side_effect=commit_then_raise,
+            ):
+                result = service.refresh_configured_snapshot(store)
+
+            assert isinstance(result, ExportFailure)
+            snapshot_id = _refresh_snapshot_id(stage.staged_db_path)
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    f"artifact_handoff.{snapshot_id}",
+                )
+            )
+            paths = _paths(identity)
+            for artifact in (
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertTrue(artifact.exists(), artifact.name)
+            fresh = _fresh_store(stage)
+
+            replay = fresh.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, replay)
+            self.assertIs(replay.state, RefreshRecoveryState.COMPLETED)
+            self.assertEqual(
+                replay.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.COMPLETED,
+                    ),
+                ),
+            )
+            self.assertEqual(replay.diagnostics, ())
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    f"artifact_handoff.{snapshot_id}",
+                )
+            )
+            follow_up = service.refresh_configured_snapshot(fresh)
+            self.assertIsInstance(follow_up, ExportReport)
+
+    def test_terminal_replay_parent_replaced_after_blocker_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(paths.jsonl_recovery),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            original_blocker = tm_snapshot_recovery._terminal_handoff_row_blocker
+            renamed = (root / "exports-renamed").resolve()
+
+            def blocker_then_replace_parent(
+                facts: Any,
+                terminal_receipt: Any,
+            ) -> Any:
+                blocker, parent_handle = original_blocker(
+                    facts,
+                    terminal_receipt,
+                )
+                if blocker is None:
+                    assert parent_handle is not None
+                    old_parent = destination.parent
+                    old_parent.rename(renamed)
+                    old_parent.mkdir()
+                return blocker, parent_handle
+
+            with patch(
+                "tm_snapshot_recovery._terminal_handoff_row_blocker",
+                side_effect=blocker_then_replace_parent,
+            ):
+                outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PARENT_REPLACED",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.EXPORT_PARENT_REPLACED",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            stranded = _export_artifact_paths(renamed / "out.jsonl")
+            self.assertEqual(
+                (renamed / "out.jsonl").read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(
+                (renamed / "out.jsonl.localcat-snapshot.json").read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+            self.assertEqual(
+                stranded.jsonl_recovery.read_bytes(),
+                prior_jsonl,
+            )
+            self.assertEqual(
+                stranded.manifest_recovery.read_bytes(),
+                prior_manifest,
+            )
+
+    def test_terminal_replay_parent_symlink_replaced_after_blocker_blocks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(paths.jsonl_recovery),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            original_blocker = tm_snapshot_recovery._terminal_handoff_row_blocker
+            renamed = (root / "exports-real").resolve()
+
+            def blocker_then_symlink_parent(
+                facts: Any,
+                terminal_receipt: Any,
+            ) -> Any:
+                blocker, parent_handle = original_blocker(
+                    facts,
+                    terminal_receipt,
+                )
+                if blocker is None:
+                    assert parent_handle is not None
+                    old_parent = destination.parent
+                    old_parent.rename(renamed)
+                    os.symlink(renamed, old_parent)
+                return blocker, parent_handle
+
+            with patch(
+                "tm_snapshot_recovery._terminal_handoff_row_blocker",
+                side_effect=blocker_then_symlink_parent,
+            ):
+                outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.CLEANUP_FAILED",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.CLEANUP_FAILED",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            self.assertEqual(
+                (renamed / "out.jsonl").read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(
+                (renamed / "out.jsonl.localcat-snapshot.json").read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+
+    def test_terminal_replay_parent_replaced_between_fsync_and_clear_blocks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(paths.jsonl_recovery),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            original_fsync = tm_snapshot_recovery._fsync_artifact_parent
+            renamed = (root / "exports-renamed").resolve()
+
+            def fsync_then_replace_parent(
+                destination_path: Path,
+                expected_identity: tuple[int, int] | None,
+                parent: Any = None,
+            ) -> None:
+                original_fsync(
+                    destination_path,
+                    expected_identity,
+                    parent=parent,
+                )
+                old_parent = destination_path.parent
+                old_parent.rename(renamed)
+                old_parent.mkdir()
+
+            with patch(
+                "tm_snapshot_recovery._fsync_artifact_parent",
+                side_effect=fsync_then_replace_parent,
+            ):
+                outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("STORE.HANDOFF_PARENT_REPLACED",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "STORE.HANDOFF_PARENT_REPLACED",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            self.assertEqual(
+                (renamed / "out.jsonl").read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(
+                (renamed / "out.jsonl.localcat-snapshot.json").read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+
+    def test_terminal_replay_legacy_handoff_missing_parent_blocks_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            stored_value = _meta_value(stage.staged_db_path, meta_key)
+            self.assertIsNotNone(stored_value)
+            assert stored_value is not None
+            legacy_value = json.loads(stored_value)
+            del legacy_value["artifact_parent_device"]
+            del legacy_value["artifact_parent_inode"]
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute(
+                    "UPDATE tm_meta SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            legacy_value,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        meta_key,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            self.assertEqual(paths.destination.read_bytes(), _NEW_JSONL)
+            self.assertEqual(
+                paths.manifest.read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+
+    def test_pre_latched_divergence_replays_arbitrary_terminal_handoff_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            _simulate_crash(service, store, crash_at="manifest")
+            configured_id = _issued_refresh_snapshot_id(stage.staged_db_path)
+            revision = store.capture_export_snapshot().revision
+            store.complete_issued_refresh_receipt(
+                configured_id,
+                expected_generation=revision.generation,
+                jsonl_identity=_identity_of(identity.configured_jsonl_path),
+                manifest_identity=_identity_of(
+                    identity.snapshot_manifest_path
+                ),
+            )
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            binding_before = _binding_row(stage.staged_db_path)[4]
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute(
+                    "UPDATE tm_meta SET value = '1' "
+                    "WHERE key = 'divergence_latched'"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            configured_key = "artifact_handoff." + configured_id
+            arbitrary_key = "artifact_handoff." + receipt.snapshot_id
+            self.assertIsNotNone(
+                _meta_value(stage.staged_db_path, configured_key)
+            )
+            self.assertIsNotNone(
+                _meta_value(stage.staged_db_path, arbitrary_key)
+            )
+            configured_paths = _paths(identity)
+            self.assertTrue(configured_paths.jsonl_recovery.exists())
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.COMPLETED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.COMPLETED,
+                    ),
+                ),
+            )
+            self.assertEqual(
+                outcome.diagnostics,
+                ("RECOVERY.DIVERGENCE_PRESERVED",),
+            )
+            self.assertEqual(outcome.snapshot_id, receipt.snapshot_id)
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "1",
+            )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding_before,
+            )
+            self.assertIsNone(
+                _meta_value(stage.staged_db_path, arbitrary_key)
+            )
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            self.assertIsNotNone(
+                _meta_value(stage.staged_db_path, configured_key)
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, configured_id),
+                "completed",
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            for artifact in (
+                configured_paths.jsonl_recovery,
+                configured_paths.manifest_recovery,
+            ):
+                self.assertTrue(artifact.exists(), artifact.name)
+
+
+
+
+    def test_store_clear_parent_renamed_with_foreign_temp_blocks_closed(
+        self,
+    ) -> None:
+        """Store clear race A: parent renamed after the dirfd is bound.
+
+        The handoff parent is opened and fstat-proven, then the real
+        parent A is renamed aside and an empty replacement B is created
+        at the advertised pathname while A still holds a foreign
+        deterministic temp.  ``clear_issued_receipt_handoff`` must
+        inspect the deterministic slots relative to the retained
+        descriptor (A), never re-resolve the advertised parent pathname,
+        keep the handoff and the foreign file, and fail closed with
+        ``STORE.HANDOFF_CLEANUP_PENDING``.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            foreign_bytes = b"foreign temp bytes\n"
+            paths.jsonl_temp.write_bytes(foreign_bytes)
+            original_seam = (
+                tm_sqlite_store._after_artifact_parent_dirfd_bound
+            )
+            renamed = (root / "exports-renamed").resolve()
+            armed = False
+
+            def rename_parent_in_seam(
+                destination_path: Path,
+                parent_identity: Any,
+            ) -> None:
+                original_seam(destination_path, parent_identity)
+                if not armed or destination_path != destination:
+                    return
+                old_parent = destination_path.parent
+                old_parent.rename(renamed)
+                old_parent.mkdir()
+
+            armed = True
+            with patch(
+                "tm_sqlite_store._after_artifact_parent_dirfd_bound",
+                side_effect=rename_parent_in_seam,
+            ):
+                with self.assertRaises(SQLiteStoreSchemaError) as blocked:
+                    store.clear_issued_receipt_handoff(
+                        receipt.snapshot_id,
+                        expected_generation=generation,
+                    )
+
+            self.assertEqual(
+                str(blocked.exception),
+                "STORE.HANDOFF_CLEANUP_PENDING",
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            self.assertEqual(
+                (renamed / paths.jsonl_temp.name).read_bytes(),
+                foreign_bytes,
+            )
+            self.assertEqual(list(destination.parent.iterdir()), [])
+            self.assertFalse((renamed / paths.jsonl_temp.name).is_symlink())
+
+    def test_export_reconcile_parent_renamed_with_owned_temp_moved_blocks(
+        self,
+    ) -> None:
+        """Rename-only recovery-copy update race C.
+
+        An issued arbitrary export is reconciled with the handoff parent
+        bound, then the real parent A is renamed aside, an empty
+        replacement B is created at the advertised pathname and the
+        exact handed-off JSONL temp inode is moved from A into B under
+        its deterministic basename.  The reveal must never re-resolve
+        the advertised parent pathname for destructive work: the receipt
+        stays issued, the handoff is retained, the moved inode survives
+        in B and no unjournaled owned artifact is stranded.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            paths.destination.write_bytes(_NEW_JSONL)
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            temp_identity = _identity_of(paths.jsonl_temp)
+            original_seam = tm_snapshot_recovery._after_recovery_parent_bound
+            moved = (root / "exports-moved").resolve()
+
+            def seam_rename_and_move_owned_temp(
+                destination_path: Path,
+                parent_identity: Any,
+            ) -> None:
+                original_seam(destination_path, parent_identity)
+                if destination_path != destination:
+                    return
+                old_parent = destination_path.parent
+                old_parent.rename(moved)
+                old_parent.mkdir()
+                os.replace(
+                    moved / paths.jsonl_temp.name,
+                    old_parent / paths.jsonl_temp.name,
+                )
+
+            with patch(
+                "tm_snapshot_recovery._after_recovery_parent_bound",
+                side_effect=seam_rename_and_move_owned_temp,
+            ):
+                outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PARENT_REPLACED",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                outcome.receipts[0].diagnostics,
+                ("RECOVERY.EXPORT_PARENT_REPLACED",),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            moved_temp = destination.parent / paths.jsonl_temp.name
+            self.assertEqual(moved_temp.read_bytes(), _NEW_JSONL)
+            self.assertEqual(_identity_of(moved_temp), temp_identity)
+            self.assertEqual(
+                sorted(path.name for path in destination.parent.iterdir()),
+                [paths.jsonl_temp.name],
+            )
+            self.assertFalse((moved / paths.jsonl_temp.name).exists())
+            self.assertEqual((moved / "out.jsonl").read_bytes(), _NEW_JSONL)
+            self.assertFalse((moved / paths.manifest.name).exists())
+            self.assertEqual(
+                (moved / paths.manifest_temp.name).read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+
+    def test_terminal_replay_parent_renamed_with_owned_temp_moved_blocks(
+        self,
+    ) -> None:
+        """Terminal replay moved-owned-inode race.
+
+        After the blocker binds the handoff parent, the real parent A is
+        renamed aside, an empty replacement B is created at the
+        advertised pathname and the exact handed-off JSONL temp inode is
+        moved from A into B under its deterministic basename.  The
+        replay must never resolve the advertised parent pathname for
+        destructive work: it must not delete the moved inode from B,
+        must keep the handoff and fail closed with
+        ``RECOVERY.EXPORT_PARENT_REPLACED``.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            _publish_registered_pair(destination, receipt, _NEW_JSONL)
+
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(paths.jsonl_recovery),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            self._complete_export(
+                store,
+                receipt,
+                destination,
+                expected_generation=generation,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            paths.jsonl_temp.write_bytes(_NEW_JSONL)
+            temp_identity = _identity_of(paths.jsonl_temp)
+            original_blocker = (
+                tm_snapshot_recovery._terminal_handoff_row_blocker
+            )
+            moved = (root / "exports-moved").resolve()
+
+            def blocker_then_move_owned_temp(
+                facts: Any,
+                terminal_receipt: Any,
+            ) -> Any:
+                blocker, parent_handle = original_blocker(
+                    facts,
+                    terminal_receipt,
+                )
+                if blocker is None:
+                    assert parent_handle is not None
+                    old_parent = destination.parent
+                    old_parent.rename(moved)
+                    old_parent.mkdir()
+                    os.replace(
+                        moved / paths.jsonl_temp.name,
+                        old_parent / paths.jsonl_temp.name,
+                    )
+                return blocker, parent_handle
+
+            with patch(
+                "tm_snapshot_recovery._terminal_handoff_row_blocker",
+                side_effect=blocker_then_move_owned_temp,
+            ):
+                outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_PARENT_REPLACED",),
+                    ),
+                ),
+            )
+            self.assertIn(
+                "RECOVERY.EXPORT_PARENT_REPLACED",
+                outcome.diagnostics,
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "completed",
+            )
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            moved_temp = destination.parent / paths.jsonl_temp.name
+            self.assertEqual(moved_temp.read_bytes(), _NEW_JSONL)
+            self.assertEqual(_identity_of(moved_temp), temp_identity)
+            self.assertEqual(
+                sorted(path.name for path in destination.parent.iterdir()),
+                [paths.jsonl_temp.name],
+            )
+            self.assertFalse((moved / paths.jsonl_temp.name).exists())
+            self.assertEqual((moved / "out.jsonl").read_bytes(), _NEW_JSONL)
+            self.assertEqual(
+                (moved / "out.jsonl.localcat-snapshot.json").read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+
+
+    def test_foreign_same_byte_manifest_after_crash_blocks_completion(
+        self,
+    ) -> None:
+        """P1 1 regression: a same-byte foreign final manifest after the
+        crashed manifest replace must block recovery completion.
+
+        The completion transaction binds the final inodes to the
+        durable handoff temp identities: the foreign manifest inode is
+        not the handed-off temp inode, so the receipt stays issued, the
+        binding is not advanced, the handoff is retained and the
+        foreign manifest inode is preserved.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            service = _service(identity)
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            prior_manifest_bytes = (
+                identity.snapshot_manifest_path.read_bytes()
+            )
+            _simulate_crash(service, store, crash_at="manifest")
+            snapshot_id = _issued_refresh_snapshot_id(
+                stage.staged_db_path
+            )
+            paths = _paths(identity)
+            manifest_bytes = identity.snapshot_manifest_path.read_bytes()
+            foreign = identity.snapshot_manifest_path.with_name(
+                "foreign-same-byte-manifest.json"
+            )
+            foreign.write_bytes(manifest_bytes)
+            os.replace(foreign, identity.snapshot_manifest_path)
+            foreign_identity = _identity_of(
+                identity.snapshot_manifest_path
+            )
+
+            outcome = store.recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("STORE.HANDOFF_IDENTITY_MISMATCH",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, snapshot_id),
+                "issued",
+            )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                manifest_bytes,
+            )
+            self.assertEqual(
+                _identity_of(identity.snapshot_manifest_path),
+                foreign_identity,
+            )
+            self.assertEqual(
+                paths.manifest_recovery.read_bytes(),
+                prior_manifest_bytes,
+            )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
+            )
+
+    def test_reconstructed_manifest_source_same_byte_swap_blocks(
+        self,
+    ) -> None:
+        """P1 2 regression: same-byte foreign source swap immediately
+        before the reconstructed-manifest replace.
+
+        The handed-off manifest temp inode is re-proven again after the
+        late-bound seam returns; a same-byte foreign inode swapped in
+        exactly at the seam is detected before the rename, so the first
+        recovery BLOCKs on the pre-rename source proof and never renames
+        the foreign temp.  The second recovery BLOCKs on the unprovable
+        foreign temp in its slot: the prior manifest recovery copy, the
+        foreign temp inode and the handoff are all preserved and never
+        cleared or completed.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            os.replace(paths.jsonl_temp, paths.destination)
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(
+                    paths.jsonl_recovery
+                ),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            original_seam = (
+                tm_snapshot_recovery
+                ._after_recovery_manifest_source_proved
+            )
+            swapped = False
+            foreign_identity: tuple[int, int] | None = None
+
+            def seam_swap_manifest_source(
+                destination_path: Path,
+                manifest_temp_name: str,
+                manifest_name: str,
+                expected_source_identity: tuple[int, int],
+            ) -> None:
+                nonlocal swapped, foreign_identity
+                original_seam(
+                    destination_path,
+                    manifest_temp_name,
+                    manifest_name,
+                    expected_source_identity,
+                )
+                if swapped:
+                    return
+                swapped = True
+                foreign = paths.manifest_temp.with_name(
+                    "foreign-same-byte-manifest.tmp"
+                )
+                foreign.write_bytes(paths.manifest_temp.read_bytes())
+                os.replace(foreign, paths.manifest_temp)
+                observed = os.lstat(paths.manifest_temp)
+                foreign_identity = (observed.st_dev, observed.st_ino)
+
+            with patch(
+                "tm_snapshot_recovery."
+                "_after_recovery_manifest_source_proved",
+                side_effect=seam_swap_manifest_source,
+            ):
+                first = store.recover_configured_refresh()
+            second = store.recover_configured_refresh()
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(foreign_identity)
+            _assert_recovery_outcome_shape(self, first)
+            self.assertIs(first.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                first.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.MANIFEST_TEMP_INVALID",),
+                    ),
+                ),
+            )
+            _assert_recovery_outcome_shape(self, second)
+            self.assertIs(second.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                second.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_UNPROVEN",),
+                    ),
+                ),
+            )
+            for outcome in (first, second):
+                self.assertEqual(
+                    _status_for(
+                        stage.staged_db_path,
+                        receipt.snapshot_id,
+                    ),
+                    "issued",
+                )
+                self.assertIsNotNone(
+                    _meta_value(
+                        stage.staged_db_path,
+                        "artifact_handoff." + receipt.snapshot_id,
+                    )
+                )
+                self.assertEqual(
+                    paths.jsonl_recovery.read_bytes(),
+                    prior_jsonl,
+                )
+                self.assertEqual(
+                    paths.manifest_recovery.read_bytes(),
+                    prior_manifest,
+                )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertEqual(
+                paths.destination.read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(
+                paths.manifest.read_bytes(),
+                prior_manifest,
+            )
+            self.assertEqual(
+                paths.manifest_temp.read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+            self.assertEqual(
+                _identity_of(paths.manifest_temp),
+                foreign_identity,
+            )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
+            )
+
+    def test_reconstructed_manifest_source_different_byte_swap_blocks(
+        self,
+    ) -> None:
+        """P1 2 regression: different-byte foreign source swap
+        immediately before the reconstructed-manifest replace.
+
+        The handed-off manifest temp inode and digest are re-proven
+        again after the late-bound seam returns; a foreign inode with
+        different bytes swapped in exactly at the seam is detected
+        before the rename, so the first recovery BLOCKs on the
+        pre-rename source proof.  The second recovery BLOCKs on the
+        conflicting foreign temp in its slot: the prior manifest
+        recovery copy, the foreign temp inode and the handoff are all
+        preserved and never cleared or completed.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            foreign_bytes = b'{"manifest":"foreign-bytes"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            os.replace(paths.jsonl_temp, paths.destination)
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(
+                    paths.jsonl_recovery
+                ),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            original_seam = (
+                tm_snapshot_recovery
+                ._after_recovery_manifest_source_proved
+            )
+            swapped = False
+            foreign_identity: tuple[int, int] | None = None
+
+            def seam_swap_manifest_source(
+                destination_path: Path,
+                manifest_temp_name: str,
+                manifest_name: str,
+                expected_source_identity: tuple[int, int],
+            ) -> None:
+                nonlocal swapped, foreign_identity
+                original_seam(
+                    destination_path,
+                    manifest_temp_name,
+                    manifest_name,
+                    expected_source_identity,
+                )
+                if swapped:
+                    return
+                swapped = True
+                foreign = paths.manifest_temp.with_name(
+                    "foreign-different-byte-manifest.tmp"
+                )
+                foreign.write_bytes(foreign_bytes)
+                os.replace(foreign, paths.manifest_temp)
+                observed = os.lstat(paths.manifest_temp)
+                foreign_identity = (observed.st_dev, observed.st_ino)
+
+            with patch(
+                "tm_snapshot_recovery."
+                "_after_recovery_manifest_source_proved",
+                side_effect=seam_swap_manifest_source,
+            ):
+                first = store.recover_configured_refresh()
+            second = store.recover_configured_refresh()
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(foreign_identity)
+            _assert_recovery_outcome_shape(self, first)
+            self.assertIs(first.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                first.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.MANIFEST_TEMP_INVALID",),
+                    ),
+                ),
+            )
+            _assert_recovery_outcome_shape(self, second)
+            self.assertIs(second.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                second.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.MANIFEST_TEMP_CONFLICT",),
+                    ),
+                ),
+            )
+            for outcome in (first, second):
+                self.assertEqual(
+                    _status_for(
+                        stage.staged_db_path,
+                        receipt.snapshot_id,
+                    ),
+                    "issued",
+                )
+                self.assertIsNotNone(
+                    _meta_value(
+                        stage.staged_db_path,
+                        "artifact_handoff." + receipt.snapshot_id,
+                    )
+                )
+                self.assertEqual(
+                    paths.jsonl_recovery.read_bytes(),
+                    prior_jsonl,
+                )
+                self.assertEqual(
+                    paths.manifest_recovery.read_bytes(),
+                    prior_manifest,
+                )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertEqual(
+                paths.destination.read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(paths.manifest.read_bytes(), prior_manifest)
+            self.assertEqual(
+                paths.manifest_temp.read_bytes(),
+                foreign_bytes,
+            )
+            self.assertEqual(
+                _identity_of(paths.manifest_temp),
+                foreign_identity,
+            )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
+            )
+
+    def test_reconstructed_manifest_destination_swap_blocks(
+        self,
+    ) -> None:
+        """P1 2 regression: foreign destination swap immediately before
+        the reconstructed-manifest replace.
+
+        The manifest destination is re-proven against the handed-off
+        prior digest AND inode after the late-bound seam returns; a
+        foreign different-byte inode swapped in exactly at the seam is
+        detected before the rename, so the first recovery BLOCKs on the
+        pre-rename destination proof and the foreign final inode is
+        never overwritten.  The second recovery BLOCKs on the foreign
+        final manifest: the durable manifest temp, the prior recovery
+        copies and the handoff are all retained and never cleared or
+        completed.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            foreign_bytes = b'{"manifest":"foreign-bytes"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            generation = store.capture_export_snapshot().revision.generation
+            os.replace(paths.jsonl_temp, paths.destination)
+            paths.jsonl_recovery.write_bytes(prior_jsonl)
+            paths.manifest_recovery.write_bytes(prior_manifest)
+            store.record_export_recovery_handoff(
+                receipt.snapshot_id,
+                expected_generation=generation,
+                jsonl_recovery_identity=_identity_of(
+                    paths.jsonl_recovery
+                ),
+                manifest_recovery_identity=_identity_of(
+                    paths.manifest_recovery
+                ),
+            )
+            original_seam = (
+                tm_snapshot_recovery
+                ._after_recovery_manifest_source_proved
+            )
+            swapped = False
+            foreign_identity: tuple[int, int] | None = None
+
+            def seam_swap_manifest_destination(
+                destination_path: Path,
+                manifest_temp_name: str,
+                manifest_name: str,
+                expected_source_identity: tuple[int, int],
+            ) -> None:
+                nonlocal swapped, foreign_identity
+                original_seam(
+                    destination_path,
+                    manifest_temp_name,
+                    manifest_name,
+                    expected_source_identity,
+                )
+                if swapped:
+                    return
+                swapped = True
+                foreign = paths.manifest.with_name(
+                    "foreign-manifest-destination.tmp"
+                )
+                foreign.write_bytes(foreign_bytes)
+                os.replace(foreign, paths.manifest)
+                observed = os.lstat(paths.manifest)
+                foreign_identity = (observed.st_dev, observed.st_ino)
+
+            with patch(
+                "tm_snapshot_recovery."
+                "_after_recovery_manifest_source_proved",
+                side_effect=seam_swap_manifest_destination,
+            ):
+                first = store.recover_configured_refresh()
+            second = store.recover_configured_refresh()
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(foreign_identity)
+            _assert_recovery_outcome_shape(self, first)
+            self.assertIs(first.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                first.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.MANIFEST_DESTINATION_CHANGED",),
+                    ),
+                ),
+            )
+            _assert_recovery_outcome_shape(self, second)
+            self.assertIs(second.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                second.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.EXPORT_MANIFEST_FOREIGN",),
+                    ),
+                ),
+            )
+            for outcome in (first, second):
+                self.assertEqual(
+                    _status_for(
+                        stage.staged_db_path,
+                        receipt.snapshot_id,
+                    ),
+                    "issued",
+                )
+                self.assertIsNotNone(
+                    _meta_value(
+                        stage.staged_db_path,
+                        "artifact_handoff." + receipt.snapshot_id,
+                    )
+                )
+                self.assertEqual(
+                    paths.jsonl_recovery.read_bytes(),
+                    prior_jsonl,
+                )
+                self.assertEqual(
+                    paths.manifest_recovery.read_bytes(),
+                    prior_manifest,
+                )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path)[4],
+                binding.receipt.snapshot_id,
+            )
+            self.assertEqual(
+                paths.destination.read_bytes(),
+                _NEW_JSONL,
+            )
+            self.assertEqual(paths.manifest.read_bytes(), foreign_bytes)
+            self.assertEqual(
+                _identity_of(paths.manifest),
+                foreign_identity,
+            )
+            self.assertEqual(
+                paths.manifest_temp.read_bytes(),
+                _manifest_bytes_for(receipt),
+            )
+            self.assertTrue(paths.manifest_temp.exists())
+            self.assertFalse(paths.jsonl_temp.exists())
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "0",
             )
 
 

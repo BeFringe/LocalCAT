@@ -20,6 +20,8 @@ from tm_activation_journal import (
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
     _activation_lineage_marker_temp_path,
+    _activation_terminal_path,
+    _activation_terminal_temp_path,
 )
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -51,6 +53,8 @@ from tm_contracts import (
     TMRecordDraft,
     contract_from_json,
     contract_to_json,
+    export_cleanup_pending_failure,
+    export_ledger_ambiguous_failure,
     snapshot_receipt_digest,
 )
 from tm_snapshot_recovery import (
@@ -176,6 +180,245 @@ class _CreatedFileIdentity:
     inode: int
 
 
+class _ExportParentHandle:
+    """Resource-bound no-follow parent directory handle for one publication.
+
+    Binding validates the full real non-symlink writable/executable
+    parent chain and retains an ``O_DIRECTORY|O_NOFOLLOW`` descriptor of
+    the exact immediate parent together with its device/inode identity.
+    Every deterministic artifact operation of the publication protocol
+    (create, open, verify, copy, replace, restore, cleanup) resolves
+    basenames relative to this retained descriptor, so a hostile parent
+    rename or replacement between phases can never redirect a
+    destructive operation to another directory.  The descriptor is
+    fsynced for publication/cleanup durability and the advertised full
+    parent pathname is re-proven to still resolve to the retained
+    identity at the required boundaries; any mismatch fails closed.
+    The raw descriptor is private: contracts/specs never expose it.
+    """
+
+    __slots__ = ("destination", "_descriptor", "identity", "_closed")
+
+    def __init__(
+        self,
+        destination: Path,
+        descriptor: int,
+        identity: tuple[int, int],
+    ) -> None:
+        if type(destination) is not _NATIVE_PATH_TYPE:
+            raise TypeError("destination must be an exact native Path")
+        if type(descriptor) is not int or descriptor < 0:
+            raise TypeError("parent descriptor must be a non-negative int")
+        if (
+            type(identity) is not tuple
+            or len(identity) != 2
+            or type(identity[0]) is not int
+            or type(identity[1]) is not int
+        ):
+            raise TypeError("parent identity must be a device/inode pair")
+        self.destination = destination
+        self._descriptor = descriptor
+        self.identity = identity
+        self._closed = False
+
+    @classmethod
+    def bind(cls, destination: Path) -> _ExportParentHandle:
+        """Validate the full parent chain and retain one no-follow dirfd.
+
+        The full chain is validated first, then the immediate parent is
+        bound component-by-component from the filesystem root with
+        ``O_DIRECTORY|O_NOFOLLOW`` for every component (one retained
+        descriptor per level), so an ancestor swapped to a symlink
+        between the initial validation and the bind can never redirect
+        the retained descriptor into another tree: the walk fails closed
+        on any missing, symlinked or non-directory component, and on
+        platforms without component-safe binding (no ``O_DIRECTORY`` /
+        ``O_NOFOLLOW`` or no ``dir_fd`` support).  The final descriptor
+        must be a real writable/executable directory; its exact
+        device/inode becomes the retained identity.
+        """
+
+        _require_export_parent_safe(destination)
+        _after_export_parent_chain_validated(destination)
+        if not (
+            hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+        ):
+            raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+        parent = destination.parent
+        if not parent.is_absolute():
+            raise ExportPreflightError("EXPORT.PATH_INVALID")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(parent.parts[0], flags)
+            for part in parent.parts[1:]:
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            observed = os.fstat(descriptor)
+            if not stat.S_ISDIR(observed.st_mode):
+                raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+            if not (
+                observed.st_mode
+                & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+                and observed.st_mode
+                & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            ):
+                raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+            return cls(
+                destination,
+                descriptor,
+                (observed.st_dev, observed.st_ino),
+            )
+        except ExportPreflightError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except (OSError, TypeError, ValueError):
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise ExportPreflightError("EXPORT.PARENT_UNSAFE") from None
+
+    @property
+    def descriptor(self) -> int:
+        """Private descriptor access for dirfd-relative syscalls."""
+
+        if self._closed:
+            raise ExportPreflightError("EXPORT.PARENT_UNSAFE")
+        return self._descriptor
+
+    def fsync(self) -> None:
+        """Fsync the retained directory descriptor for durability."""
+
+        try:
+            os.fsync(self.descriptor)
+        except OSError as error:
+            raise OSError("export parent directory fsync failed") from error
+
+    def reprove(self) -> None:
+        """Re-prove the advertised full parent pathname still resolves
+        to the retained identity; a mismatch fails closed.
+
+        The advertised pathname is re-walked component-by-component
+        with ``O_DIRECTORY|O_NOFOLLOW`` per component, so an ancestor
+        symlink can never be accepted as the proven chain; only the
+        exact retained device/inode passes.
+        """
+
+        _require_export_parent_safe(self.destination)
+        descriptor = -1
+        try:
+            descriptor = _open_export_parent_chain_no_follow(
+                self.destination
+            )
+            observed = os.fstat(descriptor)
+        except (OSError, TypeError, ValueError):
+            raise ExportPreflightError(
+                "EXPORT.PARENT_REPLACED"
+            ) from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (observed.st_dev, observed.st_ino) != self.identity:
+            raise ExportPreflightError("EXPORT.PARENT_REPLACED")
+
+    def open(
+        self,
+        name: str,
+        flags: int,
+        mode: int = 0o600,
+    ) -> int:
+        """Open one basename relative to the retained parent descriptor."""
+
+        _require_export_basename(name)
+        try:
+            return os.open(
+                name,
+                flags,
+                dir_fd=self.descriptor,
+                mode=mode,
+            )
+        except OSError:
+            raise
+
+    def lstat(self, name: str) -> os.stat_result:
+        """No-follow stat of one basename relative to the retained fd."""
+
+        _require_export_basename(name)
+        try:
+            return os.stat(
+                name,
+                dir_fd=self.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise
+
+    def unlink(self, name: str) -> None:
+        """Unlink one basename relative to the retained parent descriptor."""
+
+        _require_export_basename(name)
+        try:
+            os.unlink(name, dir_fd=self.descriptor)
+        except OSError:
+            raise
+
+    def replace(self, source: str, destination: str) -> None:
+        """Rename one basename to another relative to the retained fd."""
+
+        _require_export_basename(source)
+        _require_export_basename(destination)
+        try:
+            os.replace(
+                source,
+                destination,
+                src_dir_fd=self.descriptor,
+                dst_dir_fd=self.descriptor,
+            )
+        except OSError:
+            raise
+
+    def close(self) -> None:
+        """Best-effort close of the retained descriptor."""
+
+        if self._closed:
+            return
+        self._closed = True
+        descriptor = self._descriptor
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    def __enter__(self) -> _ExportParentHandle:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
+    ) -> None:
+        self.close()
+
+
+def _require_export_basename(name: str) -> None:
+    """One deterministic artifact name must be a pure safe basename."""
+
+    if (
+        type(name) is not str
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+
+
 class _NoDestinationProof:
     """Sentinel for internal restore moves that do not publish a new file."""
 
@@ -282,10 +525,21 @@ def _export_artifact_paths(destination: Path) -> _ExportArtifactPaths:
 def _export_authority_paths(
     identity: CanonicalResourceIdentity,
 ) -> frozenset[Path]:
-    """Deterministic authority paths this export must never touch."""
+    """Deterministic authority paths this export must never touch.
+
+    Covers the configured pair, sidecar, activation journal/marker/
+    terminal families (final and temporary), and the deterministic
+    temp/recovery artifact family of the configured pair itself, so an
+    export destination can never reserve or collide with the paths the
+    refresh/recovery protocol owns.
+    """
 
     journal = _activation_journal_path(identity)
     marker = _activation_lineage_marker_path(identity)
+    terminal = _activation_terminal_path(identity)
+    configured_artifacts = _export_artifact_paths(
+        identity.configured_jsonl_path
+    )
     return frozenset(
         {
             identity.configured_jsonl_path,
@@ -295,6 +549,12 @@ def _export_authority_paths(
             _activation_journal_temp_path(journal),
             marker,
             _activation_lineage_marker_temp_path(marker),
+            terminal,
+            _activation_terminal_temp_path(terminal),
+            configured_artifacts.jsonl_temp,
+            configured_artifacts.manifest_temp,
+            configured_artifacts.jsonl_recovery,
+            configured_artifacts.manifest_recovery,
         }
     )
 
@@ -321,6 +581,177 @@ def _export_path_in_authority_family(
     return name.startswith(".localcat-") and (
         identity.target_identity[:16] in name
     )
+
+
+def _artifact_parent_identity(destination: Path) -> tuple[int, int]:
+    """Exact immediate-parent device/inode under one strict chain proof.
+
+    Runs the full real non-symlink writable/executable parent-chain
+    proof and returns the immediate parent's exact device/inode so the
+    issued registration can durably record it in the artifact handoff
+    journal; terminal cleanup and handoff release re-prove it later.
+    """
+
+    _require_export_parent_safe(destination)
+    try:
+        observed = os.lstat(destination.parent)
+    except (OSError, ValueError):
+        raise ExportPreflightError("EXPORT.PARENT_UNSAFE") from None
+    return (observed.st_dev, observed.st_ino)
+
+
+def _open_export_parent_chain_no_follow(destination: Path) -> int:
+    """Open ``destination.parent`` component-by-component from the root.
+
+    Every pathname component from the filesystem root down to the
+    immediate parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` against
+    the previously retained descriptor, so a symlinked, missing or
+    non-directory component (including an ancestor swapped to a symlink
+    between an earlier validation and this walk) fails the open instead
+    of redirecting the descriptor into another tree.  The caller owns
+    the returned descriptor.  Only usable where ``dir_fd``-relative
+    opens are available; the caller maps any unsupported-platform
+    failure to its fail-closed code.
+    """
+
+    parent = destination.parent
+    if not parent.is_absolute():
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(parent.parts[0], flags)
+    try:
+        for part in parent.parts[1:]:
+            next_descriptor = os.open(
+                part,
+                flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _after_export_parent_chain_validated(destination: Path) -> None:
+    """Late-bound seam invoked after the parent-chain validation.
+
+    Test-only fault-injection point: runs immediately after the full
+    real parent chain has been validated and before the component-wise
+    no-follow descriptor binding, so an ancestor symlink swap exactly at
+    that boundary can be reproduced without re-resolving the parent
+    pathname for destructive work.
+    """
+
+
+def _after_replace_source_proved(
+    source: Path,
+    destination: Path,
+    expected_source_identity: tuple[int, int],
+) -> None:
+    """Late-bound seam invoked immediately before the publication rename.
+
+    Runs after the exact source identity proof and immediately before
+    the mutation, so a source-name swap exactly at that boundary can be
+    reproduced deterministically without re-resolving the source or
+    destination pathname for destructive work.  Test-only
+    fault-injection point.
+    """
+
+
+def _prove_replace_source(
+    source: Path,
+    *,
+    expected_source_identity: tuple[int, int],
+    parent_handle: _ExportParentHandle | None = None,
+) -> None:
+    """Prove the exact single-link source identity for one publication.
+
+    Resolves the basename relative to the retained parent descriptor
+    when one is held, otherwise by strict no-follow pathname lstat; any
+    observation other than the exact expected regular single-link inode
+    fails closed with ``EXPORT.SOURCE_UNPROVEN`` before any mutation.
+    """
+
+    if parent_handle is not None:
+        observed = parent_handle.lstat(source.name)
+    else:
+        observed = os.lstat(source)
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino)
+        != expected_source_identity
+    ):
+        raise ExportPreflightError("EXPORT.SOURCE_UNPROVEN")
+
+
+def _prove_replace_destination(
+    destination: Path,
+    *,
+    expected_destination_digest: str | None | _NoDestinationProof,
+    expected_destination_identity: (
+        tuple[int, int] | None | _NoDestinationProof
+    ),
+    parent_handle: _ExportParentHandle | None = None,
+) -> None:
+    """Prove the exact prior destination digest+identity or absence.
+
+    Both publication-proof parameters must be set or both unset; a
+    partial proof fails with ``ValueError`` before any probe.
+
+    The destination must still match the exact prior proof recorded
+    before publication: either the exact prior regular single-link
+    digest AND inode, or the recorded exact absence.  Any divergence --
+    including a same-byte foreign inode swapped in after an earlier
+    proof -- fails closed with ``EXPORT.PRIOR_PAIR_CHANGED`` before any
+    mutation, so a concurrent destination replacement in the late seam
+    can never be silently overwritten by the rename.
+    """
+
+    if isinstance(
+        expected_destination_digest,
+        _NoDestinationProof,
+    ) or isinstance(
+        expected_destination_identity,
+        _NoDestinationProof,
+    ):
+        raise ValueError("destination publication proof is incomplete")
+    if parent_handle is not None:
+        state, observed_digest, observed_identity = _dirfd_entry_state(
+            destination,
+            parent_handle=parent_handle,
+        )
+        if expected_destination_digest is None:
+            if state != "absent":
+                raise ExportPreflightError(
+                    "EXPORT.PRIOR_PAIR_CHANGED"
+                )
+        elif (
+            state != "present"
+            or observed_digest != expected_destination_digest
+            or observed_identity
+            != expected_destination_identity
+        ):
+            raise ExportPreflightError(
+                "EXPORT.PRIOR_PAIR_CHANGED"
+            )
+    else:
+        observed = _export_existing_state(
+            destination,
+            unsafe_code="EXPORT.PRIOR_PAIR_CHANGED",
+        )
+        expected = (
+            None
+            if expected_destination_digest is None
+            else (
+                expected_destination_digest,
+                expected_destination_identity,
+            )
+        )
+        if observed != expected:
+            raise ExportPreflightError("EXPORT.PRIOR_PAIR_CHANGED")
 
 
 def _require_export_parent_safe(destination: Path) -> None:
@@ -513,15 +944,30 @@ def _require_refresh_artifacts_absent(
     identity: CanonicalResourceIdentity,
     paths: _ExportArtifactPaths,
 ) -> None:
-    """Fail closed on any conflicting same-directory refresh artifact."""
+    """Fail closed on any conflicting same-directory refresh artifact.
 
+    The refresh artifacts are themselves the deterministic configured
+    artifact family, so they are excluded from the authority set they
+    legitimately occupy; the check still rejects a collision with the
+    journal/marker/terminal or any other authority path.
+    """
+
+    configured = _export_artifact_paths(identity.configured_jsonl_path)
+    own_artifacts = frozenset(
+        {
+            configured.jsonl_temp,
+            configured.manifest_temp,
+            configured.jsonl_recovery,
+            configured.manifest_recovery,
+        }
+    )
     for artifact in (
         paths.jsonl_temp,
         paths.manifest_temp,
         paths.jsonl_recovery,
         paths.manifest_recovery,
     ):
-        if artifact in _export_authority_paths(identity):
+        if artifact in _export_authority_paths(identity) - own_artifacts:
             raise ExportPreflightError("REFRESH.PATH_ALIASED")
     for artifact, code in (
         (paths.jsonl_temp, "REFRESH.TEMP_CONFLICT"),
@@ -533,7 +979,22 @@ def _require_refresh_artifacts_absent(
             raise ExportPreflightError(code)
 
 
-def _path_exists(path: Path) -> bool:
+def _path_exists(
+    path: Path,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
+) -> bool:
+    """True when one deterministic entry exists under the retained parent
+    descriptor, or by pathname when no handle is supplied."""
+
+    if parent_handle is not None:
+        try:
+            parent_handle.lstat(path.name)
+            return True
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            raise ExportPreflightError("EXPORT.PATH_UNREADABLE") from None
     try:
         os.lstat(path)
         return True
@@ -547,7 +1008,24 @@ def _fsync_file(descriptor: int) -> None:
     os.fsync(descriptor)
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(
+    path: Path,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
+) -> None:
+    """Fsync one directory for publication/cleanup durability.
+
+    With a retained parent handle the fsync runs on the exact retained
+    descriptor and the advertised full parent pathname is then re-proven
+    to still resolve to the same identity; a mismatch fails closed with
+    ``EXPORT.PARENT_REPLACED``.  Without a handle the directory is
+    opened by pathname exactly as before.
+    """
+
+    if parent_handle is not None:
+        parent_handle.fsync()
+        parent_handle.reprove()
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -584,13 +1062,22 @@ def _replace_path(
     source: Path,
     destination: Path,
     *,
+    expected_source_identity: tuple[int, int],
     expected_destination_digest: str | None | _NoDestinationProof = (
         _NO_DESTINATION_PROOF
     ),
     expected_destination_identity: (
         tuple[int, int] | None | _NoDestinationProof
     ) = _NO_DESTINATION_PROOF,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
+    if (
+        type(expected_source_identity) is not tuple
+        or len(expected_source_identity) != 2
+        or type(expected_source_identity[0]) is not int
+        or type(expected_source_identity[1]) is not int
+    ):
+        raise ValueError("expected source identity is invalid")
     digest_unset = isinstance(
         expected_destination_digest,
         _NoDestinationProof,
@@ -602,21 +1089,49 @@ def _replace_path(
     if digest_unset != identity_unset:
         raise ValueError("destination publication proof is incomplete")
     if not digest_unset:
-        observed = _export_existing_state(
+        _prove_replace_destination(
             destination,
-            unsafe_code="EXPORT.PRIOR_PAIR_CHANGED",
+            expected_destination_digest=expected_destination_digest,
+            expected_destination_identity=expected_destination_identity,
+            parent_handle=parent_handle,
         )
-        expected = (
-            None
-            if expected_destination_digest is None
-            else (
-                expected_destination_digest,
-                expected_destination_identity,
-            )
+    _prove_replace_source(
+        source,
+        expected_source_identity=expected_source_identity,
+        parent_handle=parent_handle,
+    )
+    _after_replace_source_proved(
+        source,
+        destination,
+        expected_source_identity,
+    )
+    _prove_replace_source(
+        source,
+        expected_source_identity=expected_source_identity,
+        parent_handle=parent_handle,
+    )
+    if not digest_unset:
+        _prove_replace_destination(
+            destination,
+            expected_destination_digest=expected_destination_digest,
+            expected_destination_identity=expected_destination_identity,
+            parent_handle=parent_handle,
         )
-        if observed != expected:
-            raise ExportPreflightError("EXPORT.PRIOR_PAIR_CHANGED")
-    os.replace(source, destination)
+    if parent_handle is not None:
+        parent_handle.replace(source.name, destination.name)
+    else:
+        os.replace(source, destination)
+    if parent_handle is not None:
+        observed = parent_handle.lstat(destination.name)
+    else:
+        observed = os.lstat(destination)
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino)
+        != expected_source_identity
+    ):
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
 
 
 def _export_jsonl_row(item: object) -> dict[str, object]:
@@ -647,14 +1162,24 @@ def _export_jsonl_row(item: object) -> dict[str, object]:
 def _stream_export_jsonl_temp(
     path: Path,
     records: tuple[object, ...],
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> tuple[str, int, _CreatedFileIdentity]:
-    """Stream one exclusive JSONL temporary file and fsync it."""
+    """Stream one exclusive JSONL temporary file and fsync it.
+
+    With a retained parent handle the exclusive no-follow create runs
+    relative to the retained descriptor; cleanup on failure is likewise
+    descriptor-relative.
+    """
 
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(path.name, flags, 0o600)
+        else:
+            descriptor = os.open(path, flags, 0o600)
     except OSError as error:
         raise ExportPreflightError("EXPORT.TEMP_CONFLICT") from error
     identity: _CreatedFileIdentity | None = None
@@ -703,6 +1228,7 @@ def _stream_export_jsonl_temp(
         if identity is None or not _remove_failed_export_artifact(
             path,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.TEMP_CLEANUP_FAILED"
@@ -712,6 +1238,7 @@ def _stream_export_jsonl_temp(
         if identity is None or not _remove_failed_export_artifact(
             path,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.TEMP_CLEANUP_FAILED"
@@ -727,12 +1254,19 @@ def _verify_export_jsonl_temp(
     expected_digest: str,
     expected_count: int,
     identity: _CreatedFileIdentity,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
     """Re-open and re-validate one JSONL temporary before publication."""
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(
+                path.name,
+                os.O_RDONLY | no_follow,
+            )
+        else:
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
     except OSError as error:
         raise ExportPreflightError("EXPORT.TEMP_UNREADABLE") from error
     try:
@@ -757,7 +1291,10 @@ def _verify_export_jsonl_temp(
             or count != expected_count
         ):
             raise ExportPreflightError("EXPORT.JSONL_VERIFY_FAILED")
-        final = os.lstat(path)
+        if parent_handle is not None:
+            final = parent_handle.lstat(path.name)
+        else:
+            final = os.lstat(path)
         if (
             not stat.S_ISREG(final.st_mode)
             or final.st_nlink != 1
@@ -772,14 +1309,24 @@ def _verify_export_jsonl_temp(
 def _write_export_payload_temp(
     path: Path,
     payload: bytes,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> _CreatedFileIdentity:
-    """Write one exclusive manifest temporary file and fsync it."""
+    """Write one exclusive manifest temporary file and fsync it.
+
+    With a retained parent handle the exclusive no-follow create runs
+    relative to the retained descriptor; cleanup on failure is likewise
+    descriptor-relative.
+    """
 
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(path.name, flags, 0o600)
+        else:
+            descriptor = os.open(path, flags, 0o600)
     except OSError as error:
         raise ExportPreflightError("EXPORT.TEMP_CONFLICT") from error
     identity: _CreatedFileIdentity | None = None
@@ -810,6 +1357,7 @@ def _write_export_payload_temp(
         if identity is None or not _remove_failed_export_artifact(
             path,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.TEMP_CLEANUP_FAILED"
@@ -819,6 +1367,7 @@ def _write_export_payload_temp(
         if identity is None or not _remove_failed_export_artifact(
             path,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.TEMP_CLEANUP_FAILED"
@@ -835,12 +1384,19 @@ def _verify_export_payload_temp(
     *,
     expected_bytes: bytes,
     identity: _CreatedFileIdentity,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
     """Re-open and re-validate one manifest temporary before publication."""
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(
+                path.name,
+                os.O_RDONLY | no_follow,
+            )
+        else:
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
     except OSError as error:
         raise ExportPreflightError("EXPORT.TEMP_UNREADABLE") from error
     try:
@@ -860,7 +1416,10 @@ def _verify_export_payload_temp(
             chunks.append(chunk)
         if b"".join(chunks) != expected_bytes:
             raise ExportPreflightError("EXPORT.MANIFEST_VERIFY_FAILED")
-        final = os.lstat(path)
+        if parent_handle is not None:
+            final = parent_handle.lstat(path.name)
+        else:
+            final = os.lstat(path)
         if (
             not stat.S_ISREG(final.st_mode)
             or final.st_nlink != 1
@@ -877,17 +1436,23 @@ def _remove_exported_if_owned(
     *,
     expected_identity: tuple[int, int] | None,
     expected_digest: str | None,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> bool:
     """Unlink one published file only when its exact identity still holds.
 
     Returns True when the path was never published by us (nothing to
     restore), is already absent, or was removed by us.  A foreign swap
     (different inode or digest) fails closed without deleting anything.
+    With a retained parent handle the proof and unlink are
+    descriptor-relative.
     """
 
     if expected_identity is None or expected_digest is None:
-        return not _path_exists(path)
-    proof = _strict_regular_file_state(path)
+        return not _path_exists(path, parent_handle=parent_handle)
+    proof = _strict_regular_file_state(
+        path,
+        parent_handle=parent_handle,
+    )
     if (
         proof is None
         or proof[0] != expected_digest
@@ -895,7 +1460,10 @@ def _remove_exported_if_owned(
     ):
         return False
     try:
-        observed = os.lstat(path)
+        if parent_handle is not None:
+            observed = parent_handle.lstat(path.name)
+        else:
+            observed = os.lstat(path)
     except FileNotFoundError:
         return True
     except OSError:
@@ -906,10 +1474,13 @@ def _remove_exported_if_owned(
     ):
         return False
     try:
-        path.unlink()
+        if parent_handle is not None:
+            parent_handle.unlink(path.name)
+        else:
+            path.unlink()
     except OSError:
         return False
-    return not _path_exists(path)
+    return not _path_exists(path, parent_handle=parent_handle)
 
 
 def _copy_export_prior_pair(
@@ -917,6 +1488,7 @@ def _copy_export_prior_pair(
     *,
     destination_before: str | None,
     manifest_before: str | None,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> tuple[
     _CreatedFileIdentity | None,
     _CreatedFileIdentity | None,
@@ -925,7 +1497,9 @@ def _copy_export_prior_pair(
 
     Returns the (jsonl, manifest) recovery identities.  A digest mismatch
     between validation and copy means the prior pair changed under us;
-    that fails stop before any publication side effect.
+    that fails stop before any publication side effect.  With a retained
+    parent handle the exclusive recovery creates and the prior source
+    reads are descriptor-relative.
     """
 
     jsonl_identity: _CreatedFileIdentity | None = None
@@ -936,6 +1510,7 @@ def _copy_export_prior_pair(
             paths.jsonl_recovery,
             expected_digest=destination_before,
             code="EXPORT.JSONL_RECOVERY_COPY_FAILED",
+            parent_handle=parent_handle,
         )
     if manifest_before is not None:
         try:
@@ -944,6 +1519,7 @@ def _copy_export_prior_pair(
                 paths.manifest_recovery,
                 expected_digest=manifest_before,
                 code="EXPORT.MANIFEST_RECOVERY_COPY_FAILED",
+                parent_handle=parent_handle,
             )
         except ExportPreflightError as error:
             if (
@@ -951,6 +1527,7 @@ def _copy_export_prior_pair(
                 and not _remove_failed_export_artifact(
                     paths.jsonl_recovery,
                     jsonl_identity,
+                    parent_handle=parent_handle,
                 )
             ):
                 raise ExportPreflightError(
@@ -966,6 +1543,7 @@ def _copy_export_recovery_file(
     *,
     expected_digest: str,
     code: str,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> _CreatedFileIdentity:
     """Copy one prior file into an owned exclusive recovery file."""
 
@@ -973,7 +1551,10 @@ def _copy_export_recovery_file(
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(recovery, flags, 0o600)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(recovery.name, flags, 0o600)
+        else:
+            descriptor = os.open(recovery, flags, 0o600)
     except OSError as error:
         raise ExportPreflightError("EXPORT.RECOVERY_CONFLICT") from error
     identity: _CreatedFileIdentity | None = None
@@ -986,7 +1567,13 @@ def _copy_export_recovery_file(
             ) from identity_error
         os.fchmod(descriptor, 0o600)
         no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-        source_descriptor = os.open(source, os.O_RDONLY | no_follow)
+        if parent_handle is not None:
+            source_descriptor = parent_handle.open(
+                source.name,
+                os.O_RDONLY | no_follow,
+            )
+        else:
+            source_descriptor = os.open(source, os.O_RDONLY | no_follow)
         observed = os.fstat(source_descriptor)
         if (
             not stat.S_ISREG(observed.st_mode)
@@ -1021,6 +1608,7 @@ def _copy_export_recovery_file(
         if identity is None or not _remove_failed_export_artifact(
             recovery,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.RECOVERY_CLEANUP_FAILED"
@@ -1030,6 +1618,7 @@ def _copy_export_recovery_file(
         if identity is None or not _remove_failed_export_artifact(
             recovery,
             identity,
+            parent_handle=parent_handle,
         ):
             raise ExportPreflightError(
                 "EXPORT.RECOVERY_CLEANUP_FAILED"
@@ -1046,12 +1635,16 @@ def _entry_is_owned(
     *,
     identity: tuple[int, int] | None,
     digest: str | None,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> bool:
     """Prove one published file by digest AND exact created inode."""
 
     if identity is None or digest is None:
         return False
-    proof = _strict_regular_file_state(path)
+    proof = _strict_regular_file_state(
+        path,
+        parent_handle=parent_handle,
+    )
     return (
         proof is not None
         and proof[0] == digest
@@ -1068,16 +1661,22 @@ def _restore_export_pair(
     manifest_published_identity: tuple[int, int] | None,
     jsonl_digest: str | None,
     manifest_digest: str | None,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
     """Restore the exact prior pair or the original absence, then fsync.
 
     The destination is only replaced from the owned recovery copy when
     the current entry is still provably this export's publication; a
-    foreign entry is left untouched and fails stop.
+    foreign entry is left untouched and fails stop.  With a retained
+    parent handle every proof, replace, unlink and the terminal
+    directory fsync are descriptor-relative.
     """
 
     if destination_before is not None:
-        current_destination = _strict_regular_file_state(paths.destination)
+        current_destination = _strict_regular_file_state(
+            paths.destination,
+            parent_handle=parent_handle,
+        )
         if (
             current_destination is None
             or current_destination[0] != destination_before
@@ -1086,6 +1685,7 @@ def _restore_export_pair(
                 paths.destination,
                 identity=jsonl_published_identity,
                 digest=jsonl_digest,
+                parent_handle=parent_handle,
             ):
                 raise ExportPreflightError("EXPORT.JSONL_RESTORE_FAILED")
             assert jsonl_digest is not None
@@ -1097,15 +1697,20 @@ def _restore_export_pair(
                 expected_destination_digest=jsonl_digest,
                 expected_destination_identity=jsonl_published_identity,
                 code="EXPORT.JSONL_RESTORE_FAILED",
+                parent_handle=parent_handle,
             )
     elif not _remove_exported_if_owned(
         paths.destination,
         expected_identity=jsonl_published_identity,
         expected_digest=jsonl_digest,
+        parent_handle=parent_handle,
     ):
         raise ExportPreflightError("EXPORT.JSONL_RESTORE_FAILED")
     if manifest_before is not None:
-        current_manifest = _strict_regular_file_state(paths.manifest)
+        current_manifest = _strict_regular_file_state(
+            paths.manifest,
+            parent_handle=parent_handle,
+        )
         if (
             current_manifest is None
             or current_manifest[0] != manifest_before
@@ -1114,6 +1719,7 @@ def _restore_export_pair(
                 paths.manifest,
                 identity=manifest_published_identity,
                 digest=manifest_digest,
+                parent_handle=parent_handle,
             ):
                 raise ExportPreflightError("EXPORT.MANIFEST_RESTORE_FAILED")
             assert manifest_digest is not None
@@ -1125,15 +1731,20 @@ def _restore_export_pair(
                 expected_destination_digest=manifest_digest,
                 expected_destination_identity=manifest_published_identity,
                 code="EXPORT.MANIFEST_RESTORE_FAILED",
+                parent_handle=parent_handle,
             )
     elif not _remove_exported_if_owned(
         paths.manifest,
         expected_identity=manifest_published_identity,
         expected_digest=manifest_digest,
+        parent_handle=parent_handle,
     ):
         raise ExportPreflightError("EXPORT.MANIFEST_RESTORE_FAILED")
     try:
-        _fsync_directory(paths.destination.parent)
+        _fsync_directory(
+            paths.destination.parent,
+            parent_handle=parent_handle,
+        )
     except OSError as error:
         raise ExportPreflightError(
             "EXPORT.RESTORE_FSYNC_FAILED"
@@ -1148,30 +1759,115 @@ def _restore_export_from_recovery(
     expected_destination_digest: str,
     expected_destination_identity: tuple[int, int],
     code: str,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
     """Replace one owned published file with the prior-bytes recovery copy.
 
     The recovery copy must still pass the strict no-follow, regular,
     single-link, digest and stable-identity proof; an unprovable or
     swapped recovery file fails stop and is never used to overwrite.
+    With a retained parent handle the proof and the replace are
+    descriptor-relative.
     """
 
-    proof = _strict_locator_proof(recovery, expected_digest)
-    if proof is None:
-        raise ExportPreflightError(code)
+    if parent_handle is not None:
+        regular_proof = _strict_regular_file_state(
+            recovery,
+            parent_handle=parent_handle,
+        )
+        if (
+            regular_proof is None
+            or regular_proof[0] != expected_digest
+        ):
+            raise ExportPreflightError(code)
+        source_identity = regular_proof[1]
+    else:
+        locator_proof = _strict_locator_proof(recovery, expected_digest)
+        if locator_proof is None:
+            raise ExportPreflightError(code)
+        source_identity = locator_proof[0]
     try:
         _replace_path(
             recovery,
             destination,
+            expected_source_identity=source_identity,
             expected_destination_digest=expected_destination_digest,
             expected_destination_identity=expected_destination_identity,
+            parent_handle=parent_handle,
         )
     except OSError as error:
         raise ExportPreflightError(code) from error
 
 
+def _dirfd_entry_state(
+    path: Path,
+    *,
+    parent_handle: _ExportParentHandle,
+) -> tuple[str, str | None, tuple[int, int] | None]:
+    """One descriptor-relative three-way proof of an export entry.
+
+    Returns ``("absent", None, None)`` when the basename does not exist
+    under the retained parent descriptor, ``("unsafe", None, None)``
+    when the entry is a symlink, directory, multi-link, unreadable or
+    identity-unstable, and ``("present", digest, identity)`` only for a
+    regular single-link file hashed through a no-follow descriptor and
+    re-proven by terminal ``lstat`` relative to the same retained fd.
+    """
+
+    try:
+        observed = parent_handle.lstat(path.name)
+    except FileNotFoundError:
+        return ("absent", None, None)
+    except OSError:
+        return ("unsafe", None, None)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        return ("unsafe", None, None)
+    identity = (observed.st_dev, observed.st_ino)
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    try:
+        descriptor = parent_handle.open(
+            path.name,
+            os.O_RDONLY | no_follow,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            return ("unsafe", None, None)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError:
+        return ("unsafe", None, None)
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    try:
+        final = parent_handle.lstat(path.name)
+    except OSError:
+        return ("unsafe", None, None)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_nlink != 1
+        or (final.st_dev, final.st_ino) != identity
+    ):
+        return ("unsafe", None, None)
+    return ("present", digest.hexdigest(), identity)
+
+
 def _strict_regular_file_state(
     path: Path,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> tuple[str, tuple[int, int]] | None:
     """One descriptor-based no-follow proof of a published/owned entry.
 
@@ -1180,13 +1876,21 @@ def _strict_regular_file_state(
     bytes hash to a stable digest read through the descriptor, and a
     terminal ``lstat`` still reports the same device/inode.  Absent,
     symlinked, directory, multi-link, swapped, or unreadable entries
-    return ``None`` and are never hashed by pathname.
+    return ``None`` and are never hashed by pathname.  With a retained
+    parent handle the open and the terminal lstat are
+    descriptor-relative.
     """
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        if parent_handle is not None:
+            descriptor = parent_handle.open(
+                path.name,
+                os.O_RDONLY | no_follow,
+            )
+        else:
+            descriptor = os.open(path, os.O_RDONLY | no_follow)
         observed = os.fstat(descriptor)
         if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
             return None
@@ -1199,7 +1903,10 @@ def _strict_regular_file_state(
             digest.update(chunk)
         os.close(descriptor)
         descriptor = -1
-        final = os.lstat(path)
+        if parent_handle is not None:
+            final = parent_handle.lstat(path.name)
+        else:
+            final = os.lstat(path)
         if (
             not stat.S_ISREG(final.st_mode)
             or final.st_nlink != 1
@@ -1220,10 +1927,15 @@ def _strict_regular_file_state(
 def _published_file_identity(
     path: Path,
     expected_digest: str,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> tuple[int, int]:
     """Prove the just-published file still holds our exact bytes."""
 
-    proof = _strict_regular_file_state(path)
+    proof = _strict_regular_file_state(
+        path,
+        parent_handle=parent_handle,
+    )
     if proof is None or proof[0] != expected_digest:
         raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
     return proof[1]
@@ -1236,22 +1948,30 @@ def _verify_export_pair(
     manifest_bytes: bytes,
     jsonl_identity: tuple[int, int],
     manifest_identity: tuple[int, int],
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
     """Re-prove the published pair by digest AND exact created identity.
 
     A foreign same-byte inode swap cannot pass: the strict
     descriptor-based proof must report the exact identities of the
-    files this publication created.
+    files this publication created.  With a retained parent handle the
+    proofs are descriptor-relative.
     """
 
-    jsonl_proof = _strict_regular_file_state(paths.destination)
+    jsonl_proof = _strict_regular_file_state(
+        paths.destination,
+        parent_handle=parent_handle,
+    )
     if (
         jsonl_proof is None
         or jsonl_proof[0] != jsonl_digest
         or jsonl_proof[1] != jsonl_identity
     ):
         raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
-    manifest_proof = _strict_regular_file_state(paths.manifest)
+    manifest_proof = _strict_regular_file_state(
+        paths.manifest,
+        parent_handle=parent_handle,
+    )
     if (
         manifest_proof is None
         or manifest_proof[0]
@@ -1268,25 +1988,35 @@ def _cleanup_export_artifacts(
     manifest_temp_identity: _CreatedFileIdentity | None,
     jsonl_recovery_identity: _CreatedFileIdentity | None,
     manifest_recovery_identity: _CreatedFileIdentity | None,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> tuple[Path, ...]:
     """Remove only artifacts whose creation identity we still own.
 
     Returns the paths that could not be removed (hostile swap or I/O
     failure); those are never deleted and fail the next export closed.
+    The manifest recovery copy is processed before the JSONL recovery
+    copy so a partial cleanup that returns ``remaining`` always leaves
+    the JSONL recovery locator provable when a prior pair existed.
+    With a retained parent handle the proof and unlink are
+    descriptor-relative.
     """
 
     remaining: list[Path] = []
     for path, identity in (
         (paths.jsonl_temp, jsonl_temp_identity),
         (paths.manifest_temp, manifest_temp_identity),
-        (paths.jsonl_recovery, jsonl_recovery_identity),
         (paths.manifest_recovery, manifest_recovery_identity),
+        (paths.jsonl_recovery, jsonl_recovery_identity),
     ):
         if identity is None:
             continue
         try:
-            _remove_created_file(path, identity)
-            if _path_exists(path):
+            _remove_created_file(
+                path,
+                identity,
+                parent_handle=parent_handle,
+            )
+            if _path_exists(path, parent_handle=parent_handle):
                 remaining.append(path)
         except (OSError, ExportPreflightError):
             remaining.append(path)
@@ -1296,17 +2026,25 @@ def _cleanup_export_artifacts(
 def _remove_failed_export_artifact(
     path: Path,
     identity: _CreatedFileIdentity,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> bool:
     """Remove an artifact created by this call after an ordinary exception.
 
     Process termination can still leave the deterministic temp for the
     cross-call recovery protocol, but a caught write/fsync failure must not
     turn an otherwise retryable export into a permanent TEMP_CONFLICT.
+    With a retained parent handle the proof and unlink are
+    descriptor-relative.
     """
 
     try:
-        _remove_created_file(path, identity)
-        return not _path_exists(path)
+        _remove_created_file(
+            path,
+            identity,
+            parent_handle=parent_handle,
+        )
+        return not _path_exists(path, parent_handle=parent_handle)
     except (OSError, ExportPreflightError):
         return False
 
@@ -1604,7 +2342,7 @@ class TMMigrationService:
                     manifest_identity=manifest_identity,
                     receipt_id_prefix="snapshot.refresh.",
                     stage_prefix="REFRESH",
-                    register=lambda receipt, jsonl_temp_identity, manifest_temp_identity: (
+                    register=lambda receipt, jsonl_temp_identity, manifest_temp_identity, prior, parent_identity: (
                         store.register_issued_refresh_receipt(
                             receipt,
                             expected_generation=(
@@ -1612,6 +2350,13 @@ class TMMigrationService:
                             ),
                             jsonl_temp_identity=jsonl_temp_identity,
                             manifest_temp_identity=manifest_temp_identity,
+                            artifact_parent_identity=parent_identity,
+                            prior_jsonl_identity=prior[0],
+                            prior_jsonl_digest=prior[1],
+                            prior_jsonl_absent=prior[2],
+                            prior_manifest_identity=prior[3],
+                            prior_manifest_digest=prior[4],
+                            prior_manifest_absent=prior[5],
                         )
                     ),
                     record_recovery_handoff=(
@@ -1739,7 +2484,7 @@ class TMMigrationService:
             receipt_id_prefix="snapshot.export.",
             stage_prefix="EXPORT",
             register=(
-                lambda receipt, jsonl_temp_identity, manifest_temp_identity: (
+                lambda receipt, jsonl_temp_identity, manifest_temp_identity, prior, parent_identity: (
                     store.register_issued_export_receipt(
                         receipt,
                         destination_jsonl_path=paths.destination,
@@ -1747,6 +2492,13 @@ class TMMigrationService:
                         expected_generation=snapshot.revision.generation,
                         jsonl_temp_identity=jsonl_temp_identity,
                         manifest_temp_identity=manifest_temp_identity,
+                        artifact_parent_identity=parent_identity,
+                        prior_jsonl_identity=prior[0],
+                        prior_jsonl_digest=prior[1],
+                        prior_jsonl_absent=prior[2],
+                        prior_manifest_identity=prior[3],
+                        prior_manifest_digest=prior[4],
+                        prior_manifest_absent=prior[5],
                     )
                 )
             ),
@@ -1783,7 +2535,20 @@ class TMMigrationService:
         receipt_id_prefix: str,
         stage_prefix: str,
         register: Callable[
-            [SnapshotReceipt, tuple[int, int], tuple[int, int]],
+            [
+                SnapshotReceipt,
+                tuple[int, int],
+                tuple[int, int],
+                tuple[
+                    tuple[int, int] | None,
+                    str | None,
+                    bool | None,
+                    tuple[int, int] | None,
+                    str | None,
+                    bool | None,
+                ],
+                tuple[int, int],
+            ],
             None,
         ],
         record_recovery_handoff: Callable[
@@ -1798,15 +2563,27 @@ class TMMigrationService:
         """Run the shared Task 5.12 publication protocol for one pair.
 
         The caller has already validated the destination state and
-        captured the canonical snapshot.  This method writes and verifies
-        the deterministic JSONL/manifest temporary pair, registers
-        exactly one issued receipt, publishes in the fixed
-        JSONL replace / parent fsync / manifest replace / parent fsync
-        order, re-verifies the published pair, and atomically completes
-        the receipt.  Any caught failure restores the exact prior pair
-        (or original absence), cancels the issued receipt after a
-        complete restore, cleans only inode-proven artifacts, and
-        returns the shared failure contract.
+        captured the canonical snapshot.  Before the first JSONL
+        temporary creation the full parent chain is validated and the
+        immediate parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and
+        retained as ``_ExportParentHandle``: its exact device/inode is
+        the pre-temp identity durably persisted by the issued
+        registration, and every artifact create/open/verify/copy/
+        replace/restore/cleanup for the six deterministic names runs
+        relative to the retained descriptor with no-follow semantics and
+        never re-resolves the parent pathname for destructive work.  The
+        retained descriptor is fsynced for publication/cleanup
+        durability and the advertised full parent pathname is re-proven
+        to still resolve to that identity at the required boundaries; a
+        mismatch fails closed.  The method then writes and verifies the
+        deterministic JSONL/manifest temporary pair, registers exactly
+        one issued receipt, publishes in the fixed JSONL replace /
+        parent fsync / manifest replace / parent fsync order,
+        re-verifies the published pair, and atomically completes the
+        receipt.  Any caught failure restores the exact prior pair (or
+        original absence), cancels the issued receipt after a complete
+        restore, cleans only inode-proven artifacts, and returns the
+        shared failure contract.
         """
 
         jsonl_temp_identity: _CreatedFileIdentity | None = None
@@ -1821,11 +2598,14 @@ class TMMigrationService:
         issued = False
         complete_called = False
         receipt: SnapshotReceipt | None = None
+        parent_handle: _ExportParentHandle | None = None
         try:
+            parent_handle = _ExportParentHandle.bind(paths.destination)
             jsonl_digest, record_count, jsonl_temp_identity = (
                 _stream_export_jsonl_temp(
                     paths.jsonl_temp,
                     snapshot.records,
+                    parent_handle=parent_handle,
                 )
             )
             _verify_export_jsonl_temp(
@@ -1833,6 +2613,7 @@ class TMMigrationService:
                 expected_digest=jsonl_digest,
                 expected_count=record_count,
                 identity=jsonl_temp_identity,
+                parent_handle=parent_handle,
             )
             receipt = SnapshotReceipt(
                 snapshot_id=f"{receipt_id_prefix}{uuid.uuid4().hex}",
@@ -1853,14 +2634,17 @@ class TMMigrationService:
             manifest_temp_identity = _write_export_payload_temp(
                 paths.manifest_temp,
                 manifest_bytes,
+                parent_handle=parent_handle,
             )
             _verify_export_payload_temp(
                 paths.manifest_temp,
                 expected_bytes=manifest_bytes,
                 identity=manifest_temp_identity,
+                parent_handle=parent_handle,
             )
             assert jsonl_temp_identity is not None
             assert manifest_temp_identity is not None
+            artifact_parent_identity = parent_handle.identity
             register(
                 receipt,
                 (
@@ -1871,6 +2655,19 @@ class TMMigrationService:
                     manifest_temp_identity.device,
                     manifest_temp_identity.inode,
                 ),
+                (
+                    destination_identity,
+                    destination_before,
+                    (
+                        True
+                        if destination_before is None
+                        else False
+                    ),
+                    manifest_identity,
+                    manifest_before,
+                    True if manifest_before is None else False,
+                ),
+                artifact_parent_identity,
             )
             issued = True
             jsonl_recovery_identity, manifest_recovery_identity = (
@@ -1878,6 +2675,7 @@ class TMMigrationService:
                     paths,
                     destination_before=destination_before,
                     manifest_before=manifest_before,
+                    parent_handle=parent_handle,
                 )
             )
             record_recovery_handoff(
@@ -1899,16 +2697,22 @@ class TMMigrationService:
                     )
                 ),
             )
+            assert jsonl_temp_identity is not None
             _replace_path(
                 paths.jsonl_temp,
                 paths.destination,
+                expected_source_identity=(
+                    jsonl_temp_identity.device,
+                    jsonl_temp_identity.inode,
+                ),
                 expected_destination_digest=destination_before,
                 expected_destination_identity=destination_identity,
+                parent_handle=parent_handle,
             )
-            assert jsonl_temp_identity is not None
             observed_jsonl_identity = _published_file_identity(
                 paths.destination,
                 jsonl_digest,
+                parent_handle=parent_handle,
             )
             if observed_jsonl_identity != (
                 jsonl_temp_identity.device,
@@ -1918,17 +2722,26 @@ class TMMigrationService:
                     "EXPORT.PUBLISH_VERIFY_FAILED"
                 )
             jsonl_published_identity = observed_jsonl_identity
-            _fsync_directory(paths.destination.parent)
+            _fsync_directory(
+                paths.destination.parent,
+                parent_handle=parent_handle,
+            )
+            assert manifest_temp_identity is not None
             _replace_path(
                 paths.manifest_temp,
                 paths.manifest,
+                expected_source_identity=(
+                    manifest_temp_identity.device,
+                    manifest_temp_identity.inode,
+                ),
                 expected_destination_digest=manifest_before,
                 expected_destination_identity=manifest_identity,
+                parent_handle=parent_handle,
             )
-            assert manifest_temp_identity is not None
             observed_manifest_identity = _published_file_identity(
                 paths.manifest,
                 manifest_digest,
+                parent_handle=parent_handle,
             )
             if observed_manifest_identity != (
                 manifest_temp_identity.device,
@@ -1938,7 +2751,10 @@ class TMMigrationService:
                     "EXPORT.PUBLISH_VERIFY_FAILED"
                 )
             manifest_published_identity = observed_manifest_identity
-            _fsync_directory(paths.destination.parent)
+            _fsync_directory(
+                paths.destination.parent,
+                parent_handle=parent_handle,
+            )
             _verify_export_pair(
                 paths,
                 jsonl_digest=jsonl_digest,
@@ -1951,6 +2767,7 @@ class TMMigrationService:
                     manifest_temp_identity.device,
                     manifest_temp_identity.inode,
                 ),
+                parent_handle=parent_handle,
             )
             complete_called = True
             complete(
@@ -1964,6 +2781,40 @@ class TMMigrationService:
                     manifest_temp_identity.inode,
                 ),
             )
+            cleanup_pending = False
+            try:
+                remaining = _cleanup_export_artifacts(
+                    paths,
+                    jsonl_temp_identity=None,
+                    manifest_temp_identity=None,
+                    jsonl_recovery_identity=jsonl_recovery_identity,
+                    manifest_recovery_identity=manifest_recovery_identity,
+                    parent_handle=parent_handle,
+                )
+                if remaining:
+                    cleanup_pending = True
+                else:
+                    _fsync_directory(
+                        paths.destination.parent,
+                        parent_handle=parent_handle,
+                    )
+                    store.clear_issued_receipt_handoff(
+                        receipt.snapshot_id,
+                        expected_generation=snapshot.revision.generation,
+                    )
+            except (
+                SQLiteStoreLifecycleError,
+                SQLiteStoreSchemaError,
+                sqlite3.DatabaseError,
+                OSError,
+            ):
+                cleanup_pending = True
+            if cleanup_pending:
+                return self._cleanup_pending_failure(
+                    stage_prefix=stage_prefix,
+                    paths=paths,
+                    destination_before=destination_before,
+                )
         except (
             ExportPreflightError,
             SQLiteStoreLifecycleError,
@@ -1979,12 +2830,15 @@ class TMMigrationService:
                     paths=paths,
                     stage_prefix=stage_prefix,
                     receipt=receipt,
+                    jsonl_temp_identity=jsonl_temp_identity,
+                    manifest_temp_identity=manifest_temp_identity,
                     jsonl_recovery_identity=jsonl_recovery_identity,
                     manifest_recovery_identity=manifest_recovery_identity,
                     jsonl_digest=jsonl_digest,
                     record_count=record_count,
                     destination_before=destination_before,
                     error=error,
+                    parent_handle=parent_handle,
                 )
                 if window_outcome is not None:
                     return window_outcome
@@ -2004,6 +2858,7 @@ class TMMigrationService:
                         ),
                         jsonl_digest=jsonl_digest,
                         manifest_digest=manifest_digest,
+                        parent_handle=parent_handle,
                     )
                 except Exception as restore_exception:
                     restore_error = restore_exception
@@ -2024,8 +2879,10 @@ class TMMigrationService:
                     if keep_recovery
                     else manifest_recovery_identity
                 ),
+                parent_handle=parent_handle,
             )
             ledger_error: Exception | None = None
+            handoff_release_failed = False
             if issued and restore_error is None:
                 assert receipt is not None
                 try:
@@ -2038,8 +2895,32 @@ class TMMigrationService:
                 except Exception as cancel_exception:
                     ledger_error = cancel_exception
                     failure_stage = f"{stage_prefix}.LEDGER"
+                else:
+                    if not cleanup_remaining:
+                        try:
+                            _fsync_directory(
+                                paths.destination.parent,
+                                parent_handle=parent_handle,
+                            )
+                            store.clear_issued_receipt_handoff(
+                                receipt.snapshot_id,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                            )
+                        except (
+                            OSError,
+                            SQLiteStoreLifecycleError,
+                            SQLiteStoreSchemaError,
+                            sqlite3.DatabaseError,
+                        ):
+                            handoff_release_failed = True
+                            ledger_error = ExportPreflightError(
+                                "EXPORT.CLEANUP_PENDING"
+                            )
+                            failure_stage = f"{stage_prefix}.LEDGER"
             diagnostics: list[ExportDiagnostic] = []
-            if cleanup_remaining:
+            if cleanup_remaining or handoff_release_failed:
                 diagnostics.append(
                     _export_diagnostic(
                         "EXPORT.CLEANUP_PENDING",
@@ -2068,23 +2949,9 @@ class TMMigrationService:
                 diagnostics=tuple(diagnostics),
                 recovery_candidate=paths.jsonl_recovery,
             )
-        remaining = _cleanup_export_artifacts(
-            paths,
-            jsonl_temp_identity=None,
-            manifest_temp_identity=None,
-            jsonl_recovery_identity=jsonl_recovery_identity,
-            manifest_recovery_identity=manifest_recovery_identity,
-        )
-        success_diagnostics = (
-            ()
-            if not remaining
-            else (
-                _export_diagnostic(
-                    "EXPORT.CLEANUP_PENDING",
-                    "EXPORT_ARTIFACTS_REMAIN",
-                ),
-            )
-        )
+        finally:
+            if parent_handle is not None:
+                parent_handle.close()
         assert jsonl_digest is not None
         assert receipt is not None
         return self._export_report(
@@ -2092,7 +2959,39 @@ class TMMigrationService:
             jsonl_digest=jsonl_digest,
             snapshot=snapshot,
             receipt=receipt,
-            diagnostics=success_diagnostics,
+            diagnostics=(),
+        )
+
+    def _cleanup_pending_failure(
+        self,
+        *,
+        stage_prefix: str,
+        paths: _ExportArtifactPaths,
+        destination_before: str | None,
+        extra_diagnostics: tuple[ExportDiagnostic, ...] = (),
+    ) -> ExportFailure:
+        """Build the explicit ``EXPORT.CLEANUP_PENDING`` failure.
+
+        Delegates to the public cleanup-pending outcome builder: the
+        receipt is already terminal and the published pair is the
+        durable truth, so ``publication_committed`` is True, the failure
+        is fail-stop and never carries a recovery locator (the old
+        destination is never restored).  The before/observed digests are
+        retained whenever known; a fresh prior-absent destination is
+        ``NOT_APPLICABLE``.  Only code-only diagnostics are emitted.
+        """
+
+        return export_cleanup_pending_failure(
+            stage=f"{stage_prefix}.LEDGER",
+            destination_before=destination_before,
+            destination_observed=_try_file_digest(paths.destination),
+            diagnostics=(
+                _export_diagnostic(
+                    "EXPORT.CLEANUP_PENDING",
+                    "EXPORT_ARTIFACTS_REMAIN",
+                ),
+            )
+            + tuple(extra_diagnostics),
         )
 
     def _post_completion_exception_window(
@@ -2103,12 +3002,15 @@ class TMMigrationService:
         paths: _ExportArtifactPaths,
         stage_prefix: str,
         receipt: SnapshotReceipt,
+        jsonl_temp_identity: _CreatedFileIdentity | None,
+        manifest_temp_identity: _CreatedFileIdentity | None,
         jsonl_recovery_identity: _CreatedFileIdentity | None,
         manifest_recovery_identity: _CreatedFileIdentity | None,
         jsonl_digest: str | None,
         record_count: int,
         destination_before: str | None,
         error: Exception,
+        parent_handle: _ExportParentHandle | None = None,
     ) -> ExportOutcome | None:
         """Resolve the Task 5.13 ambiguous post-completion exception window.
 
@@ -2120,7 +3022,16 @@ class TMMigrationService:
         cancelled; a committed-but-unclean window fails closed with
         evidence preserved; only a provably not-committed window returns
         ``None`` so the ordinary known-before-commit restore/cancel
-        behavior continues.
+        behavior continues.  When the probe itself raises, the ledger
+        truth is unknown: every probe exception is routed through the
+        dedicated ``export_ledger_ambiguous_failure`` builder, which
+        fails stop at ``<stage_prefix>.LEDGER`` with
+        ``publication_commit_ambiguous`` True, ``publication_committed``
+        False, code-only diagnostics, and never fabricates a recovery
+        locator (``NOT_APPLICABLE`` only when no prior destination;
+        otherwise every known before/observed digest is preserved as
+        truthful VERIFIED_CHANGED/UNVERIFIED evidence).  No
+        ``ExportPreflightError`` can escape the outcome.
         """
 
         try:
@@ -2130,12 +3041,11 @@ class TMMigrationService:
                 require_bound=(stage_prefix == "REFRESH"),
             )
         except Exception as probe_error:
-            observed = _try_file_digest(paths.destination)
-            return self._export_failure(
-                probe_error,
-                stage_label=f"{stage_prefix}.LEDGER",
+            return export_ledger_ambiguous_failure(
+                stage=f"{stage_prefix}.LEDGER",
+                error_code=_export_error_code(probe_error),
                 destination_before=destination_before,
-                destination_observed=observed,
+                destination_observed=_try_file_digest(paths.destination),
                 diagnostics=(
                     _export_diagnostic(
                         "EXPORT.LEDGER_AMBIGUOUS",
@@ -2144,45 +3054,66 @@ class TMMigrationService:
                 ),
             )
         if probe is ReceiptCompletionProbe.COMMITTED:
-            remaining = _cleanup_export_artifacts(
-                paths,
-                jsonl_temp_identity=None,
-                manifest_temp_identity=None,
-                jsonl_recovery_identity=jsonl_recovery_identity,
-                manifest_recovery_identity=manifest_recovery_identity,
-            )
-            success_diagnostics = (
-                ()
-                if not remaining
-                else (
-                    _export_diagnostic(
-                        "EXPORT.CLEANUP_PENDING",
-                        "EXPORT_ARTIFACTS_REMAIN",
-                    ),
+            try:
+                remaining = _cleanup_export_artifacts(
+                    paths,
+                    jsonl_temp_identity=jsonl_temp_identity,
+                    manifest_temp_identity=manifest_temp_identity,
+                    jsonl_recovery_identity=jsonl_recovery_identity,
+                    manifest_recovery_identity=manifest_recovery_identity,
+                    parent_handle=parent_handle,
                 )
-            )
+                if not remaining:
+                    _fsync_directory(
+                        paths.destination.parent,
+                        parent_handle=parent_handle,
+                    )
+                    try:
+                        store.clear_issued_receipt_handoff(
+                            receipt.snapshot_id,
+                            expected_generation=(
+                                snapshot.revision.generation
+                            ),
+                        )
+                    except SQLiteStoreSchemaError as clear_error:
+                        if str(clear_error) != "STORE.HANDOFF_MISSING":
+                            raise
+            except (
+                SQLiteStoreLifecycleError,
+                SQLiteStoreSchemaError,
+                sqlite3.DatabaseError,
+                OSError,
+            ):
+                return self._cleanup_pending_failure(
+                    stage_prefix=stage_prefix,
+                    paths=paths,
+                    destination_before=destination_before,
+                )
+            if remaining:
+                return self._cleanup_pending_failure(
+                    stage_prefix=stage_prefix,
+                    paths=paths,
+                    destination_before=destination_before,
+                )
             assert jsonl_digest is not None
             return self._export_report(
                 record_count=record_count,
                 jsonl_digest=jsonl_digest,
                 snapshot=snapshot,
                 receipt=receipt,
-                diagnostics=success_diagnostics,
+                diagnostics=(),
             )
         if probe is ReceiptCompletionProbe.COMMITTED_UNCLEAN:
-            observed = _try_file_digest(paths.destination)
-            return self._export_failure(
-                error,
-                stage_label=f"{stage_prefix}.LEDGER",
+            return self._cleanup_pending_failure(
+                stage_prefix=stage_prefix,
+                paths=paths,
                 destination_before=destination_before,
-                destination_observed=observed,
-                diagnostics=(
+                extra_diagnostics=(
                     _export_diagnostic(
                         "EXPORT.LEDGER_UNCLEAN",
                         "EXPORT_LEDGER_UNCLEAN",
                     ),
                 ),
-                recovery_candidate=paths.jsonl_recovery,
             )
         return None
 
@@ -4242,9 +5173,17 @@ def _write_new_file(path: Path, payload: bytes) -> _CreatedFileIdentity:
 def _remove_created_file(
     path: Path,
     expected: _CreatedFileIdentity,
+    *,
+    parent_handle: _ExportParentHandle | None = None,
 ) -> None:
+    """Unlink one identity-proven entry, by pathname or by retained
+    parent descriptor."""
+
     try:
-        observed = os.lstat(path)
+        if parent_handle is not None:
+            observed = parent_handle.lstat(path.name)
+        else:
+            observed = os.lstat(path)
     except FileNotFoundError:
         return
     if (
@@ -4252,7 +5191,10 @@ def _remove_created_file(
         and observed.st_dev == expected.device
         and observed.st_ino == expected.inode
     ):
-        path.unlink()
+        if parent_handle is not None:
+            parent_handle.unlink(path.name)
+        else:
+            path.unlink()
 
 
 def _remove_owned_schema_upgrade_backup(

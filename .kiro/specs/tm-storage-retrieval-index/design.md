@@ -481,8 +481,10 @@ class ExportFailure:
     error_code: str
     retryable: bool
     diagnostics: tuple[ExportDiagnostic, ...]
-    previous_destination_unchanged: bool
-    recovery_path: Path | None
+    previous_destination_preservation: AssetPreservationEvidence
+    recovery_locators: tuple[RecoveryLocator, ...]
+    publication_committed: bool = False
+    publication_commit_ambiguous: bool = False
 
 type MigrationOutcome = MigrationReport | MigrationFailure
 type ExportOutcome = ExportReport | ExportFailure
@@ -614,7 +616,7 @@ class BenchmarkReport:
     environment: tuple[tuple[str, str], ...]
 ```
 
-所有相似度/overlap 在 `[0.0, 1.0]`，limit 为正整数，source/target/resource id 非空，handle order 唯一且非负。fuzzy 必须有 evidence；exact/context 不得伪造 scorer evidence。候选阶段计数均非负且按规定顺序出现；`UNION.output_unique_count == union_unique_count`，deduplicate/truncate 前后可对账，`scored_count <= recall.candidate_budget`，`truncated` 与 TRUNCATE dropped count 一致。fuzzy/context available 为 false 时对应 unavailable code 必须非空且不得返回该类型结果，true 时 code 必须为空。Success 必须有 digest/generation，Failure 必须有 stage/error/retryable 和资产保持标志；无法证明 unchanged 时必须给 recovery path 并 fail-stop。公开 diagnostics 只保存 code、stage、line/record id 和安全摘要，不包含正文。
+所有相似度/overlap 在 `[0.0, 1.0]`，limit 为正整数，source/target/resource id 非空，handle order 唯一且非负。fuzzy 必须有 evidence；exact/context 不得伪造 scorer evidence。候选阶段计数均非负且按规定顺序出现；`UNION.output_unique_count == union_unique_count`，deduplicate/truncate 前后可对账，`scored_count <= recall.candidate_budget`，`truncated` 与 TRUNCATE dropped count 一致。fuzzy/context available 为 false 时对应 unavailable code 必须非空且不得返回该类型结果，true 时 code 必须为空。Success 必须有 digest/generation，Failure 必须有 stage/error/retryable 和资产保持标志；普通失败无法证明 unchanged 时必须给 recovery locator 并 fail-stop。若 receipt 与新 pair 已 durable commit、禁止回滚旧 destination，但 deterministic cleanup/handoff 尚未闭合，`ExportFailure.publication_committed` 为 true：结果仍 fail-stop，保留已知 before/observed digest，且不得给出会暗示恢复旧 destination 的 locator；若 completion probe 本身失败、ledger commit 状态不可判定且自动回滚同样不安全，则互斥地设置 `publication_commit_ambiguous`，以同样的 fail-stop/no-locator 规则保留真实证据但绝不宣称已经 commit。原 destination 不存在时才可使用 `NOT_APPLICABLE`。公开 diagnostics 只保存 code、stage、line/record id 和安全摘要，不包含正文。
 
 ### SQLiteTMStore
 
@@ -822,6 +824,8 @@ class TMMigrationService:
 | JSONL 或 manifest 与 completed/issued ledger 均不一致 | 标记 `SOURCE_DIVERGED` | canonical 继续，禁止自动覆盖 |
 
 该协议不回滚或替换 canonical records。manifest 缺失、被外部改写，JSONL digest 被外部改写，或 receipt 的 resource/canonical identity、revision ancestry 不成立，都进入 `SOURCE_DIVERGED`；合法 local write 只推进 head revision，仍保持既有 receipt 为 `VERIFIED_HISTORY`。
+
+issued receipt 的 versioned artifact handoff 同时记录排他 temp/recovery copy 身份、其真实直接父目录的 device/inode，以及发布前 final pair 的 identity/digest/明确缺席事实。handoff 必须跨越 completed/cancelled 终态事务继续存在；只有先验证 terminal receipt 的 resource/canonical identity、revision ancestry、配置/任意路径分类、authority alias、完整真实父目录链与 durable parent identity，再按 exact identity+digest 清理 owned artifact、通过绑定该 parent identity 的 no-follow directory descriptor 执行 fsync、严格复核父目录未替换且四个 deterministic artifact path 均缺席后，才可清除 handoff。任何外来同字节 inode、symlink、hardlink、目录、父目录替换或 fsync 失败都保持文件与 handoff、返回 `BLOCKED`/cleanup-pending failure；不得在 cleanup 未闭合时报告成功。预先锁存的配置 divergence 只阻止 configured terminal replay，不得永久阻塞与 binding/divergence 无关的任意路径 terminal cleanup。任意路径 export replay 始终不改变 active binding 或 divergence；配置 refresh replay 仍受资源级可重入 observation gate 串行化。
 
 显式 import/rebuild 与 export 不互相冒充：只有 import/rebuild 能在 divergence 后创建新 canonical generation、更新 source binding 并清除状态；export 永不把一个未知外部 JSONL 宣称为 canonical 来源。
 

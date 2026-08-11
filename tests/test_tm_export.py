@@ -16,12 +16,15 @@ import unittest
 from unittest.mock import patch
 
 import tm_migration
+import tm_snapshot_recovery
 import tm_sqlite_store
 from tm_activation_journal import (
     _activation_journal_path,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
     _activation_lineage_marker_temp_path,
+    _activation_terminal_path,
+    _activation_terminal_temp_path,
 )
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -255,6 +258,18 @@ def _ledger_status(store_path: Path, destination: Path) -> str | None:
     return statuses[0]
 
 
+def _meta_value(store_path: Path, key: str) -> str | None:
+    connection = sqlite3.connect(store_path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM tm_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else str(row[0])
+
+
 def _ledger_receipt(
     store: SQLiteTMStore,
     *,
@@ -285,6 +300,76 @@ def _ledger_receipt(
             revision.record_count if record_count is None else record_count
         ),
     )
+
+
+def _write_ledger_pair(
+    store: SQLiteTMStore,
+    *,
+    snapshot_id: str,
+    destination: Path,
+    manifest: Path,
+    payload: bytes = b'{"source":"ledger","target":"pair"}\n',
+) -> tuple[SnapshotReceipt, tuple[int, int], tuple[int, int]]:
+    """Write a real destination pair and register one issued receipt.
+
+    Returns the receipt plus the exact published identities so the
+    caller can pass them to ``complete_issued_export_receipt``.  The
+    registration records a durable handoff journal whose temporary
+    identities are the pair identities and whose prior record is the
+    explicit proven absence of the fresh destination pair.
+    """
+
+    revision = store.capture_export_snapshot().revision
+    receipt = SnapshotReceipt(
+        snapshot_id=snapshot_id,
+        resource_id=revision.resource_id,
+        canonical_store_id=revision.canonical_store_id,
+        exported_revision=revision.head_revision,
+        jsonl_digest=hashlib.sha256(payload).hexdigest(),
+        record_count=revision.record_count,
+    )
+    manifest_bytes = contract_to_json(
+        SnapshotManifest(
+            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+            receipt=receipt,
+            receipt_digest=snapshot_receipt_digest(receipt),
+        )
+    ).encode("utf-8")
+    paths = _export_artifact_paths(destination)
+    paths.jsonl_temp.write_bytes(payload)
+    paths.manifest_temp.write_bytes(manifest_bytes)
+    jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+    manifest_temp_identity = _identity_of(paths.manifest_temp)
+    store.register_issued_export_receipt(
+        receipt,
+        destination_jsonl_path=destination,
+        destination_manifest_path=manifest,
+        expected_generation=revision.generation,
+        jsonl_temp_identity=jsonl_temp_identity,
+        manifest_temp_identity=manifest_temp_identity,
+        artifact_parent_identity=_identity_of(destination.parent),
+        prior_jsonl_absent=True,
+        prior_manifest_absent=True,
+    )
+    os.replace(paths.jsonl_temp, destination)
+    os.replace(paths.manifest_temp, manifest)
+    jsonl_identity = (
+        os.lstat(destination).st_dev,
+        os.lstat(destination).st_ino,
+    )
+    manifest_identity = (
+        os.lstat(manifest).st_dev,
+        os.lstat(manifest).st_ino,
+    )
+    return receipt, jsonl_identity, manifest_identity
+
+
+def _identity_of(path: Path) -> tuple[int, int]:
+    """The exact device/inode identity of one existing entry."""
+
+    observed = os.lstat(path)
+    return (observed.st_dev, observed.st_ino)
 
 
 def _record_fields(record: Any) -> tuple[object, ...]:
@@ -755,11 +840,17 @@ class TMExportSnapshotIsolationTests(unittest.TestCase):
             def interleave_stream(
                 path: Path,
                 records: tuple[object, ...],
+                *,
+                parent_handle: Any = None,
             ) -> tuple[str, int, Any]:
                 capture_done.set()
                 if not append_done.wait(10):
                     raise AssertionError("concurrent append never completed")
-                return original_stream(path, records)
+                return original_stream(
+                    path,
+                    records,
+                    parent_handle=parent_handle,
+                )
 
             def appender() -> None:
                 if not capture_done.wait(10):
@@ -809,6 +900,10 @@ class TMExportPreflightTests(unittest.TestCase):
             service = _service(identity)
             journal = _activation_journal_path(identity)
             marker = _activation_lineage_marker_path(identity)
+            terminal = _activation_terminal_path(identity)
+            configured = _export_artifact_paths(
+                identity.configured_jsonl_path
+            )
             cases = (
                 (identity.configured_jsonl_path, "EXPORT.PATH_ALIASED"),
                 (identity.snapshot_manifest_path, "EXPORT.PATH_ALIASED"),
@@ -817,6 +912,12 @@ class TMExportPreflightTests(unittest.TestCase):
                 (_activation_journal_temp_path(journal), "EXPORT.PATH_ALIASED"),
                 (marker, "EXPORT.PATH_ALIASED"),
                 (_activation_lineage_marker_temp_path(marker), "EXPORT.PATH_ALIASED"),
+                (terminal, "EXPORT.PATH_ALIASED"),
+                (_activation_terminal_temp_path(terminal), "EXPORT.PATH_ALIASED"),
+                (configured.jsonl_temp, "EXPORT.PATH_ALIASED"),
+                (configured.manifest_temp, "EXPORT.PATH_ALIASED"),
+                (configured.jsonl_recovery, "EXPORT.PATH_ALIASED"),
+                (configured.manifest_recovery, "EXPORT.PATH_ALIASED"),
             )
             for destination, expected_code in cases:
                 with self.subTest(destination=destination.name):
@@ -965,6 +1066,75 @@ class TMExportPreflightTests(unittest.TestCase):
             ):
                 self.assertFalse(artifact.exists())
 
+    def test_export_bind_ancestor_symlink_swap_fails_closed(self) -> None:
+        """P1 B bind-time ancestor-symlink race.
+
+        The full real parent chain is validated, then an ancestor of the
+        immediate parent is renamed aside and replaced by a symlink into
+        an attacker tree exactly at the late-bound seam between the
+        validation and the component-wise ``O_DIRECTORY|O_NOFOLLOW``
+        descriptor binding.  The component walk must fail closed on the
+        symlinked ancestor: the export returns ``EXPORT.PARENT_UNSAFE``
+        and never creates any deterministic temp or canonical bytes in
+        the attacker tree, and no ledger row or handoff is left behind.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            service = _service(stage.resource_identity)
+            exports = (root / "exports").resolve()
+            sub = exports / "sub"
+            sub.mkdir(parents=True)
+            destination = sub / "out.jsonl"
+            attacker = (root / "attacker").resolve()
+            attacker.mkdir()
+            marker = attacker / "marker.txt"
+            marker.write_bytes(b"attacker marker\n")
+            original_seam = tm_migration._after_export_parent_chain_validated
+            renamed_exports = (root / "exports-real").resolve()
+
+            def swap_ancestor_to_symlink(destination_path: Path) -> None:
+                original_seam(destination_path)
+                if destination_path != destination:
+                    return
+                exports.rename(renamed_exports)
+                os.symlink(attacker, exports)
+
+            with patch(
+                "tm_migration._after_export_parent_chain_validated",
+                side_effect=swap_ancestor_to_symlink,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "EXPORT.PARENT_UNSAFE")
+            self.assertEqual(result.stage, "EXPORT.PUBLISH")
+            self.assertFalse(result.retryable)
+            self.assertTrue(os.path.islink(exports))
+            self.assertEqual(os.readlink(exports), str(attacker))
+            self.assertEqual(
+                sorted(path.name for path in attacker.iterdir()),
+                ["marker.txt"],
+            )
+            self.assertEqual(marker.read_bytes(), b"attacker marker\n")
+            self.assertEqual(
+                sorted(path.name for path in (renamed_exports / "sub").iterdir()),
+                [],
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM tm_snapshot_receipt "
+                    "WHERE status = 'issued'"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(row[0], 0)
+            self.assertIsNone(
+                _meta_value(stage.staged_db_path, "artifact_handoff")
+            )
+
     def test_embedded_nul_path_returns_stable_preflight_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -997,12 +1167,18 @@ class TMExportFailureInjectionTests(unittest.TestCase):
         def failing_stream(
             path: Path,
             records: tuple[object, ...],
+            *,
+            parent_handle: Any = None,
         ) -> tuple[str, int, Any]:
             with patch(
                 "tm_migration.os.write",
                 side_effect=OSError("injected jsonl write failure"),
             ):
-                return original(path, records)
+                return original(
+                    path,
+                    records,
+                    parent_handle=parent_handle,
+                )
 
         return patch(
             "tm_migration._stream_export_jsonl_temp",
@@ -1037,12 +1213,18 @@ class TMExportFailureInjectionTests(unittest.TestCase):
         def failing_manifest_write(
             path: Path,
             payload: bytes,
+            *,
+            parent_handle: Any = None,
         ) -> Any:
             with patch(
                 "tm_migration.os.write",
                 side_effect=OSError("injected manifest write failure"),
             ):
-                return original(path, payload)
+                return original(
+                    path,
+                    payload,
+                    parent_handle=parent_handle,
+                )
 
         return patch(
             "tm_migration._write_export_payload_temp",
@@ -1113,11 +1295,15 @@ class TMExportFailureInjectionTests(unittest.TestCase):
         original = tm_migration._fsync_directory
         calls: list[int] = []
 
-        def failing_dir_fsync(path: Path) -> None:
+        def failing_dir_fsync(
+            path: Path,
+            *,
+            parent_handle: Any = None,
+        ) -> None:
             calls.append(1)
             if len(calls) == 1:
                 raise OSError("injected jsonl directory fsync failure")
-            original(path)
+            original(path, parent_handle=parent_handle)
 
         return patch(
             "tm_migration._fsync_directory",
@@ -1133,11 +1319,15 @@ class TMExportFailureInjectionTests(unittest.TestCase):
         original = tm_migration._fsync_directory
         calls: list[int] = []
 
-        def failing_dir_fsync(path: Path) -> None:
+        def failing_dir_fsync(
+            path: Path,
+            *,
+            parent_handle: Any = None,
+        ) -> None:
             calls.append(1)
             if len(calls) == 2:
                 raise OSError("injected manifest directory fsync failure")
-            original(path)
+            original(path, parent_handle=parent_handle)
 
         return patch(
             "tm_migration._fsync_directory",
@@ -1181,6 +1371,7 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             *,
             destination_before: str | None,
             manifest_before: str | None,
+            parent_handle: Any = None,
         ) -> Any:
             raise ExportPreflightError(
                 "EXPORT.JSONL_RECOVERY_COPY_FAILED"
@@ -1410,6 +1601,7 @@ class TMExportFailureInjectionTests(unittest.TestCase):
                 *,
                 expected_digest: str,
                 code: str,
+                parent_handle: Any = None,
             ) -> Any:
                 nonlocal calls
                 calls += 1
@@ -1422,6 +1614,7 @@ class TMExportFailureInjectionTests(unittest.TestCase):
                     recovery,
                     expected_digest=expected_digest,
                     code=code,
+                    parent_handle=parent_handle,
                 )
 
             with patch(
@@ -1459,12 +1652,12 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             destination = _destination(root)
             paths = _export_artifact_paths(destination)
             original_fstat = tm_migration.os.fstat
-            first = True
+            calls = 0
 
             def flaky_fstat(descriptor: int) -> os.stat_result:
-                nonlocal first
-                if first:
-                    first = False
+                nonlocal calls
+                calls += 1
+                if calls == 2:
                     raise OSError("injected initial temp fstat failure")
                 return original_fstat(descriptor)
 
@@ -1503,6 +1696,7 @@ class TMExportFailureInjectionTests(unittest.TestCase):
                 *,
                 expected_digest: str,
                 code: str,
+                parent_handle: Any = None,
             ) -> Any:
                 first = True
 
@@ -1524,6 +1718,7 @@ class TMExportFailureInjectionTests(unittest.TestCase):
                         recovery,
                         expected_digest=expected_digest,
                         code=code,
+                        parent_handle=parent_handle,
                     )
 
             with patch(
@@ -1660,13 +1855,17 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             calls = 0
             original_dir_fsync = tm_migration._fsync_directory
 
-            def hostile_second_dir_fsync(path: Path) -> None:
+            def hostile_second_dir_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     paths.manifest.write_bytes(foreign)
                     raise OSError("injected manifest directory fsync failure")
-                original_dir_fsync(path)
+                original_dir_fsync(path, parent_handle=parent_handle)
 
             with patch(
                 "tm_migration._fsync_directory",
@@ -1703,7 +1902,12 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             original_identity = tm_migration._published_file_identity
             swapped = False
 
-            def hostile_identity(path: Path, digest: str) -> tuple[int, int]:
+            def hostile_identity(
+                path: Path,
+                digest: str,
+                *,
+                parent_handle: Any = None,
+            ) -> tuple[int, int]:
                 nonlocal swapped
                 if not swapped and path == destination:
                     swapped = True
@@ -1714,7 +1918,11 @@ class TMExportFailureInjectionTests(unittest.TestCase):
                     raise ExportPreflightError(
                         "EXPORT.PUBLISH_VERIFY_FAILED"
                     )
-                return original_identity(path, digest)
+                return original_identity(
+                    path,
+                    digest,
+                    parent_handle=parent_handle,
+                )
 
             with patch(
                 "tm_migration._published_file_identity",
@@ -1757,13 +1965,17 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             swapped = False
             original_dir_fsync = tm_migration._fsync_directory
 
-            def hostile_dir_fsync(path: Path) -> None:
+            def hostile_dir_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
                 nonlocal swapped
                 if not swapped:
                     swapped = True
                     destination.write_bytes(foreign)
                     raise OSError("injected jsonl directory fsync failure")
-                original_dir_fsync(path)
+                original_dir_fsync(path, parent_handle=parent_handle)
 
             with patch(
                 "tm_migration._fsync_directory",
@@ -1943,6 +2155,185 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             self.assertEqual(str(ExportPreflightError("EXPORT.X")), "EXPORT.X")
             self.assertNotIn(str(root), repr(result.previous_destination_preservation))
 
+    def test_source_swap_at_pre_mutation_seam_fails_closed(self) -> None:
+        """P1 2 regression: a source-name swap at the pre-mutation seam.
+
+        The exact created temp identity is proved immediately before
+        the rename and re-proved again after the late-bound seam
+        returns: a foreign same-byte inode swapped in exactly at the
+        seam is detected before the rename, so the publisher fails stop
+        at the pre-rename source proof and never renames the foreign
+        inode or reports ``ExportReport``.  The receipt is cancelled
+        without completion, the durable handoff stays retained because
+        cleanup cannot remove the unprovable foreign temp, and the
+        foreign inode and bytes survive untouched.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_seam = tm_migration._after_replace_source_proved
+            swapped = False
+            foreign_identity: tuple[int, int] | None = None
+            swapped_payload = b""
+
+            def seam_swap_source(
+                source: Path,
+                target: Path,
+                expected_source_identity: tuple[int, int],
+            ) -> None:
+                nonlocal swapped, foreign_identity, swapped_payload
+                original_seam(source, target, expected_source_identity)
+                if swapped:
+                    return
+                swapped = True
+                swapped_payload = source.read_bytes()
+                foreign = source.with_name("foreign-same-bytes.jsonl")
+                foreign.write_bytes(swapped_payload)
+                os.replace(foreign, source)
+                observed = os.lstat(source)
+                foreign_identity = (observed.st_dev, observed.st_ino)
+
+            with patch(
+                "tm_migration._after_replace_source_proved",
+                side_effect=seam_swap_source,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertTrue(swapped)
+            self.assertIsNotNone(foreign_identity)
+            self.assertEqual(result.stage, "EXPORT.PUBLISH")
+            self.assertEqual(
+                result.error_code,
+                "EXPORT.SOURCE_UNPROVEN",
+            )
+            self.assertFalse(result.retryable)
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                ("EXPORT.CLEANUP_PENDING",),
+            )
+            self.assertEqual(
+                _ledger_status(stage.staged_db_path, destination),
+                "cancelled",
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            observed = os.lstat(paths.jsonl_temp)
+            self.assertEqual(
+                (observed.st_dev, observed.st_ino),
+                foreign_identity,
+            )
+            self.assertEqual(paths.jsonl_temp.read_bytes(), swapped_payload)
+            self.assertEqual(destination.read_bytes(), prior_jsonl)
+            self.assertEqual(paths.manifest.read_bytes(), prior_manifest)
+            self.assertFalse(paths.jsonl_recovery.exists())
+            self.assertFalse(paths.manifest_recovery.exists())
+            self.assertEqual(len(result.recovery_locators), 0)
+
+
+    def test_destination_swap_at_pre_mutation_seam_fails_closed(
+        self,
+    ) -> None:
+        """P1 2 regression: a destination swap at the pre-mutation seam.
+
+        The exact prior destination digest and inode are proved before
+        the publication and re-proved again after the late-bound seam
+        returns: a foreign same-byte inode swapped in exactly at the
+        seam is detected before the rename, so the publisher fails stop
+        at the pre-rename destination proof and never overwrites the
+        foreign destination.  The receipt is cancelled without
+        completion, the foreign destination inode and bytes survive
+        cleanup untouched, and no ``ExportReport`` is ever returned.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_seam = tm_migration._after_replace_source_proved
+            swapped = False
+            foreign_identity: tuple[int, int] | None = None
+
+            def seam_swap_destination(
+                source: Path,
+                target: Path,
+                expected_source_identity: tuple[int, int],
+            ) -> None:
+                nonlocal swapped, foreign_identity
+                original_seam(source, target, expected_source_identity)
+                if swapped:
+                    return
+                swapped = True
+                foreign = destination.with_name("foreign-same-byte.jsonl")
+                foreign.write_bytes(prior_jsonl)
+                os.replace(foreign, destination)
+                observed = os.lstat(destination)
+                foreign_identity = (observed.st_dev, observed.st_ino)
+
+            with patch(
+                "tm_migration._after_replace_source_proved",
+                side_effect=seam_swap_destination,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertTrue(swapped)
+            self.assertIsNotNone(foreign_identity)
+            self.assertEqual(result.stage, "EXPORT.PUBLISH")
+            self.assertEqual(
+                result.error_code,
+                "EXPORT.PRIOR_PAIR_CHANGED",
+            )
+            self.assertFalse(result.retryable)
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                (),
+            )
+            self.assertEqual(
+                _ledger_status(stage.staged_db_path, destination),
+                "cancelled",
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            observed = os.lstat(destination)
+            self.assertEqual(
+                (observed.st_dev, observed.st_ino),
+                foreign_identity,
+            )
+            self.assertEqual(destination.read_bytes(), prior_jsonl)
+            self.assertEqual(paths.manifest.read_bytes(), prior_manifest)
+            self.assertFalse(paths.jsonl_temp.exists())
+            self.assertFalse(paths.manifest_temp.exists())
+            self.assertFalse(paths.jsonl_recovery.exists())
+            self.assertFalse(paths.manifest_recovery.exists())
+            self.assertEqual(len(result.recovery_locators), 0)
+
 
 class TMExportLedgerTests(unittest.TestCase):
     def _prepared(self, root: Path) -> tuple[MutableStageRef, SQLiteTMStore]:
@@ -1954,15 +2345,11 @@ class TMExportLedgerTests(unittest.TestCase):
             stage, store = self._prepared(root)
             destination = (root / "ledger.jsonl").resolve()
             paths = _export_artifact_paths(destination)
-            receipt = _ledger_receipt(
+            receipt, jsonl_identity, manifest_identity = _write_ledger_pair(
                 store,
                 snapshot_id="snapshot.export." + "a" * 32,
-            )
-            store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=0,
+                destination=destination,
+                manifest=paths.manifest,
             )
             self.assertEqual(
                 _ledger_status(stage.staged_db_path, destination),
@@ -1971,6 +2358,8 @@ class TMExportLedgerTests(unittest.TestCase):
             store.complete_issued_export_receipt(
                 receipt.snapshot_id,
                 expected_generation=0,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
             )
             self.assertEqual(
                 _ledger_status(stage.staged_db_path, destination),
@@ -1994,15 +2383,14 @@ class TMExportLedgerTests(unittest.TestCase):
                 ),
             )
 
-            cancelled = _ledger_receipt(
-                store,
-                snapshot_id="snapshot.export." + "b" * 32,
-            )
-            store.register_issued_export_receipt(
-                cancelled,
-                destination_jsonl_path=destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=0,
+            cancelled, _cjsonl_identity, _cmanifest_identity = (
+                _write_ledger_pair(
+                    store,
+                    snapshot_id="snapshot.export." + "b" * 32,
+                    destination=destination,
+                    manifest=paths.manifest,
+                    payload=b'{"source":"second","target":"pair"}\n',
+                )
             )
             store.cancel_issued_export_receipt(
                 cancelled.snapshot_id,
@@ -2023,15 +2411,11 @@ class TMExportLedgerTests(unittest.TestCase):
             stage, store = self._prepared(root)
             destination = (root / "ledger.jsonl").resolve()
             paths = _export_artifact_paths(destination)
-            receipt = _ledger_receipt(
+            receipt, jsonl_identity, manifest_identity = _write_ledger_pair(
                 store,
                 snapshot_id="snapshot.export." + "c" * 32,
-            )
-            store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=0,
+                destination=destination,
+                manifest=paths.manifest,
             )
             with self.assertRaises(SQLiteStoreSchemaError) as duplicate:
                 store.register_issued_export_receipt(
@@ -2048,8 +2432,43 @@ class TMExportLedgerTests(unittest.TestCase):
                 store.complete_issued_export_receipt(
                     "snapshot.export." + "d" * 32,
                     expected_generation=0,
+                    jsonl_identity=jsonl_identity,
+                    manifest_identity=manifest_identity,
                 )
             self.assertEqual(str(unknown.exception), "STORE.RECEIPT_UNKNOWN")
+            with self.assertRaises(TypeError):
+                store.complete_issued_export_receipt(
+                    receipt.snapshot_id,
+                    expected_generation=0,
+                )  # pyright: ignore[reportCallIssue]
+            absent_destination = (root / "absent.jsonl").resolve()
+            absent, absent_jsonl, absent_manifest = _write_ledger_pair(
+                store,
+                snapshot_id="snapshot.export." + "dd" * 16,
+                destination=absent_destination,
+                manifest=(
+                    absent_destination.with_name(
+                        f"{absent_destination.name}.localcat-snapshot.json"
+                    )
+                ),
+            )
+            os.unlink(absent_destination)
+            os.unlink(
+                absent_destination.with_name(
+                    f"{absent_destination.name}.localcat-snapshot.json"
+                )
+            )
+            with self.assertRaises(SQLiteStoreSchemaError) as missing:
+                store.complete_issued_export_receipt(
+                    absent.snapshot_id,
+                    expected_generation=0,
+                    jsonl_identity=absent_jsonl,
+                    manifest_identity=absent_manifest,
+                )
+            self.assertEqual(
+                str(missing.exception),
+                "STORE.RECEIPT_PAIR_INVALID",
+            )
             with self.assertRaises(ValueError):
                 store.register_issued_export_receipt(
                     _ledger_receipt(
@@ -2079,20 +2498,18 @@ class TMExportLedgerTests(unittest.TestCase):
             stage, store = self._prepared(root)
             destination = (root / "ledger.jsonl").resolve()
             paths = _export_artifact_paths(destination)
-            receipt = _ledger_receipt(
+            receipt, jsonl_identity, manifest_identity = _write_ledger_pair(
                 store,
                 snapshot_id="snapshot.export." + "g" * 32,
-            )
-            store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=0,
+                destination=destination,
+                manifest=paths.manifest,
             )
             with self.assertRaises(SQLiteStoreLifecycleError) as generation:
                 store.complete_issued_export_receipt(
                     receipt.snapshot_id,
                     expected_generation=1,
+                    jsonl_identity=jsonl_identity,
+                    manifest_identity=manifest_identity,
                 )
             self.assertEqual(generation.exception.code, "STORE.GENERATION_CHANGED")
             self.assertTrue(generation.exception.retryable)
@@ -2109,11 +2526,15 @@ class TMExportLedgerTests(unittest.TestCase):
             store.complete_issued_export_receipt(
                 receipt.snapshot_id,
                 expected_generation=0,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
             )
             with self.assertRaises(SQLiteStoreSchemaError) as stale:
                 store.complete_issued_export_receipt(
                     receipt.snapshot_id,
                     expected_generation=0,
+                    jsonl_identity=jsonl_identity,
+                    manifest_identity=manifest_identity,
                 )
             self.assertEqual(str(stale.exception), "STORE.RECEIPT_STALE")
             with self.assertRaises(SQLiteStoreSchemaError) as stale_cancel:
@@ -2235,6 +2656,10 @@ class TMExportLedgerTests(unittest.TestCase):
                 store.complete_issued_export_receipt(
                     result.snapshot_id,
                     expected_generation=result.canonical_generation,
+                    jsonl_identity=_identity_of(destination),
+                    manifest_identity=_identity_of(
+                        _export_artifact_paths(destination).manifest
+                    ),
                 )
             self.assertEqual(str(stale.exception), "STORE.RECEIPT_STALE")
             with self.assertRaises(SQLiteStoreSchemaError):
@@ -2246,6 +2671,764 @@ class TMExportLedgerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(str(rows[0][9]), "completed")
             self.assertEqual(str(rows[0][0]), result.snapshot_id)
+
+
+class TMExportHandoffDurabilityTests(unittest.TestCase):
+    def _prepared(self, root: Path) -> tuple[MutableStageRef, SQLiteTMStore]:
+        return _prepared_store(root)
+
+    def test_handoff_clear_requires_all_four_deterministic_paths_absent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            destination = (root / "ledger.jsonl").resolve()
+            paths = _export_artifact_paths(destination)
+            receipt, jsonl_identity, manifest_identity = _write_ledger_pair(
+                store,
+                snapshot_id="snapshot.export." + "h" * 32,
+                destination=destination,
+                manifest=paths.manifest,
+            )
+            store.complete_issued_export_receipt(
+                receipt.snapshot_id,
+                expected_generation=0,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
+            )
+            meta_key = "artifact_handoff." + receipt.snapshot_id
+            self.assertIsNotNone(_meta_value(stage.staged_db_path, meta_key))
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                artifact.write_bytes(b"foreign different bytes\n")
+                with self.assertRaises(SQLiteStoreSchemaError) as blocked:
+                    store.clear_issued_receipt_handoff(
+                        receipt.snapshot_id,
+                        expected_generation=0,
+                    )
+                self.assertEqual(
+                    str(blocked.exception),
+                    "STORE.HANDOFF_CLEANUP_PENDING",
+                )
+                self.assertIsNotNone(
+                    _meta_value(stage.staged_db_path, meta_key)
+                )
+                artifact.unlink()
+            same_bytes = destination.with_name("foreign-same-bytes.jsonl")
+            same_bytes.write_bytes(destination.read_bytes())
+            os.replace(same_bytes, paths.jsonl_temp)
+            with self.assertRaises(SQLiteStoreSchemaError) as same_byte:
+                store.clear_issued_receipt_handoff(
+                    receipt.snapshot_id,
+                    expected_generation=0,
+                )
+            self.assertEqual(
+                str(same_byte.exception),
+                "STORE.HANDOFF_CLEANUP_PENDING",
+            )
+            paths.jsonl_temp.unlink()
+            os.symlink(destination, paths.manifest_temp)
+            with self.assertRaises(SQLiteStoreSchemaError) as symlink:
+                store.clear_issued_receipt_handoff(
+                    receipt.snapshot_id,
+                    expected_generation=0,
+                )
+            self.assertEqual(
+                str(symlink.exception),
+                "STORE.HANDOFF_CLEANUP_PENDING",
+            )
+            paths.manifest_temp.unlink()
+            paths.jsonl_recovery.mkdir()
+            with self.assertRaises(SQLiteStoreSchemaError) as directory:
+                store.clear_issued_receipt_handoff(
+                    receipt.snapshot_id,
+                    expected_generation=0,
+                )
+            self.assertEqual(
+                str(directory.exception),
+                "STORE.HANDOFF_CLEANUP_PENDING",
+            )
+            paths.jsonl_recovery.rmdir()
+            os.link(destination, paths.manifest_recovery)
+            with self.assertRaises(SQLiteStoreSchemaError) as hardlink:
+                store.clear_issued_receipt_handoff(
+                    receipt.snapshot_id,
+                    expected_generation=0,
+                )
+            self.assertEqual(
+                str(hardlink.exception),
+                "STORE.HANDOFF_CLEANUP_PENDING",
+            )
+            paths.manifest_recovery.unlink()
+            store.clear_issued_receipt_handoff(
+                receipt.snapshot_id,
+                expected_generation=0,
+            )
+            self.assertIsNone(_meta_value(stage.staged_db_path, meta_key))
+
+    def test_cleanup_fsync_failure_before_handoff_clear_returns_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            original_dir_fsync = tm_migration._fsync_directory
+            calls: list[int] = []
+
+            def failing_cleanup_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
+                calls.append(1)
+                if len(calls) == 3:
+                    raise OSError(
+                        "injected cleanup directory fsync failure"
+                    )
+                original_dir_fsync(path, parent_handle=parent_handle)
+
+            with patch(
+                "tm_migration._fsync_directory",
+                side_effect=failing_cleanup_fsync,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "EXPORT.CLEANUP_PENDING")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertTrue(result.publication_committed)
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                ("EXPORT.CLEANUP_PENDING",),
+            )
+            self.assertEqual(
+                result.previous_destination_preservation.state,
+                AssetPreservationState.NOT_APPLICABLE,
+            )
+            self.assertEqual(result.recovery_locators, ())
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "completed")
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            recovered = store.recover_configured_refresh()
+            self.assertIs(
+                recovered.state,
+                tm_snapshot_recovery.RefreshRecoveryState.COMPLETED,
+            )
+            retry = service.export_jsonl(store, destination)
+            self.assertIsInstance(retry, ExportReport)
+
+    def test_cancellation_failure_durably_releases_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_replace = tm_migration._replace_path
+
+            def failing_manifest_replace(
+                source: Path,
+                target: Path,
+                **kwargs: Any,
+            ) -> None:
+                if source == paths.manifest_temp:
+                    raise OSError("injected manifest replace failure")
+                original_replace(source, target, **kwargs)
+
+            with patch(
+                "tm_migration._replace_path",
+                side_effect=failing_manifest_replace,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.stage, "EXPORT.PUBLISH")
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "cancelled")
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            self.assertEqual(destination.read_bytes(), prior_jsonl)
+            self.assertEqual(paths.manifest.read_bytes(), prior_manifest)
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                self.assertFalse(artifact.exists(), artifact.name)
+            retry = service.export_jsonl(store, destination)
+            self.assertIsInstance(retry, ExportReport)
+
+    def test_committed_probe_with_cleanup_conflict_returns_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            original_complete = store.complete_issued_export_receipt
+            conflict_planted = False
+
+            def commit_clear_then_conflict(
+                snapshot_id: str,
+                **kwargs: Any,
+            ) -> None:
+                nonlocal conflict_planted
+                original_complete(snapshot_id, **kwargs)
+                for artifact in (
+                    paths.jsonl_recovery,
+                    paths.manifest_recovery,
+                ):
+                    if artifact.exists():
+                        artifact.unlink()
+                store.clear_issued_receipt_handoff(
+                    snapshot_id,
+                    expected_generation=kwargs["expected_generation"],
+                )
+                paths.manifest_temp.write_bytes(
+                    b"foreign post-clear bytes\n"
+                )
+                conflict_planted = True
+                raise OSError("injected post-clear exception")
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=commit_clear_then_conflict,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertTrue(conflict_planted)
+            self.assertEqual(result.error_code, "EXPORT.CLEANUP_PENDING")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertTrue(result.publication_committed)
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                ("EXPORT.CLEANUP_PENDING",),
+            )
+            self.assertEqual(
+                result.previous_destination_preservation.state,
+                AssetPreservationState.NOT_APPLICABLE,
+            )
+            self.assertEqual(result.recovery_locators, ())
+            self.assertEqual(
+                paths.manifest_temp.read_bytes(),
+                b"foreign post-clear bytes\n",
+            )
+            self.assertEqual(
+                _ledger_status(stage.staged_db_path, destination),
+                "completed",
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            self.assertTrue(destination.exists())
+            self.assertTrue(paths.manifest.exists())
+
+    def test_committed_unclean_probe_at_fresh_destination_returns_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            original_complete = store.complete_issued_export_receipt
+
+            def commit_then_raise(
+                snapshot_id: str,
+                **kwargs: Any,
+            ) -> None:
+                original_complete(snapshot_id, **kwargs)
+                raise SQLiteStoreLifecycleError(
+                    "STORE.LEDGER_UNAVAILABLE",
+                    resource_id="tm.primary",
+                    generation=0,
+                    retryable=True,
+                )
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=commit_then_raise,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "EXPORT.CLEANUP_PENDING")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertTrue(result.publication_committed)
+            self.assertEqual(result.recovery_locators, ())
+            self.assertEqual(
+                result.previous_destination_preservation.state,
+                AssetPreservationState.NOT_APPLICABLE,
+            )
+            self.assertIsNone(
+                result.previous_destination_preservation.before_digest
+            )
+            self.assertIsNone(
+                result.previous_destination_preservation.observed_digest
+            )
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                ("EXPORT.CLEANUP_PENDING", "EXPORT.LEDGER_UNCLEAN"),
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "completed")
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            self.assertTrue(destination.exists())
+            self.assertTrue(paths.manifest.exists())
+
+    def test_committed_unclean_probe_retains_prior_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_complete = store.complete_issued_export_receipt
+
+            def commit_then_raise(
+                snapshot_id: str,
+                **kwargs: Any,
+            ) -> None:
+                original_complete(snapshot_id, **kwargs)
+                raise SQLiteStoreLifecycleError(
+                    "STORE.LEDGER_UNAVAILABLE",
+                    resource_id="tm.primary",
+                    generation=0,
+                    retryable=True,
+                )
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=commit_then_raise,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "EXPORT.CLEANUP_PENDING")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertTrue(result.publication_committed)
+            self.assertEqual(result.recovery_locators, ())
+            evidence = result.previous_destination_preservation
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.VERIFIED_CHANGED,
+            )
+            self.assertEqual(
+                evidence.before_digest,
+                hashlib.sha256(prior_jsonl).hexdigest(),
+            )
+            self.assertEqual(
+                evidence.observed_digest,
+                hashlib.sha256(destination.read_bytes()).hexdigest(),
+            )
+            self.assertNotEqual(
+                evidence.before_digest,
+                evidence.observed_digest,
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "completed")
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+
+
+class TMExportProbeErrorWindowTests(unittest.TestCase):
+    """Probe-raise post-completion window contract for export/refresh.
+
+    When ``probe_issued_receipt_completed`` itself raises after the
+    destination pair has been published, both entry points must return a
+    fail-stop ``ExportFailure`` (never let ``_export_failure`` raise
+    ``EXPORT.PRIOR_STATE_UNRECOVERABLE``).  A fresh prior-absent
+    destination is ``NOT_APPLICABLE`` with no locator and
+    ``publication_committed`` False; a prior-existing destination keeps
+    the digest-backed evidence and proven recovery locator.
+    """
+
+    def _prepared(self, root: Path) -> tuple[MutableStageRef, SQLiteTMStore]:
+        return _prepared_store(root)
+
+    def _commit_then_raise(
+        self,
+        original_complete: Any,
+    ) -> Callable[..., None]:
+        def commit_then_raise(
+            snapshot_id: str,
+            **kwargs: Any,
+        ) -> None:
+            original_complete(snapshot_id, **kwargs)
+            raise SQLiteStoreLifecycleError(
+                "STORE.LEDGER_UNAVAILABLE",
+                resource_id="tm.primary",
+                generation=kwargs["expected_generation"],
+                retryable=True,
+            )
+
+        return commit_then_raise
+
+    def _raising_probe(self, *args: Any, **kwargs: Any) -> None:
+        raise SQLiteStoreLifecycleError(
+            "STORE.PROBE_UNAVAILABLE",
+            resource_id="tm.primary",
+            generation=0,
+            retryable=True,
+        )
+
+    def _assert_probe_error_window(
+        self,
+        result: Any,
+        *,
+        stage: str,
+        before_digest: str | None,
+        observed_digest: str | None,
+    ) -> None:
+        assert isinstance(result, ExportFailure)
+        self.assertEqual(result.stage, stage)
+        self.assertEqual(result.error_code, "STORE.PROBE_UNAVAILABLE")
+        self.assertFalse(result.retryable)
+        self.assertFalse(result.publication_committed)
+        self.assertTrue(result.publication_commit_ambiguous)
+        self.assertEqual(
+            tuple(d.code for d in result.diagnostics),
+            ("EXPORT.LEDGER_AMBIGUOUS",),
+        )
+        evidence = result.previous_destination_preservation
+        if before_digest is None:
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.NOT_APPLICABLE,
+            )
+            self.assertIsNone(evidence.before_digest)
+            self.assertIsNone(evidence.observed_digest)
+        else:
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.VERIFIED_CHANGED,
+            )
+            self.assertEqual(evidence.before_digest, before_digest)
+            self.assertEqual(evidence.observed_digest, observed_digest)
+            self.assertNotEqual(
+                evidence.before_digest,
+                evidence.observed_digest,
+            )
+        self.assertEqual(result.recovery_locators, ())
+
+    def test_probe_error_at_fresh_destination_returns_fail_stop_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            original_complete = store.complete_issued_export_receipt
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=self._commit_then_raise(original_complete),
+            ), patch.object(
+                store,
+                "probe_issued_receipt_completed",
+                side_effect=self._raising_probe,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            self._assert_probe_error_window(
+                result,
+                stage="EXPORT.LEDGER",
+                before_digest=None,
+                observed_digest=None,
+            )
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "completed")
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+            self.assertTrue(destination.exists())
+            self.assertTrue(paths.manifest.exists())
+
+    def test_probe_error_retains_prior_digests_without_locator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_complete = store.complete_issued_export_receipt
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=self._commit_then_raise(original_complete),
+            ), patch.object(
+                store,
+                "probe_issued_receipt_completed",
+                side_effect=self._raising_probe,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            self._assert_probe_error_window(
+                result,
+                stage="EXPORT.LEDGER",
+                before_digest=hashlib.sha256(prior_jsonl).hexdigest(),
+                observed_digest=hashlib.sha256(
+                    destination.read_bytes()
+                ).hexdigest(),
+            )
+            self.assertTrue(paths.jsonl_recovery.exists())
+            self.assertTrue(destination.exists())
+
+    def test_refresh_probe_error_retains_prior_digests_without_locator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            identity = stage.resource_identity
+            prior_jsonl = b'{"source":"bound","target":"pair"}\n'
+            _ = _bind_current_snapshot(store, stage, prior_jsonl)
+            paths = _export_artifact_paths(identity.configured_jsonl_path)
+            original_complete = store.complete_issued_refresh_receipt
+
+            with patch.object(
+                store,
+                "complete_issued_refresh_receipt",
+                side_effect=self._commit_then_raise(original_complete),
+            ), patch.object(
+                store,
+                "probe_issued_receipt_completed",
+                side_effect=self._raising_probe,
+            ):
+                result = service.refresh_configured_snapshot(store)
+
+            self._assert_probe_error_window(
+                result,
+                stage="REFRESH.LEDGER",
+                before_digest=hashlib.sha256(prior_jsonl).hexdigest(),
+                observed_digest=hashlib.sha256(
+                    identity.configured_jsonl_path.read_bytes()
+                ).hexdigest(),
+            )
+            self.assertTrue(paths.jsonl_recovery.exists())
+            self.assertTrue(identity.configured_jsonl_path.exists())
+            self.assertTrue(identity.snapshot_manifest_path.exists())
+            rows = _ledger_rows(
+                stage.staged_db_path,
+                identity.configured_jsonl_path,
+            )
+            refresh_rows = tuple(
+                row for row in rows if str(row[0]).startswith(
+                    "snapshot.refresh."
+                )
+            )
+            self.assertEqual(len(refresh_rows), 1)
+            self.assertEqual(str(refresh_rows[0][9]), "completed")
+
+    def test_probe_error_with_replaced_recovery_locator_never_fabricates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_complete = store.complete_issued_export_receipt
+            before_digest = hashlib.sha256(prior_jsonl).hexdigest()
+
+            def raising_probe_with_replaced_locator(
+                *args: Any,
+                **kwargs: Any,
+            ) -> None:
+                if paths.jsonl_recovery.exists():
+                    paths.jsonl_recovery.unlink()
+                raise SQLiteStoreLifecycleError(
+                    "STORE.PROBE_UNAVAILABLE",
+                    resource_id="tm.primary",
+                    generation=0,
+                    retryable=True,
+                )
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=self._commit_then_raise(original_complete),
+            ), patch.object(
+                store,
+                "probe_issued_receipt_completed",
+                side_effect=raising_probe_with_replaced_locator,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "STORE.PROBE_UNAVAILABLE")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertFalse(result.publication_committed)
+            self.assertTrue(result.publication_commit_ambiguous)
+            self.assertEqual(result.recovery_locators, ())
+            evidence = result.previous_destination_preservation
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.VERIFIED_CHANGED,
+            )
+            self.assertEqual(evidence.before_digest, before_digest)
+            self.assertEqual(
+                evidence.observed_digest,
+                hashlib.sha256(destination.read_bytes()).hexdigest(),
+            )
+            self.assertFalse(paths.jsonl_recovery.exists())
+            rows = _ledger_rows(stage.staged_db_path, destination)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0][9]), "completed")
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + str(rows[0][0]),
+                )
+            )
+
+    def test_probe_error_unreadable_destination_keeps_unverified_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = self._prepared(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_complete = store.complete_issued_export_receipt
+            before_digest = hashlib.sha256(prior_jsonl).hexdigest()
+
+            def raising_probe_with_unreadable_destination(
+                *args: Any,
+                **kwargs: Any,
+            ) -> None:
+                destination.unlink()
+                destination.mkdir()
+                raise SQLiteStoreLifecycleError(
+                    "STORE.PROBE_UNAVAILABLE",
+                    resource_id="tm.primary",
+                    generation=0,
+                    retryable=True,
+                )
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=self._commit_then_raise(original_complete),
+            ), patch.object(
+                store,
+                "probe_issued_receipt_completed",
+                side_effect=raising_probe_with_unreadable_destination,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertEqual(result.error_code, "STORE.PROBE_UNAVAILABLE")
+            self.assertEqual(result.stage, "EXPORT.LEDGER")
+            self.assertFalse(result.retryable)
+            self.assertFalse(result.publication_committed)
+            self.assertTrue(result.publication_commit_ambiguous)
+            self.assertEqual(result.recovery_locators, ())
+            evidence = result.previous_destination_preservation
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.UNVERIFIED,
+            )
+            self.assertEqual(evidence.before_digest, before_digest)
+            self.assertIsNone(evidence.observed_digest)
+            self.assertEqual(
+                tuple(d.code for d in result.diagnostics),
+                ("EXPORT.LEDGER_AMBIGUOUS",),
+            )
+            self.assertTrue(destination.is_dir())
+            self.assertIsNotNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff."
+                    + str(_ledger_rows(stage.staged_db_path, destination)[0][0]),
+                )
+            )
 
 
 if __name__ == "__main__":

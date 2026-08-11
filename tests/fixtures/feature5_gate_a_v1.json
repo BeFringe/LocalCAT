@@ -4,9 +4,9 @@
     "CONTRACTS": {
       "artifact_paths": ["tm_contracts.py"],
       "fixture_paths": [],
-      "artifact_digest": "65be0446b8e9039c79c42661d75745e3472ea7a66c87ec547682374ca5f26003",
+      "artifact_digest": "2de65bed42545533bf691043979ed9957b2de359b1535fe86fc45204b240e3c3",
       "fixture_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-      "transcript_digest": "3e7b79ffb42a66aef2e1e35cfabf602c933dd409fbbeae9055f80a2cabb32d06"
+      "transcript_digest": "d748f0c2de774b25cef1fd24b6cb3a577107752c836ca4c2b80d44b5e5aa18bf"
     },
     "SIMILARITY": {
       "artifact_paths": ["tm_similarity.py"],
@@ -41,7 +41,7 @@
     "evaluator_path": "matcher_capability.py",
     "fixture_paths": ["tests/fixtures/text_matcher_v1_vectors.json"],
     "matcher_artifact_digest": "e1ccfabb3fb0dbb178632c1bad5aa176373a58fcacee7e5ae4f7d4a7d4ff3b80",
-    "matcher_build_digest": "596d41cc635982786b9b991f2391770486e4e9e6906ba7d9448736b3bcf26d68",
+    "matcher_build_digest": "c6be4f0918b7491f7ae7387e5a11654271c0098c934d2a89213e02ae0919519e",
     "fixture_digest": "09967fd2e72b8f5d748c5754ff76983b55d584b73e55abba15e730fdda528ed1",
     "evaluator_digest": "bf41a588ff902d93beee0ced8b0c015f2f18883bf2db298b90a20cf975003777",
     "semantics_version": "text-v1-unicode-16.0.0",

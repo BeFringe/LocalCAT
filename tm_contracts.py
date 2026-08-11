@@ -2170,7 +2170,19 @@ def _validate_preservation_and_recovery(
     recovery_locators: tuple[RecoveryLocator, ...],
     retryable: bool,
     field_name: str,
+    publication_committed: bool = False,
+    publication_commit_ambiguous: bool = False,
 ) -> None:
+    if type(publication_committed) is not bool:
+        raise TypeError(f"{field_name} publication committed must be a bool")
+    if type(publication_commit_ambiguous) is not bool:
+        raise TypeError(
+            f"{field_name} publication commit ambiguous must be a bool"
+        )
+    if publication_committed and publication_commit_ambiguous:
+        raise ValueError(
+            f"{field_name} publication commit state is contradictory"
+        )
     for item in evidence:
         if not isinstance(item, AssetPreservationEvidence):
             raise TypeError(
@@ -2221,6 +2233,30 @@ def _validate_preservation_and_recovery(
             key=lambda item: item.value,
         )
     )
+    if publication_committed:
+        if retryable:
+            raise ValueError(
+                "committed publication failure must be fail-stop and "
+                "not retryable"
+            )
+        if locators:
+            raise ValueError(
+                "committed publication failure cannot restore the "
+                "prior destination"
+            )
+        return
+    if publication_commit_ambiguous:
+        if retryable:
+            raise ValueError(
+                "ambiguous publication failure must be fail-stop and "
+                "not retryable"
+            )
+        if locators:
+            raise ValueError(
+                "ambiguous publication failure cannot fabricate a "
+                "recovery locator"
+            )
+        return
     if locator_kinds != recovery_kinds:
         if not recovery_kinds:
             raise ValueError(
@@ -2496,7 +2532,26 @@ class ExportReport:
 
 @dataclass(frozen=True)
 class ExportFailure:
-    """Fail-stop export result with destination preservation evidence."""
+    """Fail-stop export result with destination preservation evidence.
+
+    ``publication_committed`` distinguishes a failure whose destination
+    publication is the durable truth (the canonical/ledger rollback is
+    forbidden and only cleanup/handoff remains pending) from an ordinary
+    fail-stop export failure where the prior destination may still be
+    restored.  When True the failure must be fail-stop (``retryable``
+    False) and must not carry any recovery locator: the old destination
+    is never restored after a committed publication.
+
+    ``publication_commit_ambiguous`` marks a failure whose ledger commit
+    state is unknown (the completion probe itself failed), so neither
+    committed truth nor rollback authority may be claimed: it must be
+    fail-stop, must not carry any recovery locator, and may preserve
+    truthful VERIFIED_CHANGED/UNVERIFIED destination evidence without a
+    locator because automatic rollback is forbidden while the commit
+    state is unknown.  The two publication-state flags are mutually
+    exclusive.  Both defaults are False and preserve the original
+    contract unchanged.
+    """
 
     stage: str
     error_code: str
@@ -2504,6 +2559,8 @@ class ExportFailure:
     diagnostics: tuple[ExportDiagnostic, ...]
     previous_destination_preservation: AssetPreservationEvidence
     recovery_locators: tuple[RecoveryLocator, ...]
+    publication_committed: bool = False
+    publication_commit_ambiguous: bool = False
 
     def __post_init__(self) -> None:
         _require_diagnostic_identifier(self.stage, "export failure stage")
@@ -2512,6 +2569,14 @@ class ExportFailure:
             "export failure error code",
         )
         _require_bool(self.retryable, "export failure retryable")
+        _require_bool(
+            self.publication_committed,
+            "export failure publication committed",
+        )
+        _require_bool(
+            self.publication_commit_ambiguous,
+            "export failure publication commit ambiguous",
+        )
         _require_export_diagnostics(self.diagnostics)
         if not isinstance(
             self.previous_destination_preservation,
@@ -2533,7 +2598,132 @@ class ExportFailure:
             recovery_locators=self.recovery_locators,
             retryable=self.retryable,
             field_name="export preservation evidence",
+            publication_committed=self.publication_committed,
+            publication_commit_ambiguous=self.publication_commit_ambiguous,
         )
+
+
+def export_cleanup_pending_failure(
+    *,
+    stage: str,
+    destination_before: str | None,
+    destination_observed: str | None,
+    diagnostics: tuple[ExportDiagnostic, ...] = (),
+) -> ExportFailure:
+    """Build the dedicated cleanup-pending failure for a committed export.
+
+    The destination publication is durably committed and the canonical/
+    ledger rollback is forbidden, so the failure is fail-stop
+    (``retryable`` False), carries ``publication_committed`` True and
+    never fabricates a recovery locator for the old destination.  The
+    evidence keeps every known digest: a fresh prior-absent destination
+    is ``NOT_APPLICABLE``, an unchanged destination is
+    ``VERIFIED_UNCHANGED``, a changed destination is
+    ``VERIFIED_CHANGED`` with both digests, and an unreadable
+    destination is ``UNVERIFIED`` with the known before digest.  Callers
+    pass code-only diagnostics (stable identifiers, no paths or text).
+    """
+
+    if destination_before is None:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.NOT_APPLICABLE,
+            before_digest=None,
+            observed_digest=None,
+        )
+    elif destination_observed == destination_before:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.VERIFIED_UNCHANGED,
+            before_digest=destination_before,
+            observed_digest=destination_before,
+        )
+    elif destination_observed is not None:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.VERIFIED_CHANGED,
+            before_digest=destination_before,
+            observed_digest=destination_observed,
+        )
+    else:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.UNVERIFIED,
+            before_digest=destination_before,
+            observed_digest=None,
+        )
+    return ExportFailure(
+        stage=stage,
+        error_code="EXPORT.CLEANUP_PENDING",
+        retryable=False,
+        diagnostics=diagnostics,
+        previous_destination_preservation=evidence,
+        recovery_locators=(),
+        publication_committed=True,
+    )
+
+
+def export_ledger_ambiguous_failure(
+    *,
+    stage: str,
+    error_code: str,
+    destination_before: str | None,
+    destination_observed: str | None,
+    diagnostics: tuple[ExportDiagnostic, ...] = (),
+) -> ExportFailure:
+    """Build the dedicated ledger-ambiguous failure for a lost probe.
+
+    When the completion probe itself raises, the ledger commit state is
+    unknown: this is never success, never ``publication_committed``, and
+    automatic rollback is forbidden, so the failure is fail-stop
+    (``retryable`` False), sets ``publication_commit_ambiguous`` True and
+    never fabricates a recovery locator.  The evidence keeps every known
+    digest: a fresh prior-absent destination is ``NOT_APPLICABLE``, an
+    unchanged destination is ``VERIFIED_UNCHANGED``, a changed
+    destination is ``VERIFIED_CHANGED`` with both digests, and an
+    unreadable destination is ``UNVERIFIED`` with the known before
+    digest.  Callers pass code-only diagnostics (stable identifiers, no
+    paths or text).
+    """
+
+    if destination_before is None:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.NOT_APPLICABLE,
+            before_digest=None,
+            observed_digest=None,
+        )
+    elif destination_observed == destination_before:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.VERIFIED_UNCHANGED,
+            before_digest=destination_before,
+            observed_digest=destination_before,
+        )
+    elif destination_observed is not None:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.VERIFIED_CHANGED,
+            before_digest=destination_before,
+            observed_digest=destination_observed,
+        )
+    else:
+        evidence = AssetPreservationEvidence(
+            asset_kind=AssetKind.EXPORT_DESTINATION,
+            state=AssetPreservationState.UNVERIFIED,
+            before_digest=destination_before,
+            observed_digest=None,
+        )
+    return ExportFailure(
+        stage=stage,
+        error_code=error_code,
+        retryable=False,
+        diagnostics=diagnostics,
+        previous_destination_preservation=evidence,
+        recovery_locators=(),
+        publication_committed=False,
+        publication_commit_ambiguous=True,
+    )
 
 
 type MigrationOutcome = MigrationReport | MigrationFailure
@@ -4387,6 +4577,10 @@ def _encode_export_failure(failure: ExportFailure) -> dict[str, Any]:
                 failure.previous_destination_preservation
             )
         ),
+        "publication_commit_ambiguous": (
+            failure.publication_commit_ambiguous
+        ),
+        "publication_committed": failure.publication_committed,
         "recovery_locators": [
             _encode_recovery_locator(locator)
             for locator in failure.recovery_locators
@@ -5483,6 +5677,12 @@ def _decode_export_report(value: object) -> ExportReport:
 
 
 def _decode_export_failure(value: object) -> ExportFailure:
+    mapping = _as_mapping(value, "ExportFailure payload")
+    present_optional = tuple(
+        key
+        for key in ("publication_committed", "publication_commit_ambiguous")
+        if key in mapping
+    )
     payload = _strict_fields(
         value,
         "ExportFailure payload",
@@ -5493,7 +5693,8 @@ def _decode_export_failure(value: object) -> ExportFailure:
             "recovery_locators",
             "retryable",
             "stage",
-        ),
+        )
+        + present_optional,
     )
     return ExportFailure(
         stage=payload["stage"],
@@ -5507,6 +5708,11 @@ def _decode_export_failure(value: object) -> ExportFailure:
         ),
         recovery_locators=_decode_recovery_locators(
             payload["recovery_locators"]
+        ),
+        publication_committed=payload.get("publication_committed", False),
+        publication_commit_ambiguous=payload.get(
+            "publication_commit_ambiguous",
+            False,
         ),
     )
 

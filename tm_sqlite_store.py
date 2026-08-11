@@ -1103,13 +1103,22 @@ class _CoordinatorStorePort:
         head_revision: int,
         cumulative_record_counts: tuple[tuple[int, int], ...],
     ) -> tuple[str, ...]:
-        return _configured_pair_diagnostics(
+        diagnostics = _configured_pair_diagnostics(
             binding,
             identity=identity,
             canonical_store_id=canonical_store_id,
             head_revision=head_revision,
             cumulative_record_counts=cumulative_record_counts,
         )
+        if any(
+            code in {"SOURCE_BINDING.JSONL_UNSAFE", "SOURCE_BINDING.MANIFEST_UNSAFE"}
+            for code in diagnostics
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIOR_ASSET_INVALID",
+                retryable=False,
+            )
+        return diagnostics
 
     def table_count(self, connection: sqlite3.Connection, table_name: str) -> int:
         return _table_count(connection, table_name)
@@ -3874,6 +3883,138 @@ def _strict_pair_file_state(
     return ("present", digest.hexdigest(), identity)
 
 
+def _artifact_parent_dirfd(
+    destination: Path,
+    expected_identity: tuple[int, int] | None,
+) -> int:
+    """Open and fstat-prove one no-follow parent directory descriptor.
+
+    Runs the real non-symlink writable/executable parent-chain proof,
+    opens the immediate parent with ``O_DIRECTORY|O_NOFOLLOW`` (where
+    available) and requires the descriptor's exact device/inode to equal
+    the durable handoff identity recorded at issued registration.  A
+    missing legacy identity, an unsafe/replaced chain, an open/fstat
+    failure or an identity mismatch fails closed with a stable store
+    code and never returns a descriptor.
+    """
+
+    if expected_identity is None:
+        raise SQLiteStoreSchemaError(
+            "STORE.HANDOFF_PARENT_IDENTITY_MISSING"
+        )
+    if not snapshot_recovery_module._parent_chain_safe(destination):
+        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_UNSAFE")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination.parent, flags)
+    except OSError:
+        raise SQLiteStoreSchemaError(
+            "STORE.HANDOFF_PARENT_UNSAFE"
+        ) from None
+    try:
+        observed = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise SQLiteStoreSchemaError(
+            "STORE.HANDOFF_PARENT_UNSAFE"
+        ) from None
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != expected_identity
+    ):
+        os.close(descriptor)
+        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_REPLACED")
+    return descriptor
+
+
+def _after_artifact_parent_dirfd_bound(
+    destination: Path,
+    parent_identity: tuple[int, int] | None,
+) -> None:
+    """Late-bound seam invoked once the handoff parent dirfd is bound.
+
+    Test-only fault-injection point: runs immediately after the parent
+    descriptor has been opened and fstat-proven against the durable
+    handoff identity and before any descriptor-relative artifact probe,
+    so a hostile parent rename/replacement exactly at that boundary can
+    be reproduced without re-resolving the parent pathname.
+    """
+
+
+def _artifact_handoff_dirfd_entry(
+    name: str,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+    code: str,
+) -> None:
+    """Prove one deterministic handoff entry relative to a parent dirfd.
+
+    The basename must exist under the retained descriptor as a regular
+    single-link file whose exact device/inode equals the handed-off
+    identity; absent, symlinked, directory, multi-link, swapped or
+    unreadable entries fail closed with ``code``.
+    """
+
+    try:
+        observed = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise SQLiteStoreSchemaError(code) from None
+    except OSError:
+        raise SQLiteStoreSchemaError(code) from None
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != expected_identity
+    ):
+        raise SQLiteStoreSchemaError(code)
+
+
+def _artifact_handoff_dirfd_absent(
+    name: str,
+    descriptor: int,
+) -> bool:
+    """True only when one basename is provably absent under the dirfd."""
+
+    try:
+        os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        return False
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _artifact_handoff_dirfd_reprove(
+    destination: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Re-prove the advertised full parent pathname still resolves to
+    the exact handoff identity after the descriptor-relative probes."""
+
+    if not snapshot_recovery_module._parent_chain_safe(destination):
+        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_UNSAFE")
+    try:
+        observed = os.lstat(destination.parent)
+    except (OSError, ValueError):
+        raise SQLiteStoreSchemaError(
+            "STORE.HANDOFF_PARENT_UNSAFE"
+        ) from None
+    if (observed.st_dev, observed.st_ino) != expected_identity:
+        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_REPLACED")
+
+
 def _configured_pair_diagnostics(
     binding: SnapshotBinding,
     *,
@@ -4118,18 +4259,106 @@ def _artifact_handoff_meta_key(snapshot_id: str) -> str:
     return f"{_ARTIFACT_HANDOFF_META_PREFIX}{snapshot_id}"
 
 
+def _artifact_handoff_prior_record(
+    *,
+    identity: tuple[int, int] | None,
+    digest: str | None,
+    absent: bool | None,
+    field_name: str,
+) -> None:
+    """Validate one optional durable prior-pair asset record.
+
+    The record is either an explicit proven absence (``absent=True``
+    with no digest/identity), a proven present entry (``absent=False``
+    with a 64-hex digest and an exact device/inode pair), or entirely
+    unrecorded (``absent=None`` with no digest/identity).  Anything else
+    is rejected so reconstruction and cleanup never act on a half-written
+    ownership record.
+    """
+
+    if absent is True:
+        if digest is not None or identity is not None:
+            raise ValueError(f"{field_name} absent record must be empty")
+        return
+    if absent is False:
+        if type(digest) is not str or len(digest) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in digest
+        ):
+            raise ValueError(f"{field_name} digest is invalid")
+        if (
+            type(identity) is not tuple
+            or len(identity) != 2
+            or type(identity[0]) is not int
+            or type(identity[1]) is not int
+        ):
+            raise ValueError(f"{field_name} identity is invalid")
+        return
+    if absent is None:
+        if digest is not None or identity is not None:
+            raise ValueError(f"{field_name} record is not fully absent")
+        return
+    raise ValueError(f"{field_name} absent flag is invalid")
+
+
 def _artifact_handoff_meta_value(
     *,
     jsonl_temp_identity: tuple[int, int] | None,
     manifest_temp_identity: tuple[int, int] | None,
+    artifact_parent_identity: tuple[int, int] | None = None,
     jsonl_recovery_identity: tuple[int, int] | None = None,
     manifest_recovery_identity: tuple[int, int] | None = None,
+    prior_jsonl_identity: tuple[int, int] | None = None,
+    prior_jsonl_digest: str | None = None,
+    prior_jsonl_absent: bool | None = None,
+    prior_manifest_identity: tuple[int, int] | None = None,
+    prior_manifest_digest: str | None = None,
+    prior_manifest_absent: bool | None = None,
 ) -> str:
-    """One write-once artifact handoff journal payload."""
+    """One write-once artifact handoff cleanup-pending journal payload.
 
+    In addition to the exclusive temporary and recovery-copy identities,
+    the payload durably records the exact immediate-parent device/inode
+    (``artifact_parent_identity``) proven by a strict real non-symlink
+    parent-chain proof at issued registration, so terminal cleanup and
+    handoff release can detect a hostile parent rename or replacement
+    and fail closed with the handoff retained.  The payload also
+    durably records the prior final JSONL/manifest identity and digest
+    (or their explicit proven absence) captured before any publication
+    replace, so reconstruction can replace an old manifest only when
+    the current entry still matches the recorded prior identity and
+    digest.  Missing prior records are ``None`` and always fail closed.
+    """
+
+    _require_artifact_identity_pair(
+        artifact_parent_identity,
+        "artifact_parent_identity",
+    )
+    _artifact_handoff_prior_record(
+        identity=prior_jsonl_identity,
+        digest=prior_jsonl_digest,
+        absent=prior_jsonl_absent,
+        field_name="prior_jsonl",
+    )
+    _artifact_handoff_prior_record(
+        identity=prior_manifest_identity,
+        digest=prior_manifest_digest,
+        absent=prior_manifest_absent,
+        field_name="prior_manifest",
+    )
     return json.dumps(
         {
             "version": 1,
+            "artifact_parent_device": (
+                None
+                if artifact_parent_identity is None
+                else artifact_parent_identity[0]
+            ),
+            "artifact_parent_inode": (
+                None
+                if artifact_parent_identity is None
+                else artifact_parent_identity[1]
+            ),
             "jsonl_temp_device": (
                 None
                 if jsonl_temp_identity is None
@@ -4170,6 +4399,30 @@ def _artifact_handoff_meta_value(
                 if manifest_recovery_identity is None
                 else manifest_recovery_identity[1]
             ),
+            "prior_jsonl_device": (
+                None
+                if prior_jsonl_identity is None
+                else prior_jsonl_identity[0]
+            ),
+            "prior_jsonl_inode": (
+                None
+                if prior_jsonl_identity is None
+                else prior_jsonl_identity[1]
+            ),
+            "prior_jsonl_digest": prior_jsonl_digest,
+            "prior_jsonl_absent": prior_jsonl_absent,
+            "prior_manifest_device": (
+                None
+                if prior_manifest_identity is None
+                else prior_manifest_identity[0]
+            ),
+            "prior_manifest_inode": (
+                None
+                if prior_manifest_identity is None
+                else prior_manifest_identity[1]
+            ),
+            "prior_manifest_digest": prior_manifest_digest,
+            "prior_manifest_absent": prior_manifest_absent,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -4203,12 +4456,59 @@ def _artifact_handoff_from_meta(
             raise ValueError("artifact handoff identity is invalid")
         return (device, inode)
 
+    def prior_record(
+        *,
+        identity_key: str,
+        digest_key: str,
+        absent_key: str,
+    ) -> tuple[tuple[int, int] | None, str | None, bool | None]:
+        """One strict prior-asset record, or None/Nones when unrecorded."""
+
+        absent_value = payload.get(absent_key)
+        if absent_value is None:
+            if payload.get(identity_key) is not None or payload.get(
+                digest_key
+            ) is not None:
+                raise ValueError("artifact handoff prior record is partial")
+            return (None, None, None)
+        if type(absent_value) is not bool:
+            raise ValueError("artifact handoff prior absent flag is invalid")
+        digest = payload.get(digest_key)
+        if absent_value:
+            if digest is not None or payload.get(identity_key) is not None:
+                raise ValueError("artifact handoff absent record is not empty")
+            return (None, None, True)
+        if type(digest) is not str or len(digest) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in digest
+        ):
+            raise ValueError("artifact handoff prior digest is invalid")
+        inode_key = identity_key.removesuffix("_device") + "_inode"
+        prior_identity = identity(identity_key, inode_key)
+        if prior_identity is None:
+            raise ValueError("artifact handoff prior identity is missing")
+        return (prior_identity, digest, False)
+
     try:
+        prior_jsonl = prior_record(
+            identity_key="prior_jsonl_device",
+            digest_key="prior_jsonl_digest",
+            absent_key="prior_jsonl_absent",
+        )
+        prior_manifest = prior_record(
+            identity_key="prior_manifest_device",
+            digest_key="prior_manifest_digest",
+            absent_key="prior_manifest_absent",
+        )
         return snapshot_recovery_module._ArtifactHandoffFacts(
             snapshot_id=snapshot_id,
             jsonl_temp_identity=identity(
                 "jsonl_temp_device",
                 "jsonl_temp_inode",
+            ),
+            artifact_parent_identity=identity(
+                "artifact_parent_device",
+                "artifact_parent_inode",
             ),
             manifest_temp_identity=identity(
                 "manifest_temp_device",
@@ -4222,6 +4522,12 @@ def _artifact_handoff_from_meta(
                 "manifest_recovery_device",
                 "manifest_recovery_inode",
             ),
+            prior_jsonl_identity=prior_jsonl[0],
+            prior_jsonl_digest=prior_jsonl[1],
+            prior_jsonl_absent=prior_jsonl[2],
+            prior_manifest_identity=prior_manifest[0],
+            prior_manifest_digest=prior_manifest[1],
+            prior_manifest_absent=prior_manifest[2],
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -4309,8 +4615,8 @@ class _SnapshotRecoveryPort:
         snapshot_id: str,
         *,
         expected_generation: int,
-        jsonl_identity: tuple[int, int] | None = None,
-        manifest_identity: tuple[int, int] | None = None,
+        jsonl_identity: tuple[int, int],
+        manifest_identity: tuple[int, int],
     ) -> None:
         try:
             self._store.complete_issued_export_receipt(
@@ -4337,6 +4643,27 @@ class _SnapshotRecoveryPort:
     ) -> None:
         try:
             self._store.cancel_issued_export_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def clear_issued_receipt_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        try:
+            self._store.clear_issued_receipt_handoff(
                 snapshot_id,
                 expected_generation=expected_generation,
             )
@@ -4568,6 +4895,13 @@ class SQLiteTMStore:
         expected_generation: int,
         jsonl_temp_identity: tuple[int, int] | None = None,
         manifest_temp_identity: tuple[int, int] | None = None,
+        artifact_parent_identity: tuple[int, int] | None = None,
+        prior_jsonl_identity: tuple[int, int] | None = None,
+        prior_jsonl_digest: str | None = None,
+        prior_jsonl_absent: bool | None = None,
+        prior_manifest_identity: tuple[int, int] | None = None,
+        prior_manifest_digest: str | None = None,
+        prior_manifest_absent: bool | None = None,
     ) -> None:
         """Atomically register one arbitrary-destination issued receipt.
 
@@ -4587,6 +4921,19 @@ class SQLiteTMStore:
         temporaries before any destructive unlink or replace.  When they
         are omitted the receipt is identity-less and recovery fails
         closed on any matching artifact instead of deleting it.
+
+        The exact immediate-parent device/inode proven by a strict real
+        non-symlink parent-chain proof is mandatory in the same journal
+        (``artifact_parent_identity``): terminal cleanup and handoff
+        release re-prove it so a hostile parent rename or replacement
+        between registration, cleanup, fsync and release never clears
+        the handoff or reports COMPLETED.
+
+        The prior final JSONL/manifest identity and digest (or explicit
+        proven absence) are captured before any publication replace and
+        recorded in the same handoff journal so reconstruction can
+        replace an old manifest only against the durably recorded prior
+        identity; unrecorded prior state always fails closed.
         """
 
         private_receipt = _snapshot_receipt(receipt)
@@ -4604,10 +4951,66 @@ class SQLiteTMStore:
             manifest_temp_identity,
             "manifest_temp_identity",
         )
+        _require_artifact_identity_pair(
+            artifact_parent_identity,
+            "artifact_parent_identity",
+        )
         if (jsonl_temp_identity is None) != (manifest_temp_identity is None):
             raise ValueError(
                 "jsonl and manifest temp identities must be supplied together"
             )
+        if jsonl_temp_identity is None:
+            if artifact_parent_identity is not None:
+                raise ValueError(
+                    "artifact parent identity requires a durable "
+                    "handoff journal"
+                )
+        elif artifact_parent_identity is None:
+            raise ValueError(
+                "durable handoff journal requires an artifact "
+                "parent identity"
+            )
+        for value, field_name, absent in (
+            (
+                prior_jsonl_identity,
+                "prior_jsonl_identity",
+                prior_jsonl_absent,
+            ),
+            (
+                prior_manifest_identity,
+                "prior_manifest_identity",
+                prior_manifest_absent,
+            ),
+        ):
+            _require_artifact_identity_pair(value, field_name)
+            if type(absent) is not bool and absent is not None:
+                raise ValueError(f"{field_name} absent flag is invalid")
+        if jsonl_temp_identity is None and any(
+            value is not None
+            for value in (
+                prior_jsonl_identity,
+                prior_jsonl_digest,
+                prior_jsonl_absent,
+                prior_manifest_identity,
+                prior_manifest_digest,
+                prior_manifest_absent,
+            )
+        ):
+            raise ValueError(
+                "prior pair record requires a durable handoff journal"
+            )
+        _artifact_handoff_prior_record(
+            identity=prior_jsonl_identity,
+            digest=prior_jsonl_digest,
+            absent=prior_jsonl_absent,
+            field_name="prior_jsonl",
+        )
+        _artifact_handoff_prior_record(
+            identity=prior_manifest_identity,
+            digest=prior_manifest_digest,
+            absent=prior_manifest_absent,
+            field_name="prior_manifest",
+        )
         for path_value, field_name in (
             (destination_jsonl_path, "destination_jsonl_path"),
             (destination_manifest_path, "destination_manifest_path"),
@@ -4720,22 +5123,73 @@ class SQLiteTMStore:
                     )
                     if jsonl_temp_identity is not None:
                         assert manifest_temp_identity is not None
-                        connection.execute(
-                            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
-                            (
-                                _artifact_handoff_meta_key(
-                                    private_receipt.snapshot_id
-                                ),
-                                _artifact_handoff_meta_value(
-                                    jsonl_temp_identity=(
-                                        jsonl_temp_identity
-                                    ),
-                                    manifest_temp_identity=(
-                                        manifest_temp_identity
-                                    ),
-                                ),
-                            ),
+                        parent_descriptor = _artifact_parent_dirfd(
+                            private_jsonl_path,
+                            artifact_parent_identity,
                         )
+                        try:
+                            _after_artifact_parent_dirfd_bound(
+                                private_jsonl_path,
+                                artifact_parent_identity,
+                            )
+                            artifact_paths = (
+                                snapshot_recovery_module
+                                ._recovery_artifact_paths(
+                                    private_jsonl_path
+                                )
+                            )
+                            _artifact_handoff_dirfd_entry(
+                                artifact_paths.jsonl_temp.name,
+                                parent_descriptor,
+                                jsonl_temp_identity,
+                                "STORE.HANDOFF_TEMP_UNPROVEN",
+                            )
+                            _artifact_handoff_dirfd_entry(
+                                artifact_paths.manifest_temp.name,
+                                parent_descriptor,
+                                manifest_temp_identity,
+                                "STORE.HANDOFF_TEMP_UNPROVEN",
+                            )
+                            connection.execute(
+                                "INSERT INTO tm_meta(key, value) "
+                                "VALUES (?, ?)",
+                                (
+                                    _artifact_handoff_meta_key(
+                                        private_receipt.snapshot_id
+                                    ),
+                                    _artifact_handoff_meta_value(
+                                        jsonl_temp_identity=(
+                                            jsonl_temp_identity
+                                        ),
+                                        manifest_temp_identity=(
+                                            manifest_temp_identity
+                                        ),
+                                        artifact_parent_identity=(
+                                            artifact_parent_identity
+                                        ),
+                                        prior_jsonl_identity=(
+                                            prior_jsonl_identity
+                                        ),
+                                        prior_jsonl_digest=(
+                                            prior_jsonl_digest
+                                        ),
+                                        prior_jsonl_absent=(
+                                            prior_jsonl_absent
+                                        ),
+                                        prior_manifest_identity=(
+                                            prior_manifest_identity
+                                        ),
+                                        prior_manifest_digest=(
+                                            prior_manifest_digest
+                                        ),
+                                        prior_manifest_absent=(
+                                            prior_manifest_absent
+                                        ),
+                                    ),
+                                ),
+                            )
+                        finally:
+                            os.close(parent_descriptor)
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4748,6 +5202,13 @@ class SQLiteTMStore:
         expected_generation: int,
         jsonl_temp_identity: tuple[int, int] | None = None,
         manifest_temp_identity: tuple[int, int] | None = None,
+        artifact_parent_identity: tuple[int, int] | None = None,
+        prior_jsonl_identity: tuple[int, int] | None = None,
+        prior_jsonl_digest: str | None = None,
+        prior_jsonl_absent: bool | None = None,
+        prior_manifest_identity: tuple[int, int] | None = None,
+        prior_manifest_digest: str | None = None,
+        prior_manifest_absent: bool | None = None,
     ) -> None:
         """Atomically register one configured-path issued refresh receipt.
 
@@ -4760,7 +5221,11 @@ class SQLiteTMStore:
 
         Task 5.14 durable ownership seam: same write-once ``tm_meta``
         ``artifact_handoff.<snapshot_id>`` record as the export seam when
-        the exclusive temporary identities are supplied.
+        the exclusive temporary identities are supplied, including the
+        exact immediate-parent device/inode (``artifact_parent_identity``)
+        proven by a strict real non-symlink parent-chain proof and the
+        prior final JSONL/manifest identity+digest or explicit proven
+        absence captured before any publication replace.
         """
 
         private_receipt = _snapshot_receipt(receipt)
@@ -4778,10 +5243,66 @@ class SQLiteTMStore:
             manifest_temp_identity,
             "manifest_temp_identity",
         )
+        _require_artifact_identity_pair(
+            artifact_parent_identity,
+            "artifact_parent_identity",
+        )
         if (jsonl_temp_identity is None) != (manifest_temp_identity is None):
             raise ValueError(
                 "jsonl and manifest temp identities must be supplied together"
             )
+        if jsonl_temp_identity is None:
+            if artifact_parent_identity is not None:
+                raise ValueError(
+                    "artifact parent identity requires a durable "
+                    "handoff journal"
+                )
+        elif artifact_parent_identity is None:
+            raise ValueError(
+                "durable handoff journal requires an artifact "
+                "parent identity"
+            )
+        for value, field_name, absent in (
+            (
+                prior_jsonl_identity,
+                "prior_jsonl_identity",
+                prior_jsonl_absent,
+            ),
+            (
+                prior_manifest_identity,
+                "prior_manifest_identity",
+                prior_manifest_absent,
+            ),
+        ):
+            _require_artifact_identity_pair(value, field_name)
+            if type(absent) is not bool and absent is not None:
+                raise ValueError(f"{field_name} absent flag is invalid")
+        if jsonl_temp_identity is None and any(
+            value is not None
+            for value in (
+                prior_jsonl_identity,
+                prior_jsonl_digest,
+                prior_jsonl_absent,
+                prior_manifest_identity,
+                prior_manifest_digest,
+                prior_manifest_absent,
+            )
+        ):
+            raise ValueError(
+                "prior pair record requires a durable handoff journal"
+            )
+        _artifact_handoff_prior_record(
+            identity=prior_jsonl_identity,
+            digest=prior_jsonl_digest,
+            absent=prior_jsonl_absent,
+            field_name="prior_jsonl",
+        )
+        _artifact_handoff_prior_record(
+            identity=prior_manifest_identity,
+            digest=prior_manifest_digest,
+            absent=prior_manifest_absent,
+            field_name="prior_manifest",
+        )
         with self._coordinator._operation_lease() as lease:
             identity = lease.stage.resource_identity
             if (
@@ -4857,22 +5378,73 @@ class SQLiteTMStore:
                     )
                     if jsonl_temp_identity is not None:
                         assert manifest_temp_identity is not None
-                        connection.execute(
-                            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
-                            (
-                                _artifact_handoff_meta_key(
-                                    private_receipt.snapshot_id
-                                ),
-                                _artifact_handoff_meta_value(
-                                    jsonl_temp_identity=(
-                                        jsonl_temp_identity
-                                    ),
-                                    manifest_temp_identity=(
-                                        manifest_temp_identity
-                                    ),
-                                ),
-                            ),
+                        parent_descriptor = _artifact_parent_dirfd(
+                            identity.configured_jsonl_path,
+                            artifact_parent_identity,
                         )
+                        try:
+                            _after_artifact_parent_dirfd_bound(
+                                identity.configured_jsonl_path,
+                                artifact_parent_identity,
+                            )
+                            artifact_paths = (
+                                snapshot_recovery_module
+                                ._recovery_artifact_paths(
+                                    identity.configured_jsonl_path
+                                )
+                            )
+                            _artifact_handoff_dirfd_entry(
+                                artifact_paths.jsonl_temp.name,
+                                parent_descriptor,
+                                jsonl_temp_identity,
+                                "STORE.HANDOFF_TEMP_UNPROVEN",
+                            )
+                            _artifact_handoff_dirfd_entry(
+                                artifact_paths.manifest_temp.name,
+                                parent_descriptor,
+                                manifest_temp_identity,
+                                "STORE.HANDOFF_TEMP_UNPROVEN",
+                            )
+                            connection.execute(
+                                "INSERT INTO tm_meta(key, value) "
+                                "VALUES (?, ?)",
+                                (
+                                    _artifact_handoff_meta_key(
+                                        private_receipt.snapshot_id
+                                    ),
+                                    _artifact_handoff_meta_value(
+                                        jsonl_temp_identity=(
+                                            jsonl_temp_identity
+                                        ),
+                                        manifest_temp_identity=(
+                                            manifest_temp_identity
+                                        ),
+                                        artifact_parent_identity=(
+                                            artifact_parent_identity
+                                        ),
+                                        prior_jsonl_identity=(
+                                            prior_jsonl_identity
+                                        ),
+                                        prior_jsonl_digest=(
+                                            prior_jsonl_digest
+                                        ),
+                                        prior_jsonl_absent=(
+                                            prior_jsonl_absent
+                                        ),
+                                        prior_manifest_identity=(
+                                            prior_manifest_identity
+                                        ),
+                                        prior_manifest_digest=(
+                                            prior_manifest_digest
+                                        ),
+                                        prior_manifest_absent=(
+                                            prior_manifest_absent
+                                        ),
+                                    ),
+                                ),
+                            )
+                        finally:
+                            os.close(parent_descriptor)
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4932,19 +5504,20 @@ class SQLiteTMStore:
                         canonical_store_id=lease.canonical_store_id,
                         target_identity=identity.target_identity,
                     )
-                    status = connection.execute(
-                        "SELECT status FROM tm_snapshot_receipt "
-                        "WHERE snapshot_id = ?",
+                    row = connection.execute(
+                        "SELECT status, destination_jsonl_path "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
                         (snapshot_id,),
                     ).fetchone()
-                    if status is None:
+                    if row is None:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_UNKNOWN"
                         )
-                    if str(status[0]) != "issued":
+                    if str(row[0]) != "issued":
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_STALE"
                         )
+                    destination = Path(str(row[1]))
                     meta_row = connection.execute(
                         "SELECT value FROM tm_meta WHERE key = ?",
                         (_artifact_handoff_meta_key(snapshot_id),),
@@ -4965,6 +5538,39 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.HANDOFF_ALREADY_RECORDED"
                         )
+                    if (
+                        jsonl_recovery_identity is not None
+                        or manifest_recovery_identity is not None
+                    ):
+                        parent_descriptor = _artifact_parent_dirfd(
+                            destination,
+                            prior.artifact_parent_identity,
+                        )
+                        try:
+                            _after_artifact_parent_dirfd_bound(
+                                destination,
+                                prior.artifact_parent_identity,
+                            )
+                            artifact_paths = (
+                                snapshot_recovery_module
+                                ._recovery_artifact_paths(destination)
+                            )
+                            if jsonl_recovery_identity is not None:
+                                _artifact_handoff_dirfd_entry(
+                                    artifact_paths.jsonl_recovery.name,
+                                    parent_descriptor,
+                                    jsonl_recovery_identity,
+                                    "STORE.HANDOFF_RECOVERY_UNPROVEN",
+                                )
+                            if manifest_recovery_identity is not None:
+                                _artifact_handoff_dirfd_entry(
+                                    artifact_paths.manifest_recovery.name,
+                                    parent_descriptor,
+                                    manifest_recovery_identity,
+                                    "STORE.HANDOFF_RECOVERY_UNPROVEN",
+                                )
+                        finally:
+                            os.close(parent_descriptor)
                     connection.execute(
                         "UPDATE tm_meta SET value = ? WHERE key = ?",
                         (
@@ -4975,11 +5581,28 @@ class SQLiteTMStore:
                                 manifest_temp_identity=(
                                     prior.manifest_temp_identity
                                 ),
+                                artifact_parent_identity=(
+                                    prior.artifact_parent_identity
+                                ),
                                 jsonl_recovery_identity=(
                                     jsonl_recovery_identity
                                 ),
                                 manifest_recovery_identity=(
                                     manifest_recovery_identity
+                                ),
+                                prior_jsonl_identity=(
+                                    prior.prior_jsonl_identity
+                                ),
+                                prior_jsonl_digest=prior.prior_jsonl_digest,
+                                prior_jsonl_absent=prior.prior_jsonl_absent,
+                                prior_manifest_identity=(
+                                    prior.prior_manifest_identity
+                                ),
+                                prior_manifest_digest=(
+                                    prior.prior_manifest_digest
+                                ),
+                                prior_manifest_absent=(
+                                    prior.prior_manifest_absent
                                 ),
                             ),
                             _artifact_handoff_meta_key(snapshot_id),
@@ -4995,26 +5618,28 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
-        jsonl_identity: tuple[int, int] | None = None,
-        manifest_identity: tuple[int, int] | None = None,
+        jsonl_identity: tuple[int, int],
+        manifest_identity: tuple[int, int],
     ) -> None:
         """Atomically complete exactly one issued arbitrary-destination receipt.
 
-        Task 5.14 identity closure: when the exact captured destination
-        identities are supplied (recovery and the publisher flow), the
-        transaction reconstructs the receipt and its deterministic
-        manifest from the ledger row and strict-captures both
-        destination paths (no-follow, regular, single-link, stable
-        identity and digest) before marking the receipt completed, so a
-        same-byte foreign inode swap between classification and
-        completion fails closed without touching the foreign paths.
-        The ledger digest, paths and revision ancestry must all still
-        match exactly.  Existing completed/cancelled receipts and all
-        other ledger history remain immutable; a receipt that is
-        unknown, foreign, or no longer ``issued`` is rejected.  The
-        receipt's durable artifact handoff row is consumed in the same
-        transaction.  Identity-less callers keep the legacy status-only
-        transition and cannot claim identity closure.
+        Task 5.14 identity closure: the exact captured destination
+        identities are mandatory.  The transaction reconstructs the
+        receipt and its deterministic manifest from the ledger row and
+        strict-captures both destination paths (no-follow, regular,
+        single-link, stable identity and digest) before marking the
+        receipt completed, so a same-byte foreign inode swap between
+        classification and completion fails closed without touching the
+        foreign paths, and an absent or unprovable destination can never
+        become completed.  The ledger digest, paths and revision
+        ancestry must all still match exactly.  Existing
+        completed/cancelled receipts and all other ledger history remain
+        immutable; a receipt that is unknown, foreign, or no longer
+        ``issued`` is rejected.  The receipt's durable artifact handoff
+        journal is deliberately kept after the terminal commit: it is
+        the cleanup-pending ownership proof and is released only by
+        ``clear_issued_receipt_handoff`` after the owned deterministic
+        artifacts are durably removed or proven absent.
         """
 
         _require_artifact_identity_pair(jsonl_identity, "jsonl_identity")
@@ -5022,23 +5647,15 @@ class SQLiteTMStore:
             manifest_identity,
             "manifest_identity",
         )
-        if (jsonl_identity is None) != (manifest_identity is None):
+        if jsonl_identity is None or manifest_identity is None:
             raise ValueError(
-                "jsonl and manifest identities must be supplied together"
+                "jsonl and manifest identities are required for completion"
             )
-        if jsonl_identity is not None:
-            assert manifest_identity is not None
-            self._complete_issued_export_receipt_strict(
-                snapshot_id,
-                expected_generation=expected_generation,
-                jsonl_identity=jsonl_identity,
-                manifest_identity=manifest_identity,
-            )
-            return
-        self._transition_issued_export_receipt(
+        self._complete_issued_export_receipt_strict(
             snapshot_id,
             expected_generation=expected_generation,
-            target_status="completed",
+            jsonl_identity=jsonl_identity,
+            manifest_identity=manifest_identity,
         )
 
     def _complete_issued_export_receipt_strict(
@@ -5097,6 +5714,26 @@ class SQLiteTMStore:
                     if str(row[2]) != "issued":
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_STALE"
+                        )
+                    meta_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    if meta_row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_MISSING"
+                        )
+                    handoff = _artifact_handoff_from_meta(
+                        _artifact_handoff_meta_key(snapshot_id),
+                        str(meta_row[0]),
+                    )
+                    if (
+                        handoff is None
+                        or handoff.jsonl_temp_identity is None
+                        or handoff.manifest_temp_identity is None
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_INVALID"
                         )
                     revision = _canonical_revision_from_transaction(
                         connection,
@@ -5175,6 +5812,24 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_PAIR_INVALID"
                         )
+                    if (
+                        jsonl_capture.identity.device
+                        != handoff.jsonl_temp_identity[0]
+                        or jsonl_capture.identity.inode
+                        != handoff.jsonl_temp_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_IDENTITY_MISMATCH"
+                        )
+                    if (
+                        manifest_capture.identity.device
+                        != handoff.manifest_temp_identity[0]
+                        or manifest_capture.identity.inode
+                        != handoff.manifest_temp_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_IDENTITY_MISMATCH"
+                        )
                     updated = connection.execute(
                         "UPDATE tm_snapshot_receipt SET status = 'completed' "
                         "WHERE snapshot_id = ?",
@@ -5184,10 +5839,6 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
-                    connection.execute(
-                        "DELETE FROM tm_meta WHERE key = ?",
-                        (_artifact_handoff_meta_key(snapshot_id),),
-                    )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -5199,21 +5850,17 @@ class SQLiteTMStore:
         *,
         expected_generation: int,
     ) -> None:
-        """Mark exactly one issued arbitrary-destination receipt cancelled."""
+        """Mark exactly one issued arbitrary-destination receipt cancelled.
 
-        self._transition_issued_export_receipt(
-            snapshot_id,
-            expected_generation=expected_generation,
-            target_status="cancelled",
-        )
+        Cancellation is the only issued->cancelled transition; it never
+        completes an absent pair and never rewrites completed history.
+        The receipt's durable artifact handoff journal is deliberately
+        kept after the terminal commit: it is the cleanup-pending
+        ownership proof and is released only by
+        ``clear_issued_receipt_handoff`` after the owned deterministic
+        artifacts are durably removed or proven absent.
+        """
 
-    def _transition_issued_export_receipt(
-        self,
-        snapshot_id: str,
-        *,
-        expected_generation: int,
-        target_status: str,
-    ) -> None:
         if type(snapshot_id) is not str or not snapshot_id.strip():
             raise ValueError("snapshot id must be a non-empty string")
         if (
@@ -5222,8 +5869,6 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        if target_status not in {"completed", "cancelled"}:
-            raise ValueError("target status is invalid")
         with self._coordinator._operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
@@ -5263,19 +5908,162 @@ class SQLiteTMStore:
                             "STORE.RECEIPT_STALE"
                         )
                     updated = connection.execute(
-                        "UPDATE tm_snapshot_receipt SET status = ? "
+                        "UPDATE tm_snapshot_receipt SET status = 'cancelled' "
                         "WHERE snapshot_id = ?",
-                        (target_status, snapshot_id),
+                        (snapshot_id,),
                     )
                     if updated.rowcount != 1:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
-                    connection.execute(
-                        "DELETE FROM tm_meta WHERE key = ?",
-                        (_artifact_handoff_meta_key(snapshot_id),),
-                    )
                     connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def clear_issued_receipt_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Release one terminal receipt's cleanup-pending handoff journal.
+
+        Task 5.14/Cluster F durable cleanup seam: the journal row is
+        deleted only after the caller has durably removed (or proven
+        absent) every deterministic temp/recovery artifact of this exact
+        receipt.  The transaction re-proves the receipt is terminal
+        (completed or cancelled), re-reads the journal, independently
+        re-proves the exact immediate-parent device/inode recorded at
+        registration against the current real non-symlink writable/
+        executable parent chain, and requires every one of the four
+        deterministic artifact paths to be provably absent before the
+        release: a missing legacy parent identity, an unsafe or
+        replaced parent chain, or any entry -- the owned inode, a
+        foreign regular inode with the same or different bytes, a
+        symlink, a hardlink, a directory, or an unreadable/unsafe entry
+        -- keeps the journal and fails with a stable store code.  A
+        parent rename/replacement between the recovery blocker, the
+        cleanup, the fsync and this release therefore never clears the
+        handoff and never reports COMPLETED.  The blocking entry is
+        never deleted and the release never proceeds on a partial or
+        unprovable absence, so an occupied deterministic path can never
+        release the cleanup journal while the next refresh/export stays
+        blocked.  Cleanup authority is receipt-scoped and can never be
+        transferred across snapshot ids.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) not in {"completed", "cancelled"}:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_RECEIPT_NOT_TERMINAL"
+                        )
+                    meta_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    if meta_row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_MISSING"
+                        )
+                    handoff = _artifact_handoff_from_meta(
+                        _artifact_handoff_meta_key(snapshot_id),
+                        str(meta_row[0]),
+                    )
+                    if handoff is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_INVALID"
+                        )
+                    destination = Path(str(row[3]))
+                    if handoff.artifact_parent_identity is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_PARENT_IDENTITY_MISSING"
+                        )
+                    parent_descriptor = _artifact_parent_dirfd(
+                        destination,
+                        handoff.artifact_parent_identity,
+                    )
+                    try:
+                        _after_artifact_parent_dirfd_bound(
+                            destination,
+                            handoff.artifact_parent_identity,
+                        )
+                        try:
+                            os.fsync(parent_descriptor)
+                        except OSError:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.HANDOFF_PARENT_UNSAFE"
+                            ) from None
+                        artifact_paths = (
+                            snapshot_recovery_module
+                            ._recovery_artifact_paths(destination)
+                        )
+                        for name in (
+                            artifact_paths.jsonl_temp.name,
+                            artifact_paths.manifest_temp.name,
+                            artifact_paths.jsonl_recovery.name,
+                            artifact_paths.manifest_recovery.name,
+                        ):
+                            if not _artifact_handoff_dirfd_absent(
+                                name,
+                                parent_descriptor,
+                            ):
+                                raise SQLiteStoreSchemaError(
+                                    "STORE.HANDOFF_CLEANUP_PENDING"
+                                )
+                        _artifact_handoff_dirfd_reprove(
+                            destination,
+                            handoff.artifact_parent_identity,
+                        )
+                        connection.execute(
+                            "DELETE FROM tm_meta WHERE key = ?",
+                            (_artifact_handoff_meta_key(snapshot_id),),
+                        )
+                        connection.commit()
+                    finally:
+                        os.close(parent_descriptor)
                 except Exception:
                     connection.rollback()
                     raise
@@ -5429,6 +6217,26 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_REVISION_STALE"
                         )
+                    meta_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    if meta_row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_MISSING"
+                        )
+                    handoff = _artifact_handoff_from_meta(
+                        _artifact_handoff_meta_key(snapshot_id),
+                        str(meta_row[0]),
+                    )
+                    if (
+                        handoff is None
+                        or handoff.jsonl_temp_identity is None
+                        or handoff.manifest_temp_identity is None
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_INVALID"
+                        )
                     try:
                         jsonl_capture = _capture_activation_file(
                             identity.configured_jsonl_path,
@@ -5469,6 +6277,24 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.REFRESH_PAIR_INVALID"
                         )
+                    if (
+                        jsonl_capture.identity.device
+                        != handoff.jsonl_temp_identity[0]
+                        or jsonl_capture.identity.inode
+                        != handoff.jsonl_temp_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_IDENTITY_MISMATCH"
+                        )
+                    if (
+                        manifest_capture.identity.device
+                        != handoff.manifest_temp_identity[0]
+                        or manifest_capture.identity.inode
+                        != handoff.manifest_temp_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_IDENTITY_MISMATCH"
+                        )
                     meta = _read_meta(connection)
                     if _meta_bool(meta, "divergence_latched"):
                         raise SQLiteStoreSchemaError(
@@ -5483,10 +6309,6 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
-                    connection.execute(
-                        "DELETE FROM tm_meta WHERE key = ?",
-                        (_artifact_handoff_meta_key(snapshot_id),),
-                    )
                     connection.execute(
                         "INSERT INTO tm_snapshot_binding("
                         "binding_id, configured_jsonl_path, manifest_path, "
@@ -5593,10 +6415,6 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
-                    connection.execute(
-                        "DELETE FROM tm_meta WHERE key = ?",
-                        (_artifact_handoff_meta_key(snapshot_id),),
-                    )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -5715,6 +6533,12 @@ class SQLiteTMStore:
                 binding_invalid = True
         journal_path = _activation_journal_path(identity)
         marker_path = _activation_lineage_marker_path(identity)
+        terminal_path = _activation_terminal_path(identity)
+        configured_artifacts = (
+            snapshot_recovery_module._recovery_artifact_paths(
+                identity.configured_jsonl_path
+            )
+        )
         authority_paths = frozenset(
             {
                 identity.configured_jsonl_path,
@@ -5724,6 +6548,12 @@ class SQLiteTMStore:
                 _activation_journal_temp_path(journal_path),
                 marker_path,
                 _activation_lineage_marker_temp_path(marker_path),
+                terminal_path,
+                _activation_terminal_temp_path(terminal_path),
+                configured_artifacts.jsonl_temp,
+                configured_artifacts.manifest_temp,
+                configured_artifacts.jsonl_recovery,
+                configured_artifacts.manifest_recovery,
             }
         )
         return snapshot_recovery_module._RefreshRecoveryFacts(
@@ -5761,10 +6591,13 @@ class SQLiteTMStore:
         are inspected in one snapshot.  ``COMMITTED`` requires the
         receipt completed (and, for ``require_bound``, the single
         binding pointing at it) plus a strict digest proof of both
-        published files; ``COMMITTED_UNCLEAN`` means the ledger
-        committed but the binding/pair is not cleanly provable (the
-        caller must never restore or cancel); ``NOT_COMMITTED`` keeps
-        the ordinary known-before-commit restore/cancel behavior.
+        published files and a released cleanup-pending handoff journal;
+        ``COMMITTED_UNCLEAN`` means the ledger committed but the
+        binding/pair is not cleanly provable or the receipt's artifact
+        handoff journal is still pending durable cleanup (the caller
+        must never restore or cancel and must never report success);
+        ``NOT_COMMITTED`` keeps the ordinary known-before-commit
+        restore/cancel behavior.
         """
 
         if type(snapshot_id) is not str or not snapshot_id.strip():
@@ -5812,6 +6645,13 @@ class SQLiteTMStore:
                     if str(row[2]) != "completed":
                         connection.commit()
                         return ReceiptCompletionProbe.NOT_COMMITTED
+                    pending_handoff = connection.execute(
+                        "SELECT 1 FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    if pending_handoff is not None:
+                        connection.commit()
+                        return ReceiptCompletionProbe.COMMITTED_UNCLEAN
                     if require_bound:
                         bound = connection.execute(
                             "SELECT snapshot_id FROM tm_snapshot_binding "

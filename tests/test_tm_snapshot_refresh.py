@@ -199,6 +199,39 @@ def _write_explicit_pair(
     )
 
 
+def _manifest_bytes_for(receipt: SnapshotReceipt) -> bytes:
+    """Deterministic adjacent manifest bytes for one issued receipt."""
+
+    manifest = SnapshotManifest(
+        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+        snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+        receipt=receipt,
+        receipt_digest=snapshot_receipt_digest(receipt),
+    )
+    return contract_to_json(manifest).encode("utf-8")
+
+
+def _identity_of(path: Path) -> tuple[int, int]:
+    """The exact device/inode identity of one existing entry."""
+
+    observed = os.lstat(path)
+    return (observed.st_dev, observed.st_ino)
+
+
+def _prior_state(
+    path: Path,
+) -> tuple[tuple[int, int] | None, str | None, bool]:
+    """One (identity, digest, absent) prior-entry record for a path."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return (None, None, True)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return ((observed.st_dev, observed.st_ino), digest, False)
+
+
+
 _PRIOR_JSONL = b'{"source":"bound","target":"pair"}\n'
 
 
@@ -522,12 +555,18 @@ class TMRefreshSuccessTests(unittest.TestCase):
             def interleave_stream(
                 path: Path,
                 records: tuple[object, ...],
+                *,
+                parent_handle: Any = None,
             ) -> tuple[str, int, Any]:
                 observed_records.extend(records)
                 capture_done.set()
                 if not append_done.wait(10):
                     raise AssertionError("concurrent append never completed")
-                return original_stream(path, records)
+                return original_stream(
+                    path,
+                    records,
+                    parent_handle=parent_handle,
+                )
 
             def appender() -> None:
                 if not capture_done.wait(10):
@@ -897,6 +936,8 @@ class TMRefreshSerializationTests(unittest.TestCase):
             def blocking_stream(
                 path: Path,
                 records: tuple[object, ...],
+                *,
+                parent_handle: Any = None,
             ) -> tuple[str, int, Any]:
                 nonlocal max_concurrent
                 with entries_lock:
@@ -906,7 +947,11 @@ class TMRefreshSerializationTests(unittest.TestCase):
                 if not release_first.wait(10):
                     raise AssertionError("first refresh was never released")
                 try:
-                    return original_stream(path, records)
+                    return original_stream(
+                        path,
+                        records,
+                        parent_handle=parent_handle,
+                    )
                 finally:
                     with entries_lock:
                         entries.pop()
@@ -1025,7 +1070,11 @@ class TMRefreshConcurrencyTests(unittest.TestCase):
             observation_errors: list[BaseException] = []
             refresh_results: list[Any] = []
 
-            def blocking_fsync(path: Path) -> None:
+            def blocking_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
                 nonlocal fsync_calls
                 fsync_calls += 1
                 if fsync_calls == 1:
@@ -1034,7 +1083,7 @@ class TMRefreshConcurrencyTests(unittest.TestCase):
                         raise AssertionError(
                             "test never released the publication window"
                         )
-                original_fsync(path)
+                original_fsync(path, parent_handle=parent_handle)
 
             def observer() -> None:
                 observation_started.set()
@@ -1185,7 +1234,11 @@ class TMRefreshConcurrencyTests(unittest.TestCase):
             results: list[Any] = []
             errors: list[BaseException] = []
 
-            def blocking_fsync(path: Path) -> None:
+            def blocking_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
                 nonlocal fsync_calls
                 fsync_calls += 1
                 if fsync_calls == 1:
@@ -1194,7 +1247,7 @@ class TMRefreshConcurrencyTests(unittest.TestCase):
                         raise AssertionError(
                             "test never released the publication window"
                         )
-                original_fsync(path)
+                original_fsync(path, parent_handle=parent_handle)
 
             def recording_reservation(
                 timeout_seconds: float | None = None,
@@ -1416,12 +1469,18 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
         def failing_stream(
             path: Path,
             records: tuple[object, ...],
+            *,
+            parent_handle: Any = None,
         ) -> tuple[str, int, Any]:
             with patch(
                 "tm_migration.os.write",
                 side_effect=OSError("injected jsonl write failure"),
             ):
-                return original(path, records)
+                return original(
+                    path,
+                    records,
+                    parent_handle=parent_handle,
+                )
 
         return patch(
             "tm_migration._stream_export_jsonl_temp",
@@ -1456,12 +1515,18 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
         def failing_manifest_write(
             path: Path,
             payload: bytes,
+            *,
+            parent_handle: Any = None,
         ) -> Any:
             with patch(
                 "tm_migration.os.write",
                 side_effect=OSError("injected manifest write failure"),
             ):
-                return original(path, payload)
+                return original(
+                    path,
+                    payload,
+                    parent_handle=parent_handle,
+                )
 
         return patch(
             "tm_migration._write_export_payload_temp",
@@ -1532,11 +1597,15 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
         original = tm_migration._fsync_directory
         calls: list[int] = []
 
-        def failing_dir_fsync(path: Path) -> None:
+        def failing_dir_fsync(
+            path: Path,
+            *,
+            parent_handle: Any = None,
+        ) -> None:
             calls.append(1)
             if len(calls) == 1:
                 raise OSError("injected jsonl directory fsync failure")
-            original(path)
+            original(path, parent_handle=parent_handle)
 
         return patch(
             "tm_migration._fsync_directory",
@@ -1552,11 +1621,15 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
         original = tm_migration._fsync_directory
         calls: list[int] = []
 
-        def failing_dir_fsync(path: Path) -> None:
+        def failing_dir_fsync(
+            path: Path,
+            *,
+            parent_handle: Any = None,
+        ) -> None:
             calls.append(1)
             if len(calls) == 2:
                 raise OSError("injected manifest directory fsync failure")
-            original(path)
+            original(path, parent_handle=parent_handle)
 
         return patch(
             "tm_migration._fsync_directory",
@@ -1576,6 +1649,7 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
             manifest_bytes: bytes,
             jsonl_identity: tuple[int, int],
             manifest_identity: tuple[int, int],
+            parent_handle: Any = None,
         ) -> None:
             raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
 
@@ -1621,6 +1695,7 @@ class TMRefreshFailureInjectionTests(unittest.TestCase):
             *,
             destination_before: str | None,
             manifest_before: str | None,
+            parent_handle: Any = None,
         ) -> Any:
             raise ExportPreflightError("EXPORT.JSONL_RECOVERY_COPY_FAILED")
 
@@ -1862,6 +1937,7 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
                 manifest_bytes: bytes,
                 jsonl_identity: tuple[int, int],
                 manifest_identity: tuple[int, int],
+                parent_handle: Any = None,
             ) -> None:
                 nonlocal swapped, foreign_identity, foreign_payload
                 if not swapped:
@@ -1963,7 +2039,12 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
             foreign_identity: tuple[int, int] | None = None
             foreign_payload = b""
 
-            def hostile_identity(path: Path, digest: str) -> tuple[int, int]:
+            def hostile_identity(
+                path: Path,
+                digest: str,
+                *,
+                parent_handle: Any = None,
+            ) -> tuple[int, int]:
                 nonlocal swapped, foreign_identity, foreign_payload
                 if not swapped and path == identity.configured_jsonl_path:
                     swapped = True
@@ -1975,7 +2056,11 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
                     os.replace(replacement, path)
                     observed = os.lstat(path)
                     foreign_identity = (observed.st_dev, observed.st_ino)
-                return original_identity(path, digest)
+                return original_identity(
+                    path,
+                    digest,
+                    parent_handle=parent_handle,
+                )
 
             with patch(
                 "tm_migration._published_file_identity",
@@ -2051,6 +2136,7 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
                 manifest_bytes: bytes,
                 jsonl_identity: tuple[int, int],
                 manifest_identity: tuple[int, int],
+                parent_handle: Any = None,
             ) -> None:
                 nonlocal swapped, foreign_identity, foreign_payload
                 if not swapped:
@@ -2137,7 +2223,12 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
             original_identity = tm_migration._published_file_identity
             swapped = False
 
-            def hostile_identity(path: Path, digest: str) -> tuple[int, int]:
+            def hostile_identity(
+                path: Path,
+                digest: str,
+                *,
+                parent_handle: Any = None,
+            ) -> tuple[int, int]:
                 nonlocal swapped
                 if not swapped and path == identity.configured_jsonl_path:
                     swapped = True
@@ -2148,7 +2239,11 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
                     raise ExportPreflightError(
                         "EXPORT.PUBLISH_VERIFY_FAILED"
                     )
-                return original_identity(path, digest)
+                return original_identity(
+                    path,
+                    digest,
+                    parent_handle=parent_handle,
+                )
 
             with patch(
                 "tm_migration._published_file_identity",
@@ -2224,13 +2319,17 @@ class TMRefreshHostileSwapTests(unittest.TestCase):
             swapped = False
             original_dir_fsync = tm_migration._fsync_directory
 
-            def hostile_dir_fsync(path: Path) -> None:
+            def hostile_dir_fsync(
+                path: Path,
+                *,
+                parent_handle: Any = None,
+            ) -> None:
                 nonlocal swapped
                 if not swapped:
                     swapped = True
                     identity.configured_jsonl_path.write_bytes(foreign)
                     raise OSError("injected jsonl directory fsync failure")
-                original_dir_fsync(path)
+                original_dir_fsync(path, parent_handle=parent_handle)
 
             with patch(
                 "tm_migration._fsync_directory",
@@ -2414,15 +2513,37 @@ class TMRefreshLedgerTests(unittest.TestCase):
                 jsonl_digest=hashlib.sha256(_PRIOR_JSONL).hexdigest(),
                 record_count=revision.record_count,
             )
+            paths = _paths(identity)
+            paths.jsonl_temp.write_bytes(_PRIOR_JSONL)
+            paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+            jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+            manifest_temp_identity = _identity_of(paths.manifest_temp)
+            prior_jsonl = _prior_state(identity.configured_jsonl_path)
+            prior_manifest = _prior_state(identity.snapshot_manifest_path)
             store.register_issued_refresh_receipt(
                 receipt,
                 expected_generation=revision.generation,
+                jsonl_temp_identity=jsonl_temp_identity,
+                manifest_temp_identity=manifest_temp_identity,
+                artifact_parent_identity=_identity_of(
+                    identity.configured_jsonl_path.parent
+                ),
+                prior_jsonl_identity=prior_jsonl[0],
+                prior_jsonl_digest=prior_jsonl[1],
+                prior_jsonl_absent=prior_jsonl[2],
+                prior_manifest_identity=prior_manifest[0],
+                prior_manifest_digest=prior_manifest[1],
+                prior_manifest_absent=prior_manifest[2],
             )
             self.assertEqual(
                 _binding_row(stage.staged_db_path)[4],
                 binding.receipt.snapshot_id,
             )
-            _write_explicit_pair(identity, receipt, _PRIOR_JSONL)
+            os.replace(paths.jsonl_temp, identity.configured_jsonl_path)
+            os.replace(
+                paths.manifest_temp,
+                identity.snapshot_manifest_path,
+            )
 
             store.complete_issued_refresh_receipt(
                 receipt.snapshot_id,
@@ -2462,9 +2583,27 @@ class TMRefreshLedgerTests(unittest.TestCase):
                 jsonl_digest="a" * 64,
                 record_count=revision.record_count,
             )
+            paths = _paths(identity)
+            paths.jsonl_temp.write_bytes(_PRIOR_JSONL)
+            paths.manifest_temp.write_bytes(_manifest_bytes_for(receipt))
+            jsonl_temp_identity = _identity_of(paths.jsonl_temp)
+            manifest_temp_identity = _identity_of(paths.manifest_temp)
+            prior_jsonl = _prior_state(identity.configured_jsonl_path)
+            prior_manifest = _prior_state(identity.snapshot_manifest_path)
             store.register_issued_refresh_receipt(
                 receipt,
                 expected_generation=revision.generation,
+                jsonl_temp_identity=jsonl_temp_identity,
+                manifest_temp_identity=manifest_temp_identity,
+                artifact_parent_identity=_identity_of(
+                    identity.configured_jsonl_path.parent
+                ),
+                prior_jsonl_identity=prior_jsonl[0],
+                prior_jsonl_digest=prior_jsonl[1],
+                prior_jsonl_absent=prior_jsonl[2],
+                prior_manifest_identity=prior_manifest[0],
+                prior_manifest_digest=prior_manifest[1],
+                prior_manifest_absent=prior_manifest[2],
             )
 
             with self.assertRaises(SQLiteStoreSchemaError) as pair_error:

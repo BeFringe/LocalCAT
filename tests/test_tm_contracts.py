@@ -4,14 +4,22 @@ import json
 import traceback
 import unittest
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import cast
 
 from tm_contracts import (
+    AssetKind,
+    AssetPreservationEvidence,
+    AssetPreservationState,
     CANDIDATE_BUDGET_VERSION,
     CandidateRecallMetadata,
     TM_CONTRACT_CODEC_VERSION,
     ContextEvidence,
+    DiagnosticDisposition,
+    ExportDiagnostic,
+    ExportFailure,
     QueryReport,
+    RecoveryLocator,
     ResourceQueryFailure,
     ResourceQueryMetadata,
     SimilarityEvidence,
@@ -28,6 +36,8 @@ from tm_contracts import (
     contract_from_json,
     contract_to_json,
     candidate_budget_v1,
+    export_cleanup_pending_failure,
+    export_ledger_ambiguous_failure,
     validate_resource_handles,
 )
 
@@ -709,6 +719,608 @@ class TMContractTests(unittest.TestCase):
                 context_evidence=_context_evidence(),
                 provenance=(),
                 stable_tie_key=(0, 1),
+            )
+
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+def _export_diagnostic() -> ExportDiagnostic:
+    return ExportDiagnostic(
+        code="EXPORT.CLEANUP_PENDING",
+        record_id=None,
+        disposition=DiagnosticDisposition.WARNING,
+        safe_summary="EXPORT_ARTIFACTS_REMAIN",
+    )
+
+
+def _destination_evidence(
+    state: AssetPreservationState,
+    *,
+    before_digest: str | None,
+    observed_digest: str | None,
+) -> AssetPreservationEvidence:
+    return AssetPreservationEvidence(
+        asset_kind=AssetKind.EXPORT_DESTINATION,
+        state=state,
+        before_digest=before_digest,
+        observed_digest=observed_digest,
+    )
+
+
+class TMExportFailurePublicationCommittedTests(unittest.TestCase):
+    """ExportFailure publication_committed contract and codec tests."""
+
+    def test_default_false_preserves_original_invariant(self) -> None:
+        changed_with_locator = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(
+                RecoveryLocator(
+                    path=Path("/catalog/recovery/out.jsonl"),
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    expected_digest=_DIGEST_A,
+                ),
+            ),
+        )
+        self.assertFalse(changed_with_locator.publication_committed)
+        with self.assertRaisesRegex(ValueError, "exactly match assets"):
+            ExportFailure(
+                stage="EXPORT.PUBLISH",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+            )
+        with self.assertRaisesRegex(ValueError, "exactly match assets"):
+            ExportFailure(
+                stage="EXPORT.PUBLISH",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.UNVERIFIED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=None,
+                ),
+                recovery_locators=(),
+            )
+        with self.assertRaises(FrozenInstanceError):
+            changed_with_locator.publication_committed = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_committed_requires_fail_stop_and_forbids_rollback(self) -> None:
+        changed = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.CLEANUP_PENDING",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_committed=True,
+        )
+        self.assertTrue(changed.publication_committed)
+        with self.assertRaisesRegex(ValueError, "not retryable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=True,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot restore"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(
+                    RecoveryLocator(
+                        path=Path("/catalog/recovery/out.jsonl"),
+                        asset_kind=AssetKind.EXPORT_DESTINATION,
+                        expected_digest=_DIGEST_A,
+                    ),
+                ),
+                publication_committed=True,
+            )
+
+    def test_committed_evidence_allows_truthful_states_without_locator(
+        self,
+    ) -> None:
+        for evidence in (
+            _destination_evidence(
+                AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            _destination_evidence(
+                AssetPreservationState.UNVERIFIED,
+                before_digest=_DIGEST_A,
+                observed_digest=None,
+            ),
+        ):
+            with self.subTest(state=evidence.state):
+                failure = ExportFailure(
+                    stage="EXPORT.LEDGER",
+                    error_code="EXPORT.CLEANUP_PENDING",
+                    retryable=False,
+                    diagnostics=(),
+                    previous_destination_preservation=evidence,
+                    recovery_locators=(),
+                    publication_committed=True,
+                )
+                self.assertTrue(failure.publication_committed)
+                self.assertEqual(failure.recovery_locators, ())
+
+    def test_committed_not_applicable_requires_no_prior_destination(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "not-applicable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.NOT_APPLICABLE,
+                    before_digest=_DIGEST_A,
+                    observed_digest=None,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+            )
+
+    def test_cleanup_pending_builder_contract(self) -> None:
+        fresh = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=None,
+            destination_observed=_DIGEST_B,
+        )
+        self.assertEqual(fresh.error_code, "EXPORT.CLEANUP_PENDING")
+        self.assertFalse(fresh.retryable)
+        self.assertTrue(fresh.publication_committed)
+        self.assertEqual(fresh.recovery_locators, ())
+        self.assertEqual(
+            fresh.previous_destination_preservation.state,
+            AssetPreservationState.NOT_APPLICABLE,
+        )
+
+        changed = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        self.assertTrue(changed.publication_committed)
+        self.assertEqual(
+            changed.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_CHANGED,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.observed_digest,
+            _DIGEST_B,
+        )
+
+        unverified = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=_DIGEST_A,
+            destination_observed=None,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.state,
+            AssetPreservationState.UNVERIFIED,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertIsNone(
+            unverified.previous_destination_preservation.observed_digest
+        )
+
+    def test_publication_committed_round_trips_and_old_payload_decodes(
+        self,
+    ) -> None:
+        failure = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.CLEANUP_PENDING",
+            retryable=False,
+            diagnostics=(_export_diagnostic(),),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_committed=True,
+        )
+        encoded = contract_to_json(failure)
+        self.assertTrue(
+            json.loads(encoded)["payload"]["publication_committed"]
+        )
+        self.assertEqual(contract_from_json(encoded), failure)
+        self.assertEqual(contract_to_json(contract_from_json(encoded)), encoded)
+
+        legacy_encoded = contract_to_json(
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_UNCHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_A,
+                ),
+                recovery_locators=(),
+            )
+        )
+        legacy = json.loads(legacy_encoded)
+        del legacy["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(legacy, sort_keys=True))
+        self.assertIsInstance(decoded, ExportFailure)
+        assert isinstance(decoded, ExportFailure)
+        self.assertEqual(decoded.publication_committed, False)
+        self.assertEqual(decoded.error_code, "EXPORT.FAILED")
+        self.assertEqual(
+            decoded.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        default_failure = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=True,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            recovery_locators=(),
+        )
+        self.assertFalse(default_failure.publication_committed)
+        self.assertEqual(
+            contract_from_json(contract_to_json(default_failure)),
+            default_failure,
+        )
+
+
+class TMExportFailurePublicationAmbiguousTests(unittest.TestCase):
+    """ExportFailure publication_commit_ambiguous contract and codec tests."""
+
+    def _ambiguous_evidence(
+        self,
+        state: AssetPreservationState,
+        *,
+        before_digest: str | None,
+        observed_digest: str | None,
+    ) -> AssetPreservationEvidence:
+        return _destination_evidence(
+            state,
+            before_digest=before_digest,
+            observed_digest=observed_digest,
+        )
+
+    def test_default_false_preserves_original_invariant(self) -> None:
+        failure = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(
+                RecoveryLocator(
+                    path=Path("/catalog/recovery/out.jsonl"),
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    expected_digest=_DIGEST_A,
+                ),
+            ),
+        )
+        self.assertFalse(failure.publication_commit_ambiguous)
+        self.assertFalse(failure.publication_committed)
+        with self.assertRaises(FrozenInstanceError):
+            failure.publication_commit_ambiguous = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_ambiguous_requires_fail_stop_and_forbids_locator(self) -> None:
+        changed = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.LEDGER_AMBIGUOUS",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_commit_ambiguous=True,
+        )
+        self.assertTrue(changed.publication_commit_ambiguous)
+        self.assertFalse(changed.publication_committed)
+        with self.assertRaisesRegex(ValueError, "not retryable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=True,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_commit_ambiguous=True,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot fabricate"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(
+                    RecoveryLocator(
+                        path=Path("/catalog/recovery/out.jsonl"),
+                        asset_kind=AssetKind.EXPORT_DESTINATION,
+                        expected_digest=_DIGEST_A,
+                    ),
+                ),
+                publication_commit_ambiguous=True,
+            )
+
+    def test_ambiguous_is_mutually_exclusive_with_committed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "contradictory"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+                publication_commit_ambiguous=True,
+            )
+
+    def test_ambiguous_allows_truthful_states_without_locator(self) -> None:
+        for evidence in (
+            _destination_evidence(
+                AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            _destination_evidence(
+                AssetPreservationState.UNVERIFIED,
+                before_digest=_DIGEST_A,
+                observed_digest=None,
+            ),
+        ):
+            with self.subTest(state=evidence.state):
+                failure = ExportFailure(
+                    stage="EXPORT.LEDGER",
+                    error_code="EXPORT.LEDGER_AMBIGUOUS",
+                    retryable=False,
+                    diagnostics=(),
+                    previous_destination_preservation=evidence,
+                    recovery_locators=(),
+                    publication_commit_ambiguous=True,
+                )
+                self.assertTrue(failure.publication_commit_ambiguous)
+                self.assertFalse(failure.publication_committed)
+                self.assertEqual(failure.recovery_locators, ())
+
+    def test_ambiguous_builder_contract(self) -> None:
+        fresh = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=None,
+            destination_observed=_DIGEST_B,
+        )
+        self.assertEqual(fresh.error_code, "STORE.PROBE_UNAVAILABLE")
+        self.assertFalse(fresh.retryable)
+        self.assertFalse(fresh.publication_committed)
+        self.assertTrue(fresh.publication_commit_ambiguous)
+        self.assertEqual(fresh.recovery_locators, ())
+        self.assertEqual(
+            fresh.previous_destination_preservation.state,
+            AssetPreservationState.NOT_APPLICABLE,
+        )
+        self.assertIsNone(fresh.previous_destination_preservation.before_digest)
+        self.assertIsNone(
+            fresh.previous_destination_preservation.observed_digest
+        )
+
+        changed = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        self.assertTrue(changed.publication_commit_ambiguous)
+        self.assertFalse(changed.publication_committed)
+        self.assertEqual(
+            changed.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_CHANGED,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.observed_digest,
+            _DIGEST_B,
+        )
+
+        unchanged = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_A,
+        )
+        self.assertEqual(
+            unchanged.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        unverified = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=None,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.state,
+            AssetPreservationState.UNVERIFIED,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertIsNone(
+            unverified.previous_destination_preservation.observed_digest
+        )
+
+    def test_ambiguous_round_trips_and_legacy_payloads_decode_false(
+        self,
+    ) -> None:
+        failure = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        encoded = contract_to_json(failure)
+        self.assertTrue(
+            json.loads(encoded)["payload"]["publication_commit_ambiguous"]
+        )
+        self.assertFalse(
+            json.loads(encoded)["payload"]["publication_committed"]
+        )
+        self.assertEqual(contract_from_json(encoded), failure)
+        self.assertEqual(contract_to_json(contract_from_json(encoded)), encoded)
+
+        legacy_candidate = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_A,
+        )
+        legacy_payload = json.loads(contract_to_json(legacy_candidate))
+        del legacy_payload["payload"]["publication_commit_ambiguous"]
+        decoded = contract_from_json(
+            json.dumps(legacy_payload, sort_keys=True)
+        )
+        self.assertIsInstance(decoded, ExportFailure)
+        assert isinstance(decoded, ExportFailure)
+        self.assertFalse(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+        self.assertEqual(decoded.error_code, "STORE.PROBE_UNAVAILABLE")
+        self.assertEqual(
+            decoded.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        payload = json.loads(encoded)
+        del payload["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(payload, sort_keys=True))
+        assert isinstance(decoded, ExportFailure)
+        self.assertTrue(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+
+        payload = json.loads(contract_to_json(legacy_candidate))
+        del payload["payload"]["publication_commit_ambiguous"]
+        del payload["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(payload, sort_keys=True))
+        assert isinstance(decoded, ExportFailure)
+        self.assertFalse(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+        self.assertEqual(decoded.error_code, "STORE.PROBE_UNAVAILABLE")
+
+        with self.assertRaises(ValueError):
+            contract_from_json(
+                contract_to_json(
+                    ExportFailure(
+                        stage="EXPORT.LEDGER",
+                        error_code="EXPORT.LEDGER_AMBIGUOUS",
+                        retryable=False,
+                        diagnostics=(),
+                        previous_destination_preservation=(
+                            _destination_evidence(
+                                AssetPreservationState.VERIFIED_CHANGED,
+                                before_digest=_DIGEST_A,
+                                observed_digest=_DIGEST_B,
+                            )
+                        ),
+                        recovery_locators=(),
+                        publication_committed=True,
+                        publication_commit_ambiguous=True,
+                    )
+                )
             )
 
 
