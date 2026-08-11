@@ -53,7 +53,14 @@ from tm_contracts import (
     contract_to_json,
     snapshot_receipt_digest,
 )
+from tm_snapshot_recovery import (
+    IssuedReceiptRecovery,
+    RecoveryError,
+    RefreshRecoveryOutcome,
+    RefreshRecoveryState,
+)
 from tm_sqlite_store import (
+    ReceiptCompletionProbe,
     TM_LEGACY_SCHEMA_VERSION,
     TM_SCHEMA_VERSION,
     ActivationPreparationError,
@@ -1316,6 +1323,29 @@ def _export_diagnostic(
     )
 
 
+def _recovery_error_code(error: Exception) -> str:
+    error_code = getattr(error, "error_code", None)
+    if type(error_code) is str and error_code:
+        return error_code
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    message = getattr(error, "args", None)
+    if (
+        type(message) is tuple
+        and message
+        and type(message[0]) is str
+        and message[0]
+    ):
+        return message[0]
+    return "RECOVERY.FAILED"
+
+
+def _recovery_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    return retryable if type(retryable) is bool else False
+
+
 def _export_error_code(error: Exception) -> str:
     error_code = getattr(error, "error_code", None)
     if type(error_code) is str and error_code:
@@ -1574,12 +1604,30 @@ class TMMigrationService:
                     manifest_identity=manifest_identity,
                     receipt_id_prefix="snapshot.refresh.",
                     stage_prefix="REFRESH",
-                    register=lambda receipt: (
+                    register=lambda receipt, jsonl_temp_identity, manifest_temp_identity: (
                         store.register_issued_refresh_receipt(
                             receipt,
                             expected_generation=(
                                 snapshot.revision.generation
                             ),
+                            jsonl_temp_identity=jsonl_temp_identity,
+                            manifest_temp_identity=manifest_temp_identity,
+                        )
+                    ),
+                    record_recovery_handoff=(
+                        lambda snapshot_id, jsonl_recovery_identity, manifest_recovery_identity: (
+                            store.record_export_recovery_handoff(
+                                snapshot_id,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                                jsonl_recovery_identity=(
+                                    jsonl_recovery_identity
+                                ),
+                                manifest_recovery_identity=(
+                                    manifest_recovery_identity
+                                ),
+                            )
                         )
                     ),
                     complete=lambda snapshot_id, jsonl_identity, manifest_identity: (
@@ -1603,6 +1651,37 @@ class TMMigrationService:
                 stage_label="REFRESH.PREFLIGHT",
                 destination_before=None,
                 destination_observed=None,
+            )
+
+    def recover_configured_refresh(
+        self,
+        store: SQLiteTMStore,
+    ) -> RefreshRecoveryOutcome:
+        """Close every issued snapshot publication crash window.
+
+        Task 5.14 explicit service seam: delegates to the store recovery
+        entry (which runs classification and effects under the
+        resource-scoped reentrant refresh/observation gate) and
+        normalizes the expected lifecycle/schema/database failures to a
+        stable ``BLOCKED`` outcome consistent with the existing export
+        failure patterns.  Unexpected programmer errors remain visible.
+        Recovery is idempotent and never clears a pre-existing
+        divergence latch.
+        """
+
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        try:
+            return store.recover_configured_refresh()
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                error_code=_recovery_error_code(error),
+                retryable=_recovery_retryable(error),
             )
 
     def _run_arbitrary_export(
@@ -1659,16 +1738,34 @@ class TMMigrationService:
             manifest_identity=manifest_identity,
             receipt_id_prefix="snapshot.export.",
             stage_prefix="EXPORT",
-            register=lambda receipt: store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=paths.destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=snapshot.revision.generation,
+            register=(
+                lambda receipt, jsonl_temp_identity, manifest_temp_identity: (
+                    store.register_issued_export_receipt(
+                        receipt,
+                        destination_jsonl_path=paths.destination,
+                        destination_manifest_path=paths.manifest,
+                        expected_generation=snapshot.revision.generation,
+                        jsonl_temp_identity=jsonl_temp_identity,
+                        manifest_temp_identity=manifest_temp_identity,
+                    )
+                )
+            ),
+            record_recovery_handoff=(
+                lambda snapshot_id, jsonl_recovery_identity, manifest_recovery_identity: (
+                    store.record_export_recovery_handoff(
+                        snapshot_id,
+                        expected_generation=snapshot.revision.generation,
+                        jsonl_recovery_identity=jsonl_recovery_identity,
+                        manifest_recovery_identity=manifest_recovery_identity,
+                    )
+                )
             ),
             complete=lambda snapshot_id, jsonl_identity, manifest_identity: (
                 store.complete_issued_export_receipt(
                     snapshot_id,
                     expected_generation=snapshot.revision.generation,
+                    jsonl_identity=jsonl_identity,
+                    manifest_identity=manifest_identity,
                 )
             ),
         )
@@ -1685,7 +1782,14 @@ class TMMigrationService:
         manifest_identity: tuple[int, int] | None,
         receipt_id_prefix: str,
         stage_prefix: str,
-        register: Callable[[SnapshotReceipt], None],
+        register: Callable[
+            [SnapshotReceipt, tuple[int, int], tuple[int, int]],
+            None,
+        ],
+        record_recovery_handoff: Callable[
+            [str, tuple[int, int] | None, tuple[int, int] | None],
+            None,
+        ],
         complete: Callable[
             [str, tuple[int, int], tuple[int, int]],
             None,
@@ -1715,6 +1819,7 @@ class TMMigrationService:
         manifest_digest: str | None = None
         record_count = len(snapshot.records)
         issued = False
+        complete_called = False
         receipt: SnapshotReceipt | None = None
         try:
             jsonl_digest, record_count, jsonl_temp_identity = (
@@ -1754,7 +1859,19 @@ class TMMigrationService:
                 expected_bytes=manifest_bytes,
                 identity=manifest_temp_identity,
             )
-            register(receipt)
+            assert jsonl_temp_identity is not None
+            assert manifest_temp_identity is not None
+            register(
+                receipt,
+                (
+                    jsonl_temp_identity.device,
+                    jsonl_temp_identity.inode,
+                ),
+                (
+                    manifest_temp_identity.device,
+                    manifest_temp_identity.inode,
+                ),
+            )
             issued = True
             jsonl_recovery_identity, manifest_recovery_identity = (
                 _copy_export_prior_pair(
@@ -1762,6 +1879,25 @@ class TMMigrationService:
                     destination_before=destination_before,
                     manifest_before=manifest_before,
                 )
+            )
+            record_recovery_handoff(
+                receipt.snapshot_id,
+                (
+                    None
+                    if jsonl_recovery_identity is None
+                    else (
+                        jsonl_recovery_identity.device,
+                        jsonl_recovery_identity.inode,
+                    )
+                ),
+                (
+                    None
+                    if manifest_recovery_identity is None
+                    else (
+                        manifest_recovery_identity.device,
+                        manifest_recovery_identity.inode,
+                    )
+                ),
             )
             _replace_path(
                 paths.jsonl_temp,
@@ -1816,6 +1952,7 @@ class TMMigrationService:
                     manifest_temp_identity.inode,
                 ),
             )
+            complete_called = True
             complete(
                 receipt.snapshot_id,
                 (
@@ -1834,6 +1971,23 @@ class TMMigrationService:
             sqlite3.DatabaseError,
             OSError,
         ) as error:
+            if complete_called:
+                assert receipt is not None
+                window_outcome = self._post_completion_exception_window(
+                    store,
+                    snapshot=snapshot,
+                    paths=paths,
+                    stage_prefix=stage_prefix,
+                    receipt=receipt,
+                    jsonl_recovery_identity=jsonl_recovery_identity,
+                    manifest_recovery_identity=manifest_recovery_identity,
+                    jsonl_digest=jsonl_digest,
+                    record_count=record_count,
+                    destination_before=destination_before,
+                    error=error,
+                )
+                if window_outcome is not None:
+                    return window_outcome
             restore_error: Exception | None = None
             failure_stage = f"{stage_prefix}.PUBLISH"
             if issued:
@@ -1933,6 +2087,116 @@ class TMMigrationService:
         )
         assert jsonl_digest is not None
         assert receipt is not None
+        return self._export_report(
+            record_count=record_count,
+            jsonl_digest=jsonl_digest,
+            snapshot=snapshot,
+            receipt=receipt,
+            diagnostics=success_diagnostics,
+        )
+
+    def _post_completion_exception_window(
+        self,
+        store: SQLiteTMStore,
+        *,
+        snapshot: CanonicalExportSnapshot,
+        paths: _ExportArtifactPaths,
+        stage_prefix: str,
+        receipt: SnapshotReceipt,
+        jsonl_recovery_identity: _CreatedFileIdentity | None,
+        manifest_recovery_identity: _CreatedFileIdentity | None,
+        jsonl_digest: str | None,
+        record_count: int,
+        destination_before: str | None,
+        error: Exception,
+    ) -> ExportOutcome | None:
+        """Resolve the Task 5.13 ambiguous post-completion exception window.
+
+        The completion call may have committed before raising an outward
+        exception.  Before any rollback/cancel the durable ledger,
+        binding and published pair are inspected: when the completion
+        actually committed the refresh/export is reported as success and
+        the old pair is never restored nor the completed receipt
+        cancelled; a committed-but-unclean window fails closed with
+        evidence preserved; only a provably not-committed window returns
+        ``None`` so the ordinary known-before-commit restore/cancel
+        behavior continues.
+        """
+
+        try:
+            probe = store.probe_issued_receipt_completed(
+                receipt.snapshot_id,
+                expected_generation=snapshot.revision.generation,
+                require_bound=(stage_prefix == "REFRESH"),
+            )
+        except Exception as probe_error:
+            observed = _try_file_digest(paths.destination)
+            return self._export_failure(
+                probe_error,
+                stage_label=f"{stage_prefix}.LEDGER",
+                destination_before=destination_before,
+                destination_observed=observed,
+                diagnostics=(
+                    _export_diagnostic(
+                        "EXPORT.LEDGER_AMBIGUOUS",
+                        "EXPORT_LEDGER_AMBIGUOUS",
+                    ),
+                ),
+            )
+        if probe is ReceiptCompletionProbe.COMMITTED:
+            remaining = _cleanup_export_artifacts(
+                paths,
+                jsonl_temp_identity=None,
+                manifest_temp_identity=None,
+                jsonl_recovery_identity=jsonl_recovery_identity,
+                manifest_recovery_identity=manifest_recovery_identity,
+            )
+            success_diagnostics = (
+                ()
+                if not remaining
+                else (
+                    _export_diagnostic(
+                        "EXPORT.CLEANUP_PENDING",
+                        "EXPORT_ARTIFACTS_REMAIN",
+                    ),
+                )
+            )
+            assert jsonl_digest is not None
+            return self._export_report(
+                record_count=record_count,
+                jsonl_digest=jsonl_digest,
+                snapshot=snapshot,
+                receipt=receipt,
+                diagnostics=success_diagnostics,
+            )
+        if probe is ReceiptCompletionProbe.COMMITTED_UNCLEAN:
+            observed = _try_file_digest(paths.destination)
+            return self._export_failure(
+                error,
+                stage_label=f"{stage_prefix}.LEDGER",
+                destination_before=destination_before,
+                destination_observed=observed,
+                diagnostics=(
+                    _export_diagnostic(
+                        "EXPORT.LEDGER_UNCLEAN",
+                        "EXPORT_LEDGER_UNCLEAN",
+                    ),
+                ),
+                recovery_candidate=paths.jsonl_recovery,
+            )
+        return None
+
+    def _export_report(
+        self,
+        *,
+        record_count: int,
+        jsonl_digest: str,
+        snapshot: CanonicalExportSnapshot,
+        receipt: SnapshotReceipt,
+        diagnostics: tuple[ExportDiagnostic, ...],
+    ) -> ExportReport:
+        """Build the shared success report from one durable receipt."""
+
         return ExportReport(
             exported_count=record_count,
             skipped_count=0,
@@ -1942,7 +2206,7 @@ class TMMigrationService:
             snapshot_id=receipt.snapshot_id,
             snapshot_receipt_digest=snapshot_receipt_digest(receipt),
             snapshot_receipt=receipt,
-            diagnostics=success_diagnostics,
+            diagnostics=diagnostics,
         )
 
     def _export_failure(

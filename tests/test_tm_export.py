@@ -1154,6 +1154,8 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             snapshot_id: str,
             *,
             expected_generation: int,
+            jsonl_identity: tuple[int, int] | None = None,
+            manifest_identity: tuple[int, int] | None = None,
         ) -> None:
             raise SQLiteStoreLifecycleError(
                 "STORE.LEDGER_UNAVAILABLE",
@@ -1812,6 +1814,103 @@ class TMExportFailureInjectionTests(unittest.TestCase):
             self.assertEqual(
                 fail_stop.exception.error_code,
                 "EXPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+
+    def test_same_byte_foreign_swap_at_completion_seam_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            service = _service(stage.resource_identity)
+            destination = _destination(root)
+            paths = _export_artifact_paths(destination)
+            prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+            prior_manifest = b'{"manifest":"prior"}\n'
+            destination.write_bytes(prior_jsonl)
+            paths.manifest.write_bytes(prior_manifest)
+            original_complete = store.complete_issued_export_receipt
+            swapped = False
+            published_jsonl = b""
+            published_manifest = b""
+            foreign_identity: tuple[int, int] | None = None
+
+            def hostile_complete(
+                snapshot_id: str,
+                **kwargs: Any,
+            ) -> None:
+                nonlocal swapped
+                nonlocal published_jsonl
+                nonlocal published_manifest
+                nonlocal foreign_identity
+                if not swapped:
+                    swapped = True
+                    published_jsonl = paths.destination.read_bytes()
+                    published_manifest = paths.manifest.read_bytes()
+                    foreign = paths.destination.with_name(
+                        "foreign-same-bytes.jsonl"
+                    )
+                    foreign.write_bytes(published_jsonl)
+                    os.replace(foreign, paths.destination)
+                    observed = os.lstat(paths.destination)
+                    foreign_identity = (observed.st_dev, observed.st_ino)
+                original_complete(snapshot_id, **kwargs)
+
+            with patch.object(
+                store,
+                "complete_issued_export_receipt",
+                side_effect=hostile_complete,
+            ):
+                result = service.export_jsonl(store, destination)
+
+            assert isinstance(result, ExportFailure)
+            self.assertTrue(swapped)
+            self.assertEqual(result.stage, "EXPORT.RESTORE")
+            self.assertEqual(
+                result.error_code,
+                "EXPORT.JSONL_RESTORE_FAILED",
+            )
+            self.assertFalse(result.retryable)
+            self.assertEqual(
+                tuple(diagnostic.code for diagnostic in result.diagnostics),
+                ("EXPORT.RESTORE_FAILED",),
+            )
+            self.assertEqual(destination.read_bytes(), published_jsonl)
+            observed = os.lstat(destination)
+            self.assertEqual(
+                (observed.st_dev, observed.st_ino),
+                foreign_identity,
+            )
+            self.assertEqual(paths.manifest.read_bytes(), published_manifest)
+            self.assertEqual(paths.jsonl_recovery.read_bytes(), prior_jsonl)
+            self.assertEqual(
+                paths.manifest_recovery.read_bytes(),
+                prior_manifest,
+            )
+            evidence = result.previous_destination_preservation
+            self.assertEqual(
+                evidence.state,
+                AssetPreservationState.VERIFIED_CHANGED,
+            )
+            self.assertEqual(
+                evidence.before_digest,
+                hashlib.sha256(prior_jsonl).hexdigest(),
+            )
+            self.assertEqual(
+                evidence.observed_digest,
+                hashlib.sha256(published_jsonl).hexdigest(),
+            )
+            self.assertEqual(len(result.recovery_locators), 1)
+            locator = result.recovery_locators[0]
+            self.assertIs(locator.asset_kind, AssetKind.EXPORT_DESTINATION)
+            self.assertEqual(locator.path, paths.jsonl_recovery)
+            self.assertEqual(
+                locator.expected_digest,
+                hashlib.sha256(prior_jsonl).hexdigest(),
+            )
+            self.assertEqual(
+                _ledger_status(stage.staged_db_path, destination),
+                "issued",
             )
 
     def test_failure_error_codes_are_stable_identifiers_only(self) -> None:

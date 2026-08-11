@@ -224,7 +224,7 @@
   - 完成时，成功刷新产生一致的 JSONL/manifest/ledger completed pair，且不改变 canonical records
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 5.14 实现配置快照 refresh 崩溃恢复
+- [x] 5.14 实现配置快照 refresh 崩溃恢复
   - issued receipt 对应旧 completed pair 时取消，JSONL 已替换但 manifest 未发布时由 ledger 重建 manifest
   - 未闭合 pair 不得报告成功；与 completed/issued ledger 均不一致时进入 SOURCE_DIVERGED，不回滚 canonical revision
   - 完成时，每个刷新阶段的失败注入都保持旧 completed pair、发布一致新 pair或明确进入 divergence
@@ -402,3 +402,4 @@
 - 2026-08-10 / Task 5.R2：将 schema-upgrade backup/locator pending→reported 协议、strict locator file proof 与 v1→v2 copy 数据面提取到 `tm_schema_upgrade.py`；`tm_sqlite_store.py` 减少 451 行、`tm_migration.py` 减少 373 行，新模块不反向导入两个 owner。coordinator 仍独占 ticket/locator snapshot、lease/drain/state/guard/cold-root，migration 仍独占公开成败编排；原 private patch seam 由 late-bound wrapper 保留，copy plan 每次调用重建并对 DDL/digest 做只读值快照，异常分支与 cleanup 顺序未改写。E-R `v4_flash_worker`/max 等价性复审最终批准且无 P0–P3 遗留；复审 focused/recovery 306/306、fresh 全量 718/718（skip 1，含 Qt smoke）、py_compile 通过、变更文件 basedpyright error-level 0 errors。
 - 2026-08-10 / Task 5.12：在同一 lease 和 SQLite read snapshot 内捕获 canonical revision 与按 `record_id ASC` 排列的全部变体，导出固定字段顺序的 JSONL 与 adjacent manifest，并以 canonical ledger 的 issued→completed/cancelled 状态绑定 generation、revision、record count 和 receipt。发布使用排他 temp、file fsync、replace 前 digest+inode/缺席复验、atomic replace、parent fsync 与终态重验；普通写入/fsync/恢复拷贝失败只按已证明的创建 inode 清理，外来或无法证明的目标保持不删不覆盖并 fail-closed。空 provenance、完整 context/变体与 exact winner 往返保持，不改写 active binding、divergence、canonical records 或 generation。实施阶段 focused 203/203（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Task 5.13/5.14 后执行 Cluster F 统一复审。
 - 2026-08-11 / Task 5.13：实现未漂移资源的配置 JSONL 快照刷新；稳定 canonical read snapshot 经 issued receipt、JSONL replace/fsync、manifest replace/fsync、严格 digest+inode 成对复核后，在单一事务完成 receipt 与 active binding，失败按已证明所有权恢复旧 pair 或保留可恢复证据。配置 pair 观察使用资源级可重入 gate 覆盖完整发布窗口，外部 monitor 与并发 refresh 只能观察前态或 completed 后态；symlink、multi-link、same-byte foreign inode 与不稳定身份均 fail-closed 并锁存真实 divergence，canonical records、revision 与 generation 不变。实施阶段 focused 151/151（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Task 5.14 后执行 Cluster F 统一复审。
+- 2026-08-11 / Task 5.14：在资源级可重入 gate 内先恢复再观察，按 durable ledger 与严格文件身份把 issued 配置刷新确定为取消旧 pair、重建并发布 manifest、完成一致新 pair，或锁存 `SOURCE_DIVERGED`；任意路径导出的 issued receipt 独立复用同一恢复协议且不改 active binding。排他 temp/recovery copy 的 dev/inode 通过 write-once `tm_meta` handoff 跨崩溃证明所有权，所有清理、重建和完成事务均复核 digest、identity、revision ancestry、父目录链与 authority alias，无法证明的同字节外来文件保持不删并 fail-closed；canonical records、revision 与 generation 不变。实施阶段 focused 205/205（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Cluster F 统一复审。

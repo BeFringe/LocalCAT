@@ -231,6 +231,8 @@ from tm_activation_recovery import (
 
 import tm_schema_upgrade as schema_upgrade_module
 
+import tm_snapshot_recovery as snapshot_recovery_module
+
 TM_SCHEMA_VERSION = 2
 TM_LEGACY_SCHEMA_VERSION = 1
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
@@ -3141,13 +3143,42 @@ class ResourceStoreCoordinator:
             return next_generation
 
 
+class ReceiptCompletionProbe(str, Enum):
+    """Durable completion probe for one ambiguous post-commit window."""
+
+    COMMITTED = "COMMITTED"
+    COMMITTED_UNCLEAN = "COMMITTED_UNCLEAN"
+    NOT_COMMITTED = "NOT_COMMITTED"
+
+
 class SourceBindingMonitor:
     """Observe one configured snapshot without publishing either file."""
 
-    def __init__(self, coordinator: ResourceStoreCoordinator) -> None:
+    def __init__(
+        self,
+        coordinator: ResourceStoreCoordinator,
+        *,
+        store: SQLiteTMStore | None = None,
+    ) -> None:
         if type(coordinator) is not ResourceStoreCoordinator:
             raise TypeError("coordinator must be ResourceStoreCoordinator")
+        if store is not None and type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore or None")
         self._coordinator = coordinator
+        self._store = store
+
+    def _recover_configured_refresh(self) -> None:
+        """Close one issued refresh crash window before classification.
+
+        Task 5.14: runs under the already-held reentrant refresh
+        observation gate so a legitimate issued publication window can
+        never be misclassified as external divergence.  Idempotent:
+        replay returns the same stable state and a pre-existing
+        divergence latch is never cleared.
+        """
+
+        if self._store is not None:
+            self._store.recover_configured_refresh()
 
     def observe(self) -> SourceBindingObservation:
         """Derive and latch source divergence in one generation lease.
@@ -3163,6 +3194,7 @@ class SourceBindingMonitor:
         """
 
         with self._coordinator._refresh_observation_gate():
+            self._recover_configured_refresh()
             with self._coordinator._operation_lease() as lease:
                 while True:
                     with _open_leased_connection(lease) as connection:
@@ -4062,6 +4094,299 @@ def _require_timeout(value: object) -> float:
     return timeout
 
 
+def _require_artifact_identity_pair(
+    value: object,
+    field_name: str,
+) -> None:
+    """Validate one optional exact ``(device, inode)`` identity pair."""
+
+    if value is None:
+        return
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or type(value[0]) is not int
+        or type(value[1]) is not int
+    ):
+        raise ValueError(f"{field_name} is invalid")
+
+
+_ARTIFACT_HANDOFF_META_PREFIX = "artifact_handoff."
+
+
+def _artifact_handoff_meta_key(snapshot_id: str) -> str:
+    return f"{_ARTIFACT_HANDOFF_META_PREFIX}{snapshot_id}"
+
+
+def _artifact_handoff_meta_value(
+    *,
+    jsonl_temp_identity: tuple[int, int] | None,
+    manifest_temp_identity: tuple[int, int] | None,
+    jsonl_recovery_identity: tuple[int, int] | None = None,
+    manifest_recovery_identity: tuple[int, int] | None = None,
+) -> str:
+    """One write-once artifact handoff journal payload."""
+
+    return json.dumps(
+        {
+            "version": 1,
+            "jsonl_temp_device": (
+                None
+                if jsonl_temp_identity is None
+                else jsonl_temp_identity[0]
+            ),
+            "jsonl_temp_inode": (
+                None
+                if jsonl_temp_identity is None
+                else jsonl_temp_identity[1]
+            ),
+            "manifest_temp_device": (
+                None
+                if manifest_temp_identity is None
+                else manifest_temp_identity[0]
+            ),
+            "manifest_temp_inode": (
+                None
+                if manifest_temp_identity is None
+                else manifest_temp_identity[1]
+            ),
+            "jsonl_recovery_device": (
+                None
+                if jsonl_recovery_identity is None
+                else jsonl_recovery_identity[0]
+            ),
+            "jsonl_recovery_inode": (
+                None
+                if jsonl_recovery_identity is None
+                else jsonl_recovery_identity[1]
+            ),
+            "manifest_recovery_device": (
+                None
+                if manifest_recovery_identity is None
+                else manifest_recovery_identity[0]
+            ),
+            "manifest_recovery_inode": (
+                None
+                if manifest_recovery_identity is None
+                else manifest_recovery_identity[1]
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _artifact_handoff_from_meta(
+    key: str,
+    value: str,
+) -> snapshot_recovery_module._ArtifactHandoffFacts | None:
+    """Strictly parse one handoff journal row, or None when unprovable."""
+
+    if not key.startswith(_ARTIFACT_HANDOFF_META_PREFIX):
+        return None
+    snapshot_id = key[len(_ARTIFACT_HANDOFF_META_PREFIX) :]
+    if not snapshot_id:
+        return None
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if type(payload) is not dict or payload.get("version") != 1:
+        return None
+
+    def identity(device_key: str, inode_key: str) -> tuple[int, int] | None:
+        device = payload.get(device_key)
+        inode = payload.get(inode_key)
+        if device is None and inode is None:
+            return None
+        if type(device) is not int or type(inode) is not int:
+            raise ValueError("artifact handoff identity is invalid")
+        return (device, inode)
+
+    try:
+        return snapshot_recovery_module._ArtifactHandoffFacts(
+            snapshot_id=snapshot_id,
+            jsonl_temp_identity=identity(
+                "jsonl_temp_device",
+                "jsonl_temp_inode",
+            ),
+            manifest_temp_identity=identity(
+                "manifest_temp_device",
+                "manifest_temp_inode",
+            ),
+            jsonl_recovery_identity=identity(
+                "jsonl_recovery_device",
+                "jsonl_recovery_inode",
+            ),
+            manifest_recovery_identity=identity(
+                "manifest_recovery_device",
+                "manifest_recovery_inode",
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+class _SnapshotRecoveryPort:
+    """Narrow store-side adapter for Task 5.14 snapshot recovery.
+
+    Implements the ``tm_snapshot_recovery`` ``_SnapshotRecoveryPort``
+    protocol over one ``SQLiteTMStore`` and converts the expected store
+    failures (lifecycle/schema/database) into the recovery module's
+    stable ``RecoveryError`` so the module never imports the store.
+    Unexpected programmer errors propagate unchanged.
+    """
+
+    def __init__(self, store: SQLiteTMStore) -> None:
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        self._store = store
+
+    def read_recovery_facts(
+        self,
+    ) -> snapshot_recovery_module._RefreshRecoveryFacts:
+        try:
+            return self._store._read_refresh_recovery_facts()
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def cancel_issued_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        try:
+            self._store.cancel_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def complete_issued_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        jsonl_identity: tuple[int, int] | None = None,
+        manifest_identity: tuple[int, int] | None = None,
+    ) -> None:
+        try:
+            self._store.complete_issued_refresh_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
+                _allow_history_revision=True,
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def complete_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        jsonl_identity: tuple[int, int] | None = None,
+        manifest_identity: tuple[int, int] | None = None,
+    ) -> None:
+        try:
+            self._store.complete_issued_export_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def cancel_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        try:
+            self._store.cancel_issued_export_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def latch_source_divergence(self, expected_fingerprint: str) -> bool:
+        try:
+            return self._store.latch_refresh_divergence(
+                expected_fingerprint=expected_fingerprint
+            )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+
+def _recovery_store_error_code(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    message = getattr(error, "args", None)
+    if (
+        type(message) is tuple
+        and message
+        and type(message[0]) is str
+        and message[0]
+    ):
+        return message[0]
+    return "RECOVERY.STORE_FAILED"
+
+
+def _recovery_store_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    return retryable if type(retryable) is bool else False
+
+
+
 class SQLiteTMStore:
     """Per-resource store whose public operations use generation leases."""
 
@@ -4083,7 +4408,8 @@ class SQLiteTMStore:
             drain_timeout_seconds=drain_timeout_seconds,
         )
         self._source_binding_monitor = SourceBindingMonitor(
-            self._coordinator
+            self._coordinator,
+            store=self,
         )
 
     @property
@@ -4240,6 +4566,8 @@ class SQLiteTMStore:
         destination_jsonl_path: Path,
         destination_manifest_path: Path,
         expected_generation: int,
+        jsonl_temp_identity: tuple[int, int] | None = None,
+        manifest_temp_identity: tuple[int, int] | None = None,
     ) -> None:
         """Atomically register one arbitrary-destination issued receipt.
 
@@ -4251,6 +4579,14 @@ class SQLiteTMStore:
         in the ledger and never enter the portable receipt digest.  The
         snapshot binding, divergence latch, head revision and generation
         are never modified.
+
+        Task 5.14 durable ownership seam: when the exclusive JSONL and
+        manifest temporary identities are supplied they are recorded in
+        the write-once ``tm_meta`` key ``artifact_handoff.<snapshot_id>``
+        in the same transaction, so crash recovery can prove ownership of those
+        temporaries before any destructive unlink or replace.  When they
+        are omitted the receipt is identity-less and recovery fails
+        closed on any matching artifact instead of deleting it.
         """
 
         private_receipt = _snapshot_receipt(receipt)
@@ -4260,6 +4596,18 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
+        _require_artifact_identity_pair(
+            jsonl_temp_identity,
+            "jsonl_temp_identity",
+        )
+        _require_artifact_identity_pair(
+            manifest_temp_identity,
+            "manifest_temp_identity",
+        )
+        if (jsonl_temp_identity is None) != (manifest_temp_identity is None):
+            raise ValueError(
+                "jsonl and manifest temp identities must be supplied together"
+            )
         for path_value, field_name in (
             (destination_jsonl_path, "destination_jsonl_path"),
             (destination_manifest_path, "destination_manifest_path"),
@@ -4370,6 +4718,24 @@ class SQLiteTMStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
+                    if jsonl_temp_identity is not None:
+                        assert manifest_temp_identity is not None
+                        connection.execute(
+                            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
+                            (
+                                _artifact_handoff_meta_key(
+                                    private_receipt.snapshot_id
+                                ),
+                                _artifact_handoff_meta_value(
+                                    jsonl_temp_identity=(
+                                        jsonl_temp_identity
+                                    ),
+                                    manifest_temp_identity=(
+                                        manifest_temp_identity
+                                    ),
+                                ),
+                            ),
+                        )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4380,6 +4746,8 @@ class SQLiteTMStore:
         receipt: SnapshotReceipt,
         *,
         expected_generation: int,
+        jsonl_temp_identity: tuple[int, int] | None = None,
+        manifest_temp_identity: tuple[int, int] | None = None,
     ) -> None:
         """Atomically register one configured-path issued refresh receipt.
 
@@ -4389,6 +4757,10 @@ class SQLiteTMStore:
         stored destination paths are the configured JSONL and its
         deterministic adjacent manifest.  The snapshot binding, head
         revision and generation are never modified here.
+
+        Task 5.14 durable ownership seam: same write-once ``tm_meta``
+        ``artifact_handoff.<snapshot_id>`` record as the export seam when
+        the exclusive temporary identities are supplied.
         """
 
         private_receipt = _snapshot_receipt(receipt)
@@ -4398,6 +4770,18 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
+        _require_artifact_identity_pair(
+            jsonl_temp_identity,
+            "jsonl_temp_identity",
+        )
+        _require_artifact_identity_pair(
+            manifest_temp_identity,
+            "manifest_temp_identity",
+        )
+        if (jsonl_temp_identity is None) != (manifest_temp_identity is None):
+            raise ValueError(
+                "jsonl and manifest temp identities must be supplied together"
+            )
         with self._coordinator._operation_lease() as lease:
             identity = lease.stage.resource_identity
             if (
@@ -4471,6 +4855,136 @@ class SQLiteTMStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
+                    if jsonl_temp_identity is not None:
+                        assert manifest_temp_identity is not None
+                        connection.execute(
+                            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
+                            (
+                                _artifact_handoff_meta_key(
+                                    private_receipt.snapshot_id
+                                ),
+                                _artifact_handoff_meta_value(
+                                    jsonl_temp_identity=(
+                                        jsonl_temp_identity
+                                    ),
+                                    manifest_temp_identity=(
+                                        manifest_temp_identity
+                                    ),
+                                ),
+                            ),
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def record_export_recovery_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        jsonl_recovery_identity: tuple[int, int] | None = None,
+        manifest_recovery_identity: tuple[int, int] | None = None,
+    ) -> None:
+        """Write-once record of the owned recovery-copy identities.
+
+        Task 5.14 durable ownership seam: after the exclusive recovery
+        copies of the prior pair are prepared, their exact identities
+        are durably recorded in the receipt's handoff row before any
+        publication replace, so crash recovery can prove ownership of
+        the copies before any destructive cleanup.  The row must already
+        exist (the registration recorded the temporary identities) and
+        its recovery slots must still be empty; a second record for the
+        same receipt fails closed.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        _require_artifact_identity_pair(
+            jsonl_recovery_identity,
+            "jsonl_recovery_identity",
+        )
+        _require_artifact_identity_pair(
+            manifest_recovery_identity,
+            "manifest_recovery_identity",
+        )
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    status = connection.execute(
+                        "SELECT status FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if status is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if str(status[0]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    meta_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    if meta_row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_MISSING"
+                        )
+                    prior = _artifact_handoff_from_meta(
+                        _artifact_handoff_meta_key(snapshot_id),
+                        str(meta_row[0]),
+                    )
+                    if (
+                        prior is None
+                        or prior.jsonl_recovery_identity is not None
+                        or prior.manifest_recovery_identity is not None
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_ALREADY_RECORDED"
+                        )
+                    connection.execute(
+                        "UPDATE tm_meta SET value = ? WHERE key = ?",
+                        (
+                            _artifact_handoff_meta_value(
+                                jsonl_temp_identity=(
+                                    prior.jsonl_temp_identity
+                                ),
+                                manifest_temp_identity=(
+                                    prior.manifest_temp_identity
+                                ),
+                                jsonl_recovery_identity=(
+                                    jsonl_recovery_identity
+                                ),
+                                manifest_recovery_identity=(
+                                    manifest_recovery_identity
+                                ),
+                            ),
+                            _artifact_handoff_meta_key(snapshot_id),
+                        )
+                    )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4481,19 +4995,203 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        jsonl_identity: tuple[int, int] | None = None,
+        manifest_identity: tuple[int, int] | None = None,
     ) -> None:
-        """Mark exactly one issued arbitrary-destination receipt completed.
+        """Atomically complete exactly one issued arbitrary-destination receipt.
 
-        Existing completed/cancelled receipts and all other ledger
-        history remain immutable; a receipt that is unknown, foreign, or
-        no longer ``issued`` is rejected.
+        Task 5.14 identity closure: when the exact captured destination
+        identities are supplied (recovery and the publisher flow), the
+        transaction reconstructs the receipt and its deterministic
+        manifest from the ledger row and strict-captures both
+        destination paths (no-follow, regular, single-link, stable
+        identity and digest) before marking the receipt completed, so a
+        same-byte foreign inode swap between classification and
+        completion fails closed without touching the foreign paths.
+        The ledger digest, paths and revision ancestry must all still
+        match exactly.  Existing completed/cancelled receipts and all
+        other ledger history remain immutable; a receipt that is
+        unknown, foreign, or no longer ``issued`` is rejected.  The
+        receipt's durable artifact handoff row is consumed in the same
+        transaction.  Identity-less callers keep the legacy status-only
+        transition and cannot claim identity closure.
         """
 
+        _require_artifact_identity_pair(jsonl_identity, "jsonl_identity")
+        _require_artifact_identity_pair(
+            manifest_identity,
+            "manifest_identity",
+        )
+        if (jsonl_identity is None) != (manifest_identity is None):
+            raise ValueError(
+                "jsonl and manifest identities must be supplied together"
+            )
+        if jsonl_identity is not None:
+            assert manifest_identity is not None
+            self._complete_issued_export_receipt_strict(
+                snapshot_id,
+                expected_generation=expected_generation,
+                jsonl_identity=jsonl_identity,
+                manifest_identity=manifest_identity,
+            )
+            return
         self._transition_issued_export_receipt(
             snapshot_id,
             expected_generation=expected_generation,
             target_status="completed",
         )
+
+    def _complete_issued_export_receipt_strict(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        jsonl_identity: tuple[int, int],
+        manifest_identity: tuple[int, int],
+    ) -> None:
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, exported_revision, "
+                        "jsonl_digest, record_count, format_version "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    try:
+                        receipt = SnapshotReceipt(
+                            snapshot_id=snapshot_id,
+                            resource_id=str(row[0]),
+                            canonical_store_id=str(row[1]),
+                            exported_revision=_row_int(row[5]),
+                            jsonl_digest=str(row[6]),
+                            record_count=_row_int(row[7]),
+                            format_version=str(row[8]),
+                        )
+                    except (TypeError, ValueError):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PAIR_INVALID"
+                        ) from None
+                    counts = _revision_record_counts(
+                        connection,
+                        head_revision=revision.head_revision,
+                        record_count=revision.record_count,
+                    )
+                    expected_count = counts.get(receipt.exported_revision)
+                    if (
+                        expected_count is None
+                        or receipt.record_count != expected_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_ANCESTRY_INVALID"
+                        )
+                    try:
+                        jsonl_capture = _capture_activation_file(
+                            Path(str(row[3])),
+                            asset_kind="EXPORT_DESTINATION",
+                        )
+                        manifest_capture = _capture_activation_file(
+                            Path(str(row[4])),
+                            asset_kind="EXPORT_MANIFEST",
+                        )
+                    except ActivationPreparationError as error:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PAIR_INVALID"
+                        ) from error
+                    manifest = SnapshotManifest(
+                        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                        snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                        receipt=receipt,
+                        receipt_digest=snapshot_receipt_digest(receipt),
+                    )
+                    expected_manifest_digest = hashlib.sha256(
+                        contract_to_json(manifest).encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        jsonl_capture.digest != receipt.jsonl_digest
+                        or manifest_capture.digest
+                        != expected_manifest_digest
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PAIR_INVALID"
+                        )
+                    if (
+                        jsonl_capture.identity.device != jsonl_identity[0]
+                        or jsonl_capture.identity.inode != jsonl_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PAIR_INVALID"
+                        )
+                    if (
+                        manifest_capture.identity.device
+                        != manifest_identity[0]
+                        or manifest_capture.identity.inode
+                        != manifest_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PAIR_INVALID"
+                        )
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.execute(
+                        "DELETE FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
 
     def cancel_issued_export_receipt(
         self,
@@ -4573,6 +5271,10 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
+                    connection.execute(
+                        "DELETE FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -4585,6 +5287,7 @@ class SQLiteTMStore:
         expected_generation: int,
         jsonl_identity: tuple[int, int] | None = None,
         manifest_identity: tuple[int, int] | None = None,
+        _allow_history_revision: bool = False,
     ) -> None:
         """Atomically complete one issued refresh receipt and rebind.
 
@@ -4598,6 +5301,13 @@ class SQLiteTMStore:
         Canonical records, head revision, generation and the divergence
         latch are never modified; a latched divergence fails this
         transaction closed.
+
+        ``_allow_history_revision`` is the Task 5.14 recovery seam:
+        recovery may complete an issued receipt whose exported revision
+        is an older proven completed ancestry revision with the exact
+        record count (the result binding is ``VERIFIED_HISTORY``);
+        ordinary Task 5.13 callers keep the strict current-revision
+        requirement.
         """
 
         if type(snapshot_id) is not str or not snapshot_id.strip():
@@ -4696,7 +5406,23 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.REFRESH_PAIR_INVALID"
                         ) from error
-                    if (
+                    if _allow_history_revision:
+                        counts = _revision_record_counts(
+                            connection,
+                            head_revision=revision.head_revision,
+                            record_count=revision.record_count,
+                        )
+                        expected_count = counts.get(
+                            receipt.exported_revision
+                        )
+                        if (
+                            expected_count is None
+                            or receipt.record_count != expected_count
+                        ):
+                            raise SQLiteStoreSchemaError(
+                                "STORE.RECEIPT_ANCESTRY_INVALID"
+                            )
+                    elif (
                         receipt.exported_revision != revision.head_revision
                         or receipt.record_count != revision.record_count
                     ):
@@ -4758,6 +5484,10 @@ class SQLiteTMStore:
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
                     connection.execute(
+                        "DELETE FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    )
+                    connection.execute(
                         "INSERT INTO tm_snapshot_binding("
                         "binding_id, configured_jsonl_path, manifest_path, "
                         "snapshot_kind, snapshot_id, binding_version) "
@@ -4780,6 +5510,385 @@ class SQLiteTMStore:
                 except Exception:
                     connection.rollback()
                     raise
+
+    def cancel_issued_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Atomically cancel exactly one issued configured-path receipt.
+
+        Task 5.14 recovery seam: the receipt must be an issued refresh
+        receipt of this resource whose stored destination paths are the
+        configured JSONL and its deterministic adjacent manifest.  Only
+        the receipt status is changed; the old completed binding, the
+        pair, canonical records, head revision, generation and the
+        divergence latch are never modified.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    if (
+                        str(row[3])
+                        != Path.__str__(identity.configured_jsonl_path)
+                        or str(row[4])
+                        != Path.__str__(identity.snapshot_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PATH_MISMATCH"
+                        )
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'cancelled' "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.execute(
+                        "DELETE FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def latch_refresh_divergence(self, *, expected_fingerprint: str) -> bool:
+        """Durably latch ``SOURCE_DIVERGED`` under one fingerprint proof.
+
+        Task 5.14 recovery seam: re-reads the canonical facts in one
+        transaction and latches divergence only when the canonical
+        fingerprint is still the one recovery classified against, so a
+        concurrent canonical write between classification and latch
+        restarts the classification instead of latching stale facts.
+        """
+
+        if type(expected_fingerprint) is not str:
+            raise TypeError("expected_fingerprint must be a built-in string")
+        if len(expected_fingerprint) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_fingerprint
+        ):
+            raise ValueError("expected_fingerprint is invalid")
+        with self._coordinator._operation_lease() as lease:
+            return _latch_source_divergence(
+                lease,
+                expected_fingerprint=expected_fingerprint,
+            )
+
+    def _read_refresh_recovery_facts(
+        self,
+    ) -> snapshot_recovery_module._RefreshRecoveryFacts:
+        """Read ledger/binding facts in one SQLite snapshot (Task 5.14).
+
+        One operation lease and one read transaction capture the
+        canonical identity, head revision, proven ancestry record
+        counts, divergence latch, the completed binding (with its
+        deterministically reconstructed manifest), every ledger receipt
+        row and the canonical fingerprint used by the divergence-latch
+        race proof.
+        """
+
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    facts = _read_source_binding_facts_in_transaction(
+                        connection,
+                        lease,
+                    )
+                    rows = connection.execute(
+                        "SELECT snapshot_id, resource_id, "
+                        "canonical_store_id, exported_revision, "
+                        "jsonl_digest, record_count, format_version, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, status "
+                        "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+                    ).fetchall()
+                    handoff_rows = connection.execute(
+                        "SELECT key, value FROM tm_meta "
+                        "WHERE key LIKE ? ORDER BY key",
+                        (f"{_ARTIFACT_HANDOFF_META_PREFIX}%",),
+                    ).fetchall()
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        receipts = tuple(
+            snapshot_recovery_module.IssuedReceiptFacts(
+                snapshot_id=str(row[0]),
+                resource_id=str(row[1]),
+                canonical_store_id=str(row[2]),
+                exported_revision=_row_int(row[3]),
+                jsonl_digest=str(row[4]),
+                record_count=_row_int(row[5]),
+                format_version=str(row[6]),
+                destination_jsonl_path=Path(str(row[7])),
+                destination_manifest_path=Path(str(row[8])),
+                status=str(row[9]),
+            )
+            for row in rows
+        )
+        handoffs = tuple(
+            handoff
+            for row in handoff_rows
+            if (
+                handoff := _artifact_handoff_from_meta(
+                    str(row[0]),
+                    str(row[1]),
+                )
+            )
+            is not None
+        )
+        binding_invalid = bool(
+            set(facts.diagnostic_codes)
+            & {
+                "SOURCE_BINDING.LEDGER_INVALID",
+                "SOURCE_BINDING.LEDGER_NOT_COMPLETED",
+                "SOURCE_BINDING.LEDGER_PATH_MISMATCH",
+            }
+        )
+        if facts.binding is not None:
+            try:
+                _validate_binding_identity(
+                    facts.binding,
+                    identity=identity,
+                    canonical_store_id=lease.canonical_store_id,
+                )
+            except (TypeError, ValueError):
+                binding_invalid = True
+        journal_path = _activation_journal_path(identity)
+        marker_path = _activation_lineage_marker_path(identity)
+        authority_paths = frozenset(
+            {
+                identity.configured_jsonl_path,
+                identity.snapshot_manifest_path,
+                identity.canonical_sidecar_path,
+                journal_path,
+                _activation_journal_temp_path(journal_path),
+                marker_path,
+                _activation_lineage_marker_temp_path(marker_path),
+            }
+        )
+        return snapshot_recovery_module._RefreshRecoveryFacts(
+            resource_id=identity.resource_id,
+            canonical_store_id=lease.canonical_store_id,
+            generation=lease.generation,
+            configured_jsonl_path=identity.configured_jsonl_path,
+            snapshot_manifest_path=identity.snapshot_manifest_path,
+            head_revision=facts.head_revision,
+            record_count=facts.record_count,
+            cumulative_record_counts=facts.cumulative_record_counts,
+            divergence_latched=facts.divergence_latched,
+            binding=facts.binding,
+            binding_invalid=binding_invalid,
+            receipts=receipts,
+            canonical_fingerprint=facts.canonical_fingerprint,
+            handoffs=handoffs,
+            authority_paths=authority_paths,
+            canonical_sidecar_path=identity.canonical_sidecar_path,
+            target_identity_fragment=identity.target_identity[:16],
+        )
+
+    def probe_issued_receipt_completed(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        require_bound: bool,
+    ) -> ReceiptCompletionProbe:
+        """Probe one ambiguous post-commit exception window durably.
+
+        Task 5.14: when the Task 5.13 completion call raised an outward
+        exception the commit may already have happened, so before any
+        restore/cancel the durable ledger, binding and published pair
+        are inspected in one snapshot.  ``COMMITTED`` requires the
+        receipt completed (and, for ``require_bound``, the single
+        binding pointing at it) plus a strict digest proof of both
+        published files; ``COMMITTED_UNCLEAN`` means the ledger
+        committed but the binding/pair is not cleanly provable (the
+        caller must never restore or cancel); ``NOT_COMMITTED`` keeps
+        the ordinary known-before-commit restore/cancel behavior.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        if type(require_bound) is not bool:
+            raise TypeError("require_bound must be a built-in bool")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, exported_revision, "
+                        "jsonl_digest, record_count, format_version "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None or (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        connection.commit()
+                        return ReceiptCompletionProbe.NOT_COMMITTED
+                    if str(row[2]) != "completed":
+                        connection.commit()
+                        return ReceiptCompletionProbe.NOT_COMMITTED
+                    if require_bound:
+                        bound = connection.execute(
+                            "SELECT snapshot_id FROM tm_snapshot_binding "
+                            "WHERE binding_id = 1"
+                        ).fetchone()
+                        if (
+                            bound is None
+                            or str(bound[0]) != snapshot_id
+                        ):
+                            connection.commit()
+                            return (
+                                ReceiptCompletionProbe.COMMITTED_UNCLEAN
+                            )
+                    try:
+                        receipt = SnapshotReceipt(
+                            snapshot_id=snapshot_id,
+                            resource_id=str(row[0]),
+                            canonical_store_id=str(row[1]),
+                            exported_revision=_row_int(row[5]),
+                            jsonl_digest=str(row[6]),
+                            record_count=_row_int(row[7]),
+                            format_version=str(row[8]),
+                        )
+                        manifest = SnapshotManifest(
+                            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                            receipt=receipt,
+                            receipt_digest=snapshot_receipt_digest(receipt),
+                        )
+                    except (TypeError, ValueError):
+                        connection.commit()
+                        return ReceiptCompletionProbe.COMMITTED_UNCLEAN
+                    expected_manifest_digest = hashlib.sha256(
+                        contract_to_json(manifest).encode("utf-8")
+                    ).hexdigest()
+                    jsonl_path = Path(str(row[3]))
+                    manifest_path = Path(str(row[4]))
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        try:
+            jsonl_capture = _capture_activation_file(
+                jsonl_path,
+                asset_kind="RECOVERY_PROBE_JSONL",
+            )
+            manifest_capture = _capture_activation_file(
+                manifest_path,
+                asset_kind="RECOVERY_PROBE_MANIFEST",
+            )
+        except ActivationPreparationError:
+            return ReceiptCompletionProbe.COMMITTED_UNCLEAN
+        if (
+            jsonl_capture.digest != receipt.jsonl_digest
+            or manifest_capture.digest != expected_manifest_digest
+        ):
+            return ReceiptCompletionProbe.COMMITTED_UNCLEAN
+        return ReceiptCompletionProbe.COMMITTED
+
+    def recover_configured_refresh(
+        self,
+    ) -> snapshot_recovery_module.RefreshRecoveryOutcome:
+        """Close every issued snapshot publication crash window.
+
+        Task 5.14 explicit store seam: runs the recovery classification
+        and effects under the resource-scoped reentrant refresh/
+        observation gate so refresh, recovery and monitor observations
+        can never interleave on the configured pair.  Idempotent; a
+        pre-existing divergence latch is never cleared.
+        """
+
+        with self._coordinator._refresh_observation_gate(
+            require_ready_resource=True,
+        ):
+            return snapshot_recovery_module.recover_snapshot_publication(
+                _SnapshotRecoveryPort(self)
+            )
 
     def register_completed_snapshot_binding(
         self,
