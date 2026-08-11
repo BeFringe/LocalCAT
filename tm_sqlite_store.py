@@ -47,6 +47,7 @@ from tm_contracts import (
     SnapshotReceipt,
     SealedStage,
     SourceBindingState,
+    StoreHealth,
     TMRecord,
     TMRecordDraft,
     contract_from_json,
@@ -4673,6 +4674,7 @@ class SQLiteTMStore:
             self._coordinator,
             store=self,
         )
+        self._query_view_tokens: set[object] = set()
 
     @classmethod
     def from_coordinator(
@@ -4709,6 +4711,7 @@ class SQLiteTMStore:
             coordinator,
             store=store,
         )
+        store._query_view_tokens = set()
         return store
 
     @property
@@ -6709,17 +6712,9 @@ class SQLiteTMStore:
         self._source_binding_monitor.register_completed_binding(binding)
 
     def exact_records(self, source_raw: str) -> tuple[TMRecord, ...]:
-        if type(source_raw) is not str:
-            raise TypeError("source_raw must be a built-in string")
+        _validate_exact_records_input(source_raw)
         with self._coordinator._operation_lease() as lease:
-            with _open_leased_connection(lease) as connection:
-                self._validate_identity(connection, lease)
-                rows = connection.execute(
-                    f"SELECT {_RECORD_COLUMNS} FROM tm_record "
-                    "WHERE source_raw = ? ORDER BY record_id DESC",
-                    (source_raw,),
-                ).fetchall()
-        return tuple(_record_from_row(row) for row in rows)
+            return _exact_records_body(lease, source_raw)
 
     def append(self, draft: TMRecordDraft) -> TMRecord:
         if type(draft) is not TMRecordDraft:
@@ -6990,37 +6985,9 @@ class SQLiteTMStore:
         self,
         record_ids: tuple[int, ...],
     ) -> tuple[TMRecord, ...]:
-        if type(record_ids) is not tuple:
-            raise TypeError("record_ids must be a built-in tuple")
-        for record_id in record_ids:
-            if type(record_id) is not int:
-                raise TypeError(
-                    "record_ids must contain built-in integers"
-                )
-            if record_id < 1:
-                raise ValueError(
-                    "record_ids must contain positive integers"
-                )
+        prepared_ids = _validate_records_by_id_input(record_ids)
         with self._coordinator._operation_lease() as lease:
-            if not record_ids:
-                return ()
-            placeholders = ",".join("?" for _ in record_ids)
-            with _open_leased_connection(lease) as connection:
-                self._validate_identity(connection, lease)
-                rows = connection.execute(
-                    f"SELECT {_RECORD_COLUMNS} FROM tm_record "
-                    f"WHERE record_id IN ({placeholders})",
-                    record_ids,
-                ).fetchall()
-        by_id = {
-            record.record_id: record
-            for record in (_record_from_row(row) for row in rows)
-        }
-        return tuple(
-            by_id[record_id]
-            for record_id in record_ids
-            if record_id in by_id
-        )
+            return _records_by_id_body(lease, prepared_ids)
 
     def fts5_candidate_ids(
         self,
@@ -7198,215 +7165,53 @@ class SQLiteTMStore:
     ) -> SQLiteCandidateRecallSnapshot:
         """Read one complete candidate-stage snapshot under one generation lease."""
 
-        if fts_query_trigrams is not None:
-            if type(fts_query_trigrams) is not tuple:
-                raise TypeError("fts_query_trigrams must be a built-in tuple")
-            seen_trigrams: set[str] = set()
-            for trigram in fts_query_trigrams:
-                if type(trigram) is not str:
-                    raise TypeError("fts query trigrams must be built-in strings")
-                if len(trigram) != 3 or trigram in seen_trigrams:
-                    raise ValueError("fts query trigrams are invalid")
-                seen_trigrams.add(trigram)
-            if not fts_query_trigrams:
-                raise ValueError("fts_query_trigrams must not be empty")
-        if type(query_grams_by_size) is not tuple:
-            raise TypeError("query_grams_by_size must be a built-in tuple")
-        prepared_stages: list[tuple[int, tuple[str, ...]]] = []
-        seen_sizes: set[int] = set()
-        for stage in query_grams_by_size:
-            if type(stage) is not tuple or len(stage) != 2:
-                raise TypeError("query gram stages must contain built-in pairs")
-            gram_size, grams = stage
-            if type(gram_size) is not int or type(grams) is not tuple:
-                raise TypeError("query gram stage values must use built-in types")
-            if gram_size not in {1, 2, 3} or gram_size in seen_sizes:
-                raise ValueError("query gram stage size is invalid")
-            copied_grams: list[str] = []
-            seen_grams: set[str] = set()
-            for gram in grams:
-                if type(gram) is not str:
-                    raise TypeError("query grams must contain built-in strings")
-                if len(gram) != gram_size:
-                    raise ValueError("query gram length is invalid")
-                if gram in seen_grams:
-                    raise ValueError("query grams must be unique")
-                seen_grams.add(gram)
-                copied_grams.append(gram)
-            if not copied_grams:
-                raise ValueError("query gram stages must not be empty")
-            seen_sizes.add(gram_size)
-            prepared_stages.append((gram_size, tuple(copied_grams)))
-        prepared_sizes = tuple(size for size, _grams in prepared_stages)
-        if fts_query_trigrams is None:
-            if prepared_sizes not in {(), (1,), (2,)}:
-                raise ValueError("short-query gram stage order is invalid")
-        elif prepared_sizes != (3, 2, 1):
-            raise ValueError("long-query gram stage order is invalid")
-        if type(candidate_floor) is not int:
-            raise TypeError("candidate_floor must be a built-in integer")
-        if not 1 <= candidate_floor <= 8192:
-            raise ValueError("candidate_floor is outside the safe range")
-        if type(fts_query_degenerate) is not bool:
-            raise TypeError("fts_query_degenerate must be a built-in bool")
-
-        stage_matches: list[tuple[str, tuple[tuple[int, int], ...]]] = []
-        cumulative_ids: set[int] = set()
-        with self._coordinator._operation_lease() as lease:
-            with _open_leased_connection(lease) as connection:
-                try:
-                    connection.execute("BEGIN")
-                    self._validate_identity(connection, lease)
-                    meta_fts5_available = _meta_bool(
-                        _read_meta(connection), "fts5_available"
-                    )
-                    if meta_fts5_available != lease.fts5_available:
-                        raise SQLiteStoreSchemaError(
-                            "STORE.CANDIDATE_CAPABILITY_MISMATCH"
-                        )
-                    fts5_available = lease.fts5_available
-
-                    fts_ids: set[int] = set()
-                    if fts_query_trigrams is not None and fts5_available:
-                        for chunk in _chunked(fts_query_trigrams):
-                            fts_rows = connection.execute(
-                                "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
-                                (_build_fts5_match_expression(chunk),),
-                            ).fetchall()
-                            for row in fts_rows:
-                                if type(row) is not tuple or len(row) != 1:
-                                    raise SQLiteStoreSchemaError(
-                                        "STORE.CANDIDATE_RESULT_INVALID"
-                                    )
-                                value = row[0]
-                                if type(value) is int:
-                                    record_id = value
-                                elif type(value) is str and value.isdecimal():
-                                    record_id = int(value)
-                                else:
-                                    raise SQLiteStoreSchemaError(
-                                        "STORE.CANDIDATE_RESULT_INVALID"
-                                    )
-                                if record_id < 1:
-                                    raise SQLiteStoreSchemaError(
-                                        "STORE.CANDIDATE_RESULT_INVALID"
-                                    )
-                                fts_ids.add(record_id)
-                                cumulative_ids.add(record_id)
-
-                    if fts_query_trigrams is None:
-                        selected_stages = prepared_stages
-                    elif not fts5_available:
-                        selected_stages = prepared_stages
-                    elif (
-                        not cumulative_ids
-                        or fts_query_degenerate
-                        or len(cumulative_ids) < candidate_floor
-                    ):
-                        selected_stages = [
-                            stage for stage in prepared_stages if stage[0] in {1, 2}
-                        ]
-                    else:
-                        selected_stages = []
-
-                    for gram_size, grams in selected_stages:
-                        if (
-                            fts_query_trigrams is not None
-                            and fts5_available
-                            and gram_size == 1
-                            and len(cumulative_ids) >= candidate_floor
-                        ):
-                            continue
-                        matched_by_id: dict[int, int] = {}
-                        for chunk in _chunked(grams):
-                            placeholders = ",".join("?" for _ in chunk)
-                            rows = connection.execute(
-                                "SELECT record_id, COUNT(*) AS matched_count "
-                                "FROM tm_gram WHERE gram_size = ? "
-                                f"AND gram IN ({placeholders}) "
-                                "GROUP BY record_id",
-                                (gram_size, *chunk),
-                            ).fetchall()
-                            for row in rows:
-                                if (
-                                    type(row) is not tuple
-                                    or len(row) != 2
-                                    or type(row[0]) is not int
-                                    or row[0] < 1
-                                    or type(row[1]) is not int
-                                    or not 1 <= row[1] <= len(chunk)
-                                ):
-                                    raise SQLiteStoreSchemaError(
-                                        "STORE.CANDIDATE_RESULT_INVALID"
-                                    )
-                                matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
-                                cumulative_ids.add(row[0])
-                        stage_matches.append(
-                            (f"GRAM_{gram_size}", tuple(matched_by_id.items()))
-                        )
-
-                    folded_sources: list[tuple[int, str]] = []
-                    candidate_ids = tuple(cumulative_ids)
-                    for offset in range(0, len(candidate_ids), 512):
-                        chunk = candidate_ids[offset : offset + 512]
-                        placeholders = ",".join("?" for _ in chunk)
-                        rows = connection.execute(
-                            "SELECT record_id, source_fold_v1 FROM tm_record "
-                            f"WHERE record_id IN ({placeholders})",
-                            chunk,
-                        ).fetchall()
-                        for row in rows:
-                            if (
-                                type(row) is not tuple
-                                or len(row) != 2
-                                or type(row[0]) is not int
-                                or row[0] < 1
-                                or type(row[1]) is not str
-                                or not row[1]
-                            ):
-                                raise SQLiteStoreSchemaError(
-                                    "STORE.CANDIDATE_RESULT_INVALID"
-                                )
-                            folded_sources.append((row[0], row[1]))
-                    if {record_id for record_id, _source in folded_sources} != cumulative_ids:
-                        raise SQLiteStoreSchemaError(
-                            "STORE.CANDIDATE_SOURCE_MISSING"
-                        )
-                    if fts_query_trigrams is not None and fts5_available:
-                        sources_by_id = dict(folded_sources)
-                        query_gram_set = set(fts_query_trigrams)
-                        fts_matches = tuple(
-                            (
-                                record_id,
-                                len(
-                                    query_gram_set.intersection(
-                                        unique_character_ngrams(
-                                            sources_by_id[record_id], 3
-                                        )
-                                    )
-                                ),
-                            )
-                            for record_id in sorted(fts_ids)
-                        )
-                        if any(count < 1 for _record_id, count in fts_matches):
-                            raise SQLiteStoreSchemaError(
-                                "STORE.CANDIDATE_RESULT_INVALID"
-                            )
-                        stage_matches.insert(0, ("FTS_TRIGRAM", fts_matches))
-                    connection.commit()
-                except sqlite3.Error as error:
-                    connection.rollback()
-                    raise SQLiteStoreSchemaError(
-                        "STORE.CANDIDATE_QUERY_FAILED"
-                    ) from error
-                except Exception:
-                    connection.rollback()
-                    raise
-        return SQLiteCandidateRecallSnapshot(
-            fts5_available=fts5_available,
-            stage_matches=tuple(stage_matches),
-            folded_sources=tuple(folded_sources),
+        prepared = _prepare_candidate_recall_inputs(
+            fts_query_trigrams=fts_query_trigrams,
+            query_grams_by_size=query_grams_by_size,
+            candidate_floor=candidate_floor,
+            fts_query_degenerate=fts_query_degenerate,
         )
+        with self._coordinator._operation_lease() as lease:
+            return _candidate_recall_snapshot_body(lease, prepared)
+
+    @contextmanager
+    def query_lease(self) -> Iterator[SQLiteTMQueryView]:
+        """Yield one read-only query view under exactly one operation lease.
+
+        The view is an exact ``SQLiteTMQueryView`` bound to this exact
+        store and to the coordinator's captured generation view.  It is
+        invalidated when the lease exits; later calls fail closed and
+        never acquire a new lease.  The view exposes only the read-only
+        query ports and never receives an append/export/activation or
+        update port.
+        """
+
+        with self._coordinator._operation_lease() as lease:
+            token = object()
+            with self._coordinator._condition:
+                self._query_view_tokens.add(token)
+            try:
+                view = SQLiteTMQueryView(self, lease, token=token)
+                try:
+                    yield view
+                finally:
+                    view._invalidate()
+            finally:
+                with self._coordinator._condition:
+                    self._query_view_tokens.discard(token)
+
+    def health(self) -> StoreHealth:
+        """Return one truthful physical-health observation under one lease.
+
+        Revalidates canonical identity and derives schema/generation/
+        count/index and canonical ledger/source-binding facts from the
+        same leased canonical view in one read transaction.  It never
+        checks or mutates external JSONL, never latches or clears
+        divergence, never publishes Gate C, and never writes the DB.
+        """
+
+        with self._coordinator._operation_lease() as lease:
+            return _store_health_body(lease)
 
     def export_records(self) -> Iterator[TMRecord]:
         with self._coordinator._operation_lease() as lease:
@@ -7423,13 +7228,246 @@ class SQLiteTMStore:
         connection: sqlite3.Connection,
         lease: _SQLiteGenerationView,
     ) -> None:
-        identity = lease.stage.resource_identity
-        _validate_store_identity(
-            connection,
-            resource_id=identity.resource_id,
-            canonical_store_id=lease.canonical_store_id,
-            target_identity=identity.target_identity,
-        )
+        _validate_lease_identity(connection, lease)
+
+
+@dataclass(frozen=True)
+class _PreparedCandidateRecallInputs:
+    fts_query_trigrams: tuple[str, ...] | None
+    query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...]
+    candidate_floor: int
+    fts_query_degenerate: bool
+
+
+def _prepare_candidate_recall_inputs(
+    *,
+    fts_query_trigrams: tuple[str, ...] | None,
+    query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...],
+    candidate_floor: int,
+    fts_query_degenerate: bool,
+) -> _PreparedCandidateRecallInputs:
+    """Exact-type and privately snapshot one candidate snapshot input set."""
+
+    if fts_query_trigrams is not None:
+        if type(fts_query_trigrams) is not tuple:
+            raise TypeError("fts_query_trigrams must be a built-in tuple")
+        seen_trigrams: set[str] = set()
+        for trigram in fts_query_trigrams:
+            if type(trigram) is not str:
+                raise TypeError("fts query trigrams must be built-in strings")
+            if len(trigram) != 3 or trigram in seen_trigrams:
+                raise ValueError("fts query trigrams are invalid")
+            seen_trigrams.add(trigram)
+        if not fts_query_trigrams:
+            raise ValueError("fts_query_trigrams must not be empty")
+        fts_query_trigrams = tuple(fts_query_trigrams)
+    if type(query_grams_by_size) is not tuple:
+        raise TypeError("query_grams_by_size must be a built-in tuple")
+    prepared_stages: list[tuple[int, tuple[str, ...]]] = []
+    seen_sizes: set[int] = set()
+    for stage in query_grams_by_size:
+        if type(stage) is not tuple or len(stage) != 2:
+            raise TypeError("query gram stages must contain built-in pairs")
+        gram_size, grams = stage
+        if type(gram_size) is not int or type(grams) is not tuple:
+            raise TypeError("query gram stage values must use built-in types")
+        if gram_size not in {1, 2, 3} or gram_size in seen_sizes:
+            raise ValueError("query gram stage size is invalid")
+        copied_grams: list[str] = []
+        seen_grams: set[str] = set()
+        for gram in grams:
+            if type(gram) is not str:
+                raise TypeError("query grams must contain built-in strings")
+            if len(gram) != gram_size:
+                raise ValueError("query gram length is invalid")
+            if gram in seen_grams:
+                raise ValueError("query grams must be unique")
+            seen_grams.add(gram)
+            copied_grams.append(gram)
+        if not copied_grams:
+            raise ValueError("query gram stages must not be empty")
+        seen_sizes.add(gram_size)
+        prepared_stages.append((gram_size, tuple(copied_grams)))
+    prepared_sizes = tuple(size for size, _grams in prepared_stages)
+    if fts_query_trigrams is None:
+        if prepared_sizes not in {(), (1,), (2,)}:
+            raise ValueError("short-query gram stage order is invalid")
+    elif prepared_sizes != (3, 2, 1):
+        raise ValueError("long-query gram stage order is invalid")
+    if type(candidate_floor) is not int:
+        raise TypeError("candidate_floor must be a built-in integer")
+    if not 1 <= candidate_floor <= 8192:
+        raise ValueError("candidate_floor is outside the safe range")
+    if type(fts_query_degenerate) is not bool:
+        raise TypeError("fts_query_degenerate must be a built-in bool")
+    return _PreparedCandidateRecallInputs(
+        fts_query_trigrams=fts_query_trigrams,
+        query_grams_by_size=tuple(prepared_stages),
+        candidate_floor=candidate_floor,
+        fts_query_degenerate=fts_query_degenerate,
+    )
+
+
+def _candidate_recall_snapshot_body(
+    lease: _SQLiteGenerationView,
+    prepared: _PreparedCandidateRecallInputs,
+) -> SQLiteCandidateRecallSnapshot:
+    stage_matches: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+    cumulative_ids: set[int] = set()
+    with _open_leased_connection(lease) as connection:
+        try:
+            connection.execute("BEGIN")
+            _validate_lease_identity(connection, lease)
+            meta_fts5_available = _meta_bool(
+                _read_meta(connection), "fts5_available"
+            )
+            if meta_fts5_available != lease.fts5_available:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_CAPABILITY_MISMATCH"
+                )
+            fts5_available = lease.fts5_available
+
+            fts_ids: set[int] = set()
+            if prepared.fts_query_trigrams is not None and fts5_available:
+                for chunk in _chunked(prepared.fts_query_trigrams):
+                    fts_rows = connection.execute(
+                        "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
+                        (_build_fts5_match_expression(chunk),),
+                    ).fetchall()
+                    for row in fts_rows:
+                        if type(row) is not tuple or len(row) != 1:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_RESULT_INVALID"
+                            )
+                        value = row[0]
+                        if type(value) is int:
+                            record_id = value
+                        elif type(value) is str and value.isdecimal():
+                            record_id = int(value)
+                        else:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_RESULT_INVALID"
+                            )
+                        if record_id < 1:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_RESULT_INVALID"
+                            )
+                        fts_ids.add(record_id)
+                        cumulative_ids.add(record_id)
+
+            if prepared.fts_query_trigrams is None:
+                selected_stages = prepared.query_grams_by_size
+            elif not fts5_available:
+                selected_stages = prepared.query_grams_by_size
+            elif (
+                not cumulative_ids
+                or prepared.fts_query_degenerate
+                or len(cumulative_ids) < prepared.candidate_floor
+            ):
+                selected_stages = [
+                    stage for stage in prepared.query_grams_by_size if stage[0] in {1, 2}
+                ]
+            else:
+                selected_stages = []
+
+            for gram_size, grams in selected_stages:
+                if (
+                    prepared.fts_query_trigrams is not None
+                    and fts5_available
+                    and gram_size == 1
+                    and len(cumulative_ids) >= prepared.candidate_floor
+                ):
+                    continue
+                matched_by_id: dict[int, int] = {}
+                for chunk in _chunked(grams):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = connection.execute(
+                        "SELECT record_id, COUNT(*) AS matched_count "
+                        "FROM tm_gram WHERE gram_size = ? "
+                        f"AND gram IN ({placeholders}) "
+                        "GROUP BY record_id",
+                        (gram_size, *chunk),
+                    ).fetchall()
+                    for row in rows:
+                        if (
+                            type(row) is not tuple
+                            or len(row) != 2
+                            or type(row[0]) is not int
+                            or row[0] < 1
+                            or type(row[1]) is not int
+                            or not 1 <= row[1] <= len(chunk)
+                        ):
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_RESULT_INVALID"
+                            )
+                        matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
+                        cumulative_ids.add(row[0])
+                stage_matches.append(
+                    (f"GRAM_{gram_size}", tuple(matched_by_id.items()))
+                )
+
+            folded_sources: list[tuple[int, str]] = []
+            candidate_ids = tuple(cumulative_ids)
+            for offset in range(0, len(candidate_ids), 512):
+                chunk = candidate_ids[offset : offset + 512]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT record_id, source_fold_v1 FROM tm_record "
+                    f"WHERE record_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    if (
+                        type(row) is not tuple
+                        or len(row) != 2
+                        or type(row[0]) is not int
+                        or row[0] < 1
+                        or type(row[1]) is not str
+                        or not row[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.CANDIDATE_RESULT_INVALID"
+                        )
+                    folded_sources.append((row[0], row[1]))
+            if {record_id for record_id, _source in folded_sources} != cumulative_ids:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_SOURCE_MISSING"
+                )
+            if prepared.fts_query_trigrams is not None and fts5_available:
+                sources_by_id = dict(folded_sources)
+                query_gram_set = set(prepared.fts_query_trigrams)
+                fts_matches = tuple(
+                    (
+                        record_id,
+                        len(
+                            query_gram_set.intersection(
+                                unique_character_ngrams(
+                                    sources_by_id[record_id], 3
+                                )
+                            )
+                        ),
+                    )
+                    for record_id in sorted(fts_ids)
+                )
+                if any(count < 1 for _record_id, count in fts_matches):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_RESULT_INVALID"
+                    )
+                stage_matches.insert(0, ("FTS_TRIGRAM", fts_matches))
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise SQLiteStoreSchemaError(
+                "STORE.CANDIDATE_QUERY_FAILED"
+            ) from error
+        except Exception:
+            connection.rollback()
+            raise
+    return SQLiteCandidateRecallSnapshot(
+        fts5_available=fts5_available,
+        stage_matches=tuple(stage_matches),
+        folded_sources=tuple(folded_sources),
+    )
 
 
 def _validate_store_identity(
@@ -7448,6 +7486,82 @@ def _validate_store_identity(
         raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
     if meta.get("activation_status") == "SEALED":
         raise SQLiteStoreSchemaError("STORE.STAGE_SEALED")
+
+
+def _validate_lease_identity(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> None:
+    identity = lease.stage.resource_identity
+    _validate_store_identity(
+        connection,
+        resource_id=identity.resource_id,
+        canonical_store_id=lease.canonical_store_id,
+        target_identity=identity.target_identity,
+    )
+
+
+def _validate_exact_records_input(source_raw: object) -> None:
+    if type(source_raw) is not str:
+        raise TypeError("source_raw must be a built-in string")
+
+
+def _exact_records_body(
+    lease: _SQLiteGenerationView,
+    source_raw: str,
+) -> tuple[TMRecord, ...]:
+    with _open_leased_connection(lease) as connection:
+        _validate_lease_identity(connection, lease)
+        rows = connection.execute(
+            f"SELECT {_RECORD_COLUMNS} FROM tm_record "
+            "WHERE source_raw = ? ORDER BY record_id DESC",
+            (source_raw,),
+        ).fetchall()
+    return tuple(_record_from_row(row) for row in rows)
+
+
+def _validate_records_by_id_input(
+    record_ids: object,
+) -> tuple[int, ...]:
+    if type(record_ids) is not tuple:
+        raise TypeError("record_ids must be a built-in tuple")
+    copied_ids: list[int] = []
+    for record_id in record_ids:
+        if type(record_id) is not int:
+            raise TypeError(
+                "record_ids must contain built-in integers"
+            )
+        if record_id < 1:
+            raise ValueError(
+                "record_ids must contain positive integers"
+            )
+        copied_ids.append(record_id)
+    return tuple(copied_ids)
+
+
+def _records_by_id_body(
+    lease: _SQLiteGenerationView,
+    record_ids: tuple[int, ...],
+) -> tuple[TMRecord, ...]:
+    if not record_ids:
+        return ()
+    placeholders = ",".join("?" for _ in record_ids)
+    with _open_leased_connection(lease) as connection:
+        _validate_lease_identity(connection, lease)
+        rows = connection.execute(
+            f"SELECT {_RECORD_COLUMNS} FROM tm_record "
+            f"WHERE record_id IN ({placeholders})",
+            record_ids,
+        ).fetchall()
+    by_id = {
+        record.record_id: record
+        for record in (_record_from_row(row) for row in rows)
+    }
+    return tuple(
+        by_id[record_id]
+        for record_id in record_ids
+        if record_id in by_id
+    )
 
 
 def _canonical_revision_from_connection(
@@ -8283,6 +8397,201 @@ def _validate_legacy_line_number(line_number: object) -> None:
         raise TypeError("legacy line numbers must be built-in integers or None")
     if line_number < 1:
         raise ValueError("legacy line numbers must be positive integers")
+
+
+def _source_binding_health_state(
+    facts: _SourceBindingFacts,
+) -> tuple[SourceBindingState | None, tuple[str, ...]]:
+    """Classify one canonical ledger read without latching or JSONL checks."""
+
+    diagnostics = list(facts.diagnostic_codes)
+    if facts.divergence_latched:
+        diagnostics.append("SOURCE_BINDING.DIVERGENCE_LATCHED")
+    if facts.divergence_latched or facts.diagnostic_codes:
+        state = SourceBindingState.SOURCE_DIVERGED
+    elif facts.binding is None:
+        state = None
+    elif facts.binding.receipt.exported_revision == facts.head_revision:
+        state = SourceBindingState.VERIFIED_CURRENT
+    else:
+        state = SourceBindingState.VERIFIED_HISTORY
+    return state, tuple(sorted(set(diagnostics)))
+
+
+def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
+    """Build one health snapshot from one already-held canonical lease."""
+
+    with _open_leased_connection(lease) as connection:
+        connection.execute("BEGIN")
+        try:
+            identity = lease.stage.resource_identity
+            _validate_store_identity(
+                connection,
+                resource_id=identity.resource_id,
+                canonical_store_id=lease.canonical_store_id,
+                target_identity=identity.target_identity,
+            )
+            meta = _read_meta(connection)
+            schema_version = _meta_int(meta, "schema_version")
+            generation = _meta_int(meta, "generation")
+            if generation != lease.generation:
+                raise SQLiteStoreSchemaError("STORE.GENERATION_MISMATCH")
+            activation_status = meta["activation_status"]
+            if type(activation_status) is not str:
+                raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
+            if activation_status == "ACTIVE" and generation < 1:
+                raise SQLiteStoreSchemaError("STORE.GENERATION_MISMATCH")
+            index_kind = meta["candidate_index_kind"]
+            if type(index_kind) is not str or not index_kind.strip():
+                raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
+            facts = _read_source_binding_facts_in_transaction(
+                connection,
+                lease,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    state, binding_codes = _source_binding_health_state(facts)
+    exact_available = activation_status == "ACTIVE"
+    availability_codes = (
+        {"STORE.CONTEXT_GATE_CLOSED", "STORE.FUZZY_GATE_CLOSED"}
+        if exact_available
+        else {"STORE.CANONICAL_NOT_ACTIVE"}
+    )
+    diagnostic_codes = tuple(
+        sorted(
+            set(binding_codes)
+            | availability_codes
+        )
+    )
+    return StoreHealth(
+        healthy=True,
+        schema_version=schema_version,
+        generation=lease.generation,
+        record_count=facts.record_count,
+        index_kind=index_kind,
+        snapshot_binding_digest=(
+            None
+            if facts.binding is None
+            else _snapshot_binding_digest(facts.binding)
+        ),
+        source_binding_state=state,
+        exact_available=exact_available,
+        context_available=False,
+        fuzzy_available=False,
+        diagnostic_codes=diagnostic_codes,
+    )
+
+
+class SQLiteTMQueryView:
+    """Read-only exact-typed query view bound to one operation lease.
+
+    Constructible only by :meth:`SQLiteTMStore.query_lease`; the view
+    holds exactly one coordinator operation lease for its lifetime and
+    exposes no append/export/activation/update port.  Every operation
+    revalidates the view lifetime/identity before touching the DB, and
+    the view never acquires a lease itself.
+    """
+
+    def __init__(
+        self,
+        store: SQLiteTMStore,
+        lease: _SQLiteGenerationView,
+        *,
+        token: object,
+    ) -> None:
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        if type(lease) is not _SQLiteGenerationView:
+            raise TypeError("lease must be exact _SQLiteGenerationView")
+        with store._coordinator._condition:
+            if token not in store._query_view_tokens:
+                raise TypeError("query view is not directly constructible")
+        self._store = store
+        self._coordinator = store._coordinator
+        self._lease = lease
+        self._token = token
+        self._expired = False
+
+    def _invalidate(self) -> None:
+        self._expired = True
+
+    def _check_lifetime(self) -> None:
+        resource_id = self._lease.stage.resource_identity.resource_id
+        generation = self._lease.generation
+        if self._expired:
+            raise SQLiteStoreLifecycleError(
+                "STORE.QUERY_VIEW_EXPIRED",
+                resource_id=resource_id,
+                generation=generation,
+                retryable=False,
+            )
+        if self._store._coordinator is not self._coordinator:
+            raise SQLiteStoreSchemaError("STORE.QUERY_VIEW_FOREIGN")
+        with self._coordinator._condition:
+            if self._token not in self._store._query_view_tokens:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.QUERY_VIEW_EXPIRED",
+                    resource_id=resource_id,
+                    generation=generation,
+                    retryable=False,
+                )
+            if self._coordinator._view is not self._lease:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=resource_id,
+                    generation=generation,
+                    retryable=True,
+                )
+
+    @property
+    def resource_id(self) -> str:
+        self._check_lifetime()
+        return self._lease.stage.resource_identity.resource_id
+
+    @property
+    def generation(self) -> int:
+        self._check_lifetime()
+        return self._lease.generation
+
+    def exact_records(self, source_raw: str) -> tuple[TMRecord, ...]:
+        self._check_lifetime()
+        _validate_exact_records_input(source_raw)
+        return _exact_records_body(self._lease, source_raw)
+
+    def records_by_id(
+        self,
+        record_ids: tuple[int, ...],
+    ) -> tuple[TMRecord, ...]:
+        self._check_lifetime()
+        prepared_ids = _validate_records_by_id_input(record_ids)
+        return _records_by_id_body(self._lease, prepared_ids)
+
+    def candidate_recall_snapshot(
+        self,
+        *,
+        fts_query_trigrams: tuple[str, ...] | None,
+        query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...],
+        candidate_floor: int,
+        fts_query_degenerate: bool,
+    ) -> SQLiteCandidateRecallSnapshot:
+        """Read one complete candidate-stage snapshot on the captured lease."""
+
+        self._check_lifetime()
+        prepared = _prepare_candidate_recall_inputs(
+            fts_query_trigrams=fts_query_trigrams,
+            query_grams_by_size=query_grams_by_size,
+            candidate_floor=candidate_floor,
+            fts_query_degenerate=fts_query_degenerate,
+        )
+        return _candidate_recall_snapshot_body(self._lease, prepared)
+
+    def health(self) -> StoreHealth:
+        """Return the same truthful health snapshot on the captured lease."""
+
+        self._check_lifetime()
+        return _store_health_body(self._lease)
 
 
 @dataclass(frozen=True)
@@ -9703,6 +10012,7 @@ __all__ = [
     "SQLiteStoreLifecycleError",
     "SQLiteStoreSchemaError",
     "SQLiteTMStore",
+    "SQLiteTMQueryView",
     "SourceBindingMonitor",
     "SourceBindingObservation",
     "TM_LEGACY_SCHEMA_VERSION",

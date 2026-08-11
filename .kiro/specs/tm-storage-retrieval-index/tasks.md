@@ -280,7 +280,7 @@
   - 完成时，阈值边界、双 source、重复记录、limit 和无写副作用测试全部通过
   - _Requirements: 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
 
-- [ ] 7.3 聚合多资源稳定顺序与部分失败
+- [x] 7.3 聚合多资源稳定顺序与部分失败
   - 只为 Active+Lookup 资源获取且只获取一次查询 lease；同资源的 health、raw exact、candidate recall 与 candidate record 批量读取共享一个只读 generation view，任一步失败不得用新 lease 拼接局部结果
   - Lookup 不授予写权限，Update 不授予查询权限；query view 不暴露 append、export、activation 或 update 端口，退出 lease 后立即失效
   - 按 EXACT、CONTEXT、FUZZY，最终分数、context strength、调用方资源顺序和稳定记录身份排序
@@ -423,3 +423,4 @@
 - 2026-08-12 / Cluster G 复审：累积复审批准 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷打开权威矩阵、canonical import 事务与三态兼容，无 P0–P2 遗留；唯一 P3 将非相同 digest 的 SQLite constraint 误报为重复导入，已收紧为只识别 `tm_origin_batch(kind, source_digest)` 唯一约束并完成定点复验。主 agent fresh 全量 930/930（skip 1，含 Qt smoke），累积变更文件 basedpyright error-level 0 errors，py_compile 与 range diff check 通过。
 - 2026-08-12 / Task 7.1：新增独立 retrieval domain seam；同资源 raw-exact 组只取最大有效 `record_id` 为 EXACT，其他变体仅在双方非空的 speaker/previous/next 原始完整字段出现至少一项正匹配时成为 CONTEXT，大小写/空白差异保持 mismatch，缺失事实不参与比较，无正面证据的变体只保留不返回。输入组对非 exact source、重复 identity 与非法空结果身份 fail-closed；focused 17/17、相关回归 130/130、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Task 7.2：在 storage-independent retrieval seam 中消费完整重建并重验的 bounded candidate/record 私有快照，以 scorer-v1 原始双 source 生成未舍入 fuzzy evidence；同 source 不进入评分，threshold 等值保留且在排序/全局 limit 前过滤，按资源与 record identity 去重，不执行写入、应用或确认。所有 query、recall stage、candidate、record/provenance 与 scorer evidence 在首个可控 callback 前完成 exact-type/nested 闭包，`score` port 只锁存一次，回调篡改 frozen alias 不会重绑结果；focused 50/50、相关回归 115/115、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 7.3：实现多资源 `TMRetrievalService` 与只读 query-view 接缝；每个 Active+Lookup 资源只取得一次 generation lease，同一 view 内闭合 health、raw exact/context、candidate recall 与 record batch，退出后失效且不暴露写端口。服务按调用方资源顺序隔离局部失败，先聚合再按 EXACT/CONTEXT/FUZZY、分数、context strength、资源顺序与 record identity 稳定排序并应用 global limit；最终 metadata 对账 scored/returned count。query/handle/view/report/record 值在可控 callback 间逐阶段重建，generation 与 health 成套复核，retriever/scorer 动态端口按需且整次 query 各锁存一次；focused 165/165、相关回归 145/145、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过，进入 Cluster H 统一复审。

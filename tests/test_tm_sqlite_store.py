@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -14,13 +15,25 @@ from unittest.mock import patch
 
 import tm_sqlite_store
 from tm_contracts import (
+    SNAPSHOT_BINDING_VERSION,
+    SNAPSHOT_FORMAT_VERSION,
+    SNAPSHOT_MANIFEST_VERSION,
     CanonicalResourceIdentity,
     MutableStageRef,
+    SnapshotBinding,
+    SnapshotKind,
+    SnapshotManifest,
+    SnapshotReceipt,
+    SourceBindingState,
     TMRecord,
     TMRecordDraft,
+    contract_to_json,
+    snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
     CANDIDATE_INDEX_VERSION,
+    build_candidate_write_plan,
+    unique_character_ngrams,
     FOLD_VERSION_V1,
     TM_SCHEMA_VERSION,
     SQLiteCandidateRecord,
@@ -2799,6 +2812,586 @@ class SQLiteSchemaTests(unittest.TestCase):
             )
             self.assertNotIn("tm_fts", snapshot.table_names)
             self.assertFalse(snapshot.fuzzy_available)
+
+
+def _query_view_snapshot(
+    source: SQLiteTMStore | tm_sqlite_store.SQLiteTMQueryView,
+    folded_query: str,
+) -> tm_sqlite_store.SQLiteCandidateRecallSnapshot:
+    trigrams = (
+        None
+        if len(folded_query) < 3
+        else unique_character_ngrams(folded_query, 3)
+    )
+    return source.candidate_recall_snapshot(
+        fts_query_trigrams=trigrams,
+        query_grams_by_size=tuple(
+            (
+                gram_size,
+                unique_character_ngrams(folded_query, gram_size),
+            )
+            for gram_size in (
+                (3, 2, 1)
+                if len(folded_query) >= 3
+                else (len(folded_query),)
+            )
+        ),
+        candidate_floor=2048,
+        fts_query_degenerate=(
+            len(trigrams) <= 1 if trigrams is not None else False
+        ),
+    )
+
+
+class SQLiteTMQueryViewTests(unittest.TestCase):
+    def _store_with_records(
+        self,
+        root: Path,
+        *,
+        fts5_available: bool,
+        sources: tuple[str, ...] = ("Open Door", "Close Window", "猫狗"),
+    ) -> tuple[SQLiteTMStore, tuple[int, ...]]:
+        stage = _stage(root)
+        with patch("tm_sqlite_store._probe_fts5", return_value=fts5_available):
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+        records = store.append_batch(
+            batch_id="import.query-view",
+            kind="import",
+            drafts=tuple(
+                _draft(source, f"target-{ordinal}")
+                for ordinal, source in enumerate(sources)
+            ),
+            source_digest="a" * 64,
+            source_path=(root / "query-view.jsonl").resolve(),
+            extension=lambda values: build_candidate_write_plan(
+                values,
+                fts5_available=fts5_available,
+            ),
+        )
+        return store, tuple(record.record_id for record in records)
+
+    def test_query_view_is_read_only_and_matches_store_ports_under_one_lease(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    store, record_ids = self._store_with_records(
+                        Path(temporary),
+                        fts5_available=fts5_available,
+                    )
+                    query = "Open Door" if fts5_available else "猫狗"
+                    folded = query
+                    with store.query_lease() as view:
+                        self.assertIs(
+                            type(view),
+                            tm_sqlite_store.SQLiteTMQueryView,
+                        )
+                        self.assertEqual(view.resource_id, "tm.primary")
+                        self.assertEqual(view.generation, 0)
+                        self.assertEqual(
+                            store.coordinator._active_lease_count,
+                            1,
+                        )
+                        self.assertEqual(
+                            view.exact_records("Open Door"),
+                            store.exact_records("Open Door"),
+                        )
+                        self.assertEqual(
+                            view.records_by_id(record_ids),
+                            store.records_by_id(record_ids),
+                        )
+                        self.assertEqual(
+                            view.records_by_id(record_ids[::-1]),
+                            store.records_by_id(record_ids[::-1]),
+                        )
+                        self.assertEqual(
+                            _query_view_snapshot(view, folded),
+                            _query_view_snapshot(store, folded),
+                        )
+                        self.assertEqual(view.health(), store.health())
+                        for missing_port in (
+                            "append",
+                            "append_batch",
+                            "export_records",
+                            "activate",
+                            "update",
+                        ):
+                            self.assertFalse(hasattr(view, missing_port))
+                    self.assertEqual(
+                        store.coordinator._active_lease_count,
+                        0,
+                    )
+                    for call in (
+                        lambda: view.exact_records("Open Door"),
+                        lambda: view.records_by_id(record_ids),
+                        lambda: _query_view_snapshot(view, folded),
+                        lambda: view.health(),
+                    ):
+                        with self.assertRaises(
+                            SQLiteStoreLifecycleError
+                        ) as raised:
+                            _ = call()
+                        self.assertEqual(
+                            raised.exception.code,
+                            "STORE.QUERY_VIEW_EXPIRED",
+                        )
+                        self.assertFalse(raised.exception.retryable)
+
+    def test_expired_query_view_fails_closed_without_connection_or_new_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=True,
+            )
+            with store.query_lease() as view:
+                pass
+            with patch(
+                "tm_sqlite_store._open_configured_connection",
+                side_effect=AssertionError("connection opened after expiry"),
+            ) as open_connection:
+                with self.assertRaises(
+                    SQLiteStoreLifecycleError
+                ) as raised:
+                    _ = view.exact_records("Open Door")
+                self.assertEqual(
+                    raised.exception.code,
+                    "STORE.QUERY_VIEW_EXPIRED",
+                )
+                self.assertFalse(raised.exception.retryable)
+                self.assertEqual(raised.exception.generation, 0)
+                self.assertEqual(raised.exception.resource_id, "tm.primary")
+                open_connection.assert_not_called()
+            self.assertEqual(store.coordinator._active_lease_count, 0)
+
+    def test_query_view_survives_drain_but_rejects_drift_or_foreign_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary_stage = _stage(root, "tm.primary")
+            secondary_stage = _stage(root, "tm.secondary")
+            initialize_stage_schema(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            initialize_stage_schema(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            primary = SQLiteTMStore(
+                primary_stage,
+                canonical_store_id="store.primary",
+            )
+            secondary = SQLiteTMStore(
+                secondary_stage,
+                canonical_store_id="store.secondary",
+            )
+            with primary.query_lease() as view:
+                with primary.coordinator._condition:
+                    primary.coordinator._state = "DRAINING"
+                self.assertEqual(view.exact_records("source"), ())
+                with primary.coordinator._condition:
+                    primary.coordinator._state = "READY"
+                    primary.coordinator._view = (
+                        secondary.coordinator._view
+                    )
+                with self.assertRaises(
+                    SQLiteStoreLifecycleError
+                ) as raised:
+                    _ = view.exact_records("source")
+                self.assertEqual(
+                    raised.exception.code,
+                    "STORE.GENERATION_CHANGED",
+                )
+                view._store = secondary
+                with self.assertRaisesRegex(
+                    SQLiteStoreSchemaError,
+                    "STORE.QUERY_VIEW_FOREIGN",
+                ):
+                    _ = view.exact_records("source")
+
+    def test_query_lease_blocks_generation_publication_until_exit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            transition_done = threading.Event()
+            transition_errors: list[BaseException] = []
+
+            def publish_next_generation() -> None:
+                try:
+                    _ = store.coordinator._transition_generation(
+                        stage,
+                        canonical_store_id="store.primary",
+                        expected_prior_generation=0,
+                        timeout_seconds=2.0,
+                    )
+                except BaseException as error:
+                    transition_errors.append(error)
+                finally:
+                    transition_done.set()
+
+            with store.query_lease() as view:
+                _ = view.exact_records("source")
+                publisher = threading.Thread(
+                    target=publish_next_generation
+                )
+                publisher.start()
+                self.assertTrue(
+                    store.coordinator.wait_for_state(
+                        "DRAINING",
+                        timeout_seconds=1.0,
+                    )
+                )
+                self.assertFalse(transition_done.is_set())
+                with self.assertRaises(
+                    SQLiteStoreLifecycleError
+                ) as raised:
+                    with store.query_lease():
+                        pass
+                self.assertEqual(
+                    raised.exception.code,
+                    "STORE.RESOURCE_DRAINING",
+                )
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(view.exact_records("source"), ())
+
+            publisher.join(timeout=3)
+            self.assertFalse(publisher.is_alive())
+            self.assertEqual(transition_errors, [])
+            self.assertTrue(transition_done.is_set())
+            self.assertEqual(store.coordinator.current_generation, 1)
+
+    def test_health_is_read_only_and_parity_between_public_and_view(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    stage = _stage(root)
+                    configured = (
+                        stage.resource_identity.configured_jsonl_path
+                    )
+                    manifest = configured.with_name(
+                        configured.name + ".localcat-snapshot.json"
+                    )
+                    store, _record_ids = self._store_with_records(
+                        root,
+                        fts5_available=fts5_available,
+                    )
+                    database_bytes = stage.staged_db_path.read_bytes()
+                    public_health = store.health()
+                    with store.query_lease() as view:
+                        view_health = view.health()
+                    self.assertEqual(public_health, view_health)
+                    self.assertTrue(public_health.healthy)
+                    self.assertFalse(public_health.exact_available)
+                    self.assertFalse(public_health.context_available)
+                    self.assertFalse(public_health.fuzzy_available)
+                    self.assertEqual(
+                        public_health.diagnostic_codes,
+                        ("STORE.CANONICAL_NOT_ACTIVE",),
+                    )
+                    self.assertIsNone(public_health.source_binding_state)
+                    self.assertIsNone(
+                        public_health.snapshot_binding_digest
+                    )
+                    self.assertEqual(
+                        public_health.schema_version,
+                        TM_SCHEMA_VERSION,
+                    )
+                    self.assertEqual(public_health.generation, 0)
+                    self.assertEqual(public_health.record_count, 3)
+                    self.assertEqual(
+                        public_health.index_kind,
+                        (
+                            "FTS5_TRIGRAM"
+                            if fts5_available
+                            else "GRAM_FALLBACK"
+                        ),
+                    )
+                    self.assertEqual(
+                        stage.staged_db_path.read_bytes(),
+                        database_bytes,
+                    )
+                    self.assertFalse(configured.exists())
+                    self.assertFalse(manifest.exists())
+
+    def test_health_reports_truthful_source_binding_ledger_states(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            configured = stage.resource_identity.configured_jsonl_path
+            manifest = configured.with_name(
+                configured.name + ".localcat-snapshot.json"
+            )
+            store, _record_ids = self._store_with_records(
+                root,
+                fts5_available=False,
+                sources=("first", "second"),
+            )
+
+            def ledger_binding(
+                exported_revision: int,
+                record_count: int,
+            ) -> None:
+                connection = sqlite3.connect(stage.staged_db_path)
+                try:
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_receipt("
+                        "snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)",
+                        (
+                            "snapshot.current",
+                            "tm.primary",
+                            "store.primary",
+                            exported_revision,
+                            "b" * 64,
+                            record_count,
+                            SNAPSHOT_FORMAT_VERSION,
+                            str(configured),
+                            str(manifest),
+                            "2026-08-12T00:00:00+00:00",
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, 'EXPLICIT_EXPORT', "
+                        "'snapshot.current', ?)",
+                        (
+                            str(configured),
+                            str(manifest),
+                            SNAPSHOT_BINDING_VERSION,
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            def set_meta(key: str, value: str) -> None:
+                connection = sqlite3.connect(stage.staged_db_path)
+                try:
+                    connection.execute(
+                        "UPDATE tm_meta SET value = ? WHERE key = ?",
+                        (value, key),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            def meta_value(key: str) -> str:
+                connection = sqlite3.connect(stage.staged_db_path)
+                try:
+                    row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    self.assertIsNotNone(row)
+                    return str(row[0])
+                finally:
+                    connection.close()
+
+            def expected_digest(
+                exported_revision: int,
+                record_count: int,
+            ) -> str:
+                receipt = SnapshotReceipt(
+                    snapshot_id="snapshot.current",
+                    resource_id="tm.primary",
+                    canonical_store_id="store.primary",
+                    exported_revision=exported_revision,
+                    jsonl_digest="b" * 64,
+                    record_count=record_count,
+                    format_version=SNAPSHOT_FORMAT_VERSION,
+                )
+                binding = SnapshotBinding(
+                    configured_jsonl_path=configured,
+                    manifest_path=manifest,
+                    snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                    receipt=receipt,
+                    manifest=SnapshotManifest(
+                        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                        snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                        receipt=receipt,
+                        receipt_digest=snapshot_receipt_digest(receipt),
+                    ),
+                    binding_version=SNAPSHOT_BINDING_VERSION,
+                )
+                return hashlib.sha256(
+                    contract_to_json(binding).encode("utf-8")
+                ).hexdigest()
+
+            no_binding = store.health()
+            self.assertIsNone(no_binding.source_binding_state)
+            self.assertIsNone(no_binding.snapshot_binding_digest)
+            self.assertEqual(
+                no_binding.diagnostic_codes,
+                ("STORE.CANONICAL_NOT_ACTIVE",),
+            )
+
+            ledger_binding(exported_revision=1, record_count=2)
+            current = store.health()
+            self.assertIs(
+                current.source_binding_state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+            self.assertEqual(
+                current.snapshot_binding_digest,
+                expected_digest(exported_revision=1, record_count=2),
+            )
+            self.assertEqual(
+                current.diagnostic_codes,
+                ("STORE.CANONICAL_NOT_ACTIVE",),
+            )
+
+            set_meta("head_revision", "9")
+            drifted_ancestry = store.health()
+            self.assertIs(
+                drifted_ancestry.source_binding_state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            self.assertEqual(
+                drifted_ancestry.diagnostic_codes,
+                (
+                    "SOURCE_BINDING.ANCESTRY_INVALID",
+                    "STORE.CANONICAL_NOT_ACTIVE",
+                ),
+            )
+            self.assertEqual(meta_value("divergence_latched"), "0")
+
+            set_meta("head_revision", "1")
+            set_meta("divergence_latched", "1")
+            latched = store.health()
+            self.assertIs(
+                latched.source_binding_state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            self.assertEqual(
+                latched.diagnostic_codes,
+                (
+                    "SOURCE_BINDING.DIVERGENCE_LATCHED",
+                    "STORE.CANONICAL_NOT_ACTIVE",
+                ),
+            )
+            self.assertEqual(
+                latched.snapshot_binding_digest,
+                expected_digest(exported_revision=1, record_count=2),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            configured = stage.resource_identity.configured_jsonl_path
+            manifest = configured.with_name(
+                configured.name + ".localcat-snapshot.json"
+            )
+            store, _record_ids = self._store_with_records(
+                root,
+                fts5_available=False,
+                sources=("first",),
+            )
+            _ = store.append_batch(
+                batch_id="import.history",
+                kind="import",
+                drafts=(_draft("second", "target-second"),),
+                source_digest="d" * 64,
+                source_path=(root / "history.jsonl").resolve(),
+                extension=lambda values: build_candidate_write_plan(
+                    values,
+                    fts5_available=False,
+                ),
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute(
+                    "INSERT INTO tm_snapshot_receipt("
+                    "snapshot_id, resource_id, canonical_store_id, "
+                    "exported_revision, jsonl_digest, record_count, "
+                    "format_version, destination_jsonl_path, "
+                    "destination_manifest_path, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)",
+                    (
+                        "snapshot.current",
+                        "tm.primary",
+                        "store.primary",
+                        1,
+                        "b" * 64,
+                        1,
+                        SNAPSHOT_FORMAT_VERSION,
+                        str(configured),
+                        str(manifest),
+                        "2026-08-12T00:00:00+00:00",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO tm_snapshot_binding("
+                    "binding_id, configured_jsonl_path, manifest_path, "
+                    "snapshot_kind, snapshot_id, binding_version) "
+                    "VALUES (1, ?, ?, 'EXPLICIT_EXPORT', "
+                    "'snapshot.current', ?)",
+                    (
+                        str(configured),
+                        str(manifest),
+                        SNAPSHOT_BINDING_VERSION,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            history = store.health()
+            self.assertIs(
+                history.source_binding_state,
+                SourceBindingState.VERIFIED_HISTORY,
+            )
+            self.assertEqual(
+                history.diagnostic_codes,
+                ("STORE.CANONICAL_NOT_ACTIVE",),
+            )
+
+    def test_query_view_requires_a_live_store_registered_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=False,
+            )
+            lease = store.coordinator._view
+            self.assertIsNotNone(lease)
+            with self.assertRaisesRegex(
+                TypeError,
+                "query view is not directly constructible",
+            ):
+                _ = tm_sqlite_store.SQLiteTMQueryView(
+                    store,
+                    cast(Any, lease),
+                    token=object(),
+                )
 
 
 if __name__ == "__main__":

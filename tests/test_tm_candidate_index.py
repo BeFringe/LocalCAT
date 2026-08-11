@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 import tempfile
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from tm_contracts import (
 from tm_sqlite_store import (
     SQLiteCandidateRecord,
     SQLiteCandidateRecallSnapshot,
+    SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     initialize_stage_schema,
@@ -1015,6 +1017,157 @@ class CandidateRetrieverTests(unittest.TestCase):
                     _ = CandidateRetriever().candidates(
                         "tm.primary", store, "queryabc", result_limit=10
                     )
+
+
+def _retriever_store_with_records(
+    root: Path,
+    *,
+    fts5_available: bool,
+    sources: tuple[str, ...],
+) -> tuple[SQLiteTMStore, tuple[int, ...]]:
+    stage = _stage(root)
+    with patch("tm_sqlite_store._probe_fts5", return_value=fts5_available):
+        initialize_stage_schema(stage, canonical_store_id="store.primary")
+        store = SQLiteTMStore(stage, canonical_store_id="store.primary")
+    records = store.append_batch(
+        batch_id="import.retriever-view",
+        kind="import",
+        drafts=tuple(
+            _draft(source, f"target-{ordinal}")
+            for ordinal, source in enumerate(sources)
+        ),
+        source_digest="e" * 64,
+        source_path=(root / "retriever-view.jsonl").resolve(),
+        extension=lambda values: build_candidate_write_plan(
+            values,
+            fts5_available=fts5_available,
+        ),
+    )
+    return store, tuple(record.record_id for record in records)
+
+
+class CandidateRetrieverQueryViewTests(unittest.TestCase):
+    def test_view_report_matches_public_report_for_fts_and_fallback(
+        self,
+    ) -> None:
+        for fts5_available, query in (
+            (True, "abcdef"),
+            (False, "猫狗"),
+        ):
+            with self.subTest(
+                fts5_available=fts5_available,
+                query=query,
+            ):
+                with tempfile.TemporaryDirectory() as temporary:
+                    store, _record_ids = _retriever_store_with_records(
+                        Path(temporary),
+                        fts5_available=fts5_available,
+                        sources=("abcdef", "abcxyz", "abzzzz", "a-only"),
+                    )
+                    with store.query_lease() as view:
+                        public_report = CandidateRetriever().candidates(
+                            "tm.primary",
+                            store,
+                            query,
+                            result_limit=10,
+                        )
+                        view_report = (
+                            CandidateRetriever().candidates_from_view(
+                                "tm.primary",
+                                view,
+                                query,
+                                result_limit=10,
+                            )
+                        )
+                self.assertEqual(public_report, view_report)
+
+    def test_candidates_from_view_rejects_wrong_binding_resource_or_expiry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = _retriever_store_with_records(
+                Path(temporary),
+                fts5_available=False,
+                sources=("abc",),
+            )
+            with store.query_lease() as view:
+                with self.assertRaises(TypeError):
+                    _ = CandidateRetriever().candidates_from_view(
+                        "tm.primary",
+                        cast(Any, store),
+                        "abc",
+                        result_limit=10,
+                    )
+                with self.assertRaises(ValueError):
+                    _ = CandidateRetriever().candidates_from_view(
+                        "tm.secondary",
+                        view,
+                        "abc",
+                        result_limit=10,
+                    )
+                with self.assertRaises(ValueError):
+                    _ = CandidateRetriever().candidates_from_view(
+                        "tm.primary",
+                        view,
+                        "abc",
+                        result_limit=0,
+                    )
+            with self.assertRaises(SQLiteStoreLifecycleError) as raised:
+                _ = CandidateRetriever().candidates_from_view(
+                    "tm.primary",
+                    view,
+                    "abc",
+                    result_limit=10,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "STORE.QUERY_VIEW_EXPIRED",
+            )
+
+    def test_candidates_from_view_rejects_subtypes_before_view_query(
+        self,
+    ) -> None:
+        class StringSubtype(str):
+            def __hash__(self) -> int:
+                raise AssertionError("forged query was hashed")
+
+        class IntSubtype(int):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _ = _retriever_store_with_records(
+                Path(temporary),
+                fts5_available=False,
+                sources=("abc",),
+            )
+            with store.query_lease() as view:
+                with patch.object(
+                    view,
+                    "candidate_recall_snapshot",
+                    side_effect=AssertionError("view queried"),
+                ) as query:
+                    with self.assertRaises(TypeError):
+                        _ = CandidateRetriever().candidates_from_view(
+                            StringSubtype("tm.primary"),
+                            view,
+                            "abc",
+                            result_limit=10,
+                        )
+                    with self.assertRaises(TypeError):
+                        _ = CandidateRetriever().candidates_from_view(
+                            "tm.primary",
+                            view,
+                            StringSubtype("abc"),
+                            result_limit=10,
+                        )
+                    with self.assertRaises(TypeError):
+                        _ = CandidateRetriever().candidates_from_view(
+                            "tm.primary",
+                            view,
+                            "abc",
+                            result_limit=IntSubtype(10),
+                        )
+                    query.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Exact/context classification and fuzzy scoring seams for TM retrieval.
+"""Exact/context classification, fuzzy scoring and retrieval composition.
 
 Task 7.1 production slice: a per-resource exact/context classifier that
 Task 7.3 composes into the full query pipeline.  It consumes only the
@@ -11,31 +11,50 @@ records.  It retains both query and matched source, applies minimum
 similarity before any ordering, deduplicates by (resource_id, record_id),
 and performs no store lease, persistence, apply/confirm, capability
 publication or cross-resource global limiting.
+
+Task 7.3 production slice: the multi-resource ``TMRetrievalService`` that
+composes Task 7.1 and Task 7.2 under exactly one read-only query lease per
+Active+Lookup resource, aggregates in stable EXACT/CONTEXT/FUZZY order, and
+applies the global limit only after cross-resource aggregation.  It performs
+no persistence, apply/confirm, activation/update, capability publication or
+write side effects, and isolates every resource-local failure.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import Any, Callable, cast
 
+from text_matcher import fold_text_v1
+from tm_candidate_index import CandidateRetriever
 from tm_contracts import (
+    CANDIDATE_BUDGET_VERSION,
     CandidateEvidence,
     CandidateRecallMetadata,
     CandidateRetrievalReport,
     CandidateStage,
     CandidateStageMetadata,
     ContextEvidence,
+    QueryReport,
+    ResourceQueryFailure,
+    ResourceQueryMetadata,
     SCORER_VERSION_V1,
     SimilarityEvidence,
     SimilarityScorer,
+    StoreHealth,
     TMMatchType,
     TMQuery,
     TMRecord,
     TMResourceHandle,
     TMResult,
+    candidate_budget_v1,
 )
 from tm_similarity import SimilarityScorerV1
+from tm_sqlite_store import SQLiteStoreLifecycleError, SQLiteStoreSchemaError
 
 
 _CONTEXT_FIELD_NAMES = (
@@ -653,3 +672,629 @@ def score_fuzzy_candidates(
         accepted=tuple(accepted),
         scored_count=scored_count,
     )
+
+
+# --- Task 7.3 service composition -------------------------------------------
+
+_CONTEXT_GATE_CLOSED_CODE = "STORE.CONTEXT_GATE_CLOSED"
+_FUZZY_GATE_CLOSED_CODE = "STORE.FUZZY_GATE_CLOSED"
+_UNHEALTHY_CODE = "RETRIEVAL.STORE_UNHEALTHY"
+_EXACT_UNAVAILABLE_CODE = "RETRIEVAL.EXACT_UNAVAILABLE"
+_LEASE_UNAVAILABLE_CODE = "STORE.QUERY_LEASE_UNAVAILABLE"
+_QUERY_VIEW_INVALID_CODE = "STORE.QUERY_VIEW_INVALID"
+_QUERY_VIEW_FOREIGN_CODE = "STORE.QUERY_VIEW_FOREIGN"
+_GENERATION_MISMATCH_CODE = "STORE.GENERATION_MISMATCH"
+_NORMALIZED_FAILURE_CODE = "RETRIEVAL.QUERY_FAILED"
+_FALLBACK_STAGE = "QUERY"
+
+_TYPE_RANK = {
+    TMMatchType.EXACT: 0,
+    TMMatchType.CONTEXT: 1,
+    TMMatchType.FUZZY: 2,
+}
+
+_DIAGNOSTIC_IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\Z")
+
+
+@dataclass(frozen=True)
+class _ServiceHandleSnapshot:
+    """Private pre-callback copy of every caller-owned handle scalar/ref."""
+
+    resource_id: str
+    store: object
+    active: bool
+    lookup: bool
+    update: bool
+    order: int
+
+
+class _ResourcePipelineFailure(Exception):
+    """Private per-resource stage failure carrying only stable safe codes."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        error_code: str,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(error_code)
+        self.stage = stage
+        self.error_code = error_code
+        self.retryable = retryable
+
+
+def _snapshot_handle(handle: TMResourceHandle) -> _ServiceHandleSnapshot:
+    _require_exact_type(handle, TMResourceHandle, "handle")
+    resource_id = handle.resource_id
+    _require_builtin_str(resource_id, "resource id")
+    if not resource_id.strip():
+        raise ValueError("resource id must not be empty")
+    store = handle.store
+    if store is None:
+        raise ValueError("resource store binding must not be None")
+    active = handle.active
+    lookup = handle.lookup
+    update = handle.update
+    _require_exact_type(active, bool, "resource active")
+    _require_exact_type(lookup, bool, "resource lookup")
+    _require_exact_type(update, bool, "resource update")
+    order = handle.order
+    _require_builtin_int(order, "resource order", minimum=0)
+    return _ServiceHandleSnapshot(
+        resource_id=resource_id,
+        store=store,
+        active=active,
+        lookup=lookup,
+        update=update,
+        order=order,
+    )
+
+
+def _snapshot_handles(
+    handles: object,
+) -> tuple[_ServiceHandleSnapshot, ...]:
+    items = _require_exact_tuple(handles, "resource handles")
+    snapshots = tuple(_snapshot_handle(item) for item in items)
+    resource_ids = tuple(item.resource_id for item in snapshots)
+    if len(resource_ids) != len(set(resource_ids)):
+        raise ValueError("resource ids must be unique")
+    orders = tuple(item.order for item in snapshots)
+    if len(orders) != len(set(orders)):
+        raise ValueError("resource orders must be unique")
+    return snapshots
+
+
+def _snapshot_service_query(query: TMQuery) -> TMQuery:
+    _require_exact_type(query, TMQuery, "query")
+    query_source = query.query_source
+    _require_builtin_str(query_source, "query source")
+    if not query_source.strip():
+        raise ValueError("query source must not be empty")
+    speaker_raw = query.speaker_raw
+    context_prev_raw = query.context_prev_raw
+    context_next_raw = query.context_next_raw
+    for label, value in (
+        ("query speaker_raw", speaker_raw),
+        ("query context_prev_raw", context_prev_raw),
+        ("query context_next_raw", context_next_raw),
+    ):
+        if value is not None:
+            _require_builtin_str(value, label)
+    minimum_similarity = query.minimum_similarity
+    _require_builtin_ratio(minimum_similarity, "minimum similarity")
+    limit = query.limit
+    _require_builtin_int(limit, "query limit", minimum=1)
+    resource_order = _require_exact_tuple(
+        query.resource_order,
+        "query resource_order",
+    )
+    for item in resource_order:
+        _require_builtin_str(item, "resource_order id")
+        if not item.strip():
+            raise ValueError("resource_order ids must not be empty")
+    if len(resource_order) != len(set(resource_order)):
+        raise ValueError("resource_order ids must be unique")
+    return TMQuery(
+        query_source=query_source,
+        speaker_raw=speaker_raw,
+        context_prev_raw=context_prev_raw,
+        context_next_raw=context_next_raw,
+        minimum_similarity=minimum_similarity,
+        limit=limit,
+        resource_order=resource_order,
+    )
+
+
+def _validate_service_mapping(
+    snapshots: tuple[_ServiceHandleSnapshot, ...],
+    query: TMQuery,
+) -> None:
+    """Enforce the one-to-one handle/query.resource_order tie mapping."""
+
+    resource_ids = tuple(item.resource_id for item in snapshots)
+    query_ids = query.resource_order
+    if set(query_ids) != set(resource_ids):
+        raise ValueError(
+            "query resource_order must map one-to-one to handle ids"
+        )
+    position_by_id = {
+        resource_id: position
+        for position, resource_id in enumerate(query_ids)
+    }
+    for snapshot in snapshots:
+        if snapshot.order != position_by_id[snapshot.resource_id]:
+            raise ValueError(
+                "handle order must match its query resource_order position"
+            )
+
+
+def _snapshot_store_health(health: StoreHealth) -> StoreHealth:
+    _require_exact_type(health, StoreHealth, "store health")
+    healthy = health.healthy
+    schema_version = health.schema_version
+    generation = health.generation
+    record_count = health.record_count
+    index_kind = health.index_kind
+    snapshot_binding_digest = health.snapshot_binding_digest
+    source_binding_state = health.source_binding_state
+    exact_available = health.exact_available
+    context_available = health.context_available
+    fuzzy_available = health.fuzzy_available
+    diagnostic_codes = health.diagnostic_codes
+    return StoreHealth(
+        healthy=healthy,
+        schema_version=schema_version,
+        generation=generation,
+        record_count=record_count,
+        index_kind=index_kind,
+        snapshot_binding_digest=snapshot_binding_digest,
+        source_binding_state=source_binding_state,
+        exact_available=exact_available,
+        context_available=context_available,
+        fuzzy_available=fuzzy_available,
+        diagnostic_codes=diagnostic_codes,
+    )
+
+
+def _snapshot_exact_records(
+    records: tuple[TMRecord, ...],
+) -> tuple[TMRecord, ...]:
+    items = _require_exact_tuple(records, "exact records")
+    for record in items:
+        _require_exact_type(record, TMRecord, "record")
+    return items
+
+
+def _unavailable_recall_metadata(
+    *,
+    resource_id: str,
+    index_kind: str,
+    result_limit: int,
+) -> CandidateRecallMetadata:
+    return CandidateRecallMetadata(
+        resource_id=resource_id,
+        index_kind=index_kind,
+        fuzzy_available=False,
+        fuzzy_unavailable_code=_FUZZY_GATE_CLOSED_CODE,
+        stages=(),
+        union_unique_count=0,
+        deduplicated_count=0,
+        result_limit=result_limit,
+        candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+        candidate_budget=candidate_budget_v1(result_limit),
+        truncated=False,
+    )
+
+
+def _safe_attr(error: object, name: str) -> object:
+    try:
+        return getattr(error, name, None)
+    except Exception:
+        return None
+
+
+def _is_stable_code(value: object) -> bool:
+    if type(value) is not str or value == "":
+        return False
+    return _DIAGNOSTIC_IDENTIFIER.fullmatch(value) is not None
+
+
+def _stable_error_code(error: Exception) -> str:
+    code = _safe_attr(error, "error_code")
+    if _is_stable_code(code):
+        return cast(str, code)
+    code = _safe_attr(error, "code")
+    if _is_stable_code(code):
+        return cast(str, code)
+    if isinstance(error, SQLiteStoreSchemaError):
+        message = error.args[0] if error.args else None
+        if _is_stable_code(message):
+            return cast(str, message)
+    return _NORMALIZED_FAILURE_CODE
+
+
+def _stable_error_retryable(error: Exception) -> bool:
+    retryable = _safe_attr(error, "retryable")
+    return retryable if type(retryable) is bool else False
+
+
+def _normalize_stage_error(
+    error: Exception,
+    stage: str,
+) -> _ResourcePipelineFailure:
+    return _ResourcePipelineFailure(
+        stage=stage,
+        error_code=_stable_error_code(error),
+        retryable=_stable_error_retryable(error),
+    )
+
+
+@contextmanager
+def _stage_guard(stage: str) -> Iterator[None]:
+    try:
+        yield
+    except _ResourcePipelineFailure:
+        raise
+    except Exception as error:
+        raise _normalize_stage_error(error, stage) from error
+
+
+def _fold_query(query: TMQuery) -> str:
+    folded_query = fold_text_v1(query.query_source).folded_text
+    if type(folded_query) is not str:
+        raise TypeError("folded query must be a built-in string")
+    return folded_query
+
+
+def _result_sort_key(result: TMResult) -> tuple[int, float, tuple[int, ...], int, int]:
+    return (
+        _TYPE_RANK[result.match_type],
+        -result.similarity,
+        tuple(-value for value in result.context_evidence.strength_v1),
+        result.stable_tie_key[0],
+        -result.record_id,
+    )
+
+
+class _LazyRetrieverPort:
+    """Query-scoped retriever port captured once on first fuzzy use."""
+
+    def __init__(self, retriever: object) -> None:
+        self._retriever = retriever
+        self._port: Callable[..., CandidateRetrievalReport] | None = None
+
+    def port(self) -> Callable[..., CandidateRetrievalReport]:
+        if self._port is None:
+            port = _safe_attr(self._retriever, "candidates_from_view")
+            if not callable(port):
+                raise TypeError(
+                    "retriever must implement the candidates_from_view port"
+                )
+            self._port = cast(
+                Callable[..., CandidateRetrievalReport],
+                port,
+            )
+        return self._port
+
+
+class _LazyScorerPort:
+    """Query-scoped scorer facade capturing the original score port once."""
+
+    def __init__(self, scorer: object) -> None:
+        self._scorer = scorer
+        self._score: Callable[[str, str], SimilarityEvidence] | None = None
+
+    @property
+    def score(self) -> Callable[[str, str], SimilarityEvidence]:
+        if self._score is None:
+            port = getattr(self._scorer, "score", None)
+            if not callable(port):
+                raise TypeError(
+                    "scorer must implement the SimilarityScorer score port"
+                )
+            self._score = cast(
+                Callable[[str, str], SimilarityEvidence],
+                port,
+            )
+        return self._score
+
+
+class TMRetrievalService:
+    """Deterministic multi-resource exact/context/fuzzy retrieval service.
+
+    ``query`` snapshots every caller-owned handle and query value before any
+    controllable callback, then processes each Active+Lookup resource in the
+    declared ``TMQuery.resource_order``.  Each participating resource obtains
+    exactly one ``store.query_lease`` context and consumes only the leased
+    read-only view for health, raw exact records, candidate recall and the
+    candidate record batch; public store query and write ports are never
+    called.  Resource-local exceptions become one stable
+    ``ResourceQueryFailure`` per resource, and other resources survive.
+    Successful results are aggregated, stable-sorted by EXACT, CONTEXT,
+    FUZZY / similarity / context strength / caller order / record id,
+    deduplicated by (resource_id, record_id), and the global limit is
+    applied only after cross-resource aggregation.  Dynamic retriever and
+    scorer ports are captured lazily once per query on first fuzzy use and
+    reused for every later fuzzy resource.
+    """
+
+    def __init__(
+        self,
+        *,
+        retriever: CandidateRetriever | None = None,
+        scorer: SimilarityScorer | None = None,
+    ) -> None:
+        if retriever is None:
+            retriever = CandidateRetriever()
+        if scorer is None:
+            scorer = SimilarityScorerV1()
+        self._retriever = retriever
+        self._scorer = scorer
+
+    def query(
+        self,
+        resources: tuple[TMResourceHandle, ...],
+        query: TMQuery,
+    ) -> QueryReport:
+        """Run one deterministic multi-resource query without side effects."""
+
+        snapshots = _snapshot_handles(resources)
+        query_snapshot = _snapshot_service_query(query)
+        _validate_service_mapping(snapshots, query_snapshot)
+        lazy_retriever = _LazyRetrieverPort(self._retriever)
+        lazy_scorer = _LazyScorerPort(self._scorer)
+        folded_query = _fold_query(query_snapshot)
+
+        snapshot_by_id = {
+            snapshot.resource_id: snapshot for snapshot in snapshots
+        }
+        ordered_snapshots = tuple(
+            snapshot_by_id[resource_id]
+            for resource_id in query_snapshot.resource_order
+        )
+
+        local_outcomes: list[
+            tuple[tuple[TMResult, ...], ResourceQueryMetadata]
+        ] = []
+        failures: list[ResourceQueryFailure] = []
+        for snapshot in ordered_snapshots:
+            if not (snapshot.active and snapshot.lookup):
+                continue
+            try:
+                local_results, metadata = self._query_resource(
+                    snapshot,
+                    query_snapshot,
+                    lazy_retriever,
+                    lazy_scorer,
+                    folded_query,
+                )
+            except _ResourcePipelineFailure as failure:
+                failures.append(
+                    ResourceQueryFailure(
+                        resource_id=snapshot.resource_id,
+                        stage=failure.stage,
+                        error_code=failure.error_code,
+                        retryable=failure.retryable,
+                    )
+                )
+                continue
+            except Exception as error:
+                failures.append(
+                    ResourceQueryFailure(
+                        resource_id=snapshot.resource_id,
+                        stage=_FALLBACK_STAGE,
+                        error_code=_stable_error_code(error),
+                        retryable=_stable_error_retryable(error),
+                    )
+                )
+                continue
+            local_outcomes.append((local_results, metadata))
+
+        all_results = [
+            result
+            for local_results, _metadata in local_outcomes
+            for result in local_results
+        ]
+        ordered_results = sorted(all_results, key=_result_sort_key)
+        deduplicated: list[TMResult] = []
+        seen: set[tuple[str, int]] = set()
+        for result in ordered_results:
+            identity = (result.resource_id, result.record_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduplicated.append(result)
+        limited_results = deduplicated[: query_snapshot.limit]
+
+        returned_by_resource: dict[str, int] = {}
+        for result in limited_results:
+            returned_by_resource[result.resource_id] = (
+                returned_by_resource.get(result.resource_id, 0) + 1
+            )
+        resource_metadata = tuple(
+            replace(
+                metadata,
+                returned_count=returned_by_resource.get(
+                    metadata.resource_id,
+                    0,
+                ),
+            )
+            for _local_results, metadata in local_outcomes
+        )
+        return QueryReport(
+            results=tuple(limited_results),
+            resource_failures=tuple(failures),
+            resource_metadata=resource_metadata,
+        )
+
+    def _query_resource(
+        self,
+        snapshot: _ServiceHandleSnapshot,
+        query: TMQuery,
+        lazy_retriever: _LazyRetrieverPort,
+        lazy_scorer: _LazyScorerPort,
+        folded_query: str,
+    ) -> tuple[tuple[TMResult, ...], ResourceQueryMetadata]:
+        store = snapshot.store
+        query_lease_port = _safe_attr(store, "query_lease")
+        if not callable(query_lease_port):
+            raise _ResourcePipelineFailure(
+                stage="LEASE",
+                error_code=_LEASE_UNAVAILABLE_CODE,
+            )
+        try:
+            with cast(Any, query_lease_port)() as view:
+                with _stage_guard("LEASE"):
+                    health_port = _safe_attr(view, "health")
+                    view_resource_id = _safe_attr(view, "resource_id")
+                    view_generation = _safe_attr(view, "generation")
+                    if not callable(health_port):
+                        raise _ResourcePipelineFailure(
+                            stage="LEASE",
+                            error_code=_QUERY_VIEW_INVALID_CODE,
+                        )
+                    if type(view_resource_id) is not str:
+                        raise _ResourcePipelineFailure(
+                            stage="LEASE",
+                            error_code=_QUERY_VIEW_INVALID_CODE,
+                        )
+                    if view_resource_id != snapshot.resource_id:
+                        raise _ResourcePipelineFailure(
+                            stage="LEASE",
+                            error_code=_QUERY_VIEW_FOREIGN_CODE,
+                        )
+                    if (
+                        type(view_generation) is not int
+                        or isinstance(view_generation, bool)
+                        or view_generation < 0
+                    ):
+                        raise _ResourcePipelineFailure(
+                            stage="LEASE",
+                            error_code=_QUERY_VIEW_INVALID_CODE,
+                        )
+
+                with _stage_guard("HEALTH"):
+                    health_snapshot = _snapshot_store_health(
+                        cast(Any, health_port)()
+                    )
+                    if not health_snapshot.healthy:
+                        raise _ResourcePipelineFailure(
+                            stage="HEALTH",
+                            error_code=_UNHEALTHY_CODE,
+                        )
+                    if not health_snapshot.exact_available:
+                        raise _ResourcePipelineFailure(
+                            stage="HEALTH",
+                            error_code=_EXACT_UNAVAILABLE_CODE,
+                        )
+                    if health_snapshot.generation != view_generation:
+                        raise _ResourcePipelineFailure(
+                            stage="HEALTH",
+                            error_code=_GENERATION_MISMATCH_CODE,
+                        )
+
+                with _stage_guard("EXACT"):
+                    exact_port = _safe_attr(view, "exact_records")
+                    if not callable(exact_port):
+                        raise _ResourcePipelineFailure(
+                            stage="EXACT",
+                            error_code=_QUERY_VIEW_INVALID_CODE,
+                        )
+                    exact_records = _snapshot_exact_records(
+                        cast(Any, exact_port)(query.query_source)
+                    )
+                    classification = classify_exact_context(
+                        resource_id=snapshot.resource_id,
+                        resource_order=snapshot.order,
+                        query=query,
+                        records=exact_records,
+                    )
+
+                if health_snapshot.fuzzy_available:
+                    with _stage_guard("RECALL"):
+                        retriever_port = lazy_retriever.port()
+                        report = retriever_port(
+                            snapshot.resource_id,
+                            view,
+                            folded_query,
+                            result_limit=query.limit,
+                        )
+                        report_snapshot = _snapshot_candidate_report(report)
+                        if (
+                            report_snapshot.metadata.resource_id
+                            != snapshot.resource_id
+                        ):
+                            raise _ResourcePipelineFailure(
+                                stage="RECALL",
+                                error_code=_NORMALIZED_FAILURE_CODE,
+                            )
+                        if (
+                            report_snapshot.metadata.result_limit
+                            != query.limit
+                        ):
+                            raise _ResourcePipelineFailure(
+                                stage="RECALL",
+                                error_code=_NORMALIZED_FAILURE_CODE,
+                            )
+                        candidate_ids = tuple(
+                            candidate.record_id
+                            for candidate in report_snapshot.candidates
+                        )
+                    with _stage_guard("RECORDS"):
+                        records_port = _safe_attr(view, "records_by_id")
+                        if not callable(records_port):
+                            raise _ResourcePipelineFailure(
+                                stage="RECORDS",
+                                error_code=_QUERY_VIEW_INVALID_CODE,
+                            )
+                        batch_records = cast(Any, records_port)(candidate_ids)
+                    with _stage_guard("SCORE"):
+                        fuzzy = score_fuzzy_candidates(
+                            resource_id=snapshot.resource_id,
+                            resource_order=snapshot.order,
+                            query=query,
+                            report=report_snapshot,
+                            records=batch_records,
+                            scorer=cast(Any, lazy_scorer),
+                        )
+                    recall_metadata = report_snapshot.metadata
+                    scored_count = fuzzy.scored_count
+                    fuzzy_results = fuzzy.accepted
+                else:
+                    with _stage_guard("RECALL"):
+                        recall_metadata = _unavailable_recall_metadata(
+                            resource_id=snapshot.resource_id,
+                            index_kind=health_snapshot.index_kind,
+                            result_limit=query.limit,
+                        )
+                    scored_count = 0
+                    fuzzy_results = ()
+
+                with _stage_guard("QUERY"):
+                    if health_snapshot.context_available:
+                        local_results = classification.returned_results
+                    else:
+                        local_results = (
+                            (classification.winner,)
+                            if classification.winner is not None
+                            else ()
+                        )
+                    local_results = local_results + fuzzy_results
+                    metadata = ResourceQueryMetadata(
+                        resource_id=snapshot.resource_id,
+                        context_available=health_snapshot.context_available,
+                        context_unavailable_code=(
+                            None
+                            if health_snapshot.context_available
+                            else _CONTEXT_GATE_CLOSED_CODE
+                        ),
+                        recall=recall_metadata,
+                        scored_count=scored_count,
+                        returned_count=0,
+                    )
+                return local_results, metadata
+        except _ResourcePipelineFailure:
+            raise
+        except Exception as error:
+            raise _normalize_stage_error(error, "LEASE") from error

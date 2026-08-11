@@ -9,6 +9,7 @@ from tm_sqlite_store import (
     SQLiteCandidateRecallSnapshot,
     SQLiteCandidateWritePlan,
     SQLiteTMStore,
+    SQLiteTMQueryView,
     SQLiteStoreSchemaError,
     build_candidate_write_plan as _store_build_candidate_write_plan,
     unique_character_ngrams as _store_unique_character_ngrams,
@@ -411,6 +412,293 @@ class FTS5TrigramIndex:
         )
 
 
+@dataclass(frozen=True)
+class _PreparedCandidateQuery:
+    result_limit: int
+    budget: int
+    query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...]
+    fts_query_trigrams: tuple[str, ...] | None
+    fts_query_degenerate: bool
+
+
+def _validate_candidate_scalars(
+    folded_query: object,
+    result_limit: object,
+) -> None:
+    if type(folded_query) is not str:
+        raise TypeError("folded_query must be a built-in string")
+    if type(result_limit) is not int:
+        raise TypeError("result_limit must be a built-in integer")
+    if result_limit < 1:
+        raise ValueError("result_limit must be positive")
+
+
+def _prepare_candidate_query(
+    folded_query: str,
+    result_limit: int,
+) -> _PreparedCandidateQuery:
+    budget = candidate_budget_v1(result_limit)
+    query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...]
+    fts_query_trigrams: tuple[str, ...] | None = None
+    fts_query_degenerate = False
+    if not folded_query:
+        query_grams_by_size = ()
+    elif len(folded_query) == 1:
+        query_grams_by_size = (
+            (1, unique_character_ngrams(folded_query, 1)),
+        )
+    elif len(folded_query) == 2:
+        query_grams_by_size = (
+            (2, unique_character_ngrams(folded_query, 2)),
+        )
+    else:
+        query_grams_by_size = tuple(
+            (
+                gram_size,
+                unique_character_ngrams(folded_query, gram_size),
+            )
+            for gram_size in (3, 2, 1)
+        )
+        query_trigrams = query_grams_by_size[0][1]
+        fts_query_trigrams = query_trigrams
+        fts_query_degenerate = len(query_trigrams) <= 1
+    return _PreparedCandidateQuery(
+        result_limit=result_limit,
+        budget=budget,
+        query_grams_by_size=query_grams_by_size,
+        fts_query_trigrams=fts_query_trigrams,
+        fts_query_degenerate=fts_query_degenerate,
+    )
+
+
+def _candidate_recall_snapshot_or_fail(
+    source: SQLiteTMStore | SQLiteTMQueryView,
+    prepared: _PreparedCandidateQuery,
+) -> SQLiteCandidateRecallSnapshot:
+    try:
+        snapshot = _copy_candidate_recall_snapshot(
+            source.candidate_recall_snapshot(
+                fts_query_trigrams=prepared.fts_query_trigrams,
+                query_grams_by_size=prepared.query_grams_by_size,
+                candidate_floor=CANDIDATE_CONTRACT_FLOOR,
+                fts_query_degenerate=prepared.fts_query_degenerate,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.CANDIDATE_EVIDENCE_INVALID"
+        ) from error
+    return snapshot
+
+
+def _build_candidate_report(
+    resource_id: str,
+    folded_query: str,
+    prepared: _PreparedCandidateQuery,
+    snapshot: SQLiteCandidateRecallSnapshot,
+) -> CandidateRetrievalReport:
+    index_kind = (
+        "FTS5_TRIGRAM"
+        if snapshot.fts5_available and len(folded_query) >= 3
+        else "GRAM_FALLBACK"
+    )
+    if not folded_query:
+        return CandidateRetrievalReport(
+            candidates=(),
+            metadata=CandidateRecallMetadata(
+                resource_id=resource_id,
+                index_kind=index_kind,
+                fuzzy_available=False,
+                fuzzy_unavailable_code=GRAM_EMPTY_QUERY_CODE,
+                stages=(),
+                union_unique_count=0,
+                deduplicated_count=0,
+                result_limit=prepared.result_limit,
+                candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+                candidate_budget=prepared.budget,
+                truncated=False,
+            ),
+        )
+
+    grams_by_stage = {
+        CandidateStage[f"GRAM_{gram_size}"]: grams
+        for gram_size, grams in prepared.query_grams_by_size
+    }
+    if len(folded_query) >= 3:
+        grams_by_stage[CandidateStage.FTS_TRIGRAM] = (
+            unique_character_trigrams(folded_query)
+        )
+    sources_by_id = dict(snapshot.folded_sources)
+    if len(sources_by_id) != len(snapshot.folded_sources):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+    try:
+        raw_stages = tuple(
+            (CandidateStage(stage_name), matches)
+            for stage_name, matches in snapshot.stage_matches
+        )
+    except ValueError as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.CANDIDATE_EVIDENCE_INVALID"
+        ) from error
+    actual_stage_sequence = tuple(stage for stage, _matches in raw_stages)
+    if not folded_query:
+        expected_stage_sequence: tuple[CandidateStage, ...] = ()
+    elif len(folded_query) == 1:
+        expected_stage_sequence = (CandidateStage.GRAM_1,)
+    elif len(folded_query) == 2:
+        expected_stage_sequence = (CandidateStage.GRAM_2,)
+    elif not snapshot.fts5_available:
+        expected_stage_sequence = (
+            CandidateStage.GRAM_3,
+            CandidateStage.GRAM_2,
+            CandidateStage.GRAM_1,
+        )
+    else:
+        expected: list[CandidateStage] = [CandidateStage.FTS_TRIGRAM]
+        fts_ids = {
+            record_id
+            for record_id, _count in (
+                raw_stages[0][1]
+                if raw_stages and raw_stages[0][0] is CandidateStage.FTS_TRIGRAM
+                else ()
+            )
+        }
+        if not fts_ids or prepared.fts_query_degenerate or len(fts_ids) < CANDIDATE_CONTRACT_FLOOR:
+            expected.append(CandidateStage.GRAM_2)
+            gram_2_ids = {
+                record_id
+                for stage, matches in raw_stages
+                if stage is CandidateStage.GRAM_2
+                for record_id, _count in matches
+            }
+            if len(fts_ids | gram_2_ids) < CANDIDATE_CONTRACT_FLOOR:
+                expected.append(CandidateStage.GRAM_1)
+        expected_stage_sequence = tuple(expected)
+    if actual_stage_sequence != expected_stage_sequence:
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+    cumulative_ids: set[int] = set()
+    recall_stages_by_id: dict[int, list[CandidateStage]] = {}
+    matched_by_id: dict[int, int] = {}
+    stage_metadata: list[CandidateStageMetadata] = []
+    executed_query_grams = 0
+
+    for stage, raw_matches in raw_stages:
+        if stage not in grams_by_stage:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+        query_grams = grams_by_stage[stage]
+        executed_query_grams += len(query_grams)
+        input_count = len(cumulative_ids)
+        stage_ids: set[int] = set()
+        for record_id, store_matched_count in raw_matches:
+            if record_id in stage_ids:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+            stage_ids.add(record_id)
+            source = sources_by_id.get(record_id)
+            if source is None:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+            gram_size = 3 if stage is CandidateStage.FTS_TRIGRAM else int(stage.value[-1])
+            source_grams = set(unique_character_ngrams(source, gram_size))
+            matched_count = sum(gram in source_grams for gram in query_grams)
+            if (
+                not 1 <= matched_count <= len(query_grams)
+                or store_matched_count != matched_count
+            ):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+            recall_stages_by_id.setdefault(record_id, []).append(stage)
+            matched_by_id[record_id] = matched_by_id.get(record_id, 0) + matched_count
+        cumulative_ids.update(stage_ids)
+        stage_metadata.append(
+            CandidateStageMetadata(
+                stage=stage,
+                input_count=input_count,
+                added_unique_count=len(cumulative_ids) - input_count,
+                output_unique_count=len(cumulative_ids),
+                dropped_count=0,
+            )
+        )
+
+    if set(sources_by_id) != cumulative_ids:
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+
+    union_count = len(cumulative_ids)
+    stage_metadata.extend(
+        (
+            CandidateStageMetadata(
+                stage=CandidateStage.UNION,
+                input_count=union_count,
+                added_unique_count=0,
+                output_unique_count=union_count,
+                dropped_count=0,
+            ),
+            CandidateStageMetadata(
+                stage=CandidateStage.DEDUPLICATE,
+                input_count=union_count,
+                added_unique_count=0,
+                output_unique_count=union_count,
+                dropped_count=0,
+            ),
+        )
+    )
+    ranked_ids = tuple(
+        sorted(
+            cumulative_ids,
+            key=lambda record_id: (
+                -(matched_by_id[record_id] / executed_query_grams),
+                abs(len(sources_by_id[record_id]) - len(folded_query)),
+                record_id,
+            ),
+        )
+    )
+    truncated = union_count > prepared.budget
+    if truncated:
+        stage_metadata.append(
+            CandidateStageMetadata(
+                stage=CandidateStage.TRUNCATE,
+                input_count=union_count,
+                added_unique_count=0,
+                output_unique_count=prepared.budget,
+                dropped_count=union_count - prepared.budget,
+            )
+        )
+        returned_ids = ranked_ids[:prepared.budget]
+    else:
+        returned_ids = ranked_ids
+    rank_by_id = {
+        record_id: rank
+        for rank, record_id in enumerate(ranked_ids, start=1)
+    }
+    candidates = tuple(
+        CandidateEvidence(
+            record_id=record_id,
+            recall_stages=tuple(recall_stages_by_id[record_id]),
+            matched_grams=matched_by_id[record_id],
+            query_grams=executed_query_grams,
+            overlap_ratio=(
+                matched_by_id[record_id] / executed_query_grams
+            ),
+            pretruncate_rank=rank_by_id[record_id],
+        )
+        for record_id in returned_ids
+    )
+    return CandidateRetrievalReport(
+        candidates=candidates,
+        metadata=CandidateRecallMetadata(
+            resource_id=resource_id,
+            index_kind=index_kind,
+            fuzzy_available=True,
+            fuzzy_unavailable_code=None,
+            stages=tuple(stage_metadata),
+            union_unique_count=union_count,
+            deduplicated_count=union_count,
+            result_limit=prepared.result_limit,
+            candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+            candidate_budget=prepared.budget,
+            truncated=truncated,
+        ),
+    )
+
+
+
 class CandidateRetriever:
     """Sole recall orchestrator for candidate-budget-v1 evidence."""
 
@@ -428,253 +716,44 @@ class CandidateRetriever:
             raise ValueError("resource_id must not be empty")
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be SQLiteTMStore")
-        if type(folded_query) is not str:
-            raise TypeError("folded_query must be a built-in string")
-        if type(result_limit) is not int:
-            raise TypeError("result_limit must be a built-in integer")
-        if result_limit < 1:
-            raise ValueError("result_limit must be positive")
+        _validate_candidate_scalars(folded_query, result_limit)
         if store.coordinator.resource_id != resource_id:
             raise ValueError("resource_id must match the store resource")
-
-        budget = candidate_budget_v1(result_limit)
-        query_grams_by_size: tuple[tuple[int, tuple[str, ...]], ...]
-        fts_query_trigrams: tuple[str, ...] | None = None
-        fts_query_degenerate = False
-        if not folded_query:
-            query_grams_by_size = ()
-        elif len(folded_query) == 1:
-            query_grams_by_size = (
-                (1, unique_character_ngrams(folded_query, 1)),
-            )
-        elif len(folded_query) == 2:
-            query_grams_by_size = (
-                (2, unique_character_ngrams(folded_query, 2)),
-            )
-        else:
-            query_grams_by_size = tuple(
-                (
-                    gram_size,
-                    unique_character_ngrams(folded_query, gram_size),
-                )
-                for gram_size in (3, 2, 1)
-            )
-            query_trigrams = query_grams_by_size[0][1]
-            fts_query_trigrams = query_trigrams
-            fts_query_degenerate = len(query_trigrams) <= 1
-
-        try:
-            snapshot = _copy_candidate_recall_snapshot(
-                store.candidate_recall_snapshot(
-                    fts_query_trigrams=fts_query_trigrams,
-                    query_grams_by_size=query_grams_by_size,
-                    candidate_floor=CANDIDATE_CONTRACT_FLOOR,
-                    fts_query_degenerate=fts_query_degenerate,
-                )
-            )
-        except (TypeError, ValueError) as error:
-            raise SQLiteStoreSchemaError(
-                "STORE.CANDIDATE_EVIDENCE_INVALID"
-            ) from error
-        index_kind = (
-            "FTS5_TRIGRAM"
-            if snapshot.fts5_available and len(folded_query) >= 3
-            else "GRAM_FALLBACK"
+        prepared = _prepare_candidate_query(folded_query, result_limit)
+        snapshot = _candidate_recall_snapshot_or_fail(store, prepared)
+        return _build_candidate_report(
+            resource_id,
+            folded_query,
+            prepared,
+            snapshot,
         )
-        if not folded_query:
-            return CandidateRetrievalReport(
-                candidates=(),
-                metadata=CandidateRecallMetadata(
-                    resource_id=resource_id,
-                    index_kind=index_kind,
-                    fuzzy_available=False,
-                    fuzzy_unavailable_code=GRAM_EMPTY_QUERY_CODE,
-                    stages=(),
-                    union_unique_count=0,
-                    deduplicated_count=0,
-                    result_limit=result_limit,
-                    candidate_budget_version=CANDIDATE_BUDGET_VERSION,
-                    candidate_budget=budget,
-                    truncated=False,
-                ),
-            )
 
-        grams_by_stage = {
-            CandidateStage[f"GRAM_{gram_size}"]: grams
-            for gram_size, grams in query_grams_by_size
-        }
-        if len(folded_query) >= 3:
-            grams_by_stage[CandidateStage.FTS_TRIGRAM] = (
-                unique_character_trigrams(folded_query)
-            )
-        sources_by_id = dict(snapshot.folded_sources)
-        if len(sources_by_id) != len(snapshot.folded_sources):
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-        try:
-            raw_stages = tuple(
-                (CandidateStage(stage_name), matches)
-                for stage_name, matches in snapshot.stage_matches
-            )
-        except ValueError as error:
-            raise SQLiteStoreSchemaError(
-                "STORE.CANDIDATE_EVIDENCE_INVALID"
-            ) from error
-        actual_stage_sequence = tuple(stage for stage, _matches in raw_stages)
-        if not folded_query:
-            expected_stage_sequence: tuple[CandidateStage, ...] = ()
-        elif len(folded_query) == 1:
-            expected_stage_sequence = (CandidateStage.GRAM_1,)
-        elif len(folded_query) == 2:
-            expected_stage_sequence = (CandidateStage.GRAM_2,)
-        elif not snapshot.fts5_available:
-            expected_stage_sequence = (
-                CandidateStage.GRAM_3,
-                CandidateStage.GRAM_2,
-                CandidateStage.GRAM_1,
-            )
-        else:
-            expected: list[CandidateStage] = [CandidateStage.FTS_TRIGRAM]
-            fts_ids = {
-                record_id
-                for record_id, _count in (
-                    raw_stages[0][1]
-                    if raw_stages and raw_stages[0][0] is CandidateStage.FTS_TRIGRAM
-                    else ()
-                )
-            }
-            if not fts_ids or fts_query_degenerate or len(fts_ids) < CANDIDATE_CONTRACT_FLOOR:
-                expected.append(CandidateStage.GRAM_2)
-                gram_2_ids = {
-                    record_id
-                    for stage, matches in raw_stages
-                    if stage is CandidateStage.GRAM_2
-                    for record_id, _count in matches
-                }
-                if len(fts_ids | gram_2_ids) < CANDIDATE_CONTRACT_FLOOR:
-                    expected.append(CandidateStage.GRAM_1)
-            expected_stage_sequence = tuple(expected)
-        if actual_stage_sequence != expected_stage_sequence:
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-        cumulative_ids: set[int] = set()
-        recall_stages_by_id: dict[int, list[CandidateStage]] = {}
-        matched_by_id: dict[int, int] = {}
-        stage_metadata: list[CandidateStageMetadata] = []
-        executed_query_grams = 0
+    def candidates_from_view(
+        self,
+        resource_id: str,
+        view: SQLiteTMQueryView,
+        folded_query: str,
+        *,
+        result_limit: int,
+    ) -> CandidateRetrievalReport:
+        if type(resource_id) is not str:
+            raise TypeError("resource_id must be a built-in string")
+        if not resource_id.strip():
+            raise ValueError("resource_id must not be empty")
+        if type(view) is not SQLiteTMQueryView:
+            raise TypeError("view must be SQLiteTMQueryView")
+        _validate_candidate_scalars(folded_query, result_limit)
+        if view.resource_id != resource_id:
+            raise ValueError("resource_id must match the view resource")
+        prepared = _prepare_candidate_query(folded_query, result_limit)
+        snapshot = _candidate_recall_snapshot_or_fail(view, prepared)
+        return _build_candidate_report(
+            resource_id,
+            folded_query,
+            prepared,
+            snapshot,
+        )
 
-        for stage, raw_matches in raw_stages:
-            if stage not in grams_by_stage:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-            query_grams = grams_by_stage[stage]
-            executed_query_grams += len(query_grams)
-            input_count = len(cumulative_ids)
-            stage_ids: set[int] = set()
-            for record_id, store_matched_count in raw_matches:
-                if record_id in stage_ids:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-                stage_ids.add(record_id)
-                source = sources_by_id.get(record_id)
-                if source is None:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-                gram_size = 3 if stage is CandidateStage.FTS_TRIGRAM else int(stage.value[-1])
-                source_grams = set(unique_character_ngrams(source, gram_size))
-                matched_count = sum(gram in source_grams for gram in query_grams)
-                if (
-                    not 1 <= matched_count <= len(query_grams)
-                    or store_matched_count != matched_count
-                ):
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-                recall_stages_by_id.setdefault(record_id, []).append(stage)
-                matched_by_id[record_id] = matched_by_id.get(record_id, 0) + matched_count
-            cumulative_ids.update(stage_ids)
-            stage_metadata.append(
-                CandidateStageMetadata(
-                    stage=stage,
-                    input_count=input_count,
-                    added_unique_count=len(cumulative_ids) - input_count,
-                    output_unique_count=len(cumulative_ids),
-                    dropped_count=0,
-                )
-            )
-
-        if set(sources_by_id) != cumulative_ids:
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
-
-        union_count = len(cumulative_ids)
-        stage_metadata.extend(
-            (
-                CandidateStageMetadata(
-                    stage=CandidateStage.UNION,
-                    input_count=union_count,
-                    added_unique_count=0,
-                    output_unique_count=union_count,
-                    dropped_count=0,
-                ),
-                CandidateStageMetadata(
-                    stage=CandidateStage.DEDUPLICATE,
-                    input_count=union_count,
-                    added_unique_count=0,
-                    output_unique_count=union_count,
-                    dropped_count=0,
-                ),
-            )
-        )
-        ranked_ids = tuple(
-            sorted(
-                cumulative_ids,
-                key=lambda record_id: (
-                    -(matched_by_id[record_id] / executed_query_grams),
-                    abs(len(sources_by_id[record_id]) - len(folded_query)),
-                    record_id,
-                ),
-            )
-        )
-        truncated = union_count > budget
-        if truncated:
-            stage_metadata.append(
-                CandidateStageMetadata(
-                    stage=CandidateStage.TRUNCATE,
-                    input_count=union_count,
-                    added_unique_count=0,
-                    output_unique_count=budget,
-                    dropped_count=union_count - budget,
-                )
-            )
-            returned_ids = ranked_ids[:budget]
-        else:
-            returned_ids = ranked_ids
-        rank_by_id = {
-            record_id: rank
-            for rank, record_id in enumerate(ranked_ids, start=1)
-        }
-        candidates = tuple(
-            CandidateEvidence(
-                record_id=record_id,
-                recall_stages=tuple(recall_stages_by_id[record_id]),
-                matched_grams=matched_by_id[record_id],
-                query_grams=executed_query_grams,
-                overlap_ratio=(
-                    matched_by_id[record_id] / executed_query_grams
-                ),
-                pretruncate_rank=rank_by_id[record_id],
-            )
-            for record_id in returned_ids
-        )
-        return CandidateRetrievalReport(
-            candidates=candidates,
-            metadata=CandidateRecallMetadata(
-                resource_id=resource_id,
-                index_kind=index_kind,
-                fuzzy_available=True,
-                fuzzy_unavailable_code=None,
-                stages=tuple(stage_metadata),
-                union_unique_count=union_count,
-                deduplicated_count=union_count,
-                result_limit=result_limit,
-                candidate_budget_version=CANDIDATE_BUDGET_VERSION,
-                candidate_budget=budget,
-                truncated=truncated,
-            ),
-        )
 
 
 __all__ = [
