@@ -230,6 +230,14 @@
   - 完成时，每个刷新阶段的失败注入都保持旧 completed pair、发布一致新 pair或明确进入 divergence
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
+- [ ] 5.R3 收束 snapshot artifact 模块边界
+  - 在 Cluster F 发布/恢复状态机、命名空间故障矩阵和 mutation-proof ledger 闭合后，将 deterministic artifact family、no-follow parent dirfd、strict identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码提取到设计指定模块
+  - `TMMigrationService` 仍独占公开 export/refresh 编排和 outcome，`tm_snapshot_recovery.py` 仍独占 receipt reconciliation/terminal replay/divergence 决策，`tm_sqlite_store.py` 仍独占 ledger/binding SQL、transaction、generation 与 coordinator 状态；新模块不反向导入三个 owner
+  - 保留原导入入口、错误码、late-bound fault seam、mutation/清理顺序、durable handoff 生命周期、交易边界与磁盘效果；不夹带异常分支简化、公开 API 改写或 `tm_contracts.py`/`tm_stage_sealer.py` 拆分
+  - 用移动前后同一 Cluster F failure/interleaving matrix、mutation-proof ledger、public API 契约、依赖方向守卫、basedpyright 和 fresh 全量回归证明等价；不设生产或测试文件行数目标
+  - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
+  - _Depends: 5.14_
+
 - [ ] 6. 接入 physical canonical 与现有兼容入口
 
 - [ ] 6.1 接入 canonical import seam 并保持资源配置身份
@@ -334,8 +342,9 @@
 
 - [ ] 9.2 执行 snapshot 与 divergence 故障矩阵
   - 覆盖 export DB/JSONL/manifest crash、外部 JSONL 变化、正常 canonical 写入和 receipt/manifest/ledger/ancestry 错配
+  - 重放 snapshot mutation-proof 负空间：ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节/异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失/损坏与 terminal replay 幂等
   - 覆盖显式 import/rebuild 成败、schema upgrade 失败和配置快照 refresh 恢复
-  - 完成时，只有验证并激活成功的显式消歧会清除 divergence，其他路径均保持三方资产与 canonical authority
+  - 完成时，只有验证并激活成功的显式消歧会清除 divergence，其他路径均保持三方资产、durable replay 证据与 canonical authority，外来 inode 不被删除或覆盖
   - _Requirements: 2.4, 2.8, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
 - [ ] 9.3 执行 matcher、context、fuzzy 与元数据证据矩阵

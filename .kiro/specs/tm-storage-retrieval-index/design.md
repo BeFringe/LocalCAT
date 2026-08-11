@@ -116,6 +116,7 @@ graph LR
 ├── tm_activation_journal.py         # activation journal/terminal codec 与 durable file protocol
 ├── tm_activation_recovery.py        # phase recovery、成套 publication/rollback 与窄 store-validation port
 ├── tm_schema_upgrade.py             # schema upgrade copy 数据面与 pending/reported artifact 协议
+├── tm_snapshot_artifacts.py         # snapshot artifact namespace/proof/handoff primitives
 ├── tm_candidate_index.py            # FTS5/gram candidate retrievers
 ├── tm_similarity.py                 # Levenshtein、Dice、scorer-v1
 ├── tm_retrieval.py                  # exact/context/fuzzy pipeline 与聚合
@@ -148,6 +149,8 @@ graph LR
 Activation 模块在 Task 5.9 闭合完整恢复矩阵后、Cluster D 统一复审前做行为保持型提取。`tm_sqlite_store.py` 在 Feature 5 内继续保持既有 `ResourceStoreCoordinator` 导入入口，但不再拥有 journal/terminal canonical codec、exclusive temporary/replace/fsync 原语或逐 phase 恢复/回滚实现；新模块不得反向导入 `SQLiteTMStore`，只能消费 frozen contracts 与显式窄端口。提取不得修改 journal phase、错误码、token/nonce 单次语义、fault-injection 顺序或 public lease/activation 行为；原 Cluster D characterization/failure matrix 必须在移动前后使用同一断言通过。`tm_contracts.py` 与 `tm_stage_sealer.py` 不属于本次提取范围，待 Feature 5 契约面稳定后另行评估。
 
 Cluster E 行为闭合后、Cluster F 开始前增加 schema-upgrade 行为保持型边界提取。`tm_schema_upgrade.py` 仅拥有 v1→v2 copy 数据面、backup/locator 的 pending→reported 持久化协议、strict locator file proof 与纯候选事实校验；它不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，只通过显式值、callback/窄端口消费 schema DDL 和 canonical ancestry 证明。`ResourceStoreCoordinator` 仍在 `tm_sqlite_store.py` 独占 ticket/locator snapshot 所有权、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService.upgrade_schema()` 的公开入口、成败编排和 report/failure 构造仍在 `tm_migration.py`。原模块对已有 private 导入与 fault-injection patch seam 保留 late-bound compatibility wrapper，不得藉移动改变分支顺序、异常码、cleanup 顺序或磁盘效果。`tm_contracts.py`、`tm_stage_sealer.py`、canonical ancestry 单一证明实现与通用 coordinator 状态机不纳入此次提取；`try/except/if/raise` 简化属于正交的后续治理，不与等价移动同一提交。提取前后必须用同一 Cluster E failure/interleaving matrix、公开 API 契约、import-boundary 守卫和 fresh 全量回归证明等价。
+
+Cluster F 行为、命名空间与冷恢复矩阵闭合后增加 snapshot artifact 行为保持型边界提取。`tm_snapshot_artifacts.py` 只拥有 deterministic JSONL/manifest/temp/recovery family、root→parent no-follow directory descriptor 绑定、strict regular/single-link identity+digest proof、exclusive temporary/recovery copy、replace/cleanup 原语与 durable handoff 值编解码；它不反向导入 `tm_sqlite_store.py`、`tm_migration.py` 或 `tm_snapshot_recovery.py`。`TMMigrationService` 仍独占公开 export/refresh 编排、canonical snapshot 使用和 report/failure 构造；`tm_snapshot_recovery.py` 仍独占 receipt 分类、reconciliation、terminal replay 和 divergence 决策；`tm_sqlite_store.py` 仍独占 ledger/binding SQL、transaction、generation 与 coordinator 状态。已有 owner 导入和 fault-injection seam 通过 late-bound compatibility wrapper 保留，不得改变错误码、调用/清理顺序、durable handoff 生命周期、交易边界或磁盘效果。该门不设行数指标；只用 owner 责任减少、无反向导入、Cluster F 同一断言与 fresh 全量回归判定成功。异常分支简化、错误分类重新设计、`tm_contracts.py`/`tm_stage_sealer.py` 拆分与公开 API 调整全部排除。
 
 ### Modified Files
 
@@ -246,6 +249,7 @@ sequenceDiagram
 | StageSealer | Storage workflow | 闭合索引、校验、fsync 并生成不可变 artifact | 2, 7 | staged Store | Service |
 | SourceBindingMonitor | Storage workflow | JSONL snapshot 同源性与 divergence 状态机 | 1, 2, 7 | Store metadata | State, Service |
 | TMMigrationService | Storage workflow | JSONL migration/import/rebuild/export/upgrade | 2, 7, 8 | Store, Sealer | Batch |
+| SnapshotArtifactProtocol | Storage mechanism | snapshot artifact namespace、identity proof、replace/cleanup 与 handoff codec | 2, 7 | frozen contracts, stdlib filesystem | Service |
 | CandidateRetriever | Index | recall-only candidate ids | 4, 5, 8 | Store/FTS5 | Service |
 | SimilarityScorerV1 | Domain | Levenshtein/Dice/final | 4, 5, 8 | 无 | Service |
 | TMRetrievalService | Domain | exact/context/fuzzy order | 1, 3–5, 7 | Store/Index/Scorer | Service |
@@ -827,6 +831,8 @@ class TMMigrationService:
 
 issued receipt 的 versioned artifact handoff 同时记录排他 temp/recovery copy 身份、其真实直接父目录的 device/inode，以及发布前 final pair 的 identity/digest/明确缺席事实。handoff 必须跨越 completed/cancelled 终态事务继续存在；只有先验证 terminal receipt 的 resource/canonical identity、revision ancestry、配置/任意路径分类、authority alias、完整真实父目录链与 durable parent identity，再按 exact identity+digest 清理 owned artifact、通过绑定该 parent identity 的 no-follow directory descriptor 执行 fsync、严格复核父目录未替换且四个 deterministic artifact path 均缺席后，才可清除 handoff。任何外来同字节 inode、symlink、hardlink、目录、父目录替换或 fsync 失败都保持文件与 handoff、返回 `BLOCKED`/cleanup-pending failure；不得在 cleanup 未闭合时报告成功。预先锁存的配置 divergence 只阻止 configured terminal replay，不得永久阻塞与 binding/divergence 无关的任意路径 terminal cleanup。任意路径 export replay 始终不改变 active binding 或 divergence；配置 refresh replay 仍受资源级可重入 observation gate 串行化。
 
+路径字符串和相同字节不是命名空间授权。每个 replace/rename/delete 必须遵循同一 mutation-proof 模型：从稳定 root 逐段 no-follow 绑定直接父目录，以 durable handoff/receipt 确定允许的 source、destination 和先前缺席/身份事实，在最后一个可观测 fault seam 返回后、紧邻 mutation 之前同时复证 source 与 destination，使用该 dirfd 执行变更，然后复核 final 就是已交接 source inode、fsync parent 并持久化状态转换。父目录 rename/ABA、source 或 destination 在复证窗口被替换、多链接、同字节外来 inode 或无法复核的 post-mutation 结果均不得继续完成/清理，必须保留 durable replay 证据并 fail-closed。
+
 显式 import/rebuild 与 export 不互相冒充：只有 import/rebuild 能在 divergence 后创建新 canonical generation、更新 source binding 并清除状态；export 永不把一个未知外部 JSONL 宣称为 canonical 来源。
 
 ### CandidateRetriever
@@ -1065,7 +1071,7 @@ class TMBenchmark:
 | Matcher gate | unavailable/profile/options 未验证 | fail-closed outcome + 同一 capability snapshot |
 | Index | count mismatch、query error | 不使用该 index；health/report 明示 |
 | Query | 单资源失败 | partial QueryReport + failure |
-| Export | fsync/replace 失败 | `ExportFailure` 标明旧目标是否保持及 recovery path |
+| Export | fsync/replace 失败 | `ExportFailure` 报告旧目标保持证据、recovery locators 与 committed/ambiguous 状态，无法证明时 fail-stop |
 | Unicode | unsupported semantics version | 拒绝，不回退未版本化行为 |
 
 公开错误不包含完整 source/target；默认日志记录 resource id/path、stage、counts、SQLite code 和 exception category。
@@ -1108,6 +1114,7 @@ class TMBenchmark:
 - QueryReport 分别区分“CONTEXT/FUZZY 可用但本次无命中”与“对应 gate 未开放”，并在 global limit 后对账每资源 returned count。
 - canonical 正常写入不触发/清除 divergence；外部 JSONL 变化触发，显式 import/rebuild 失败保持三方资产，成功才换 generation 并清除。
 - 配置快照 refresh 的 issued receipt 在 crash 后按 digest 完成、取消或进入 divergence，不回滚 canonical。
+- snapshot publication/recovery 的 mutation-proof 矩阵覆盖 ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节或异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失或损坏、terminal replay 幂等和外来 inode 不删不覆盖。
 - same-source variants：winner EXACT、positive context CONTEXT、no evidence retained-only。
 - multi-resource query：stable global order、partial failure、resource provenance。
 - facade 激活前后 `query_exact/save_record` 一致。
