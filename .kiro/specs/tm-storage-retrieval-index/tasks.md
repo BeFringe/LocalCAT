@@ -267,7 +267,7 @@
 
 - [ ] 7. 实现确定性 exact、context 与 fuzzy 检索
 
-- [ ] 7.1 实现 exact winner 与 raw context 分类
+- [x] 7.1 实现 exact winner 与 raw context 分类
   - exact 仅使用 raw source 完全相等，winner 保持同资源最后有效记录；其他同 source 变体仅在存在正面 raw context 证据时分类为 CONTEXT
   - context-v1 只比较双方非空的 speaker/previous/next 原始完整字段，保持大小写和空白敏感，不伪造缺失事实
   - 完成时，EXACT→CONTEXT 类型、context strength 和 retained-only 变体黄金向量逐项一致
@@ -420,3 +420,4 @@
 - 2026-08-12 / Task 6.2：`TMEngine` 成为 legacy/canonical 唯一 facade，Active/Lookup/Update 使用 exact-bool 门，激活后 exact/save 只经 generation lease 访问 SQLite。新 coordinator runtime-rehydration seam 把 completed activation 的 generation/lineage、store identity、exact sidecar inode、schema/integrity/FK、ledger binding 与 candidate index 闭合后再由 monitor 派生 CURRENT/HISTORY/DIVERGED，不再用激活时 JSONL parity 回滚合法 head；未闭合激活仍交给 Task 5.8/5.9 严格恢复，canonical 不可证时 fail-stop 且不回退 JSONL。Tasks 6.1–6.2 相关矩阵 292/292、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Task 6.3：用真实 sidecar 激活前后的同一组输入比较完整 `LogicController` payload、openpyxl 渲染与 status counts；exact `same→winner` 保持高于同名 glossary，exact miss 后仍进入 `Glossary→术语`，完全 miss 仍为 `NO_MATCH`，对外状态集严格只有 `TM_HIT / TERMS_FOUND / NO_MATCH`。Controller/Excel/facade focused 27/27、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Cluster G 复审：累积复审批准 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷打开权威矩阵、canonical import 事务与三态兼容，无 P0–P2 遗留；唯一 P3 将非相同 digest 的 SQLite constraint 误报为重复导入，已收紧为只识别 `tm_origin_batch(kind, source_digest)` 唯一约束并完成定点复验。主 agent fresh 全量 930/930（skip 1，含 Qt smoke），累积变更文件 basedpyright error-level 0 errors，py_compile 与 range diff check 通过。
+- 2026-08-12 / Task 7.1：新增独立 retrieval domain seam；同资源 raw-exact 组只取最大有效 `record_id` 为 EXACT，其他变体仅在双方非空的 speaker/previous/next 原始完整字段出现至少一项正匹配时成为 CONTEXT，大小写/空白差异保持 mismatch，缺失事实不参与比较，无正面证据的变体只保留不返回。输入组对非 exact source、重复 identity 与非法空结果身份 fail-closed；focused 17/17、相关回归 130/130、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
