@@ -238,7 +238,7 @@
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
   - _Depends: 5.14_
 
-- [ ] 6. 接入 physical canonical 与现有兼容入口
+- [x] 6. 接入 physical canonical 与现有兼容入口
 
 - [x] 6.1 接入 canonical import seam 并保持资源配置身份
   - 已激活资源按验证后的输入顺序直接写入 canonical，不先修改 JSONL、不折叠相同 source；未激活资源保留既有原子 JSONL 路径
@@ -258,7 +258,7 @@
   - 完成时，成功保存、拒绝保存、事务回滚、generation 变化、冷重开和 divergence 矩阵的 exact winner 均符合预期
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.3, 2.11, 2.12, 2.13, 7.5, 7.6, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 6.3 保持 LogicController 与 Excel 三态兼容
+- [x] 6.3 保持 LogicController 与 Excel 三态兼容
   - 保持 TM_HIT、TERMS_FOUND、NO_MATCH 三态和字段含义，不新增 context/fuzzy 第四态
   - 保持 exact 未命中后先查术语、再返回 NO_MATCH，以及既有资源优先级和 Excel 输出
   - 在不修改 Qt 控件或产品逻辑的前提下验证 sidecar 激活前后同输入 parity
@@ -418,3 +418,4 @@
 - 2026-08-11 / Task 5.R3：将 Cluster F 已批准的 deterministic artifact family、root→parent no-follow dirfd、strict identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 编解码等 81 个顶层定义提取到 `tm_snapshot_artifacts.py`；`tm_migration.py`/`tm_snapshot_recovery.py`/`tm_sqlite_store.py` 分别减少 1260/879/330 行，仍分别独占公开 export/refresh outcome、receipt reconciliation/terminal replay/divergence 与 ledger/binding SQL/transaction/generation/coordinator 权威。owner 保留 late-bound wrapper 和 fault seam，新模块不反向导入三个 owner，错误码、mutation/清理顺序、durable handoff 生命周期与磁盘效果未改；异常分支简化未混入。F-R `v4_flash_worker`/max 等价性复审批准且无 P0–P3 遗留；新边界守卫 19/19、Cluster F/owner focused 333/333（skip 1）、fresh 全量 905/905（skip 1，含 Qt smoke）、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Task 6.1：已激活 TMX merge import 从同一个最大 100 MiB 不可变字节快照完成 DTD/实体拒绝、解析与 source digest，按输入顺序以 `import` batch 保留同 source 变体，不修改 JSONL/manifest/binding/divergence；同 digest 重试确定拒绝且不重复，合法 head 前进后 fresh reopen 保持 canonical `VERIFIED_HISTORY`。未激活资源仍走原子 JSONL last-write-wins 路径。
 - 2026-08-12 / Task 6.2：`TMEngine` 成为 legacy/canonical 唯一 facade，Active/Lookup/Update 使用 exact-bool 门，激活后 exact/save 只经 generation lease 访问 SQLite。新 coordinator runtime-rehydration seam 把 completed activation 的 generation/lineage、store identity、exact sidecar inode、schema/integrity/FK、ledger binding 与 candidate index 闭合后再由 monitor 派生 CURRENT/HISTORY/DIVERGED，不再用激活时 JSONL parity 回滚合法 head；未闭合激活仍交给 Task 5.8/5.9 严格恢复，canonical 不可证时 fail-stop 且不回退 JSONL。Tasks 6.1–6.2 相关矩阵 292/292、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 6.3：用真实 sidecar 激活前后的同一组输入比较完整 `LogicController` payload、openpyxl 渲染与 status counts；exact `same→winner` 保持高于同名 glossary，exact miss 后仍进入 `Glossary→术语`，完全 miss 仍为 `NO_MATCH`，对外状态集严格只有 `TM_HIT / TERMS_FOUND / NO_MATCH`。Controller/Excel/facade focused 27/27、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
