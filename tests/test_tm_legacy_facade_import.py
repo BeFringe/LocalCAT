@@ -10,6 +10,7 @@ JSONL last-write-wins merge unchanged.
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -248,6 +249,32 @@ class CanonicalImportSeamTests(unittest.TestCase):
                 store.canonical_revision().record_count,
                 3,
             )
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_non_duplicate_integrity_failure_is_not_misreported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _activate_resource(root)
+            original = target.read_bytes()
+            source = root / "batch.tmx"
+            self._write_tmx(source, _tmx_units(("Alpha", "甲")))
+            store = _store_for(target)
+
+            with patch.object(
+                SQLiteTMStore,
+                "append_batch",
+                side_effect=sqlite3.IntegrityError(
+                    "CHECK constraint failed: valid_count"
+                ),
+            ):
+                report = import_tmx(source, target, "en-US", "zh-CN")
+
+            self.assertFalse(report.succeeded)
+            self.assertEqual(
+                report.errors,
+                ("canonical import transaction constraint failed",),
+            )
+            self.assertEqual(store.canonical_revision().record_count, 3)
             self.assertEqual(target.read_bytes(), original)
 
     def test_unactivated_import_keeps_legacy_last_write_wins_folding(self) -> None:

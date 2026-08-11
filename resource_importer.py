@@ -86,8 +86,12 @@ def import_tmx(
                     duplicate_source_count=duplicate_count,
                 )
             except sqlite3.IntegrityError as exc:
+                if _is_identical_import_constraint(exc):
+                    raise ImportFailure(
+                        "import already applied: identical source digest"
+                    ) from exc
                 raise ImportFailure(
-                    "import already applied: identical source digest"
+                    "canonical import transaction constraint failed"
                 ) from exc
             LOGGER.info(
                 "Imported %d canonical TM entries from %s",
@@ -336,6 +340,17 @@ def _tmx_import_draft(
         context_next_raw=None,
         file_source=file_name,
         provenance=(("source", "tmx-import"), ("file", file_name)),
+    )
+
+
+def _is_identical_import_constraint(error: sqlite3.IntegrityError) -> bool:
+    """Recognize only the origin digest uniqueness contract."""
+
+    return (
+        getattr(error, "sqlite_errorcode", None)
+        == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        and "tm_origin_batch.kind, tm_origin_batch.source_digest"
+        in str(error)
     )
 
 
