@@ -10,7 +10,7 @@ journal-authenticated new set cannot be proven at any phase.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -37,6 +37,7 @@ from text_matcher import (
 )
 from tm_contracts import (
     SCORER_VERSION_V1,
+    SNAPSHOT_BINDING_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -1466,6 +1467,8 @@ class ResourceStoreCoordinator:
         self._schema_upgrade_locator_snapshot: (
             _SchemaUpgradeLocatorSnapshot | None
         ) = None
+        self._refresh_gate_owner: int | None = None
+        self._refresh_gate_depth = 0
 
     @property
     def resource_id(self) -> str:
@@ -1598,6 +1601,119 @@ class ResourceStoreCoordinator:
                     raise RuntimeError("operation lease count underflow")
                 if self._active_lease_count == 0:
                     self._condition.notify_all()
+
+    @contextmanager
+    def _refresh_observation_gate(
+        self,
+        timeout_seconds: float | None = None,
+        *,
+        require_ready_resource: bool = False,
+    ) -> Iterator[None]:
+        """Bound configured-pair observation against refresh publication.
+
+        Task 5.13: the configured pair publication intentionally runs a
+        JSONL-only window between the JSONL replace and the manifest
+        replace, so any ``SourceBindingMonitor.observe()`` read that
+        overlaps that window would latch a false ``SOURCE_DIVERGED``.
+        Both the refresh reservation and public observations pass
+        through this gate, which is scoped to one resource coordinator
+        (never a process-global lock).  The owner is the acquiring
+        thread identity plus a nesting depth, so the refresh's own
+        reentrant preflight observation under its reservation cannot
+        deadlock; other threads wait up to the bounded timeout and a
+        wedged holder converts to a retryable ``STORE.REFRESH_BUSY``
+        failure.  The gate is never acquired while an operation lease
+        is held and activation draining never acquires the gate, so it
+        cannot deadlock against leases or draining.
+        """
+
+        timeout = (
+            _REFRESH_RESERVATION_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else _require_timeout(timeout_seconds)
+        )
+        owner = threading.get_ident()
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while (
+                self._refresh_gate_owner is not None
+                and self._refresh_gate_owner != owner
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SQLiteStoreLifecycleError(
+                        "STORE.REFRESH_BUSY",
+                        resource_id=self._resource_id,
+                        generation=(
+                            0
+                            if self._view is None
+                            else self._view.generation
+                        ),
+                        retryable=True,
+                    )
+                self._condition.wait(remaining)
+            if require_ready_resource:
+                if self._state != "READY":
+                    raise SQLiteStoreLifecycleError(
+                        "STORE.RESOURCE_DRAINING",
+                        resource_id=self._resource_id,
+                        generation=(
+                            0
+                            if self._view is None
+                            else self._view.generation
+                        ),
+                        retryable=True,
+                    )
+                if self._view is None:
+                    raise SQLiteStoreLifecycleError(
+                        "STORE.CANONICAL_UNAVAILABLE",
+                        resource_id=self._resource_id,
+                        generation=0,
+                        retryable=False,
+                    )
+            if self._refresh_gate_owner is None:
+                self._refresh_gate_owner = owner
+            self._refresh_gate_depth += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._refresh_gate_depth -= 1
+                if self._refresh_gate_depth < 0:
+                    self._refresh_gate_depth = 0
+                    self._state = "FAILED"
+                    self._condition.notify_all()
+                    raise RuntimeError("refresh observation gate underflow")
+                if self._refresh_gate_depth == 0:
+                    self._refresh_gate_owner = None
+                    self._condition.notify_all()
+
+    @contextmanager
+    def configured_refresh_reservation(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """Serialize configured snapshot refreshes for one resource.
+
+        Task 5.13: the configured pair publication intentionally runs a
+        JSONL-only window between the JSONL replace and the manifest
+        replace.  A second refresh or a public monitor observation
+        crossing that window must not treat it as tampering and latch
+        ``SOURCE_DIVERGED``, so the whole refresh operation is
+        serialized under this reservation through the shared reentrant
+        observation gate.  The reservation is held only across the
+        operation body, rejects a draining/unavailable resource at
+        acquisition, and is never acquired while an operation lease is
+        held, so it cannot deadlock against leases or activation
+        draining; a bounded wait converts a wedged holder into a
+        retryable ``STORE.REFRESH_BUSY`` failure.
+        """
+
+        with self._refresh_observation_gate(
+            timeout_seconds=timeout_seconds,
+            require_ready_resource=True,
+        ):
+            yield
 
     def prepare_schema_upgrade_ticket(
         self,
@@ -3034,65 +3150,82 @@ class SourceBindingMonitor:
         self._coordinator = coordinator
 
     def observe(self) -> SourceBindingObservation:
-        """Derive and latch source divergence in one generation lease."""
+        """Derive and latch source divergence in one generation lease.
 
-        with self._coordinator._operation_lease() as lease:
-            while True:
-                with _open_leased_connection(lease) as connection:
-                    facts = _read_source_binding_facts(connection, lease)
-                diagnostics = list(facts.diagnostic_codes)
-                binding = facts.binding
-                if facts.divergence_latched:
-                    diagnostics.append("SOURCE_BINDING.DIVERGENCE_LATCHED")
-                elif binding is None:
-                    diagnostics.append("SOURCE_BINDING.LEDGER_MISSING")
-                else:
-                    diagnostics.extend(
-                        _configured_pair_diagnostics(
-                            binding,
-                            identity=lease.stage.resource_identity,
-                            canonical_store_id=lease.canonical_store_id,
-                            head_revision=facts.head_revision,
-                            cumulative_record_counts=(
-                                facts.cumulative_record_counts
-                            ),
-                        )
-                    )
+        The observation passes through the coordinator's refresh
+        observation gate: when a configured refresh holds its
+        reservation the observation waits (bounded) and then reads the
+        fully published pair, so the intentional JSONL-only publication
+        window can never be read as tampering and latch a false
+        ``SOURCE_DIVERGED``.  The owning refresh's own reentrant
+        preflight observation under its reservation is not blocked by
+        the gate.
+        """
 
-                diagnostic_codes = tuple(sorted(set(diagnostics)))
-                if diagnostic_codes:
-                    if (
-                        not facts.divergence_latched
-                        and not _latch_source_divergence(
-                            lease,
-                            expected_fingerprint=(
-                                facts.canonical_fingerprint
-                            ),
+        with self._coordinator._refresh_observation_gate():
+            with self._coordinator._operation_lease() as lease:
+                while True:
+                    with _open_leased_connection(lease) as connection:
+                        facts = _read_source_binding_facts(connection, lease)
+                    diagnostics = list(facts.diagnostic_codes)
+                    binding = facts.binding
+                    if facts.divergence_latched:
+                        diagnostics.append(
+                            "SOURCE_BINDING.DIVERGENCE_LATCHED"
                         )
-                    ):
-                        continue
-                    state = SourceBindingState.SOURCE_DIVERGED
-                else:
-                    assert binding is not None
-                    state = (
-                        SourceBindingState.VERIFIED_CURRENT
-                        if binding.receipt.exported_revision
-                        == facts.head_revision
-                        else SourceBindingState.VERIFIED_HISTORY
+                    elif binding is None:
+                        diagnostics.append(
+                            "SOURCE_BINDING.LEDGER_MISSING"
+                        )
+                    else:
+                        diagnostics.extend(
+                            _configured_pair_diagnostics(
+                                binding,
+                                identity=lease.stage.resource_identity,
+                                canonical_store_id=lease.canonical_store_id,
+                                head_revision=facts.head_revision,
+                                cumulative_record_counts=(
+                                    facts.cumulative_record_counts
+                                ),
+                            )
+                        )
+
+                    diagnostic_codes = tuple(sorted(set(diagnostics)))
+                    if diagnostic_codes:
+                        if (
+                            not facts.divergence_latched
+                            and not _latch_source_divergence(
+                                lease,
+                                expected_fingerprint=(
+                                    facts.canonical_fingerprint
+                                ),
+                            )
+                        ):
+                            continue
+                        state = SourceBindingState.SOURCE_DIVERGED
+                    else:
+                        assert binding is not None
+                        state = (
+                            SourceBindingState.VERIFIED_CURRENT
+                            if binding.receipt.exported_revision
+                            == facts.head_revision
+                            else SourceBindingState.VERIFIED_HISTORY
+                        )
+                    return SourceBindingObservation(
+                        resource_id=(
+                            lease.stage.resource_identity.resource_id
+                        ),
+                        canonical_store_id=lease.canonical_store_id,
+                        generation=lease.generation,
+                        head_revision=facts.head_revision,
+                        state=state,
+                        binding_digest=(
+                            None
+                            if binding is None
+                            else _snapshot_binding_digest(binding)
+                        ),
+                        diagnostic_codes=diagnostic_codes,
                     )
-                return SourceBindingObservation(
-                    resource_id=lease.stage.resource_identity.resource_id,
-                    canonical_store_id=lease.canonical_store_id,
-                    generation=lease.generation,
-                    head_revision=facts.head_revision,
-                    state=state,
-                    binding_digest=(
-                        None
-                        if binding is None
-                        else _snapshot_binding_digest(binding)
-                    ),
-                    diagnostic_codes=diagnostic_codes,
-                )
 
     def register_completed_binding(self, binding: SnapshotBinding) -> None:
         """Register a pair already published and validated by its owner.
@@ -3658,6 +3791,57 @@ def _binding_from_ledger_row(row: tuple[object, ...]) -> SnapshotBinding:
     )
 
 
+def _strict_pair_file_state(
+    path: Path,
+) -> tuple[str, str | None, tuple[int, int] | None]:
+    """One descriptor-based no-follow proof of a configured pair entry.
+
+    Returns ``("absent", None, None)`` when the path does not exist,
+    ``("unsafe", None, None)`` when the path is a symlink, directory,
+    multi-link entry, unreadable, or whose terminal identity is not
+    stable, and ``("present", digest, identity)`` only for a regular
+    single-link file whose bytes are hashed through the descriptor and
+    whose terminal ``lstat`` still reports the same device/inode.
+    Pathname hashing is never used, so a foreign same-byte inode cannot
+    masquerade as a stable owned entry.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except FileNotFoundError:
+        return ("absent", None, None)
+    except OSError:
+        return ("unsafe", None, None)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            return ("unsafe", None, None)
+        identity = (observed.st_dev, observed.st_ino)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError:
+        return ("unsafe", None, None)
+    finally:
+        os.close(descriptor)
+    try:
+        final = os.lstat(path)
+    except OSError:
+        return ("unsafe", None, None)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_nlink != 1
+        or (final.st_dev, final.st_ino) != identity
+    ):
+        return ("unsafe", None, None)
+    return ("present", digest.hexdigest(), identity)
+
+
 def _configured_pair_diagnostics(
     binding: SnapshotBinding,
     *,
@@ -3694,34 +3878,34 @@ def _configured_pair_diagnostics(
     ):
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
-    try:
-        jsonl_digest = _file_sha256(identity.configured_jsonl_path)
-    except FileNotFoundError:
+    jsonl_state, jsonl_digest, _jsonl_identity = _strict_pair_file_state(
+        identity.configured_jsonl_path
+    )
+    if jsonl_state == "absent":
         diagnostics.append("SOURCE_BINDING.JSONL_MISSING")
-    except OSError:
-        diagnostics.append("SOURCE_BINDING.JSONL_UNREADABLE")
-    else:
-        if jsonl_digest != receipt.jsonl_digest:
-            diagnostics.append("SOURCE_BINDING.JSONL_DIGEST_MISMATCH")
+    elif jsonl_state == "unsafe":
+        diagnostics.append("SOURCE_BINDING.JSONL_UNSAFE")
+    elif jsonl_digest != receipt.jsonl_digest:
+        diagnostics.append("SOURCE_BINDING.JSONL_DIGEST_MISMATCH")
 
-    try:
-        manifest_bytes = identity.snapshot_manifest_path.read_bytes()
-    except FileNotFoundError:
+    manifest_state, manifest_digest, _manifest_identity = (
+        _strict_pair_file_state(identity.snapshot_manifest_path)
+    )
+    expected_bytes = contract_to_json(binding.manifest).encode("utf-8")
+    if manifest_state == "absent":
         diagnostics.append("SOURCE_BINDING.MANIFEST_MISSING")
-    except OSError:
-        diagnostics.append("SOURCE_BINDING.MANIFEST_UNREADABLE")
+    elif manifest_state == "unsafe":
+        diagnostics.append("SOURCE_BINDING.MANIFEST_UNSAFE")
+    elif manifest_digest != hashlib.sha256(expected_bytes).hexdigest():
+        diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
     else:
-        expected_bytes = contract_to_json(binding.manifest).encode("utf-8")
-        if manifest_bytes != expected_bytes:
-            diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
+        try:
+            decoded = contract_from_json(expected_bytes.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            diagnostics.append("SOURCE_BINDING.MANIFEST_INVALID")
         else:
-            try:
-                decoded = contract_from_json(manifest_bytes.decode("utf-8"))
-            except (TypeError, ValueError, UnicodeDecodeError):
-                diagnostics.append("SOURCE_BINDING.MANIFEST_INVALID")
-            else:
-                if type(decoded) is not SnapshotManifest or decoded != binding.manifest:
-                    diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
+            if type(decoded) is not SnapshotManifest or decoded != binding.manifest:
+                diagnostics.append("SOURCE_BINDING.MANIFEST_MISMATCH")
     return tuple(sorted(set(diagnostics)))
 
 
@@ -3863,6 +4047,9 @@ def _latch_source_divergence(
             raise
 
 
+_REFRESH_RESERVATION_TIMEOUT_SECONDS = 300.0
+
+
 def _require_timeout(value: object) -> float:
     if type(value) is int:
         timeout = float(value)
@@ -3906,6 +4093,21 @@ class SQLiteTMStore:
     @property
     def source_binding_monitor(self) -> SourceBindingMonitor:
         return self._source_binding_monitor
+
+    def configured_refresh_reservation(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> AbstractContextManager[None]:
+        """Serialize one configured snapshot refresh for this resource.
+
+        The reservation is owned by the coordinator and scoped to the
+        refresh operation so a second refresh never observes the first
+        refresh's intentional JSONL-only publication window.
+        """
+
+        return self._coordinator.configured_refresh_reservation(
+            timeout_seconds=timeout_seconds,
+        )
 
     def canonical_revision(self) -> CanonicalRevisionSnapshot:
         with self._coordinator._operation_lease() as lease:
@@ -4173,6 +4375,107 @@ class SQLiteTMStore:
                     connection.rollback()
                     raise
 
+    def register_issued_refresh_receipt(
+        self,
+        receipt: SnapshotReceipt,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Atomically register one configured-path issued refresh receipt.
+
+        Task 5.13 ledger seam: the receipt must describe exactly the
+        current canonical revision of the live store (never a history
+        revision), the resource must not be divergence-latched, and the
+        stored destination paths are the configured JSONL and its
+        deterministic adjacent manifest.  The snapshot binding, head
+        revision and generation are never modified here.
+        """
+
+        private_receipt = _snapshot_receipt(receipt)
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if (
+                private_receipt.resource_id != identity.resource_id
+                or private_receipt.canonical_store_id
+                != lease.canonical_store_id
+            ):
+                raise SQLiteStoreSchemaError(
+                    "STORE.RECEIPT_IDENTITY_MISMATCH"
+                )
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    if (
+                        private_receipt.exported_revision
+                        != revision.head_revision
+                        or private_receipt.record_count
+                        != revision.record_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_REVISION_STALE"
+                        )
+                    meta = _read_meta(connection)
+                    if _meta_bool(meta, "divergence_latched"):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.DIVERGENCE_LATCHED"
+                        )
+                    existing = connection.execute(
+                        "SELECT 1 FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id = ?",
+                        (private_receipt.snapshot_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_DUPLICATE"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_receipt("
+                        "snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?)",
+                        (
+                            private_receipt.snapshot_id,
+                            private_receipt.resource_id,
+                            private_receipt.canonical_store_id,
+                            private_receipt.exported_revision,
+                            private_receipt.jsonl_digest,
+                            private_receipt.record_count,
+                            private_receipt.format_version,
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            datetime.now(UTC).isoformat(),
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
     def complete_issued_export_receipt(
         self,
         snapshot_id: str,
@@ -4270,6 +4573,209 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def complete_issued_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        jsonl_identity: tuple[int, int] | None = None,
+        manifest_identity: tuple[int, int] | None = None,
+    ) -> None:
+        """Atomically complete one issued refresh receipt and rebind.
+
+        Task 5.13 final transaction: one issued configured-path receipt
+        is marked completed and the single snapshot binding is pointed
+        at that same completed receipt/manifest in one transaction.
+        The published pair must still pass the strict no-follow,
+        regular, single-link, stable-identity capture, and when the
+        exact created/published identities are supplied they must match
+        that capture so a same-byte foreign inode swap fails closed.
+        Canonical records, head revision, generation and the divergence
+        latch are never modified; a latched divergence fails this
+        transaction closed.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        for identity_value, field_name in (
+            (jsonl_identity, "jsonl_identity"),
+            (manifest_identity, "manifest_identity"),
+        ):
+            if identity_value is not None and (
+                type(identity_value) is not tuple
+                or len(identity_value) != 2
+                or type(identity_value[0]) is not int
+                or type(identity_value[1]) is not int
+            ):
+                raise ValueError(f"{field_name} is invalid")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, exported_revision, "
+                        "jsonl_digest, record_count, format_version "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    if (
+                        str(row[3])
+                        != Path.__str__(identity.configured_jsonl_path)
+                        or str(row[4])
+                        != Path.__str__(identity.snapshot_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PATH_MISMATCH"
+                        )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    try:
+                        receipt = SnapshotReceipt(
+                            snapshot_id=snapshot_id,
+                            resource_id=str(row[0]),
+                            canonical_store_id=str(row[1]),
+                            exported_revision=_row_int(row[5]),
+                            jsonl_digest=str(row[6]),
+                            record_count=_row_int(row[7]),
+                            format_version=str(row[8]),
+                        )
+                        manifest = SnapshotManifest(
+                            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                            receipt=receipt,
+                            receipt_digest=snapshot_receipt_digest(receipt),
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_PAIR_INVALID"
+                        ) from error
+                    if (
+                        receipt.exported_revision != revision.head_revision
+                        or receipt.record_count != revision.record_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_REVISION_STALE"
+                        )
+                    try:
+                        jsonl_capture = _capture_activation_file(
+                            identity.configured_jsonl_path,
+                            asset_kind="CONFIGURED_JSONL",
+                        )
+                        manifest_capture = _capture_activation_file(
+                            identity.snapshot_manifest_path,
+                            asset_kind="SNAPSHOT_MANIFEST",
+                        )
+                    except ActivationPreparationError as error:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_PAIR_INVALID"
+                        ) from error
+                    expected_manifest_digest = hashlib.sha256(
+                        contract_to_json(manifest).encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        jsonl_capture.digest != receipt.jsonl_digest
+                        or manifest_capture.digest
+                        != expected_manifest_digest
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_PAIR_INVALID"
+                        )
+                    if jsonl_identity is not None and (
+                        jsonl_capture.identity.device != jsonl_identity[0]
+                        or jsonl_capture.identity.inode != jsonl_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_PAIR_INVALID"
+                        )
+                    if manifest_identity is not None and (
+                        manifest_capture.identity.device
+                        != manifest_identity[0]
+                        or manifest_capture.identity.inode
+                        != manifest_identity[1]
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_PAIR_INVALID"
+                        )
+                    meta = _read_meta(connection)
+                    if _meta_bool(meta, "divergence_latched"):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.DIVERGENCE_LATCHED"
+                        )
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, 'EXPLICIT_EXPORT', ?, ?) "
+                        "ON CONFLICT(binding_id) DO UPDATE SET "
+                        "configured_jsonl_path = "
+                        "excluded.configured_jsonl_path, "
+                        "manifest_path = excluded.manifest_path, "
+                        "snapshot_kind = excluded.snapshot_kind, "
+                        "snapshot_id = excluded.snapshot_id, "
+                        "binding_version = excluded.binding_version",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            snapshot_id,
+                            SNAPSHOT_BINDING_VERSION,
+                        ),
+                    )
                     connection.commit()
                 except Exception:
                     connection.rollback()

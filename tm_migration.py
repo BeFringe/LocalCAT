@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import hashlib
 import json
 import os
@@ -45,6 +45,7 @@ from tm_contracts import (
     SchemaUpgradeReport,
     SealedStage,
     SnapshotKind,
+    SourceBindingState,
     SnapshotManifest,
     SnapshotReceipt,
     TMRecordDraft,
@@ -452,6 +453,79 @@ def _validate_export_destination(
     )
 
 
+def _refresh_destination_state(
+    identity: CanonicalResourceIdentity,
+    paths: _ExportArtifactPaths,
+) -> tuple[
+    str | None,
+    str | None,
+    tuple[int, int] | None,
+    tuple[int, int] | None,
+]:
+    """Capture the provable prior state of the configured snapshot pair.
+
+    Task 5.13 configured refresh: the published pair is always the
+    service resource identity's configured JSONL and its deterministic
+    adjacent manifest; callers cannot supply another path.  The prior
+    entries are captured independently as regular single-link files or
+    absence, and the parent chain must be safe.  Pair consistency is
+    intentionally decided by ``SourceBindingMonitor.observe()`` so a
+    missing/asymmetric pair durably latches ``SOURCE_DIVERGED``.
+    """
+
+    if paths.destination != identity.configured_jsonl_path:
+        raise ExportPreflightError("REFRESH.PATH_NOT_CONFIGURED")
+    if paths.manifest != identity.snapshot_manifest_path:
+        raise ExportPreflightError("REFRESH.PATH_NOT_CONFIGURED")
+    destination_state = _export_existing_state(
+        paths.destination,
+        unsafe_code="REFRESH.CONFIGURED_UNSAFE",
+    )
+    manifest_state = _export_existing_state(
+        paths.manifest,
+        unsafe_code="REFRESH.MANIFEST_UNSAFE",
+    )
+    destination_before = (
+        None if destination_state is None else destination_state[0]
+    )
+    destination_identity = (
+        None if destination_state is None else destination_state[1]
+    )
+    manifest_before = None if manifest_state is None else manifest_state[0]
+    manifest_identity = None if manifest_state is None else manifest_state[1]
+    _require_export_parent_safe(paths.destination)
+    return (
+        destination_before,
+        manifest_before,
+        destination_identity,
+        manifest_identity,
+    )
+
+
+def _require_refresh_artifacts_absent(
+    identity: CanonicalResourceIdentity,
+    paths: _ExportArtifactPaths,
+) -> None:
+    """Fail closed on any conflicting same-directory refresh artifact."""
+
+    for artifact in (
+        paths.jsonl_temp,
+        paths.manifest_temp,
+        paths.jsonl_recovery,
+        paths.manifest_recovery,
+    ):
+        if artifact in _export_authority_paths(identity):
+            raise ExportPreflightError("REFRESH.PATH_ALIASED")
+    for artifact, code in (
+        (paths.jsonl_temp, "REFRESH.TEMP_CONFLICT"),
+        (paths.manifest_temp, "REFRESH.TEMP_CONFLICT"),
+        (paths.jsonl_recovery, "REFRESH.RECOVERY_CONFLICT"),
+        (paths.manifest_recovery, "REFRESH.RECOVERY_CONFLICT"),
+    ):
+        if _path_exists(artifact):
+            raise ExportPreflightError(code)
+
+
 def _path_exists(path: Path) -> bool:
     try:
         os.lstat(path)
@@ -806,22 +880,29 @@ def _remove_exported_if_owned(
 
     if expected_identity is None or expected_digest is None:
         return not _path_exists(path)
+    proof = _strict_regular_file_state(path)
+    if (
+        proof is None
+        or proof[0] != expected_digest
+        or proof[1] != expected_identity
+    ):
+        return False
     try:
         observed = os.lstat(path)
     except FileNotFoundError:
         return True
+    except OSError:
+        return False
     if (
         not stat.S_ISREG(observed.st_mode)
         or (observed.st_dev, observed.st_ino) != expected_identity
     ):
         return False
-    if _try_file_digest(path) != expected_digest:
-        return False
     try:
         path.unlink()
     except OSError:
         return False
-    return True
+    return not _path_exists(path)
 
 
 def _copy_export_prior_pair(
@@ -959,21 +1040,15 @@ def _entry_is_owned(
     identity: tuple[int, int] | None,
     digest: str | None,
 ) -> bool:
-    """Prove one published file by both exact content and created inode."""
+    """Prove one published file by digest AND exact created inode."""
 
-    if (
-        identity is None
-        or digest is None
-        or _try_file_digest(path) != digest
-    ):
+    if identity is None or digest is None:
         return False
-    try:
-        observed = os.lstat(path)
-    except FileNotFoundError:
-        return False
+    proof = _strict_regular_file_state(path)
     return (
-        stat.S_ISREG(observed.st_mode)
-        and (observed.st_dev, observed.st_ino) == identity
+        proof is not None
+        and proof[0] == digest
+        and proof[1] == identity
     )
 
 
@@ -995,7 +1070,11 @@ def _restore_export_pair(
     """
 
     if destination_before is not None:
-        if _try_file_digest(paths.destination) != destination_before:
+        current_destination = _strict_regular_file_state(paths.destination)
+        if (
+            current_destination is None
+            or current_destination[0] != destination_before
+        ):
             if not _entry_is_owned(
                 paths.destination,
                 identity=jsonl_published_identity,
@@ -1019,7 +1098,11 @@ def _restore_export_pair(
     ):
         raise ExportPreflightError("EXPORT.JSONL_RESTORE_FAILED")
     if manifest_before is not None:
-        if _try_file_digest(paths.manifest) != manifest_before:
+        current_manifest = _strict_regular_file_state(paths.manifest)
+        if (
+            current_manifest is None
+            or current_manifest[0] != manifest_before
+        ):
             if not _entry_is_owned(
                 paths.manifest,
                 identity=manifest_published_identity,
@@ -1080,26 +1163,63 @@ def _restore_export_from_recovery(
         raise ExportPreflightError(code) from error
 
 
+def _strict_regular_file_state(
+    path: Path,
+) -> tuple[str, tuple[int, int]] | None:
+    """One descriptor-based no-follow proof of a published/owned entry.
+
+    Returns ``(digest, identity)`` only when the path opens
+    ``O_NOFOLLOW``, ``fstat`` reports a regular single-link file, its
+    bytes hash to a stable digest read through the descriptor, and a
+    terminal ``lstat`` still reports the same device/inode.  Absent,
+    symlinked, directory, multi-link, swapped, or unreadable entries
+    return ``None`` and are never hashed by pathname.
+    """
+
+    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            return None
+        identity = (observed.st_dev, observed.st_ino)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        os.close(descriptor)
+        descriptor = -1
+        final = os.lstat(path)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != identity
+        ):
+            return None
+        return digest.hexdigest(), identity
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def _published_file_identity(
     path: Path,
     expected_digest: str,
 ) -> tuple[int, int]:
     """Prove the just-published file still holds our exact bytes."""
 
-    try:
-        observed = os.lstat(path)
-    except OSError as error:
-        raise ExportPreflightError(
-            "EXPORT.PUBLISH_VERIFY_FAILED"
-        ) from error
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-    ):
+    proof = _strict_regular_file_state(path)
+    if proof is None or proof[0] != expected_digest:
         raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
-    if _try_file_digest(path) != expected_digest:
-        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
-    return (observed.st_dev, observed.st_ino)
+    return proof[1]
 
 
 def _verify_export_pair(
@@ -1107,20 +1227,30 @@ def _verify_export_pair(
     *,
     jsonl_digest: str,
     manifest_bytes: bytes,
+    jsonl_identity: tuple[int, int],
+    manifest_identity: tuple[int, int],
 ) -> None:
-    """Re-open and re-validate the published destination pair."""
+    """Re-prove the published pair by digest AND exact created identity.
 
-    observed_jsonl = _export_existing_digest(
-        paths.destination,
-        unsafe_code="EXPORT.PUBLISH_VERIFY_FAILED",
-    )
-    if observed_jsonl != jsonl_digest:
+    A foreign same-byte inode swap cannot pass: the strict
+    descriptor-based proof must report the exact identities of the
+    files this publication created.
+    """
+
+    jsonl_proof = _strict_regular_file_state(paths.destination)
+    if (
+        jsonl_proof is None
+        or jsonl_proof[0] != jsonl_digest
+        or jsonl_proof[1] != jsonl_identity
+    ):
         raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
-    observed_manifest = _export_existing_digest(
-        paths.manifest,
-        unsafe_code="EXPORT.PUBLISH_VERIFY_FAILED",
-    )
-    if observed_manifest != hashlib.sha256(manifest_bytes).hexdigest():
+    manifest_proof = _strict_regular_file_state(paths.manifest)
+    if (
+        manifest_proof is None
+        or manifest_proof[0]
+        != hashlib.sha256(manifest_bytes).hexdigest()
+        or manifest_proof[1] != manifest_identity
+    ):
         raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
 
 
@@ -1288,6 +1418,193 @@ class TMMigrationService:
             raise TypeError("store must be exact SQLiteTMStore")
         return self._run_arbitrary_export(store, destination)
 
+    def refresh_configured_snapshot(
+        self,
+        store: SQLiteTMStore,
+    ) -> ExportOutcome:
+        """Republish the active canonical store as the configured snapshot.
+
+        Task 5.13 configured refresh: this entry point operates only on
+        the service resource identity's configured JSONL and its
+        deterministic adjacent manifest; callers cannot supply another
+        path.  A current ``SourceBindingMonitor`` observation must be
+        ``VERIFIED_CURRENT`` or ``VERIFIED_HISTORY``; ``SOURCE_DIVERGED``
+        fails before any temporary file, ledger row or filesystem
+        mutation and stays latched.  The monitor observes first so an
+        unsafe (symlinked, hardlinked, unprovable) configured entry
+        durably latches divergence before any path rejection can bypass
+        it.  The whole operation runs under a resource-scoped refresh
+        reservation so a second refresh never observes the first
+        refresh's intentional JSONL-only publication window as
+        tampering.  The capture, deterministic JSONL/manifest temporary
+        pair, issued receipt, replace/fsync publication order, strict
+        identity+digest pair verification and atomic complete+rebind
+        reuse the Task 5.12 export protocol.  Canonical records,
+        generation and head revision are never modified, and on success
+        the monitor reports ``VERIFIED_CURRENT`` with the binding and
+        ledger completed against the same receipt/manifest.
+        """
+
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        identity = self._resource_identity
+        paths = _export_artifact_paths(identity.configured_jsonl_path)
+        destination_before: str | None = None
+        manifest_before: str | None = None
+        destination_identity: tuple[int, int] | None = None
+        manifest_identity: tuple[int, int] | None = None
+        reservation_entered = False
+        try:
+            reservation = store.configured_refresh_reservation()
+            with reservation:
+                reservation_entered = True
+                try:
+                    observation = store.source_binding_monitor.observe()
+                except (
+                    SQLiteStoreLifecycleError,
+                    SQLiteStoreSchemaError,
+                    sqlite3.DatabaseError,
+                ) as error:
+                    return self._export_failure(
+                        error,
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=None,
+                        destination_observed=None,
+                    )
+                if (
+                    observation.resource_id != identity.resource_id
+                    or observation.canonical_store_id
+                    != self._canonical_store_id
+                ):
+                    return self._export_failure(
+                        ExportPreflightError(
+                            "REFRESH.STORE_IDENTITY_MISMATCH"
+                        ),
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=None,
+                        destination_observed=None,
+                    )
+                if (
+                    observation.state
+                    is SourceBindingState.SOURCE_DIVERGED
+                ):
+                    return self._export_failure(
+                        ExportPreflightError(
+                            "REFRESH.SOURCE_DIVERGED"
+                        ),
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=None,
+                        destination_observed=None,
+                    )
+                try:
+                    (
+                        destination_before,
+                        manifest_before,
+                        destination_identity,
+                        manifest_identity,
+                    ) = _refresh_destination_state(identity, paths)
+                except ExportPreflightError as error:
+                    try:
+                        store.source_binding_monitor.observe()
+                    except (
+                        SQLiteStoreLifecycleError,
+                        SQLiteStoreSchemaError,
+                        sqlite3.DatabaseError,
+                    ):
+                        pass
+                    if error.error_code in {
+                        "REFRESH.CONFIGURED_UNSAFE",
+                        "REFRESH.MANIFEST_UNSAFE",
+                    }:
+                        error = ExportPreflightError(
+                            "REFRESH.SOURCE_DIVERGED"
+                        )
+                    return self._export_failure(
+                        error,
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=None,
+                        destination_observed=None,
+                    )
+                try:
+                    _require_refresh_artifacts_absent(identity, paths)
+                except ExportPreflightError as error:
+                    observed = _try_file_digest(paths.destination)
+                    return self._export_failure(
+                        error,
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=destination_before,
+                        destination_observed=observed,
+                    )
+                try:
+                    snapshot = store.capture_export_snapshot()
+                except (
+                    SQLiteStoreLifecycleError,
+                    SQLiteStoreSchemaError,
+                    sqlite3.DatabaseError,
+                ) as error:
+                    observed = _try_file_digest(paths.destination)
+                    return self._export_failure(
+                        error,
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=destination_before,
+                        destination_observed=observed,
+                    )
+                if (
+                    snapshot.revision.resource_id
+                    != identity.resource_id
+                    or snapshot.revision.canonical_store_id
+                    != self._canonical_store_id
+                ):
+                    observed = _try_file_digest(paths.destination)
+                    return self._export_failure(
+                        ExportPreflightError(
+                            "REFRESH.STORE_IDENTITY_MISMATCH"
+                        ),
+                        stage_label="REFRESH.PREFLIGHT",
+                        destination_before=destination_before,
+                        destination_observed=observed,
+                    )
+                return self._publish_export_snapshot(
+                    store,
+                    snapshot=snapshot,
+                    paths=paths,
+                    destination_before=destination_before,
+                    manifest_before=manifest_before,
+                    destination_identity=destination_identity,
+                    manifest_identity=manifest_identity,
+                    receipt_id_prefix="snapshot.refresh.",
+                    stage_prefix="REFRESH",
+                    register=lambda receipt: (
+                        store.register_issued_refresh_receipt(
+                            receipt,
+                            expected_generation=(
+                                snapshot.revision.generation
+                            ),
+                        )
+                    ),
+                    complete=lambda snapshot_id, jsonl_identity, manifest_identity: (
+                        store.complete_issued_refresh_receipt(
+                            snapshot_id,
+                            expected_generation=snapshot.revision.generation,
+                            jsonl_identity=jsonl_identity,
+                            manifest_identity=manifest_identity,
+                        )
+                    ),
+                )
+        except (
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            if reservation_entered:
+                raise
+            return self._export_failure(
+                error,
+                stage_label="REFRESH.PREFLIGHT",
+                destination_before=None,
+                destination_observed=None,
+            )
+
     def _run_arbitrary_export(
         self,
         store: SQLiteTMStore,
@@ -1332,6 +1649,62 @@ class TMMigrationService:
                 destination_before=destination_before,
                 destination_observed=observed,
             )
+        return self._publish_export_snapshot(
+            store,
+            snapshot=snapshot,
+            paths=paths,
+            destination_before=destination_before,
+            manifest_before=manifest_before,
+            destination_identity=destination_identity,
+            manifest_identity=manifest_identity,
+            receipt_id_prefix="snapshot.export.",
+            stage_prefix="EXPORT",
+            register=lambda receipt: store.register_issued_export_receipt(
+                receipt,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                expected_generation=snapshot.revision.generation,
+            ),
+            complete=lambda snapshot_id, jsonl_identity, manifest_identity: (
+                store.complete_issued_export_receipt(
+                    snapshot_id,
+                    expected_generation=snapshot.revision.generation,
+                )
+            ),
+        )
+
+    def _publish_export_snapshot(
+        self,
+        store: SQLiteTMStore,
+        *,
+        snapshot: CanonicalExportSnapshot,
+        paths: _ExportArtifactPaths,
+        destination_before: str | None,
+        manifest_before: str | None,
+        destination_identity: tuple[int, int] | None,
+        manifest_identity: tuple[int, int] | None,
+        receipt_id_prefix: str,
+        stage_prefix: str,
+        register: Callable[[SnapshotReceipt], None],
+        complete: Callable[
+            [str, tuple[int, int], tuple[int, int]],
+            None,
+        ],
+    ) -> ExportOutcome:
+        """Run the shared Task 5.12 publication protocol for one pair.
+
+        The caller has already validated the destination state and
+        captured the canonical snapshot.  This method writes and verifies
+        the deterministic JSONL/manifest temporary pair, registers
+        exactly one issued receipt, publishes in the fixed
+        JSONL replace / parent fsync / manifest replace / parent fsync
+        order, re-verifies the published pair, and atomically completes
+        the receipt.  Any caught failure restores the exact prior pair
+        (or original absence), cancels the issued receipt after a
+        complete restore, cleans only inode-proven artifacts, and
+        returns the shared failure contract.
+        """
+
         jsonl_temp_identity: _CreatedFileIdentity | None = None
         manifest_temp_identity: _CreatedFileIdentity | None = None
         jsonl_recovery_identity: _CreatedFileIdentity | None = None
@@ -1357,7 +1730,7 @@ class TMMigrationService:
                 identity=jsonl_temp_identity,
             )
             receipt = SnapshotReceipt(
-                snapshot_id=f"snapshot.export.{uuid.uuid4().hex}",
+                snapshot_id=f"{receipt_id_prefix}{uuid.uuid4().hex}",
                 resource_id=snapshot.revision.resource_id,
                 canonical_store_id=snapshot.revision.canonical_store_id,
                 exported_revision=snapshot.revision.head_revision,
@@ -1381,12 +1754,7 @@ class TMMigrationService:
                 expected_bytes=manifest_bytes,
                 identity=manifest_temp_identity,
             )
-            store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=paths.destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=snapshot.revision.generation,
-            )
+            register(receipt)
             issued = True
             jsonl_recovery_identity, manifest_recovery_identity = (
                 _copy_export_prior_pair(
@@ -1401,10 +1769,19 @@ class TMMigrationService:
                 expected_destination_digest=destination_before,
                 expected_destination_identity=destination_identity,
             )
-            jsonl_published_identity = _published_file_identity(
+            assert jsonl_temp_identity is not None
+            observed_jsonl_identity = _published_file_identity(
                 paths.destination,
                 jsonl_digest,
             )
+            if observed_jsonl_identity != (
+                jsonl_temp_identity.device,
+                jsonl_temp_identity.inode,
+            ):
+                raise ExportPreflightError(
+                    "EXPORT.PUBLISH_VERIFY_FAILED"
+                )
+            jsonl_published_identity = observed_jsonl_identity
             _fsync_directory(paths.destination.parent)
             _replace_path(
                 paths.manifest_temp,
@@ -1412,19 +1789,43 @@ class TMMigrationService:
                 expected_destination_digest=manifest_before,
                 expected_destination_identity=manifest_identity,
             )
-            manifest_published_identity = _published_file_identity(
+            assert manifest_temp_identity is not None
+            observed_manifest_identity = _published_file_identity(
                 paths.manifest,
                 manifest_digest,
             )
+            if observed_manifest_identity != (
+                manifest_temp_identity.device,
+                manifest_temp_identity.inode,
+            ):
+                raise ExportPreflightError(
+                    "EXPORT.PUBLISH_VERIFY_FAILED"
+                )
+            manifest_published_identity = observed_manifest_identity
             _fsync_directory(paths.destination.parent)
             _verify_export_pair(
                 paths,
                 jsonl_digest=jsonl_digest,
                 manifest_bytes=manifest_bytes,
+                jsonl_identity=(
+                    jsonl_temp_identity.device,
+                    jsonl_temp_identity.inode,
+                ),
+                manifest_identity=(
+                    manifest_temp_identity.device,
+                    manifest_temp_identity.inode,
+                ),
             )
-            store.complete_issued_export_receipt(
+            complete(
                 receipt.snapshot_id,
-                expected_generation=snapshot.revision.generation,
+                (
+                    jsonl_temp_identity.device,
+                    jsonl_temp_identity.inode,
+                ),
+                (
+                    manifest_temp_identity.device,
+                    manifest_temp_identity.inode,
+                ),
             )
         except (
             ExportPreflightError,
@@ -1434,7 +1835,7 @@ class TMMigrationService:
             OSError,
         ) as error:
             restore_error: Exception | None = None
-            failure_stage = "EXPORT.PUBLISH"
+            failure_stage = f"{stage_prefix}.PUBLISH"
             if issued:
                 try:
                     _restore_export_pair(
@@ -1452,7 +1853,7 @@ class TMMigrationService:
                     )
                 except Exception as restore_exception:
                     restore_error = restore_exception
-                    failure_stage = "EXPORT.RESTORE"
+                    failure_stage = f"{stage_prefix}.RESTORE"
             observed = _try_file_digest(paths.destination)
             keep_recovery = restore_error is not None
             cleanup_remaining = _cleanup_export_artifacts(
@@ -1482,7 +1883,7 @@ class TMMigrationService:
                     )
                 except Exception as cancel_exception:
                     ledger_error = cancel_exception
-                    failure_stage = "EXPORT.LEDGER"
+                    failure_stage = f"{stage_prefix}.LEDGER"
             diagnostics: list[ExportDiagnostic] = []
             if cleanup_remaining:
                 diagnostics.append(
