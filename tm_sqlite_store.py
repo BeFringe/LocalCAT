@@ -119,6 +119,7 @@ from tm_activation_journal import (
     _decode_journal_string,
     _decode_optional_journal_digest,
     _decode_optional_journal_identity,
+    _ensure_activation_lineage_marker,
     _fsync_activation_directory,
     _fsync_activation_file,
     _fsync_activation_journal,
@@ -1387,6 +1388,239 @@ class _SchemaUpgradeSnapshotTicket:
             raise TypeError("ticket backup identity is invalid")
         if type(self.backup_digest) is not str or len(self.backup_digest) != 64:
             raise TypeError("ticket backup digest is invalid")
+
+
+def _rehydrate_runtime_authority(
+    port: _StoreValidationPort,
+) -> ActivationRecoveryReport | None:
+    """Rehydrate the durable activation authority for one fresh facade open.
+
+    Task 6.1/6.2 cold-open seam.  A *completed* activation (a durable
+    ``GENERATION_PUBLISHED`` journal or terminal) is re-proven at the
+    authority, canonical-generation, and lineage level and hydrated as the
+    one in-memory view, without re-requiring the activation-time snapshot
+    parity: a legitimate canonical append/import advances the head past
+    the completed binding (``VERIFIED_HISTORY``) and an externally changed
+    configured JSONL/manifest (``SOURCE_DIVERGED``) are both healthy
+    runtime states that ``SourceBindingMonitor`` derives only after the
+    generation is restored.  A pending activation (``PREPARED`` /
+    ``DB_REPLACED`` / ``MANIFEST_PUBLISHED``), an unclosed or tampered
+    authority, or any journal/terminal temp or coexistence anomaly still
+    goes through the strict Task 5.8/5.9 protocol unchanged, so incomplete
+    activations and canonical corruption keep their recovery-or-fail-stop
+    semantics and JSONL is never an implicit fallback.
+    """
+
+    if (
+        port.state not in {"READY", "ACTIVATING"}
+        or port.preparation is not None
+        or port.cleanup_reservation is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_STATE_INVALID",
+            retryable=True,
+        )
+    if port.state == "READY":
+        port.drain_for_transition()
+    try:
+        identity = port.resource_identity
+        journal_path = _activation_journal_path(identity)
+        terminal_path = _activation_terminal_path(identity)
+        try:
+            journal_identity = _lstat_activation_journal_identity(
+                journal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        try:
+            terminal_identity = _lstat_activation_terminal_identity(
+                terminal_path
+            )
+        except ActivationPreparationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                retryable=False,
+                reason_code=error.code,
+            ) from error
+        if (
+            _lstat_any_entry(_activation_journal_temp_path(journal_path))
+            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+            or (journal_identity is not None and terminal_identity is not None)
+        ):
+            return recover_durable_activation(port)
+        if journal_identity is not None:
+            record = _load_recovery_journal(port,
+                journal_path,
+                journal_identity,
+            )
+            _revalidate_recovery_authority(port, record)
+            if (
+                record.phase
+                is not _ActivationJournalPhase.GENERATION_PUBLISHED
+            ):
+                return recover_durable_activation(port)
+            report = _rehydrate_completed_activation(port, record)
+            port.state = "READY"
+            port.notify_all()
+            return report
+        if terminal_identity is not None:
+            record = _load_recovery_terminal(port,
+                terminal_path,
+                terminal_identity,
+            )
+            _revalidate_recovery_authority(port, record)
+            if (
+                record.phase
+                is not _ActivationJournalPhase.GENERATION_PUBLISHED
+            ):
+                return recover_durable_activation(port)
+            report = _rehydrate_completed_activation(port, record)
+            port.state = "READY"
+            port.notify_all()
+            return report
+        return recover_durable_activation(port)
+    except BaseException:
+        port.notify_all()
+        raise
+
+
+def _rehydrate_completed_activation(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> ActivationRecoveryReport:
+    """Re-prove and hydrate exactly one completed canonical generation.
+
+    Proves the canonical generation and lineage from the authenticated
+    record plus disk: the ACTIVE sidecar schema with the record-derived
+    generation/activation digest, store identity, integrity, foreign keys,
+    the completed ledger binding/receipt closure, and the candidate index
+    closure.  The binding receipt is *not* required to equal the current
+    head, and the configured JSONL/manifest are *not* compared to the
+    ledger here: ``SourceBindingMonitor`` derives ``VERIFIED_CURRENT`` /
+    ``VERIFIED_HISTORY`` / ``SOURCE_DIVERGED`` from the restored
+    generation on first observation.  Any unproven canonical fact raises
+    instead of ever falling back to JSONL.
+    """
+
+    identity = port.resource_identity
+    if record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+            retryable=False,
+        )
+    if (
+        _lstat_any_entry(record.candidate_stage_db_path)
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    database = _recovery_capture_journal_file(
+        identity.canonical_sidecar_path
+    )
+    if (
+        (database[0].device, database[0].inode)
+        != record.candidate_stage_db_identity
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    next_generation = (
+        0
+        if record.expected_prior_generation is None
+        else record.expected_prior_generation + 1
+    )
+    activation_digest = _activation_publication_digest(
+        record,
+        next_generation=next_generation,
+    )
+    active_ref = _canonical_activation_ref(
+        identity,
+        journal_id=record.journal_id,
+    )
+    snapshot = port.inspect_stage_schema(
+        active_ref,
+        canonical_store_id=record.canonical_store_id,
+        _allow_diverged_runtime=True,
+        _allow_active=True,
+        _expected_active_generation=next_generation,
+        _expected_activation_digest=activation_digest,
+    )
+    with port.open_configured_connection(
+        identity.canonical_sidecar_path,
+        require_existing=True,
+    ) as connection:
+        connection.execute("BEGIN")
+        try:
+            port.validate_store_identity(
+                connection,
+                resource_id=identity.resource_id,
+                canonical_store_id=record.canonical_store_id,
+                target_identity=identity.target_identity,
+            )
+            if connection.execute("PRAGMA integrity_check").fetchall() != [
+                ("ok",)
+            ]:
+                raise port.store_schema_error(
+                    "STORE.INTEGRITY_CHECK_FAILED"
+                )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise port.store_schema_error(
+                    "STORE.FOREIGN_KEY_CHECK_FAILED"
+                )
+            lease = _SQLiteGenerationView(
+                stage=active_ref,
+                canonical_store_id=record.canonical_store_id,
+                generation=next_generation,
+                fts5_available=snapshot.fts5_available,
+            )
+            facts = port.read_source_binding_facts_in_transaction(
+                connection,
+                lease,
+            )
+            binding = facts.binding
+            if binding is None or facts.diagnostic_codes:
+                raise port.store_schema_error(
+                    "STORE.ACTIVE_BINDING_INVALID"
+                )
+            if (
+                binding.receipt.snapshot_id != record.new_receipt_id
+                or snapshot_receipt_digest(binding.receipt)
+                != record.snapshot_receipt_digest
+                or binding.receipt.jsonl_digest
+                != record.source_jsonl_digest
+            ):
+                raise port.store_schema_error(
+                    "STORE.ACTIVE_BINDING_INVALID"
+                )
+            _recover_activation_indexes(port,
+                connection,
+                fts5_available=snapshot.fts5_available,
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    port.view = _SQLiteGenerationView(
+        stage=active_ref,
+        canonical_store_id=record.canonical_store_id,
+        generation=next_generation,
+        fts5_available=snapshot.fts5_available,
+    )
+    _ensure_activation_lineage_marker(identity)
+    port._activate_candidate_store_id(record.canonical_store_id)
+    _remove_journal_proven_backups(record)
+    return ActivationRecoveryReport(
+        phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
+        action="COMPLETED",
+        generation=next_generation,
+    )
 
 
 class ResourceStoreCoordinator:
@@ -2814,6 +3048,37 @@ class ResourceStoreCoordinator:
                 # canonical sidecar, so the pending family is resolved
                 # against the original store path of the retained
                 # terminal closure.
+                _finish_cold_schema_upgrade_pending(
+                    _recovered_schema_upgrade_pending_root(port, view),
+                    completed=(report.action == "COMPLETED"),
+                )
+            return report
+
+    def rehydrate_runtime_authority(
+        self,
+    ) -> ActivationRecoveryReport | None:
+        """Rehydrate the durable activation authority for a fresh facade.
+
+        Task 6.1/6.2 cold-open seam used by the legacy facade: a completed
+        activation (``GENERATION_PUBLISHED`` journal or terminal) is
+        re-proven and hydrated as the one in-memory canonical generation
+        without re-requiring the activation-time snapshot parity, so a
+        legitimate canonical save/import (``VERIFIED_HISTORY``) and a
+        latched/observed ``SOURCE_DIVERGED`` both reopen on the same
+        canonical lineage.  Incomplete activations and unclosed or tampered
+        authorities keep the strict Task 5.8/5.9 recovery or fail-stop
+        semantics of :meth:`recover_durable_activation`; JSONL is never an
+        implicit fallback.
+        """
+
+        with self._condition:
+            port = _CoordinatorStorePort(self)
+            report = _rehydrate_runtime_authority(port)
+            view = self._view
+            if report is not None and view is not None:
+                # Mirror the cold completion wrapper: a completed runtime
+                # open resolves any pending schema-upgrade artifacts
+                # deterministically against the retained closure.
                 _finish_cold_schema_upgrade_pending(
                     _recovered_schema_upgrade_pending_root(port, view),
                     completed=(report.action == "COMPLETED"),
@@ -4408,6 +4673,43 @@ class SQLiteTMStore:
             self._coordinator,
             store=self,
         )
+
+    @classmethod
+    def from_coordinator(
+        cls,
+        coordinator: ResourceStoreCoordinator,
+    ) -> SQLiteTMStore:
+        """Construct a store bound to an already-recovered canonical coordinator.
+
+        Task 6.2 facade seam: the coordinator must be ``READY`` with a
+        live canonical generation view (for example one rehydrated by
+        :meth:`ResourceStoreCoordinator.recover_durable_activation`).
+        The returned store reuses the coordinator's lease, identity and
+        canonical store id instead of minting a new stage-bound
+        coordinator, so an active canonical sidecar is never re-opened
+        under an unactivated stage contract.
+        """
+
+        if type(coordinator) is not ResourceStoreCoordinator:
+            raise TypeError("coordinator must be ResourceStoreCoordinator")
+        observed_generation = coordinator.current_generation
+        if coordinator.state != "READY" or observed_generation is None:
+            raise SQLiteStoreLifecycleError(
+                "STORE.CANONICAL_UNAVAILABLE",
+                resource_id=coordinator.resource_id,
+                generation=(
+                    0 if observed_generation is None else observed_generation
+                ),
+                retryable=False,
+            )
+        store = cls.__new__(cls)
+        store._canonical_store_id = coordinator.canonical_store_id
+        store._coordinator = coordinator
+        store._source_binding_monitor = SourceBindingMonitor(
+            coordinator,
+            store=store,
+        )
+        return store
 
     @property
     def coordinator(self) -> ResourceStoreCoordinator:

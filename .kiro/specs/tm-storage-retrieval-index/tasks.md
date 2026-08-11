@@ -240,7 +240,7 @@
 
 - [ ] 6. 接入 physical canonical 与现有兼容入口
 
-- [ ] 6.1 接入 canonical import seam 并保持资源配置身份
+- [x] 6.1 接入 canonical import seam 并保持资源配置身份
   - 已激活资源按验证后的输入顺序直接写入 canonical，不先修改 JSONL、不折叠相同 source；未激活资源保留既有原子 JSONL 路径
   - 普通 canonical merge import 不修改 snapshot binding，也不清除或触发 SOURCE_DIVERGED
   - import 推进 head revision 后，fresh process 必须从同一 canonical lineage 重开并观察 `VERIFIED_HISTORY`；不得把快照落后误判为 activation 损坏或回退 JSONL
@@ -250,7 +250,7 @@
   - 完成时，同一导入批次在两种激活状态下都保持顺序、资源身份、选择状态和明确回退行为
   - _Requirements: 1.2, 1.4, 1.5, 1.9, 2.13, 3.1, 3.2, 3.7, 7.1, 7.2, 7.3, 7.7_
 
-- [ ] 6.2 切换 Legacy exact 查询与受控保存
+- [x] 6.2 切换 Legacy exact 查询与受控保存
   - physical gate 与 exact parity 通过后，legacy exact/save 适配使用 canonical；未激活或首次迁移失败仍保持 JSONL 兼容
   - facade 不向旧调用约定注入 context/fuzzy；只有 Active+Update 且 generation 稳定时允许保存
   - SOURCE_DIVERGED 期间 Lookup/Update 继续使用 canonical，成功保存不修改 JSONL、不清除 divergence
@@ -416,3 +416,5 @@
 - 2026-08-11 / Task 5.13：实现未漂移资源的配置 JSONL 快照刷新；稳定 canonical read snapshot 经 issued receipt、JSONL replace/fsync、manifest replace/fsync、严格 digest+inode 成对复核后，在单一事务完成 receipt 与 active binding，失败按已证明所有权恢复旧 pair 或保留可恢复证据。配置 pair 观察使用资源级可重入 gate 覆盖完整发布窗口，外部 monitor 与并发 refresh 只能观察前态或 completed 后态；symlink、multi-link、same-byte foreign inode 与不稳定身份均 fail-closed 并锁存真实 divergence，canonical records、revision 与 generation 不变。实施阶段 focused 151/151（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Task 5.14 后执行 Cluster F 统一复审。
 - 2026-08-11 / Task 5.14：在资源级可重入 gate 内先恢复再观察，按 durable ledger 与严格文件身份把 issued 配置刷新确定为取消旧 pair、重建并发布 manifest、完成一致新 pair，或锁存 `SOURCE_DIVERGED`；任意路径导出的 issued receipt 独立复用同一恢复协议且不改 active binding。排他 temp/recovery copy 的 dev/inode 通过 write-once `tm_meta` handoff 跨崩溃证明所有权，正常发布与冷恢复从 root→parent 逐段绑定 no-follow directory descriptor，并在 replace 前同时复核 source/destination exact identity、digest、revision ancestry 与 authority alias；父目录 rename/ABA、symlink/hardlink、同字节外来 inode、崩溃后丢失 durable temp 均保持文件和 handoff 并 fail-closed。native xhigh Cluster F 统一复审最终批准且无 P0–P3 遗留；9 个 TM 模块 focused 314/314（skip 1）、显式 100k resource envelope 1/1、Excel adapter 3/3、fresh 全量 886/886（skip 1，含 Qt smoke）、Gate A 契约/转录/matcher build 证据根重签后 22/22，变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-11 / Task 5.R3：将 Cluster F 已批准的 deterministic artifact family、root→parent no-follow dirfd、strict identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 编解码等 81 个顶层定义提取到 `tm_snapshot_artifacts.py`；`tm_migration.py`/`tm_snapshot_recovery.py`/`tm_sqlite_store.py` 分别减少 1260/879/330 行，仍分别独占公开 export/refresh outcome、receipt reconciliation/terminal replay/divergence 与 ledger/binding SQL/transaction/generation/coordinator 权威。owner 保留 late-bound wrapper 和 fault seam，新模块不反向导入三个 owner，错误码、mutation/清理顺序、durable handoff 生命周期与磁盘效果未改；异常分支简化未混入。F-R `v4_flash_worker`/max 等价性复审批准且无 P0–P3 遗留；新边界守卫 19/19、Cluster F/owner focused 333/333（skip 1）、fresh 全量 905/905（skip 1，含 Qt smoke）、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 6.1：已激活 TMX merge import 从同一个最大 100 MiB 不可变字节快照完成 DTD/实体拒绝、解析与 source digest，按输入顺序以 `import` batch 保留同 source 变体，不修改 JSONL/manifest/binding/divergence；同 digest 重试确定拒绝且不重复，合法 head 前进后 fresh reopen 保持 canonical `VERIFIED_HISTORY`。未激活资源仍走原子 JSONL last-write-wins 路径。
+- 2026-08-12 / Task 6.2：`TMEngine` 成为 legacy/canonical 唯一 facade，Active/Lookup/Update 使用 exact-bool 门，激活后 exact/save 只经 generation lease 访问 SQLite。新 coordinator runtime-rehydration seam 把 completed activation 的 generation/lineage、store identity、exact sidecar inode、schema/integrity/FK、ledger binding 与 candidate index 闭合后再由 monitor 派生 CURRENT/HISTORY/DIVERGED，不再用激活时 JSONL parity 回滚合法 head；未闭合激活仍交给 Task 5.8/5.9 严格恢复，canonical 不可证时 fail-stop 且不回退 JSONL。Tasks 6.1–6.2 相关矩阵 292/292、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。

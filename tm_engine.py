@@ -6,9 +6,33 @@ Module for managing Translation Memory using JSONL format.
 import json
 import time
 import os
+import sqlite3
+import stat
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 from pathlib import Path
+
+from tm_activation_journal import (
+    ActivationPreparationError,
+    _lstat_any_entry,
+    _lstat_activation_journal_identity,
+    _parse_activation_journal_bytes,
+    _read_activation_journal_file,
+)
+from tm_contracts import CanonicalResourceIdentity, TMRecordDraft
+from tm_sqlite_store import (
+    ResourceStoreCoordinator,
+    SQLiteStoreLifecycleError,
+    SQLiteStoreSchemaError,
+    SQLiteTMStore,
+)
+
+
+_CANONICAL_RECOVERY_FAILED_CODE = "TM.CANONICAL_RECOVERY_FAILED"
+_CANONICAL_AMBIGUOUS_CODE = "TM.CANONICAL_ACTIVATION_AMBIGUOUS"
+_CANONICAL_IDENTITY_MISSING_CODE = "TM.CANONICAL_IDENTITY_MISSING"
+_CANONICAL_UNHEALTHY_CODE = "TM.CANONICAL_UNHEALTHY"
+
 
 # =============================================================================
 # 1. Data Contracts (Immutable)
@@ -26,7 +50,7 @@ class SourceUnit:
     context_next: Optional[str] = None
     speaker: Optional[str] = None
     file_source: str = ""
-    metadata: Dict[str, Any] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 @dataclass(frozen=True)
 class TMMatch:
@@ -42,24 +66,267 @@ class TMMatch:
     usage_count: int = 0
     last_used: str = ""     # ISO timestamp
 
+
+def _configured_jsonl_path(tm_path: Path) -> Path:
+    """Resolve the configured JSONL path used for canonical identity."""
+
+    return tm_path.expanduser().resolve()
+
+
+def _canonical_artifact_paths(
+    configured_jsonl: Path,
+) -> tuple[Path, Path, Path, Path, Path]:
+    """Deterministic adjacent activation artifact paths (sidecar family).
+
+    Mirrors ``CanonicalResourceIdentity`` and the activation journal
+    naming so the facade can bootstrap durable facts before constructing
+    the coordinator that re-proves them.
+    """
+
+    resolved = _configured_jsonl_path(configured_jsonl)
+    sidecar = resolved.with_name(f"{resolved.name}.sqlite3")
+    manifest = resolved.with_name(f"{resolved.name}.localcat-snapshot.json")
+    journal = sidecar.with_name(
+        f".{sidecar.name}.localcat-activation-journal.json"
+    )
+    terminal = sidecar.with_name(
+        f".{sidecar.name}.localcat-activation-terminal.json"
+    )
+    marker = sidecar.with_name(
+        f".{sidecar.name}.localcat-activated-lineage.json"
+    )
+    return sidecar, manifest, journal, terminal, marker
+
+
+def _sidecar_activation_facts(sidecar: Path) -> tuple[str, str]:
+    """Bootstrap ``(resource_id, canonical_store_id)`` from sidecar meta.
+
+    This is a read-only identity bootstrap only: recovery re-proves every
+    fact before any generation view is trusted.
+    """
+
+    try:
+        initial = os.lstat(sidecar)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+            raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+        connection = sqlite3.connect(
+            f"{sidecar.as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            rows = connection.execute(
+                "SELECT key, value FROM tm_meta "
+                "WHERE key IN ('resource_id', 'canonical_store_id')"
+            ).fetchall()
+        finally:
+            connection.close()
+        final = os.lstat(sidecar)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino)
+            != (initial.st_dev, initial.st_ino)
+        ):
+            raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE) from error
+    meta = {str(key): str(value) for key, value in rows}
+    resource_id = meta.get("resource_id")
+    canonical_store_id = meta.get("canonical_store_id")
+    if not resource_id or not canonical_store_id:
+        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+    return resource_id, canonical_store_id
+
+
+def _journal_activation_facts(
+    journal: Path,
+    *,
+    expected_journal_path: Path,
+) -> tuple[str, str]:
+    """Bootstrap identity facts from one durable journal/terminal record.
+
+    A pending replacement journal is bound to its candidate store id, so
+    the coordinator is bootstrapped with the prior id when one is
+    recorded; recovery then re-proves and adopts the correct authority.
+    """
+
+    try:
+        journal_identity = _lstat_activation_journal_identity(journal)
+        if journal_identity is None:
+            raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+        payload, observed_identity = _read_activation_journal_file(
+            journal,
+            journal_identity,
+        )
+        if observed_identity != journal_identity:
+            raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+        record = _parse_activation_journal_bytes(
+            payload,
+            expected_journal_path=expected_journal_path,
+        )
+    except ActivationPreparationError as error:
+        raise ValueError(_CANONICAL_AMBIGUOUS_CODE) from error
+    canonical_store_id = (
+        record.prior_canonical_store_id
+        if record.prior_canonical_store_id is not None
+        else record.canonical_store_id
+    )
+    return record.resource_id, canonical_store_id
+
+
+def _activation_facts(configured_jsonl: Path) -> tuple[str, str] | None:
+    """Return durable ``(resource_id, canonical_store_id)`` or ``None``.
+
+    ``None`` means the resource carries no activation artifacts at all and
+    stays on the legacy JSONL path.  Any present-but-ambiguous or tampered
+    durable fact raises ``ValueError`` (fail-stop) instead of silently
+    continuing on JSONL.
+    """
+
+    sidecar, _manifest, journal, terminal, marker = (
+        _canonical_artifact_paths(configured_jsonl)
+    )
+    if not any(
+        _lstat_any_entry(path)
+        for path in (sidecar, _manifest, journal, terminal, marker)
+    ):
+        return None
+    if _lstat_any_entry(sidecar):
+        return _sidecar_activation_facts(sidecar)
+    if _lstat_any_entry(journal):
+        return _journal_activation_facts(
+            journal,
+            expected_journal_path=journal,
+        )
+    if _lstat_any_entry(terminal):
+        return _journal_activation_facts(
+            terminal,
+            expected_journal_path=journal,
+        )
+    raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
+
+
+def open_canonical_tm_store(
+    configured_jsonl: Path,
+    *,
+    drain_timeout_seconds: float = 5.0,
+) -> SQLiteTMStore | None:
+    """Open one activated resource's canonical store, or ``None`` for legacy.
+
+    Task 6.1/6.2 shared seam: a resource with no (or a provably cancelled
+    first) activation authority returns ``None`` so callers keep the
+    existing JSONL path.  A completed activation is re-proven and hydrated
+    as the one canonical generation without requiring the activation-time
+    snapshot parity: the ``SourceBindingMonitor`` derives
+    ``VERIFIED_CURRENT`` / ``VERIFIED_HISTORY`` / ``SOURCE_DIVERGED`` on
+    first observation, so a normal canonical save/import and a latched
+    divergence reopen on the same canonical lineage.  Any
+    present-but-ambiguous or tampered durable fact, an unhealthy prior
+    canonical, an unclosed activation, or a recovery failure raises
+    ``ValueError`` with a stable code-only message; JSONL is never an
+    implicit fallback for an activated resource.
+    """
+
+    try:
+        facts = _activation_facts(configured_jsonl)
+    except ActivationPreparationError as error:
+        raise ValueError(
+            f"{_CANONICAL_RECOVERY_FAILED_CODE}:{error.code}"
+        ) from error
+    if facts is None:
+        return None
+    resource_id, canonical_store_id = facts
+    try:
+        identity = CanonicalResourceIdentity.from_configured_jsonl(
+            resource_id,
+            _configured_jsonl_path(configured_jsonl),
+        )
+        coordinator = ResourceStoreCoordinator(
+            resource_identity=identity,
+            canonical_store_id=canonical_store_id,
+            drain_timeout_seconds=drain_timeout_seconds,
+        )
+        report = coordinator.rehydrate_runtime_authority()
+        if report is None or (
+            report.action == "CANCELLED" and report.generation is None
+        ):
+            return None
+        if coordinator.current_generation is None:
+            raise ValueError(_CANONICAL_UNHEALTHY_CODE)
+        store = SQLiteTMStore.from_coordinator(coordinator)
+        _ = store.canonical_revision()
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        SQLiteStoreLifecycleError,
+        sqlite3.DatabaseError,
+        OSError,
+    ) as error:
+        code = getattr(error, "code", None)
+        if isinstance(code, str) and code.startswith("ACTIVATION."):
+            raise ValueError(
+                f"{_CANONICAL_RECOVERY_FAILED_CODE}:{code}"
+            ) from error
+        raise ValueError(_CANONICAL_UNHEALTHY_CODE) from error
+    return store
+
 # =============================================================================
 # 2. TM Engine Implementation
 # =============================================================================
 
 class TMEngine:
     """
-    Core logic for Translation Memory.
-    Uses append-only JSONL storage.
+    Legacy TM compatibility facade (Task 6.2).
+
+    Decides, per resource, between the legacy JSONL engine and the
+    canonical SQLite authority.  Before first physical activation (or a
+    provably cancelled first activation) every public operation keeps the
+    exact legacy JSONL last-write-wins behavior; after activation every
+    query/save uses the canonical store under one stable generation
+    lease, and the JSONL is never loaded, written, or used as an implicit
+    fallback.
     """
-    def __init__(self, tm_path: str):
+
+    def __init__(
+        self,
+        tm_path: str,
+        *,
+        active: bool = True,
+        lookup: bool = True,
+        update: bool = True,
+        drain_timeout_seconds: float = 5.0,
+    ) -> None:
+        for field_name, value in (
+            ("active", active),
+            ("lookup", lookup),
+            ("update", update),
+        ):
+            if type(value) is not bool:
+                raise TypeError(f"{field_name} must be bool")
         self.tm_path = Path(tm_path)
+        self._active = active
+        self._lookup = lookup
+        self._update = update
         # In-memory index for exact matching: {source_text: TMMatch}
         # Last write wins policy for duplicates
         self._exact_index: Dict[str, TMMatch] = {}
-        self._load_tm()
+        self._store = open_canonical_tm_store(
+            self.tm_path,
+            drain_timeout_seconds=drain_timeout_seconds,
+        )
+        if self._store is None:
+            self._load_tm()
+
+    @property
+    def canonical_active(self) -> bool:
+        """True when this facade is bound to the canonical store."""
+
+        return self._store is not None
 
     def _load_tm(self):
         """Loads TM from JSONL file into memory index."""
+
         if not self.tm_path.exists():
             return
 
@@ -95,11 +362,36 @@ class TMEngine:
         Appends a new translation record to the TM file.
         Updates in-memory index immediately.
         """
+
+        if not self._active or not self._update:
+            return False
         if not unit.text or not target:
             return False
 
+        if self._store is not None:
+            try:
+                draft = TMRecordDraft(
+                    source_raw=unit.text,
+                    target_raw=target,
+                    speaker_raw=unit.speaker,
+                    context_prev_raw=unit.context_prev,
+                    context_next_raw=unit.context_next,
+                    file_source=unit.file_source,
+                    provenance=(("source", "local-write"),),
+                )
+                self._store.append(draft)
+            except (
+                SQLiteStoreSchemaError,
+                SQLiteStoreLifecycleError,
+                sqlite3.DatabaseError,
+                OSError,
+            ) as e:
+                print(f"Error saving to TM {self.tm_path}: {e}")
+                return False
+            return True
+
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        
+
         # Prepare record for storage
         # We store more fields than TMMatch needs, for future proofing/context matching
         record = {
@@ -139,6 +431,23 @@ class TMEngine:
         Queries the TM for an exact match.
         Returns TMMatch or None.
         """
+
+        if not self._active or not self._lookup:
+            return None
+        if self._store is not None:
+            records = self._store.exact_records(text)
+            if not records:
+                return None
+            record = records[0]
+            return TMMatch(
+                source=record.source_raw,
+                target=record.target_raw,
+                similarity=1.0,
+                match_type="EXACT",
+                tm_source=self.tm_path.name,
+                usage_count=0,
+                last_used="",
+            )
         return self._exact_index.get(text)
 
 # =============================================================================
@@ -247,12 +556,14 @@ if __name__ == "__main__":
     engine_reloaded.save_record(unit1, "您好") # Changed from 你好 to 您好
     
     match_updated = engine_reloaded.query_exact("Hello")
+    assert match_updated is not None
     assert match_updated.target == "您好"
     print(f"  [PASS] Updated translation: {match_updated.target}")
     
     # Verify persistence of update
     engine_final = TMEngine(test_tm_file)
     match_final = engine_final.query_exact("Hello")
+    assert match_final is not None
     assert match_final.target == "您好"
     print("  [PASS] Update persisted to disk")
 

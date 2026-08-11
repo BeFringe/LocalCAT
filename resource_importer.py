@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, cast
+from uuid import uuid4
 
 from editor_contracts import ImportReport
+from tm_contracts import TMRecordDraft
+from tm_engine import open_canonical_tm_store
+from tm_sqlite_store import (
+    SQLiteStoreLifecycleError,
+    SQLiteStoreSchemaError,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,7 +42,13 @@ def import_tmx(
     source_locale: str,
     target_locale: str,
 ) -> ImportReport:
-    """Merge one safe TMX Level 1 file into a JSONL translation memory."""
+    """Merge one safe TMX Level 1 file into a translation memory.
+
+    Task 6.1: an activated resource receives its validated ordered units
+    directly in canonical storage (same-source variants retained, no
+    folding); a not-yet-activated resource keeps the existing atomic
+    JSONL last-write-wins merge unchanged.
+    """
 
     try:
         source_language = _normalize_locale(source_locale)
@@ -42,9 +57,9 @@ def import_tmx(
             raise ImportFailure("source and target locales must be different")
         source = _validate_input(input_path, {".tmx"})
         target = target_path.expanduser().resolve()
-        _reject_xml_declarations(source)
-        incoming, skipped, warnings, duplicate_count = _parse_tmx(
-            source,
+        source_bytes = _read_tmx_snapshot(source)
+        incoming, ordered_units, skipped, warnings, duplicate_count = _parse_tmx(
+            io.BytesIO(source_bytes),
             source_language,
             target_language,
         )
@@ -52,6 +67,38 @@ def import_tmx(
             raise ImportFailure(
                 "TMX contains no valid units for "
                 f"{source_locale.strip()} → {target_locale.strip()}"
+            )
+        canonical = open_canonical_tm_store(target)
+        if canonical is not None:
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            drafts = tuple(
+                _tmx_import_draft(source_text, target_text, source.name)
+                for source_text, target_text in ordered_units
+            )
+            try:
+                canonical.append_batch(
+                    batch_id=f"import.{uuid4().hex}",
+                    kind="import",
+                    drafts=drafts,
+                    source_digest=source_digest,
+                    source_path=source,
+                    invalid_count=skipped,
+                    duplicate_source_count=duplicate_count,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ImportFailure(
+                    "import already applied: identical source digest"
+                ) from exc
+            LOGGER.info(
+                "Imported %d canonical TM entries from %s",
+                len(drafts),
+                source,
+            )
+            return ImportReport(
+                imported=len(drafts),
+                skipped=skipped,
+                overwritten=0,
+                errors=tuple(warnings),
             )
         existing = _read_existing_tm(target)
         overwritten = duplicate_count + sum(key in existing for key in incoming)
@@ -69,7 +116,15 @@ def import_tmx(
             overwritten=overwritten,
             errors=tuple(warnings),
         )
-    except (ImportFailure, OSError, UnicodeError, ET.ParseError) as exc:
+    except (
+        ImportFailure,
+        OSError,
+        UnicodeError,
+        ET.ParseError,
+        ValueError,
+        SQLiteStoreSchemaError,
+        SQLiteStoreLifecycleError,
+    ) as exc:
         return ImportReport(errors=(str(exc),))
 
 
@@ -136,13 +191,19 @@ def _validate_input(input_path: Path, suffixes: set[str]) -> Path:
     return path
 
 
-def _reject_xml_declarations(path: Path) -> None:
+def _read_tmx_snapshot(path: Path) -> bytes:
+    """Read one bounded immutable TMX snapshot for validation and parsing."""
+
     try:
-        data = path.read_bytes().upper()
+        data = path.read_bytes()
     except OSError as exc:
         raise ImportFailure(f"unable to read TMX '{path}': {exc}") from exc
-    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+    if len(data) > MAX_INPUT_BYTES:
+        raise ImportFailure("input exceeds the 100 MB safety limit")
+    declarations = data.upper()
+    if b"<!DOCTYPE" in declarations or b"<!ENTITY" in declarations:
         raise ImportFailure("TMX containing DTD or ENTITY declarations is not supported")
+    return data
 
 
 def _normalize_locale(locale: str) -> str:
@@ -190,18 +251,25 @@ def _select_locale(
 
 
 def _parse_tmx(
-    path: Path,
+    source: io.BytesIO,
     source_locale: str,
     target_locale: str,
-) -> tuple[dict[str, dict[str, str]], int, list[str], int]:
-    incoming: dict[str, dict[str, str]] = {}
+) -> tuple[
+    dict[str, dict[str, object]],
+    tuple[tuple[str, str], ...],
+    int,
+    list[str],
+    int,
+]:
+    incoming: dict[str, dict[str, object]] = {}
+    ordered_units: list[tuple[str, str]] = []
     skipped = 0
     duplicate_count = 0
     warnings: list[str] = []
     total_units = 0
     root: ET.Element | None = None
 
-    for event, element in ET.iterparse(path, events=("start", "end")):
+    for event, element in ET.iterparse(source, events=("start", "end")):
         if root is None and event == "start":
             root = element
         if event != "end" or _local_name(element.tag) != "tu":
@@ -240,6 +308,7 @@ def _parse_tmx(
                 elif target_error and "ambiguous" in target_error:
                     warnings.append(f"TMX unit {total_units} skipped: {target_error}")
             else:
+                ordered_units.append((source_text, target_text))
                 if source_text in incoming:
                     duplicate_count += 1
                 incoming[source_text] = {"source": source_text, "target": target_text}
@@ -249,7 +318,25 @@ def _parse_tmx(
 
     if total_units == 0:
         raise ImportFailure("TMX contains no translation units")
-    return incoming, skipped, warnings, duplicate_count
+    return incoming, tuple(ordered_units), skipped, warnings, duplicate_count
+
+
+def _tmx_import_draft(
+    source_text: str,
+    target_text: str,
+    file_name: str,
+) -> TMRecordDraft:
+    """One private exact import draft in validated input order."""
+
+    return TMRecordDraft(
+        source_raw=source_text,
+        target_raw=target_text,
+        speaker_raw=None,
+        context_prev_raw=None,
+        context_next_raw=None,
+        file_source=file_name,
+        provenance=(("source", "tmx-import"), ("file", file_name)),
+    )
 
 
 def _read_existing_tm(path: Path) -> dict[str, dict[str, object]]:
@@ -291,6 +378,8 @@ def _read_termbase_rows(path: Path) -> Iterable[tuple[object, ...]]:
         workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
             sheet = workbook.active
+            if sheet is None:
+                raise ImportFailure("XLSX termbase has no active worksheet")
             return list(sheet.iter_rows(values_only=True))
         finally:
             workbook.close()
