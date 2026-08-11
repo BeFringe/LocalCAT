@@ -82,12 +82,12 @@ graph LR
     Similarity[Similarity scorers] --> Retrieval[TM retrieval]
     Candidate --> Retrieval
     Coordinator --> Retrieval
+    RetrievalEvidence[Retrieval validation evidence] --> RetrievalGate[Retrieval capability publisher]
+    RetrievalGate --> Retrieval
     Migration --> Coordinator
     Retrieval --> Facade[Legacy TM facade]
     Coordinator --> Facade
-    Benchmark[TM benchmark] --> FuzzyGate[Fuzzy capability gate]
-    Retrieval --> FuzzyGate
-    FuzzyGate --> Facade
+    Benchmark[TM benchmark] --> RetrievalGate
     MatcherGate --> ProductAdapters[Qt independent product adapters]
 ```
 
@@ -120,6 +120,7 @@ graph LR
 ├── tm_candidate_index.py            # FTS5/gram candidate retrievers
 ├── tm_similarity.py                 # Levenshtein、Dice、scorer-v1
 ├── tm_retrieval.py                  # exact/context/fuzzy pipeline 与聚合
+├── tm_retrieval_capability.py       # Gate C/D evidence evaluator、原子能力快照与发布
 ├── tm_migration.py                  # JSONL preflight/migrate/export/upgrade
 ├── text_matcher.py                  # text-v1 纯算法、fold projection 与 hit logic
 ├── matcher_capability.py             # evidence evaluator、三态发布与 gated port
@@ -139,6 +140,7 @@ graph LR
     ├── test_tm_candidate_index.py
     ├── test_tm_similarity.py
     ├── test_tm_retrieval.py
+    ├── test_tm_retrieval_capability.py
     ├── test_tm_migration.py
     ├── test_text_matcher.py
     ├── test_matcher_capability.py
@@ -253,6 +255,8 @@ sequenceDiagram
 | CandidateRetriever | Index | recall-only candidate ids | 4, 5, 8 | Store/FTS5 | Service |
 | SimilarityScorerV1 | Domain | Levenshtein/Dice/final | 4, 5, 8 | 无 | Service |
 | TMRetrievalService | Domain | exact/context/fuzzy order | 1, 3–5, 7 | Store/Index/Scorer | Service |
+| RetrievalCapabilityEvaluator | Domain validation | Gate C correctness 与逐执行路径 Gate D evidence 的唯一判定 | 4, 5, 7, 8 | frozen contracts, validation evidence | State, Service |
+| RetrievalCapabilityPublisher | Domain runtime | 原子发布 CONTEXT 与逐路径 FUZZY 不可变快照 | 4, 7, 8 | evaluator | State, Service |
 | TextMatcherV1 | Shared domain | Unicode/CJK stable hits 纯算法 | 6, 9 | pinned data | Service |
 | MatcherCapabilityEvaluator | Shared domain | 校验证据到三态快照的唯一决策 | 9 | manifest, TextMatcherV1 | State, Service |
 | CapabilityGatedTextMatcher | Shared domain | 用途/选项门控和结果信封 | 6, 9 | evaluator, TextMatcherV1 | Service |
@@ -914,6 +918,18 @@ class TMRetrievalService:
 5. record id 降序。
 
 threshold 只过滤 FUZZY；dedupe 使用 `(resource_id, record_id)`；global limit 最后应用。
+
+### Retrieval capability publication
+
+`tm_retrieval_capability.py` 是 retrieval gate 的唯一判定与发布边界。它只依赖 frozen contracts 和不可变 validation evidence，不导入 store、candidate、retrieval 或 benchmark runner；`tm_sqlite_store.py`、`tm_candidate_index.py` 和 `tm_benchmark.py` 也不得反向成为能力判定权威。`SQLiteTMStore.health()` 只报告同一 generation 的物理事实和 canonical exact 可用性，CONTEXT/FUZZY 的 query-effective availability 由 Retrieval 在内存中组合，不能写回 DB、coordinator、binding 或 migration report。
+
+`RetrievalCapabilitySnapshot` 至少冻结 retrieval semantics version、CONTEXT 子门决定、fuzzy-core correctness 决定、`FTS5_TRIGRAM` 与 `GRAM_FALLBACK` 两条 Gate D 决定，以及只含版本、digest、时间和稳定 unavailable code 的不透明 evidence summary。CONTEXT、fuzzy-core 和两条 benchmark path 可分别降级，任何一项不得替另一项宣称成功。FUZZY 对某次查询可用，当且仅当 fuzzy-core correctness 与该查询实际执行路径的 Gate D 都开放；Task 7.5 完成但 Task 8 尚未发布 benchmark evidence 时，FUZZY 必须继续关闭。
+
+`RetrievalCapabilityEvaluator` 是 evidence 到决定的唯一函数；manifest 中的自报 `passed` 不能单独授予能力。evaluator 必须重新核对批准的 cohort/fixture/build/semantics/evaluator digest、有效期和可重算结果；Gate D 还要核对 frozen benchmark contract、execution path、environment/report digest 和 hard-gate 结果。`RetrievalCapabilityPublisher` 只接受精确 evaluator/manifest 值，构造时私有克隆 expectation，refresh 时在锁内重新求值并原子替换整个 snapshot；调用方不能注入返回任意 `available=True` 的 callback。缺失、过期、版本/digest 不符或重算失败都 fail-closed，且允许从 open 降级为 closed。
+
+`TMRetrievalService.query()` 在读取任何资源前只取得一次 capability snapshot，并让同一不可变值服务整次多资源查询；发布者随后 refresh 不改变在途 query。每个资源仍只取得一次 generation view。Retrieval 先复核 physical health/exact/generation，再把 snapshot 与查询的 intended recall path 组合为 query-effective health：仅当 physical `index_kind` 是 `FTS5_TRIGRAM` 且 fold-v1 query 长度至少为 3 时选择 fast path，否则选择 `GRAM_FALLBACK`。对应 FUZZY 子门关闭时不得读取 CandidateRetriever、candidate records 或 scorer，而是返回带 intended path、空阶段和 evaluator stable unavailable code 的 recall metadata；开放后 CandidateRetriever 返回的 `index_kind` 必须与 intended path 一致，否则该资源 fail-closed。
+
+CONTEXT 关闭时仍保留 exact winner，但不返回其他 same-source variants；FUZZY 关闭时不影响 exact、已开放 CONTEXT 或 save。能力开放但零命中时 availability 为 true 且 unavailable code 为空；门关闭时 availability 为 false、结果和阶段为空且 code 非空。稳定 code 由 evaluator 按“identity/version/digest 不符 → evidence 缺失 → evidence 重算失败 → evidence 过期”的固定优先级产生，分别使用 `RETRIEVAL.CONTEXT_*`、`RETRIEVAL.FUZZY_CORRECTNESS_*` 和 `RETRIEVAL.FUZZY_BENCHMARK_*` 命名空间，不再由 store 硬编码 `STORE.*_GATE_CLOSED`。
 
 ### TextMatcherV1
 

@@ -290,16 +290,20 @@
   - _Requirements: 1.4, 3.2, 3.7, 4.1, 4.2, 4.3, 4.5, 4.7, 5.3, 5.4, 7.4, 7.7_
 
 - [ ] 7.4 建立 CONTEXT 与 FUZZY 独立可用性
-  - physical canonical 激活只开放 exact/save；raw context correctness 证据单独开放 CONTEXT，oracle/benchmark 证据单独开放 FUZZY
-  - 明确区分“能力可用但本次无命中”和“能力门未开放”，并提供稳定 unavailable code
-  - CONTEXT 或 FUZZY 失败不得撤销 canonical authority、exact/save 或另一项已验证能力
-  - 完成时，能力组合矩阵中的 QueryReport 和 health 状态与门禁证据一致
+  - 新增独立 retrieval capability evaluator/publisher；SQLite store 只报告 physical/canonical health，Retrieval 在内存中用整次 query 唯一不可变 capability snapshot 组合 query-effective availability
+  - CONTEXT、fuzzy-core correctness、FTS5_TRIGRAM Gate D 和 GRAM_FALLBACK Gate D 独立决定；FUZZY 仅在 fuzzy-core 与本次 intended execution path 同时开放时执行
+  - 门关闭时不得读取 candidate/records/scorer，返回 intended path、空阶段和 evaluator stable unavailable code；门开放但零命中时 available 为 true 且 code 为空
+  - publisher 只接受精确 evaluator/manifest 值并在锁内原子 refresh；任意 callback、自报 passed、store diagnostic 或调用方布尔值不能授予能力
+  - CONTEXT 或任一 FUZZY path 降级不得撤销 canonical authority、exact/save 或另一项已验证能力；跨资源在途查询不混用 refresh 前后快照
+  - 完成时，closed/open/zero-hit、双 path、refresh race、真实 ACTIVE-store journey、依赖方向和无写副作用矩阵全部通过
   - _Requirements: 4.6, 4.7, 7.4, 7.5, 7.7, 8.7_
 
 - [ ] 7.5 建立 Gate C retrieval correctness
-  - 分别汇总 raw context 分类、candidate 阶段计数、fuzzy 评分排序、事务回滚、局部失败和 global limit 证据
-  - CONTEXT correctness 与 FUZZY oracle/benchmark 使用独立子门；未通过时只关闭对应查询类型
-  - 完成时，Gate C 的每项证据可重算，且不会撤销 Gate B 已发布的 canonical exact/save
+  - 以固定 cohort/fixture/build/semantics/evaluator digest 生成可重算 manifest，分别汇总 raw context 分类和 fuzzy-core 的 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据
+  - evaluator 重新计算每个 vector/cohort 的实际结果，拒绝仅凭 manifest 自报 passed、未知/重复 cohort、过期、version/digest mismatch 或不完整证据开放能力
+  - CONTEXT correctness 通过即可独立开放；fuzzy-core correctness 通过只满足 FUZZY 的 Gate C 前提，Task 8.4/8.5 发布对应 execution path 的 oracle/benchmark evidence 前 FUZZY 仍保持关闭
+  - refresh 可使任一子门独立开放或降级；在途 query 保持旧快照，新 query 使用新快照，且任何降级都不撤销 Gate B canonical exact/save
+  - 完成时，每项 Gate C evidence 都可从固定输入重算，能力矩阵与 opaque summary/稳定 unavailable code 一致且不泄漏 source/target 正文
   - _Requirements: 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 7.4, 7.5, 8.7_
 
 - [ ] 8. 建立 Gate D benchmark-v1
