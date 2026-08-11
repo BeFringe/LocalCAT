@@ -1,0 +1,45 @@
+{
+ "artifact_digest": "42e46d3dffe1a0c49a9dc00f274dab25d7b66ab625ae86733d03375d831a5fe3",
+ "artifact_paths": [
+  "tm_candidate_index.py",
+  "tm_contracts.py",
+  "tm_gate_a.py",
+  "tm_retrieval.py",
+  "tm_retrieval_capability.py",
+  "tm_similarity.py",
+  "tm_sqlite_store.py"
+ ],
+ "build_digest": "e3015331ea58abdb5035ac83d65646934fde45b658ab537a020d1a4d7a350efa",
+ "build_paths": [
+  "tm_candidate_index.py",
+  "tm_contracts.py",
+  "tm_gate_a.py",
+  "tm_retrieval.py",
+  "tm_retrieval_capability.py",
+  "tm_retrieval_validation.py",
+  "tm_similarity.py",
+  "tm_sqlite_store.py"
+ ],
+ "context_cohorts": {
+  "context.correctness.cohort.v1": "7e790a4f8fafaf5556bb31e16c592cfcb0b38fcfd0fd8998ec5c3d3c3843f10a"
+ },
+ "evaluator_digest": "520c299e44041e6b619bf8175f3870ae75b89b591245e979c0fcf341ef459cfb",
+ "evaluator_path": "tm_retrieval_capability.py",
+ "fixture_digest": "6b0964542e898dde4ae366078c9431f7a7aead54e0ed6fc84a6fd2641ee1148e",
+ "fixture_paths": [
+  "tests/fixtures/retrieval_gate_c_vectors_v1.json"
+ ],
+ "fts5_trigram": {
+  "contract_digest": "9c22b8d04c1bc20fc08882b018994436291e7beadcec9bc911c6bab783cbfacf",
+  "path": "FTS5_TRIGRAM"
+ },
+ "fuzzy_core_cohorts": {
+  "fuzzy.core.correctness.cohort.v1": "fecfb747e0f0126ad4c3b3fe7f3cf0af1ecf99fad56103169267cc233a73d103"
+ },
+ "gram_fallback": {
+  "contract_digest": "4ff11ef707fa55fa82f87ab0c1053f20b401665706c1c39bcbc254c309916d73",
+  "path": "GRAM_FALLBACK"
+ },
+ "schema_version": "retrieval-gate-c-roots-v1",
+ "semantics_version": "retrieval-v1"
+}

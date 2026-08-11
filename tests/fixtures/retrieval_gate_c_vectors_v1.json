@@ -1,0 +1,1357 @@
+{
+ "fixture_version": "retrieval-gate-c-context-v1",
+ "semantics_version": "retrieval-v1",
+ "vectors": [
+  {
+   "id": "mixed-context-and-retained",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": "Alice",
+    "context_prev_raw": "Wait.",
+    "context_next_raw": null
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 9,
+     "source_raw": "Open the door.",
+     "target_raw": "target-9",
+     "speaker_raw": "Alice",
+     "context_prev_raw": "Wait.",
+     "context_next_raw": null
+    },
+    {
+     "record_id": 5,
+     "source_raw": "Open the door.",
+     "target_raw": "target-5",
+     "speaker_raw": "Alice",
+     "context_prev_raw": "Nope.",
+     "context_next_raw": null
+    },
+    {
+     "record_id": 2,
+     "source_raw": "Open the door.",
+     "target_raw": "target-2",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [
+     {
+      "record_id": 9,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "matched_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "mismatched_fields": [],
+      "strength_v1": [
+       2,
+       0,
+       1,
+       1,
+       0
+      ]
+     },
+     {
+      "record_id": 5,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "matched_fields": [
+       "speaker_raw"
+      ],
+      "mismatched_fields": [
+       "context_prev_raw"
+      ],
+      "strength_v1": [
+       1,
+       -1,
+       1,
+       0,
+       0
+      ]
+     }
+    ],
+    "context_count": 2,
+    "retained_record_ids": [
+     2
+    ],
+    "retained_count": 1
+   }
+  },
+  {
+   "id": "missing-facts",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": "Alice",
+    "context_prev_raw": null,
+    "context_next_raw": "Then."
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 7,
+     "source_raw": "Open the door.",
+     "target_raw": "target-7",
+     "speaker_raw": null,
+     "context_prev_raw": "Wait.",
+     "context_next_raw": "Then."
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [
+     {
+      "record_id": 7,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "context_next_raw"
+      ],
+      "matched_fields": [
+       "context_next_raw"
+      ],
+      "mismatched_fields": [],
+      "strength_v1": [
+       1,
+       0,
+       0,
+       0,
+       1
+      ]
+     }
+    ],
+    "context_count": 1,
+    "retained_record_ids": [],
+    "retained_count": 0
+   }
+  },
+  {
+   "id": "positive-context",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": "Alice",
+    "context_prev_raw": "Wait.",
+    "context_next_raw": null
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 7,
+     "source_raw": "Open the door.",
+     "target_raw": "target-7",
+     "speaker_raw": "Alice",
+     "context_prev_raw": "Wait.",
+     "context_next_raw": null
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [
+     {
+      "record_id": 7,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "matched_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "mismatched_fields": [],
+      "strength_v1": [
+       2,
+       0,
+       1,
+       1,
+       0
+      ]
+     }
+    ],
+    "context_count": 1,
+    "retained_record_ids": [],
+    "retained_count": 0
+   }
+  },
+  {
+   "id": "raw-case-mismatch",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": "Alice",
+    "context_prev_raw": "Wait.",
+    "context_next_raw": "Then."
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 7,
+     "source_raw": "Open the door.",
+     "target_raw": "target-7",
+     "speaker_raw": "alice",
+     "context_prev_raw": "Wait.",
+     "context_next_raw": "Then."
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [
+     {
+      "record_id": 7,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw",
+       "context_next_raw"
+      ],
+      "matched_fields": [
+       "context_prev_raw",
+       "context_next_raw"
+      ],
+      "mismatched_fields": [
+       "speaker_raw"
+      ],
+      "strength_v1": [
+       2,
+       -1,
+       0,
+       1,
+       1
+      ]
+     }
+    ],
+    "context_count": 1,
+    "retained_record_ids": [],
+    "retained_count": 0
+   }
+  },
+  {
+   "id": "retained-only",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": null,
+    "context_prev_raw": null,
+    "context_next_raw": null
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 7,
+     "source_raw": "Open the door.",
+     "target_raw": "target-7",
+     "speaker_raw": "Alice",
+     "context_prev_raw": "Wait.",
+     "context_next_raw": "Really?"
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [],
+    "context_count": 0,
+    "retained_record_ids": [
+     7
+    ],
+    "retained_count": 1
+   }
+  },
+  {
+   "id": "whitespace-mismatch",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": "Alice",
+    "context_prev_raw": "Wait.",
+    "context_next_raw": "Then."
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    },
+    {
+     "record_id": 7,
+     "source_raw": "Open the door.",
+     "target_raw": "target-7",
+     "speaker_raw": " Alice",
+     "context_prev_raw": "Wait. ",
+     "context_next_raw": "Then."
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [
+     {
+      "record_id": 7,
+      "match_type": "CONTEXT",
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw",
+       "context_next_raw"
+      ],
+      "matched_fields": [
+       "context_next_raw"
+      ],
+      "mismatched_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "strength_v1": [
+       1,
+       -2,
+       0,
+       0,
+       1
+      ]
+     }
+    ],
+    "context_count": 1,
+    "retained_record_ids": [],
+    "retained_count": 0
+   }
+  },
+  {
+   "id": "winner-only",
+   "query": {
+    "query_source": "Open the door.",
+    "speaker_raw": null,
+    "context_prev_raw": null,
+    "context_next_raw": null
+   },
+   "records": [
+    {
+     "record_id": 100,
+     "source_raw": "Open the door.",
+     "target_raw": "target-100",
+     "speaker_raw": null,
+     "context_prev_raw": null,
+     "context_next_raw": null
+    }
+   ],
+   "expected": {
+    "winner_record_id": 100,
+    "context": [],
+    "context_count": 0,
+    "retained_record_ids": [],
+    "retained_count": 0
+   }
+  }
+ ],
+ "fuzzy": {
+  "version": "retrieval-gate-c-fuzzy-scoring-v1",
+  "vectors": [
+   {
+    "id": "fuzzy-threshold-boundary",
+    "query": {
+     "query_source": "Close the window.",
+     "minimum_similarity": 0.9544592030360531,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 7,
+      "source_raw": "Close the window",
+      "target_raw": "target-7",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 5,
+      "source_raw": "Close the window now",
+      "target_raw": "target-5",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 3,
+      "source_raw": "Close the window.",
+      "target_raw": "target-3",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 3,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 2,
+     "accepted_count": 1,
+     "accepted": [
+      {
+       "record_id": 7,
+       "similarity": 0.9544592030360531,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9411764705882353,
+        "dice_bigram": 0.967741935483871,
+        "final_similarity": 0.9544592030360531,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "id": "fuzzy-threshold-zero",
+    "query": {
+     "query_source": "xyz",
+     "minimum_similarity": 0.0,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 4,
+      "source_raw": "abc",
+      "target_raw": "target-4",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 6,
+      "source_raw": "xyz",
+      "target_raw": "target-6",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 2,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 1,
+     "accepted_count": 1,
+     "accepted": [
+      {
+       "record_id": 4,
+       "similarity": 0.0,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.0,
+        "dice_bigram": 0.0,
+        "final_similarity": 0.0,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "id": "fuzzy-threshold-one",
+    "query": {
+     "query_source": "Open the door.",
+     "minimum_similarity": 1.0,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 7,
+      "source_raw": "OPEN THE DOOR.",
+      "target_raw": "target-7",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 5,
+      "source_raw": "Open the door",
+      "target_raw": "target-5",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 2,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 2,
+     "accepted_count": 1,
+     "accepted": [
+      {
+       "record_id": 7,
+       "similarity": 1.0,
+       "similarity_evidence": {
+        "levenshtein_ratio": 1.0,
+        "dice_bigram": 1.0,
+        "final_similarity": 1.0,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "id": "fuzzy-tie-break",
+    "query": {
+     "query_source": "Close the window.",
+     "minimum_similarity": 0.7,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 9,
+      "source_raw": "close the window",
+      "target_raw": "target-9",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 4,
+      "source_raw": "CLOSE THE WINDOW",
+      "target_raw": "target-4",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 2,
+      "source_raw": "Close the window now",
+      "target_raw": "target-2",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 3,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 3,
+     "accepted_count": 3,
+     "accepted": [
+      {
+       "record_id": 9,
+       "similarity": 0.9544592030360531,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9411764705882353,
+        "dice_bigram": 0.967741935483871,
+        "final_similarity": 0.9544592030360531,
+        "scorer_version": "scorer-v1"
+       }
+      },
+      {
+       "record_id": 4,
+       "similarity": 0.9544592030360531,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9411764705882353,
+        "dice_bigram": 0.967741935483871,
+        "final_similarity": 0.9544592030360531,
+        "scorer_version": "scorer-v1"
+       }
+      },
+      {
+       "record_id": 2,
+       "similarity": 0.8285714285714285,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.8,
+        "dice_bigram": 0.8571428571428571,
+        "final_similarity": 0.8285714285714285,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "id": "fuzzy-same-source-exclusion",
+    "query": {
+     "query_source": "Open the door.",
+     "minimum_similarity": 0.7,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 8,
+      "source_raw": "Open the door.",
+      "target_raw": "target-8",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 6,
+      "source_raw": "Open the door",
+      "target_raw": "target-6",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 2,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 1,
+     "accepted_count": 1,
+     "accepted": [
+      {
+       "record_id": 6,
+       "similarity": 0.9442857142857143,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9285714285714286,
+        "dice_bigram": 0.96,
+        "final_similarity": 0.9442857142857143,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "id": "fuzzy-all-below-threshold",
+    "query": {
+     "query_source": "Please close the window.",
+     "minimum_similarity": 1.0,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 5,
+      "source_raw": "Please close the window",
+      "target_raw": "target-5",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 2,
+      "source_raw": "Please close the window now",
+      "target_raw": "target-2",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "FTS5_TRIGRAM",
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 2,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 2,
+       "added_unique_count": 0,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 2,
+     "accepted_count": 0,
+     "accepted": []
+    }
+   },
+   {
+    "id": "fuzzy-gram-fallback",
+    "query": {
+     "query_source": "Turn off the light.",
+     "minimum_similarity": 0.7,
+     "limit": 10
+    },
+    "records": [
+     {
+      "record_id": 11,
+      "source_raw": "Turn on the light",
+      "target_raw": "target-11",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 12,
+      "source_raw": "Turn off the light",
+      "target_raw": "target-12",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     },
+     {
+      "record_id": 13,
+      "source_raw": "turn off the light",
+      "target_raw": "target-13",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "index_kind": "GRAM_FALLBACK",
+     "stages": [
+      {
+       "stage": "GRAM_3",
+       "input_count": 0,
+       "added_unique_count": 2,
+       "output_unique_count": 2,
+       "dropped_count": 0
+      },
+      {
+       "stage": "GRAM_2",
+       "input_count": 2,
+       "added_unique_count": 1,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      }
+     ],
+     "scored_count": 3,
+     "accepted_count": 3,
+     "accepted": [
+      {
+       "record_id": 13,
+       "similarity": 0.9593984962406015,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9473684210526316,
+        "dice_bigram": 0.9714285714285714,
+        "final_similarity": 0.9593984962406015,
+        "scorer_version": "scorer-v1"
+       }
+      },
+      {
+       "record_id": 12,
+       "similarity": 0.9593984962406015,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.9473684210526316,
+        "dice_bigram": 0.9714285714285714,
+        "final_similarity": 0.9593984962406015,
+        "scorer_version": "scorer-v1"
+       }
+      },
+      {
+       "record_id": 11,
+       "similarity": 0.8328173374613003,
+       "similarity_evidence": {
+        "levenshtein_ratio": 0.8421052631578947,
+        "dice_bigram": 0.8235294117647058,
+        "final_similarity": 0.8328173374613003,
+        "scorer_version": "scorer-v1"
+       }
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "store": {
+  "id": "store-gate-c-candidate-rollback",
+  "version": "retrieval-gate-c-store-v1",
+  "resource_id": "tm.gate-c.store",
+  "canonical_store_id": "store.gate-c",
+  "stage_id": "stage.gate-c",
+  "batch_id": "import.gate-c.store",
+  "batch_kind": "import",
+  "source_digest": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+  "source_name": "gate-c.source.jsonl",
+  "duplicate_source_digest": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+  "duplicate_source_name": "gate-c.duplicate.jsonl",
+  "query_source": "Open the door.",
+  "folded_query": "open the door.",
+  "minimum_similarity": 0.7,
+  "result_limit": 10,
+  "drafts": [
+   {
+    "ordinal": 0,
+    "source_raw": "Open the door.",
+    "target_raw": "target-exact"
+   },
+   {
+    "ordinal": 1,
+    "source_raw": "Open the door",
+    "target_raw": "target-near-1"
+   },
+   {
+    "ordinal": 2,
+    "source_raw": "Open the window.",
+    "target_raw": "target-near-2"
+   },
+   {
+    "ordinal": 3,
+    "source_raw": "xyzzy",
+    "target_raw": "target-unrelated"
+   }
+  ],
+  "duplicate_draft": {
+   "ordinal": 4,
+   "source_raw": "A different body.",
+   "target_raw": "target-duplicate"
+  },
+  "expected": {
+   "generation": 0,
+   "head_revision": 1,
+   "record_count": 4,
+   "exported_record_ids": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "by_runtime": {
+    "FTS5_TRIGRAM": {
+     "stages": [
+      {
+       "stage": "FTS_TRIGRAM",
+       "input_count": 0,
+       "added_unique_count": 3,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "GRAM_2",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "GRAM_1",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      }
+     ],
+     "union_unique_count": 3,
+     "deduplicated_count": 3,
+     "truncated": false,
+     "candidates": [
+      {
+       "record_id": 1,
+       "recall_stages": [
+        "FTS_TRIGRAM",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 35,
+       "query_grams": 35,
+       "overlap_ratio": 1.0,
+       "pretruncate_rank": 1
+      },
+      {
+       "record_id": 2,
+       "recall_stages": [
+        "FTS_TRIGRAM",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 32,
+       "query_grams": 35,
+       "overlap_ratio": 0.9142857142857143,
+       "pretruncate_rank": 2
+      },
+      {
+       "record_id": 3,
+       "recall_stages": [
+        "FTS_TRIGRAM",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 25,
+       "query_grams": 35,
+       "overlap_ratio": 0.7142857142857143,
+       "pretruncate_rank": 3
+      }
+     ],
+     "scoring": {
+      "scored_count": 2,
+      "accepted_count": 1,
+      "accepted": [
+       {
+        "record_id": 2,
+        "similarity": 0.9442857142857143,
+        "levenshtein_ratio": 0.9285714285714286,
+        "dice_bigram": 0.96,
+        "final_similarity": 0.9442857142857143
+       }
+      ]
+     }
+    },
+    "GRAM_FALLBACK": {
+     "stages": [
+      {
+       "stage": "GRAM_3",
+       "input_count": 0,
+       "added_unique_count": 3,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "GRAM_2",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "GRAM_1",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "UNION",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      },
+      {
+       "stage": "DEDUPLICATE",
+       "input_count": 3,
+       "added_unique_count": 0,
+       "output_unique_count": 3,
+       "dropped_count": 0
+      }
+     ],
+     "union_unique_count": 3,
+     "deduplicated_count": 3,
+     "truncated": false,
+     "candidates": [
+      {
+       "record_id": 1,
+       "recall_stages": [
+        "GRAM_3",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 35,
+       "query_grams": 35,
+       "overlap_ratio": 1.0,
+       "pretruncate_rank": 1
+      },
+      {
+       "record_id": 2,
+       "recall_stages": [
+        "GRAM_3",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 32,
+       "query_grams": 35,
+       "overlap_ratio": 0.9142857142857143,
+       "pretruncate_rank": 2
+      },
+      {
+       "record_id": 3,
+       "recall_stages": [
+        "GRAM_3",
+        "GRAM_2",
+        "GRAM_1"
+       ],
+       "matched_grams": 25,
+       "query_grams": 35,
+       "overlap_ratio": 0.7142857142857143,
+       "pretruncate_rank": 3
+      }
+     ],
+     "scoring": {
+      "scored_count": 2,
+      "accepted_count": 1,
+      "accepted": [
+       {
+        "record_id": 2,
+        "similarity": 0.9442857142857143,
+        "levenshtein_ratio": 0.9285714285714286,
+        "dice_bigram": 0.96,
+        "final_similarity": 0.9442857142857143
+       }
+      ]
+     }
+    }
+   },
+   "rollback": {
+    "exception_type": "sqlite3.IntegrityError",
+    "revision_unchanged": true,
+    "exported_unchanged": true,
+    "health_unchanged": true,
+    "candidates_unchanged": true,
+    "record_count_before": 4,
+    "record_count_after": 4,
+    "exported_count_before": 4,
+    "exported_count_after": 4,
+    "candidate_count_before": 3,
+    "candidate_count_after": 3,
+    "absent_record_id": 5,
+    "absent": true
+   }
+  }
+ },
+ "service": {
+  "version": "retrieval-gate-c-service-v1",
+  "query": {
+   "query_source": "Open the door.",
+   "speaker_raw": "Alice",
+   "context_prev_raw": "Wait.",
+   "context_next_raw": null,
+   "minimum_similarity": 0.7,
+   "limit": 2,
+   "resource_order": [
+    "tm.gate-c.service.primary",
+    "tm.gate-c.service.secondary"
+   ]
+  },
+  "resources": [
+   {
+    "id": "service-resource-primary",
+    "resource_id": "tm.gate-c.service.primary",
+    "canonical_store_id": "store.gate-c.service.primary",
+    "stage_id": "stage.gate-c.service.primary",
+    "batch_id": "import.gate-c.service.primary",
+    "batch_kind": "import",
+    "source_digest": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+    "source_name": "gate-c.service.primary.jsonl",
+    "drafts": [
+     {
+      "ordinal": 0,
+      "source_raw": "Open the door.",
+      "target_raw": "target-service-primary-context",
+      "speaker_raw": "Alice",
+      "context_prev_raw": "Wait.",
+      "context_next_raw": null
+     },
+     {
+      "ordinal": 1,
+      "source_raw": "Open the door.",
+      "target_raw": "target-service-primary-exact",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "generation": 0,
+     "head_revision": 1,
+     "record_count": 2,
+     "exported_record_ids": [
+      1,
+      2
+     ],
+     "winner_record_id": 2,
+     "context_variant": {
+      "record_id": 1,
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "matched_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "mismatched_fields": [],
+      "strength_v1": [
+       2,
+       0,
+       1,
+       1,
+       0
+      ]
+     }
+    }
+   },
+   {
+    "id": "service-resource-secondary",
+    "resource_id": "tm.gate-c.service.secondary",
+    "canonical_store_id": "store.gate-c.service.secondary",
+    "stage_id": "stage.gate-c.service.secondary",
+    "batch_id": "import.gate-c.service.secondary",
+    "batch_kind": "import",
+    "source_digest": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+    "source_name": "gate-c.service.secondary.jsonl",
+    "drafts": [
+     {
+      "ordinal": 0,
+      "source_raw": "Open the door.",
+      "target_raw": "target-service-secondary-context",
+      "speaker_raw": "Alice",
+      "context_prev_raw": "Wait.",
+      "context_next_raw": null
+     },
+     {
+      "ordinal": 1,
+      "source_raw": "Open the door.",
+      "target_raw": "target-service-secondary-exact",
+      "speaker_raw": null,
+      "context_prev_raw": null,
+      "context_next_raw": null
+     }
+    ],
+    "expected": {
+     "generation": 0,
+     "head_revision": 1,
+     "record_count": 2,
+     "exported_record_ids": [
+      1,
+      2
+     ],
+     "winner_record_id": 2,
+     "context_variant": {
+      "record_id": 1,
+      "comparable_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "matched_fields": [
+       "speaker_raw",
+       "context_prev_raw"
+      ],
+      "mismatched_fields": [],
+      "strength_v1": [
+       2,
+       0,
+       1,
+       1,
+       0
+      ]
+     }
+    }
+   }
+  ],
+  "scenarios": [
+   {
+    "id": "service-gate-c-global-limit",
+    "kind": "global_limit",
+    "failed_resource_id": null,
+    "expected": {
+     "result_count": 2,
+     "result_record_ids": [
+      2,
+      2
+     ],
+     "result_resource_ids": [
+      "tm.gate-c.service.primary",
+      "tm.gate-c.service.secondary"
+     ],
+     "returned_count_by_resource": {
+      "tm.gate-c.service.primary": 1,
+      "tm.gate-c.service.secondary": 1
+     },
+     "context_observed_count": 2,
+     "context_returned_count": 0,
+     "scored_count_total": 0,
+     "failure_count": 0
+    },
+    "failure": null
+   },
+   {
+    "id": "service-gate-c-partial-failure",
+    "kind": "partial_failure",
+    "failed_resource_id": "tm.gate-c.service.secondary",
+    "failure": {
+     "stage": "LEASE",
+     "code": "STORE.GENERATION_CHANGED",
+     "retryable": true
+    },
+    "expected": {
+     "result_count": 2,
+     "result_record_ids": [
+      2,
+      1
+     ],
+     "result_resource_ids": [
+      "tm.gate-c.service.primary",
+      "tm.gate-c.service.primary"
+     ],
+     "returned_count_by_resource": {
+      "tm.gate-c.service.primary": 2
+     },
+     "context_observed_count": 1,
+     "context_returned_count": 1,
+     "scored_count_total": 0,
+     "failure_count": 1
+    }
+   }
+  ]
+ }
+}
