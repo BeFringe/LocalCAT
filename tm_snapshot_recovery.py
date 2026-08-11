@@ -67,31 +67,27 @@ from tm_activation_journal import (
     _write_activation_journal_bytes,
 )
 
+import tm_snapshot_artifacts as snapshot_artifacts_module
 
-_EXPORT_MANIFEST_SUFFIX = ".localcat-snapshot.json"
-_EXPORT_JSONL_TEMP_SUFFIX = ".localcat-export.jsonl.tmp"
-_EXPORT_MANIFEST_TEMP_SUFFIX = ".localcat-export.manifest.tmp"
-_EXPORT_JSONL_RECOVERY_SUFFIX = ".localcat-export-recovery.jsonl.bak"
-_EXPORT_MANIFEST_RECOVERY_SUFFIX = ".localcat-export-recovery.manifest.bak"
+
+_EXPORT_JSONL_RECOVERY_SUFFIX = snapshot_artifacts_module._EXPORT_JSONL_RECOVERY_SUFFIX
+"""_EXPORT_JSONL_RECOVERY_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+_EXPORT_JSONL_TEMP_SUFFIX = snapshot_artifacts_module._EXPORT_JSONL_TEMP_SUFFIX
+"""_EXPORT_JSONL_TEMP_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+_EXPORT_MANIFEST_RECOVERY_SUFFIX = snapshot_artifacts_module._EXPORT_MANIFEST_RECOVERY_SUFFIX
+"""_EXPORT_MANIFEST_RECOVERY_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+_EXPORT_MANIFEST_TEMP_SUFFIX = snapshot_artifacts_module._EXPORT_MANIFEST_TEMP_SUFFIX
+"""_EXPORT_MANIFEST_TEMP_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+_EXPORT_MANIFEST_SUFFIX = snapshot_artifacts_module._EXPORT_MANIFEST_SUFFIX
+"""_EXPORT_MANIFEST_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 
 _NATIVE_PATH_TYPE = type(Path())
 
 _MAX_RECOVERY_ROUNDS = 8
 
 
-class RecoveryError(RuntimeError):
-    """Stable code-only recovery failure with no path or TM payload."""
-
-    def __init__(self, error_code: str, *, retryable: bool) -> None:
-        if type(error_code) is not str or not error_code:
-            raise TypeError("recovery error code is invalid")
-        if type(retryable) is not bool:
-            raise TypeError("recovery retryable flag is invalid")
-        self.error_code = error_code
-        self.retryable = retryable
-        super().__init__(error_code)
-
-
+RecoveryError = snapshot_artifacts_module.RecoveryError
+"""RecoveryError late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 class RefreshRecoveryState(str, Enum):
     """Stable public classification of one Task 5.14 recovery outcome."""
 
@@ -215,93 +211,8 @@ class IssuedReceiptFacts:
         )
 
 
-@dataclass(frozen=True)
-class _ArtifactHandoffFacts:
-    """One durable write-once ownership record for one issued receipt.
-
-    The publisher records the exclusive temporary identities at
-    registration, the recovery-copy identities after the copies are
-    prepared, and the prior final JSONL/manifest identity+digest (or
-    explicit proven absence) captured before any publication replace.
-    Recovery treats a matching regular single-link file as owned only
-    when its exact identity was durably handed off; content equality
-    alone never proves ownership, and a prior record is either proven
-    absent (``prior_*_absent`` True), proven present (digest+identity),
-    or unrecorded (all three ``None``) which always fails closed.  The
-    exact immediate-parent device/inode proven by a strict real
-    non-symlink parent-chain proof at registration is durably recorded
-    (``artifact_parent_identity``); a missing legacy identity always
-    fails terminal replay closed and is never inferred.
-    """
-
-    snapshot_id: str
-    jsonl_temp_identity: tuple[int, int] | None
-    manifest_temp_identity: tuple[int, int] | None
-    artifact_parent_identity: tuple[int, int] | None = None
-    jsonl_recovery_identity: tuple[int, int] | None = None
-    manifest_recovery_identity: tuple[int, int] | None = None
-    prior_jsonl_identity: tuple[int, int] | None = None
-    prior_jsonl_digest: str | None = None
-    prior_jsonl_absent: bool | None = None
-    prior_manifest_identity: tuple[int, int] | None = None
-    prior_manifest_digest: str | None = None
-    prior_manifest_absent: bool | None = None
-
-    def __post_init__(self) -> None:
-        if type(self.snapshot_id) is not str or not self.snapshot_id:
-            raise TypeError("handoff snapshot id must be a non-empty string")
-        for value, field_name in (
-            (self.jsonl_temp_identity, "jsonl_temp_identity"),
-            (self.manifest_temp_identity, "manifest_temp_identity"),
-            (self.artifact_parent_identity, "artifact_parent_identity"),
-            (self.jsonl_recovery_identity, "jsonl_recovery_identity"),
-            (self.manifest_recovery_identity, "manifest_recovery_identity"),
-        ):
-            if value is not None and (
-                type(value) is not tuple
-                or len(value) != 2
-                or type(value[0]) is not int
-                or type(value[1]) is not int
-            ):
-                raise TypeError(
-                    f"{field_name} must be a device/inode identity pair"
-                )
-        for value, field_name in (
-            (self.prior_jsonl_identity, "prior_jsonl_identity"),
-            (self.prior_manifest_identity, "prior_manifest_identity"),
-        ):
-            if value is not None and (
-                type(value) is not tuple
-                or len(value) != 2
-                or type(value[0]) is not int
-                or type(value[1]) is not int
-            ):
-                raise TypeError(
-                    f"{field_name} must be a device/inode identity pair"
-                )
-        for digest, field_name in (
-            (self.prior_jsonl_digest, "prior_jsonl_digest"),
-            (self.prior_manifest_digest, "prior_manifest_digest"),
-        ):
-            if digest is not None and (
-                type(digest) is not str
-                or len(digest) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in digest
-                )
-            ):
-                raise TypeError(
-                    f"{field_name} must be a 64-hex digest string"
-                )
-        for absent, field_name in (
-            (self.prior_jsonl_absent, "prior_jsonl_absent"),
-            (self.prior_manifest_absent, "prior_manifest_absent"),
-        ):
-            if absent is not None and type(absent) is not bool:
-                raise TypeError(f"{field_name} must be a bool or None")
-
-
+_ArtifactHandoffFacts = snapshot_artifacts_module._ArtifactHandoffFacts
+"""_ArtifactHandoffFacts late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 @dataclass(frozen=True)
 class _RefreshRecoveryFacts:
     """Ledger/binding facts for one resource in one SQLite snapshot."""
@@ -349,56 +260,14 @@ class _RefreshRecoveryFacts:
             )
 
 
-@dataclass(frozen=True)
-class _RecoveryArtifactPaths:
-    """Deterministic same-directory artifact family (Task 5.12 frozen)."""
-
-    destination: Path
-    manifest: Path
-    jsonl_temp: Path
-    manifest_temp: Path
-    jsonl_recovery: Path
-    manifest_recovery: Path
-
-    def __post_init__(self) -> None:
-        for value in (
-            self.destination,
-            self.manifest,
-            self.jsonl_temp,
-            self.manifest_temp,
-            self.jsonl_recovery,
-            self.manifest_recovery,
-        ):
-            if type(value) is not type(Path()):
-                raise TypeError("artifact paths must be exact Path values")
-        if self.manifest != self.destination.with_name(
-            f"{self.destination.name}{_EXPORT_MANIFEST_SUFFIX}"
-        ):
-            raise ValueError("manifest path is not deterministic")
-
-
+_RecoveryArtifactPaths = snapshot_artifacts_module._RecoveryArtifactPaths
+"""_RecoveryArtifactPaths late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _recovery_artifact_paths(destination: Path) -> _RecoveryArtifactPaths:
-    if type(destination) is not type(Path()):
-        raise TypeError("destination must be an exact Path")
-    return _RecoveryArtifactPaths(
-        destination=destination,
-        manifest=destination.with_name(
-            f"{destination.name}{_EXPORT_MANIFEST_SUFFIX}"
-        ),
-        jsonl_temp=destination.with_name(
-            f".{destination.name}{_EXPORT_JSONL_TEMP_SUFFIX}"
-        ),
-        manifest_temp=destination.with_name(
-            f".{destination.name}{_EXPORT_MANIFEST_TEMP_SUFFIX}"
-        ),
-        jsonl_recovery=destination.with_name(
-            f".{destination.name}{_EXPORT_JSONL_RECOVERY_SUFFIX}"
-        ),
-        manifest_recovery=destination.with_name(
-            f".{destination.name}{_EXPORT_MANIFEST_RECOVERY_SUFFIX}"
-        ),
-    )
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
+    return snapshot_artifacts_module._recovery_artifact_paths(
+        destination=destination,
+    )
 
 def _recovery_destination_safe(
     facts: _RefreshRecoveryFacts,
@@ -463,391 +332,49 @@ def _recovery_destination_safe(
 
 
 def _parent_chain_safe(destination: Path) -> bool:
-    """Real non-symlink writable/executable parent chain for one file.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Every path component from the root down to the immediate parent
-    must be a real directory (``lstat``, so a symlinked component is
-    rejected) and the immediate parent must be writable and executable.
-    """
-
-    parent = destination.parent
-    chain = [parent]
-    chain.extend(parent.parents)
-    for candidate in reversed(chain):
-        try:
-            observed = os.lstat(candidate)
-        except (OSError, ValueError):
-            return False
-        if not stat.S_ISDIR(observed.st_mode):
-            return False
-    try:
-        observed = os.lstat(parent)
-    except (OSError, ValueError):
-        return False
-    if not (
-        observed.st_mode
-        & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-        and observed.st_mode
-        & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    ):
-        return False
-    return True
-
+    return snapshot_artifacts_module._parent_chain_safe(
+        destination=destination,
+    )
 
 def _artifact_parent_proof(
     destination: Path,
     expected_identity: tuple[int, int] | None,
 ) -> str | None:
-    """One strict identity-bound proof of the immediate parent chain.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Returns ``None`` only when the full parent chain is real/
-    non-symlink/writable/executable and the current immediate-parent
-    device/inode still equals the exact identity recorded at issued
-    registration; any other observation returns a stable blocker code.
-    A missing legacy identity fails closed and is never inferred as new
-    authority.
-    """
-
-    if expected_identity is None:
-        return "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING"
-    if not _parent_chain_safe(destination):
-        return "RECOVERY.EXPORT_PARENT_UNSAFE"
-    try:
-        observed = os.lstat(destination.parent)
-    except (OSError, ValueError):
-        return "RECOVERY.EXPORT_PARENT_UNSAFE"
-    if (observed.st_dev, observed.st_ino) != expected_identity:
-        return "RECOVERY.EXPORT_PARENT_REPLACED"
-    return None
-
-
-def _open_recovery_parent_chain_no_follow(destination: Path) -> int:
-    """Open ``destination.parent`` component-by-component from the root.
-
-    Every pathname component from the filesystem root down to the
-    immediate parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` against
-    the previously retained descriptor, so a symlinked, missing or
-    non-directory component (including an ancestor swapped to a symlink
-    between an earlier validation and this walk) fails the open instead
-    of redirecting the descriptor into another tree.  The caller owns
-    the returned descriptor.  Only usable where ``dir_fd``-relative
-    opens are available; the caller maps any unsupported-platform
-    failure to its fail-closed code.
-    """
-
-    parent = destination.parent
-    if not parent.is_absolute():
-        raise OSError("recovery parent path is not absolute")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptor = os.open(parent.parts[0], flags)
-    try:
-        for part in parent.parts[1:]:
-            next_descriptor = os.open(
-                part,
-                flags,
-                dir_fd=descriptor,
-            )
-            os.close(descriptor)
-            descriptor = next_descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
-
-
-class _RecoveryParentHandle:
-    """Component-bound no-follow parent dirfd for terminal recovery.
-
-    Binding walks every component of the advertised parent pathname
-    from the filesystem root with ``O_DIRECTORY|O_NOFOLLOW`` per
-    component (one retained descriptor per level), so an ancestor
-    swapped to a symlink between the row validation and the cleanup can
-    never redirect the retained descriptor into another tree.  The
-    final descriptor must be a real writable/executable directory whose
-    exact device/inode equals the durable handoff identity recorded at
-    issued registration.  Every terminal artifact probe,
-    reconstruction open/replace, cleanup unlink and the parent fsync
-    resolve only deterministic basenames relative to this descriptor;
-    the advertised parent pathname is never re-resolved for destructive
-    work.  ``reprove`` re-walks the advertised pathname component-wise
-    and requires it to still resolve to the retained identity, raising
-    ``RecoveryError`` with the stable post-validation codes
-    (``RECOVERY.EXPORT_PARENT_REPLACED`` for a replaced real directory,
-    ``RECOVERY.CLEANUP_FAILED`` for an unsafe chain) so the caller
-    keeps the handoff and fails closed.  The raw descriptor is private.
-    """
-
-    __slots__ = (
-        "destination",
-        "identity",
-        "_descriptor",
-        "_closed",
+    return snapshot_artifacts_module._artifact_parent_proof(
+        destination=destination,
+        expected_identity=expected_identity,
     )
 
-    def __init__(
-        self,
-        destination: Path,
-        descriptor: int,
-        identity: tuple[int, int],
-    ) -> None:
-        if type(destination) is not _NATIVE_PATH_TYPE:
-            raise TypeError("destination must be an exact native Path")
-        if type(descriptor) is not int or descriptor < 0:
-            raise TypeError("parent descriptor must be a non-negative int")
-        if (
-            type(identity) is not tuple
-            or len(identity) != 2
-            or type(identity[0]) is not int
-            or type(identity[1]) is not int
-        ):
-            raise TypeError("parent identity must be a device/inode pair")
-        self.destination = destination
-        self._descriptor = descriptor
-        self.identity = identity
-        self._closed = False
+def _open_recovery_parent_chain_no_follow(destination: Path) -> int:
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    @classmethod
-    def bind(
-        cls,
-        destination: Path,
-        expected_identity: tuple[int, int],
-    ) -> _RecoveryParentHandle:
-        """Validate the full parent chain and retain one no-follow dirfd.
+    return snapshot_artifacts_module._open_recovery_parent_chain_no_follow(
+        destination=destination,
+    )
 
-        The component-wise walk fails closed with
-        ``RECOVERY.EXPORT_PARENT_UNSAFE`` on any missing, symlinked,
-        non-directory or unsupported component (including platforms
-        without component-safe binding) and
-        ``RECOVERY.EXPORT_PARENT_REPLACED`` when the walked directory's
-        exact device/inode differs from the durable handoff identity;
-        a missing legacy identity fails closed with
-        ``RECOVERY.EXPORT_PARENT_IDENTITY_MISSING``.
-        """
-
-        if (
-            type(expected_identity) is not tuple
-            or len(expected_identity) != 2
-            or type(expected_identity[0]) is not int
-            or type(expected_identity[1]) is not int
-        ):
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",
-                retryable=False,
-            )
-        if not (
-            hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
-        ):
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_UNSAFE",
-                retryable=False,
-            )
-        descriptor = -1
-        try:
-            descriptor = _open_recovery_parent_chain_no_follow(
-                destination
-            )
-            observed = os.fstat(descriptor)
-        except (OSError, TypeError, ValueError):
-            if descriptor >= 0:
-                os.close(descriptor)
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_UNSAFE",
-                retryable=False,
-            ) from None
-        try:
-            if not stat.S_ISDIR(observed.st_mode):
-                raise RecoveryError(
-                    "RECOVERY.EXPORT_PARENT_UNSAFE",
-                    retryable=False,
-                )
-            if not (
-                observed.st_mode
-                & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-                and observed.st_mode
-                & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            ):
-                raise RecoveryError(
-                    "RECOVERY.EXPORT_PARENT_UNSAFE",
-                    retryable=False,
-                )
-            if (observed.st_dev, observed.st_ino) != expected_identity:
-                raise RecoveryError(
-                    "RECOVERY.EXPORT_PARENT_REPLACED",
-                    retryable=False,
-                )
-        except RecoveryError:
-            os.close(descriptor)
-            raise
-        return cls(
-            destination,
-            descriptor,
-            (observed.st_dev, observed.st_ino),
-        )
-
-    @property
-    def descriptor(self) -> int:
-        """Private descriptor access for dirfd-relative syscalls."""
-
-        if self._closed:
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_REPLACED",
-                retryable=False,
-            )
-        return self._descriptor
-
-    def fsync(self) -> None:
-        """Fsync the retained directory descriptor for durability."""
-
-        try:
-            os.fsync(self.descriptor)
-        except OSError:
-            raise RecoveryError(
-                "RECOVERY.EXPORT_IO_FAILED",
-                retryable=False,
-            ) from None
-
-    def reprove(self) -> None:
-        """Re-walk the advertised pathname and require the identity.
-
-        The advertised full parent pathname is re-proven
-        component-by-component with ``O_DIRECTORY|O_NOFOLLOW`` per
-        component, so an ancestor symlink can never be accepted as the
-        proven chain.  A replaced real directory raises
-        ``RECOVERY.EXPORT_PARENT_REPLACED`` (non-retryable) and an
-        unsafe chain raises ``RECOVERY.CLEANUP_FAILED`` (retryable), so
-        the caller keeps the handoff and fails closed without touching
-        the moved/replaced parent or any attacker path.
-        """
-
-        descriptor = -1
-        try:
-            descriptor = _open_recovery_parent_chain_no_follow(
-                self.destination
-            )
-            observed = os.fstat(descriptor)
-        except (OSError, TypeError, ValueError):
-            raise RecoveryError(
-                "RECOVERY.CLEANUP_FAILED",
-                retryable=True,
-            ) from None
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        if not stat.S_ISDIR(observed.st_mode):
-            raise RecoveryError(
-                "RECOVERY.CLEANUP_FAILED",
-                retryable=True,
-            )
-        if not (
-            observed.st_mode
-            & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-            and observed.st_mode
-            & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        ):
-            raise RecoveryError(
-                "RECOVERY.CLEANUP_FAILED",
-                retryable=True,
-            )
-        if (observed.st_dev, observed.st_ino) != self.identity:
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_REPLACED",
-                retryable=False,
-            )
-
-    def open(
-        self,
-        name: str,
-        flags: int,
-        mode: int = 0o600,
-    ) -> int:
-        """Open one basename relative to the retained parent descriptor."""
-
-        _require_recovery_basename(name)
-        return os.open(
-            name,
-            flags,
-            dir_fd=self.descriptor,
-            mode=mode,
-        )
-
-    def lstat(self, name: str) -> os.stat_result:
-        """No-follow stat of one basename relative to the retained fd."""
-
-        _require_recovery_basename(name)
-        return os.stat(
-            name,
-            dir_fd=self.descriptor,
-            follow_symlinks=False,
-        )
-
-    def unlink(self, name: str) -> None:
-        """Unlink one basename relative to the retained parent descriptor."""
-
-        _require_recovery_basename(name)
-        os.unlink(name, dir_fd=self.descriptor)
-
-    def replace(self, source: str, destination: str) -> None:
-        """Rename one basename to another relative to the retained fd."""
-
-        _require_recovery_basename(source)
-        _require_recovery_basename(destination)
-        os.replace(
-            source,
-            destination,
-            src_dir_fd=self.descriptor,
-            dst_dir_fd=self.descriptor,
-        )
-
-    def close(self) -> None:
-        """Best-effort close of the retained descriptor."""
-
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            os.close(self._descriptor)
-        except OSError:
-            pass
-
-    def __enter__(self) -> _RecoveryParentHandle:
-        return self
-
-    def __exit__(
-        self,
-        _exc_type: object,
-        _exc_value: object,
-        _traceback: object,
-    ) -> None:
-        self.close()
-
-
+_RecoveryParentHandle = snapshot_artifacts_module._RecoveryParentHandle
+"""_RecoveryParentHandle late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _require_recovery_basename(name: str) -> None:
-    """One deterministic artifact name must be a pure safe basename."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    if (
-        type(name) is not str
-        or not name
-        or name in {".", ".."}
-        or "/" in name
-        or "\\" in name
-    ):
-        raise ValueError("recovery artifact name is not a safe basename")
-
+    return snapshot_artifacts_module._require_recovery_basename(
+        name=name,
+    )
 
 def _after_recovery_parent_bound(
     destination: Path,
     parent_identity: tuple[int, int],
 ) -> None:
-    """Late-bound seam invoked once the recovery parent dirfd is bound.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Test-only fault-injection point: runs immediately after the parent
-    descriptor has been bound and identity-proven against the durable
-    handoff and before any descriptor-relative artifact probe or
-    reconstruction, so a hostile parent rename/replacement exactly at
-    that boundary can be reproduced without re-resolving the parent
-    pathname.
-    """
-
+    return snapshot_artifacts_module._after_recovery_parent_bound(
+        destination=destination,
+        parent_identity=parent_identity,
+    )
 
 def _after_recovery_manifest_source_proved(
     destination: Path,
@@ -855,15 +382,14 @@ def _after_recovery_manifest_source_proved(
     manifest_name: str,
     expected_source_identity: tuple[int, int],
 ) -> None:
-    """Late-bound seam invoked immediately before the manifest replace.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Runs after the exact handed-off manifest temp identity has been
-    re-proven and immediately before the parent-relative rename, so a
-    source-name swap exactly at that mutation boundary can be
-    reproduced deterministically without re-resolving the parent
-    pathname for destructive work.  Test-only fault-injection point.
-    """
-
+    return snapshot_artifacts_module._after_recovery_manifest_source_proved(
+        destination=destination,
+        manifest_temp_name=manifest_temp_name,
+        manifest_name=manifest_name,
+        expected_source_identity=expected_source_identity,
+    )
 
 def _prove_recovery_manifest_source(
     manifest_temp: Path,
@@ -873,34 +399,16 @@ def _prove_recovery_manifest_source(
     expected_identity: tuple[int, int],
     parent: _RecoveryParentHandle | None = None,
 ) -> None:
-    """Prove the durable manifest temp by exact digest AND handed-off inode.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    A same-byte foreign inode swapped into the temp slot after an
-    earlier proof fails closed with ``RECOVERY.MANIFEST_TEMP_INVALID``
-    before any rename; with a retained parent handle the capture is
-    descriptor-relative.
-    """
-
-    if parent is not None:
-        capture = _recovery_parent_capture(
-            parent,
-            manifest_temp_name,
-            "RECOVERY_MANIFEST_TEMP",
-        )
-    else:
-        capture = _capture_activation_file(
-            manifest_temp,
-            asset_kind="RECOVERY_MANIFEST_TEMP",
-        )
-    if capture.digest != expected_digest or (
-        capture.identity.device,
-        capture.identity.inode,
-    ) != expected_identity:
-        raise RecoveryError(
-            "RECOVERY.MANIFEST_TEMP_INVALID",
-            retryable=False,
-        )
-
+    return snapshot_artifacts_module._prove_recovery_manifest_source(
+        manifest_temp=manifest_temp,
+        manifest_temp_name=manifest_temp_name,
+        expected_digest=expected_digest,
+        expected_identity=expected_identity,
+        parent=parent,
+        parent_capture=_recovery_parent_capture,
+    )
 
 def _prove_recovery_manifest_destination(
     manifest_path: Path,
@@ -909,71 +417,14 @@ def _prove_recovery_manifest_destination(
     handoff: _ArtifactHandoffFacts,
     parent: _RecoveryParentHandle | None = None,
 ) -> None:
-    """Prove the manifest destination against the durable handoff record.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The destination must still match the exact prior manifest digest
-    AND handed-off inode, or the recorded exact absence; any divergence
-    -- including a same-byte foreign inode swapped in after an earlier
-    proof -- fails closed with the existing
-    ``RECOVERY.MANIFEST_DESTINATION_*`` codes before any rename, so a
-    concurrent destination replacement in the late seam can never be
-    silently overwritten.
-    """
-
-    if expected_manifest_digest is None:
-        if handoff.prior_jsonl_absent is not True:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
-                retryable=False,
-            )
-        if handoff.prior_manifest_absent is not True:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
-                retryable=False,
-            )
-        try:
-            if parent is not None:
-                parent.lstat(manifest_path.name)
-            else:
-                os.lstat(manifest_path)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_UNSAFE",
-                retryable=False,
-            ) from error
-        else:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_CHANGED",
-                retryable=False,
-            )
-    else:
-        if (
-            handoff.prior_manifest_absent is not False
-            or handoff.prior_manifest_digest
-            != expected_manifest_digest
-            or handoff.prior_manifest_identity is None
-        ):
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
-                retryable=False,
-            )
-        state, digest, identity = _strict_file_state(
-            manifest_path,
-            parent=parent,
-        )
-        if state != "present" or digest != expected_manifest_digest:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_CHANGED",
-                retryable=False,
-            )
-        if identity != handoff.prior_manifest_identity:
-            raise RecoveryError(
-                "RECOVERY.MANIFEST_DESTINATION_UNPROVEN",
-                retryable=False,
-            )
-
+    return snapshot_artifacts_module._prove_recovery_manifest_destination(
+        manifest_path=manifest_path,
+        expected_manifest_digest=expected_manifest_digest,
+        handoff=handoff,
+        parent=parent,
+    )
 
 def _bind_recovery_parent(
     receipt: IssuedReceiptFacts,
@@ -1066,69 +517,12 @@ def _strict_file_state(
     *,
     parent: _RecoveryParentHandle | None = None,
 ) -> tuple[str, str | None, tuple[int, int] | None]:
-    """One descriptor-based no-follow proof of a configured pair entry.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Returns ``("absent", None, None)`` when the path does not exist,
-    ``("unsafe", None, None)`` when the path is a symlink, directory,
-    multi-link entry, unreadable, or whose terminal identity is not
-    stable, and ``("present", digest, identity)`` only for a regular
-    single-link file whose bytes are hashed through the descriptor and
-    whose terminal ``lstat`` still reports the same device/inode.
-    Pathname hashing is never used, so a foreign same-byte inode cannot
-    masquerade as a stable owned entry.  With a retained parent handle
-    the probe resolves the basename relative to that descriptor and
-    never re-resolves the parent pathname.
-    """
-
-    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-    descriptor = -1
-    try:
-        if parent is not None:
-            descriptor = os.open(
-                path.name,
-                os.O_RDONLY | no_follow,
-                dir_fd=parent.descriptor,
-            )
-        else:
-            descriptor = os.open(path, os.O_RDONLY | no_follow)
-    except FileNotFoundError:
-        return ("absent", None, None)
-    except OSError:
-        return ("unsafe", None, None)
-    try:
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            return ("unsafe", None, None)
-        identity = (observed.st_dev, observed.st_ino)
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    except OSError:
-        return ("unsafe", None, None)
-    finally:
-        os.close(descriptor)
-    try:
-        if parent is not None:
-            final = os.stat(
-                path.name,
-                dir_fd=parent.descriptor,
-                follow_symlinks=False,
-            )
-        else:
-            final = os.lstat(path)
-    except OSError:
-        return ("unsafe", None, None)
-    if (
-        not stat.S_ISREG(final.st_mode)
-        or final.st_nlink != 1
-        or (final.st_dev, final.st_ino) != identity
-    ):
-        return ("unsafe", None, None)
-    return ("present", digest.hexdigest(), identity)
-
+    return snapshot_artifacts_module._strict_file_state(
+        path=path,
+        parent=parent,
+    )
 
 def _path_exists(
     path: Path,
@@ -1155,27 +549,26 @@ def _manifest_for_receipt(
     receipt: SnapshotReceipt,
     kind: SnapshotKind,
 ) -> SnapshotManifest:
-    """Deterministic adjacent manifest reconstructed from one receipt."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    return SnapshotManifest(
-        manifest_version=SNAPSHOT_MANIFEST_VERSION,
-        snapshot_kind=kind,
+    return snapshot_artifacts_module._manifest_for_receipt(
         receipt=receipt,
-        receipt_digest=snapshot_receipt_digest(receipt),
+        kind=kind,
     )
 
-
 def _manifest_bytes(manifest: SnapshotManifest) -> bytes:
-    return contract_to_json(manifest).encode("utf-8")
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
+    return snapshot_artifacts_module._manifest_bytes(
+        manifest=manifest,
+    )
 
 def _manifest_digest_for_receipt(receipt: SnapshotReceipt) -> str:
-    return hashlib.sha256(
-        _manifest_bytes(
-            _manifest_for_receipt(receipt, SnapshotKind.EXPLICIT_EXPORT)
-        )
-    ).hexdigest()
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
+    return snapshot_artifacts_module._manifest_digest_for_receipt(
+        receipt=receipt,
+    )
 
 def _record_count_at(
     facts: _RefreshRecoveryFacts,
@@ -1567,17 +960,12 @@ def _artifact_expected_identity(
     handoff: _ArtifactHandoffFacts | None,
     artifact: str,
 ) -> tuple[int, int] | None:
-    """The durably handed-off identity for one artifact, if any."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    if handoff is None:
-        return None
-    return {
-        "jsonl_temp": handoff.jsonl_temp_identity,
-        "manifest_temp": handoff.manifest_temp_identity,
-        "jsonl_recovery": handoff.jsonl_recovery_identity,
-        "manifest_recovery": handoff.manifest_recovery_identity,
-    }[artifact]
-
+    return snapshot_artifacts_module._artifact_expected_identity(
+        handoff=handoff,
+        artifact=artifact,
+    )
 
 def _unproven_artifact_code(
     handoff: _ArtifactHandoffFacts | None,
@@ -1585,56 +973,24 @@ def _unproven_artifact_code(
     *,
     parent: _RecoveryParentHandle | None = None,
 ) -> str | None:
-    """Blocking error when an existing artifact matches expected content
-    but has no durable ownership proof.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Content equality alone is never ownership: a same-byte foreign
-    inode without the exact handed-off identity is unprovable and must
-    be preserved, never unlinked or replaced.  With a retained parent
-    handle the probe resolves the basename relative to that descriptor.
-    """
-
-    for path, digests, artifact in expectations:
-        state, digest, identity = _strict_file_state(path, parent=parent)
-        if state == "absent":
-            continue
-        if state != "present" or digest not in digests:
-            continue
-        expected_identity = _artifact_expected_identity(
-            handoff,
-            artifact,
-        )
-        if expected_identity is None or identity != expected_identity:
-            return "RECOVERY.ARTIFACT_UNPROVEN"
-    return None
-
+    return snapshot_artifacts_module._unproven_artifact_code(
+        handoff=handoff,
+        expectations=expectations,
+        parent=parent,
+    )
 
 def _prior_handoff_digests(
     handoff: _ArtifactHandoffFacts | None,
     artifact: str,
 ) -> set[str]:
-    """The durably recorded prior-pair digest set for one recovery copy.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Only a recorded present prior entry (``absent=False`` with a
-    64-hex digest) yields a digest; an unrecorded or recorded-absent
-    prior state yields an empty set so an existing copy can never be
-    proven and fails closed.
-    """
-
-    if handoff is None:
-        return set()
-    if artifact == "jsonl_recovery":
-        digest = handoff.prior_jsonl_digest
-        if handoff.prior_jsonl_absent is False and digest is not None:
-            return {digest}
-        return set()
-    if artifact == "manifest_recovery":
-        digest = handoff.prior_manifest_digest
-        if handoff.prior_manifest_absent is False and digest is not None:
-            return {digest}
-        return set()
-    raise ValueError(f"unknown recovery artifact {artifact!r}")
-
+    return snapshot_artifacts_module._prior_handoff_digests(
+        handoff=handoff,
+        artifact=artifact,
+    )
 
 def _export_artifact_expectations(
     destination: Path,
@@ -1717,183 +1073,39 @@ def _remove_owned_recovery_artifact(
     name: str,
     expected_identity: _ActivationFileIdentity,
 ) -> bool:
-    """Remove exactly one owned deterministic artifact relative to the
-    retained parent descriptor; True only when provably absent after.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The unlink, parent fsync and absence re-proof all resolve the
-    basename relative to the retained descriptor, so a parent renamed
-    or replaced after the bind can never redirect the unlink into the
-    replacement directory.  Any observation other than the exact
-    single-link owned inode returns False and the caller fails closed.
-    """
+    return snapshot_artifacts_module._remove_owned_recovery_artifact(
+        parent=parent,
+        name=name,
+        expected_identity=expected_identity,
+    )
 
-    try:
-        observed = os.stat(
-            name,
-            dir_fd=parent.descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-        or (observed.st_dev, observed.st_ino)
-        != (expected_identity.device, expected_identity.inode)
-    ):
-        return False
-    try:
-        os.unlink(name, dir_fd=parent.descriptor)
-    except OSError:
-        return False
-    try:
-        os.fsync(parent.descriptor)
-    except OSError:
-        return False
-    try:
-        os.stat(
-            name,
-            dir_fd=parent.descriptor,
-            follow_symlinks=False,
-        )
-        return False
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-
-
-@dataclass(frozen=True)
-class _RecoveryFileCapture:
-    """Strict descriptor-relative capture of one recovery entry."""
-
-    asset_kind: str
-    identity: _ActivationFileIdentity
-    digest: str
-
-
+_RecoveryFileCapture = snapshot_artifacts_module._RecoveryFileCapture
+"""_RecoveryFileCapture late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _recovery_parent_capture(
     parent: _RecoveryParentHandle,
     name: str,
     asset_kind: str,
 ) -> _RecoveryFileCapture:
-    """One strict single-link capture relative to the retained parent.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Mirrors the activation-journal capture semantics (regular
-    single-link closure at the initial stat, the descriptor fstat/read
-    and the final revalidation) but resolves the entry only relative to
-    the retained descriptor, so a swapped parent pathname can never
-    substitute a foreign entry.
-    """
-
-    try:
-        initial = os.stat(
-            name,
-            dir_fd=parent.descriptor,
-            follow_symlinks=False,
-        )
-    except OSError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.PRIOR_ASSET_INVALID",
-            retryable=False,
-        ) from error
-    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
-        raise ActivationPreparationError(
-            "ACTIVATION.PRIOR_ASSET_INVALID",
-            retryable=False,
-        )
-    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | no_follow,
-            dir_fd=parent.descriptor,
-        )
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            raise ActivationPreparationError(
-                "ACTIVATION.PRIOR_ASSET_INVALID",
-                retryable=False,
-            )
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        identity = _ActivationFileIdentity(
-            observed.st_dev,
-            observed.st_ino,
-        )
-    except OSError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.PRIOR_ASSET_INVALID",
-            retryable=False,
-        ) from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    try:
-        final = os.stat(
-            name,
-            dir_fd=parent.descriptor,
-            follow_symlinks=False,
-        )
-    except OSError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.PRIOR_ASSET_INVALID",
-            retryable=False,
-        ) from error
-    if (
-        not stat.S_ISREG(final.st_mode)
-        or final.st_nlink != 1
-        or (final.st_dev, final.st_ino)
-        != (identity.device, identity.inode)
-    ):
-        raise ActivationPreparationError(
-            "ACTIVATION.PRIOR_ASSET_INVALID",
-            retryable=False,
-        )
-    return _RecoveryFileCapture(
+    return snapshot_artifacts_module._recovery_parent_capture(
+        parent=parent,
+        name=name,
         asset_kind=asset_kind,
-        identity=identity,
-        digest=digest.hexdigest(),
     )
-
 
 def _recovery_parent_open_exclusive(
     parent: _RecoveryParentHandle,
     name: str,
 ) -> tuple[int, _ActivationFileIdentity]:
-    """Create one exclusive deterministic temporary relative to the
-    retained parent descriptor; returns the open descriptor and the
-    exact created identity."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(
-        name,
-        flags,
-        0o600,
-        dir_fd=parent.descriptor,
+    return snapshot_artifacts_module._recovery_parent_open_exclusive(
+        parent=parent,
+        name=name,
     )
-    try:
-        observed = os.fstat(descriptor)
-    except BaseException:
-        os.close(descriptor)
-        raise
-    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-        os.close(descriptor)
-        raise OSError("recovery temporary is not an exclusive regular file")
-    return descriptor, _ActivationFileIdentity(
-        observed.st_dev,
-        observed.st_ino,
-    )
-
 
 def _remove_content_proven_artifact(
     path: Path,
@@ -1902,62 +1114,25 @@ def _remove_content_proven_artifact(
     expected_identity: tuple[int, int] | None,
     parent: _RecoveryParentHandle | None = None,
 ) -> bool:
-    """Remove one deterministic artifact proven by strict content proof
-    plus the durable handed-off identity.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The unlink is identity-bound to the proven inode with a parent
-    fsync and an absence re-proof.  A foreign, linked, unsafe,
-    digest-mismatched or identity-less entry fails closed and is never
-    removed.  With a retained parent handle the probe, unlink, fsync
-    and absence re-proof resolve the basename relative to that
-    descriptor and never re-resolve the parent pathname.
-    """
-
-    state, digest, identity = _strict_file_state(
-        path,
+    return snapshot_artifacts_module._remove_content_proven_artifact(
+        path=path,
+        expected_digest=expected_digest,
+        expected_identity=expected_identity,
         parent=parent,
     )
-    if state == "absent":
-        return True
-    if (
-        state != "present"
-        or digest != expected_digest
-        or expected_identity is None
-        or identity is None
-        or identity != expected_identity
-    ):
-        return False
-    if parent is not None:
-        return _remove_owned_recovery_artifact(
-            parent,
-            path.name,
-            _ActivationFileIdentity(identity[0], identity[1]),
-        )
-    return _remove_owned_activation_journal_temp(
-        path,
-        _ActivationFileIdentity(identity[0], identity[1]),
-    )
-
 
 def _recovery_cleanup_parent_gate(
     destination: Path,
     parent: _RecoveryParentHandle | None,
 ) -> None:
-    """Fail closed before any destructive probe when the advertised
-    parent pathname can no longer be proven.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Runs after the row validation, before the first descriptor-relative
-    probe or unlink.  A replaced real directory fails closed with
-    ``RECOVERY.EXPORT_PARENT_REPLACED`` without touching either the
-    moved original or the replacement, and an unsafe chain (symlinked,
-    missing, unwritable) fails closed with ``RECOVERY.CLEANUP_FAILED``
-    so the cleanup-pending handoff is kept for a later idempotent
-    replay.
-    """
-
-    if parent is not None:
-        parent.reprove()
-
+    return snapshot_artifacts_module._recovery_cleanup_parent_gate(
+        destination=destination,
+        parent=parent,
+    )
 
 def _cleanup_refresh_artifacts(
     facts: _RefreshRecoveryFacts,
@@ -2509,67 +1684,13 @@ def _fsync_artifact_parent(
     *,
     parent: _RecoveryParentHandle | None = None,
 ) -> None:
-    """No-follow directory-descriptor proof and fsync of the parent.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The parent directory is opened with ``O_DIRECTORY`` and
-    ``O_NOFOLLOW`` (where available), its descriptor is ``fstat``-proven
-    to be the exact device/inode recorded at issued registration, the
-    descriptor is fsynced, and the pathname/full chain is re-proven to
-    still resolve to that same identity.  The fsync is unconditional:
-    even when every deterministic artifact is already absent (a prior
-    unlink succeeded but its directory fsync failed), the release must
-    still durably record the absence before the cleanup-pending handoff
-    journal is cleared.  Any mismatch or failure raises
-    ``RecoveryError`` and the caller keeps the handoff and reports
-    BLOCKED; a missing legacy identity fails closed and is never
-    inferred as new authority.  With a retained parent handle the fsync
-    runs on that exact retained descriptor and the advertised pathname
-    is re-proven by the component-wise walk; the parent pathname is
-    never re-resolved for the fsync.
-    """
-
-    if parent is not None:
-        parent.fsync()
-        parent.reprove()
-        return
-    proof_error = _artifact_parent_proof(destination, expected_identity)
-    if proof_error is not None:
-        raise RecoveryError(proof_error, retryable=False)
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = -1
-    try:
-        descriptor = os.open(destination.parent, flags)
-        observed = os.fstat(descriptor)
-        if not stat.S_ISDIR(observed.st_mode) or (
-            observed.st_dev,
-            observed.st_ino,
-        ) != expected_identity:
-            raise RecoveryError(
-                "RECOVERY.EXPORT_PARENT_REPLACED",
-                retryable=False,
-            )
-        os.fsync(descriptor)
-    except RecoveryError:
-        raise
-    except OSError:
-        raise RecoveryError(
-            "RECOVERY.EXPORT_IO_FAILED",
-            retryable=False,
-        ) from None
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-    proof_error = _artifact_parent_proof(destination, expected_identity)
-    if proof_error is not None:
-        raise RecoveryError(proof_error, retryable=False)
-
+    return snapshot_artifacts_module._fsync_artifact_parent(
+        destination=destination,
+        expected_identity=expected_identity,
+        parent=parent,
+    )
 
 def _terminal_handoff_row_blocker(
     facts: _RefreshRecoveryFacts,

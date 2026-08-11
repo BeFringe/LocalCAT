@@ -232,6 +232,8 @@ from tm_activation_recovery import (
 import tm_schema_upgrade as schema_upgrade_module
 
 import tm_snapshot_recovery as snapshot_recovery_module
+import tm_snapshot_artifacts as snapshot_artifacts_module
+
 
 TM_SCHEMA_VERSION = 2
 TM_LEGACY_SCHEMA_VERSION = 1
@@ -3835,115 +3837,34 @@ def _binding_from_ledger_row(row: tuple[object, ...]) -> SnapshotBinding:
 def _strict_pair_file_state(
     path: Path,
 ) -> tuple[str, str | None, tuple[int, int] | None]:
-    """One descriptor-based no-follow proof of a configured pair entry.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Returns ``("absent", None, None)`` when the path does not exist,
-    ``("unsafe", None, None)`` when the path is a symlink, directory,
-    multi-link entry, unreadable, or whose terminal identity is not
-    stable, and ``("present", digest, identity)`` only for a regular
-    single-link file whose bytes are hashed through the descriptor and
-    whose terminal ``lstat`` still reports the same device/inode.
-    Pathname hashing is never used, so a foreign same-byte inode cannot
-    masquerade as a stable owned entry.
-    """
-
-    no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
-    descriptor = -1
-    try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
-    except FileNotFoundError:
-        return ("absent", None, None)
-    except OSError:
-        return ("unsafe", None, None)
-    try:
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            return ("unsafe", None, None)
-        identity = (observed.st_dev, observed.st_ino)
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    except OSError:
-        return ("unsafe", None, None)
-    finally:
-        os.close(descriptor)
-    try:
-        final = os.lstat(path)
-    except OSError:
-        return ("unsafe", None, None)
-    if (
-        not stat.S_ISREG(final.st_mode)
-        or final.st_nlink != 1
-        or (final.st_dev, final.st_ino) != identity
-    ):
-        return ("unsafe", None, None)
-    return ("present", digest.hexdigest(), identity)
-
+    return snapshot_artifacts_module._strict_pair_file_state(
+        path=path,
+    )
 
 def _artifact_parent_dirfd(
     destination: Path,
     expected_identity: tuple[int, int] | None,
 ) -> int:
-    """Open and fstat-prove one no-follow parent directory descriptor.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Runs the real non-symlink writable/executable parent-chain proof,
-    opens the immediate parent with ``O_DIRECTORY|O_NOFOLLOW`` (where
-    available) and requires the descriptor's exact device/inode to equal
-    the durable handoff identity recorded at issued registration.  A
-    missing legacy identity, an unsafe/replaced chain, an open/fstat
-    failure or an identity mismatch fails closed with a stable store
-    code and never returns a descriptor.
-    """
-
-    if expected_identity is None:
-        raise SQLiteStoreSchemaError(
-            "STORE.HANDOFF_PARENT_IDENTITY_MISSING"
-        )
-    if not snapshot_recovery_module._parent_chain_safe(destination):
-        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_UNSAFE")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(destination.parent, flags)
-    except OSError:
-        raise SQLiteStoreSchemaError(
-            "STORE.HANDOFF_PARENT_UNSAFE"
-        ) from None
-    try:
-        observed = os.fstat(descriptor)
-    except OSError:
-        os.close(descriptor)
-        raise SQLiteStoreSchemaError(
-            "STORE.HANDOFF_PARENT_UNSAFE"
-        ) from None
-    if (
-        not stat.S_ISDIR(observed.st_mode)
-        or (observed.st_dev, observed.st_ino) != expected_identity
-    ):
-        os.close(descriptor)
-        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_REPLACED")
-    return descriptor
-
+    return snapshot_artifacts_module._artifact_parent_dirfd(
+        destination=destination,
+        expected_identity=expected_identity,
+        error_factory=SQLiteStoreSchemaError,
+    )
 
 def _after_artifact_parent_dirfd_bound(
     destination: Path,
     parent_identity: tuple[int, int] | None,
 ) -> None:
-    """Late-bound seam invoked once the handoff parent dirfd is bound.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    Test-only fault-injection point: runs immediately after the parent
-    descriptor has been opened and fstat-proven against the durable
-    handoff identity and before any descriptor-relative artifact probe,
-    so a hostile parent rename/replacement exactly at that boundary can
-    be reproduced without re-resolving the parent pathname.
-    """
-
+    return snapshot_artifacts_module._after_artifact_parent_dirfd_bound(
+        destination=destination,
+        parent_identity=parent_identity,
+    )
 
 def _artifact_handoff_dirfd_entry(
     name: str,
@@ -3951,69 +3872,38 @@ def _artifact_handoff_dirfd_entry(
     expected_identity: tuple[int, int],
     code: str,
 ) -> None:
-    """Prove one deterministic handoff entry relative to a parent dirfd.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The basename must exist under the retained descriptor as a regular
-    single-link file whose exact device/inode equals the handed-off
-    identity; absent, symlinked, directory, multi-link, swapped or
-    unreadable entries fail closed with ``code``.
-    """
-
-    try:
-        observed = os.stat(
-            name,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        raise SQLiteStoreSchemaError(code) from None
-    except OSError:
-        raise SQLiteStoreSchemaError(code) from None
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-        or (observed.st_dev, observed.st_ino) != expected_identity
-    ):
-        raise SQLiteStoreSchemaError(code)
-
+    return snapshot_artifacts_module._artifact_handoff_dirfd_entry(
+        name=name,
+        descriptor=descriptor,
+        expected_identity=expected_identity,
+        code=code,
+        error_factory=SQLiteStoreSchemaError,
+    )
 
 def _artifact_handoff_dirfd_absent(
     name: str,
     descriptor: int,
 ) -> bool:
-    """True only when one basename is provably absent under the dirfd."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    try:
-        os.stat(
-            name,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-        return False
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-
+    return snapshot_artifacts_module._artifact_handoff_dirfd_absent(
+        name=name,
+        descriptor=descriptor,
+    )
 
 def _artifact_handoff_dirfd_reprove(
     destination: Path,
     expected_identity: tuple[int, int],
 ) -> None:
-    """Re-prove the advertised full parent pathname still resolves to
-    the exact handoff identity after the descriptor-relative probes."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    if not snapshot_recovery_module._parent_chain_safe(destination):
-        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_UNSAFE")
-    try:
-        observed = os.lstat(destination.parent)
-    except (OSError, ValueError):
-        raise SQLiteStoreSchemaError(
-            "STORE.HANDOFF_PARENT_UNSAFE"
-        ) from None
-    if (observed.st_dev, observed.st_ino) != expected_identity:
-        raise SQLiteStoreSchemaError("STORE.HANDOFF_PARENT_REPLACED")
-
+    return snapshot_artifacts_module._artifact_handoff_dirfd_reprove(
+        destination=destination,
+        expected_identity=expected_identity,
+        error_factory=SQLiteStoreSchemaError,
+    )
 
 def _configured_pair_diagnostics(
     binding: SnapshotBinding,
@@ -4239,25 +4129,22 @@ def _require_artifact_identity_pair(
     value: object,
     field_name: str,
 ) -> None:
-    """Validate one optional exact ``(device, inode)`` identity pair."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    if value is None:
-        return
-    if (
-        type(value) is not tuple
-        or len(value) != 2
-        or type(value[0]) is not int
-        or type(value[1]) is not int
-    ):
-        raise ValueError(f"{field_name} is invalid")
+    return snapshot_artifacts_module._require_artifact_identity_pair(
+        value=value,
+        field_name=field_name,
+    )
 
-
-_ARTIFACT_HANDOFF_META_PREFIX = "artifact_handoff."
-
+_ARTIFACT_HANDOFF_META_PREFIX = snapshot_artifacts_module._ARTIFACT_HANDOFF_META_PREFIX
+"""_ARTIFACT_HANDOFF_META_PREFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 
 def _artifact_handoff_meta_key(snapshot_id: str) -> str:
-    return f"{_ARTIFACT_HANDOFF_META_PREFIX}{snapshot_id}"
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
+    return snapshot_artifacts_module._artifact_handoff_meta_key(
+        snapshot_id=snapshot_id,
+    )
 
 def _artifact_handoff_prior_record(
     *,
@@ -4266,40 +4153,14 @@ def _artifact_handoff_prior_record(
     absent: bool | None,
     field_name: str,
 ) -> None:
-    """Validate one optional durable prior-pair asset record.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    The record is either an explicit proven absence (``absent=True``
-    with no digest/identity), a proven present entry (``absent=False``
-    with a 64-hex digest and an exact device/inode pair), or entirely
-    unrecorded (``absent=None`` with no digest/identity).  Anything else
-    is rejected so reconstruction and cleanup never act on a half-written
-    ownership record.
-    """
-
-    if absent is True:
-        if digest is not None or identity is not None:
-            raise ValueError(f"{field_name} absent record must be empty")
-        return
-    if absent is False:
-        if type(digest) is not str or len(digest) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in digest
-        ):
-            raise ValueError(f"{field_name} digest is invalid")
-        if (
-            type(identity) is not tuple
-            or len(identity) != 2
-            or type(identity[0]) is not int
-            or type(identity[1]) is not int
-        ):
-            raise ValueError(f"{field_name} identity is invalid")
-        return
-    if absent is None:
-        if digest is not None or identity is not None:
-            raise ValueError(f"{field_name} record is not fully absent")
-        return
-    raise ValueError(f"{field_name} absent flag is invalid")
-
+    return snapshot_artifacts_module._artifact_handoff_prior_record(
+        identity=identity,
+        digest=digest,
+        absent=absent,
+        field_name=field_name,
+    )
 
 def _artifact_handoff_meta_value(
     *,
@@ -4315,223 +4176,32 @@ def _artifact_handoff_meta_value(
     prior_manifest_digest: str | None = None,
     prior_manifest_absent: bool | None = None,
 ) -> str:
-    """One write-once artifact handoff cleanup-pending journal payload.
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    In addition to the exclusive temporary and recovery-copy identities,
-    the payload durably records the exact immediate-parent device/inode
-    (``artifact_parent_identity``) proven by a strict real non-symlink
-    parent-chain proof at issued registration, so terminal cleanup and
-    handoff release can detect a hostile parent rename or replacement
-    and fail closed with the handoff retained.  The payload also
-    durably records the prior final JSONL/manifest identity and digest
-    (or their explicit proven absence) captured before any publication
-    replace, so reconstruction can replace an old manifest only when
-    the current entry still matches the recorded prior identity and
-    digest.  Missing prior records are ``None`` and always fail closed.
-    """
-
-    _require_artifact_identity_pair(
-        artifact_parent_identity,
-        "artifact_parent_identity",
+    return snapshot_artifacts_module._artifact_handoff_meta_value(
+        jsonl_temp_identity=jsonl_temp_identity,
+        manifest_temp_identity=manifest_temp_identity,
+        artifact_parent_identity=artifact_parent_identity,
+        jsonl_recovery_identity=jsonl_recovery_identity,
+        manifest_recovery_identity=manifest_recovery_identity,
+        prior_jsonl_identity=prior_jsonl_identity,
+        prior_jsonl_digest=prior_jsonl_digest,
+        prior_jsonl_absent=prior_jsonl_absent,
+        prior_manifest_identity=prior_manifest_identity,
+        prior_manifest_digest=prior_manifest_digest,
+        prior_manifest_absent=prior_manifest_absent,
     )
-    _artifact_handoff_prior_record(
-        identity=prior_jsonl_identity,
-        digest=prior_jsonl_digest,
-        absent=prior_jsonl_absent,
-        field_name="prior_jsonl",
-    )
-    _artifact_handoff_prior_record(
-        identity=prior_manifest_identity,
-        digest=prior_manifest_digest,
-        absent=prior_manifest_absent,
-        field_name="prior_manifest",
-    )
-    return json.dumps(
-        {
-            "version": 1,
-            "artifact_parent_device": (
-                None
-                if artifact_parent_identity is None
-                else artifact_parent_identity[0]
-            ),
-            "artifact_parent_inode": (
-                None
-                if artifact_parent_identity is None
-                else artifact_parent_identity[1]
-            ),
-            "jsonl_temp_device": (
-                None
-                if jsonl_temp_identity is None
-                else jsonl_temp_identity[0]
-            ),
-            "jsonl_temp_inode": (
-                None
-                if jsonl_temp_identity is None
-                else jsonl_temp_identity[1]
-            ),
-            "manifest_temp_device": (
-                None
-                if manifest_temp_identity is None
-                else manifest_temp_identity[0]
-            ),
-            "manifest_temp_inode": (
-                None
-                if manifest_temp_identity is None
-                else manifest_temp_identity[1]
-            ),
-            "jsonl_recovery_device": (
-                None
-                if jsonl_recovery_identity is None
-                else jsonl_recovery_identity[0]
-            ),
-            "jsonl_recovery_inode": (
-                None
-                if jsonl_recovery_identity is None
-                else jsonl_recovery_identity[1]
-            ),
-            "manifest_recovery_device": (
-                None
-                if manifest_recovery_identity is None
-                else manifest_recovery_identity[0]
-            ),
-            "manifest_recovery_inode": (
-                None
-                if manifest_recovery_identity is None
-                else manifest_recovery_identity[1]
-            ),
-            "prior_jsonl_device": (
-                None
-                if prior_jsonl_identity is None
-                else prior_jsonl_identity[0]
-            ),
-            "prior_jsonl_inode": (
-                None
-                if prior_jsonl_identity is None
-                else prior_jsonl_identity[1]
-            ),
-            "prior_jsonl_digest": prior_jsonl_digest,
-            "prior_jsonl_absent": prior_jsonl_absent,
-            "prior_manifest_device": (
-                None
-                if prior_manifest_identity is None
-                else prior_manifest_identity[0]
-            ),
-            "prior_manifest_inode": (
-                None
-                if prior_manifest_identity is None
-                else prior_manifest_identity[1]
-            ),
-            "prior_manifest_digest": prior_manifest_digest,
-            "prior_manifest_absent": prior_manifest_absent,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
 
 def _artifact_handoff_from_meta(
     key: str,
     value: str,
 ) -> snapshot_recovery_module._ArtifactHandoffFacts | None:
-    """Strictly parse one handoff journal row, or None when unprovable."""
+    """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
-    if not key.startswith(_ARTIFACT_HANDOFF_META_PREFIX):
-        return None
-    snapshot_id = key[len(_ARTIFACT_HANDOFF_META_PREFIX) :]
-    if not snapshot_id:
-        return None
-    try:
-        payload = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    if type(payload) is not dict or payload.get("version") != 1:
-        return None
-
-    def identity(device_key: str, inode_key: str) -> tuple[int, int] | None:
-        device = payload.get(device_key)
-        inode = payload.get(inode_key)
-        if device is None and inode is None:
-            return None
-        if type(device) is not int or type(inode) is not int:
-            raise ValueError("artifact handoff identity is invalid")
-        return (device, inode)
-
-    def prior_record(
-        *,
-        identity_key: str,
-        digest_key: str,
-        absent_key: str,
-    ) -> tuple[tuple[int, int] | None, str | None, bool | None]:
-        """One strict prior-asset record, or None/Nones when unrecorded."""
-
-        absent_value = payload.get(absent_key)
-        if absent_value is None:
-            if payload.get(identity_key) is not None or payload.get(
-                digest_key
-            ) is not None:
-                raise ValueError("artifact handoff prior record is partial")
-            return (None, None, None)
-        if type(absent_value) is not bool:
-            raise ValueError("artifact handoff prior absent flag is invalid")
-        digest = payload.get(digest_key)
-        if absent_value:
-            if digest is not None or payload.get(identity_key) is not None:
-                raise ValueError("artifact handoff absent record is not empty")
-            return (None, None, True)
-        if type(digest) is not str or len(digest) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in digest
-        ):
-            raise ValueError("artifact handoff prior digest is invalid")
-        inode_key = identity_key.removesuffix("_device") + "_inode"
-        prior_identity = identity(identity_key, inode_key)
-        if prior_identity is None:
-            raise ValueError("artifact handoff prior identity is missing")
-        return (prior_identity, digest, False)
-
-    try:
-        prior_jsonl = prior_record(
-            identity_key="prior_jsonl_device",
-            digest_key="prior_jsonl_digest",
-            absent_key="prior_jsonl_absent",
-        )
-        prior_manifest = prior_record(
-            identity_key="prior_manifest_device",
-            digest_key="prior_manifest_digest",
-            absent_key="prior_manifest_absent",
-        )
-        return snapshot_recovery_module._ArtifactHandoffFacts(
-            snapshot_id=snapshot_id,
-            jsonl_temp_identity=identity(
-                "jsonl_temp_device",
-                "jsonl_temp_inode",
-            ),
-            artifact_parent_identity=identity(
-                "artifact_parent_device",
-                "artifact_parent_inode",
-            ),
-            manifest_temp_identity=identity(
-                "manifest_temp_device",
-                "manifest_temp_inode",
-            ),
-            jsonl_recovery_identity=identity(
-                "jsonl_recovery_device",
-                "jsonl_recovery_inode",
-            ),
-            manifest_recovery_identity=identity(
-                "manifest_recovery_device",
-                "manifest_recovery_inode",
-            ),
-            prior_jsonl_identity=prior_jsonl[0],
-            prior_jsonl_digest=prior_jsonl[1],
-            prior_jsonl_absent=prior_jsonl[2],
-            prior_manifest_identity=prior_manifest[0],
-            prior_manifest_digest=prior_manifest[1],
-            prior_manifest_absent=prior_manifest[2],
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-
+    return snapshot_artifacts_module._artifact_handoff_from_meta(
+        key=key,
+        value=value,
+    )
 
 class _SnapshotRecoveryPort:
     """Narrow store-side adapter for Task 5.14 snapshot recovery.
