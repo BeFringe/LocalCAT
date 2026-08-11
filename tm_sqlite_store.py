@@ -8439,8 +8439,6 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             activation_status = meta["activation_status"]
             if type(activation_status) is not str:
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
-            if activation_status == "ACTIVE" and generation < 1:
-                raise SQLiteStoreSchemaError("STORE.GENERATION_MISMATCH")
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
@@ -8455,7 +8453,7 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
     state, binding_codes = _source_binding_health_state(facts)
     exact_available = activation_status == "ACTIVE"
     availability_codes = (
-        {"STORE.CONTEXT_GATE_CLOSED", "STORE.FUZZY_GATE_CLOSED"}
+        set()
         if exact_available
         else {"STORE.CANONICAL_NOT_ACTIVE"}
     )

@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+import tempfile
 import unittest
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 from tm_contracts import (
+    BENCHMARK_CONTRACT_VERSION,
     CANDIDATE_BUDGET_VERSION,
+    BenchmarkContract,
     CandidateEvidence,
     CandidateRecallMetadata,
     CandidateRetrievalReport,
     CandidateStage,
     CandidateStageMetadata,
     ContextEvidence,
+    BenchmarkExecutionPath,
+    BenchmarkReport,
     SimilarityEvidence,
     StoreHealth,
     TMMatchType,
@@ -28,8 +37,22 @@ from tm_contracts import (
     QueryReport,
     ResourceQueryFailure,
     ResourceQueryMetadata,
+    benchmark_contract_digest,
+    benchmark_environment_digest,
 )
 from text_matcher import fold_text_v1
+from tm_retrieval_capability import (
+    RETRIEVAL_CAPABILITY_EVIDENCE_SCHEMA_VERSION,
+    RETRIEVAL_SEMANTICS_VERSION,
+    RetrievalBenchmarkEvidence,
+    RetrievalBenchmarkExpectation,
+    RetrievalCapabilityEvaluator,
+    RetrievalCapabilityExpectation,
+    RetrievalCapabilityManifest,
+    RetrievalCapabilityPublisher,
+    RetrievalCohortExpectation,
+    RetrievalCorrectnessCohortEvidence,
+)
 from tm_retrieval import (
     ExactContextClassification,
     FuzzyScoringResult,
@@ -40,7 +63,12 @@ from tm_retrieval import (
     score_fuzzy_candidates,
 )
 from tm_similarity import SimilarityScorerV1
-from tm_sqlite_store import SQLiteStoreLifecycleError, SQLiteStoreSchemaError
+from tm_sqlite_store import (
+    SQLiteStoreLifecycleError,
+    SQLiteStoreSchemaError,
+    SQLiteTMStore,
+)
+from tests.test_tm_activation_journal import _first_prepared
 
 
 FIXTURE_VERSION = "tm-retrieval-vectors-v1"
@@ -1187,12 +1215,19 @@ def _candidate_report(
     resource_id: str = "tm.primary",
     result_limit: int = 10,
     fuzzy_available: bool = True,
+    index_kind_override: str | None = None,
 ) -> CandidateRetrievalReport:
     count = len(record_ids)
+    index_kind = index_kind_override or "FTS5_TRIGRAM"
+    source_stage = (
+        CandidateStage.FTS_TRIGRAM
+        if index_kind == "FTS5_TRIGRAM"
+        else CandidateStage.GRAM_2
+    )
     if fuzzy_available:
         stages = (
             CandidateStageMetadata(
-                stage=CandidateStage.FTS_TRIGRAM,
+                stage=source_stage,
                 input_count=0,
                 added_unique_count=count,
                 output_unique_count=count,
@@ -1216,7 +1251,7 @@ def _candidate_report(
         candidates = tuple(
             CandidateEvidence(
                 record_id=record_id,
-                recall_stages=(CandidateStage.FTS_TRIGRAM,),
+                recall_stages=(source_stage,),
                 matched_grams=1,
                 query_grams=1,
                 overlap_ratio=1.0,
@@ -1226,7 +1261,7 @@ def _candidate_report(
         )
         metadata = CandidateRecallMetadata(
             resource_id=resource_id,
-            index_kind="FTS5_TRIGRAM",
+            index_kind=index_kind,
             fuzzy_available=True,
             fuzzy_unavailable_code=None,
             stages=stages,
@@ -1241,7 +1276,7 @@ def _candidate_report(
         candidates = ()
         metadata = CandidateRecallMetadata(
             resource_id=resource_id,
-            index_kind="FTS5_TRIGRAM",
+            index_kind=index_kind,
             fuzzy_available=False,
             fuzzy_unavailable_code="FUZZY_GATE.CLOSED",
             stages=(),
@@ -2265,14 +2300,241 @@ def _service_health(
     )
 
 
+# --- Task 7.4 capability publisher fixtures --------------------------------
+
+_CAPABILITY_GENERATED_UTC = "2026-08-12T00:00:00Z"
+_CAPABILITY_VALID_UNTIL_UTC = "2026-08-13T00:00:00Z"
+_CAPABILITY_EVALUATED_AT = datetime(
+    2026,
+    8,
+    12,
+    12,
+    0,
+    0,
+    tzinfo=timezone.utc,
+)
+
+
+def _capability_digest(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _capability_benchmark_contract() -> BenchmarkContract:
+    """One valid frozen benchmark-v1 contract shared by both paths."""
+
+    return BenchmarkContract(
+        contract_version=BENCHMARK_CONTRACT_VERSION,
+        corpus_generator_version="tm-benchmark-corpus-v1",
+        corpus_seed=20260729,
+        corpus_record_count=100_000,
+        corpus_digest=_capability_digest("corpus"),
+        corpus_composition_version="tm-corpus-composition-v1",
+        corpus_composition_digest=_capability_digest("composition"),
+        exact_cohort_digest=_capability_digest("exact-cohort"),
+        exact_min_samples=1_000,
+        exact_cohort_count=1_200,
+        fuzzy_cohort_digest=_capability_digest("fuzzy-cohort"),
+        fuzzy_min_samples=200,
+        fuzzy_cohort_count=240,
+        oracle_subset_digest=_capability_digest("oracle-subset"),
+        oracle_subset_record_count=5_000,
+        oracle_query_count=200,
+        top_k=10,
+        minimum_similarity=0.60,
+        warmup_queries_per_cohort=100,
+        measured_repeats=1,
+        percentile_method="nearest-rank",
+        rss_scope="child-process-lifetime-v1",
+        candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+        scorer_config_digest=_capability_digest("scorer-config"),
+        fast_path_config_digest=_capability_digest("fast-path"),
+        fallback_path_config_digest=_capability_digest("fallback-path"),
+        exact_p95_gate_ms=50.0,
+        fuzzy_p95_gate_ms=500.0,
+        migration_gate_seconds=120.0,
+        peak_rss_gate_mib=512.0,
+        candidate_recall_gate=1.0,
+    )
+
+
+def _capability_benchmark_report(
+    path: BenchmarkExecutionPath,
+) -> BenchmarkReport:
+    """One recomputable, passing benchmark report for one execution path."""
+
+    contract = _capability_benchmark_contract()
+    environment = (
+        ("cpu", "test-cpu"),
+        (
+            "fts5_enabled",
+            "true"
+            if path is BenchmarkExecutionPath.FTS5_TRIGRAM
+            else "false",
+        ),
+        ("os", "test-os"),
+        ("python_version", "3.14.0"),
+        ("ram_mib", "16384"),
+        ("sqlite_version", "3.51.2"),
+        ("unicode_version", "16.0.0"),
+    )
+    return BenchmarkReport(
+        contract=contract,
+        contract_digest=benchmark_contract_digest(contract),
+        corpus_digest=contract.corpus_digest,
+        corpus_composition_version=contract.corpus_composition_version,
+        corpus_composition_digest=contract.corpus_composition_digest,
+        exact_cohort_digest=contract.exact_cohort_digest,
+        fuzzy_cohort_digest=contract.fuzzy_cohort_digest,
+        oracle_subset_digest=contract.oracle_subset_digest,
+        scorer_config_digest=contract.scorer_config_digest,
+        execution_path=path,
+        path_config_digest=(
+            contract.fast_path_config_digest
+            if path is BenchmarkExecutionPath.FTS5_TRIGRAM
+            else contract.fallback_path_config_digest
+        ),
+        exact_sample_count=contract.exact_cohort_count,
+        fuzzy_sample_count=contract.fuzzy_cohort_count,
+        oracle_query_count=200,
+        percentile_method="nearest-rank",
+        candidate_recall=1.0,
+        exact_p50_ms=25.0,
+        exact_p95_ms=49.0,
+        exact_max_ms=75.0,
+        fuzzy_top10_p50_ms=250.0,
+        fuzzy_top10_p95_ms=499.0,
+        fuzzy_top10_max_ms=750.0,
+        migration_seconds=119.0,
+        peak_rss_mib=511.0,
+        passed=True,
+        failed_gates=(),
+        environment=environment,
+        environment_digest=benchmark_environment_digest(environment),
+    )
+
+
+def _retrieval_capability_publisher(
+    *,
+    context_open: bool = True,
+    fuzzy_core_open: bool = True,
+    fts5_open: bool = True,
+    gram_open: bool = True,
+) -> RetrievalCapabilityPublisher:
+    """Build a real evaluator-produced publisher with identity-closed evidence.
+
+    Every open sub-gate carries approved identity/version/digest facts and
+    recomputable report digests; closed sub-gates simply omit the evidence
+    (stable missing codes).  The service never receives an arbitrary
+    snapshot or callback.
+    """
+
+    contract_digest = benchmark_contract_digest(
+        _capability_benchmark_contract()
+    )
+    artifact_digest = _capability_digest("artifact")
+    build_digest = _capability_digest("build")
+    fixture_digest = _capability_digest("fixture")
+    evaluator_digest = _capability_digest("evaluator")
+    context_cohort_digest = _capability_digest("context.cohort")
+    fuzzy_core_cohort_digest = _capability_digest("fuzzy-core.cohort")
+    expectation = RetrievalCapabilityExpectation(
+        evidence_schema_version=(
+            RETRIEVAL_CAPABILITY_EVIDENCE_SCHEMA_VERSION
+        ),
+        retrieval_artifact_digest=artifact_digest,
+        retrieval_build_digest=build_digest,
+        semantics_version=RETRIEVAL_SEMANTICS_VERSION,
+        fixture_digest=fixture_digest,
+        evaluator_digest=evaluator_digest,
+        context_cohorts=(
+            RetrievalCohortExpectation(
+                cohort_id="context.correctness.cohort.v1",
+                cohort_digest=context_cohort_digest,
+            ),
+        ),
+        fuzzy_core_cohorts=(
+            RetrievalCohortExpectation(
+                cohort_id="fuzzy.core.correctness.cohort.v1",
+                cohort_digest=fuzzy_core_cohort_digest,
+            ),
+        ),
+        fts5_trigram=RetrievalBenchmarkExpectation(
+            path="FTS5_TRIGRAM",
+            contract_digest=contract_digest,
+        ),
+        gram_fallback=RetrievalBenchmarkExpectation(
+            path="GRAM_FALLBACK",
+            contract_digest=contract_digest,
+        ),
+    )
+    manifest = RetrievalCapabilityManifest(
+        evidence_schema_version=(
+            RETRIEVAL_CAPABILITY_EVIDENCE_SCHEMA_VERSION
+        ),
+        retrieval_artifact_digest=artifact_digest,
+        retrieval_build_digest=build_digest,
+        semantics_version=RETRIEVAL_SEMANTICS_VERSION,
+        fixture_digest=fixture_digest,
+        evaluator_digest=evaluator_digest,
+        generated_at_utc=_CAPABILITY_GENERATED_UTC,
+        valid_until_utc=_CAPABILITY_VALID_UNTIL_UTC,
+        context_cohorts=(
+            RetrievalCorrectnessCohortEvidence(
+                cohort_id="context.correctness.cohort.v1",
+                cohort_digest=context_cohort_digest,
+                passed=context_open,
+                generated_at_utc=_CAPABILITY_GENERATED_UTC,
+                valid_until_utc=_CAPABILITY_VALID_UNTIL_UTC,
+            ),
+        ),
+        fuzzy_core_cohorts=(
+            RetrievalCorrectnessCohortEvidence(
+                cohort_id="fuzzy.core.correctness.cohort.v1",
+                cohort_digest=fuzzy_core_cohort_digest,
+                passed=fuzzy_core_open,
+                generated_at_utc=_CAPABILITY_GENERATED_UTC,
+                valid_until_utc=_CAPABILITY_VALID_UNTIL_UTC,
+            ),
+        ),
+        fts5_trigram_benchmark=(
+            RetrievalBenchmarkEvidence(
+                report=_capability_benchmark_report(
+                    BenchmarkExecutionPath.FTS5_TRIGRAM
+                ),
+                generated_at_utc=_CAPABILITY_GENERATED_UTC,
+                valid_until_utc=_CAPABILITY_VALID_UNTIL_UTC,
+            )
+            if fts5_open
+            else None
+        ),
+        gram_fallback_benchmark=(
+            RetrievalBenchmarkEvidence(
+                report=_capability_benchmark_report(
+                    BenchmarkExecutionPath.GRAM_FALLBACK
+                ),
+                generated_at_utc=_CAPABILITY_GENERATED_UTC,
+                valid_until_utc=_CAPABILITY_VALID_UNTIL_UTC,
+            )
+            if gram_open
+            else None
+        ),
+    )
+    return RetrievalCapabilityPublisher(
+        RetrievalCapabilityEvaluator(expectation),
+        initial_manifest=manifest,
+        evaluated_at_utc=_CAPABILITY_EVALUATED_AT,
+    )
+
+
 def _service_query(
     *,
     resource_order: tuple[str, ...],
+    query_source: str = QUERY_SOURCE,
     limit: int = 10,
     minimum_similarity: float = 0.7,
 ) -> TMQuery:
     return TMQuery(
-        query_source=QUERY_SOURCE,
+        query_source=query_source,
         speaker_raw="speaker",
         context_prev_raw="prev",
         context_next_raw="next",
@@ -2757,6 +3019,7 @@ class TMRetrievalServiceAggregationTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=cast(Any, scorer),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -2810,6 +3073,7 @@ class TMRetrievalServiceAggregationTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=cast(Any, scorer),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -2903,6 +3167,7 @@ class TMRetrievalServiceLeaseTests(unittest.TestCase):
                     }
                 ),
             ),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -3177,6 +3442,7 @@ class TMRetrievalServicePartialFailureTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=cast(Any, scorer),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             tuple(
@@ -3324,77 +3590,168 @@ class TMRetrievalServicePermutationTests(unittest.TestCase):
 
 
 class TMRetrievalServiceAvailabilityTests(unittest.TestCase):
-    def test_context_gate_closed_is_distinct_from_available_zero_hits(self) -> None:
+    def _context_pair(self) -> tuple[tuple[_ServiceStore, _ServiceStore], TMQuery]:
         closed = _ServiceStore(resource_id="tm.closed")
-        closed_view = _ServiceQueryView(
+        closed._view = _ServiceQueryView(
             closed,
-            health=_service_health(context_available=False),
+            health=_service_health(),
             exact_records=(
                 _record(100, speaker_raw="speaker"),
                 _record(90, target_raw="variant", speaker_raw="speaker"),
             ),
         )
-        closed._view = closed_view
         open_zero = _ServiceStore(resource_id="tm.open_zero")
-        open_zero_view = _ServiceQueryView(
+        open_zero._view = _ServiceQueryView(
             open_zero,
-            health=_service_health(context_available=True),
+            health=_service_health(),
             exact_records=(_record(200, speaker_raw="speaker"),),
         )
-        open_zero._view = open_zero_view
-        service = TMRetrievalService(
+        query = _service_query(
+            resource_order=("tm.closed", "tm.open_zero")
+        )
+        return (closed, open_zero), query
+
+    def test_context_gate_closed_is_distinct_from_available_zero_hits(self) -> None:
+        stores, query = self._context_pair()
+        closed_store, open_zero_store = stores
+        closed_handles = (
+            _service_handle(
+                closed_store,
+                resource_id="tm.closed",
+                order=0,
+            ),
+            _service_handle(
+                open_zero_store,
+                resource_id="tm.open_zero",
+                order=1,
+            ),
+        )
+        closed_service = TMRetrievalService(
             retriever=cast(Any, _ServiceRetriever()),
             scorer=cast(Any, SimilarityScorerV1()),
-        )
-        report = service.query(
-            (
-                _service_handle(
-                    closed,
-                    resource_id="tm.closed",
-                    order=0,
-                ),
-                _service_handle(
-                    open_zero,
-                    resource_id="tm.open_zero",
-                    order=1,
-                ),
+            capability_publisher=_retrieval_capability_publisher(
+                context_open=False,
+                fuzzy_core_open=False,
+                fts5_open=False,
+                gram_open=False,
             ),
-            _service_query(resource_order=("tm.closed", "tm.open_zero")),
         )
+        closed_report = closed_service.query(closed_handles, query)
         self.assertEqual(
-            [_result_identity(result) for result in report.results],
+            [_result_identity(result) for result in closed_report.results],
             [
                 ("tm.closed", 100, "EXACT", 1.0),
                 ("tm.open_zero", 200, "EXACT", 1.0),
             ],
         )
-        closed_metadata = report.resource_metadata[0]
-        open_metadata = report.resource_metadata[1]
+        closed_metadata = closed_report.resource_metadata[0]
         self.assertFalse(closed_metadata.context_available)
         self.assertEqual(
             closed_metadata.context_unavailable_code,
-            "STORE.CONTEXT_GATE_CLOSED",
+            "RETRIEVAL.CONTEXT_EVIDENCE_FAILED",
         )
         self.assertEqual(closed_metadata.returned_count, 1)
+        self.assertFalse(
+            closed_report.resource_metadata[1].context_available
+        )
+
+        open_stores, _open_query = self._context_pair()
+        open_handles = (
+            _service_handle(
+                open_stores[0],
+                resource_id="tm.closed",
+                order=0,
+            ),
+            _service_handle(
+                open_stores[1],
+                resource_id="tm.open_zero",
+                order=1,
+            ),
+        )
+        open_service = TMRetrievalService(
+            retriever=cast(Any, _ServiceRetriever()),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(
+                fuzzy_core_open=False,
+                fts5_open=False,
+                gram_open=False,
+            ),
+        )
+        open_report = open_service.query(open_handles, query)
+        self.assertEqual(
+            [_result_identity(result) for result in open_report.results],
+            [
+                ("tm.closed", 100, "EXACT", 1.0),
+                ("tm.open_zero", 200, "EXACT", 1.0),
+                ("tm.closed", 90, "CONTEXT", 1.0),
+            ],
+        )
+        closed_metadata = open_report.resource_metadata[0]
+        open_metadata = open_report.resource_metadata[1]
+        self.assertTrue(closed_metadata.context_available)
+        self.assertIsNone(closed_metadata.context_unavailable_code)
+        self.assertEqual(closed_metadata.returned_count, 2)
         self.assertTrue(open_metadata.context_available)
         self.assertIsNone(open_metadata.context_unavailable_code)
         self.assertEqual(open_metadata.returned_count, 1)
 
-    def test_fuzzy_gate_closed_is_distinct_from_available_zero_hits(self) -> None:
-        limit = 10
+    def _fuzzy_pair(self) -> tuple[_ServiceStore, _ServiceStore]:
         closed = _ServiceStore(resource_id="tm.closed")
         closed._view = _ServiceQueryView(
             closed,
-            health=_service_health(fuzzy_available=False),
+            health=_service_health(),
             exact_records=(_record(100),),
         )
         open_zero = _ServiceStore(resource_id="tm.open_zero")
         open_zero._view = _ServiceQueryView(
             open_zero,
-            health=_service_health(fuzzy_available=True),
+            health=_service_health(),
             exact_records=(_record(200),),
         )
-        retriever = _ServiceRetriever(
+        return closed, open_zero
+
+    def test_fuzzy_gate_closed_is_distinct_from_available_zero_hits(self) -> None:
+        limit = 10
+        query = _service_query(
+            resource_order=("tm.closed", "tm.open_zero"),
+            limit=limit,
+        )
+
+        closed_stores = self._fuzzy_pair()
+        closed_retriever = _ServiceRetriever()
+        closed_handles = (
+            _service_handle(
+                closed_stores[0],
+                resource_id="tm.closed",
+                order=0,
+            ),
+            _service_handle(
+                closed_stores[1],
+                resource_id="tm.open_zero",
+                order=1,
+            ),
+        )
+        closed_service = TMRetrievalService(
+            retriever=cast(Any, closed_retriever),
+            scorer=cast(Any, _FixedEvidenceScorer({})),
+            capability_publisher=_retrieval_capability_publisher(
+                fts5_open=False
+            ),
+        )
+        closed_report = closed_service.query(closed_handles, query)
+        closed_metadata = closed_report.resource_metadata[0]
+        self.assertFalse(closed_metadata.recall.fuzzy_available)
+        self.assertEqual(
+            closed_metadata.recall.fuzzy_unavailable_code,
+            "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING",
+        )
+        self.assertEqual(closed_metadata.scored_count, 0)
+        self.assertEqual(closed_metadata.recall.index_kind, "FTS5_TRIGRAM")
+        self.assertEqual(closed_metadata.recall.stages, ())
+        self.assertEqual(closed_retriever.resource_ids, [])
+
+        open_stores = self._fuzzy_pair()
+        open_retriever = _ServiceRetriever(
             report_by_resource={
                 "tm.open_zero": _candidate_report(
                     (),
@@ -3402,45 +3759,43 @@ class TMRetrievalServiceAvailabilityTests(unittest.TestCase):
                     result_limit=limit,
                     fuzzy_available=True,
                 ),
+                "tm.closed": _candidate_report(
+                    (),
+                    resource_id="tm.closed",
+                    result_limit=limit,
+                    fuzzy_available=True,
+                ),
             }
         )
-        service = TMRetrievalService(
-            retriever=cast(Any, retriever),
+        open_handles = (
+            _service_handle(
+                open_stores[0],
+                resource_id="tm.closed",
+                order=0,
+            ),
+            _service_handle(
+                open_stores[1],
+                resource_id="tm.open_zero",
+                order=1,
+            ),
+        )
+        open_service = TMRetrievalService(
+            retriever=cast(Any, open_retriever),
             scorer=cast(Any, _FixedEvidenceScorer({})),
+            capability_publisher=_retrieval_capability_publisher(),
         )
-        report = service.query(
-            (
-                _service_handle(
-                    closed,
-                    resource_id="tm.closed",
-                    order=0,
-                ),
-                _service_handle(
-                    open_zero,
-                    resource_id="tm.open_zero",
-                    order=1,
-                ),
-            ),
-            _service_query(
-                resource_order=("tm.closed", "tm.open_zero"),
-                limit=limit,
-            ),
-        )
-        closed_metadata = report.resource_metadata[0]
-        open_metadata = report.resource_metadata[1]
-        self.assertFalse(closed_metadata.recall.fuzzy_available)
-        self.assertEqual(
-            closed_metadata.recall.fuzzy_unavailable_code,
-            "STORE.FUZZY_GATE_CLOSED",
-        )
-        self.assertEqual(closed_metadata.scored_count, 0)
+        open_report = open_service.query(open_handles, query)
+        open_metadata = open_report.resource_metadata[1]
         self.assertTrue(open_metadata.recall.fuzzy_available)
         self.assertIsNone(open_metadata.recall.fuzzy_unavailable_code)
         self.assertTrue(open_metadata.recall.stages)
         self.assertEqual(open_metadata.scored_count, 0)
-        self.assertEqual(retriever.resource_ids, ["tm.open_zero"])
         self.assertEqual(
-            [result.match_type for result in report.results],
+            open_retriever.resource_ids,
+            ["tm.closed", "tm.open_zero"],
+        )
+        self.assertEqual(
+            [result.match_type for result in open_report.results],
             [TMMatchType.EXACT, TMMatchType.EXACT],
         )
 
@@ -3484,6 +3839,7 @@ class TMRetrievalServiceCountTests(unittest.TestCase):
                     }
                 ),
             ),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         limited = service.query(
             (
@@ -3541,6 +3897,7 @@ class TMRetrievalServiceCountTests(unittest.TestCase):
                     }
                 ),
             ),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         full = full_service.query(
             (
@@ -3606,6 +3963,11 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, _ServiceRetriever()),
             scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(
+                fuzzy_core_open=False,
+                fts5_open=False,
+                gram_open=False,
+            ),
         )
         report = service.query((handle,), query)
         self.assertEqual(store.lease_entries, 1)
@@ -3646,6 +4008,7 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
                     {"Open the door quickly.": _evidence(0.9)}
                 ),
             ),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -3706,6 +4069,7 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -3770,6 +4134,7 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, _ServiceRetriever(candidate_report)),
             scorer=cast(Any, mutating_scorer),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         service_result = service.query(
             (
@@ -3811,6 +4176,7 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
         aliasing_service = TMRetrievalService(
             retriever=cast(Any, _ServiceRetriever(reference_report)),
             scorer=cast(Any, _EvidenceAliasingScorer()),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         aliasing_report = aliasing_service.query(
             (
@@ -3865,6 +4231,7 @@ class TMRetrievalServiceTOCTOUTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, _ServiceRetriever(report)),
             scorer=cast(Any, scorer),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         service_report = service.query(
             (
@@ -3953,6 +4320,7 @@ class TMRetrievalServiceDynamicPortTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=scorer,
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -4007,6 +4375,7 @@ class TMRetrievalServiceDynamicPortTests(unittest.TestCase):
         service = TMRetrievalService(
             retriever=cast(Any, retriever),
             scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -4391,6 +4760,7 @@ class TMRetrievalServiceLeaseLifecycleTests(unittest.TestCase):
                     {"Open the door quickly.": _evidence(0.9)}
                 ),
             ),
+            capability_publisher=_retrieval_capability_publisher(),
         )
         report = service.query(
             (
@@ -4488,3 +4858,526 @@ class TMRetrievalServiceLeaseLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(store.lease_entries, 1)
         self.assertEqual(store.lease_exits, 0)
+
+
+# --- Task 7.4 capability integration tests ----------------------------------
+
+
+class TMRetrievalCapabilityIntegrationTests(unittest.TestCase):
+    """Query-effective CONTEXT/FUZZY combination over the real service."""
+
+    def _fuzzy_store(
+        self,
+        resource_id: str,
+        *,
+        index_kind: str = "FTS5_TRIGRAM",
+        exact_records: tuple[TMRecord, ...] = (_record(100),),
+        batch_records: tuple[TMRecord, ...] = (),
+        on_health: Callable[[], None] | None = None,
+    ) -> _ServiceStore:
+        store = _ServiceStore(resource_id=resource_id)
+        store._view = _ServiceQueryView(
+            store,
+            health=_service_health(index_kind=index_kind),
+            exact_records=exact_records,
+            batch_records=batch_records,
+            on_health=on_health,
+        )
+        return store
+
+    def test_default_construction_is_fail_closed_without_dynamic_ports(
+        self,
+    ) -> None:
+        store = self._fuzzy_store(
+            "tm.primary",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+        )
+        retriever = _RotatingPortRetriever(
+            _candidate_report((501,), resource_id="tm.primary")
+        )
+        scorer = cast(Any, _ScoreAttributeRotatingScorer())
+        service = TMRetrievalService(
+            retriever=cast(Any, retriever),
+            scorer=scorer,
+        )
+        report = service.query(
+            (
+                _service_handle(
+                    store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(resource_order=("tm.primary",)),
+        )
+        self.assertEqual(report.resource_failures, ())
+        metadata = report.resource_metadata[0]
+        self.assertFalse(metadata.context_available)
+        self.assertEqual(
+            metadata.context_unavailable_code,
+            "RETRIEVAL.CONTEXT_EVIDENCE_MISSING",
+        )
+        self.assertFalse(metadata.recall.fuzzy_available)
+        self.assertEqual(
+            metadata.recall.fuzzy_unavailable_code,
+            "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_MISSING",
+        )
+        self.assertEqual(metadata.recall.index_kind, "FTS5_TRIGRAM")
+        self.assertEqual(metadata.recall.stages, ())
+        self.assertEqual(retriever.accesses, 0)
+        self.assertEqual(retriever.calls, 0)
+        self.assertEqual(scorer.score_accesses, 0)
+        self.assertEqual(
+            [_result_identity(result) for result in report.results],
+            [("tm.primary", 100, "EXACT", 1.0)],
+        )
+
+    def test_intended_path_from_physical_index_kind_and_query_length(
+        self,
+    ) -> None:
+        long_query = _service_query(
+            resource_order=("tm.primary",),
+            query_source="Open the door.",
+        )
+        short_query = _service_query(
+            resource_order=("tm.primary",),
+            query_source="ab",
+        )
+
+        fts_store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="FTS5_TRIGRAM",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+        )
+        fts_retriever = _ServiceRetriever(
+            _candidate_report((501,), resource_id="tm.primary")
+        )
+        fts_service = TMRetrievalService(
+            retriever=cast(Any, fts_retriever),
+            scorer=cast(
+                Any,
+                _FixedEvidenceScorer(
+                    {"Open the door quickly.": _evidence(0.9)}
+                ),
+            ),
+            capability_publisher=_retrieval_capability_publisher(),
+        )
+        long_report = fts_service.query(
+            (_service_handle(fts_store, resource_id="tm.primary", order=0),),
+            long_query,
+        )
+        self.assertEqual(long_report.resource_failures, ())
+        self.assertTrue(
+            long_report.resource_metadata[0].recall.fuzzy_available
+        )
+        self.assertEqual(
+            long_report.resource_metadata[0].recall.index_kind,
+            "FTS5_TRIGRAM",
+        )
+        self.assertEqual(fts_retriever.folded_queries, ["open the door."])
+
+        short_store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="FTS5_TRIGRAM",
+            exact_records=(),
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+        )
+        short_retriever = _ServiceRetriever(
+            _candidate_report(
+                (501,),
+                resource_id="tm.primary",
+                index_kind_override="GRAM_FALLBACK",
+            )
+        )
+        short_service = TMRetrievalService(
+            retriever=cast(Any, short_retriever),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(),
+        )
+        short_report = short_service.query(
+            (_service_handle(short_store, resource_id="tm.primary", order=0),),
+            short_query,
+        )
+        self.assertEqual(short_report.resource_failures, ())
+        self.assertTrue(
+            short_report.resource_metadata[0].recall.fuzzy_available
+        )
+        self.assertEqual(
+            short_report.resource_metadata[0].recall.index_kind,
+            "GRAM_FALLBACK",
+        )
+
+        fallback_store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="GRAM_FALLBACK",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+        )
+        fallback_retriever = _ServiceRetriever(
+            _candidate_report(
+                (501,),
+                resource_id="tm.primary",
+                index_kind_override="GRAM_FALLBACK",
+            )
+        )
+        fallback_service = TMRetrievalService(
+            retriever=cast(Any, fallback_retriever),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(),
+        )
+        fallback_report = fallback_service.query(
+            (
+                _service_handle(
+                    fallback_store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            long_query,
+        )
+        self.assertEqual(fallback_report.resource_failures, ())
+        self.assertEqual(
+            fallback_report.resource_metadata[0].recall.index_kind,
+            "GRAM_FALLBACK",
+        )
+
+    def test_returned_index_kind_mismatch_fails_closed(self) -> None:
+        store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="FTS5_TRIGRAM",
+        )
+        retriever = _ServiceRetriever(
+            _candidate_report(
+                (),
+                resource_id="tm.primary",
+                index_kind_override="GRAM_FALLBACK",
+            )
+        )
+        service = TMRetrievalService(
+            retriever=cast(Any, retriever),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(),
+        )
+        report = service.query(
+            (
+                _service_handle(
+                    store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(resource_order=("tm.primary",)),
+        )
+        self.assertEqual(
+            [
+                (
+                    failure.resource_id,
+                    failure.stage,
+                    failure.error_code,
+                    failure.retryable,
+                )
+                for failure in report.resource_failures
+            ],
+            [
+                (
+                    "tm.primary",
+                    "RECALL",
+                    "RETRIEVAL.RECALL_PATH_MISMATCH",
+                    False,
+                )
+            ],
+        )
+        self.assertEqual(store.lease_entries, 1)
+        self.assertEqual(store.lease_exits, 1)
+
+    def test_path_specific_opening_closes_only_the_other_path(self) -> None:
+        publisher = _retrieval_capability_publisher(
+            fts5_open=True,
+            gram_open=False,
+        )
+        long_store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="FTS5_TRIGRAM",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+        )
+        long_retriever = _RotatingPortRetriever(
+            _candidate_report((501,), resource_id="tm.primary")
+        )
+        long_service = TMRetrievalService(
+            retriever=cast(Any, long_retriever),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=publisher,
+        )
+        long_report = long_service.query(
+            (
+                _service_handle(
+                    long_store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(
+                resource_order=("tm.primary",),
+                query_source="Open the door.",
+            ),
+        )
+        self.assertTrue(
+            long_report.resource_metadata[0].recall.fuzzy_available
+        )
+        self.assertEqual(long_retriever.calls, 1)
+
+        short_store = self._fuzzy_store(
+            "tm.primary",
+            index_kind="FTS5_TRIGRAM",
+            exact_records=(),
+        )
+        short_retriever = _RotatingPortRetriever(
+            _candidate_report((), resource_id="tm.primary")
+        )
+        short_scorer = cast(Any, _ScoreAttributeRotatingScorer())
+        short_service = TMRetrievalService(
+            retriever=cast(Any, short_retriever),
+            scorer=short_scorer,
+            capability_publisher=publisher,
+        )
+        short_report = short_service.query(
+            (
+                _service_handle(
+                    short_store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(
+                resource_order=("tm.primary",),
+                query_source="ab",
+            ),
+        )
+        metadata = short_report.resource_metadata[0]
+        self.assertFalse(metadata.recall.fuzzy_available)
+        self.assertEqual(
+            metadata.recall.fuzzy_unavailable_code,
+            "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING",
+        )
+        self.assertEqual(metadata.recall.index_kind, "GRAM_FALLBACK")
+        self.assertEqual(metadata.recall.stages, ())
+        self.assertEqual(short_retriever.accesses, 0)
+        self.assertEqual(short_retriever.calls, 0)
+        self.assertEqual(short_scorer.score_accesses, 0)
+        self.assertEqual(short_scorer.calls, 0)
+
+    def test_refresh_during_in_flight_query_never_mixes_snapshots(self) -> None:
+        publisher = _retrieval_capability_publisher()
+        events: list[str] = []
+
+        def refresh_to_closed() -> None:
+            events.append("refresh")
+            publisher.refresh(
+                None,
+                evaluated_at_utc=_CAPABILITY_EVALUATED_AT,
+            )
+
+        first = self._fuzzy_store(
+            "tm.first",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+            on_health=refresh_to_closed,
+        )
+        second = self._fuzzy_store(
+            "tm.second",
+            batch_records=(
+                _record(601, source_raw="Open the gate widely."),
+            ),
+        )
+        retriever = _ServiceRetriever(
+            report_by_resource={
+                "tm.first": _candidate_report(
+                    (501,),
+                    resource_id="tm.first",
+                    result_limit=10,
+                ),
+                "tm.second": _candidate_report(
+                    (601,),
+                    resource_id="tm.second",
+                    result_limit=10,
+                ),
+            }
+        )
+        service = TMRetrievalService(
+            retriever=cast(Any, retriever),
+            scorer=cast(
+                Any,
+                _FixedEvidenceScorer(
+                    {
+                        "Open the door quickly.": _evidence(0.9),
+                        "Open the gate widely.": _evidence(0.95),
+                    }
+                ),
+            ),
+            capability_publisher=publisher,
+        )
+        report = service.query(
+            (
+                _service_handle(first, resource_id="tm.first", order=0),
+                _service_handle(second, resource_id="tm.second", order=1),
+            ),
+            _service_query(
+                resource_order=("tm.first", "tm.second"),
+                limit=10,
+            ),
+        )
+        self.assertEqual(events, ["refresh"])
+        self.assertEqual(report.resource_failures, ())
+        self.assertFalse(publisher.snapshot().context.available)
+        self.assertEqual(
+            [
+                (
+                    metadata.resource_id,
+                    metadata.context_available,
+                    metadata.recall.fuzzy_available,
+                )
+                for metadata in report.resource_metadata
+            ],
+            [
+                ("tm.first", True, True),
+                ("tm.second", True, True),
+            ],
+        )
+        self.assertEqual(retriever.resource_ids, ["tm.first", "tm.second"])
+        self.assertEqual(
+            {result.resource_id for result in report.results},
+            {"tm.first", "tm.second"},
+        )
+
+    def test_tampered_published_snapshot_cannot_corrupt_in_flight_query(
+        self,
+    ) -> None:
+        publisher = _retrieval_capability_publisher()
+        captured = publisher.snapshot()
+
+        def tamper_context() -> None:
+            object.__setattr__(captured.context, "available", False)
+
+        store = _ServiceStore(resource_id="tm.primary")
+        store._view = _ServiceQueryView(
+            store,
+            health=_service_health(),
+            exact_records=(
+                _record(100, speaker_raw="speaker"),
+                _record(90, target_raw="variant", speaker_raw="speaker"),
+            ),
+            on_health=tamper_context,
+        )
+        service = TMRetrievalService(
+            retriever=cast(
+                Any,
+                _ServiceRetriever(),
+            ),
+            scorer=cast(Any, SimilarityScorerV1()),
+            capability_publisher=_retrieval_capability_publisher(
+                fuzzy_core_open=False,
+                fts5_open=False,
+                gram_open=False,
+            ),
+        )
+        report = service.query(
+            (
+                _service_handle(
+                    store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(resource_order=("tm.primary",)),
+        )
+        self.assertEqual(
+            [_result_identity(result) for result in report.results],
+            [
+                ("tm.primary", 100, "EXACT", 1.0),
+                ("tm.primary", 90, "CONTEXT", 1.0),
+            ],
+        )
+        self.assertTrue(
+            report.resource_metadata[0].context_available
+        )
+        self.assertIsNone(
+            report.resource_metadata[0].context_unavailable_code
+        )
+
+    def test_real_active_store_journey_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                coordinator,
+                _sealed,
+                prepared,
+                journal,
+            ) = _first_prepared(root, fts5_available=True)
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=True,
+            ):
+                coordinator.publish_activation(prepared, journal)
+            store = SQLiteTMStore.from_coordinator(coordinator)
+            self.assertEqual(store.health().exact_available, True)
+            self.assertEqual(store.health().index_kind, "FTS5_TRIGRAM")
+            self.assertFalse(store.health().context_available)
+            self.assertFalse(store.health().fuzzy_available)
+            self.assertEqual(store.health().diagnostic_codes, ())
+
+            sidecar = identity.canonical_sidecar_path
+            before_bytes = sidecar.read_bytes()
+            before_files = sorted(
+                path.name for path in root.iterdir()
+            )
+            service = TMRetrievalService(
+                capability_publisher=_retrieval_capability_publisher(),
+            )
+            report = service.query(
+                (
+                    _service_handle(
+                        store,
+                        resource_id="tm.primary",
+                        order=0,
+                    ),
+                ),
+                _service_query(
+                    resource_order=("tm.primary",),
+                    query_source="same",
+                ),
+            )
+            self.assertEqual(report.resource_failures, ())
+            self.assertEqual(
+                [result.match_type for result in report.results],
+                [TMMatchType.EXACT],
+            )
+            self.assertEqual(
+                report.results[0].target,
+                "winner",
+            )
+            metadata = report.resource_metadata[0]
+            self.assertTrue(metadata.context_available)
+            self.assertIsNone(metadata.context_unavailable_code)
+            self.assertTrue(metadata.recall.fuzzy_available)
+            self.assertEqual(
+                metadata.recall.index_kind,
+                "FTS5_TRIGRAM",
+            )
+            self.assertEqual(
+                metadata.returned_count,
+                len(report.results),
+            )
+            after_files = sorted(path.name for path in root.iterdir())
+            self.assertEqual(after_files, before_files)
+            self.assertEqual(sidecar.read_bytes(), before_bytes)

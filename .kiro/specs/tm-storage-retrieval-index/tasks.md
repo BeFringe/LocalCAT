@@ -289,7 +289,7 @@
   - 完成时，置换底层执行顺序不改变结果、失败列表、provenance 或阶段计数
   - _Requirements: 1.4, 3.2, 3.7, 4.1, 4.2, 4.3, 4.5, 4.7, 5.3, 5.4, 7.4, 7.7_
 
-- [ ] 7.4 建立 CONTEXT 与 FUZZY 独立可用性
+- [x] 7.4 建立 CONTEXT 与 FUZZY 独立可用性
   - 新增独立 retrieval capability evaluator/publisher；SQLite store 只报告 physical/canonical health，Retrieval 在内存中用整次 query 唯一不可变 capability snapshot 组合 query-effective availability
   - CONTEXT、fuzzy-core correctness、FTS5_TRIGRAM Gate D 和 GRAM_FALLBACK Gate D 独立决定；FUZZY 仅在 fuzzy-core 与本次 intended execution path 同时开放时执行
   - 门关闭时不得读取 candidate/records/scorer，返回 intended path、空阶段和 evaluator stable unavailable code；门开放但零命中时 available 为 true 且 code 为空
@@ -429,3 +429,4 @@
 - 2026-08-12 / Task 7.2：在 storage-independent retrieval seam 中消费完整重建并重验的 bounded candidate/record 私有快照，以 scorer-v1 原始双 source 生成未舍入 fuzzy evidence；同 source 不进入评分，threshold 等值保留且在排序/全局 limit 前过滤，按资源与 record identity 去重，不执行写入、应用或确认。所有 query、recall stage、candidate、record/provenance 与 scorer evidence 在首个可控 callback 前完成 exact-type/nested 闭包，`score` port 只锁存一次，回调篡改 frozen alias 不会重绑结果；focused 50/50、相关回归 115/115、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Task 7.3：实现多资源 `TMRetrievalService` 与只读 query-view 接缝；每个 Active+Lookup 资源只取得一次 generation lease，同一 view 内闭合 health、raw exact/context、candidate recall 与 record batch，退出后失效且不暴露写端口。服务按调用方资源顺序隔离局部失败，先聚合再按 EXACT/CONTEXT/FUZZY、分数、context strength、资源顺序与 record identity 稳定排序并应用 global limit；最终 metadata 对账 scored/returned count。query/handle/view/report/record 值在可控 callback 间逐阶段重建，generation 与 health 成套复核，retriever/scorer 动态端口按需且整次 query 各锁存一次；focused 165/165、相关回归 145/145、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过，进入 Cluster H 统一复审。
 - 2026-08-12 / Cluster H 复审：`v4_flash_worker`/max 累积复审批准 exact/context→fuzzy→多资源 query-view 流水线，无 P0–P2；两个非阻断 P3 分别由 Task 7.4 细化 unavailable code、由 7.4/7.5 增加真实 ACTIVE-store Gate C 旅程。主 agent fresh 全量 1017/1017（skip 1，含 Qt smoke），Cluster H 变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过；根目录 comparative-report 脚本仍因缺少既有 backend artifact 维持外部失败基线。
+- 2026-08-12 / Task 7.4：新增 retrieval capability evaluator/publisher，将 CONTEXT、fuzzy-core 与 fast/fallback Gate D 决定冻结为整次多资源查询唯一快照；store health 只保留 physical/canonical 权威，Retrieval 按 intended path 组合 query-effective availability，关闭路径不读取 recall/records/scorer，开放路径复核实际 index kind。稳定 unavailable code、独立降级、refresh race、真实首次激活 generation 0、只读 ACTIVE-store 旅程与依赖方向均已覆盖；focused/相关回归 236/236，变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过，等待 Task 7.5 闭合 Cluster I。

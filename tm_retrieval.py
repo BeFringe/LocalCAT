@@ -18,6 +18,14 @@ Active+Lookup resource, aggregates in stable EXACT/CONTEXT/FUZZY order, and
 applies the global limit only after cross-resource aggregation.  It performs
 no persistence, apply/confirm, activation/update, capability publication or
 write side effects, and isolates every resource-local failure.
+
+Task 7.4 production slice: the same service captures the publisher's
+immutable ``RetrievalCapabilitySnapshot`` exactly once before reading any
+participating resource and threads that snapshot through the whole query, so
+a refresh during an in-flight multi-resource query affects only the next
+query.  Query-effective CONTEXT/FUZZY availability is combined in memory from
+physical store health and the captured snapshot; closed gates never touch
+retriever, candidate record or scorer ports.
 """
 
 from __future__ import annotations
@@ -27,10 +35,20 @@ import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
 from text_matcher import fold_text_v1
 from tm_candidate_index import CandidateRetriever
+from tm_retrieval_capability import (
+    RetrievalCapabilityEvidenceSummary,
+    RetrievalCapabilityPublisher,
+    RetrievalCapabilitySnapshot,
+    RetrievalContextDecision,
+    RetrievalFuzzyCoreDecision,
+    RetrievalFuzzyPathDecision,
+    default_retrieval_capability_publisher,
+)
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
     CandidateEvidence,
@@ -676,14 +694,13 @@ def score_fuzzy_candidates(
 
 # --- Task 7.3 service composition -------------------------------------------
 
-_CONTEXT_GATE_CLOSED_CODE = "STORE.CONTEXT_GATE_CLOSED"
-_FUZZY_GATE_CLOSED_CODE = "STORE.FUZZY_GATE_CLOSED"
 _UNHEALTHY_CODE = "RETRIEVAL.STORE_UNHEALTHY"
 _EXACT_UNAVAILABLE_CODE = "RETRIEVAL.EXACT_UNAVAILABLE"
 _LEASE_UNAVAILABLE_CODE = "STORE.QUERY_LEASE_UNAVAILABLE"
 _QUERY_VIEW_INVALID_CODE = "STORE.QUERY_VIEW_INVALID"
 _QUERY_VIEW_FOREIGN_CODE = "STORE.QUERY_VIEW_FOREIGN"
 _GENERATION_MISMATCH_CODE = "STORE.GENERATION_MISMATCH"
+_RECALL_PATH_MISMATCH_CODE = "RETRIEVAL.RECALL_PATH_MISMATCH"
 _NORMALIZED_FAILURE_CODE = "RETRIEVAL.QUERY_FAILED"
 _FALLBACK_STAGE = "QUERY"
 
@@ -857,6 +874,50 @@ def _snapshot_store_health(health: StoreHealth) -> StoreHealth:
     )
 
 
+def _snapshot_capability_snapshot(
+    snapshot: RetrievalCapabilitySnapshot,
+) -> RetrievalCapabilitySnapshot:
+    """Clone one capability snapshot into fresh exact-typed values.
+
+    The query consumes its own private copy so a publisher refresh or a
+    tampered frozen alias during in-flight callbacks can never rebind or
+    corrupt the decisions that already closed this query.
+    """
+
+    _require_exact_type(
+        snapshot,
+        RetrievalCapabilitySnapshot,
+        "capability snapshot",
+    )
+    return RetrievalCapabilitySnapshot(
+        semantics_version=snapshot.semantics_version,
+        context=RetrievalContextDecision(
+            available=snapshot.context.available,
+            unavailable_code=snapshot.context.unavailable_code,
+        ),
+        fuzzy_core=RetrievalFuzzyCoreDecision(
+            available=snapshot.fuzzy_core.available,
+            unavailable_code=snapshot.fuzzy_core.unavailable_code,
+        ),
+        fts5_trigram=RetrievalFuzzyPathDecision(
+            path=snapshot.fts5_trigram.path,
+            available=snapshot.fts5_trigram.available,
+            unavailable_code=snapshot.fts5_trigram.unavailable_code,
+        ),
+        gram_fallback=RetrievalFuzzyPathDecision(
+            path=snapshot.gram_fallback.path,
+            available=snapshot.gram_fallback.available,
+            unavailable_code=snapshot.gram_fallback.unavailable_code,
+        ),
+        summary=RetrievalCapabilityEvidenceSummary(
+            summary_version=snapshot.summary.summary_version,
+            evidence_digest=snapshot.summary.evidence_digest,
+            evaluated_at_utc=snapshot.summary.evaluated_at_utc,
+            unavailable_codes=snapshot.summary.unavailable_codes,
+        ),
+    )
+
+
 def _snapshot_exact_records(
     records: tuple[TMRecord, ...],
 ) -> tuple[TMRecord, ...]:
@@ -871,12 +932,13 @@ def _unavailable_recall_metadata(
     resource_id: str,
     index_kind: str,
     result_limit: int,
+    fuzzy_unavailable_code: str,
 ) -> CandidateRecallMetadata:
     return CandidateRecallMetadata(
         resource_id=resource_id,
         index_kind=index_kind,
         fuzzy_available=False,
-        fuzzy_unavailable_code=_FUZZY_GATE_CLOSED_CODE,
+        fuzzy_unavailable_code=fuzzy_unavailable_code,
         stages=(),
         union_unique_count=0,
         deduplicated_count=0,
@@ -1016,7 +1078,10 @@ class TMRetrievalService:
     deduplicated by (resource_id, record_id), and the global limit is
     applied only after cross-resource aggregation.  Dynamic retriever and
     scorer ports are captured lazily once per query on first fuzzy use and
-    reused for every later fuzzy resource.
+    reused for every later fuzzy resource.  The capability publisher snapshot
+    is captured once per query and shared by every participating resource;
+    physical health provides only physical/canonical facts while CONTEXT and
+    FUZZY query-effective availability come from that snapshot.
     """
 
     def __init__(
@@ -1024,13 +1089,25 @@ class TMRetrievalService:
         *,
         retriever: CandidateRetriever | None = None,
         scorer: SimilarityScorer | None = None,
+        capability_publisher: RetrievalCapabilityPublisher | None = None,
     ) -> None:
         if retriever is None:
             retriever = CandidateRetriever()
         if scorer is None:
             scorer = SimilarityScorerV1()
+        if capability_publisher is None:
+            capability_publisher = default_retrieval_capability_publisher(
+                datetime.now(timezone.utc)
+            )
+        else:
+            _require_exact_type(
+                capability_publisher,
+                RetrievalCapabilityPublisher,
+                "capability publisher",
+            )
         self._retriever = retriever
         self._scorer = scorer
+        self._capability_publisher = capability_publisher
 
     def query(
         self,
@@ -1039,6 +1116,9 @@ class TMRetrievalService:
     ) -> QueryReport:
         """Run one deterministic multi-resource query without side effects."""
 
+        capability_snapshot = _snapshot_capability_snapshot(
+            self._capability_publisher.snapshot()
+        )
         snapshots = _snapshot_handles(resources)
         query_snapshot = _snapshot_service_query(query)
         _validate_service_mapping(snapshots, query_snapshot)
@@ -1065,6 +1145,7 @@ class TMRetrievalService:
                 local_results, metadata = self._query_resource(
                     snapshot,
                     query_snapshot,
+                    capability_snapshot,
                     lazy_retriever,
                     lazy_scorer,
                     folded_query,
@@ -1132,6 +1213,7 @@ class TMRetrievalService:
         self,
         snapshot: _ServiceHandleSnapshot,
         query: TMQuery,
+        capability_snapshot: RetrievalCapabilitySnapshot,
         lazy_retriever: _LazyRetrieverPort,
         lazy_scorer: _LazyScorerPort,
         folded_query: str,
@@ -1193,6 +1275,25 @@ class TMRetrievalService:
                             stage="HEALTH",
                             error_code=_GENERATION_MISMATCH_CODE,
                         )
+                    intended_path = (
+                        "FTS5_TRIGRAM"
+                        if (
+                            health_snapshot.index_kind == "FTS5_TRIGRAM"
+                            and len(folded_query) >= 3
+                        )
+                        else "GRAM_FALLBACK"
+                    )
+                    context_available = (
+                        capability_snapshot.context.available
+                    )
+                    context_unavailable_code = (
+                        capability_snapshot.context.unavailable_code
+                    )
+                    fuzzy_available, fuzzy_unavailable_code = (
+                        capability_snapshot.fuzzy_available_for(
+                            intended_path
+                        )
+                    )
 
                 with _stage_guard("EXACT"):
                     exact_port = _safe_attr(view, "exact_records")
@@ -1211,7 +1312,7 @@ class TMRetrievalService:
                         records=exact_records,
                     )
 
-                if health_snapshot.fuzzy_available:
+                if fuzzy_available:
                     with _stage_guard("RECALL"):
                         retriever_port = lazy_retriever.port()
                         report = retriever_port(
@@ -1236,6 +1337,14 @@ class TMRetrievalService:
                             raise _ResourcePipelineFailure(
                                 stage="RECALL",
                                 error_code=_NORMALIZED_FAILURE_CODE,
+                            )
+                        if (
+                            report_snapshot.metadata.index_kind
+                            != intended_path
+                        ):
+                            raise _ResourcePipelineFailure(
+                                stage="RECALL",
+                                error_code=_RECALL_PATH_MISMATCH_CODE,
                             )
                         candidate_ids = tuple(
                             candidate.record_id
@@ -1265,14 +1374,18 @@ class TMRetrievalService:
                     with _stage_guard("RECALL"):
                         recall_metadata = _unavailable_recall_metadata(
                             resource_id=snapshot.resource_id,
-                            index_kind=health_snapshot.index_kind,
+                            index_kind=intended_path,
                             result_limit=query.limit,
+                            fuzzy_unavailable_code=cast(
+                                str,
+                                fuzzy_unavailable_code,
+                            ),
                         )
                     scored_count = 0
                     fuzzy_results = ()
 
                 with _stage_guard("QUERY"):
-                    if health_snapshot.context_available:
+                    if context_available:
                         local_results = classification.returned_results
                     else:
                         local_results = (
@@ -1283,12 +1396,8 @@ class TMRetrievalService:
                     local_results = local_results + fuzzy_results
                     metadata = ResourceQueryMetadata(
                         resource_id=snapshot.resource_id,
-                        context_available=health_snapshot.context_available,
-                        context_unavailable_code=(
-                            None
-                            if health_snapshot.context_available
-                            else _CONTEXT_GATE_CLOSED_CODE
-                        ),
+                        context_available=context_available,
+                        context_unavailable_code=context_unavailable_code,
                         recall=recall_metadata,
                         scored_count=scored_count,
                         returned_count=0,
