@@ -273,7 +273,7 @@
   - 完成时，EXACT→CONTEXT 类型、context strength 和 retained-only 变体黄金向量逐项一致
   - _Requirements: 1.1, 1.2, 1.3, 3.3, 3.4, 3.5, 3.6, 4.1, 4.2, 4.3_
 
-- [ ] 7.2 实现 fuzzy 评分、阈值和显式选择安全
+- [x] 7.2 实现 fuzzy 评分、阈值和显式选择安全
   - 从有界候选中批量读取 canonical records，使用两个分项和最终平均分，保留查询 source 与实际 matched source
   - 在排序和 limit 前应用 minimum similarity，按记录身份去重，并拒绝缺失 source/target/有效分数的建议
   - 查询只返回候选 target，不执行自动应用、确认或持久化副作用
@@ -421,3 +421,4 @@
 - 2026-08-12 / Task 6.3：用真实 sidecar 激活前后的同一组输入比较完整 `LogicController` payload、openpyxl 渲染与 status counts；exact `same→winner` 保持高于同名 glossary，exact miss 后仍进入 `Glossary→术语`，完全 miss 仍为 `NO_MATCH`，对外状态集严格只有 `TM_HIT / TERMS_FOUND / NO_MATCH`。Controller/Excel/facade focused 27/27、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
 - 2026-08-12 / Cluster G 复审：累积复审批准 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷打开权威矩阵、canonical import 事务与三态兼容，无 P0–P2 遗留；唯一 P3 将非相同 digest 的 SQLite constraint 误报为重复导入，已收紧为只识别 `tm_origin_batch(kind, source_digest)` 唯一约束并完成定点复验。主 agent fresh 全量 930/930（skip 1，含 Qt smoke），累积变更文件 basedpyright error-level 0 errors，py_compile 与 range diff check 通过。
 - 2026-08-12 / Task 7.1：新增独立 retrieval domain seam；同资源 raw-exact 组只取最大有效 `record_id` 为 EXACT，其他变体仅在双方非空的 speaker/previous/next 原始完整字段出现至少一项正匹配时成为 CONTEXT，大小写/空白差异保持 mismatch，缺失事实不参与比较，无正面证据的变体只保留不返回。输入组对非 exact source、重复 identity 与非法空结果身份 fail-closed；focused 17/17、相关回归 130/130、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 7.2：在 storage-independent retrieval seam 中消费完整重建并重验的 bounded candidate/record 私有快照，以 scorer-v1 原始双 source 生成未舍入 fuzzy evidence；同 source 不进入评分，threshold 等值保留且在排序/全局 limit 前过滤，按资源与 record identity 去重，不执行写入、应用或确认。所有 query、recall stage、candidate、record/provenance 与 scorer evidence 在首个可控 callback 前完成 exact-type/nested 闭包，`score` port 只锁存一次，回调篡改 frozen alias 不会重绑结果；focused 50/50、相关回归 115/115、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。

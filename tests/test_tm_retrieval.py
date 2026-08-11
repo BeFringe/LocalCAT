@@ -1,27 +1,39 @@
-"""Task 7.1 focused tests: exact winner and raw context classification."""
+"""Task 7.1/7.2 focused tests: exact/context classification and fuzzy scoring."""
 
 from __future__ import annotations
 
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any, cast
 
 from tm_contracts import (
+    CANDIDATE_BUDGET_VERSION,
+    CandidateEvidence,
+    CandidateRecallMetadata,
+    CandidateRetrievalReport,
+    CandidateStage,
+    CandidateStageMetadata,
     ContextEvidence,
+    SimilarityEvidence,
     StoreHealth,
     TMMatchType,
     TMQuery,
     TMRecord,
     TMRecordDraft,
     TMResourceHandle,
+    TMResult,
     TMStore,
+    candidate_budget_v1,
 )
 from tm_retrieval import (
     ExactContextClassification,
+    FuzzyScoringResult,
     classify_exact_context,
     compare_context_v1,
     query_resource_exact,
+    score_fuzzy_candidates,
 )
+from tm_similarity import SimilarityScorerV1
 
 
 FIXTURE_VERSION = "tm-retrieval-vectors-v1"
@@ -1141,6 +1153,1076 @@ class InputValidationTests(unittest.TestCase):
                 handle=_handle(_StubStore(records=())),
                 query=cast(Any, object()),
             )
+
+
+FUZZY_FIXTURE_VERSION = "tm-retrieval-fuzzy-vectors-v1"
+
+
+def _fuzzy_query(
+    *,
+    minimum_similarity: float = 0.7,
+    limit: int = 10,
+) -> TMQuery:
+    return TMQuery(
+        query_source=QUERY_SOURCE,
+        speaker_raw=None,
+        context_prev_raw=None,
+        context_next_raw=None,
+        minimum_similarity=minimum_similarity,
+        limit=limit,
+        resource_order=("tm.primary",),
+    )
+
+
+def _candidate_report(
+    record_ids: tuple[int, ...],
+    *,
+    resource_id: str = "tm.primary",
+    result_limit: int = 10,
+    fuzzy_available: bool = True,
+) -> CandidateRetrievalReport:
+    count = len(record_ids)
+    if fuzzy_available:
+        stages = (
+            CandidateStageMetadata(
+                stage=CandidateStage.FTS_TRIGRAM,
+                input_count=0,
+                added_unique_count=count,
+                output_unique_count=count,
+                dropped_count=0,
+            ),
+            CandidateStageMetadata(
+                stage=CandidateStage.UNION,
+                input_count=count,
+                added_unique_count=0,
+                output_unique_count=count,
+                dropped_count=0,
+            ),
+            CandidateStageMetadata(
+                stage=CandidateStage.DEDUPLICATE,
+                input_count=count,
+                added_unique_count=0,
+                output_unique_count=count,
+                dropped_count=0,
+            ),
+        )
+        candidates = tuple(
+            CandidateEvidence(
+                record_id=record_id,
+                recall_stages=(CandidateStage.FTS_TRIGRAM,),
+                matched_grams=1,
+                query_grams=1,
+                overlap_ratio=1.0,
+                pretruncate_rank=None,
+            )
+            for record_id in record_ids
+        )
+        metadata = CandidateRecallMetadata(
+            resource_id=resource_id,
+            index_kind="FTS5_TRIGRAM",
+            fuzzy_available=True,
+            fuzzy_unavailable_code=None,
+            stages=stages,
+            union_unique_count=count,
+            deduplicated_count=count,
+            result_limit=result_limit,
+            candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+            candidate_budget=candidate_budget_v1(result_limit),
+            truncated=False,
+        )
+    else:
+        candidates = ()
+        metadata = CandidateRecallMetadata(
+            resource_id=resource_id,
+            index_kind="FTS5_TRIGRAM",
+            fuzzy_available=False,
+            fuzzy_unavailable_code="FUZZY_GATE.CLOSED",
+            stages=(),
+            union_unique_count=0,
+            deduplicated_count=0,
+            result_limit=result_limit,
+            candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+            candidate_budget=candidate_budget_v1(result_limit),
+            truncated=False,
+        )
+    return CandidateRetrievalReport(candidates=candidates, metadata=metadata)
+
+
+class _CountingScorer:
+    """Scorer-v1 wrapper that records every query/candidate pair."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def score(self, query: str, candidate: str) -> SimilarityEvidence:
+        self.calls.append((query, candidate))
+        return SimilarityScorerV1().score(query, candidate)
+
+
+class _BrokenScorer:
+    def score(self, query: str, candidate: str) -> SimilarityEvidence:
+        return cast(Any, object())
+
+
+class _InvalidEvidenceScorer:
+    def score(self, query: str, candidate: str) -> SimilarityEvidence:
+        return SimilarityEvidence(
+            levenshtein_ratio=0.5,
+            dice_bigram=0.5,
+            final_similarity=1.5,
+        )
+
+
+class _MutatingAliasScorer:
+    """Scorer that mutates every caller-owned alias it can reach on first call."""
+
+    def __init__(
+        self,
+        *,
+        query: TMQuery,
+        records: tuple[TMRecord, ...],
+        report: CandidateRetrievalReport,
+    ) -> None:
+        self.query = query
+        self.records = records
+        self.report = report
+        self.returned_evidences: list[SimilarityEvidence] = []
+        self.mutated = False
+
+    def score(self, query: str, candidate: str) -> SimilarityEvidence:
+        if not self.mutated:
+            object.__setattr__(self.query, "query_source", "MUTATED QUERY")
+            object.__setattr__(self.query, "minimum_similarity", 0.99)
+            object.__setattr__(self.query, "limit", 1)
+            for record in self.records:
+                object.__setattr__(record, "source_raw", "MUTATED SOURCE")
+                object.__setattr__(record, "target_raw", "MUTATED TARGET")
+                object.__setattr__(
+                    record,
+                    "provenance",
+                    (("importer", "mutated"),),
+                )
+            for candidate_evidence in self.report.candidates:
+                object.__setattr__(candidate_evidence, "record_id", 999)
+            object.__setattr__(self.report, "candidates", ())
+            object.__setattr__(self.report.metadata, "resource_id", "tm.mutated")
+            object.__setattr__(self.report.metadata, "result_limit", 1)
+            self.mutated = True
+        evidence = SimilarityScorerV1().score(query, candidate)
+        self.returned_evidences.append(evidence)
+        return evidence
+
+
+class _EvidenceAliasingScorer:
+    """Scorer that mutates its previously returned evidence on later calls."""
+
+    def __init__(self) -> None:
+        self.returned_evidences: list[SimilarityEvidence] = []
+        self.mutated_previous = False
+
+    def score(self, query: str, candidate: str) -> SimilarityEvidence:
+        if self.returned_evidences:
+            object.__setattr__(self.returned_evidences[0], "final_similarity", 0.0)
+            object.__setattr__(self.returned_evidences[0], "levenshtein_ratio", 0.0)
+            object.__setattr__(self.returned_evidences[0], "dice_bigram", 0.0)
+            self.mutated_previous = True
+        evidence = SimilarityScorerV1().score(query, candidate)
+        self.returned_evidences.append(evidence)
+        return evidence
+
+
+class _ScoreAttributeRotatingScorer:
+    """Scorer whose score attribute returns a fresh callable on every access."""
+
+    def __init__(self) -> None:
+        self.score_accesses = 0
+        self.calls = 0
+
+    @property
+    def score(self) -> Callable[[str, str], SimilarityEvidence]:
+        self.score_accesses += 1
+
+        def score(query: str, candidate: str) -> SimilarityEvidence:
+            self.calls += 1
+            return SimilarityScorerV1().score(query, candidate)
+
+        return score
+
+
+class _ScorePropertyMutatingScorer:
+    """Scorer whose port lookup mutates every caller-owned input alias."""
+
+    def __init__(
+        self,
+        *,
+        query: TMQuery,
+        records: tuple[TMRecord, ...],
+        report: CandidateRetrievalReport,
+    ) -> None:
+        self.query = query
+        self.records = records
+        self.report = report
+        self.score_accesses = 0
+
+    @property
+    def score(self) -> Callable[[str, str], SimilarityEvidence]:
+        self.score_accesses += 1
+        object.__setattr__(self.query, "query_source", "MUTATED QUERY")
+        object.__setattr__(self.query, "minimum_similarity", 0.99)
+        for record in self.records:
+            object.__setattr__(record, "source_raw", "MUTATED SOURCE")
+            object.__setattr__(record, "target_raw", "MUTATED TARGET")
+            object.__setattr__(
+                record,
+                "provenance",
+                (("importer", "mutated"),),
+            )
+        object.__setattr__(self.report, "candidates", ())
+        object.__setattr__(self.report.metadata, "resource_id", "tm.mutated")
+        return SimilarityScorerV1().score
+
+
+class FuzzyScoringTests(unittest.TestCase):
+    def test_fixture_version_is_frozen(self) -> None:
+        self.assertEqual(FUZZY_FIXTURE_VERSION, "tm-retrieval-fuzzy-vectors-v1")
+
+    def test_threshold_boundary_equality_is_accepted_and_below_is_excluded(
+        self,
+    ) -> None:
+        records = (
+            _record(1, source_raw="Open the door", target_raw="high"),
+            _record(2, source_raw="Close the window.", target_raw="mid"),
+            _record(3, source_raw="zzz zzz zzz", target_raw="low"),
+        )
+        report = _candidate_report((1, 2, 3))
+        boundary = (
+            SimilarityScorerV1()
+            .score(QUERY_SOURCE, "Close the window.")
+            .final_similarity
+        )
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=boundary),
+            report=report,
+            records=records,
+        )
+        self.assertEqual(
+            tuple(item.record_id for item in result.accepted),
+            (1, 2),
+        )
+        self.assertEqual(result.scored_count, 3)
+        for item in result.accepted:
+            self.assertGreaterEqual(item.similarity, boundary)
+
+        strict = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(
+                minimum_similarity=(
+                    SimilarityScorerV1()
+                    .score(QUERY_SOURCE, "Open the door")
+                    .final_similarity
+                )
+            ),
+            report=report,
+            records=records,
+        )
+        self.assertEqual(
+            tuple(item.record_id for item in strict.accepted),
+            (1,),
+        )
+
+    def test_zero_threshold_accepts_all_and_one_threshold_accepts_none(
+        self,
+    ) -> None:
+        records = (
+            _record(1, source_raw="Open the door", target_raw="high"),
+            _record(2, source_raw="Close the window.", target_raw="mid"),
+        )
+        report = _candidate_report((1, 2))
+        all_results = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.0),
+            report=report,
+            records=records,
+        )
+        self.assertEqual(
+            tuple(item.record_id for item in all_results.accepted),
+            (1, 2),
+        )
+        none_results = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=1.0),
+            report=report,
+            records=records,
+        )
+        self.assertEqual(none_results.accepted, ())
+        self.assertEqual(none_results.scored_count, 2)
+
+    def test_accepted_results_retain_query_and_matched_sources(self) -> None:
+        record = _record(7, source_raw="Open the door", target_raw="开门。")
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=3,
+            query=_fuzzy_query(),
+            report=_candidate_report((7,)),
+            records=(record,),
+        )
+        self.assertEqual(len(result.accepted), 1)
+        item = result.accepted[0]
+        self.assertEqual(item.resource_id, "tm.primary")
+        self.assertEqual(item.record_id, 7)
+        self.assertEqual(item.query_source, QUERY_SOURCE)
+        self.assertEqual(item.matched_source, "Open the door")
+        self.assertNotEqual(item.query_source, item.matched_source)
+        self.assertEqual(item.target, "开门。")
+        self.assertEqual(item.match_type, TMMatchType.FUZZY)
+        self.assertEqual(item.stable_tie_key, (3, 7))
+        self.assertEqual(item.context_evidence.matched_fields, ())
+        self.assertEqual(
+            item.provenance,
+            (("importer", "legacy-7"),),
+        )
+        expected = SimilarityScorerV1().score(QUERY_SOURCE, "Open the door")
+        self.assertIsNotNone(item.similarity_evidence)
+        if item.similarity_evidence is not None:
+            self.assertEqual(item.similarity_evidence, expected)
+            self.assertEqual(item.similarity, expected.final_similarity)
+            self.assertGreaterEqual(item.similarity, 0.0)
+            self.assertLessEqual(item.similarity, 1.0)
+
+    def test_same_source_candidates_are_excluded_without_scoring(self) -> None:
+        records = (
+            _record(1, source_raw=QUERY_SOURCE, target_raw="exact-target"),
+            _record(2, source_raw="Open the door", target_raw="fuzzy-target"),
+        )
+        scorer = _CountingScorer()
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(),
+            report=_candidate_report((1, 2)),
+            records=records,
+            scorer=scorer,
+        )
+        self.assertEqual(
+            tuple(item.record_id for item in result.accepted),
+            (2,),
+        )
+        self.assertEqual(result.scored_count, 1)
+        self.assertEqual(scorer.calls, [(QUERY_SOURCE, "Open the door")])
+
+    def test_order_is_final_similarity_desc_then_record_id_desc(self) -> None:
+        records = (
+            _record(1, source_raw="Close the door.", target_raw="first"),
+            _record(2, source_raw="Close the door.", target_raw="second"),
+            _record(3, source_raw="Open the door", target_raw="third"),
+        )
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.0),
+            report=_candidate_report((1, 2, 3)),
+            records=records,
+        )
+        self.assertEqual(
+            tuple(item.record_id for item in result.accepted),
+            (3, 2, 1),
+        )
+        scores = tuple(item.similarity for item in result.accepted)
+        self.assertEqual(scores, tuple(sorted(scores, reverse=True)))
+
+    def test_accepted_is_unbounded_by_query_limit_for_global_slice(self) -> None:
+        records = tuple(
+            _record(
+                record_id,
+                source_raw=f"Open the door {record_id}",
+                target_raw=f"target-{record_id}",
+            )
+            for record_id in (1, 2, 3, 4, 5)
+        )
+        report = _candidate_report((1, 2, 3, 4, 5), result_limit=2)
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.0, limit=2),
+            report=report,
+            records=records,
+        )
+        self.assertEqual(len(result.accepted), 5)
+        self.assertEqual(report.metadata.result_limit, 2)
+        self.assertEqual(
+            report.metadata.candidate_budget,
+            candidate_budget_v1(2),
+        )
+
+    def test_empty_candidates_return_empty_accepted(self) -> None:
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(),
+            report=_candidate_report(()),
+            records=(),
+        )
+        self.assertEqual(result.accepted, ())
+        self.assertEqual(result.scored_count, 0)
+
+    def test_fuzzy_unavailable_report_scores_nothing(self) -> None:
+        scorer = _CountingScorer()
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(),
+            report=_candidate_report((), fuzzy_available=False),
+            records=(),
+            scorer=scorer,
+        )
+        self.assertEqual(result.accepted, ())
+        self.assertEqual(result.scored_count, 0)
+        self.assertEqual(scorer.calls, [])
+
+    def test_repeated_scoring_is_deterministic_without_mutating_inputs(
+        self,
+    ) -> None:
+        records = (
+            _record(1, source_raw="Open the door", target_raw="first"),
+            _record(2, source_raw="Close the window.", target_raw="second"),
+        )
+        report = _candidate_report((1, 2))
+        query = _fuzzy_query(minimum_similarity=0.0)
+        first = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=query,
+            report=report,
+            records=records,
+        )
+        second = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=query,
+            report=report,
+            records=records,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(report, _candidate_report((1, 2)))
+        self.assertEqual(query, _fuzzy_query(minimum_similarity=0.0))
+        self.assertEqual(records, (records[0], records[1]))
+        self.assertEqual(
+            tuple(item.provenance for item in first.accepted),
+            (
+                (("importer", "legacy-1"),),
+                (("importer", "legacy-2"),),
+            ),
+        )
+
+
+class FuzzyIdentitySafetyTests(unittest.TestCase):
+    def test_duplicate_record_identity_in_batch_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "records must have unique record ids",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,)),
+                records=(
+                    _record(1, target_raw="first"),
+                    _record(1, target_raw="second"),
+                ),
+            )
+
+    def test_missing_candidate_record_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "records must correspond exactly to candidate ids",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1, 2)),
+                records=(_record(1),),
+            )
+
+    def test_foreign_record_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "records must correspond exactly to candidate ids",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,)),
+                records=(_record(1), _record(9)),
+            )
+
+    def test_report_resource_mismatch_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "report must belong to resource_id",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,), resource_id="tm.other"),
+                records=(_record(1),),
+            )
+
+    def test_report_result_limit_mismatch_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "report result limit must equal query limit",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(limit=2),
+                report=_candidate_report((1,), result_limit=10),
+                records=(_record(1),),
+            )
+
+    def test_malformed_scorer_evidence_fails_closed(self) -> None:
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,)),
+                records=(_record(1, source_raw="Open the door"),),
+                scorer=_BrokenScorer(),
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "final similarity must be between 0 and 1",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,)),
+                records=(_record(1, source_raw="Open the door"),),
+                scorer=_InvalidEvidenceScorer(),
+            )
+
+    def test_non_contract_inputs_are_rejected(self) -> None:
+        report = _candidate_report((1,))
+        records = (_record(1, source_raw="Open the door"),)
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id=cast(Any, 7),
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=records,
+            )
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=True,
+                query=_fuzzy_query(),
+                report=report,
+                records=records,
+            )
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=cast(Any, object()),
+                report=report,
+                records=records,
+            )
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=cast(Any, object()),
+                records=records,
+            )
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=cast(Any, [records[0]]),
+            )
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=cast(Any, (object(),)),
+            )
+
+    def test_scorer_without_score_port_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report((1,)),
+                records=(_record(1, source_raw="Open the door"),),
+                scorer=cast(Any, object()),
+            )
+
+    def test_fuzzy_result_rejects_empty_identity_and_negative_order(self) -> None:
+        with self.assertRaisesRegex(ValueError, "resource_id must not be empty"):
+            score_fuzzy_candidates(
+                resource_id=" ",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=_candidate_report(()),
+                records=(),
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "resource_order must be non-negative",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=-1,
+                query=_fuzzy_query(),
+                report=_candidate_report(()),
+                records=(),
+            )
+
+
+class FuzzyScoringResultValidationTests(unittest.TestCase):
+    def _scored_result(self) -> FuzzyScoringResult:
+        records = (
+            _record(1, source_raw="Open the door", target_raw="first"),
+            _record(2, source_raw="Close the window.", target_raw="second"),
+        )
+        return score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.0),
+            report=_candidate_report((1, 2)),
+            records=records,
+        )
+
+    def test_duplicate_resource_record_pair_is_rejected(self) -> None:
+        scored = self._scored_result()
+        duplicate = scored.accepted[:1] + scored.accepted[:1]
+        with self.assertRaisesRegex(
+            ValueError,
+            "accepted results must be deduplicated",
+        ):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=duplicate,
+                scored_count=2,
+            )
+
+    def test_foreign_resource_result_is_rejected(self) -> None:
+        scored = self._scored_result()
+        foreign = (
+            TMResult(
+                resource_id="tm.other",
+                record_id=scored.accepted[0].record_id,
+                query_source=QUERY_SOURCE,
+                matched_source=scored.accepted[0].matched_source,
+                target=scored.accepted[0].target,
+                match_type=TMMatchType.FUZZY,
+                similarity=scored.accepted[0].similarity,
+                similarity_evidence=scored.accepted[0].similarity_evidence,
+                context_evidence=scored.accepted[0].context_evidence,
+                provenance=scored.accepted[0].provenance,
+                stable_tie_key=(9, scored.accepted[0].record_id),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "accepted result resource id must match",
+        ):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=foreign,
+                scored_count=1,
+            )
+
+    def test_non_fuzzy_result_is_rejected(self) -> None:
+        exact = TMResult(
+            resource_id="tm.primary",
+            record_id=WINNER_RECORD_ID,
+            query_source=QUERY_SOURCE,
+            matched_source=QUERY_SOURCE,
+            target="target",
+            match_type=TMMatchType.EXACT,
+            similarity=1.0,
+            similarity_evidence=None,
+            context_evidence=ContextEvidence(
+                comparable_fields=(),
+                matched_fields=(),
+                mismatched_fields=(),
+                strength_v1=(0, 0, 0, 0, 0),
+            ),
+            provenance=(("importer", "legacy-100"),),
+            stable_tie_key=(0, WINNER_RECORD_ID),
+        )
+        with self.assertRaisesRegex(ValueError, "accepted results must be fuzzy"):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=(exact,),
+                scored_count=1,
+            )
+
+    def test_negative_scored_count_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "scored_count must be non-negative",
+        ):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=(),
+                scored_count=-1,
+            )
+
+    def test_non_contract_fields_are_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            FuzzyScoringResult(
+                resource_id=cast(Any, 7),
+                resource_order=0,
+                accepted=(),
+                scored_count=0,
+            )
+        with self.assertRaises(TypeError):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=True,
+                accepted=(),
+                scored_count=0,
+            )
+        with self.assertRaises(TypeError):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=cast(Any, []),
+                scored_count=0,
+            )
+        with self.assertRaises(TypeError):
+            FuzzyScoringResult(
+                resource_id="tm.primary",
+                resource_order=0,
+                accepted=(),
+                scored_count=True,
+            )
+
+
+class FuzzyCallbackTOCTOUTests(unittest.TestCase):
+    """A scorer mutating aliased caller-owned values must not corrupt results."""
+
+    def _honest_result(self) -> FuzzyScoringResult:
+        return score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.5),
+            report=_candidate_report((1, 2, 3)),
+            records=(
+                _record(1, source_raw="Open the door", target_raw="first"),
+                _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+                _record(3, source_raw="Close the window.", target_raw="third"),
+            ),
+            scorer=SimilarityScorerV1(),
+        )
+
+    def test_result_stays_bound_to_pre_callback_values(self) -> None:
+        honest = self._honest_result()
+        query = _fuzzy_query(minimum_similarity=0.5)
+        records = (
+            _record(1, source_raw="Open the door", target_raw="first"),
+            _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+            _record(3, source_raw="Close the window.", target_raw="third"),
+        )
+        report = _candidate_report((1, 2, 3))
+        scorer = _MutatingAliasScorer(
+            query=query,
+            records=records,
+            report=report,
+        )
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=query,
+            report=report,
+            records=records,
+            scorer=scorer,
+        )
+
+        self.assertTrue(scorer.mutated)
+        self.assertEqual(query.query_source, "MUTATED QUERY")
+        self.assertEqual(query.minimum_similarity, 0.99)
+        self.assertEqual(records[1].source_raw, "MUTATED SOURCE")
+        self.assertEqual(records[0].provenance, (("importer", "mutated"),))
+        self.assertEqual(report.candidates, ())
+        self.assertEqual(report.metadata.resource_id, "tm.mutated")
+        self.assertEqual(result, honest)
+        self.assertEqual(result.scored_count, 2)
+        self.assertEqual(
+            tuple(item.record_id for item in result.accepted),
+            (1,),
+        )
+        accepted = result.accepted[0]
+        self.assertEqual(accepted.query_source, QUERY_SOURCE)
+        self.assertEqual(accepted.matched_source, "Open the door")
+        self.assertEqual(accepted.target, "first")
+        self.assertEqual(accepted.provenance, (("importer", "legacy-1"),))
+        self.assertGreaterEqual(accepted.similarity, 0.5)
+        self.assertLess(accepted.similarity, 0.99)
+
+    def test_evidence_aliases_are_not_retained_in_results(self) -> None:
+        honest = self._honest_result()
+        scorer = _EvidenceAliasingScorer()
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.5),
+            report=_candidate_report((1, 2, 3)),
+            records=(
+                _record(1, source_raw="Open the door", target_raw="first"),
+                _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+                _record(3, source_raw="Close the window.", target_raw="third"),
+            ),
+            scorer=scorer,
+        )
+
+        self.assertTrue(scorer.mutated_previous)
+        self.assertEqual(len(scorer.returned_evidences), 2)
+        for item in result.accepted:
+            self.assertIsNot(
+                item.similarity_evidence,
+                scorer.returned_evidences[0],
+            )
+        self.assertEqual(result, honest)
+        for alias in scorer.returned_evidences:
+            object.__setattr__(alias, "final_similarity", 0.0)
+            object.__setattr__(alias, "levenshtein_ratio", 0.0)
+            object.__setattr__(alias, "dice_bigram", 0.0)
+        self.assertEqual(result, honest)
+
+    def test_mutated_fuzzy_unavailable_with_candidates_fails_before_scoring(
+        self,
+    ) -> None:
+        report = _candidate_report((1,))
+        object.__setattr__(report.metadata, "fuzzy_available", False)
+        object.__setattr__(
+            report.metadata,
+            "fuzzy_unavailable_code",
+            "FUZZY_GATE.CLOSED",
+        )
+        object.__setattr__(report.metadata, "stages", ())
+        object.__setattr__(report.metadata, "union_unique_count", 0)
+        object.__setattr__(report.metadata, "deduplicated_count", 0)
+        object.__setattr__(report.metadata, "truncated", False)
+        scorer = _CountingScorer()
+        with self.assertRaisesRegex(
+            ValueError,
+            "fuzzy unavailable recall must return empty candidates",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=(_record(1, source_raw="Open the door"),),
+                scorer=scorer,
+            )
+        self.assertEqual(scorer.calls, [])
+
+    def test_mutated_duplicate_candidate_ids_fail_before_scoring(self) -> None:
+        report = _candidate_report((1, 2))
+        object.__setattr__(
+            report,
+            "candidates",
+            (
+                CandidateEvidence(
+                    record_id=1,
+                    recall_stages=(CandidateStage.FTS_TRIGRAM,),
+                    matched_grams=1,
+                    query_grams=1,
+                    overlap_ratio=1.0,
+                    pretruncate_rank=None,
+                ),
+                CandidateEvidence(
+                    record_id=1,
+                    recall_stages=(CandidateStage.FTS_TRIGRAM,),
+                    matched_grams=1,
+                    query_grams=1,
+                    overlap_ratio=1.0,
+                    pretruncate_rank=None,
+                ),
+            ),
+        )
+        scorer = _CountingScorer()
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate values must have unique record ids",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=(_record(1, source_raw="Open the door"),),
+                scorer=scorer,
+            )
+        self.assertEqual(scorer.calls, [])
+
+    def test_mutated_stage_counts_fail_before_scoring(self) -> None:
+        report = _candidate_report((1, 2))
+        object.__setattr__(
+            report.metadata.stages[1],
+            "output_unique_count",
+            report.metadata.stages[1].output_unique_count + 1,
+        )
+        scorer = _CountingScorer()
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate stage counts must conserve input and output",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=(
+                    _record(1, source_raw="Open the door"),
+                    _record(2, source_raw="Close the window."),
+                ),
+                scorer=scorer,
+            )
+        self.assertEqual(scorer.calls, [])
+
+    def test_mutated_evidence_counts_fail_before_scoring(self) -> None:
+        report = _candidate_report((1, 2))
+        object.__setattr__(report.candidates[0], "matched_grams", 2)
+        scorer = _CountingScorer()
+        with self.assertRaisesRegex(
+            ValueError,
+            "matched grams must not exceed query grams",
+        ):
+            score_fuzzy_candidates(
+                resource_id="tm.primary",
+                resource_order=0,
+                query=_fuzzy_query(),
+                report=report,
+                records=(
+                    _record(1, source_raw="Open the door"),
+                    _record(2, source_raw="Close the window."),
+                ),
+                scorer=scorer,
+            )
+        self.assertEqual(scorer.calls, [])
+
+    def test_score_callable_is_captured_once_before_iteration(self) -> None:
+        honest = self._honest_result()
+        scorer = cast(Any, _ScoreAttributeRotatingScorer())
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=_fuzzy_query(minimum_similarity=0.5),
+            report=_candidate_report((1, 2, 3)),
+            records=(
+                _record(1, source_raw="Open the door", target_raw="first"),
+                _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+                _record(3, source_raw="Close the window.", target_raw="third"),
+            ),
+            scorer=scorer,
+        )
+        self.assertEqual(scorer.score_accesses, 1)
+        self.assertEqual(scorer.calls, 2)
+        self.assertEqual(result, honest)
+
+    def test_score_port_lookup_runs_only_after_private_input_snapshot(self) -> None:
+        honest = self._honest_result()
+        query = _fuzzy_query(minimum_similarity=0.5)
+        records = (
+            _record(1, source_raw="Open the door", target_raw="first"),
+            _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+            _record(3, source_raw="Close the window.", target_raw="third"),
+        )
+        report = _candidate_report((1, 2, 3))
+        scorer = cast(
+            Any,
+            _ScorePropertyMutatingScorer(
+                query=query,
+                records=records,
+                report=report,
+            ),
+        )
+
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=query,
+            report=report,
+            records=records,
+            scorer=scorer,
+        )
+
+        self.assertEqual(scorer.score_accesses, 1)
+        self.assertEqual(query.query_source, "MUTATED QUERY")
+        self.assertEqual(records[0].source_raw, "MUTATED SOURCE")
+        self.assertEqual(report.candidates, ())
+        self.assertEqual(result, honest)
+
+    def test_post_call_mutation_of_caller_aliases_does_not_corrupt_result(
+        self,
+    ) -> None:
+        honest = self._honest_result()
+        query = _fuzzy_query(minimum_similarity=0.5)
+        records = (
+            _record(1, source_raw="Open the door", target_raw="first"),
+            _record(2, source_raw=QUERY_SOURCE, target_raw="second"),
+            _record(3, source_raw="Close the window.", target_raw="third"),
+        )
+        report = _candidate_report((1, 2, 3))
+        scorer = _MutatingAliasScorer(
+            query=query,
+            records=records,
+            report=report,
+        )
+        result = score_fuzzy_candidates(
+            resource_id="tm.primary",
+            resource_order=0,
+            query=query,
+            report=report,
+            records=records,
+            scorer=scorer,
+        )
+
+        for record in records:
+            object.__setattr__(record, "source_raw", "MUTATED SOURCE")
+            object.__setattr__(record, "target_raw", "MUTATED TARGET")
+            object.__setattr__(record, "provenance", (("importer", "mutated"),))
+        object.__setattr__(query, "query_source", "MUTATED QUERY")
+        object.__setattr__(query, "minimum_similarity", 0.99)
+        object.__setattr__(report, "candidates", ())
+        for alias in scorer.returned_evidences:
+            object.__setattr__(alias, "final_similarity", 0.0)
+            object.__setattr__(alias, "scorer_version", "MUTATED")
+
+        self.assertEqual(result, honest)
+        for item in result.accepted:
+            self.assertIsNot(
+                item.similarity_evidence,
+                scorer.returned_evidences[0],
+            )
+            self.assertIsNot(item.provenance, records[0].provenance)
 
 
 if __name__ == "__main__":
