@@ -300,6 +300,7 @@
 
 - [ ] 7.5 建立 Gate C retrieval correctness
   - 在独立 `tm_retrieval_validation.py` 中以固定 cohort/fixture/build/semantics/evaluator digest 重跑纯验证入口并生成 manifest；fixture codec、向量执行和 observed digest 不进入 capability publisher 模块
+  - approved roots 可覆盖 evaluator/build 文件自身；禁止把 observed digest 回填为被哈希生产模块的默认常量。默认无 evidence publisher 保持 fail-closed，外层 composition root 只用 validation release 的 exact expectation/manifest 构造并注入 evaluator/publisher
   - 分别汇总 raw context 分类和 fuzzy-core 的 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据
   - evaluator 重新计算每个 vector/cohort 的实际结果，拒绝仅凭 manifest 自报 passed、未知/重复 cohort、过期、version/digest mismatch 或不完整证据开放能力
   - CONTEXT correctness 通过即可独立开放；fuzzy-core correctness 通过只满足 FUZZY 的 Gate C 前提，Task 8.4/8.5 发布对应 execution path 的 oracle/benchmark evidence 前 FUZZY 仍保持关闭

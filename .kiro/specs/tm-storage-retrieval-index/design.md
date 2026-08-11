@@ -928,6 +928,8 @@ threshold 只过滤 FUZZY；dedupe 使用 `(resource_id, record_id)`；global li
 
 Gate C 的固定输入、expected/observed canonical digest 重算和 manifest 生成由 `tm_retrieval_validation.py` 独占；它是离线 validation leaf，可以消费 `tm_retrieval.py` 的纯分类/评分入口、公开 query/store 端口和 `tm_retrieval_capability.py` 的 frozen evidence values，以临时资源重放事务回滚、局部失败和 global-limit cohorts，但任何 production runtime 模块都不得反向导入它。该模块不接触 facade 或 Qt，也不得发布能力。`tm_retrieval_capability.py` 保持 evaluator/publisher 状态机边界，不继续吸收 fixture codec、向量 runner 或测试语料；避免把“如何产生证据”和“谁有权解释/发布证据”重新耦合。
 
+批准 roots 可以覆盖 evaluator/build 文件本身，因此不得把这些文件的 observed digest 回填为被哈希生产模块中的默认常量，否则会形成自引用身份。无 evidence 的默认 publisher 始终保持 fail-closed；离线验证只返回从批准 roots 构造的不可变 expectation 与 manifest，外层 composition root 再用这两个值显式构造 `RetrievalCapabilityEvaluator`/`RetrievalCapabilityPublisher` 并注入 Retrieval。该装配不使 validation leaf 成为发布者，runtime 也不读取 roots；任何默认常量、调用方布尔值或未闭合 manifest 都不能替代批准 roots。
+
 `RetrievalCapabilitySnapshot` 至少冻结 retrieval semantics version、CONTEXT 子门决定、fuzzy-core correctness 决定、`FTS5_TRIGRAM` 与 `GRAM_FALLBACK` 两条 Gate D 决定，以及只含版本、digest、时间和稳定 unavailable code 的不透明 evidence summary。CONTEXT、fuzzy-core 和两条 benchmark path 可分别降级，任何一项不得替另一项宣称成功。FUZZY 对某次查询可用，当且仅当 fuzzy-core correctness 与该查询实际执行路径的 Gate D 都开放；Task 7.5 完成但 Task 8 尚未发布 benchmark evidence 时，FUZZY 必须继续关闭。
 
 `RetrievalCapabilityEvaluator` 是 evidence 到决定的唯一函数；manifest 中的自报 `passed` 不能单独授予能力。evaluator 必须重新核对批准的 cohort/fixture/build/semantics/evaluator digest、有效期和可重算结果；Gate D 还要核对 frozen benchmark contract、execution path、environment/report digest 和 hard-gate 结果。`RetrievalCapabilityPublisher` 只接受精确 evaluator/manifest 值，构造时私有克隆 expectation，refresh 时在锁内重新求值并原子替换整个 snapshot；调用方不能注入返回任意 `available=True` 的 callback。缺失、过期、版本/digest 不符或重算失败都 fail-closed，且允许从 open 降级为 closed。
