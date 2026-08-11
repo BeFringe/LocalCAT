@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v8）
+# Feature 5 评审集群与推理强度指南（采纳稿 v9）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -128,6 +128,13 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 ## 实施、提交与集群复审节奏
 
+### 集群实施准备门
+
+- 首个实现 assignment 下发前，主 agent 先形成 provider-independent implementation invariant capsule：固定已批准的 Requirements/Design/Task 条款、cluster base、消费的前序权威状态、只能显式清除的 latch、fail-stop 负空间、当前切片的精确 owner/exclusion、验证合同与停止条件。后续切片只引用并收紧该 capsule，不能从邻近代码、旧会话摘要或实施者记忆重新猜测任务权威。
+- 含 file replace/rename/delete 或 journal recovery 的集群，mutation-proof ledger 是实施输入而不是复审后补文档；实现发现新 mutation seam 时必须先补齐该 seam 的 authority snapshot、parent/path identity、pre-mutation 复证、线性化变更、post-mutation durability/proof 与 crash replay，再继续扩展代码。
+- assignment 大小按“一个连贯实现切片内需要重建多少独立状态机/故障模型和 owner 权威”裁剪，不以文件行数裁剪。若同一 assignment 需要反复重建多个独立模型，先做只读侦察，再按 owner seam 拆成更窄的实现切片，集群级对抗复审仍保持一次。
+- 实施返回、进度叙述与磁盘状态冲突时，以目标 Git root、branch/base、owned-path diff 和主 agent 新鲜验证为整合权威；身份或变更声明不闭合的 contribution 先拒绝整合并审计适配边界，不能仅凭“后来出现了预期代码”或一条异常消息判定 transport 串线。
+
 ### 子任务实现提交
 
 - 子任务或紧密任务组达到 task completion definition 后，运行 task-focused tests、相关 static check 和 `git diff --check`；确认不 break 当前 build 后即可勾选并提交，不 dispatch 对抗性 reviewer。
@@ -141,9 +148,9 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 1. 集群内全部子任务已有小步提交且 checkbox 为 `[x]`；
 2. 集群共享状态机、故障模型或流水线的正向与失败分支已经实现，不以“后续任务会补”作为当前不变量；
 3. task-focused mechanical checks 全绿，且不存在未分类的新失败；
-4. 主 agent 提供 cluster base commit、tip commit、累计 diff、共享不变量清单、故障矩阵和已知外部基线；
-5. 主 agent 提供 downstream invariant capsule：列出本集群消费的前序状态、权威转移、只能显式清除的 latch 和 fail-stop 负空间，并把它们压缩为当前实施 assignment 和 fresh-process 验收用例；不得只依赖前序集群的长篇 Implementation Notes 或实施者记忆；
-6. 含 file replace/rename/delete 或 journal recovery 的集群提供 mutation-proof ledger：每个变更点都列出 authority snapshot、parent/path identity、最后一次 pre-mutation 复证、线性化变更、post-mutation durability/proof 和 crash replay 结果；任一格缺失都表明不变量尚未闭合；
+4. 主 agent 固定 cluster base commit、tip commit、累计 diff、共享不变量清单、故障矩阵和已知外部基线，并与实施前 capsule 逐项核对；
+5. 主 agent 把实施前 capsule 更新为 downstream invariant capsule：记录最终权威转移、只能显式清除的 latch 和 fail-stop 负空间，并压缩为后续集群 assignment 与 fresh-process 验收用例；不得只依赖长篇 Implementation Notes 或实施者记忆；
+6. 含 file replace/rename/delete 或 journal recovery 的集群完成实施前 mutation-proof ledger 的最终对账；任一 mutation seam 缺少 authority snapshot、parent/path identity、最后一次 pre-mutation 复证、线性化变更、post-mutation durability/proof 或 crash replay 结果，都表明不变量尚未闭合；
 7. reviewer 使用表中 `review` 强度，对累计补丁和最终状态做一次对抗性复审。
 
 复审发现问题后只实施 concrete findings，形成独立修正提交并复用同一 reviewer 心智模型做定点复验。复审通过后，主 agent 才运行一次 fresh full suite 并记录集群验证证据；不在每个子任务重复 full suite + adversarial review。
@@ -158,6 +165,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v9 | 2026-08-12 | 将 invariant capsule 与 mutation-proof ledger 从集群复审前移到首次实现 dispatch；按独立状态机/owner 权威而非文件行数裁剪 assignment，并以目标 worktree 的 Git 身份、磁盘 diff 与新鲜验证裁决返回叙述冲突。 |
 | v8 | 2026-08-11 | 将 Cluster G 从简化双态分支收紧为 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵；在集群闭合门加入 provider-independent downstream invariant capsule，防止前序已批准语义在后续实施中丢失。 |
 | v7 | 2026-08-11 | Cluster F 闭合后增加 5.R3/F-R 纯等价快照 artifact 边界提取；将 mutation-proof ledger 加入所有文件发布/恢复集群的闭合门，异常分支简化保持正交。 |
 | v6 | 2026-08-10 | 在 Cluster E 闭合后、Cluster F 开始前增加 5.R2/E-R 等价性结构门；提取 schema-upgrade copy/artifact 数据面，保留 coordinator/migration 权威与异常分支语义。 |
