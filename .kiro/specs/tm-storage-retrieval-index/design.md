@@ -636,6 +636,7 @@ class TMStore(Protocol):
 **连接配置**
 
 - 每个公开 operation 先从 per-resource coordinator 获得 generation lease，再在所属线程建立短生命周期 connection；connection 不跨线程共享，也不泄露到 Store API 外。
+- `TMRetrievalService` 的一次单资源查询是一个组合 operation：只取得一次 query lease，并在其生命周期内通过 module-private、只读的 generation view 完成 health、raw exact、candidate recall 与 candidate record 批量读取。view 不暴露 append/export/activation/update 端口，不得在内部重新取得 lease，退出后立即失效；进入 `DRAINING` 前已经签发的 view 可完成当前查询并阻塞 generation 发布，`DRAINING` 后不得签发新 view。该约束保证同一资源的查询事实来自一个完整 generation，但不要求跨多个短连接持有同一个 SQLite transaction。
 - `journal_mode=DELETE`、`synchronous=FULL`、`foreign_keys=ON`、`busy_timeout=5000`。
 - write 使用显式 transaction；失败 rollback；read cursor 尽快关闭。
 - WAL capability 默认为 false；只有 SQLite fixed version、并发 recovery suite 与 writer serialization 同时满足才允许新 semantics version。
@@ -838,12 +839,23 @@ issued receipt 的 versioned artifact handoff 同时记录排他 temp/recovery c
 ### CandidateRetriever
 
 ```python
-class CandidateRetriever(Protocol):
+class CandidateRetriever:
     def candidates(
         self,
         resource_id: str,
+        store: SQLiteTMStore,
         folded_query: str,
-        limit: int,
+        *,
+        result_limit: int,
+    ) -> CandidateRetrievalReport: ...
+
+    def candidates_from_view(
+        self,
+        resource_id: str,
+        view: SQLiteTMQueryView,
+        folded_query: str,
+        *,
+        result_limit: int,
     ) -> CandidateRetrievalReport: ...
 ```
 
@@ -882,7 +894,7 @@ class TMRetrievalService:
     ) -> QueryReport: ...
 ```
 
-`resources` 可包含完整 ResourceConfig adapter 集合；Retrieval 只为 `active=true && lookup=true` 的 handle 获得 store lease。`TMQuery.resource_order` 必须与 handle ids 一一对应并决定跨资源 tie order。Legacy facade 的 save path 独立只写 `active=true && update=true` handles；Lookup 不授予写权限，Update 不授予查询权限。
+`resources` 可包含完整 ResourceConfig adapter 集合；Retrieval 只为 `active=true && lookup=true` 的 handle 获得 store lease。每个参与查询的资源只取得一次只读 query lease，`StoreHealth`、exact/context 分类、candidate recall 和 candidate record 批量读取全部消费同一个 generation view；任一步失败都丢弃该资源的局部结果并关闭 view，不能用新的 lease 拼接同一份资源报告。`TMQuery.resource_order` 必须与 handle ids 一一对应并决定跨资源 tie order。Legacy facade 的 save path 独立只写 `active=true && update=true` handles；Lookup 不授予写权限，Update 不授予查询权限。
 
 **分类**
 

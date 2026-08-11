@@ -281,7 +281,8 @@
   - _Requirements: 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
 
 - [ ] 7.3 聚合多资源稳定顺序与部分失败
-  - 只为 Active+Lookup 资源获取查询 lease，Lookup 不授予写权限，Update 不授予查询权限
+  - 只为 Active+Lookup 资源获取且只获取一次查询 lease；同资源的 health、raw exact、candidate recall 与 candidate record 批量读取共享一个只读 generation view，任一步失败不得用新 lease 拼接局部结果
+  - Lookup 不授予写权限，Update 不授予查询权限；query view 不暴露 append、export、activation 或 update 端口，退出 lease 后立即失效
   - 按 EXACT、CONTEXT、FUZZY，最终分数、context strength、调用方资源顺序和稳定记录身份排序
   - 单资源失败不丢弃其他资源结果，并保留每条结果的资源、批次和 provenance
   - global limit 只在跨资源聚合后应用，最终资源元数据在评分/过滤/limit 后填入 scored 和 returned count
