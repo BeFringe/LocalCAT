@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v7）
+# Feature 5 评审集群与推理强度指南（采纳稿 v8）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -50,7 +50,7 @@
 | E-R — Upgrade boundary | 5.R2 | 已批准 schema-upgrade 故障模型的等价提取 + 依赖方向守卫 | `high` | `high` | 1 | 中 |
 | F — Export + snapshot | 5.12 + 5.13 + 5.14 | 任意路径导出与配置快照发布协议 + 崩溃恢复矩阵 | `high` | `xhigh` | 1 | 中 |
 | F-R — Snapshot artifact boundary | 5.R3 | 已批准 export/refresh/recovery 命名空间故障模型的纯等价提取 + mutation-proof 依赖守卫 | `high` | `high` | 1 | 大 |
-| G — Facade integration | 6.1 + 6.2 + 6.3 | 双状态激活/not 分支 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
+| G — Facade integration | 6.1 + 6.2 + 6.3 | legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
 | H — Retrieval pipeline | 7.1 + 7.2 + 7.3 | exact/context 分类 → fuzzy 评分 → 多资源聚合排序/部分失败 | `high` | `high` | 1 | 中 |
 | I — Capability gate C | 7.4 + 7.5 | 独立 CONTEXT/FUZZY 可用性门 + 证据聚合且不撤销 exact/save | `medium` | `high` | 1 | 小 |
 | J — Benchmark subsystem | 8.1 + 8.2 + 8.3 + 8.4 + 8.5 | 确定性语料 → 延迟/RSS 运行器 → oracle recall → 双路径硬门 | `medium` | `high` | 1 | 大 |
@@ -78,7 +78,7 @@
 
 **F-R — Snapshot artifact boundary：** Cluster F 先以原模块形态闭合发布/恢复状态机和命名空间故障矩阵；5.R3 才把 deterministic artifact family、root→parent no-follow dirfd 绑定、strict single-link identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码移入独立模块。`tm_migration.py` 仍拥有对外导出/刷新编排与成败 outcome，`tm_snapshot_recovery.py` 仍拥有 receipt 分类、reconciliation 和 terminal replay 状态机，`tm_sqlite_store.py` 仍独占 ledger/binding/transaction/coordinator 权威。实施和复审均使用 `high`；必须保留全部 error code、fault seam、mutation 顺序、durable handoff 生命周期和磁盘效果。异常分支简化属于正交治理，禁止混入该门。
 
-**G — Facade integration：** 导入接缝切换、exact 查询切换和三态兼容验证。6.3 不是新代码，是回归断言。双状态分支是认知成本来源。
+**G — Facade integration：** 导入接缝切换、exact 查询切换和三态兼容验证。6.3 不是新代码，是回归断言。复审必须以进程级重开为边界，覆盖 never-activated、cancelled-first、CURRENT、合法写后 HISTORY、SOURCE_DIVERGED 与 canonical artifact 不可证的 fail-stop；只有前两种可以使用 legacy JSONL。普通 save/import 使 snapshot 落后不是 activation recovery 失败，而是 monitor 在 canonical generation 恢复后派生的 `VERIFIED_HISTORY`。
 
 **H — Retrieval pipeline：** exact/context 分类 + fuzzy 评分 + 全局排序是一条流水线。7.3 的部分失败和 global limit 语义只能对照 7.1+7.2 验证。
 
@@ -142,8 +142,9 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 2. 集群共享状态机、故障模型或流水线的正向与失败分支已经实现，不以“后续任务会补”作为当前不变量；
 3. task-focused mechanical checks 全绿，且不存在未分类的新失败；
 4. 主 agent 提供 cluster base commit、tip commit、累计 diff、共享不变量清单、故障矩阵和已知外部基线；
-5. 含 file replace/rename/delete 或 journal recovery 的集群提供 mutation-proof ledger：每个变更点都列出 authority snapshot、parent/path identity、最后一次 pre-mutation 复证、线性化变更、post-mutation durability/proof 和 crash replay 结果；任一格缺失都表明不变量尚未闭合；
-6. reviewer 使用表中 `review` 强度，对累计补丁和最终状态做一次对抗性复审。
+5. 主 agent 提供 downstream invariant capsule：列出本集群消费的前序状态、权威转移、只能显式清除的 latch 和 fail-stop 负空间，并把它们压缩为当前实施 assignment 和 fresh-process 验收用例；不得只依赖前序集群的长篇 Implementation Notes 或实施者记忆；
+6. 含 file replace/rename/delete 或 journal recovery 的集群提供 mutation-proof ledger：每个变更点都列出 authority snapshot、parent/path identity、最后一次 pre-mutation 复证、线性化变更、post-mutation durability/proof 和 crash replay 结果；任一格缺失都表明不变量尚未闭合；
+7. reviewer 使用表中 `review` 强度，对累计补丁和最终状态做一次对抗性复审。
 
 复审发现问题后只实施 concrete findings，形成独立修正提交并复用同一 reviewer 心智模型做定点复验。复审通过后，主 agent 才运行一次 fresh full suite 并记录集群验证证据；不在每个子任务重复 full suite + adversarial review。
 
@@ -157,6 +158,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v8 | 2026-08-11 | 将 Cluster G 从简化双态分支收紧为 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵；在集群闭合门加入 provider-independent downstream invariant capsule，防止前序已批准语义在后续实施中丢失。 |
 | v7 | 2026-08-11 | Cluster F 闭合后增加 5.R3/F-R 纯等价快照 artifact 边界提取；将 mutation-proof ledger 加入所有文件发布/恢复集群的闭合门，异常分支简化保持正交。 |
 | v6 | 2026-08-10 | 在 Cluster E 闭合后、Cluster F 开始前增加 5.R2/E-R 等价性结构门；提取 schema-upgrade copy/artifact 数据面，保留 coordinator/migration 权威与异常分支语义。 |
 | v5 | 2026-08-09 | 在 5.9 后加入行为保持型结构门 5.R1，将 activation/recovery 提取纳入 Cluster D 的同一次最终复审；保持既有功能编号、故障模型和复审强度。 |

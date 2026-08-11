@@ -243,16 +243,19 @@
 - [ ] 6.1 接入 canonical import seam 并保持资源配置身份
   - 已激活资源按验证后的输入顺序直接写入 canonical，不先修改 JSONL、不折叠相同 source；未激活资源保留既有原子 JSONL 路径
   - 普通 canonical merge import 不修改 snapshot binding，也不清除或触发 SOURCE_DIVERGED
+  - import 推进 head revision 后，fresh process 必须从同一 canonical lineage 重开并观察 `VERIFIED_HISTORY`；不得把快照落后误判为 activation 损坏或回退 JSONL
+  - 同 digest 重复 import 必须给出确定的幂等结果，不新增变体，且不影响之后的 fresh canonical reopen
   - 配置入口继续指向原 JSONL，sidecar 保持 deterministic adjacent path，Active/Lookup/Update 选择迁移前后不变
   - 不改变 Parser、TMX context mapping、Glossary 或 Qt 语义
   - 完成时，同一导入批次在两种激活状态下都保持顺序、资源身份、选择状态和明确回退行为
-  - _Requirements: 1.2, 1.4, 1.5, 1.9, 3.1, 3.2, 3.7, 7.1, 7.2, 7.3, 7.7_
+  - _Requirements: 1.2, 1.4, 1.5, 1.9, 2.13, 3.1, 3.2, 3.7, 7.1, 7.2, 7.3, 7.7_
 
 - [ ] 6.2 切换 Legacy exact 查询与受控保存
   - physical gate 与 exact parity 通过后，legacy exact/save 适配使用 canonical；未激活或首次迁移失败仍保持 JSONL 兼容
   - facade 不向旧调用约定注入 context/fuzzy；只有 Active+Update 且 generation 稳定时允许保存
   - SOURCE_DIVERGED 期间 Lookup/Update 继续使用 canonical，成功保存不修改 JSONL、不清除 divergence
-  - 完成时，成功保存、拒绝保存、事务回滚、generation 变化和 divergence 矩阵的 exact winner 均符合预期
+  - 进程重开时重放 never-activated、cancelled-first、`VERIFIED_CURRENT`、`VERIFIED_HISTORY`、`SOURCE_DIVERGED` 与 unhealthy/ambiguous artifact 矩阵；前两者之外不得回退 JSONL
+  - 完成时，成功保存、拒绝保存、事务回滚、generation 变化、冷重开和 divergence 矩阵的 exact winner 均符合预期
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.3, 2.11, 2.12, 2.13, 7.5, 7.6, 7.8, 7.9, 7.10, 7.11_
 
 - [ ] 6.3 保持 LogicController 与 Excel 三态兼容

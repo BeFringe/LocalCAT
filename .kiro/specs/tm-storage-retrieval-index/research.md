@@ -12,6 +12,7 @@
   - Python `str.casefold()` 可能扩展字符，匹配结果必须通过 projection map 回到原字符串；stdlib `re \b` 不能充当完整 Unicode word-break 契约。
   - physical canonical activation、fuzzy benchmark 和 matcher validation 是三个独立发布门；后两者失败不能把已激活 SQLite 回退成 JSONL。
   - 迁移后 SQLite 是唯一运行时读写权威；JSONL 是绑定到 canonical 历史基点的只读快照。合法 local write 使快照变旧但不使其异源，`SOURCE_DIVERGED` 不能用“当前 DB 内容等于 JSONL”判断。
+  - facade 冷打开必须先恢复 canonical generation/lineage，再派生 `VERIFIED_CURRENT / VERIFIED_HISTORY / SOURCE_DIVERGED`；把 completed snapshot revision 等于 head 当作恢复前提，会把正常 append/import 误判为激活损坏。
 
 ## 研究记录
 
@@ -126,6 +127,7 @@
 - **写入来源**：所有 canonical record 都引用通用 origin batch；migration/import batch 记录 source digest，本地 `save_record()` 使用单记录 `local_write` batch，并与 record/index 同事务提交。
 - **导入协调**：sidecar 激活后，现有 `resource_importer.py` 必须把 incoming records 直接写成 canonical `import` batch；外部 JSONL 变化只产生 `SOURCE_DIVERGED`，不能静默替换已验证数据库。
 - **快照同源性**：binding/receipt 记录 resource id、canonical store id、快照 digest 和其 canonical revision/high-water 基点。local write 只推进 canonical head，不修改 receipt；快照是同 canonical 的已知历史基点时仍属同源，不因内容落后而 divergence。
+- **冷打开顺序**：facade 以 activation lineage/canonical health 恢复唯一 generation，然后让 binding monitor 判定 CURRENT、HISTORY 或 DIVERGED。除从未激活或首次激活已可证取消外，进程重开不使用 JSONL fallback。
 - **兼容导出**：按 record id 递增导出所有变体，确保重新迁移时最新 exact winner 仍在最后；stable read snapshot 生成 JSONL 和相邻只读 manifest，canonical ledger receipt 协调多个文件的发布与 crash recovery。
 - **取舍**：UI 路径解释需在后续 adapter 中说明 canonical sidecar，但 Feature 5 Core 不拥有 UI。
 

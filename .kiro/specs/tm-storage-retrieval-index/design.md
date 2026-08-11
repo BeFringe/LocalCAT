@@ -1017,6 +1017,18 @@ Core 内部的 `MatcherValidationEvidence` manifest 至少绑定 evidence schema
 - fuzzy gate 失败只使 FUZZY unavailable；已通过 Gate C 的 CONTEXT、canonical exact/save 和 Excel 三态继续运行。matcher gate 与 facade exact/save 独立。
 - Excel `LogicController` 不调用 full query，因此仍只有三态。
 
+facade 每次进程级打开都必须重建同一权威判定，不得把“本进程内已经持有 canonical handle”当作唯一成功条件：
+
+| 冷启动可观察状态 | facade 权威 | 必须保持的语义 |
+|------------------|-------------|--------------------|
+| 从未完成首次激活，或首次 `PREPARED` 已可证取消且无 canonical generation | legacy JSONL | 只有这两种状态可以使用 JSONL runtime |
+| completed binding 指向当前 head | canonical / `VERIFIED_CURRENT` | 恢复唯一 generation，exact/save 不回退 JSONL |
+| 合法 append 或 merge import 使 head 超过 completed binding | canonical / `VERIFIED_HISTORY` | 冷重开仍必须成功；历史 snapshot 不是激活损坏 |
+| 配置 JSONL/manifest 与 ledger 不再一致 | canonical / `SOURCE_DIVERGED` | 冷重开后 Lookup/Update 继续，divergence 保持锁存，不修改 JSONL |
+| activation 未闭合、canonical 资产损坏或身份歧义 | coordinator recovery 或 fail-stop | 不得因 canonical 不可用而猜测回退 JSONL |
+
+冷打开先恢复 canonical generation/lineage，再由 `SourceBindingMonitor` 对 completed binding 派生 CURRENT、HISTORY 或 DIVERGED；不得反过来要求 binding revision 必须等于 head 才允许恢复 generation。
+
 ### TMBenchmark
 
 ```python
