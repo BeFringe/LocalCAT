@@ -299,7 +299,8 @@
   - _Requirements: 4.6, 4.7, 7.4, 7.5, 7.7, 8.7_
 
 - [ ] 7.5 建立 Gate C retrieval correctness
-  - 以固定 cohort/fixture/build/semantics/evaluator digest 生成可重算 manifest，分别汇总 raw context 分类和 fuzzy-core 的 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据
+  - 在独立 `tm_retrieval_validation.py` 中以固定 cohort/fixture/build/semantics/evaluator digest 重跑纯验证入口并生成 manifest；fixture codec、向量执行和 observed digest 不进入 capability publisher 模块
+  - 分别汇总 raw context 分类和 fuzzy-core 的 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据
   - evaluator 重新计算每个 vector/cohort 的实际结果，拒绝仅凭 manifest 自报 passed、未知/重复 cohort、过期、version/digest mismatch 或不完整证据开放能力
   - CONTEXT correctness 通过即可独立开放；fuzzy-core correctness 通过只满足 FUZZY 的 Gate C 前提，Task 8.4/8.5 发布对应 execution path 的 oracle/benchmark evidence 前 FUZZY 仍保持关闭
   - refresh 可使任一子门独立开放或降级；在途 query 保持旧快照，新 query 使用新快照，且任何降级都不撤销 Gate B canonical exact/save
