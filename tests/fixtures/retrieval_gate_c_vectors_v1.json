@@ -1322,7 +1322,8 @@
      "scored_count_total": 0,
      "failure_count": 0
     },
-    "failure": null
+    "failure": null,
+    "expected_after_refresh": null
    },
    {
     "id": "service-gate-c-partial-failure",
@@ -1350,6 +1351,51 @@
      "context_returned_count": 1,
      "scored_count_total": 0,
      "failure_count": 1
+    },
+    "expected_after_refresh": null
+   },
+   {
+    "id": "service-gate-c-refresh-snapshot",
+    "kind": "refresh_snapshot",
+    "failed_resource_id": null,
+    "failure": null,
+    "expected": {
+     "result_count": 2,
+     "result_record_ids": [
+      2,
+      2
+     ],
+     "result_resource_ids": [
+      "tm.gate-c.service.primary",
+      "tm.gate-c.service.secondary"
+     ],
+     "returned_count_by_resource": {
+      "tm.gate-c.service.primary": 1,
+      "tm.gate-c.service.secondary": 1
+     },
+     "context_observed_count": 2,
+     "context_returned_count": 0,
+     "scored_count_total": 0,
+     "failure_count": 0
+    },
+    "expected_after_refresh": {
+     "result_count": 2,
+     "result_record_ids": [
+      2,
+      2
+     ],
+     "result_resource_ids": [
+      "tm.gate-c.service.primary",
+      "tm.gate-c.service.secondary"
+     ],
+     "returned_count_by_resource": {
+      "tm.gate-c.service.primary": 1,
+      "tm.gate-c.service.secondary": 1
+     },
+     "context_observed_count": 2,
+     "context_returned_count": 0,
+     "scored_count_total": 0,
+     "failure_count": 0
     }
    }
   ]

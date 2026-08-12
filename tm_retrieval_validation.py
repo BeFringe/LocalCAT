@@ -11,11 +11,12 @@ cross-resource global-limit and resource-local lease-failure evidence,
 then recomputes observed Gate C digests from an approved closed-field
 roots file.  It returns one immutable ``RetrievalValidationRelease``
 carrying the approved expectation and a short-lived, non-persisted
-manifest.  The fuzzy scoring and store transcripts are observed and
-verified but are not yet folded into the fuzzy-core cohort digest:
-fuzzy-core correctness stays on the deterministic IMPLEMENTATION_PENDING
-digest and never passes; the FTS5_TRIGRAM and GRAM_FALLBACK benchmark
-evidence rows stay empty until Task 8.
+manifest.  The final fuzzy-core cohort digest is locked only after every
+fixed observation completes, from one closed canonical object covering
+the fixture digest plus the scoring, store and service transcripts; the
+FTS5_TRIGRAM and GRAM_FALLBACK benchmark evidence rows stay empty until
+Task 8.  CONTEXT correctness opens independently; fuzzy-core correctness
+is a Gate C prerequisite only and never opens either execution path.
 
 This leaf is never imported by a production runtime module and never
 publishes capability.  The service journey builds one non-returned,
@@ -23,7 +24,11 @@ non-persisted harness ``RetrievalCapabilityPublisher`` from the approved
 expectation and the independently recomputed CONTEXT evidence with fuzzy
 correctness pending and both Gate D rows empty; the harness snapshot is
 captured once per query and the final fuzzy-core manifest digest is never
-used to authorize the same run.  The manifest ``passed`` flags are derived only from
+used to authorize the same run.  A fixed refresh scenario proves the
+single-snapshot race semantics: the first resource's real query-view
+health step fires a fail-closed ``refresh(None, ...)`` that leaves the
+in-flight query on the old snapshot while the publisher moves to a closed
+snapshot that only the next query observes.  The manifest ``passed`` flags are derived only from
 observed digest equality with the approved roots; no caller-supplied
 ``passed`` value or callback exists.  Transcripts, manifests and summaries
 carry only vector ids, record ids, candidate stage names, counts, match
@@ -35,7 +40,7 @@ next bodies, provenance, paths or exception text.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -87,8 +92,10 @@ from tm_retrieval import (
 from tm_retrieval_capability import (
     RETRIEVAL_CAPABILITY_EVIDENCE_SCHEMA_VERSION,
     RETRIEVAL_CONTEXT_EVIDENCE_FAILED_CODE,
+    RETRIEVAL_CONTEXT_EVIDENCE_MISSING_CODE,
     RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
     RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
+    RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_MISSING_CODE,
     RETRIEVAL_SEMANTICS_VERSION,
     RetrievalBenchmarkExpectation,
     RetrievalCapabilityEvaluator,
@@ -214,6 +221,7 @@ class _ServiceScenarioConfig:
     failed_resource_id: str | None
     failure: dict[str, object] | None
     expected: dict[str, object]
+    expected_after_refresh: dict[str, object] | None
 
 
 class _NoFuzzyAccessPort:
@@ -362,6 +370,59 @@ class _HarnessServiceStore:
         return self._store.health()
 
 
+class _RefreshHarnessServiceView(_HarnessServiceView):
+    """View adapter that triggers one publisher refresh from ``health()``.
+
+    The service captures the capability snapshot once at query start, so a
+    refresh fired from the first resource's real query-view health step
+    cannot change the in-flight query: both resources keep the pre-refresh
+    snapshot while the publisher itself moves to the closed snapshot that
+    only the next query observes.
+    """
+
+    def __init__(
+        self,
+        view: SQLiteTMQueryView,
+        health: StoreHealth,
+        on_health: Callable[[], None],
+    ) -> None:
+        super().__init__(view, health)
+        self._on_health = on_health
+
+    def health(self) -> StoreHealth:
+        health = super().health()
+        self._on_health()
+        return health
+
+
+class _RefreshHarnessServiceStore(_HarnessServiceStore):
+    """Store adapter whose first query-view health step refreshes the harness.
+
+    The refresh is a ``refresh(None, ...)`` fail-closed evaluation: it never
+    uses the final fuzzy-core evidence and only changes the publisher
+    snapshot for the query that starts after the refresh.
+    """
+
+    def __init__(
+        self,
+        store: SQLiteTMStore,
+        *,
+        health: StoreHealth,
+        on_health: Callable[[], None],
+    ) -> None:
+        super().__init__(store, health=health)
+        self._on_health = on_health
+
+    @contextmanager
+    def query_lease(self) -> Iterator[_RefreshHarnessServiceView]:
+        with self._store.query_lease() as view:
+            yield _RefreshHarnessServiceView(
+                view,
+                self._health,
+                self._on_health,
+            )
+
+
 @dataclass(frozen=True)
 class _StoreConfig:
     id: str
@@ -463,26 +524,38 @@ def recompute_retrieval_validation(
                 "transcript": transcript,
             }
         )
-        observed_fuzzy_core_digest = canonical_digest(
-            {"implementation": _IMPLEMENTATION_PENDING}
-        )
-        if (
-            observed_fuzzy_core_digest
-            == expectation.fuzzy_core_cohorts[0].cohort_digest
-        ):
-            raise ValueError(
-                "approved fuzzy-core digest must differ from the pending marker"
-            )
         service_transcript = _observe_service_transcript(
             repository_root / _CONTEXT_VECTORS_FIXTURE,
             expectation=expectation,
             observed_context_digest=observed_context_digest,
-            observed_fuzzy_core_digest=observed_fuzzy_core_digest,
+            harness_fuzzy_core_digest=canonical_digest(
+                {"implementation": _IMPLEMENTATION_PENDING}
+            ),
             generated_at_utc=generated,
             valid_until_utc=valid_until,
         )
         if not service_transcript:
             raise ValueError("service transcript must not be empty")
+        # The fuzzy-core digest is locked only after every fixed observation
+        # is complete, from one closed canonical object covering the fixture
+        # and the scoring, store and service transcripts.  The service
+        # transcript itself ran on a fuzzy-closed harness publisher built
+        # from the pending digest, so it never self-authorizes with the
+        # final evidence.
+        observed_fuzzy_core_digest = canonical_digest(
+            {
+                "fixture_digest": observed_fixture_digest,
+                "scoring": fuzzy_transcript,
+                "store": store_transcript,
+                "service": service_transcript,
+            }
+        )
+        if observed_fuzzy_core_digest == canonical_digest(
+            {"implementation": _IMPLEMENTATION_PENDING}
+        ):
+            raise ValueError(
+                "observed fuzzy-core digest must not equal the pending marker"
+            )
     except Exception:
         # Approved roots remain authoritative and validated above.  Failure
         # to observe current source or fixture bytes cannot mint evidence.
@@ -2613,7 +2686,8 @@ def _store_rollback_facts(
         "candidate_count_after": len(after_report.candidates),
         "absent_record_id": len(before_exported) + 1,
         "absent": (
-            (len(before_exported) + 1) not in after_exported
+            (len(before_exported) + 1)
+            not in {record.record_id for record in after_exported}
         )
         and exact_absent,
     }
@@ -2807,7 +2881,11 @@ def _service_config(
         raise ValueError(
             "service resource_order must map one-to-one to resource ids"
         )
-    known_scenario_kinds = {"global_limit", "partial_failure"}
+    known_scenario_kinds = {
+        "global_limit",
+        "partial_failure",
+        "refresh_snapshot",
+    }
     for scenario in scenarios:
         if scenario.kind not in known_scenario_kinds:
             raise ValueError("unsupported service scenario kind")
@@ -2825,6 +2903,15 @@ def _service_config(
                 raise ValueError(
                     "healthy scenarios must not carry failure facts"
                 )
+        if scenario.kind == "refresh_snapshot":
+            if scenario.expected_after_refresh is None:
+                raise ValueError(
+                    "refresh scenarios need after-refresh expectations"
+                )
+        elif scenario.expected_after_refresh is not None:
+            raise ValueError(
+                "only refresh scenarios may carry after-refresh expectations"
+            )
     return {
         "query": query,
         "resources": resources,
@@ -3166,6 +3253,7 @@ def _service_scenario_config(
 ) -> _ServiceScenarioConfig:
     if set(raw) != {
         "expected",
+        "expected_after_refresh",
         "failure",
         "failed_resource_id",
         "id",
@@ -3193,17 +3281,27 @@ def _service_scenario_config(
         failure = _service_scenario_failure(
             _require_mapping(failure, "service scenario failure")
         )
+    expected = _service_scenario_expected(
+        _require_mapping(
+            raw.get("expected"),
+            "service scenario expected",
+        )
+    )
+    expected_after_refresh = raw.get("expected_after_refresh")
+    if expected_after_refresh is not None:
+        expected_after_refresh = _service_scenario_expected(
+            _require_mapping(
+                expected_after_refresh,
+                "service scenario expected_after_refresh",
+            )
+        )
     return _ServiceScenarioConfig(
         id=scenario_id,
         kind=kind,
         failed_resource_id=failed_resource_id,
         failure=failure,
-        expected=_service_scenario_expected(
-            _require_mapping(
-                raw.get("expected"),
-                "service scenario expected",
-            )
-        ),
+        expected=expected,
+        expected_after_refresh=expected_after_refresh,
     )
 
 
@@ -3485,7 +3583,7 @@ def _harness_capability_publisher(
     expectation: RetrievalCapabilityExpectation,
     *,
     observed_context_digest: str,
-    observed_fuzzy_core_digest: str,
+    harness_fuzzy_core_digest: str,
     generated_at_utc: datetime,
     valid_until_utc: datetime,
 ) -> RetrievalCapabilityPublisher:
@@ -3519,7 +3617,7 @@ def _harness_capability_publisher(
         fuzzy_core_cohorts=(
             RetrievalCorrectnessCohortEvidence(
                 cohort_id=fuzzy_expected.cohort_id,
-                cohort_digest=observed_fuzzy_core_digest,
+                cohort_digest=harness_fuzzy_core_digest,
                 passed=False,
                 generated_at_utc=generated_text,
                 valid_until_utc=valid_until_text,
@@ -3580,11 +3678,11 @@ def _observe_service_transcript(
     *,
     expectation: RetrievalCapabilityExpectation,
     observed_context_digest: str,
-    observed_fuzzy_core_digest: str,
+    harness_fuzzy_core_digest: str,
     generated_at_utc: datetime,
     valid_until_utc: datetime,
 ) -> list[dict[str, object]]:
-    """Run both fixed multi-resource service scenarios and emit entries.
+    """Run the fixed multi-resource service scenarios and emit entries.
 
     Each scenario builds two real temporary ``SQLiteTMStore`` stages from
     the fixed service section, observes each real stage through its public
@@ -3597,6 +3695,10 @@ def _observe_service_transcript(
     constructed from the approved expectation and the observed CONTEXT
     digest with the fuzzy-core row pending, and ``TMRetrievalService`` runs
     with sentinel retriever/scorer ports so any fuzzy access fails closed.
+    The fixed refresh scenario wraps the first resource's real query-view
+    health step with a fail-closed ``refresh(None, ...)`` and proves the
+    in-flight query keeps the pre-refresh snapshot while the publisher
+    moves to a closed snapshot that only the next query observes.
     Entries carry only scenario/vector/resource ids, generation, result ids
     and match types, context field names and strength tuples,
     returned/scored counts, availability/unavailable codes and stable
@@ -3642,7 +3744,7 @@ def _observe_service_transcript(
             harness = _harness_capability_publisher(
                 expectation,
                 observed_context_digest=observed_context_digest,
-                observed_fuzzy_core_digest=observed_fuzzy_core_digest,
+                harness_fuzzy_core_digest=harness_fuzzy_core_digest,
                 generated_at_utc=generated_at_utc,
                 valid_until_utc=valid_until_utc,
             )
@@ -3652,33 +3754,6 @@ def _observe_service_transcript(
                 observed_context_digest=observed_context_digest,
                 expectation=expectation,
             )
-            handles: list[TMResourceHandle] = []
-            for resource_id in query.resource_order:
-                store = stores[resource_id]
-                if scenario.failed_resource_id == resource_id:
-                    binding: TMStore = _GenerationChangedQueryLeaseStore(
-                        store,
-                        resource_id=resource_id,
-                        generation=cast(
-                            int,
-                            observed[resource_id]["generation"],
-                        ),
-                    )
-                else:
-                    binding = _HarnessServiceStore(
-                        store,
-                        health=_harness_service_health(store),
-                    )
-                handles.append(
-                    TMResourceHandle(
-                        resource_id=resource_id,
-                        store=binding,
-                        active=True,
-                        lookup=True,
-                        update=False,
-                        order=query.resource_order.index(resource_id),
-                    )
-                )
             service = TMRetrievalService(
                 retriever=cast(
                     CandidateRetriever,
@@ -3689,6 +3764,62 @@ def _observe_service_transcript(
                     cast(Any, _NoFuzzyAccessPort()),
                 ),
                 capability_publisher=harness,
+            )
+            if scenario.kind == "refresh_snapshot":
+                handles = _service_handles(
+                    scenario=scenario,
+                    stores=stores,
+                    observed=observed,
+                    query=query,
+                )
+                def refresh_publisher() -> None:
+                    harness.refresh(
+                        None,
+                        evaluated_at_utc=generated_at_utc,
+                    )
+
+                refresh_handles = _service_handles(
+                    scenario=scenario,
+                    stores=stores,
+                    observed=observed,
+                    query=query,
+                    refresh_first_resource=refresh_publisher,
+                )
+                first_report = service.query(
+                    tuple(refresh_handles),
+                    query,
+                )
+                closed_snapshot = harness.snapshot()
+                _verify_refresh_closed_snapshot(closed_snapshot)
+                second_snapshot = harness.snapshot()
+                second_report = service.query(tuple(handles), query)
+                if harness.snapshot() != closed_snapshot:
+                    raise ValueError(
+                        "service publisher state moved after the second query"
+                    )
+                entry = _service_refresh_transcript_entry(
+                    scenario=scenario,
+                    query=query,
+                    first_report=first_report,
+                    observed=observed,
+                    initial_snapshot=snapshot,
+                    closed_snapshot=closed_snapshot,
+                    second_snapshot=second_snapshot,
+                    second_report=second_report,
+                )
+                _verify_service_refresh_entry(
+                    entry,
+                    scenario,
+                    initial_snapshot=snapshot,
+                    closed_snapshot=closed_snapshot,
+                )
+                transcript.append(entry)
+                continue
+            handles = _service_handles(
+                scenario=scenario,
+                stores=stores,
+                observed=observed,
+                query=query,
             )
             report = service.query(tuple(handles), query)
             entry = _service_transcript_entry(
@@ -3703,14 +3834,89 @@ def _observe_service_transcript(
     return transcript
 
 
-def _service_transcript_entry(
+def _service_handles(
     *,
     scenario: _ServiceScenarioConfig,
-    query: TMQuery,
-    report: QueryReport,
+    stores: Mapping[str, SQLiteTMStore],
     observed: Mapping[str, Mapping[str, object]],
+    query: TMQuery,
+    refresh_first_resource: Callable[[], None] | None = None,
+) -> list[TMResourceHandle]:
+    """Build the fixed service handle set for one scenario.
+
+    The refresh variant wraps the first queried resource's real query-view
+    lease so its ``health()`` step fires the provided publisher refresh;
+    every read still flows through the real ``SQLiteTMQueryView``.
+    """
+
+    handles: list[TMResourceHandle] = []
+    first = True
+    for resource_id in query.resource_order:
+        store = stores[resource_id]
+        if scenario.failed_resource_id == resource_id:
+            binding: TMStore = _GenerationChangedQueryLeaseStore(
+                store,
+                resource_id=resource_id,
+                generation=cast(
+                    int,
+                    observed[resource_id]["generation"],
+                ),
+            )
+        elif refresh_first_resource is not None and first:
+            binding = _RefreshHarnessServiceStore(
+                store,
+                health=_harness_service_health(store),
+                on_health=refresh_first_resource,
+            )
+        else:
+            binding = _HarnessServiceStore(
+                store,
+                health=_harness_service_health(store),
+            )
+        first = False
+        handles.append(
+            TMResourceHandle(
+                resource_id=resource_id,
+                store=binding,
+                active=True,
+                lookup=True,
+                update=False,
+                order=query.resource_order.index(resource_id),
+            )
+        )
+    return handles
+
+
+def _service_capability_payload(
     snapshot: RetrievalCapabilitySnapshot,
 ) -> dict[str, object]:
+    return {
+        "context": {
+            "available": snapshot.context.available,
+            "unavailable_code": snapshot.context.unavailable_code,
+        },
+        "fuzzy_core": {
+            "available": snapshot.fuzzy_core.available,
+            "unavailable_code": snapshot.fuzzy_core.unavailable_code,
+        },
+        "fts5_trigram": {
+            "available": snapshot.fts5_trigram.available,
+            "unavailable_code": snapshot.fts5_trigram.unavailable_code,
+        },
+        "gram_fallback": {
+            "available": snapshot.gram_fallback.available,
+            "unavailable_code": snapshot.gram_fallback.unavailable_code,
+        },
+        "summary_unavailable_codes": list(
+            snapshot.summary.unavailable_codes
+        ),
+    }
+
+
+def _service_resource_entries(
+    report: QueryReport,
+    observed: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
     resource_entries: list[dict[str, object]] = []
     for metadata in report.resource_metadata:
         resource_observed = observed[metadata.resource_id]
@@ -3763,7 +3969,11 @@ def _service_transcript_entry(
                 ],
             }
         )
-    failures = [
+    return resource_entries
+
+
+def _service_failures(report: QueryReport) -> list[dict[str, object]]:
+    return [
         {
             "resource_id": failure.resource_id,
             "stage": failure.stage,
@@ -3772,6 +3982,12 @@ def _service_transcript_entry(
         }
         for failure in report.resource_failures
     ]
+
+
+def _service_aggregation(
+    report: QueryReport,
+    observed: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
     context_observed_total = sum(
         cast(int, observed[metadata.resource_id]["context_count"])
         for metadata in report.resource_metadata
@@ -3785,6 +4001,32 @@ def _service_transcript_entry(
         metadata.scored_count for metadata in report.resource_metadata
     )
     return {
+        "result_count": len(report.results),
+        "result_record_ids": [
+            result.record_id for result in report.results
+        ],
+        "result_resource_ids": [
+            result.resource_id for result in report.results
+        ],
+        "returned_count_by_resource": {
+            metadata.resource_id: metadata.returned_count
+            for metadata in report.resource_metadata
+        },
+        "context_observed_count": context_observed_total,
+        "context_returned_count": context_returned_total,
+        "scored_count_total": scored_total,
+    }
+
+
+def _service_transcript_entry(
+    *,
+    scenario: _ServiceScenarioConfig,
+    query: TMQuery,
+    report: QueryReport,
+    observed: Mapping[str, Mapping[str, object]],
+    snapshot: RetrievalCapabilitySnapshot,
+) -> dict[str, object]:
+    return {
         "id": scenario.id,
         "kind": scenario.kind,
         "version": _SERVICE_SECTION_VERSION,
@@ -3793,57 +4035,70 @@ def _service_transcript_entry(
             "minimum_similarity": query.minimum_similarity,
             "resource_order": list(query.resource_order),
         },
-        "capability": {
-            "context": {
-                "available": snapshot.context.available,
-                "unavailable_code": snapshot.context.unavailable_code,
-            },
-            "fuzzy_core": {
-                "available": snapshot.fuzzy_core.available,
-                "unavailable_code": snapshot.fuzzy_core.unavailable_code,
-            },
-            "fts5_trigram": {
-                "available": snapshot.fts5_trigram.available,
-                "unavailable_code": snapshot.fts5_trigram.unavailable_code,
-            },
-            "gram_fallback": {
-                "available": snapshot.gram_fallback.available,
-                "unavailable_code": snapshot.gram_fallback.unavailable_code,
-            },
-            "summary_unavailable_codes": list(
-                snapshot.summary.unavailable_codes
-            ),
+        "capability": _service_capability_payload(snapshot),
+        "resources": _service_resource_entries(report, observed),
+        "failures": _service_failures(report),
+        "aggregation": _service_aggregation(report, observed),
+    }
+
+
+def _service_refresh_transcript_entry(
+    *,
+    scenario: _ServiceScenarioConfig,
+    query: TMQuery,
+    first_report: QueryReport,
+    observed: Mapping[str, Mapping[str, object]],
+    initial_snapshot: RetrievalCapabilitySnapshot,
+    closed_snapshot: RetrievalCapabilitySnapshot,
+    second_snapshot: RetrievalCapabilitySnapshot,
+    second_report: QueryReport,
+) -> dict[str, object]:
+    """Emit one fixed single-snapshot refresh evidence entry.
+
+    ``capability`` is the snapshot the in-flight query actually used;
+    ``capability_after_refresh`` is the closed publisher snapshot observed
+    right after that query; ``second_query`` carries the snapshot and
+    outcomes of the next query, which must observe the closed snapshot.
+    """
+
+    if second_snapshot != closed_snapshot:
+        raise ValueError("service publisher state moved between queries")
+    return {
+        "id": scenario.id,
+        "kind": scenario.kind,
+        "version": _SERVICE_SECTION_VERSION,
+        "query": {
+            "limit": query.limit,
+            "minimum_similarity": query.minimum_similarity,
+            "resource_order": list(query.resource_order),
         },
-        "resources": resource_entries,
-        "failures": failures,
-        "aggregation": {
-            "result_count": len(report.results),
-            "result_record_ids": [
-                result.record_id for result in report.results
-            ],
-            "result_resource_ids": [
-                result.resource_id for result in report.results
-            ],
-            "returned_count_by_resource": {
-                metadata.resource_id: metadata.returned_count
-                for metadata in report.resource_metadata
-            },
-            "context_observed_count": context_observed_total,
-            "context_returned_count": context_returned_total,
-            "scored_count_total": scored_total,
+        "capability": _service_capability_payload(initial_snapshot),
+        "capability_after_refresh": _service_capability_payload(
+            closed_snapshot
+        ),
+        "resources": _service_resource_entries(first_report, observed),
+        "failures": _service_failures(first_report),
+        "aggregation": _service_aggregation(first_report, observed),
+        "second_query": {
+            "capability": _service_capability_payload(second_snapshot),
+            "resources": _service_resource_entries(
+                second_report,
+                observed,
+            ),
+            "failures": _service_failures(second_report),
+            "aggregation": _service_aggregation(second_report, observed),
         },
     }
 
 
-def _verify_service_entry(
-    entry: Mapping[str, object],
-    scenario: _ServiceScenarioConfig,
+def _verify_service_blocks(
+    blocks: Mapping[str, object],
+    expected: Mapping[str, object],
     snapshot: RetrievalCapabilitySnapshot,
 ) -> None:
-    expected = scenario.expected
-    aggregation = cast("dict[str, object]", entry["aggregation"])
-    failures = cast("list[dict[str, object]]", entry["failures"])
-    resources = cast("list[dict[str, object]]", entry["resources"])
+    aggregation = cast("dict[str, object]", blocks["aggregation"])
+    failures = cast("list[dict[str, object]]", blocks["failures"])
+    resources = cast("list[dict[str, object]]", blocks["resources"])
     for field_name in (
         "result_count",
         "result_record_ids",
@@ -3857,19 +4112,6 @@ def _verify_service_entry(
             raise ValueError(f"service {field_name} diverged")
     if len(failures) != expected["failure_count"]:
         raise ValueError("service failure count diverged")
-    if expected["failure_count"]:
-        failure = failures[0]
-        scenario_failure = scenario.failure
-        if scenario_failure is None:
-            raise ValueError("service failure facts are missing")
-        if failure["stage"] != scenario_failure["stage"]:
-            raise ValueError("service failure stage diverged")
-        if failure["error_code"] != scenario_failure["code"]:
-            raise ValueError("service failure code diverged")
-        if failure["retryable"] != scenario_failure["retryable"]:
-            raise ValueError("service failure retryable diverged")
-        if failure["resource_id"] != scenario.failed_resource_id:
-            raise ValueError("service failure resource diverged")
     for resource in resources:
         context = cast("dict[str, object]", resource["context"])
         if context["available"] != snapshot.context.available:
@@ -3883,7 +4125,7 @@ def _verify_service_entry(
         if recall["fuzzy_available"] is not False:
             raise ValueError("service fuzzy recall must stay closed")
         if recall["fuzzy_unavailable_code"] != (
-            RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE
+            snapshot.fuzzy_core.unavailable_code
         ):
             raise ValueError("service fuzzy recall code diverged")
         if recall["stages"] != []:
@@ -3897,6 +4139,112 @@ def _verify_service_entry(
             raise ValueError("service fuzzy recall must not truncate")
         if resource["scored_count"] != 0:
             raise ValueError("service scored count must stay zero")
+
+
+def _verify_service_entry(
+    entry: Mapping[str, object],
+    scenario: _ServiceScenarioConfig,
+    snapshot: RetrievalCapabilitySnapshot,
+) -> None:
+    expected = scenario.expected
+    _verify_service_blocks(entry, expected, snapshot)
+    failures = cast("list[dict[str, object]]", entry["failures"])
+    if expected["failure_count"]:
+        failure = failures[0]
+        scenario_failure = scenario.failure
+        if scenario_failure is None:
+            raise ValueError("service failure facts are missing")
+        if failure["stage"] != scenario_failure["stage"]:
+            raise ValueError("service failure stage diverged")
+        if failure["error_code"] != scenario_failure["code"]:
+            raise ValueError("service failure code diverged")
+        if failure["retryable"] != scenario_failure["retryable"]:
+            raise ValueError("service failure retryable diverged")
+        if failure["resource_id"] != scenario.failed_resource_id:
+            raise ValueError("service failure resource diverged")
+
+
+def _verify_refresh_closed_snapshot(
+    snapshot: RetrievalCapabilitySnapshot,
+) -> None:
+    if snapshot.context.available is not False:
+        raise ValueError("refreshed publisher context must stay closed")
+    if snapshot.context.unavailable_code != (
+        RETRIEVAL_CONTEXT_EVIDENCE_MISSING_CODE
+    ):
+        raise ValueError("refreshed publisher context code diverged")
+    if snapshot.fuzzy_core.available is not False:
+        raise ValueError("refreshed publisher fuzzy core must stay closed")
+    if snapshot.fuzzy_core.unavailable_code != (
+        RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_MISSING_CODE
+    ):
+        raise ValueError("refreshed publisher fuzzy core code diverged")
+    if (
+        snapshot.fts5_trigram.available is not False
+        or snapshot.gram_fallback.available is not False
+    ):
+        raise ValueError("refreshed publisher Gate D paths must stay closed")
+    if snapshot.fts5_trigram.unavailable_code != (
+        RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE
+    ):
+        raise ValueError("refreshed publisher FTS5 trigram code diverged")
+    if snapshot.gram_fallback.unavailable_code != (
+        RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE
+    ):
+        raise ValueError("refreshed publisher gram fallback code diverged")
+
+
+def _verify_service_refresh_entry(
+    entry: Mapping[str, object],
+    scenario: _ServiceScenarioConfig,
+    *,
+    initial_snapshot: RetrievalCapabilitySnapshot,
+    closed_snapshot: RetrievalCapabilitySnapshot,
+) -> None:
+    if scenario.expected_after_refresh is None:
+        raise ValueError("refresh scenario needs after-refresh expectations")
+    if initial_snapshot.context.available is not True:
+        raise ValueError(
+            "refresh in-flight query must start with CONTEXT open"
+        )
+    if entry["capability"] != _service_capability_payload(
+        initial_snapshot
+    ):
+        raise ValueError("refresh in-flight capability diverged")
+    _verify_service_blocks(entry, scenario.expected, initial_snapshot)
+    failures = cast("list[dict[str, object]]", entry["failures"])
+    if len(failures) != 0:
+        raise ValueError("refresh scenario must not fail any resource")
+    _verify_refresh_closed_snapshot(closed_snapshot)
+    if entry["capability_after_refresh"] != _service_capability_payload(
+        closed_snapshot
+    ):
+        raise ValueError("refresh publisher final state diverged")
+    second_query = cast("dict[str, object]", entry["second_query"])
+    if second_query["capability"] != _service_capability_payload(
+        closed_snapshot
+    ):
+        raise ValueError("second query capability diverged")
+    _verify_service_blocks(
+        second_query,
+        scenario.expected_after_refresh,
+        closed_snapshot,
+    )
+    second_failures = cast(
+        "list[dict[str, object]]",
+        second_query["failures"],
+    )
+    if len(second_failures) != 0:
+        raise ValueError("second query must not fail any resource")
+    for resource in cast(
+        "list[dict[str, object]]",
+        second_query["resources"],
+    ):
+        context = cast("dict[str, object]", resource["context"])
+        if context["available"] is not False:
+            raise ValueError(
+                "second query must observe closed context"
+            )
 
 
 def _require_bool(value: object, field_name: str) -> bool:

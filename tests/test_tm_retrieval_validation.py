@@ -7,16 +7,20 @@ deterministic body-safe transcript, executes one fixed real temporary-store
 journey against public ``SQLiteTMStore``, ``CandidateRetriever`` and
 query-view ports with duplicate-batch rollback into a deterministic
 body-safe transcript, mints a short-lived manifest whose ``passed`` flags
-derive only from observed digest equality, keeps fuzzy-core deterministically
-pending and both Gate D benchmark rows empty, fails closed on tamper, raises
-on malformed roots, and never persists output or leaks
-source/target/speaker/previous/next bodies, provenance, paths or exception
-text.
+derive only from observed digest equality, locks the final fuzzy-core
+cohort digest over the fixture plus the scoring, store and service
+transcripts while keeping both Gate D benchmark rows empty, proves the
+fixed single-snapshot refresh race (in-flight query keeps the old snapshot,
+the publisher moves to a closed snapshot, and the next query observes it),
+fails closed on tamper, raises on malformed roots, and never persists
+output or leaks source/target/speaker/previous/next bodies, provenance,
+paths or exception text.
 """
 
 from __future__ import annotations
 # pyright: reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false
 
+import copy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -31,11 +35,22 @@ import unittest
 
 from tm_retrieval_capability import (
     RETRIEVAL_CONTEXT_EVIDENCE_FAILED_CODE,
+    RETRIEVAL_CONTEXT_EVIDENCE_MISSING_CODE,
     RETRIEVAL_CONTEXT_IDENTITY_INVALID_CODE,
     RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
     RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
+    RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_MISSING_CODE,
     RetrievalCapabilityEvaluator,
     RetrievalCapabilitySnapshot,
+)
+from tm_contracts import (
+    CandidateEvidence,
+    CandidateRecallMetadata,
+    CandidateRetrievalReport,
+    CandidateStage,
+    CandidateStageMetadata,
+    StoreHealth,
+    TMRecord,
 )
 from tm_gate_a import aggregate_paths_digest, canonical_digest
 from tm_retrieval_validation import (
@@ -44,12 +59,16 @@ from tm_retrieval_validation import (
     RETRIEVAL_FUZZY_CORE_COHORT_ID,
     RetrievalValidationRelease,
     _IMPLEMENTATION_PENDING,
+    _StoreConfig,
+    _StoreDraftConfig,
     _observe_context_transcript,
     _observe_fuzzy_scoring_transcript,
     _observe_service_transcript,
     _observe_store_transcript,
+    _store_rollback_facts,
     recompute_retrieval_validation,
 )
+from tm_sqlite_store import CanonicalRevisionSnapshot
 
 
 _REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -218,24 +237,24 @@ def _service_digests() -> tuple[str, str, str]:
             "transcript": context_transcript,
         }
     )
-    fuzzy_digest = canonical_digest(
+    harness_fuzzy_digest = canonical_digest(
         {"implementation": _IMPLEMENTATION_PENDING}
     )
-    return fixture_digest, context_digest, fuzzy_digest
+    return fixture_digest, context_digest, harness_fuzzy_digest
 
 
 def _service_entries() -> list[dict[str, Any]]:
-    _fixture_digest, context_digest, fuzzy_digest = _service_digests()
+    _fixture_digest, context_digest, harness_fuzzy_digest = _service_digests()
     entries = _observe_service_transcript(
         _VECTORS_FIXTURE,
         expectation=_release().expectation,
         observed_context_digest=context_digest,
-        observed_fuzzy_core_digest=fuzzy_digest,
+        harness_fuzzy_core_digest=harness_fuzzy_digest,
         generated_at_utc=_FIXED_GENERATED_AT,
         valid_until_utc=_FIXED_VALID_UNTIL,
     )
-    if len(entries) != 2:
-        raise AssertionError("expected exactly two service transcript entries")
+    if len(entries) != 3:
+        raise AssertionError("expected exactly three service transcript entries")
     return entries
 
 
@@ -261,6 +280,22 @@ def _store_rollback_fields() -> tuple[str, ...]:
         "health_unchanged",
         "candidates_unchanged",
         "absent",
+    )
+
+
+def _rollback_record(record_id: int) -> TMRecord:
+    return TMRecord(
+        record_id=record_id,
+        source_raw="Open the door.",
+        target_raw=f"target-{record_id}",
+        speaker_raw=None,
+        context_prev_raw=None,
+        context_next_raw=None,
+        file_source=None,
+        provenance=(("origin", "import.gate-c.store"),),
+        legacy_line_no=None,
+        origin_batch_id="import.gate-c.store",
+        origin_ordinal=record_id - 1,
     )
 
 
@@ -299,7 +334,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
             )
         )
 
-    def test_context_passes_while_fuzzy_core_and_gate_d_close(
+    def test_context_and_fuzzy_core_open_while_gate_d_paths_close(
         self,
     ) -> None:
         release = _release()
@@ -313,16 +348,19 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
         )
         self.assertIs(manifest.context_cohorts[0].passed, True)
         self.assertEqual(len(manifest.fuzzy_core_cohorts), 1)
-        self.assertIs(manifest.fuzzy_core_cohorts[0].passed, False)
+        self.assertEqual(
+            manifest.fuzzy_core_cohorts[0].cohort_id,
+            RETRIEVAL_FUZZY_CORE_COHORT_ID,
+        )
+        self.assertIs(manifest.fuzzy_core_cohorts[0].passed, True)
+        self.assertIsNone(manifest.fts5_trigram_benchmark)
+        self.assertIsNone(manifest.gram_fallback_benchmark)
 
         snapshot = _snapshot(release)
         self.assertTrue(snapshot.context.available)
         self.assertIsNone(snapshot.context.unavailable_code)
-        self.assertFalse(snapshot.fuzzy_core.available)
-        self.assertEqual(
-            snapshot.fuzzy_core.unavailable_code,
-            RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
-        )
+        self.assertTrue(snapshot.fuzzy_core.available)
+        self.assertIsNone(snapshot.fuzzy_core.unavailable_code)
         self.assertFalse(snapshot.fts5_trigram.available)
         self.assertEqual(
             snapshot.fts5_trigram.unavailable_code,
@@ -335,31 +373,35 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
         )
         self.assertEqual(
             snapshot.summary.unavailable_codes,
-            (
-                RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
-                RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
-            ),
+            (RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,),
         )
-        self.assertFalse(snapshot.fuzzy_available_for("FTS5_TRIGRAM")[0])
-        self.assertFalse(snapshot.fuzzy_available_for("GRAM_FALLBACK")[0])
+        self.assertEqual(
+            snapshot.fuzzy_available_for("FTS5_TRIGRAM"),
+            (False, RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE),
+        )
+        self.assertEqual(
+            snapshot.fuzzy_available_for("GRAM_FALLBACK"),
+            (False, RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE),
+        )
 
-    def test_fuzzy_core_is_explicitly_closed_not_missing(self) -> None:
+    def test_fuzzy_core_opens_only_as_gate_c_prerequisite(self) -> None:
         release = _release()
         manifest = release.manifest
         assert manifest is not None
         self.assertEqual(len(manifest.fuzzy_core_cohorts), 1)
         row = manifest.fuzzy_core_cohorts[0]
         self.assertEqual(row.cohort_id, RETRIEVAL_FUZZY_CORE_COHORT_ID)
-        self.assertFalse(row.passed)
+        self.assertIs(row.passed, True)
         self.assertIsNotNone(_DIGEST.fullmatch(row.cohort_digest))
         approved = release.expectation.fuzzy_core_cohorts[0].cohort_digest
-        self.assertNotEqual(row.cohort_digest, approved)
+        self.assertEqual(row.cohort_digest, approved)
         snapshot = _snapshot(release)
-        self.assertFalse(snapshot.fuzzy_core.available)
-        self.assertEqual(
-            snapshot.fuzzy_core.unavailable_code,
-            RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
-        )
+        self.assertTrue(snapshot.fuzzy_core.available)
+        self.assertIsNone(snapshot.fuzzy_core.unavailable_code)
+        self.assertFalse(snapshot.fts5_trigram.available)
+        self.assertFalse(snapshot.gram_fallback.available)
+        self.assertFalse(snapshot.fuzzy_available_for("FTS5_TRIGRAM")[0])
+        self.assertFalse(snapshot.fuzzy_available_for("GRAM_FALLBACK")[0])
 
     def test_gate_d_benchmark_evidence_rows_are_missing(self) -> None:
         release = _release()
@@ -926,6 +968,124 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
             )
             self.assertIsNone(release.manifest)
 
+    def test_final_fuzzy_digest_covers_all_four_inputs_and_fails_closed(
+        self,
+    ) -> None:
+        fixture_digest = aggregate_paths_digest(
+            _REPOSITORY_ROOT,
+            (
+                str(
+                    _VECTORS_FIXTURE.relative_to(
+                        _REPOSITORY_ROOT
+                    )
+                ),
+            ),
+        )
+        context_transcript = _observe_context_transcript(
+            _VECTORS_FIXTURE
+        )
+        scoring_transcript = _observe_fuzzy_scoring_transcript(
+            _VECTORS_FIXTURE
+        )
+        store_transcript = _observe_store_transcript(_VECTORS_FIXTURE)
+        service_transcript = _observe_service_transcript(
+            _VECTORS_FIXTURE,
+            expectation=_release().expectation,
+            observed_context_digest=canonical_digest(
+                {
+                    "fixture_digest": fixture_digest,
+                    "transcript": context_transcript,
+                }
+            ),
+            harness_fuzzy_core_digest=canonical_digest(
+                {"implementation": _IMPLEMENTATION_PENDING}
+            ),
+            generated_at_utc=_FIXED_GENERATED_AT,
+            valid_until_utc=_FIXED_VALID_UNTIL,
+        )
+        final_digest = canonical_digest(
+            {
+                "fixture_digest": fixture_digest,
+                "scoring": scoring_transcript,
+                "store": store_transcript,
+                "service": service_transcript,
+            }
+        )
+        approved = _release().expectation.fuzzy_core_cohorts[0].cohort_digest
+        self.assertEqual(final_digest, approved)
+        manifest = _release().manifest
+        assert manifest is not None
+        self.assertEqual(
+            manifest.fuzzy_core_cohorts[0].cohort_digest,
+            final_digest,
+        )
+        # Every one of the four inputs alone must move the digest.
+        self.assertNotEqual(
+            final_digest,
+            canonical_digest(
+                {
+                    "fixture_digest": hashlib.sha256(
+                        b"tampered-fixture"
+                    ).hexdigest(),
+                    "scoring": scoring_transcript,
+                    "store": store_transcript,
+                    "service": service_transcript,
+                }
+            ),
+        )
+        tampered_scoring: list[dict[str, Any]] = copy.deepcopy(
+            scoring_transcript
+        )
+        tampered_scoring[0]["scored_count"] = (
+            cast("int", tampered_scoring[0]["scored_count"]) + 1
+        )
+        self.assertNotEqual(
+            final_digest,
+            canonical_digest(
+                {
+                    "fixture_digest": fixture_digest,
+                    "scoring": tampered_scoring,
+                    "store": store_transcript,
+                    "service": service_transcript,
+                }
+            ),
+        )
+        tampered_store: list[dict[str, Any]] = copy.deepcopy(
+            store_transcript
+        )
+        tampered_store[0]["rollback"]["absent"] = not cast(
+            "bool", tampered_store[0]["rollback"]["absent"]
+        )
+        self.assertNotEqual(
+            final_digest,
+            canonical_digest(
+                {
+                    "fixture_digest": fixture_digest,
+                    "scoring": scoring_transcript,
+                    "store": tampered_store,
+                    "service": service_transcript,
+                }
+            ),
+        )
+        tampered_service: list[dict[str, Any]] = copy.deepcopy(
+            service_transcript
+        )
+        tampered_service[0]["aggregation"]["result_count"] = (
+            cast("int", tampered_service[0]["aggregation"]["result_count"])
+            + 1
+        )
+        self.assertNotEqual(
+            final_digest,
+            canonical_digest(
+                {
+                    "fixture_digest": fixture_digest,
+                    "scoring": scoring_transcript,
+                    "store": store_transcript,
+                    "service": tampered_service,
+                }
+            ),
+        )
+
     def test_fuzzy_duplicate_unknown_unsorted_and_closed_fields_fail(
         self,
     ) -> None:
@@ -1193,6 +1353,107 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
         )
         self.assertNotIn("UNIQUE constraint", serialized)
 
+    def test_store_rollback_absent_membership_uses_exported_record_ids(
+        self,
+    ) -> None:
+        exported = tuple(
+            _rollback_record(record_id) for record_id in (1, 2, 3, 4)
+        )
+        revision = CanonicalRevisionSnapshot(
+            resource_id="tm.gate-c.store",
+            canonical_store_id="store.gate-c",
+            generation=0,
+            head_revision=1,
+            record_count=4,
+        )
+        health = StoreHealth(
+            healthy=True,
+            schema_version=2,
+            generation=0,
+            record_count=4,
+            index_kind="FTS5_TRIGRAM",
+            snapshot_binding_digest=None,
+            source_binding_state=None,
+            exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+            diagnostic_codes=(),
+        )
+        metadata = CandidateRecallMetadata(
+            resource_id="tm.gate-c.store",
+            index_kind="FTS5_TRIGRAM",
+            fuzzy_available=False,
+            fuzzy_unavailable_code="RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_FAILED",
+            stages=(),
+            union_unique_count=0,
+            deduplicated_count=0,
+            result_limit=10,
+            candidate_budget_version="candidate-budget-v1",
+            candidate_budget=2048,
+            truncated=False,
+        )
+        report = CandidateRetrievalReport(candidates=(), metadata=metadata)
+        config = _StoreConfig(
+            id="store-gate-c-candidate-rollback",
+            resource_id="tm.gate-c.store",
+            canonical_store_id="store.gate-c",
+            stage_id="stage.gate-c.store",
+            batch_id="import.gate-c.store",
+            batch_kind="import",
+            source_digest="f" * 64,
+            source_name="gate-c.store.jsonl",
+            duplicate_source_digest="e" * 64,
+            duplicate_source_name="duplicate.jsonl",
+            query_source="Open the door.",
+            folded_query="openthedoor",
+            minimum_similarity=0.7,
+            result_limit=10,
+            drafts=(),
+            duplicate_draft=_StoreDraftConfig(
+                ordinal=0,
+                source_raw="Open the door.",
+                target_raw="target-5",
+            ),
+        )
+
+        def facts(
+            *,
+            after_exported: tuple[TMRecord, ...],
+            exact_absent: bool = True,
+        ) -> dict[str, Any]:
+            return _store_rollback_facts(
+                config=config,
+                exception_type="sqlite3.IntegrityError",
+                before_revision=revision,
+                before_exported=exported,
+                before_health=health,
+                before_report=report,
+                after_revision=revision,
+                after_exported=after_exported,
+                after_health=health,
+                after_report=report,
+                exact_absent=exact_absent,
+            )
+
+        # An after-exported TMRecord carrying the would-be new id must be
+        # detected by the exported record id membership check: absent is
+        # False even though the query-view exact probe stayed empty.
+        present = facts(after_exported=exported + (_rollback_record(5),))
+        self.assertEqual(present["absent_record_id"], 5)
+        self.assertIs(present["absent"], False)
+
+        # The real rollback state (no such exported record) stays absent.
+        absent = facts(after_exported=exported)
+        self.assertEqual(absent["absent_record_id"], 5)
+        self.assertIs(absent["absent"], True)
+
+        # A negative exact probe closes the absent claim regardless.
+        negative = facts(
+            after_exported=exported,
+            exact_absent=False,
+        )
+        self.assertIs(negative["absent"], False)
+
     def test_store_transcript_is_body_safe_and_shape_closed(self) -> None:
         entry = _store_entry()
         serialized = json.dumps(
@@ -1457,6 +1718,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
             [
                 "service-gate-c-global-limit",
                 "service-gate-c-partial-failure",
+                "service-gate-c-refresh-snapshot",
             ],
         )
         for entry in first:
@@ -1614,6 +1876,137 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                 0,
             )
 
+    def test_service_refresh_keeps_inflight_snapshot_and_closes_next(
+        self,
+    ) -> None:
+        entry = _service_entry("service-gate-c-refresh-snapshot")
+        self.assertEqual(entry["kind"], "refresh_snapshot")
+        self.assertEqual(entry["failures"], [])
+        capability = cast("dict[str, Any]", entry["capability"])
+        self.assertIs(capability["context"]["available"], True)
+        self.assertIsNone(capability["context"]["unavailable_code"])
+        self.assertIs(capability["fuzzy_core"]["available"], False)
+        self.assertEqual(
+            capability["fuzzy_core"]["unavailable_code"],
+            RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
+        )
+        self.assertIs(capability["fts5_trigram"]["available"], False)
+        self.assertIs(capability["gram_fallback"]["available"], False)
+        self.assertEqual(
+            capability["fts5_trigram"]["unavailable_code"],
+            RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
+        )
+        self.assertEqual(
+            capability["gram_fallback"]["unavailable_code"],
+            RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
+        )
+        # The in-flight query kept the pre-refresh snapshot on both
+        # resources even though the first resource's health step already
+        # fired the publisher refresh.
+        for resource in cast(
+            "list[dict[str, Any]]", entry["resources"]
+        ):
+            context = cast("dict[str, Any]", resource["context"])
+            self.assertIs(context["available"], True)
+            self.assertIsNone(context["unavailable_code"])
+            recall = cast("dict[str, Any]", resource["recall"])
+            self.assertIs(recall["fuzzy_available"], False)
+            self.assertEqual(
+                recall["fuzzy_unavailable_code"],
+                RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE,
+            )
+            self.assertEqual(recall["stages"], [])
+            self.assertEqual(resource["scored_count"], 0)
+        self.assertEqual(
+            cast("dict[str, Any]", entry["aggregation"]),
+            {
+                "result_count": 2,
+                "result_record_ids": [2, 2],
+                "result_resource_ids": [
+                    "tm.gate-c.service.primary",
+                    "tm.gate-c.service.secondary",
+                ],
+                "returned_count_by_resource": {
+                    "tm.gate-c.service.primary": 1,
+                    "tm.gate-c.service.secondary": 1,
+                },
+                "context_observed_count": 2,
+                "context_returned_count": 0,
+                "scored_count_total": 0,
+            },
+        )
+        # The publisher snapshot after the in-flight query is closed.
+        closed = cast("dict[str, Any]", entry["capability_after_refresh"])
+        self.assertIs(closed["context"]["available"], False)
+        self.assertEqual(
+            closed["context"]["unavailable_code"],
+            RETRIEVAL_CONTEXT_EVIDENCE_MISSING_CODE,
+        )
+        self.assertIs(closed["fuzzy_core"]["available"], False)
+        self.assertEqual(
+            closed["fuzzy_core"]["unavailable_code"],
+            RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_MISSING_CODE,
+        )
+        self.assertIs(closed["fts5_trigram"]["available"], False)
+        self.assertIs(closed["gram_fallback"]["available"], False)
+        self.assertEqual(
+            closed["fts5_trigram"]["unavailable_code"],
+            RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
+        )
+        self.assertEqual(
+            closed["gram_fallback"]["unavailable_code"],
+            RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE,
+        )
+        # The next query observes the closed snapshot: context unavailable
+        # on every successful resource and no fuzzy execution.
+        second = cast("dict[str, Any]", entry["second_query"])
+        self.assertEqual(second["capability"], closed)
+        self.assertEqual(second["failures"], [])
+        self.assertEqual(
+            cast("dict[str, Any]", second["aggregation"]),
+            {
+                "result_count": 2,
+                "result_record_ids": [2, 2],
+                "result_resource_ids": [
+                    "tm.gate-c.service.primary",
+                    "tm.gate-c.service.secondary",
+                ],
+                "returned_count_by_resource": {
+                    "tm.gate-c.service.primary": 1,
+                    "tm.gate-c.service.secondary": 1,
+                },
+                "context_observed_count": 2,
+                "context_returned_count": 0,
+                "scored_count_total": 0,
+            },
+        )
+        for resource in cast(
+            "list[dict[str, Any]]", second["resources"]
+        ):
+            context = cast("dict[str, Any]", resource["context"])
+            self.assertIs(context["available"], False)
+            self.assertEqual(
+                context["unavailable_code"],
+                RETRIEVAL_CONTEXT_EVIDENCE_MISSING_CODE,
+            )
+            self.assertEqual(
+                [
+                    (result["record_id"], result["match_type"])
+                    for result in cast(
+                        "list[dict[str, Any]]", resource["results"]
+                    )
+                ],
+                [(2, "EXACT")],
+            )
+            recall = cast("dict[str, Any]", resource["recall"])
+            self.assertIs(recall["fuzzy_available"], False)
+            self.assertEqual(
+                recall["fuzzy_unavailable_code"],
+                RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_MISSING_CODE,
+            )
+            self.assertEqual(recall["stages"], [])
+            self.assertEqual(resource["scored_count"], 0)
+
     def test_service_transcript_is_body_safe_and_shape_closed(self) -> None:
         for entry in _service_entries():
             serialized = json.dumps(
@@ -1626,107 +2019,149 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                 self.assertNotIn(body, serialized)
             self.assertNotIn(".sqlite3", serialized)
             self.assertNotIn(".jsonl", serialized)
-            self.assertEqual(
-                set(entry),
-                {
-                    "id",
-                    "kind",
-                    "version",
-                    "query",
-                    "capability",
-                    "resources",
-                    "failures",
-                    "aggregation",
-                },
-            )
-            capability = cast("dict[str, Any]", entry["capability"])
-            self.assertEqual(
-                set(capability),
-                {
+            is_refresh = cast("str", entry["kind"]) == "refresh_snapshot"
+            if is_refresh:
+                self.assertEqual(
+                    set(entry),
+                    {
+                        "id",
+                        "kind",
+                        "version",
+                        "query",
+                        "capability",
+                        "capability_after_refresh",
+                        "resources",
+                        "failures",
+                        "aggregation",
+                        "second_query",
+                    },
+                )
+            else:
+                self.assertEqual(
+                    set(entry),
+                    {
+                        "id",
+                        "kind",
+                        "version",
+                        "query",
+                        "capability",
+                        "resources",
+                        "failures",
+                        "aggregation",
+                    },
+                )
+            capability_payloads = [entry["capability"]]
+            if is_refresh:
+                capability_payloads.append(entry["capability_after_refresh"])
+                capability_payloads.append(
+                    cast(
+                        "dict[str, Any]",
+                        entry["second_query"],
+                    )["capability"]
+                )
+            for capability in capability_payloads:
+                self.assertEqual(
+                    set(cast("dict[str, Any]", capability)),
+                    {
+                        "context",
+                        "fuzzy_core",
+                        "fts5_trigram",
+                        "gram_fallback",
+                        "summary_unavailable_codes",
+                    },
+                )
+                for decision in (
                     "context",
                     "fuzzy_core",
                     "fts5_trigram",
                     "gram_fallback",
-                    "summary_unavailable_codes",
-                },
-            )
-            for decision in (
-                "context",
-                "fuzzy_core",
-                "fts5_trigram",
-                "gram_fallback",
-            ):
-                self.assertEqual(
-                    set(cast("dict[str, Any]", capability[decision])),
-                    {"available", "unavailable_code"},
-                )
-            for resource in cast(
-                "list[dict[str, Any]]", entry["resources"]
-            ):
-                self.assertEqual(
-                    set(resource),
-                    {
-                        "resource_id",
-                        "generation",
-                        "context",
-                        "context_variant",
-                        "recall",
-                        "scored_count",
-                        "returned_count",
-                        "results",
-                    },
-                )
-                self.assertEqual(
-                    set(cast("dict[str, Any]", resource["context"])),
-                    {
-                        "available",
-                        "unavailable_code",
-                        "observed_count",
-                        "returned_count",
-                    },
-                )
-                self.assertEqual(
-                    set(cast("dict[str, Any]", resource["recall"])),
-                    {
-                        "index_kind",
-                        "fuzzy_available",
-                        "fuzzy_unavailable_code",
-                        "stages",
-                        "union_unique_count",
-                        "deduplicated_count",
-                        "result_limit",
-                        "candidate_budget",
-                        "candidate_budget_version",
-                        "truncated",
-                    },
-                )
-                for result in cast(
-                    "list[dict[str, Any]]", resource["results"]
                 ):
                     self.assertEqual(
-                        set(result),
-                        {"record_id", "match_type"},
+                        set(
+                            cast(
+                                "dict[str, Any]",
+                                capability[decision],
+                            )
+                        ),
+                        {"available", "unavailable_code"},
                     )
-            for failure in cast(
-                "list[dict[str, Any]]", entry["failures"]
-            ):
-                self.assertEqual(
-                    set(failure),
-                    {"resource_id", "stage", "error_code", "retryable"},
+            blocks: list[dict[str, Any]] = [entry]
+            if is_refresh:
+                blocks.append(
+                    cast("dict[str, Any]", entry["second_query"])
                 )
-            self.assertEqual(
-                set(cast("dict[str, Any]", entry["aggregation"])),
-                {
-                    "result_count",
-                    "result_record_ids",
-                    "result_resource_ids",
-                    "returned_count_by_resource",
-                    "context_observed_count",
-                    "context_returned_count",
-                    "scored_count_total",
-                },
-            )
-
+            for block in blocks:
+                for resource in cast(
+                    "list[dict[str, Any]]", block["resources"]
+                ):
+                    self.assertEqual(
+                        set(resource),
+                        {
+                            "resource_id",
+                            "generation",
+                            "context",
+                            "context_variant",
+                            "recall",
+                            "scored_count",
+                            "returned_count",
+                            "results",
+                        },
+                    )
+                    self.assertEqual(
+                        set(cast("dict[str, Any]", resource["context"])),
+                        {
+                            "available",
+                            "unavailable_code",
+                            "observed_count",
+                            "returned_count",
+                        },
+                    )
+                    self.assertEqual(
+                        set(cast("dict[str, Any]", resource["recall"])),
+                        {
+                            "index_kind",
+                            "fuzzy_available",
+                            "fuzzy_unavailable_code",
+                            "stages",
+                            "union_unique_count",
+                            "deduplicated_count",
+                            "result_limit",
+                            "candidate_budget",
+                            "candidate_budget_version",
+                            "truncated",
+                        },
+                    )
+                    for result in cast(
+                        "list[dict[str, Any]]", resource["results"]
+                    ):
+                        self.assertEqual(
+                            set(result),
+                            {"record_id", "match_type"},
+                        )
+                for failure in cast(
+                    "list[dict[str, Any]]", block["failures"]
+                ):
+                    self.assertEqual(
+                        set(failure),
+                        {
+                            "resource_id",
+                            "stage",
+                            "error_code",
+                            "retryable",
+                        },
+                    )
+                self.assertEqual(
+                    set(cast("dict[str, Any]", block["aggregation"])),
+                    {
+                        "result_count",
+                        "result_record_ids",
+                        "result_resource_ids",
+                        "returned_count_by_resource",
+                        "context_observed_count",
+                        "context_returned_count",
+                        "scored_count_total",
+                    },
+                )
     def test_service_observation_leaves_no_residual_files(self) -> None:
         before = _snapshot_file_set(_REPOSITORY_ROOT)
         _service_entries()
@@ -1734,7 +2169,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_service_fixture_tamper_fails_closed(self) -> None:
-        for tamper in ("aggregation", "failure_facts"):
+        for tamper in ("aggregation", "failure_facts", "refresh"):
             with self.subTest(tamper=tamper):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
@@ -1753,10 +2188,14 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                             9,
                             9,
                         ]
-                    else:
+                    elif tamper == "failure_facts":
                         scenarios[1]["failure"]["code"] = (
                             "STORE.SOMETHING_ELSE"
                         )
+                    else:
+                        scenarios[2]["expected_after_refresh"][
+                            "result_record_ids"
+                        ] = [9, 9]
                     fixture.write_text(
                         json.dumps(
                             payload,
@@ -1809,7 +2248,9 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
     def test_service_closed_fields_and_unknown_values_fail(self) -> None:
         base_payload = _load_json(_VECTORS_FIXTURE)
         expectation = _release().expectation
-        fixture_digest, context_digest, fuzzy_digest = _service_digests()
+        fixture_digest, context_digest, harness_fuzzy_digest = (
+            _service_digests()
+        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
 
@@ -1832,7 +2273,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                     tampered(missing_service),
                     expectation=expectation,
                     observed_context_digest=context_digest,
-                    observed_fuzzy_core_digest=fuzzy_digest,
+                    harness_fuzzy_core_digest=harness_fuzzy_digest,
                     generated_at_utc=_FIXED_GENERATED_AT,
                     valid_until_utc=_FIXED_VALID_UNTIL,
                 )
@@ -1844,7 +2285,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                     tampered(extra_field),
                     expectation=expectation,
                     observed_context_digest=context_digest,
-                    observed_fuzzy_core_digest=fuzzy_digest,
+                    harness_fuzzy_core_digest=harness_fuzzy_digest,
                     generated_at_utc=_FIXED_GENERATED_AT,
                     valid_until_utc=_FIXED_VALID_UNTIL,
                 )
@@ -1858,7 +2299,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                     tampered(wrong_version),
                     expectation=expectation,
                     observed_context_digest=context_digest,
-                    observed_fuzzy_core_digest=fuzzy_digest,
+                    harness_fuzzy_core_digest=harness_fuzzy_digest,
                     generated_at_utc=_FIXED_GENERATED_AT,
                     valid_until_utc=_FIXED_VALID_UNTIL,
                 )
@@ -1874,7 +2315,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                     tampered(duplicate_resource),
                     expectation=expectation,
                     observed_context_digest=context_digest,
-                    observed_fuzzy_core_digest=fuzzy_digest,
+                    harness_fuzzy_core_digest=harness_fuzzy_digest,
                     generated_at_utc=_FIXED_GENERATED_AT,
                     valid_until_utc=_FIXED_VALID_UNTIL,
                 )
@@ -1890,7 +2331,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                     tampered(duplicate_scenario),
                     expectation=expectation,
                     observed_context_digest=context_digest,
-                    observed_fuzzy_core_digest=fuzzy_digest,
+                    harness_fuzzy_core_digest=harness_fuzzy_digest,
                     generated_at_utc=_FIXED_GENERATED_AT,
                     valid_until_utc=_FIXED_VALID_UNTIL,
                 )
