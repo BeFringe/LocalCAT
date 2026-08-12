@@ -324,18 +324,21 @@
   - 分别执行 FTS5 与 fallback，记录运行环境、能力、索引路径、查询数量和统计口径
   - 完成时，固定原始样本可重算 warm exact 与 fuzzy top-10 的 p50/p95/max
   - _Requirements: 8.1, 8.2, 8.5, 8.6_
+  - _Boundary: TMBenchmark Latency_
 
 - [ ] 8.3 实现隔离迁移与 RSS 测量运行器
   - 在独立子进程中测量从启动到完成的峰值 RSS，迁移计时包含 parse、insert、索引、校验、fsync、激活和 reopen
   - 排除预生成 fixture 成本，并记录两条索引路径的环境与原始样本
   - 完成时，固定样本可重算报告中的迁移耗时和峰值 RSS
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6_
+  - _Boundary: TMBenchmark Process/RSS_
 
 - [ ] 8.4 实现全扫描 oracle 与召回硬门
   - 对阈值以上集合和真实 top-10 与固定全扫描 oracle 比较，逐查询报告缺失 candidate identity
   - FTS5 与 fallback 分别核对，任一遗漏都把对应 candidate recall gate 标记失败
   - 完成时，两条路径都有可重算的 recall 报告，只有 100% 才允许进入 fuzzy 性能发布门
   - _Requirements: 4.2, 5.3, 5.4, 8.7_
+  - _Boundary: TMBenchmark Oracle_
 
 - [ ] 8.5 执行 fast/fallback 性能硬门并发布 Gate D
   - 两条路径分别验证 warm exact p95≤50 ms、fuzzy top-10 p95≤500 ms、迁移≤120 s、峰值 RSS≤512 MiB、recall=100%
@@ -343,6 +346,7 @@
   - matcher BASIC/TEXT_V1 只按 matcher evidence 发布，不受 fuzzy benchmark 成败推断
   - 完成时，报告对每条索引路径和每个能力门给出独立 PASS/FAIL，且失败不撤销 canonical exact/save
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
+  - _Boundary: TMBenchmark Gate D_
 
 - [ ] 9. 完成故障、边界与 86 条验收
 

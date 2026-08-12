@@ -128,7 +128,11 @@ graph LR
 ├── unicode_word_break_data.py       # generated pinned property tables
 ├── tm_engine.py                     # 激活 gate 后的 compatibility facade
 ├── resource_importer.py             # 已激活资源调用 canonical import port
-├── tm_benchmark.py                  # 100k corpus、latency、RSS、recall
+├── tm_benchmark.py                  # benchmark-v1 确定性语料、cohort 与冻结输入契约
+├── tm_benchmark_latency.py          # exact/fuzzy 逐查询延迟样本与 nearest-rank 统计
+├── tm_benchmark_process.py          # 独立子进程迁移、reopen 与全生命周期 RSS 采样
+├── tm_benchmark_oracle.py           # 固定 subset 全扫描 oracle 与 candidate recall 对账
+├── tm_benchmark_gate.py             # TMBenchmark 组合入口、双路径报告与 Gate D 发布
 ├── benchmark_tm_contract.json       # thresholds、corpus/scorer/index config
 └── tests/
     ├── assets/
@@ -1072,6 +1076,8 @@ facade 每次进程级打开都必须重建同一权威判定，不得把“本�
 class TMBenchmark:
     def run(self, contract: BenchmarkContract) -> BenchmarkReport: ...
 ```
+
+`TMBenchmark` 是最终组合入口，不是要求把全部 benchmark 逻辑堆入一个文件。Task 8.1 的确定性语料与 digest 权威保留在 `tm_benchmark.py`；Task 8.2、8.3、8.4 分别由 latency、process/RSS、oracle owner 产生不可变原始证据；Task 8.5 的 `tm_benchmark_gate.py` 只组合这些证据、构造两个独立路径报告并发布 Gate D。前三个执行 owner 不得构造最终 `BenchmarkReport` 或授予 capability，gate owner 不得重新选择 cohort、丢弃原始样本或重写 oracle 结果。这些 owner seam 只分隔独立故障模型，Cluster J 仍在 8.1–8.5 全部闭合后做一次累积复审和一次 fresh full suite。
 
 - machine-readable `benchmark_tm_contract.json` 必须与 `BenchmarkContract` 一致；`benchmark-v1` 固定 generator/seed/digests、100,000 records、exact ≥1,000 queries、fuzzy ≥200 queries。
 - deterministic corpus 包括 multilingual/CJK/short/duplicate/multi-target/context/near-edit/miss cohorts；query cohort 由 digest 固定，不允许运行时挑选有利样本。

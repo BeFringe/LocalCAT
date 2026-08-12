@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v9）
+# Feature 5 评审集群与推理强度指南（采纳稿 v10）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -53,7 +53,7 @@
 | G — Facade integration | 6.1 + 6.2 + 6.3 | legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵 + 兼容回归断言 | `medium` | `high` | 1 | 中 |
 | H — Retrieval pipeline | 7.1 + 7.2 + 7.3 | exact/context 分类 → fuzzy 评分 → 多资源聚合排序/部分失败 | `high` | `high` | 1 | 中 |
 | I — Capability gate C | 7.4 + 7.5 | 独立 CONTEXT/FUZZY 可用性门 + 证据聚合且不撤销 exact/save | `medium` | `high` | 1 | 小 |
-| J — Benchmark subsystem | 8.1 + 8.2 + 8.3 + 8.4 + 8.5 | 确定性语料 → 延迟/RSS 运行器 → oracle recall → 双路径硬门 | `medium` | `high` | 1 | 大 |
+| J — Benchmark subsystem | 8.1 + 8.2 + 8.3 + 8.4 + 8.5 | 确定性语料 → latency/process/oracle 三个 evidence owner → 双路径硬门 | `medium` | `high` | 1 | 大 |
 | K — Fault injection | 9.1 + 9.2 | 全量迁移/激活/快照故障矩阵，验证 D+F+E 的负空间 | `high` | `xhigh` | 1 | 中 |
 | L — Evidence + release | 9.3 + 9.4 + 9.5 + 9.6 | 跨域能力矩阵 + 兼容回归 + 86 条覆盖映射 + 完整发布 | `medium` | `xhigh` | 1 | 中 |
 
@@ -84,7 +84,7 @@
 
 **I — Capability gate C：** CONTEXT 与 FUZZY 独立可用性门 + Gate C 证据聚合。任一子门失败只能关闭自身，不得撤销 canonical exact/save 或另一个已验证子门，因此 review 提升为 `high`。
 
-**J — Benchmark subsystem：** 自包含测量流水线。"数字是否满足硬门"只是最后一步；复审还要排除有利样本选择、digest/环境/统计口径漂移、fast-path 成功掩盖 fallback 失败。oracle recall=100% 是正确性硬约束。
+**J — Benchmark subsystem：** 自包含测量流水线。Task 8.1 闭合后的实际体量表明，latency、独立子进程/RSS、oracle recall 必须按 owner seam 分开，Gate D 再做唯一组合与能力发布；分文件不分集群，仍只在五个任务全部闭合后复审一次。"数字是否满足硬门"只是最后一步；复审还要排除有利样本选择、digest/环境/统计口径漂移、fast-path 成功掩盖 fallback 失败。oracle recall=100% 是正确性硬约束。
 
 **K — Fault injection：** 测试 D + F + E 的负空间。共享同一方法论和"prior 资产必须存活"不变量。
 
@@ -165,6 +165,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v10 | 2026-08-12 | Task 8.1 闭合后按实际体量将 Cluster J 内部分为 corpus、latency、process/RSS、oracle 与 Gate D owner seam；保持 8.1–8.5 单集群、单次累积复审和原硬门不变。 |
 | v9 | 2026-08-12 | 将 invariant capsule 与 mutation-proof ledger 从集群复审前移到首次实现 dispatch；按独立状态机/owner 权威而非文件行数裁剪 assignment，并以目标 worktree 的 Git 身份、磁盘 diff 与新鲜验证裁决返回叙述冲突。 |
 | v8 | 2026-08-11 | 将 Cluster G 从简化双态分支收紧为 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵；在集群闭合门加入 provider-independent downstream invariant capsule，防止前序已批准语义在后续实施中丢失。 |
 | v7 | 2026-08-11 | Cluster F 闭合后增加 5.R3/F-R 纯等价快照 artifact 边界提取；将 mutation-proof ledger 加入所有文件发布/恢复集群的闭合门，异常分支简化保持正交。 |
