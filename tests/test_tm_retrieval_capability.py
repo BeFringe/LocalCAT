@@ -12,7 +12,7 @@ module is imported here.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from typing import Any, cast
 import unittest
@@ -584,6 +584,54 @@ class FailClosedMatrixTests(unittest.TestCase):
 
 
 class IndependentGateTests(unittest.TestCase):
+    def test_unknown_extra_cohort_closes_only_its_own_gate(self) -> None:
+        manifest = _manifest()
+        extra_context = _cohort(
+            "context.unknown.cohort.v1",
+            _digest("context-unknown"),
+        )
+        context_snapshot = RetrievalCapabilityEvaluator(
+            _expectation()
+        ).evaluate(
+            replace(
+                manifest,
+                context_cohorts=(
+                    manifest.context_cohorts[0],
+                    extra_context,
+                ),
+            ),
+            evaluated_at_utc=EVALUATED_AT,
+        )
+        self.assertFalse(context_snapshot.context.available)
+        self.assertEqual(
+            context_snapshot.context.unavailable_code,
+            RETRIEVAL_CONTEXT_IDENTITY_INVALID_CODE,
+        )
+        self.assertTrue(context_snapshot.fuzzy_core.available)
+
+        extra_fuzzy = _cohort(
+            "fuzzy.unknown.cohort.v1",
+            _digest("fuzzy-unknown"),
+        )
+        fuzzy_snapshot = RetrievalCapabilityEvaluator(
+            _expectation()
+        ).evaluate(
+            replace(
+                manifest,
+                fuzzy_core_cohorts=(
+                    manifest.fuzzy_core_cohorts[0],
+                    extra_fuzzy,
+                ),
+            ),
+            evaluated_at_utc=EVALUATED_AT,
+        )
+        self.assertTrue(fuzzy_snapshot.context.available)
+        self.assertFalse(fuzzy_snapshot.fuzzy_core.available)
+        self.assertEqual(
+            fuzzy_snapshot.fuzzy_core.unavailable_code,
+            RETRIEVAL_FUZZY_CORRECTNESS_IDENTITY_INVALID_CODE,
+        )
+
     def test_closed_context_never_revokes_fuzzy_or_exact_capability(self) -> None:
         manifest = _manifest(
             context_cohort=_cohort(

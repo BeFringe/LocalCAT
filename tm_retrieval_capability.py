@@ -1000,6 +1000,13 @@ def _context_decision(
             available=False,
             unavailable_code=RETRIEVAL_CONTEXT_IDENTITY_INVALID_CODE,
         )
+    if tuple(
+        evidence.cohort_id for evidence in manifest.context_cohorts
+    ) != tuple(cohort.cohort_id for cohort in expectation.context_cohorts):
+        return RetrievalContextDecision(
+            available=False,
+            unavailable_code=RETRIEVAL_CONTEXT_IDENTITY_INVALID_CODE,
+        )
     evidence_by_id = {
         evidence.cohort_id: evidence
         for evidence in manifest.context_cohorts
@@ -1052,6 +1059,17 @@ def _fuzzy_core_decision(
     evaluated_at_utc: datetime,
 ) -> RetrievalFuzzyCoreDecision:
     if not _envelope_identity_matches(manifest, expectation):
+        return RetrievalFuzzyCoreDecision(
+            available=False,
+            unavailable_code=(
+                RETRIEVAL_FUZZY_CORRECTNESS_IDENTITY_INVALID_CODE
+            ),
+        )
+    if tuple(
+        evidence.cohort_id for evidence in manifest.fuzzy_core_cohorts
+    ) != tuple(
+        cohort.cohort_id for cohort in expectation.fuzzy_core_cohorts
+    ):
         return RetrievalFuzzyCoreDecision(
             available=False,
             unavailable_code=(
