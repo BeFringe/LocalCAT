@@ -357,7 +357,7 @@
   - _Requirements: 4.2, 4.7, 5.2, 5.3, 8.2, 8.7_
   - _Boundary: Candidate Proof Index_
 
-- [ ] 8.7 实现有界 proof/scorer 查询流水线
+- [x] 8.7 实现有界 proof/scorer 查询流水线
   - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；同时证明 threshold 全集和无阈值真实 top-k 后才返回 fuzzy 候选
   - 单资源真实评分达到 candidate budget 仍不能闭合时，以 `CANDIDATE.PROOF_BUDGET_EXHAUSTED` 局部失败，不影响其他资源、exact、CONTEXT 或 save
   - FTS5 与 fallback 分别执行各自 seed path 并共享同一 proof closure；禁止全量 union source fetch/sort、重复评分或 caller 自报 completeness
@@ -486,3 +486,4 @@
 - 2026-08-13 / Task 9.4：将 compatibility/priority/Excel/selfcheck/privacy/isolation/SQLite policy/architecture 收束为 14 行验收证据，累计 acceptance matrix 32 行、78 个精确引用。新增 disposable cwd + `-B` 子进程覆盖 TMEngine、stress runner 与 translation runner 旧自检；静态守卫以设计拥有的 28 个 Core 文件闭集和 Qt/Glossary/Legacy/Controller consumer 集合为权威，拒绝网络/账号/telemetry/凭据/外部服务依赖、Core 反向导入 Qt/Parser/TMX/Glossary，以及 consumer 通过普通 import、`__import__`、字面 `importlib.import_module`、readiness 标识符或 validation-summary 字符串取得第二权威。兼容/Excel/Legacy/selfcheck/architecture focused 35/35、matrix 8/8，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；现有 LogicController→Glossary 合法兼容职责没有被误归为 Core 依赖违规。
 - 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
 - 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
+- 2026-08-14 / Task 8.7：生产查询在同一 generation view 内只预取 FTS/回退真实有界 seed 与 block summary，打开 256-slot block 时才窄口批取 exact length/TF proof facts，再以最多 32 条原文/scorer 批交替闭合 threshold 全集和 `(score, record_id DESC)` top-k；Task 8.6 完整性 health 权威保留，协调篡改、世代漂移、证明失真与预算耗尽均资源级 fail-closed，单 identity 仅评分一次并保留 exact/CONTEXT/其他资源。oracle/query child 复用同一生产链；主 agent 新鲜核心 212/212、benchmark/oracle/query-process 175/175 及变更文件 basedpyright 0 errors 通过，其中字面 5000/200 两路径均 `missing_above=0`/`missing_top10=0`、旧 27 个遗漏恢复；20 条 miss 可丢弃时序探针 p95 约 484/492 ms，未运行或冒充 100k Gate D。

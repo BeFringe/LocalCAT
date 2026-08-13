@@ -3,26 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
+import math
 
 from tm_sqlite_store import (
     SQLiteCandidateRecord,
+    SQLiteCandidateProofBlock,
+    SQLiteCandidateProofRecord,
+    SQLiteCandidateProofSnapshot,
     SQLiteCandidateRecallSnapshot,
     SQLiteCandidateWritePlan,
     SQLiteTMStore,
     SQLiteTMQueryView,
     SQLiteStoreSchemaError,
+    CANDIDATE_PROOF_BLOCK_SIZE,
+    CANDIDATE_PROOF_BLOCK_VERSION_V1,
     build_candidate_write_plan as _store_build_candidate_write_plan,
     unique_character_ngrams as _store_unique_character_ngrams,
 )
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
     CandidateEvidence,
+    CandidateProofMetadata,
     CandidateRecallMetadata,
     CandidateRetrievalReport,
     CandidateStage,
     CandidateStageMetadata,
     candidate_budget_v1,
+    SCORER_BOUND_VERSION_V1,
+    SimilarityEvidence,
 )
+from tm_similarity import scorer_upper_bound_v1
 
 
 FTS5_UNAVAILABLE_CODE = "CANDIDATE.FTS5_UNAVAILABLE"
@@ -31,6 +43,17 @@ GRAM_EMPTY_QUERY_CODE = "CANDIDATE.GRAM_QUERY_EMPTY"
 GRAM_LONG_QUERY_FTS_SELECTED_CODE = "CANDIDATE.GRAM_LONG_QUERY_FTS_SELECTED"
 GRAM_CANDIDATE_HARD_CAP = 8192
 CANDIDATE_CONTRACT_FLOOR = candidate_budget_v1(1)
+CANDIDATE_PROOF_BATCH_SIZE = 32
+CANDIDATE_PROOF_BUDGET_EXHAUSTED = "CANDIDATE.PROOF_BUDGET_EXHAUSTED"
+
+
+class CandidateProofBudgetExhausted(RuntimeError):
+    """The frozen scorer budget ended before both proof closures."""
+
+    code = CANDIDATE_PROOF_BUDGET_EXHAUSTED
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 def _copy_candidate_recall_snapshot(
@@ -698,6 +721,557 @@ def _build_candidate_report(
     )
 
 
+def _copy_proof_snapshot(value: object) -> SQLiteCandidateProofSnapshot:
+    """Close every store-owned proof value before heap/order operations."""
+
+    if type(value) is not SQLiteCandidateProofSnapshot:
+        raise TypeError("store returned an invalid proof snapshot")
+    if type(value.index_kind) is not str or value.index_kind not in {
+        "FTS5_TRIGRAM",
+        "GRAM_FALLBACK",
+    }:
+        raise ValueError("proof snapshot index kind is invalid")
+    if type(value.seed_stages) is not tuple:
+        raise TypeError("proof seed stages must be a tuple")
+    stages: list[tuple[str, tuple[int, ...]]] = []
+    seen_names: set[str] = set()
+    for entry in value.seed_stages:
+        if type(entry) is not tuple or len(entry) != 2:
+            raise TypeError("proof seed stage is invalid")
+        name, ids = entry
+        if type(name) is not str or name not in {
+            "FTS_TRIGRAM", "GRAM_3", "GRAM_2", "GRAM_1"
+        }:
+            raise ValueError("proof seed stage name is invalid")
+        if name in seen_names or type(ids) is not tuple:
+            raise TypeError("proof seed stage values are invalid")
+        copied_ids: list[int] = []
+        for record_id in ids:
+            if type(record_id) is not int or record_id < 1:
+                raise ValueError("proof seed record id is invalid")
+            copied_ids.append(record_id)
+        if len(copied_ids) != len(set(copied_ids)):
+            raise ValueError("proof seed ids must be unique per stage")
+        seen_names.add(name)
+        stages.append((name, tuple(copied_ids)))
+
+    if type(value.blocks) is not tuple:
+        raise TypeError("proof blocks must be a tuple")
+    blocks: list[SQLiteCandidateProofBlock] = []
+    block_ids: set[int] = set()
+    for block in value.blocks:
+        if type(block) is not SQLiteCandidateProofBlock:
+            raise TypeError("proof blocks contain an invalid value")
+        integers = (
+            block.block_id,
+            block.first_record_id,
+            block.last_record_id,
+            block.record_count,
+            block.min_source_fold_length,
+            block.max_source_fold_length,
+            block.character_intersection_upper,
+            block.bigram_intersection_upper,
+        )
+        if any(type(item) is not int or item < 0 for item in integers):
+            raise ValueError("proof block integer fact is invalid")
+        if (
+            block.block_id in block_ids
+            or block.record_count < 1
+            or block.first_record_id < 1
+            or block.last_record_id < block.first_record_id
+            or block.min_source_fold_length < 1
+            or block.max_source_fold_length < block.min_source_fold_length
+        ):
+            raise ValueError("proof block fact is invalid")
+        block_ids.add(block.block_id)
+        blocks.append(SQLiteCandidateProofBlock(**block.__dict__))
+    if type(value.total_record_count) is not int or value.total_record_count < 0:
+        raise ValueError("proof total record count is invalid")
+    if type(value.head_revision) is not int or value.head_revision < 0:
+        raise ValueError("proof head revision is invalid")
+    expected_block_ids = set(range(
+        (value.total_record_count + CANDIDATE_PROOF_BLOCK_SIZE - 1)
+        // CANDIDATE_PROOF_BLOCK_SIZE
+    ))
+    if block_ids != expected_block_ids:
+        raise ValueError("proof block identities do not close the universe")
+    for block in blocks:
+        expected_first = block.block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
+        expected_count = min(
+            CANDIDATE_PROOF_BLOCK_SIZE,
+            value.total_record_count - expected_first + 1,
+        )
+        if (
+            block.first_record_id != expected_first
+            or block.last_record_id
+            != expected_first + CANDIDATE_PROOF_BLOCK_SIZE - 1
+            or block.record_count != expected_count
+        ):
+            raise ValueError("proof block slot facts do not close")
+    if any(
+        record_id > value.total_record_count
+        for _name, ids in stages
+        for record_id in ids
+    ):
+        raise ValueError("proof seed identity is outside the proof universe")
+    return SQLiteCandidateProofSnapshot(
+        index_kind=value.index_kind,
+        seed_stages=tuple(stages),
+        blocks=tuple(blocks),
+        total_record_count=value.total_record_count,
+        head_revision=value.head_revision,
+    )
+
+
+def _block_upper_bound(
+    block: SQLiteCandidateProofBlock,
+    *,
+    query_length: int,
+) -> float:
+    query_bigram_count = max(query_length - 1, 0)
+    best = 0.0
+    length_span = block.max_source_fold_length - block.min_source_fold_length
+    if length_span > 4096:
+        return 1.0
+    for record_length in range(
+        block.min_source_fold_length,
+        block.max_source_fold_length + 1,
+    ):
+        bound = scorer_upper_bound_v1(
+            query_fold_length=query_length,
+            record_fold_length=record_length,
+            character_multiset_intersection=min(
+                block.character_intersection_upper,
+                query_length,
+                record_length,
+            ),
+            bigram_multiset_intersection=min(
+                block.bigram_intersection_upper,
+                query_bigram_count,
+                max(record_length - 1, 0),
+            ),
+            query_bigram_count=query_bigram_count,
+            record_bigram_count=max(record_length - 1, 0),
+        ).final_similarity_upper_bound
+        best = max(best, bound)
+    return best
+
+
+def _record_upper_bound(
+    record: SQLiteCandidateProofRecord,
+    *,
+    query_length: int,
+) -> float:
+    return scorer_upper_bound_v1(
+        query_fold_length=query_length,
+        record_fold_length=record.source_fold_length,
+        character_multiset_intersection=record.character_multiset_intersection,
+        bigram_multiset_intersection=record.bigram_multiset_intersection,
+        query_bigram_count=max(query_length - 1, 0),
+        record_bigram_count=max(record.source_fold_length - 1, 0),
+    ).final_similarity_upper_bound
+
+
+class CandidateProofSession:
+    """Private alternating proof port; Retrieval alone executes scorer-v1."""
+
+    def __init__(
+        self,
+        *,
+        resource_id: str,
+        view: SQLiteTMQueryView,
+        folded_query: str,
+        minimum_similarity: float,
+        result_limit: int,
+    ) -> None:
+        _validate_candidate_scalars(folded_query, result_limit)
+        if not folded_query:
+            raise ValueError("proof query must not be empty")
+        if type(minimum_similarity) is not float or not math.isfinite(minimum_similarity):
+            raise TypeError("minimum_similarity must be a finite float")
+        if not 0.0 <= minimum_similarity <= 1.0:
+            raise ValueError("minimum_similarity must be in [0, 1]")
+        if type(view) is not SQLiteTMQueryView or view.resource_id != resource_id:
+            raise TypeError("proof view must be the resource's exact query view")
+        self._view = view
+        self._resource_id = resource_id
+        self._folded_query = folded_query
+        self._minimum_similarity = minimum_similarity
+        self._result_limit = result_limit
+        self._budget = candidate_budget_v1(result_limit)
+        try:
+            snapshot = _copy_proof_snapshot(
+                view.candidate_proof_snapshot(
+                    folded_query=folded_query,
+                    seed_limit=min(256, self._budget),
+                )
+            )
+            expected_seed_names = (
+                ("FTS_TRIGRAM",)
+                if snapshot.index_kind == "FTS5_TRIGRAM"
+                else (
+                    ("GRAM_1",)
+                    if len(folded_query) == 1
+                    else (
+                        ("GRAM_2",)
+                        if len(folded_query) == 2
+                        else ("GRAM_3", "GRAM_2", "GRAM_1")
+                    )
+                )
+            )
+            if tuple(name for name, _ids in snapshot.seed_stages) != expected_seed_names:
+                raise ValueError("proof seed stages do not match the actual path")
+        except (TypeError, ValueError) as error:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID") from error
+        self._snapshot = snapshot
+        self._blocks_by_id = {block.block_id: block for block in snapshot.blocks}
+        self._record_by_id: dict[int, SQLiteCandidateProofRecord] = {}
+        self._upper_by_id: dict[int, float] = {}
+        self._block_heap: list[tuple[float, int, int]] = []
+        for block in snapshot.blocks:
+            upper = _block_upper_bound(block, query_length=len(folded_query))
+            possible_record_id = min(
+                block.last_record_id,
+                snapshot.total_record_count,
+            )
+            heapq.heappush(
+                self._block_heap,
+                (-upper, -possible_record_id, block.block_id),
+            )
+        self._record_heap: list[tuple[float, int, int]] = []
+        self._opened_blocks: set[int] = set()
+        self._outstanding: set[int] = set()
+        self._scores: dict[int, float] = {}
+        self._observation_order: list[int] = []
+        seed_ids = {
+            record_id
+            for _stage, ids in snapshot.seed_stages
+            for record_id in ids
+        }
+        self._seed_block_ids = tuple(sorted(
+            {
+                (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+                for record_id in seed_ids
+            }
+        ))
+        self._seed_blocks_opened = False
+
+    @property
+    def index_kind(self) -> str:
+        return self._snapshot.index_kind
+
+    def _open_block(self, block_id: int) -> None:
+        if block_id in self._opened_blocks:
+            return
+        block = self._blocks_by_id.get(block_id)
+        if block is None:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        records = self._view.candidate_proof_block_records(
+            folded_query=self._folded_query,
+            block=block,
+            head_revision=self._snapshot.head_revision,
+            total_record_count=self._snapshot.total_record_count,
+        )
+        if type(records) is not tuple or len(records) != block.record_count:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        expected_record_id = block.first_record_id
+        copied_records: list[SQLiteCandidateProofRecord] = []
+        for record in records:
+            if type(record) is not SQLiteCandidateProofRecord:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            integers = (
+                record.record_id,
+                record.block_id,
+                record.source_fold_length,
+                record.character_multiset_intersection,
+                record.bigram_multiset_intersection,
+            )
+            if (
+                any(type(item) is not int or item < 0 for item in integers)
+                or record.record_id != expected_record_id
+                or record.block_id != block_id
+                or record.source_fold_length < 1
+                or record.character_multiset_intersection
+                > min(len(self._folded_query), record.source_fold_length)
+                or record.bigram_multiset_intersection
+                > min(
+                    max(len(self._folded_query) - 1, 0),
+                    max(record.source_fold_length - 1, 0),
+                )
+            ):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            copied_records.append(SQLiteCandidateProofRecord(**record.__dict__))
+            expected_record_id += 1
+        if (
+            min(record.source_fold_length for record in copied_records)
+            != block.min_source_fold_length
+            or max(record.source_fold_length for record in copied_records)
+            != block.max_source_fold_length
+            or max(
+                record.character_multiset_intersection
+                for record in copied_records
+            ) > block.character_intersection_upper
+            or max(
+                record.bigram_multiset_intersection
+                for record in copied_records
+            ) > block.bigram_intersection_upper
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        self._opened_blocks.add(block_id)
+        for record in copied_records:
+            if record.record_id in self._record_by_id:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            self._record_by_id[record.record_id] = record
+            upper = _record_upper_bound(record, query_length=len(self._folded_query))
+            self._upper_by_id[record.record_id] = upper
+            heapq.heappush(self._record_heap, (-upper, -record.record_id, record.record_id))
+
+    def _open_seed_blocks(self) -> None:
+        if self._seed_blocks_opened:
+            return
+        for block_id in self._seed_block_ids:
+            self._open_block(block_id)
+        self._seed_blocks_opened = True
+
+    def _discard_opened_block_heads(self) -> None:
+        while self._block_heap and self._block_heap[0][2] in self._opened_blocks:
+            heapq.heappop(self._block_heap)
+
+    def _frontier(self) -> tuple[float, int] | None:
+        self._discard_opened_block_heads()
+        block_frontier = (
+            (-self._block_heap[0][0], -self._block_heap[0][1])
+            if self._block_heap
+            else None
+        )
+        record_frontier = (
+            (-self._record_heap[0][0], -self._record_heap[0][1])
+            if self._record_heap
+            else None
+        )
+        if block_frontier is None:
+            return record_frontier
+        if record_frontier is None:
+            return block_frontier
+        return max(block_frontier, record_frontier)
+
+    def _closure(self) -> tuple[bool, bool, tuple[float, int] | None]:
+        frontier = self._frontier()
+        threshold_closed = (
+            frontier is None or frontier[0] < self._minimum_similarity
+        )
+        total = self._snapshot.total_record_count
+        if total < self._result_limit:
+            top_k_closed = frontier is None
+        elif len(self._scores) < self._result_limit:
+            top_k_closed = False
+        else:
+            kth = heapq.nlargest(
+                self._result_limit,
+                (
+                    (score, record_id)
+                    for record_id, score in self._scores.items()
+                ),
+            )[-1]
+            top_k_closed = frontier is None or frontier < kth
+        return threshold_closed, top_k_closed, frontier
+
+    def next_batch(self) -> tuple[int, ...]:
+        self._open_seed_blocks()
+        threshold_closed, top_k_closed, _frontier = self._closure()
+        if threshold_closed and top_k_closed:
+            return ()
+        batch: list[int] = []
+        batch_limit = CANDIDATE_PROOF_BATCH_SIZE
+        if len(self._scores) < self._result_limit:
+            batch_limit = min(
+                batch_limit,
+                self._result_limit - len(self._scores),
+            )
+        while len(batch) < batch_limit:
+            self._discard_opened_block_heads()
+            block_key = (
+                (-self._block_heap[0][0], -self._block_heap[0][1])
+                if self._block_heap
+                else None
+            )
+            record_key = (
+                (-self._record_heap[0][0], -self._record_heap[0][1])
+                if self._record_heap
+                else None
+            )
+            if block_key is not None and (
+                record_key is None or block_key >= record_key
+            ):
+                _neg_upper, _neg_id, block_id = heapq.heappop(self._block_heap)
+                self._open_block(block_id)
+                if not batch:
+                    threshold_closed, top_k_closed, _frontier = self._closure()
+                    if threshold_closed and top_k_closed:
+                        return ()
+                continue
+            if not self._record_heap:
+                break
+            if len(self._scores) + len(self._outstanding) >= self._budget:
+                raise CandidateProofBudgetExhausted()
+            _neg_upper, _neg_id, record_id = heapq.heappop(self._record_heap)
+            if record_id in self._scores or record_id in self._outstanding:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            self._outstanding.add(record_id)
+            batch.append(record_id)
+            if len(self._scores) + len(self._outstanding) >= self._budget:
+                break
+        if not batch:
+            threshold_closed, top_k_closed, _frontier = self._closure()
+            if not (threshold_closed and top_k_closed):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        return tuple(batch)
+
+    def observe(self, observations: tuple[tuple[int, SimilarityEvidence], ...]) -> None:
+        if type(observations) is not tuple:
+            raise TypeError("proof observations must be a tuple")
+        seen: set[int] = set()
+        for item in observations:
+            if type(item) is not tuple or len(item) != 2:
+                raise TypeError("proof observation is invalid")
+            record_id, evidence = item
+            if type(record_id) is not int or record_id in seen or record_id not in self._outstanding:
+                raise ValueError("proof score identity is invalid")
+            if type(evidence) is not SimilarityEvidence:
+                raise TypeError("proof score evidence is invalid")
+            score = evidence.final_similarity
+            if (
+                evidence.scorer_version != "scorer-v1"
+                or type(score) is not float
+                or not math.isfinite(score)
+                or not 0.0 <= score <= 1.0
+                or score > self._upper_by_id[record_id] + 1e-12
+            ):
+                raise ValueError("proof score evidence does not close")
+            seen.add(record_id)
+            self._scores[record_id] = score
+            self._observation_order.append(record_id)
+        if seen != self._outstanding:
+            raise ValueError("proof observations must close the outstanding batch")
+        self._outstanding.clear()
+
+    def finish(self) -> CandidateRetrievalReport:
+        if self._outstanding:
+            raise ValueError("proof has an outstanding scorer batch")
+        threshold_closed, top_k_closed, frontier = self._closure()
+        if not (threshold_closed and top_k_closed):
+            if len(self._scores) >= self._budget:
+                raise CandidateProofBudgetExhausted()
+            raise ValueError("candidate proof is not closed")
+        self._view.validate_candidate_proof_generation(
+            head_revision=self._snapshot.head_revision,
+            total_record_count=self._snapshot.total_record_count,
+        )
+        kth = (
+            heapq.nlargest(
+                self._result_limit,
+                (
+                    (score, record_id)
+                    for record_id, score in self._scores.items()
+                ),
+            )[-1]
+            if self._snapshot.total_record_count >= self._result_limit
+            else None
+        )
+        proof = CandidateProofMetadata(
+            proof_version=CANDIDATE_PROOF_QUERY_VERSION,
+            bound_version=SCORER_BOUND_VERSION_V1,
+            block_version=CANDIDATE_PROOF_BLOCK_VERSION_V1,
+            total_block_count=len(self._snapshot.blocks),
+            total_record_count=self._snapshot.total_record_count,
+            opened_block_count=len(self._opened_blocks),
+            inspected_record_count=sum(
+                self._blocks_by_id[block_id].record_count
+                for block_id in self._opened_blocks
+            ),
+            seed_unique_count=len({
+                record_id
+                for _stage, ids in self._snapshot.seed_stages
+                for record_id in ids
+            }),
+            scored_count=len(self._scores),
+            unscored_count=self._snapshot.total_record_count - len(self._scores),
+            unscored_max_upper_bound=(None if frontier is None else frontier[0]),
+            unscored_possible_record_id=(None if frontier is None else frontier[1]),
+            minimum_similarity=self._minimum_similarity,
+            threshold_closed=threshold_closed,
+            top_k=self._result_limit,
+            kth_score=(None if kth is None else kth[0]),
+            kth_record_id=(None if kth is None else kth[1]),
+            top_k_closed=top_k_closed,
+        )
+        seed_pool: set[int] = set()
+        stages: list[CandidateStageMetadata] = []
+        for stage_name, ids in self._snapshot.seed_stages:
+            before = len(seed_pool)
+            seed_pool.update(ids)
+            stages.append(CandidateStageMetadata(
+                stage=CandidateStage(stage_name),
+                input_count=before,
+                added_unique_count=len(seed_pool) - before,
+                output_unique_count=len(seed_pool),
+                dropped_count=0,
+            ))
+        scored_ids = set(self._scores)
+        stages.append(CandidateStageMetadata(
+            stage=CandidateStage.BOUND_PROOF,
+            input_count=len(seed_pool),
+            added_unique_count=len(scored_ids - seed_pool),
+            output_unique_count=len(scored_ids),
+            dropped_count=len(seed_pool - scored_ids),
+        ))
+        for stage in (CandidateStage.UNION, CandidateStage.DEDUPLICATE):
+            stages.append(CandidateStageMetadata(
+                stage=stage,
+                input_count=len(scored_ids),
+                added_unique_count=0,
+                output_unique_count=len(scored_ids),
+                dropped_count=0,
+            ))
+        query_gram_count = len(self._folded_query) + max(len(self._folded_query) - 1, 0)
+        candidates = tuple(
+            CandidateEvidence(
+                record_id=record_id,
+                recall_stages=(CandidateStage.BOUND_PROOF,),
+                matched_grams=(
+                    self._record_by_id[record_id].character_multiset_intersection
+                    + self._record_by_id[record_id].bigram_multiset_intersection
+                ),
+                query_grams=query_gram_count,
+                overlap_ratio=(
+                    (
+                        self._record_by_id[record_id].character_multiset_intersection
+                        + self._record_by_id[record_id].bigram_multiset_intersection
+                    ) / query_gram_count
+                ),
+                pretruncate_rank=index,
+            )
+            for index, record_id in enumerate(self._observation_order, start=1)
+        )
+        return CandidateRetrievalReport(
+            candidates=candidates,
+            metadata=CandidateRecallMetadata(
+                resource_id=self._resource_id,
+                index_kind=self._snapshot.index_kind,
+                fuzzy_available=True,
+                fuzzy_unavailable_code=None,
+                stages=tuple(stages),
+                union_unique_count=len(scored_ids),
+                deduplicated_count=len(scored_ids),
+                result_limit=self._result_limit,
+                candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+                candidate_budget=self._budget,
+                truncated=False,
+                proof=proof,
+            ),
+        )
+
+
 
 class CandidateRetriever:
     """Sole recall orchestrator for candidate-budget-v1 evidence."""
@@ -754,10 +1328,34 @@ class CandidateRetriever:
             snapshot,
         )
 
+    def proof_session_from_view(
+        self,
+        resource_id: str,
+        view: SQLiteTMQueryView,
+        folded_query: str,
+        *,
+        minimum_similarity: float,
+        result_limit: int,
+    ) -> CandidateProofSession:
+        """Create the private alternating proof port on one query view."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise ValueError("resource_id must be a non-empty built-in string")
+        return CandidateProofSession(
+            resource_id=resource_id,
+            view=view,
+            folded_query=folded_query,
+            minimum_similarity=minimum_similarity,
+            result_limit=result_limit,
+        )
+
 
 
 __all__ = [
     "CANDIDATE_CONTRACT_FLOOR",
+    "CANDIDATE_PROOF_BUDGET_EXHAUSTED",
+    "CandidateProofBudgetExhausted",
+    "CandidateProofSession",
     "CandidateRetriever",
     "FTS5CandidateResult",
     "FTS5TrigramIndex",

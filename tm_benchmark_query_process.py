@@ -6,8 +6,9 @@ Ownership
 This module is the benchmark-v1 query-process execution bridge.  It consumes
 an exact-type Task 8.3 ``TMBenchmarkProcessEvidence`` (whose migration child
 has already exited), reopens the same canonical store artifact in a brand-new
-query child, runs the real production exact and ``fold-v1 -> CandidateRetriever
--> records_by_id -> scorer-v1 -> threshold -> stable top-k`` pipeline through
+query child, runs the real production exact and ``fold-v1 -> bounded
+seed/proof -> records_by_id/scorer-v1 batches -> proof closure -> threshold
+-> stable top-k`` pipeline through
 the Task 8.2 latency runner, samples the query child peak RSS, and returns
 strict self-validating raw evidence.  It is an offline validation/batch owner
 only: no production runtime module imports it, and it never constructs a
@@ -66,7 +67,6 @@ import sys
 import time
 from unittest.mock import patch
 
-from text_matcher import fold_text_v1
 from tm_benchmark import benchmark_digest, iter_fuzzy_queries
 from tm_benchmark_latency import (
     DEFAULT_TIMING_CLOCK_NAME,
@@ -92,7 +92,6 @@ from tm_benchmark_process import (
     process_evidence_to_payload,
     rss_peak_bytes_facts,
 )
-from tm_candidate_index import CandidateRetriever
 from tm_contracts import (
     BENCHMARK_RSS_SCOPE,
     BenchmarkContract,
@@ -102,7 +101,7 @@ from tm_contracts import (
     benchmark_contract_digest,
     benchmark_environment_digest,
 )
-from tm_retrieval import score_fuzzy_candidates
+from tm_retrieval import prove_and_score_fuzzy_candidates
 from tm_sqlite_store import ResourceStoreCoordinator, SQLiteTMStore
 
 QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-query-process-evidence-v1"
@@ -2142,27 +2141,6 @@ class _RealStoreExecutor:
     ) -> _FuzzyOutcome:
         if requested_path is not self._actual_path:
             raise _WorkerError("QUERY.REQUESTED_PATH_MISMATCH")
-        folded_query = fold_text_v1(query_raw).folded_text
-        try:
-            report = CandidateRetriever().candidates(
-                self._resource_id,
-                self._store,
-                folded_query,
-                result_limit=top_k,
-            )
-        except Exception as error:
-            raise _WorkerError("QUERY.CANDIDATE_EXECUTION_FAILED") from error
-        metadata = report.metadata
-        if metadata.index_kind != self._actual_index_kind:
-            raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
-        if not metadata.fuzzy_available:
-            raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
-        try:
-            records = self._store.records_by_id(
-                tuple(candidate.record_id for candidate in report.candidates)
-            )
-        except Exception as error:
-            raise _WorkerError("QUERY.RECORD_FETCH_FAILED") from error
         query = TMQuery(
             query_source=query_raw,
             speaker_raw=None,
@@ -2173,17 +2151,26 @@ class _RealStoreExecutor:
             resource_order=(self._resource_id,),
         )
         try:
-            result = score_fuzzy_candidates(
-                resource_id=self._resource_id,
-                resource_order=0,
-                query=query,
-                report=report,
-                records=records,
-                scorer=None,
-            )
+            with self._store.query_lease() as view:
+                result, report = prove_and_score_fuzzy_candidates(
+                    resource_id=self._resource_id,
+                    resource_order=0,
+                    query=query,
+                    view=view,
+                )
         except Exception as error:
-            raise _WorkerError("QUERY.SCORING_FAILED") from error
-        # ``score_fuzzy_candidates`` owns threshold filtering and stable
+            raise _WorkerError("QUERY.CANDIDATE_EXECUTION_FAILED") from error
+        metadata = report.metadata
+        if metadata.index_kind != self._actual_index_kind:
+            raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
+        if not metadata.fuzzy_available or metadata.proof is None:
+            raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
+        if not (
+            metadata.proof.threshold_closed
+            and metadata.proof.top_k_closed
+        ):
+            raise _WorkerError("QUERY.CANDIDATE_PROOF_OPEN")
+        # The production proof/scoring chain owns threshold filtering and stable
         # per-resource ordering but intentionally leaves the cross-resource
         # limit to the production service.  This benchmark has exactly one
         # resource, so the production global top-k is the first ``top_k``
@@ -2351,21 +2338,6 @@ def _run_probe(
             raise _WorkerError("QUERY.EXECUTOR_FAILED")
         fuzzy_result_count = 0
         for fuzzy_query in fuzzy_queries:
-            folded_query = fold_text_v1(fuzzy_query.query_raw).folded_text
-            report = CandidateRetriever().candidates(
-                request.resource_id,
-                store,
-                folded_query,
-                result_limit=request.process_evidence.contract.top_k,
-            )
-            metadata = report.metadata
-            if metadata.index_kind != actual_index_kind:
-                raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
-            if not metadata.fuzzy_available:
-                raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
-            records = store.records_by_id(
-                tuple(candidate.record_id for candidate in report.candidates)
-            )
             query = TMQuery(
                 query_source=fuzzy_query.query_raw,
                 speaker_raw=None,
@@ -2375,14 +2347,23 @@ def _run_probe(
                 limit=request.process_evidence.contract.top_k,
                 resource_order=(request.resource_id,),
             )
-            result = score_fuzzy_candidates(
-                resource_id=request.resource_id,
-                resource_order=0,
-                query=query,
-                report=report,
-                records=records,
-                scorer=None,
-            )
+            with store.query_lease() as view:
+                result, report = prove_and_score_fuzzy_candidates(
+                    resource_id=request.resource_id,
+                    resource_order=0,
+                    query=query,
+                    view=view,
+                )
+            metadata = report.metadata
+            if metadata.index_kind != actual_index_kind:
+                raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
+            if not metadata.fuzzy_available or metadata.proof is None:
+                raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
+            if not (
+                metadata.proof.threshold_closed
+                and metadata.proof.top_k_closed
+            ):
+                raise _WorkerError("QUERY.CANDIDATE_PROOF_OPEN")
             fuzzy_result_count += len(result.accepted)
     except _WorkerError:
         raise

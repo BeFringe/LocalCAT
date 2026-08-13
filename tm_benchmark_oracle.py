@@ -40,12 +40,13 @@ distinct from the dense physical ids assigned by SQLite: an explicit one-to-one
 physical-id<->original-record-id mapping is created, closed, and validated
 (duplicates/missing/extras/reordering ambiguity all fail closed), and every
 candidate id is translated back to original identity before comparison.
-Candidate input uses production fold-v1 and candidate-budget-v1 with
-``result_limit=10`` (the contract ``top_k``); the final scorer is never called
-in candidate retrieval.  The evidence records the actual per-query index kind,
-budget, truncation and availability facts; FTS absence or any per-query index
-kind that does not match the requested path is an explicit unavailable/fail
-outcome, never silently relabeled.
+Candidate input uses the production proof/scorer chain, fold-v1 and
+candidate-budget-v1 with ``result_limit=10`` (the contract ``top_k``).
+Candidate identities come only from the chain's real closed report, never a
+caller-derived completeness set.  The evidence records the actual per-query
+index kind, budget, truncation and availability facts; FTS absence or any
+per-query index kind that does not match the requested path is an explicit
+unavailable/fail outcome, never silently relabeled.
 
 Evidence contract
 -----------------
@@ -86,7 +87,6 @@ import unicodedata
 from typing import Protocol
 from unittest.mock import patch
 
-from text_matcher import fold_text_v1
 from tm_benchmark import (
     BenchmarkQuery,
     BenchmarkRecord,
@@ -106,6 +106,7 @@ from tm_contracts import (
     SCORER_VERSION_V1,
     BenchmarkContract,
     BenchmarkExecutionPath,
+    TMQuery,
     benchmark_contract_digest,
     benchmark_environment_digest,
     candidate_budget_v1,
@@ -113,6 +114,7 @@ from tm_contracts import (
     contract_to_json,
 )
 from tm_migration import TMMigrationService
+from tm_retrieval import prove_and_score_fuzzy_candidates
 from tm_similarity import SimilarityScorerV1
 from tm_sqlite_store import (
     ResourceStoreCoordinator,
@@ -867,20 +869,34 @@ def _run_candidate_path(
             tuple[int, tuple[int, ...], str, bool, str | None, bool]
         ] = []
         for query in queries:
-            folded_query = fold_text_v1(query.query_raw).folded_text
-            if type(folded_query) is not str:
-                raise TypeError("folded query must be a built-in string")
-            report = retriever.candidates(
-                resource_id,
-                store,
-                folded_query,
-                result_limit=contract.top_k,
+            production_query = TMQuery(
+                query_source=query.query_raw,
+                speaker_raw=None,
+                context_prev_raw=None,
+                context_next_raw=None,
+                minimum_similarity=contract.minimum_similarity,
+                limit=contract.top_k,
+                resource_order=(resource_id,),
             )
+            with store.query_lease() as view:
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id=resource_id,
+                    resource_order=0,
+                    query=production_query,
+                    view=view,
+                    retriever=retriever,
+                    scorer=SimilarityScorerV1(),
+                )
             metadata = report.metadata
             if metadata.result_limit != contract.top_k:
                 raise RuntimeError("candidate result limit drift")
             if metadata.candidate_budget_version != CANDIDATE_BUDGET_VERSION:
                 raise RuntimeError("candidate budget version drift")
+            if metadata.proof is None or not (
+                metadata.proof.threshold_closed
+                and metadata.proof.top_k_closed
+            ):
+                raise RuntimeError("candidate proof closure is missing")
             candidate_original_ids: list[int] = []
             if metadata.fuzzy_available:
                 if metadata.fuzzy_unavailable_code is not None:

@@ -34,6 +34,8 @@ MATCHER_VALIDATION_SUMMARY_VERSION = "matcher-validation-summary-v1"
 MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v2"
 MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 2
 CANDIDATE_BUDGET_VERSION = "candidate-budget-v1"
+CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
+CANDIDATE_PROOF_QUERY_VERSION = "candidate-proof-query-v1"
 BENCHMARK_CONTRACT_VERSION = "benchmark-v1"
 BENCHMARK_SUITE_VERSION = "benchmark-suite-v1"
 BENCHMARK_PERCENTILE_METHOD = "nearest-rank"
@@ -510,6 +512,7 @@ class CandidateStage(str, Enum):
     GRAM_3 = "GRAM_3"
     GRAM_2 = "GRAM_2"
     GRAM_1 = "GRAM_1"
+    BOUND_PROOF = "BOUND_PROOF"
     UNION = "UNION"
     DEDUPLICATE = "DEDUPLICATE"
     TRUNCATE = "TRUNCATE"
@@ -526,6 +529,7 @@ _CANDIDATE_STAGE_ORDER = {
     for position, stage in enumerate(
         (
             *_CANDIDATE_SOURCE_STAGES,
+            CandidateStage.BOUND_PROOF,
             CandidateStage.UNION,
             CandidateStage.DEDUPLICATE,
             CandidateStage.TRUNCATE,
@@ -554,6 +558,143 @@ class CandidateStageMetadata:
 
     def __post_init__(self) -> None:
         _validate_candidate_stage_metadata(self)
+
+
+@dataclass(frozen=True)
+class CandidateProofMetadata:
+    """Versioned closure facts for one bounded proof/scorer query."""
+
+    proof_version: str
+    bound_version: str
+    block_version: str
+    total_block_count: int
+    total_record_count: int
+    opened_block_count: int
+    inspected_record_count: int
+    seed_unique_count: int
+    scored_count: int
+    unscored_count: int
+    unscored_max_upper_bound: float | None
+    unscored_possible_record_id: int | None
+    minimum_similarity: float
+    threshold_closed: bool
+    top_k: int
+    kth_score: float | None
+    kth_record_id: int | None
+    top_k_closed: bool
+
+    def __post_init__(self) -> None:
+        _validate_candidate_proof_metadata(self)
+
+
+def _validate_candidate_proof_metadata(
+    metadata: CandidateProofMetadata,
+) -> None:
+    for field_name, value in (
+        ("proof version", metadata.proof_version),
+        ("bound version", metadata.bound_version),
+        ("block version", metadata.block_version),
+    ):
+        if type(value) is not str or not value:
+            raise TypeError(f"candidate {field_name} must be an exact non-empty string")
+    if metadata.proof_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise ValueError(
+            f"candidate proof version must be {CANDIDATE_PROOF_QUERY_VERSION}"
+        )
+    if metadata.bound_version != SCORER_BOUND_VERSION_V1:
+        raise ValueError(
+            f"candidate bound version must be {SCORER_BOUND_VERSION_V1}"
+        )
+    if metadata.block_version != CANDIDATE_PROOF_BLOCK_VERSION_V1:
+        raise ValueError(
+            "candidate block version must be "
+            f"{CANDIDATE_PROOF_BLOCK_VERSION_V1}"
+        )
+    for field_name, value in (
+        ("total block count", metadata.total_block_count),
+        ("total record count", metadata.total_record_count),
+        ("opened block count", metadata.opened_block_count),
+        ("inspected record count", metadata.inspected_record_count),
+        ("seed unique count", metadata.seed_unique_count),
+        ("scored count", metadata.scored_count),
+        ("unscored count", metadata.unscored_count),
+    ):
+        if type(value) is not int:
+            raise TypeError(
+                f"candidate proof {field_name} must be an exact non-negative integer"
+            )
+        if value < 0:
+            raise ValueError(f"candidate proof {field_name} must be non-negative")
+    if type(metadata.minimum_similarity) is not float:
+        raise TypeError("candidate proof threshold must be an exact float")
+    _require_ratio(metadata.minimum_similarity, "candidate proof threshold")
+    if type(metadata.threshold_closed) is not bool:
+        raise TypeError("candidate threshold closed must be an exact boolean")
+    if type(metadata.top_k) is not int:
+        raise TypeError("candidate proof top k must be an exact positive integer")
+    if metadata.top_k < 1:
+        raise ValueError("candidate proof top k must be positive")
+    if type(metadata.top_k_closed) is not bool:
+        raise TypeError("candidate top-k closed must be an exact boolean")
+    if metadata.total_block_count != (
+        (metadata.total_record_count + 255) // 256
+    ):
+        raise ValueError("candidate proof block count does not close the universe")
+    if metadata.opened_block_count > metadata.total_block_count:
+        raise ValueError("opened proof blocks exceed total blocks")
+    if metadata.inspected_record_count > metadata.total_record_count:
+        raise ValueError("inspected proof records exceed total records")
+    if metadata.scored_count + metadata.unscored_count != metadata.total_record_count:
+        raise ValueError("candidate proof scored/unscored counts do not conserve")
+    if metadata.scored_count > metadata.inspected_record_count:
+        raise ValueError("candidate proof scored count exceeds inspected records")
+    if metadata.seed_unique_count > metadata.inspected_record_count:
+        raise ValueError("candidate proof seed count exceeds inspected records")
+    if metadata.seed_unique_count > metadata.total_record_count:
+        raise ValueError("candidate proof seed count exceeds total records")
+
+    frontier_pair = (
+        metadata.unscored_max_upper_bound,
+        metadata.unscored_possible_record_id,
+    )
+    if metadata.unscored_count == 0:
+        if frontier_pair != (None, None):
+            raise ValueError("exhausted proof cannot carry an unscored frontier")
+    else:
+        upper_bound, record_id = frontier_pair
+        if type(upper_bound) is not float:
+            raise TypeError("unscored maximum upper bound must be a float")
+        _require_ratio(upper_bound, "unscored maximum upper bound")
+        _require_int(record_id, "unscored possible record id", minimum=1)
+
+    if metadata.threshold_closed:
+        if (
+            metadata.unscored_count
+            and metadata.unscored_max_upper_bound is not None
+            and metadata.unscored_max_upper_bound >= metadata.minimum_similarity
+        ):
+            raise ValueError("threshold proof frontier is not strictly closed")
+
+    kth_pair = (metadata.kth_score, metadata.kth_record_id)
+    if metadata.total_record_count < metadata.top_k:
+        if kth_pair != (None, None):
+            raise ValueError("short corpus cannot carry a kth proof row")
+        if metadata.top_k_closed and metadata.unscored_count:
+            raise ValueError("short-corpus top-k closes only after exhaustion")
+    elif metadata.top_k_closed:
+        kth_score, kth_record_id = kth_pair
+        if type(kth_score) is not float:
+            raise TypeError("closed top-k proof requires a float kth score")
+        _require_ratio(kth_score, "candidate proof kth score")
+        _require_int(kth_record_id, "candidate proof kth record id", minimum=1)
+        if metadata.unscored_count:
+            frontier_score = metadata.unscored_max_upper_bound
+            frontier_id = metadata.unscored_possible_record_id
+            assert frontier_score is not None and frontier_id is not None
+            if (frontier_score, frontier_id) >= (kth_score, kth_record_id):
+                raise ValueError("unscored frontier can still outrank kth result")
+    elif kth_pair != (None, None):
+        raise ValueError("open top-k proof cannot publish a kth closure row")
 
 
 def _validate_candidate_stage_metadata(
@@ -618,6 +759,7 @@ class CandidateRecallMetadata:
     candidate_budget_version: str
     candidate_budget: int
     truncated: bool
+    proof: CandidateProofMetadata | None = None
 
     def __post_init__(self) -> None:
         _validate_candidate_recall_metadata(self)
@@ -659,6 +801,12 @@ def _validate_candidate_recall_metadata(
             "candidate budget must equal candidate-budget-v1 for result limit"
         )
     _require_bool(metadata.truncated, "candidate truncated")
+    if metadata.proof is not None:
+        if type(metadata.proof) is not CandidateProofMetadata:
+            raise TypeError("candidate proof must be CandidateProofMetadata or None")
+        _validate_candidate_proof_metadata(metadata.proof)
+        if metadata.proof.scored_count > metadata.candidate_budget:
+            raise ValueError("candidate proof scored count exceeds candidate budget")
 
     stages = _require_tuple(metadata.stages, "candidate stages")
     if any(
@@ -681,6 +829,10 @@ def _validate_candidate_recall_metadata(
                 "available fuzzy recall must include executed stages"
             )
     else:
+        if metadata.proof is not None:
+            raise ValueError(
+                "fuzzy unavailable recall cannot carry candidate proof metadata"
+            )
         if metadata.fuzzy_unavailable_code is None:
             raise ValueError(
                 "fuzzy unavailable code is required when fuzzy is unavailable"
@@ -730,7 +882,11 @@ def _validate_candidate_recall_metadata(
             "candidate stage order must end with UNION, DEDUPLICATE"
             + (", TRUNCATE" if metadata.truncated else "")
         )
-    source_stages = stage_values[:-len(expected_suffix)]
+    prefix_stages = stage_values[:-len(expected_suffix)]
+    has_bound_proof = CandidateStage.BOUND_PROOF in prefix_stages
+    source_stages = tuple(
+        stage for stage in prefix_stages if stage is not CandidateStage.BOUND_PROOF
+    )
     if not source_stages or any(
         stage not in _CANDIDATE_SOURCE_STAGES
         for stage in source_stages
@@ -738,6 +894,13 @@ def _validate_candidate_recall_metadata(
         raise ValueError(
             "candidate stage order must start with recall source stages"
         )
+    if has_bound_proof:
+        if prefix_stages[-1] is not CandidateStage.BOUND_PROOF:
+            raise ValueError("BOUND_PROOF must follow all seed source stages")
+        if metadata.proof is None:
+            raise ValueError("BOUND_PROOF requires candidate proof metadata")
+    elif metadata.proof is not None:
+        raise ValueError("candidate proof metadata requires BOUND_PROOF")
     if metadata.index_kind == "FTS5_TRIGRAM":
         if CandidateStage.FTS_TRIGRAM not in source_stages:
             raise ValueError(
@@ -771,6 +934,17 @@ def _validate_candidate_recall_metadata(
         raise ValueError(
             "DEDUPLICATE output must equal deduplicated count"
         )
+    if metadata.proof is not None:
+        proof_stage = stages[stage_values.index(CandidateStage.BOUND_PROOF)]
+        if proof_stage.output_unique_count != metadata.proof.scored_count:
+            raise ValueError("BOUND_PROOF output must equal proof scored count")
+        if metadata.union_unique_count != metadata.proof.scored_count:
+            raise ValueError("proof scored count must equal union unique count")
+        if not (
+            metadata.proof.threshold_closed
+            and metadata.proof.top_k_closed
+        ):
+            raise ValueError("published candidate proof must close threshold and top-k")
 
     if metadata.truncated:
         truncate_metadata = stages[-1]
@@ -822,11 +996,11 @@ def _validate_candidate_evidence(evidence: CandidateEvidence) -> None:
             "candidate recall stages must contain CandidateStage values"
         )
     if any(
-        stage not in _CANDIDATE_SOURCE_STAGES
+        stage not in (*_CANDIDATE_SOURCE_STAGES, CandidateStage.BOUND_PROOF)
         for stage in recall_stages
     ):
         raise ValueError(
-            "candidate recall stages may contain only recall source stages"
+            "candidate recall stages may contain only seed/proof stages"
         )
     if len(recall_stages) != len(set(recall_stages)):
         raise ValueError("candidate recall stages must be unique")
@@ -836,7 +1010,14 @@ def _validate_candidate_evidence(evidence: CandidateEvidence) -> None:
     )
     if positions != tuple(sorted(positions)):
         raise ValueError("candidate recall stages must be in stable order")
-    _require_int(evidence.matched_grams, "matched grams", minimum=1)
+    minimum_matched = (
+        0 if CandidateStage.BOUND_PROOF in recall_stages else 1
+    )
+    _require_int(
+        evidence.matched_grams,
+        "matched grams",
+        minimum=minimum_matched,
+    )
     _require_int(evidence.query_grams, "query grams", minimum=1)
     if evidence.matched_grams > evidence.query_grams:
         raise ValueError("matched grams must not exceed query grams")
@@ -901,14 +1082,15 @@ def _validate_candidate_retrieval_report(
     record_ids = tuple(candidate.record_id for candidate in candidates)
     if len(record_ids) != len(set(record_ids)):
         raise ValueError("candidate values must have unique record ids")
-    executed_source_stages = {
+    executed_evidence_stages = {
         stage_metadata.stage
         for stage_metadata in report.metadata.stages
-        if stage_metadata.stage in _CANDIDATE_SOURCE_STAGES
+        if stage_metadata.stage
+        in (*_CANDIDATE_SOURCE_STAGES, CandidateStage.BOUND_PROOF)
     }
     for candidate in candidates:
         if not set(candidate.recall_stages).issubset(
-            executed_source_stages
+            executed_evidence_stages
         ):
             raise ValueError(
                 "candidate recall stages must be executed by metadata"
@@ -1078,11 +1260,37 @@ class QueryReport:
                 "resource returned counts must not exceed global result limit"
             )
         result_ids = {result.resource_id for result in results}
-        if result_ids.intersection(failure_ids):
+        metadata_by_id = {
+            metadata.resource_id: metadata for metadata in resource_metadata
+        }
+        partial_proof_failure_ids: set[str] = set()
+        for failure in failures:
+            metadata = metadata_by_id.get(failure.resource_id)
+            if metadata is None:
+                continue
+            if (
+                failure.stage != "PROOF"
+                or metadata.recall.fuzzy_available
+                or metadata.recall.fuzzy_unavailable_code != failure.error_code
+                or any(
+                    result.resource_id == failure.resource_id
+                    and result.match_type is TMMatchType.FUZZY
+                    for result in results
+                )
+            ):
+                raise ValueError(
+                    "only a closed fuzzy proof failure may retain exact/context metadata"
+                )
+            partial_proof_failure_ids.add(failure.resource_id)
+        if result_ids.intersection(failure_ids).difference(
+            partial_proof_failure_ids
+        ):
             raise ValueError(
                 "a failed query resource cannot also contribute results"
             )
-        if set(metadata_ids).intersection(failure_ids):
+        if set(metadata_ids).intersection(failure_ids).difference(
+            partial_proof_failure_ids
+        ):
             raise ValueError(
                 "a failed query resource cannot also contribute metadata"
             )
@@ -4217,6 +4425,7 @@ type TMContract = (
     | ContextEvidence
     | TMResult
     | CandidateStageMetadata
+    | CandidateProofMetadata
     | CandidateRecallMetadata
     | CandidateEvidence
     | CandidateRetrievalReport
@@ -4320,6 +4529,31 @@ def _encode_candidate_stage_metadata(
     }
 
 
+def _encode_candidate_proof_metadata(
+    metadata: CandidateProofMetadata,
+) -> dict[str, Any]:
+    return {
+        "block_version": metadata.block_version,
+        "bound_version": metadata.bound_version,
+        "inspected_record_count": metadata.inspected_record_count,
+        "kth_record_id": metadata.kth_record_id,
+        "kth_score": metadata.kth_score,
+        "minimum_similarity": metadata.minimum_similarity,
+        "opened_block_count": metadata.opened_block_count,
+        "proof_version": metadata.proof_version,
+        "scored_count": metadata.scored_count,
+        "seed_unique_count": metadata.seed_unique_count,
+        "threshold_closed": metadata.threshold_closed,
+        "top_k": metadata.top_k,
+        "top_k_closed": metadata.top_k_closed,
+        "total_block_count": metadata.total_block_count,
+        "total_record_count": metadata.total_record_count,
+        "unscored_count": metadata.unscored_count,
+        "unscored_max_upper_bound": metadata.unscored_max_upper_bound,
+        "unscored_possible_record_id": metadata.unscored_possible_record_id,
+    }
+
+
 def _encode_candidate_recall_metadata(
     metadata: CandidateRecallMetadata,
 ) -> dict[str, Any]:
@@ -4330,6 +4564,11 @@ def _encode_candidate_recall_metadata(
         "fuzzy_available": metadata.fuzzy_available,
         "fuzzy_unavailable_code": metadata.fuzzy_unavailable_code,
         "index_kind": metadata.index_kind,
+        "proof": (
+            None
+            if metadata.proof is None
+            else _encode_candidate_proof_metadata(metadata.proof)
+        ),
         "resource_id": metadata.resource_id,
         "result_limit": metadata.result_limit,
         "stages": [
@@ -4861,6 +5100,12 @@ def _contract_payload(contract: TMContract) -> tuple[str, dict[str, Any]]:
         return (
             "CandidateRecallMetadata",
             _encode_candidate_recall_metadata(contract),
+        )
+    if isinstance(contract, CandidateProofMetadata):
+        _validate_candidate_proof_metadata(contract)
+        return (
+            "CandidateProofMetadata",
+            _encode_candidate_proof_metadata(contract),
         )
     if isinstance(contract, CandidateEvidence):
         _validate_candidate_evidence(contract)
@@ -6009,6 +6254,7 @@ def _decode_candidate_recall_metadata(
             "fuzzy_available",
             "fuzzy_unavailable_code",
             "index_kind",
+            "proof",
             "resource_id",
             "result_limit",
             "stages",
@@ -6031,7 +6277,42 @@ def _decode_candidate_recall_metadata(
         candidate_budget_version=payload["candidate_budget_version"],
         candidate_budget=payload["candidate_budget"],
         truncated=payload["truncated"],
+        proof=(
+            None
+            if payload["proof"] is None
+            else _decode_candidate_proof_metadata(payload["proof"])
+        ),
     )
+
+
+def _decode_candidate_proof_metadata(
+    value: object,
+) -> CandidateProofMetadata:
+    payload = _strict_fields(
+        value,
+        "CandidateProofMetadata payload",
+        (
+            "block_version",
+            "bound_version",
+            "inspected_record_count",
+            "kth_record_id",
+            "kth_score",
+            "minimum_similarity",
+            "opened_block_count",
+            "proof_version",
+            "scored_count",
+            "seed_unique_count",
+            "threshold_closed",
+            "top_k",
+            "top_k_closed",
+            "total_block_count",
+            "total_record_count",
+            "unscored_count",
+            "unscored_max_upper_bound",
+            "unscored_possible_record_id",
+        ),
+    )
+    return CandidateProofMetadata(**payload)
 
 
 def _decode_candidate_evidence(value: object) -> CandidateEvidence:
@@ -6460,6 +6741,8 @@ def _decode_payload(contract_type: str, value: object) -> TMContract:
         return _decode_result(value)
     if contract_type == "CandidateStageMetadata":
         return _decode_candidate_stage_metadata(value)
+    if contract_type == "CandidateProofMetadata":
+        return _decode_candidate_proof_metadata(value)
     if contract_type == "CandidateRecallMetadata":
         return _decode_candidate_recall_metadata(value)
     if contract_type == "CandidateEvidence":
@@ -6646,6 +6929,8 @@ __all__ = [
     "BENCHMARK_SUITE_VERSION",
     "CANONICAL_RESOURCE_IDENTITY_VERSION",
     "CANDIDATE_BUDGET_VERSION",
+    "CANDIDATE_PROOF_QUERY_VERSION",
+    "CANDIDATE_PROOF_BLOCK_VERSION_V1",
     "GENERATION_EXPECTATION_VERSION",
     "SCORER_BOUND_VERSION_V1",
     "SCORER_VERSION_V1",
@@ -6665,6 +6950,7 @@ __all__ = [
     "BenchmarkSuiteReport",
     "CanonicalResourceIdentity",
     "CandidateEvidence",
+    "CandidateProofMetadata",
     "CandidateRecallMetadata",
     "CandidateRetrievalReport",
     "CandidateStage",

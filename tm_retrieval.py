@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
 from text_matcher import fold_text_v1
-from tm_candidate_index import CandidateRetriever
+from tm_candidate_index import CandidateProofSession, CandidateRetriever
 from tm_retrieval_capability import (
     RetrievalCapabilityEvidenceSummary,
     RetrievalCapabilityPublisher,
@@ -52,6 +52,7 @@ from tm_retrieval_capability import (
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
     CandidateEvidence,
+    CandidateProofMetadata,
     CandidateRecallMetadata,
     CandidateRetrievalReport,
     CandidateStage,
@@ -206,6 +207,12 @@ def _snapshot_recall_metadata(
         _snapshot_candidate_stage_metadata(stage_metadata)
         for stage_metadata in stages
     )
+    proof = metadata.proof
+    proof_snapshot = (
+        None
+        if proof is None
+        else _snapshot_candidate_proof_metadata(proof)
+    )
     return CandidateRecallMetadata(
         resource_id=metadata.resource_id,
         index_kind=metadata.index_kind,
@@ -218,6 +225,37 @@ def _snapshot_recall_metadata(
         candidate_budget_version=metadata.candidate_budget_version,
         candidate_budget=metadata.candidate_budget,
         truncated=metadata.truncated,
+        proof=proof_snapshot,
+    )
+
+
+def _snapshot_candidate_proof_metadata(
+    metadata: CandidateProofMetadata,
+) -> CandidateProofMetadata:
+    _require_exact_type(
+        metadata,
+        CandidateProofMetadata,
+        "candidate proof metadata",
+    )
+    return CandidateProofMetadata(
+        proof_version=metadata.proof_version,
+        bound_version=metadata.bound_version,
+        block_version=metadata.block_version,
+        total_block_count=metadata.total_block_count,
+        total_record_count=metadata.total_record_count,
+        opened_block_count=metadata.opened_block_count,
+        inspected_record_count=metadata.inspected_record_count,
+        seed_unique_count=metadata.seed_unique_count,
+        scored_count=metadata.scored_count,
+        unscored_count=metadata.unscored_count,
+        unscored_max_upper_bound=metadata.unscored_max_upper_bound,
+        unscored_possible_record_id=metadata.unscored_possible_record_id,
+        minimum_similarity=metadata.minimum_similarity,
+        threshold_closed=metadata.threshold_closed,
+        top_k=metadata.top_k,
+        kth_score=metadata.kth_score,
+        kth_record_id=metadata.kth_record_id,
+        top_k_closed=metadata.top_k_closed,
     )
 
 
@@ -692,6 +730,145 @@ def score_fuzzy_candidates(
     )
 
 
+def prove_and_score_fuzzy_candidates(
+    *,
+    resource_id: str,
+    resource_order: int,
+    query: TMQuery,
+    view: object,
+    retriever: CandidateRetriever | None = None,
+    scorer: SimilarityScorer | None = None,
+    proof_session_port: Callable[..., CandidateProofSession] | None = None,
+) -> tuple[FuzzyScoringResult, CandidateRetrievalReport]:
+    """Alternate conservative proof expansion with scorer-v1 execution.
+
+    Candidate ownership supplies only bounded seed/proof facts and receives
+    exact scorer observations.  Retrieval owns the single scorer invocation
+    for each inspected identity, canonical record loading in small batches,
+    threshold filtering, and deterministic result ordering.
+    """
+
+    _require_exact_type(resource_id, str, "resource_id")
+    _require_exact_type(resource_order, int, "resource_order")
+    _require_exact_type(query, TMQuery, "query")
+    if not resource_id.strip():
+        raise ValueError("resource_id must not be empty")
+    if resource_order < 0:
+        raise ValueError("resource_order must be non-negative")
+    query_snapshot = _snapshot_query(query)
+    folded_query = fold_text_v1(query_snapshot.query_source).folded_text
+    if type(folded_query) is not str or not folded_query:
+        raise ValueError("proof query must fold to non-empty text")
+    if proof_session_port is None:
+        if retriever is None:
+            retriever = CandidateRetriever()
+        candidate_port = getattr(retriever, "proof_session_from_view", None)
+        if not callable(candidate_port):
+            raise TypeError("retriever must implement proof_session_from_view")
+        proof_session_port = cast(
+            Callable[..., CandidateProofSession],
+            candidate_port,
+        )
+    session = cast(
+        CandidateProofSession,
+        proof_session_port(
+            resource_id,
+            view,
+            folded_query,
+            minimum_similarity=float(query_snapshot.minimum_similarity),
+            result_limit=query_snapshot.limit,
+        ),
+    )
+    records_port = getattr(view, "records_by_id", None)
+    if not callable(records_port):
+        raise TypeError("query view must implement records_by_id")
+    if scorer is None:
+        score_callable = SimilarityScorerV1().score
+    else:
+        scorer_score = getattr(scorer, "score", None)
+        if not callable(scorer_score):
+            raise TypeError("scorer must implement the score port")
+        score_callable = cast(
+            Callable[[str, str], SimilarityEvidence],
+            scorer_score,
+        )
+
+    observed: dict[int, tuple[_FuzzyRecordSnapshot, SimilarityEvidence]] = {}
+    while True:
+        record_ids = session.next_batch()
+        _require_exact_type(record_ids, tuple, "proof record ids")
+        if not record_ids:
+            break
+        raw_records = records_port(record_ids)
+        _require_exact_type(raw_records, tuple, "proof records")
+        records = cast(tuple[TMRecord, ...], raw_records)
+        if len(records) != len(record_ids):
+            raise ValueError("proof records must close the requested batch")
+        snapshots = tuple(_snapshot_record(record) for record in records)
+        if tuple(record.record_id for record in snapshots) != record_ids:
+            raise ValueError("proof records must preserve requested identity order")
+        observations: list[tuple[int, SimilarityEvidence]] = []
+        for record in snapshots:
+            if record.record_id in observed:
+                raise ValueError("proof identity must be scored exactly once")
+            evidence = _snapshot_evidence(
+                score_callable(
+                    query_snapshot.query_source,
+                    record.source_raw,
+                )
+            )
+            if evidence.final_similarity != (
+                evidence.levenshtein_ratio + evidence.dice_bigram
+            ) / 2.0:
+                raise ValueError("scorer-v1 evidence components do not close")
+            observed[record.record_id] = (record, evidence)
+            observations.append((record.record_id, evidence))
+        session.observe(tuple(observations))
+
+    report = _snapshot_candidate_report(session.finish())
+    candidate_ids = tuple(candidate.record_id for candidate in report.candidates)
+    if candidate_ids != tuple(observed):
+        raise ValueError("proof report identities must equal scorer observations")
+    proof = report.metadata.proof
+    if (
+        proof is None
+        or not proof.threshold_closed
+        or not proof.top_k_closed
+        or proof.scored_count != len(observed)
+    ):
+        raise ValueError("proof report must publish closed scorer conservation")
+
+    accepted: list[TMResult] = []
+    for record, evidence in observed.values():
+        if record.source_raw == query_snapshot.query_source:
+            continue
+        if evidence.final_similarity < query_snapshot.minimum_similarity:
+            continue
+        accepted.append(TMResult(
+            resource_id=resource_id,
+            record_id=record.record_id,
+            query_source=query_snapshot.query_source,
+            matched_source=record.source_raw,
+            target=record.target_raw,
+            match_type=TMMatchType.FUZZY,
+            similarity=evidence.final_similarity,
+            similarity_evidence=evidence,
+            context_evidence=_empty_context_evidence(),
+            provenance=record.provenance,
+            stable_tie_key=(resource_order, record.record_id),
+        ))
+    accepted.sort(key=lambda result: (-result.similarity, -result.record_id))
+    return (
+        FuzzyScoringResult(
+            resource_id=resource_id,
+            resource_order=resource_order,
+            accepted=tuple(accepted),
+            scored_count=len(observed),
+        ),
+        report,
+    )
+
+
 # --- Task 7.3 service composition -------------------------------------------
 
 _UNHEALTHY_CODE = "RETRIEVAL.STORE_UNHEALTHY"
@@ -1025,6 +1202,8 @@ class _LazyRetrieverPort:
     def __init__(self, retriever: object) -> None:
         self._retriever = retriever
         self._port: Callable[..., CandidateRetrievalReport] | None = None
+        self._proof_port: Callable[..., CandidateProofSession] | None = None
+        self._proof_checked = False
 
     def port(self) -> Callable[..., CandidateRetrievalReport]:
         if self._port is None:
@@ -1038,6 +1217,17 @@ class _LazyRetrieverPort:
                 port,
             )
         return self._port
+
+    def proof_port(self) -> Callable[..., CandidateProofSession] | None:
+        if not self._proof_checked:
+            port = _safe_attr(self._retriever, "proof_session_from_view")
+            if callable(port):
+                self._proof_port = cast(
+                    Callable[..., CandidateProofSession],
+                    port,
+                )
+            self._proof_checked = True
+        return self._proof_port
 
 
 class _LazyScorerPort:
@@ -1142,7 +1332,7 @@ class TMRetrievalService:
             if not (snapshot.active and snapshot.lookup):
                 continue
             try:
-                local_results, metadata = self._query_resource(
+                local_results, metadata, local_failure = self._query_resource(
                     snapshot,
                     query_snapshot,
                     capability_snapshot,
@@ -1171,6 +1361,13 @@ class TMRetrievalService:
                 )
                 continue
             local_outcomes.append((local_results, metadata))
+            if local_failure is not None:
+                failures.append(ResourceQueryFailure(
+                    resource_id=snapshot.resource_id,
+                    stage=local_failure.stage,
+                    error_code=local_failure.error_code,
+                    retryable=local_failure.retryable,
+                ))
 
         all_results = [
             result
@@ -1217,7 +1414,11 @@ class TMRetrievalService:
         lazy_retriever: _LazyRetrieverPort,
         lazy_scorer: _LazyScorerPort,
         folded_query: str,
-    ) -> tuple[tuple[TMResult, ...], ResourceQueryMetadata]:
+    ) -> tuple[
+        tuple[TMResult, ...],
+        ResourceQueryMetadata,
+        _ResourcePipelineFailure | None,
+    ]:
         store = snapshot.store
         query_lease_port = _safe_attr(store, "query_lease")
         if not callable(query_lease_port):
@@ -1313,63 +1514,103 @@ class TMRetrievalService:
                     )
 
                 if fuzzy_available:
-                    with _stage_guard("RECALL"):
-                        retriever_port = lazy_retriever.port()
-                        report = retriever_port(
-                            snapshot.resource_id,
-                            view,
-                            folded_query,
-                            result_limit=query.limit,
-                        )
-                        report_snapshot = _snapshot_candidate_report(report)
-                        if (
-                            report_snapshot.metadata.resource_id
-                            != snapshot.resource_id
-                        ):
-                            raise _ResourcePipelineFailure(
-                                stage="RECALL",
-                                error_code=_NORMALIZED_FAILURE_CODE,
+                    proof_session_port = lazy_retriever.proof_port()
+                    if proof_session_port is not None:
+                        try:
+                            with _stage_guard("PROOF"):
+                                fuzzy, report = prove_and_score_fuzzy_candidates(
+                                    resource_id=snapshot.resource_id,
+                                    resource_order=snapshot.order,
+                                    query=query,
+                                    view=view,
+                                    scorer=cast(Any, lazy_scorer),
+                                    proof_session_port=proof_session_port,
+                                )
+                                report_snapshot = _snapshot_candidate_report(report)
+                                if (
+                                    report_snapshot.metadata.resource_id
+                                    != snapshot.resource_id
+                                ):
+                                    raise ValueError(
+                                        "proof report resource binding drift"
+                                    )
+                                if report_snapshot.metadata.result_limit != query.limit:
+                                    raise ValueError(
+                                        "proof report result-limit binding drift"
+                                    )
+                                if report_snapshot.metadata.index_kind != intended_path:
+                                    raise _ResourcePipelineFailure(
+                                        stage="PROOF",
+                                        error_code=_RECALL_PATH_MISMATCH_CODE,
+                                    )
+                        except _ResourcePipelineFailure as proof_failure:
+                            recall_metadata = _unavailable_recall_metadata(
+                                resource_id=snapshot.resource_id,
+                                index_kind=intended_path,
+                                result_limit=query.limit,
+                                fuzzy_unavailable_code=proof_failure.error_code,
                             )
-                        if (
-                            report_snapshot.metadata.result_limit
-                            != query.limit
-                        ):
-                            raise _ResourcePipelineFailure(
-                                stage="RECALL",
-                                error_code=_NORMALIZED_FAILURE_CODE,
+                            scored_count = 0
+                            fuzzy_results = ()
+                            local_failure: _ResourcePipelineFailure | None = proof_failure
+                        else:
+                            recall_metadata = report_snapshot.metadata
+                            scored_count = fuzzy.scored_count
+                            fuzzy_results = fuzzy.accepted
+                            local_failure = None
+                    else:
+                        with _stage_guard("RECALL"):
+                            retriever_port = lazy_retriever.port()
+                            report = retriever_port(
+                                snapshot.resource_id,
+                                view,
+                                folded_query,
+                                result_limit=query.limit,
                             )
-                        if (
-                            report_snapshot.metadata.index_kind
-                            != intended_path
-                        ):
-                            raise _ResourcePipelineFailure(
-                                stage="RECALL",
-                                error_code=_RECALL_PATH_MISMATCH_CODE,
+                            report_snapshot = _snapshot_candidate_report(report)
+                            if (
+                                report_snapshot.metadata.resource_id
+                                != snapshot.resource_id
+                            ):
+                                raise _ResourcePipelineFailure(
+                                    stage="RECALL",
+                                    error_code=_NORMALIZED_FAILURE_CODE,
+                                )
+                            if report_snapshot.metadata.result_limit != query.limit:
+                                raise _ResourcePipelineFailure(
+                                    stage="RECALL",
+                                    error_code=_NORMALIZED_FAILURE_CODE,
+                                )
+                            if report_snapshot.metadata.index_kind != intended_path:
+                                raise _ResourcePipelineFailure(
+                                    stage="RECALL",
+                                    error_code=_RECALL_PATH_MISMATCH_CODE,
+                                )
+                            candidate_ids = tuple(
+                                candidate.record_id
+                                for candidate in report_snapshot.candidates
                             )
-                        candidate_ids = tuple(
-                            candidate.record_id
-                            for candidate in report_snapshot.candidates
-                        )
-                    with _stage_guard("RECORDS"):
-                        records_port = _safe_attr(view, "records_by_id")
-                        if not callable(records_port):
-                            raise _ResourcePipelineFailure(
-                                stage="RECORDS",
-                                error_code=_QUERY_VIEW_INVALID_CODE,
+                        with _stage_guard("RECORDS"):
+                            records_port = _safe_attr(view, "records_by_id")
+                            if not callable(records_port):
+                                raise _ResourcePipelineFailure(
+                                    stage="RECORDS",
+                                    error_code=_QUERY_VIEW_INVALID_CODE,
+                                )
+                            batch_records = cast(Any, records_port)(candidate_ids)
+                        with _stage_guard("SCORE"):
+                            fuzzy = score_fuzzy_candidates(
+                                resource_id=snapshot.resource_id,
+                                resource_order=snapshot.order,
+                                query=query,
+                                report=report_snapshot,
+                                records=batch_records,
+                                scorer=cast(Any, lazy_scorer),
                             )
-                        batch_records = cast(Any, records_port)(candidate_ids)
-                    with _stage_guard("SCORE"):
-                        fuzzy = score_fuzzy_candidates(
-                            resource_id=snapshot.resource_id,
-                            resource_order=snapshot.order,
-                            query=query,
-                            report=report_snapshot,
-                            records=batch_records,
-                            scorer=cast(Any, lazy_scorer),
-                        )
-                    recall_metadata = report_snapshot.metadata
-                    scored_count = fuzzy.scored_count
-                    fuzzy_results = fuzzy.accepted
+                        recall_metadata = report_snapshot.metadata
+                        scored_count = fuzzy.scored_count
+                        fuzzy_results = fuzzy.accepted
+                        local_failure = None
                 else:
                     with _stage_guard("RECALL"):
                         recall_metadata = _unavailable_recall_metadata(
@@ -1383,6 +1624,7 @@ class TMRetrievalService:
                         )
                     scored_count = 0
                     fuzzy_results = ()
+                    local_failure = None
 
                 with _stage_guard("QUERY"):
                     if context_available:
@@ -1402,7 +1644,7 @@ class TMRetrievalService:
                         scored_count=scored_count,
                         returned_count=0,
                     )
-                return local_results, metadata
+                return local_results, metadata, local_failure
         except _ResourcePipelineFailure:
             raise
         except Exception as error:
