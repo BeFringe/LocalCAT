@@ -377,7 +377,7 @@
   - 完成时，既有回归零失败且所有依赖方向守卫通过
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.7, 9.10, 9.12_
 
-- [ ] 9.5 对照全部验收标准完成发布门
+- [x] 9.5 对照全部验收标准完成发布门
   - 将 9 项需求的 86 条验收标准逐项关联到最新自动测试、故障证据、oracle 或 benchmark 报告
   - 任一证据缺失、失败、过期或版本不一致时保持对应能力未完成，不宣告 Feature GO
   - 完成时，86/86 覆盖矩阵均指向具体、可重算且版本一致的验证入口
@@ -450,3 +450,4 @@
 - 2026-08-13 / Cluster K 复审：原生 xhigh reviewer 以迁移/激活/snapshot 的闭合故障模型做累积复审，最终批准且无 P0–P3 遗留；复审把单行 strict handoff codec 扩展为 receipt↔handoff 闭世界关系，明确 nonterminal 一对一、missing/orphan fail-stop 与 terminal post-clear 唯一缺席例外，并保持行级错误优先级和全部资产保全。Gate C source roots 随 store 身份变化机械重算且不改变 cohort 或 Gate D 语义；主 agent fresh 全量 1423/1423（skip 1，含 Qt smoke），字面 5000/200 oracle 仍为两路径各 `missing_top10=27`，FUZZY 保持关闭。
 - 2026-08-13 / Task 9.3：新增独立于 fault taxonomy 的 `tm-acceptance-matrix-v1` 行为证据矩阵，以 18 行闭集覆盖 matcher 三态/证据降级/用途选项/single-snapshot/无正文诊断、raw context 分类、candidate union/dedupe/truncate、global limit、资源局部失败、gate-closed 与零命中区分、matcher/CONTEXT/FUZZY 不冒充以及逐阶段 metadata 守恒。每行绑定生产 seam、单一断言契约和精确 unittest id；验证器只接受当前 checkout 与 canonical evidence 输出，以逐组件 no-follow regular source 摘要拒绝改名、替代 root、symlink 或 stale 源码。18/18 行、49 个引用及 matrix 8/8 全部通过，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；Gate D 的真实性保持不变，FUZZY 未因行为证据通过而开放。
 - 2026-08-13 / Task 9.4：将 compatibility/priority/Excel/selfcheck/privacy/isolation/SQLite policy/architecture 收束为 14 行验收证据，累计 acceptance matrix 32 行、78 个精确引用。新增 disposable cwd + `-B` 子进程覆盖 TMEngine、stress runner 与 translation runner 旧自检；静态守卫以设计拥有的 28 个 Core 文件闭集和 Qt/Glossary/Legacy/Controller consumer 集合为权威，拒绝网络/账号/telemetry/凭据/外部服务依赖、Core 反向导入 Qt/Parser/TMX/Glossary，以及 consumer 通过普通 import、`__import__`、字面 `importlib.import_module`、readiness 标识符或 validation-summary 字符串取得第二权威。兼容/Excel/Legacy/selfcheck/architecture focused 35/35、matrix 8/8，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；现有 LogicController→Glossary 合法兼容职责没有被误归为 Core 依赖违规。
+- 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
