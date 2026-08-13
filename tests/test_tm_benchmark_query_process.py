@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 import hashlib
 import json
 import os
@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import tm_benchmark_query_process
 from tm_benchmark import load_benchmark_contract
 from tm_benchmark_latency import (
     LATENCY_EVIDENCE_SCHEMA_VERSION,
@@ -717,6 +718,41 @@ class WorkerProtocolTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 2)
+
+    def test_latency_boundary_preserves_stable_worker_code(self) -> None:
+        specific = tm_benchmark_query_process._WorkerError(
+            "QUERY.FUZZY_UNAVAILABLE"
+        )
+        with patch(
+            "tm_benchmark_query_process.measure_path_latency",
+            side_effect=specific,
+        ):
+            with self.assertRaises(
+                tm_benchmark_query_process._WorkerError
+            ) as ctx:
+                tm_benchmark_query_process._measure_latency_evidence(
+                    contract=_CONTRACT,
+                    requested_path=_FTS5,
+                    executor=cast(Any, None),
+                    environment=_latency_environment("true"),
+                )
+        self.assertIs(ctx.exception, specific)
+
+    def test_latency_boundary_maps_unclassified_failure(self) -> None:
+        with patch(
+            "tm_benchmark_query_process.measure_path_latency",
+            side_effect=ValueError("query body must not escape"),
+        ):
+            with self.assertRaises(
+                tm_benchmark_query_process._WorkerError
+            ) as ctx:
+                tm_benchmark_query_process._measure_latency_evidence(
+                    contract=_CONTRACT,
+                    requested_path=_FTS5,
+                    executor=cast(Any, None),
+                    environment=_latency_environment("true"),
+                )
+        self.assertEqual(ctx.exception.error_code, "QUERY.LATENCY_FAILED")
 
     def test_worker_rejects_request_fact_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

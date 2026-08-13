@@ -2118,10 +2118,17 @@ class _RealStoreExecutor:
         *,
         requested_path: BenchmarkExecutionPath,
     ) -> _ExactOutcome:
-        records = self._store.exact_records(query_raw)
+        if requested_path is not self._actual_path:
+            raise _WorkerError("QUERY.REQUESTED_PATH_MISMATCH")
+        try:
+            records = self._store.exact_records(query_raw)
+        except Exception as error:
+            raise _WorkerError("QUERY.EXACT_EXECUTION_FAILED") from error
+        if not records:
+            raise _WorkerError("QUERY.EXACT_NO_MATCH")
         return _ExactOutcome(
             actual_path=self._actual_path,
-            succeeded=len(records) > 0,
+            succeeded=True,
             result_count=len(records),
         )
 
@@ -2133,21 +2140,29 @@ class _RealStoreExecutor:
         minimum_similarity: float,
         top_k: int,
     ) -> _FuzzyOutcome:
+        if requested_path is not self._actual_path:
+            raise _WorkerError("QUERY.REQUESTED_PATH_MISMATCH")
         folded_query = fold_text_v1(query_raw).folded_text
-        report = CandidateRetriever().candidates(
-            self._resource_id,
-            self._store,
-            folded_query,
-            result_limit=top_k,
-        )
+        try:
+            report = CandidateRetriever().candidates(
+                self._resource_id,
+                self._store,
+                folded_query,
+                result_limit=top_k,
+            )
+        except Exception as error:
+            raise _WorkerError("QUERY.CANDIDATE_EXECUTION_FAILED") from error
         metadata = report.metadata
         if metadata.index_kind != self._actual_index_kind:
             raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
         if not metadata.fuzzy_available:
             raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
-        records = self._store.records_by_id(
-            tuple(candidate.record_id for candidate in report.candidates)
-        )
+        try:
+            records = self._store.records_by_id(
+                tuple(candidate.record_id for candidate in report.candidates)
+            )
+        except Exception as error:
+            raise _WorkerError("QUERY.RECORD_FETCH_FAILED") from error
         query = TMQuery(
             query_source=query_raw,
             speaker_raw=None,
@@ -2157,18 +2172,27 @@ class _RealStoreExecutor:
             limit=top_k,
             resource_order=(self._resource_id,),
         )
-        result = score_fuzzy_candidates(
-            resource_id=self._resource_id,
-            resource_order=0,
-            query=query,
-            report=report,
-            records=records,
-            scorer=None,
-        )
+        try:
+            result = score_fuzzy_candidates(
+                resource_id=self._resource_id,
+                resource_order=0,
+                query=query,
+                report=report,
+                records=records,
+                scorer=None,
+            )
+        except Exception as error:
+            raise _WorkerError("QUERY.SCORING_FAILED") from error
+        # ``score_fuzzy_candidates`` owns threshold filtering and stable
+        # per-resource ordering but intentionally leaves the cross-resource
+        # limit to the production service.  This benchmark has exactly one
+        # resource, so the production global top-k is the first ``top_k``
+        # values of that already stable order.
+        stable_top_k = result.accepted[:top_k]
         return _FuzzyOutcome(
             actual_path=self._actual_path,
             succeeded=True,
-            result_count=len(result.accepted),
+            result_count=len(stable_top_k),
             minimum_similarity=minimum_similarity,
             top_k=top_k,
         )
@@ -2208,6 +2232,27 @@ def _latency_environment(
     )
     environment["fts5_enabled"] = "true" if fts5_enabled else "false"
     return tuple(sorted(environment.items()))
+
+
+def _measure_latency_evidence(
+    *,
+    contract: BenchmarkContract,
+    requested_path: BenchmarkExecutionPath,
+    executor: LatencyExecutor,
+    environment: tuple[tuple[str, str], ...],
+) -> LatencyEvidence:
+    """Run the latency owner without erasing its stable worker failures."""
+    try:
+        return measure_path_latency(
+            contract=contract,
+            requested_path=requested_path,
+            executor=executor,
+            environment=environment,
+        )
+    except _WorkerError:
+        raise
+    except Exception as error:
+        raise _WorkerError("QUERY.LATENCY_FAILED") from error
 
 
 def _reopen_store(request: _WorkerRequest) -> tuple[
@@ -2474,15 +2519,12 @@ def _run_evidence(
         fts5_enabled=fts5_enabled,
         contract=contract,
     )
-    try:
-        latency_evidence = measure_path_latency(
-            contract=contract,
-            requested_path=request.execution_path,
-            executor=executor,
-            environment=environment,
-        )
-    except Exception as error:
-        raise _WorkerError("QUERY.LATENCY_FAILED") from error
+    latency_evidence = _measure_latency_evidence(
+        contract=contract,
+        requested_path=request.execution_path,
+        executor=executor,
+        environment=environment,
+    )
     try:
         artifact_post = verify_canonical_artifact(
             run_root=run_root,
