@@ -4120,8 +4120,11 @@ class TMClusterFRegressionTests(unittest.TestCase):
     def test_issued_deleted_or_orphaned_handoff_blocks(self) -> None:
         self._assert_deleted_or_orphaned_handoff_blocks("issued")
 
-    def test_configured_issued_missing_handoff_and_all_artifacts_absent_blocks(
+    def _assert_configured_issued_missing_handoff_blocks(
         self,
+        *,
+        divergence_latched: bool,
+        artifacts_present: bool,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4135,13 +4138,15 @@ class TMClusterFRegressionTests(unittest.TestCase):
             )
             _register_refresh(store, receipt)
             paths = _paths(identity)
-            for artifact in (
+            artifacts = (
                 paths.jsonl_temp,
                 paths.manifest_temp,
                 paths.jsonl_recovery,
                 paths.manifest_recovery,
-            ):
-                artifact.unlink(missing_ok=True)
+            )
+            if not artifacts_present:
+                for artifact in artifacts:
+                    artifact.unlink(missing_ok=True)
             connection = sqlite3.connect(stage.staged_db_path)
             try:
                 changed = connection.execute(
@@ -4149,6 +4154,12 @@ class TMClusterFRegressionTests(unittest.TestCase):
                     ("artifact_handoff." + receipt.snapshot_id,),
                 )
                 self.assertEqual(changed.rowcount, 1)
+                if divergence_latched:
+                    latched = connection.execute(
+                        "UPDATE tm_meta SET value = '1' "
+                        "WHERE key = 'divergence_latched'"
+                    )
+                    self.assertEqual(latched.rowcount, 1)
                 connection.commit()
             finally:
                 connection.close()
@@ -4161,6 +4172,11 @@ class TMClusterFRegressionTests(unittest.TestCase):
             }
             binding_before = _binding_row(stage.staged_db_path)
             canonical_before = store.capture_export_snapshot()
+            artifacts_before = {
+                path: (path.read_bytes(), _identity_of(path))
+                for path in artifacts
+                if path.exists()
+            }
 
             outcome = _fresh_store(stage).recover_configured_refresh()
 
@@ -4185,17 +4201,21 @@ class TMClusterFRegressionTests(unittest.TestCase):
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
                 "issued",
             )
-            self.assertTrue(
-                all(
-                    not artifact.exists()
-                    for artifact in (
-                        paths.jsonl_temp,
-                        paths.manifest_temp,
-                        paths.jsonl_recovery,
-                        paths.manifest_recovery,
-                    )
-                )
+            self.assertEqual(
+                _meta_value(stage.staged_db_path, "divergence_latched"),
+                "1" if divergence_latched else "0",
             )
+            if artifacts_present:
+                for path, expected in artifacts_before.items():
+                    self.assertEqual(
+                        (path.read_bytes(), _identity_of(path)),
+                        expected,
+                        path.name,
+                    )
+            else:
+                self.assertTrue(
+                    all(not artifact.exists() for artifact in artifacts)
+                )
             for path, expected in pair_before.items():
                 self.assertEqual(
                     (path.read_bytes(), _identity_of(path)),
@@ -4210,6 +4230,30 @@ class TMClusterFRegressionTests(unittest.TestCase):
                 store.capture_export_snapshot(),
                 canonical_before,
             )
+
+    def test_configured_issued_missing_handoff_and_all_artifacts_absent_blocks(
+        self,
+    ) -> None:
+        self._assert_configured_issued_missing_handoff_blocks(
+            divergence_latched=False,
+            artifacts_present=False,
+        )
+
+    def test_diverged_configured_issued_missing_handoff_absent_blocks(
+        self,
+    ) -> None:
+        self._assert_configured_issued_missing_handoff_blocks(
+            divergence_latched=True,
+            artifacts_present=False,
+        )
+
+    def test_diverged_configured_issued_missing_handoff_present_blocks(
+        self,
+    ) -> None:
+        self._assert_configured_issued_missing_handoff_blocks(
+            divergence_latched=True,
+            artifacts_present=True,
+        )
 
     def test_export_issued_missing_handoff_and_all_artifacts_absent_blocks(
         self,

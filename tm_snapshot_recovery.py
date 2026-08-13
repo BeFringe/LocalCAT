@@ -2016,6 +2016,28 @@ def recover_snapshot_publication(
             read_error_retryable = error.retryable
             diagnostics.append(error.error_code)
             break
+        issued_refresh = _issued_refresh_receipts(facts)
+        if not facts.binding_invalid and all(
+            _refresh_receipt_row_error(facts, receipt) is None
+            for receipt in issued_refresh
+        ):
+            missing_handoffs = tuple(
+                receipt
+                for receipt in issued_refresh
+                if _handoff_for(facts, receipt.snapshot_id) is None
+            )
+            if missing_handoffs:
+                for receipt in missing_handoffs:
+                    per_receipt.append(
+                        IssuedReceiptRecovery(
+                            receipt.snapshot_id,
+                            RefreshRecoveryState.BLOCKED,
+                            ("RECOVERY.HANDOFF_MISSING",),
+                        )
+                    )
+                overall = RefreshRecoveryState.BLOCKED
+                diagnostics.append("RECOVERY.HANDOFF_MISSING")
+                break
         if facts.divergence_latched:
             diagnostics.append("RECOVERY.DIVERGENCE_PRESERVED")
             _replayed, replay_state = _replay_terminal_handoffs(
@@ -2042,30 +2064,8 @@ def recover_snapshot_publication(
             and overall is RefreshRecoveryState.NOOP
         ):
             overall = replay_state
-        issued_refresh = _issued_refresh_receipts(facts)
         if not issued_refresh:
             break
-        if not facts.binding_invalid and all(
-            _refresh_receipt_row_error(facts, receipt) is None
-            for receipt in issued_refresh
-        ):
-            missing_handoffs = tuple(
-                receipt
-                for receipt in issued_refresh
-                if _handoff_for(facts, receipt.snapshot_id) is None
-            )
-            if missing_handoffs:
-                for receipt in missing_handoffs:
-                    per_receipt.append(
-                        IssuedReceiptRecovery(
-                            receipt.snapshot_id,
-                            RefreshRecoveryState.BLOCKED,
-                            ("RECOVERY.HANDOFF_MISSING",),
-                        )
-                    )
-                overall = RefreshRecoveryState.BLOCKED
-                diagnostics.append("RECOVERY.HANDOFF_MISSING")
-                break
         decision = _classify_refresh_receipts(facts, issued_refresh)
         try:
             if decision.action == "cancel":
