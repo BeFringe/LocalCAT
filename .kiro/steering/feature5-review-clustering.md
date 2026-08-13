@@ -84,7 +84,7 @@
 
 **I — Capability gate C：** CONTEXT 与 FUZZY 独立可用性门 + Gate C 证据聚合。任一子门失败只能关闭自身，不得撤销 canonical exact/save 或另一个已验证子门，因此 review 提升为 `high`。
 
-**J — Benchmark subsystem：** 自包含测量流水线。Task 8.1 闭合后的实际体量表明，latency、独立子进程/RSS、oracle recall 必须按 owner seam 分开，Gate D 再做唯一组合与能力发布；分文件不分集群，仍只在五个任务全部闭合后复审一次。"数字是否满足硬门"只是最后一步；复审还要排除有利样本选择、digest/环境/统计口径漂移、fast-path 成功掩盖 fallback 失败。oracle recall=100% 是正确性硬约束。
+**J — Benchmark subsystem：** 自包含测量流水线。Task 8.1 闭合后的实际体量表明，latency、独立子进程/RSS、oracle recall 必须按 owner seam 分开，Gate D 再做唯一组合与能力发布；分文件不分集群，仍只在五个任务全部闭合后复审一次。Task 8.5 内部的 migration/query 必须保持两个独立 child 生命周期：查询 child 只按 process evidence 锁定的 artifact identity/digest 重开同一 canonical store，不伪造跨进程 handle，不二次迁移；可移植 bundle 不得发布临时绝对路径/PID。"数字是否满足硬门"只是最后一步；复审还要排除有利样本选择、调用方派生事实自授权、artifact 换代、digest/环境/统计口径漂移、fast-path 成功掩盖 fallback 失败。oracle recall=100% 是正确性硬约束；Task 8.4 实际双路径均漏掉 27 个 true top-10 identity，因此 8.5 必须如实关闭两条 FUZZY path，不得把其改写为实施失败或放宽硬门。
 
 **K — Fault injection：** 测试 D + F + E 的负空间。共享同一方法论和"prior 资产必须存活"不变量。
 
@@ -165,6 +165,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v11 | 2026-08-13 | Task 8.4 暴露调用方派生 oracle 事实自授权风险，Task 8.5 预审又确认 migration child 不能跨进程交付 store handle；因此增加 artifact-identity-bound query child 与 portable evidence bundle 不发布临时路径/PID 的闭合门，保持 Cluster J 边界、强度和硬门不变。 |
 | v10 | 2026-08-12 | Task 8.1 闭合后按实际体量将 Cluster J 内部分为 corpus、latency、process/RSS、oracle 与 Gate D owner seam；保持 8.1–8.5 单集群、单次累积复审和原硬门不变。 |
 | v9 | 2026-08-12 | 将 invariant capsule 与 mutation-proof ledger 从集群复审前移到首次实现 dispatch；按独立状态机/owner 权威而非文件行数裁剪 assignment，并以目标 worktree 的 Git 身份、磁盘 diff 与新鲜验证裁决返回叙述冲突。 |
 | v8 | 2026-08-11 | 将 Cluster G 从简化双态分支收紧为 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷启动权威矩阵；在集群闭合门加入 provider-independent downstream invariant capsule，防止前序已批准语义在后续实施中丢失。 |

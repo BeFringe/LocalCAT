@@ -342,6 +342,7 @@
 
 - [ ] 8.5 执行 fast/fallback 性能硬门并发布 Gate D
   - 两条路径分别验证 warm exact p95≤50 ms、fuzzy top-10 p95≤500 ms、迁移≤120 s、峰值 RSS≤512 MiB、recall=100%
+  - 迁移 child 退出后，查询 child 只能按已重验的 artifact identity/digest 重开同一 canonical store；两进程峰值 RSS 取较大值，可移植 evidence bundle 不发布临时绝对路径或 PID
   - 任一配置或指标失败时报告超限项并保持对应 FUZZY capability 关闭；成功路径不得掩盖失败路径
   - matcher BASIC/TEXT_V1 只按 matcher evidence 发布，不受 fuzzy benchmark 成败推断
   - 完成时，报告对每条索引路径和每个能力门给出独立 PASS/FAIL，且失败不撤销 canonical exact/save

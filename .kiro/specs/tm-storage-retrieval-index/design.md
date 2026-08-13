@@ -132,6 +132,7 @@ graph LR
 ├── tm_benchmark_latency.py          # exact/fuzzy 逐查询延迟样本与 nearest-rank 统计
 ├── tm_benchmark_process.py          # 独立子进程迁移、reopen 与全生命周期 RSS 采样
 ├── tm_benchmark_oracle.py           # 固定 subset 全扫描 oracle 与 candidate recall 对账
+├── tm_benchmark_query_process.py    # 按迁移 artifact identity 重开真实 store 的查询子进程
 ├── tm_benchmark_gate.py             # TMBenchmark 组合入口、双路径报告与 Gate D 发布
 ├── benchmark_tm_contract.json       # thresholds、corpus/scorer/index config
 └── tests/
@@ -1077,7 +1078,13 @@ class TMBenchmark:
     def run(self, contract: BenchmarkContract) -> BenchmarkReport: ...
 ```
 
-`TMBenchmark` 是最终组合入口，不是要求把全部 benchmark 逻辑堆入一个文件。Task 8.1 的确定性语料与 digest 权威保留在 `tm_benchmark.py`；Task 8.2、8.3、8.4 分别由 latency、process/RSS、oracle owner 产生不可变原始证据；Task 8.5 的 `tm_benchmark_gate.py` 只组合这些证据、构造两个独立路径报告并发布 Gate D。前三个执行 owner 不得构造最终 `BenchmarkReport` 或授予 capability，gate owner 不得重新选择 cohort、丢弃原始样本或重写 oracle 结果。这些 owner seam 只分隔独立故障模型，Cluster J 仍在 8.1–8.5 全部闭合后做一次累积复审和一次 fresh full suite。
+`TMBenchmark` 是最终组合入口，不是要求把全部 benchmark 逻辑堆入一个文件。Task 8.1 的确定性语料与 digest 权威保留在 `tm_benchmark.py`；Task 8.2、8.3、8.4 分别由 latency、process/RSS、oracle owner 产生不可变原始证据；Task 8.5 的 `tm_benchmark_query_process.py` 只把已验证的迁移 artifact 重开为真实查询进程并产生 latency/RSS 执行证据，`tm_benchmark_gate.py` 只组合这些证据、构造两个独立路径报告并发布 Gate D。前三个执行 owner 和 query-process bridge 不得构造最终 `BenchmarkReport` 或授予 capability，gate owner 不得重新选择 cohort、丢弃原始样本或重写 oracle 结果。这些 owner seam 只分隔独立故障模型，Cluster J 仍在 8.1–8.5 全部闭合后做一次累积复审和一次 fresh full suite。
+
+Task 8.3 的迁移 child 在专用 run root 内完成激活、reopen 与健康验证后退出，不把进程内 `SQLiteTMStore` handle 伪装成可跨进程复用资产。Task 8.5 为每条路径保持该专用 root 到查询取证完成；query child 在首次查询前根据 process evidence 的 contract/corpus/fixture/resource/store/generation/path 事实重建 deterministic locator，对 canonical sidecar 执行 no-follow regular/single-link identity、digest、fresh coordinator rehydrate、health/index/count 成套复核，然后在同一子进程和同一 generation 上完成全部 warmup 与 measured query。查询前后 artifact identity/digest 必须一致；任一事实漂移都废弃该路径证据，不重新迁移、不改用另一路径。
+
+query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → CandidateRetriever → records_by_id → scorer-v1 → threshold → stable top-k` 链路，并由实际 store health/candidate metadata 回显 execution path；不得以 synthetic callback、仅 candidate proof 或调用方自报 path 代替。迁移 child 与 query child 分别采样峰值 RSS，路径报告使用两个独立进程的较大值；迁移耗时仍只取 Task 8.3 已冻结的全生命周期口径。
+
+最终 machine-readable evidence bundle 保留 latency 的全部原始样本、process/query/oracle 的不可变事实与 digest，以及 strict `BenchmarkReport`/`BenchmarkSuiteReport` codec 结果。本地 child protocol 可以使用经严格验证的绝对路径定位本次临时资产，但可移植 bundle 只保留由 contract/corpus/path/artifact/evidence digest 构成的稳定 artifact key 与必要环境事实；不发布 run-root/fixture 绝对路径、PID 或可跨机器误用的句柄。专用 root 只在 bundle 原子落盘并严格回读后由调用方在测量外整体回收；Gate D 只消费已回读的 bundle，不直接信任临时路径或运行中对象。
 
 - machine-readable `benchmark_tm_contract.json` 必须与 `BenchmarkContract` 一致；`benchmark-v1` 固定 generator/seed/digests、100,000 records、exact ≥1,000 queries、fuzzy ≥200 queries。
 - deterministic corpus 包括 multilingual/CJK/short/duplicate/multi-target/context/near-edit/miss cohorts；query cohort 由 digest 固定，不允许运行时挑选有利样本。
