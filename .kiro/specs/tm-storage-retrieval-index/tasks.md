@@ -309,7 +309,7 @@
   - 完成时，每项 Gate C evidence 都可从固定输入重算，能力矩阵与 opaque summary/稳定 unavailable code 一致且不泄漏 source/target 正文
   - _Requirements: 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 7.4, 7.5, 8.7_
 
-- [x] 8. 建立 Gate D benchmark-v1
+- [ ] 8. 建立 Gate D benchmark-v1
 
 - [x] 8.1 (P) 生成确定性 100k 与 oracle 语料
   - 固定种子生成 100000 条记录、至少 1000 个 exact 查询、至少 200 个 fuzzy 查询
@@ -349,6 +349,40 @@
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
   - _Boundary: TMBenchmark Gate D_
 
+- [ ] 8.6 固化 scorer 完备性上界与 proof index
+  - 在 record/index 同事务保存 folded length、字符/bigram multiset term frequency 与固定 block 的保守 summary，并为 scorer-v1 冻结可独立验证的分数上界公式
+  - 上界必须覆盖长度差、字符 multiset/LCS 下界和 bigram multiset 差异；任何 summary 低估、缺行、重复或计数不守恒均 fail-closed
+  - 保持 `candidate-budget-v1` 不变，不使用 oracle identity、固定类别或扩大窗口证明完备
+  - 完成时，穷举与固定随机向量证明真实 scorer 分数从不超过上界，schema/append/migration/upgrade 的 index parity 与事务回滚全部闭合
+  - _Requirements: 4.2, 4.7, 5.2, 5.3, 8.2, 8.7_
+  - _Boundary: Candidate Proof Index_
+
+- [ ] 8.7 实现有界 proof/scorer 查询流水线
+  - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；同时证明 threshold 全集和无阈值真实 top-k 后才返回 fuzzy 候选
+  - 单资源真实评分达到 candidate budget 仍不能闭合时，以 `CANDIDATE.PROOF_BUDGET_EXHAUSTED` 局部失败，不影响其他资源、exact、CONTEXT 或 save
+  - FTS5 与 fallback 分别执行各自 seed path 并共享同一 proof closure；禁止全量 union source fetch/sort、重复评分或 caller 自报 completeness
+  - 完成时，200-query oracle 两项义务均为 100%，12-query/27-identity 旧遗漏成为回归用例，阶段/proof/最终元数据逐项守恒
+  - _Requirements: 4.1, 4.2, 4.4, 4.5, 4.7, 5.1, 5.2, 5.3, 8.2, 8.7_
+  - _Boundary: Candidate Proof Query_
+  - _Depends: 8.6_
+
+- [ ] 8.8 建立 sealed/active 内容证明链并压缩迁移重复扫描
+  - fresh stage 只在新建路径执行一次完整语义校验；seal 在同一事务流式闭合 parity/index/closure 与 SEALED marker，生成绑定 SHA-256、inode、版本、计数和 closure 的 sealed attestation
+  - 保留两次 Gate B、drain、replace、parent fsync、四阶段 journal、reopen 与 cold recovery；immutable 阶段以 no-follow pre/post identity + 完整 rehash 复证，不以缓存布尔值或 stat 元数据授权
+  - active receipt/meta 合法写入后执行一次完整 active-set 校验并持久化 active attestation；后续 phase 仅在 exact bytes/inode/journal facts 相等时复用，漂移仍 rollback/fail-stop
+  - 完成时，same-inode mutation、同字节换 inode、attestation 缺失/损坏/过期、各 phase crash 与 prior-generation 保全矩阵全绿，迁移仍包含 parse/insert/index/validate/fsync/activate/reopen
+  - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14, 8.3, 8.7_
+  - _Boundary: Migration Content Attestation_
+  - _Depends: 8.6, 5.R1_
+
+- [ ] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
+  - 先在固定 5k oracle 重算 threshold 集与真实 top-10 完备性，再在真实 100k 上分别执行 FTS5_TRIGRAM 与 GRAM_FALLBACK 的迁移、query child 和 portable evidence bundle
+  - 不改变 scorer、threshold、top-k、candidate budget、corpus/cohort/seed/digest、硬门或迁移阶段口径；失败路径不得被成功路径掩盖
+  - 完成时，两条路径独立达到 recall=100%、exact p95≤50 ms、fuzzy p95≤500 ms、migration≤120 s、RSS≤512 MiB，Gate D evidence 可严格回读与重算
+  - _Requirements: 4.2, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
+  - _Boundary: Gate D Remediation Evidence_
+  - _Depends: 8.7, 8.8_
+
 - [ ] 9. 完成故障、边界与 86 条验收
 
 - [x] 9.1 执行迁移与激活故障矩阵
@@ -377,7 +411,7 @@
   - 完成时，既有回归零失败且所有依赖方向守卫通过
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.7, 9.10, 9.12_
 
-- [x] 9.5 对照全部验收标准完成发布门
+- [ ] 9.5 对照全部验收标准完成发布门
   - 将 9 项需求的 86 条验收标准逐项关联到最新自动测试、故障证据、oracle 或 benchmark 报告
   - 任一证据缺失、失败、过期或版本不一致时保持对应能力未完成，不宣告 Feature GO
   - 完成时，86/86 覆盖矩阵均指向具体、可重算且版本一致的验证入口

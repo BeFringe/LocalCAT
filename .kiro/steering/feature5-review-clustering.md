@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v10）
+# Feature 5 评审集群与推理强度指南（采纳稿 v12）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -38,7 +38,7 @@
 
 ## 评审集群地图
 
-以下 12 个功能集群与 2 个行为保持型结构门覆盖 Task 3.3–9.6 全部剩余子任务及 5.R1/5.R2/5.R3。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组；结构门只证明已批准行为的移动等价性。
+以下 15 个功能集群与 2 个行为保持型结构门覆盖 Task 3.3–9.6 全部剩余子任务及 5.R1/5.R2/5.R3。打包原则：复审者需要同一心智模型才能发现缺陷的子任务归为一组；结构门只证明已批准行为的移动等价性。
 
 | 集群 | 子任务 | 共享心智模型 | impl | review | 评审轮次 | 实施体量 |
 |------|--------|-------------|------|--------|---------|----------|
@@ -55,9 +55,12 @@
 | I — Capability gate C | 7.4 + 7.5 | 独立 CONTEXT/FUZZY 可用性门 + 证据聚合且不撤销 exact/save | `medium` | `high` | 1 | 小 |
 | J — Benchmark subsystem | 8.1 + 8.2 + 8.3 + 8.4 + 8.5 | 确定性语料 → latency/process/oracle 三个 evidence owner → 双路径硬门 | `medium` | `high` | 1 | 大 |
 | K — Fault injection | 9.1 + 9.2 | 全量迁移/激活/快照故障矩阵，验证 D+F+E 的负空间 | `high` | `xhigh` | 1 | 中 |
-| L — Evidence + release | 9.3 + 9.4 + 9.5 + 9.6 | 跨域能力矩阵 + 兼容回归 + 86 条覆盖映射 + 完整发布 | `medium` | `xhigh` | 1 | 中 |
+| L — Evidence baseline | 9.3 + 9.4 | 跨域能力矩阵 + 兼容与架构回归；其源码身份会由补救实现刷新 | `medium` | 并入 O | 0 | 中 |
+| M — Candidate proof + latency | 8.6 + 8.7 | scorer 安全上界 + proof index → 单快照 lazy proof/scoring → 资源级预算耗尽 | `xhigh` | `xhigh` | 1 | 大 |
+| N — Migration attestation | 8.8 | sealed/active 内容证明链 + 保留全部耐久阶段的重复扫描压缩 | `xhigh` | `xhigh` | 1 | 大 |
+| O — Gate D + release refresh | 8.9 + 9.5 + 9.6 | fresh oracle/100k 双路径硬门 → 证据身份刷新 → 86 条映射与完整发布 | `medium` | `xhigh` | 1 | 大 |
 
-复审数量从逐小节 38 次降至 12 个功能集群复审加 2 个等价性结构门。
+复审数量从逐小节 38 次收束为 15 个功能集群边界加 2 个等价性结构门；L 因补救实现会使其证据身份失效，不单独 dispatch，实际由其余 14 个功能集群复审覆盖，L 的内容并入 O。
 
 ---
 
@@ -88,7 +91,13 @@
 
 **K — Fault injection：** 测试 D + F + E 的负空间。共享同一方法论和"prior 资产必须存活"不变量。
 
-**L — Evidence + release：** 跨域能力矩阵、兼容回归、86 条覆盖映射和完整发布验证。它是 Feature GO 的最后裁决，不得把任务勾选或测试数量当作 coverage；因此 final review 使用 `xhigh`。
+**L — Evidence baseline：** 9.3/9.4 已闭合矩阵 owner、兼容回归与架构守卫，但 M/N 会改变它们绑定的生产源码身份。保留已提交实现和诚实证据，不为即将失效的 digest 单独复审；O 必须从 owner 重新生成而非手改摘要，并对刷新后的累计事实做一次 final review。
+
+**M — Candidate proof + latency：** Task 8.4/8.5 的诚实 NO-GO 证明 overlap preorder 只是启发式，不能授权 scorer-v1 的 threshold 全集或无阈值 top-k。M 冻结字符/bigram multiset 与 block summary 的保守上界，在单一 generation view 内让 CandidateRetriever 与真实 scorer 以小批量交替推进；只有 threshold 与第 k 名的未评分上界同时闭合才可返回。固定 8,192 窗口、调权或 oracle identity 都不是证明。上界低估、proof 计数不守恒或 2,048 预算耗尽必须资源级 fail-closed，因此实施与复审均提升为原生 `xhigh`。
+
+**N — Migration attestation：** 性能剖析表明主要成本来自同一 sealed/active 内容在 build、seal、Gate B、activate 和 reopen 间重复展开语义扫描。N 只把“后来有没有变”从重复语义证明改为完整 SHA-256 + inode + phase attestation；首次 sealed 校验、激活写入后的 active-set 校验、两次 Gate B、drain、replace、fsync、四阶段 journal、reopen 和 cold recovery全部保留。same-inode mutation、同字节换 inode、attestation 缺失/损坏/过期继续 fail-stop，故独立 `xhigh` 复审，不与候选算法复审混合。
+
+**O — Gate D + release refresh：** M/N 通过后才执行一次真实 5k oracle 与 100k 双路径 Gate D；固定 scorer、budget、corpus、cohort、seed、digest、阈值和硬门均不得改写。生产源码变化会使 Gate C、fault/acceptance/release evidence roots 失效，必须由各 owner 新鲜重算。9.5 重新勾选前须恢复 86/86 可重算映射，9.6 只在两路径全部 PASS、full suite 零失败且无 unresolved blocker 时完成。O 是 Feature GO 的最后裁决，使用 `xhigh` 累积复审。
 
 ---
 
@@ -165,6 +174,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v12 | 2026-08-13 | Task 8.5 的诚实 Gate D 失败暴露 overlap 截断无 scorer 完备性证明、全量 union 物化与 sealed/active 重复语义扫描三类根因；新增 M/N/O，固定 proof-or-fail-closed、内容 attestation 与证据刷新边界，不改变既有 86 条需求、scorer/budget/corpus/硬门或耐久阶段。同步修正标题版本与历史最高版本不一致。 |
 | v11 | 2026-08-13 | Task 8.4 暴露调用方派生 oracle 事实自授权风险，Task 8.5 预审又确认 migration child 不能跨进程交付 store handle；因此增加 artifact-identity-bound query child 与 portable evidence bundle 不发布临时路径/PID 的闭合门，保持 Cluster J 边界、强度和硬门不变。 |
 | v10 | 2026-08-12 | Task 8.1 闭合后按实际体量将 Cluster J 内部分为 corpus、latency、process/RSS、oracle 与 Gate D owner seam；保持 8.1–8.5 单集群、单次累积复审和原硬门不变。 |
 | v9 | 2026-08-12 | 将 invariant capsule 与 mutation-proof ledger 从集群复审前移到首次实现 dispatch；按独立状态机/owner 权威而非文件行数裁剪 assignment，并以目标 worktree 的 Git 身份、磁盘 diff 与新鲜验证裁决返回叙述冲突。 |

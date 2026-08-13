@@ -761,6 +761,7 @@ CREATE TABLE tm_record (
     source_raw TEXT NOT NULL,
     target_raw TEXT NOT NULL,
     source_fold_v1 TEXT NOT NULL,
+    source_fold_length INTEGER NOT NULL CHECK(source_fold_length >= 0),
     speaker_raw TEXT,
     context_prev_raw TEXT,
     context_next_raw TEXT,
@@ -785,17 +786,40 @@ CREATE TABLE tm_gram (
     gram_size INTEGER NOT NULL,
     gram TEXT NOT NULL,
     record_id INTEGER NOT NULL,
+    term_frequency INTEGER NOT NULL CHECK(term_frequency > 0),
     PRIMARY KEY(gram_size, gram, record_id),
     FOREIGN KEY(record_id) REFERENCES tm_record(record_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_tm_gram_lookup
 ON tm_gram(gram_size, gram, record_id);
+
+CREATE TABLE tm_candidate_block (
+    block_id INTEGER PRIMARY KEY,
+    first_record_id INTEGER NOT NULL,
+    last_record_id INTEGER NOT NULL,
+    record_count INTEGER NOT NULL CHECK(record_count > 0),
+    min_source_fold_length INTEGER NOT NULL,
+    max_source_fold_length INTEGER NOT NULL
+);
+
+CREATE TABLE tm_gram_block_max (
+    gram_size INTEGER NOT NULL CHECK(gram_size IN (1, 2)),
+    gram TEXT NOT NULL,
+    block_id INTEGER NOT NULL,
+    max_term_frequency INTEGER NOT NULL CHECK(max_term_frequency > 0),
+    PRIMARY KEY(gram_size, gram, block_id),
+    FOREIGN KEY(block_id) REFERENCES tm_candidate_block(block_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_tm_gram_block_lookup
+ON tm_gram_block_max(gram_size, gram, block_id);
 ```
 
 `tm_origin_batch.kind` 是 `migration`、`local_write` 或 `import`；只有 migration/import 才需要 source digest/path，本地 append 在同一事务先建立单记录 write batch。`(kind, source_digest)` 的非空唯一约束保证同类批次幂等，`origin_ordinal` 保证批次内顺序。`tm_meta` 至少保存 schema version、resource id、canonical store id、head revision、fold/scorer/text semantics version、candidate index kind、SQLite runtime 与 activation digest；每个成功写事务推进 head revision。`tm_snapshot_receipt` 与相邻只读 manifest 保存同一规范化 ancestry receipt，证明 JSONL 快照来自 canonical 历史中的哪个 revision；ledger 额外保存本地 destination paths 以恢复任意路径 publication，这两个 path 不进入可移植 manifest 摘要。`tm_snapshot_binding` 只指向当前配置快照。issued receipt 只用于跨越 DB/JSONL/manifest 多文件崩溃窗口；completed receipt 一经发布永不修改，divergence 只作为当前 binding/file observation 派生的 `SourceBindingState`。
 
-FTS5 fast path 使用 contentful `tm_fts(source_fold_v1, record_id UNINDEXED, tokenize='trigram case_sensitive 1')`；输入已由 fold-v1 规范化，不再叠加 SQLite tokenizer 自己的大小写语义，也不使用 external-content table。即使 FTS5 可用，`tm_gram` 仍保存 1/2-gram；无 FTS5 时再保存 3-gram。
+FTS5 fast path 使用 contentful `tm_fts(source_fold_v1, record_id UNINDEXED, tokenize='trigram case_sensitive 1')`；输入已由 fold-v1 规范化，不再叠加 SQLite tokenizer 自己的大小写语义，也不使用 external-content table。即使 FTS5 可用，`tm_gram` 仍保存带 multiset term frequency 的 1/2-gram；无 FTS5 时再保存 3-gram。`candidate-proof-block-v1` 以每 256 个连续 record-id slot 形成固定 block；`tm_candidate_block` 与 `tm_gram_block_max` 必须由同一 record/index 事务精确维护并可从 canonical rows 完整重算。summary 可以因跨 record maxima 而宽松，但不得低于块内任一真实 term frequency。
 
 ### TMMigrationService
 
@@ -871,14 +895,14 @@ class CandidateRetriever:
     ) -> CandidateRetrievalReport: ...
 ```
 
-- query 长度 ≥3 且 FTS5 capability 可用时，把 fold-v1 query 的 unique character trigrams 分别转义为 phrase，并以 OR union 召回；按 matched unique trigram ratio、长度差、record id 稳定预排。
-- FTS 结果为空、query 退化为少量重复 trigram 或 candidate pool 未达到 contract floor 时，继续 union 2-gram，再按需 union 1-gram；query 长度 1–2 直接使用对应 postings。
-- 无 FTS5 时通过 1/2/3-gram postings union + overlap count 召回；不能把完整 query 的 substring MATCH 当作 fuzzy recall。
-- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))`；pool 超限才按上述预排截断。
-- 每次查询按执行顺序记录 FTS_TRIGRAM/GRAM_3/GRAM_2/GRAM_1/UNION/DEDUPLICATE/TRUNCATE 的 input、added unique、output unique 与 dropped counts；未执行阶段不伪造零计数。候选自身记录参与的 recall stages、matched/query grams、overlap ratio 与 pretruncate rank。
-- CandidateRetriever 通过 `CandidateRetrievalReport` 同时返回候选和只属于召回阶段的 frozen `CandidateRecallMetadata`；不得提前伪造后续 scorer 或 global-limit 计数。
-- TMRetrievalService 核对 recall metadata，完成评分、threshold、稳定排序和跨资源 global limit 后，才构造最终 `ResourceQueryMetadata`，补入 context capability、`scored_count` 和每资源 `returned_count`。
-- query report 与 benchmark 复用同一 recall metadata contract；阶段计数、union unique、dedupe、truncate、scored、returned 必须可对账，任何负数、顺序错乱或 `scored_count > candidate_budget` 都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
+- query 长度 ≥3 且 FTS5 capability 可用时，把 fold-v1 query 的 unique character trigrams 分别转义为 phrase，并以 OR union 形成 fast seed；无 FTS5 时按 GRAM_3/2/1 形成 fallback seed。seed 只决定实际 execution path、初始上界队列与可诊断阶段，不能作为 scorer-v1 完备性的证明。
+- canonical index 在 record/index 同一事务保存 `source_fold_length`、字符与 bigram 的 multiset term frequency，以及固定 record block 的长度范围和各 term 最大频次。block summary 只提供保守上界；缺行、重复、计数不守恒或 summary 低估都使该资源 fail-closed。
+- 对 fold-v1 query 与一个 record，令长度为 `m/n`、字符 multiset 交集为 `C`、bigram multiset 交集为 `I`、bigram 总数为 `Bq/Br`。编辑距离安全下界为 `max(abs(m-n), max(m,n)-C, ceil((Bq+Br-2I)/4))`；由此得到 Levenshtein ratio 上界，再与精确 bigram Dice 平均得到 scorer-v1 上界。单字符 Dice 沿用 scorer-v1 特例。实现必须以穷举/随机对照证明上界从不低估真实分数。
+- CandidateRetriever 在同一 generation view 内按 `(score_upper_bound DESC, record_id DESC)` best-first 打开 block、生成有界 record batch；TMRetrievalService 只对这些 batch 运行真实 scorer-v1，并把不可变评分事实交回 proof state。只有“所有未评分上界均低于最低相似度”且“任一未评分 `(upper_bound, record_id)` 都不能超过当前真实第 k 名 `(score, record_id)`”同时成立，候选证明才闭合。
+- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))` 保持不变，并限制单资源为闭合证明执行的真实 scorer 次数。预算耗尽而证明未闭合时返回稳定的资源级 `CANDIDATE.PROOF_BUDGET_EXHAUSTED`，不返回该资源的 fuzzy 结果；不得扩大窗口、使用 oracle identity、固定语料类别或调用方自报 completeness 绕过证明。
+- 每次查询按执行顺序记录 FTS_TRIGRAM/GRAM_3/GRAM_2/GRAM_1 seed、BOUND_PROOF、UNION、DEDUPLICATE 与可选 TRUNCATE 的守恒事实；同时冻结 bound version、总 block/record 数、已打开 block、已检查上界、真实评分数、未评分最大上界、阈值与第 k 名闭合事实。未执行阶段不伪造零计数，proof inspected 与真实 scored 不得冒充最终 global returned count。
+- CandidateRetriever 与 TMRetrievalService 通过私有 proof port 交替推进，公开 `CandidateRetrievalReport` 仍只暴露候选身份与 frozen `CandidateRecallMetadata`；评分 evidence 由 Retrieval 持有并直接用于 threshold、稳定排序和跨资源 global limit，不重复评分、不允许 candidate owner 授予 capability。
+- query report 与 benchmark 复用同一 proof-aware recall metadata contract；阶段计数、union unique、dedupe、truncate、proof scored、returned 必须可对账，任何负数、顺序错乱、上界低估、`proof_scored_count > candidate_budget` 或未闭合证明都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
 - tractable oracle corpus 上，所有高于批准 threshold 的结果与真实 top-10 必须 100% 被 candidate set 覆盖；recall gate 失败不得激活 fuzzy path。
 - 返回顺序不等于最终顺序；Retrieval 必须运行 scorer。
 
@@ -1082,7 +1106,11 @@ class TMBenchmark:
 
 Task 8.3 的迁移 child 在专用 run root 内完成激活、reopen 与健康验证后退出，不把进程内 `SQLiteTMStore` handle 伪装成可跨进程复用资产。Task 8.5 为每条路径保持该专用 root 到查询取证完成；query child 在首次查询前根据 process evidence 的 contract/corpus/fixture/resource/store/generation/path 事实重建 deterministic locator，对 canonical sidecar 执行 no-follow regular/single-link identity、digest、fresh coordinator rehydrate、health/index/count 成套复核，然后在同一子进程和同一 generation 上完成全部 warmup 与 measured query。查询前后 artifact identity/digest 必须一致；任一事实漂移都废弃该路径证据，不重新迁移、不改用另一路径。
 
-query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → CandidateRetriever → records_by_id → scorer-v1 → threshold → stable top-k` 链路，并由实际 store health/candidate metadata 回显 execution path；不得以 synthetic callback、仅 candidate proof 或调用方自报 path 代替。迁移 child 与 query child 分别采样峰值 RSS，路径报告使用两个独立进程的较大值；迁移耗时仍只取 Task 8.3 已冻结的全生命周期口径。
+Task 8.8 的性能修正不删除迁移口径中的任何阶段。fresh mutable stage 只在新建路径执行一次完整语义校验；既有 stage 的 reuse validator 不再重复校验刚构建的同一对象。StageSealer 在一个 `BEGIN IMMEDIATE` 边界内流式完成 exact parity、schema/index/fold/count 与 logical closure 校验并写入 `SEALED` marker，随后 close/fsync，生成 registry-owned `SealedContentAttestation`。该 attestation 绑定 DB/manifest/source 的 SHA-256、device/inode、schema/index/fold version、counts、exact-parity 与 closure digest。
+
+激活前和 lease drain 后的两次 Gate B 均保留；每次必须经 no-follow regular/single-link pre/post identity capture 重新计算完整文件 SHA-256 并与 sealed attestation 比较，但不重复展开 record/index 语义扫描。replace 后须证明 canonical inode/digest 等于 sealed attestation，并执行 reopen、schema、integrity 与 foreign-key 校验。合法 receipt/meta 激活写入后执行一次 active-set 全语义校验并生成 `ActiveContentAttestation`；之后的 manifest/generation/final closure 只可在 exact byte/inode 与 phase facts 均匹配该 attestation 时复用。active attestation 持久进入 journal/terminal，cold recovery 重新 hash、reopen 并核对；缺失、损坏、过期或身份漂移继续按原恢复矩阵 rollback/fail-stop。四个 journal phase、两次 Gate B、parent fsync、replace、reopen 与 last-known-good 语义均不改变。
+
+query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → seed + bound-proof batches ↔ scorer-v1 → threshold → stable top-k` 链路，并由实际 store health/candidate/proof metadata 回显 execution path；不得以 synthetic callback、仅候选身份、oracle identity 或调用方自报 path 代替。两条路径可以共享 proof closure 算法，但必须分别执行各自 seed/index path 并发布独立报告。迁移 child 与 query child 分别采样峰值 RSS，路径报告使用两个独立进程的较大值；迁移耗时仍只取 Task 8.3 已冻结的全生命周期口径。
 
 最终 machine-readable evidence bundle 保留 latency 的全部原始样本、process/query/oracle 的不可变事实与 digest，以及 strict `BenchmarkReport`/`BenchmarkSuiteReport` codec 结果。本地 child protocol 可以使用经严格验证的绝对路径定位本次临时资产，但可移植 bundle 只保留由 contract/corpus/path/artifact/evidence digest 构成的稳定 artifact key 与必要环境事实；不发布 run-root/fixture 绝对路径、PID 或可跨机器误用的句柄。专用 root 只在 bundle 原子落盘并严格回读后由调用方在测量外整体回收；Gate D 只消费已回读的 bundle，不直接信任临时路径或运行中对象。
 
@@ -1150,9 +1178,10 @@ query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → Ca
 ## 性能与可扩展性
 
 - exact B-tree raw index 是独立 fast path，不扫描 candidate index。
-- candidate batch fetch 避免每 record 一次 SQL。
+- candidate proof 以 block-level 保守上界 best-first 打开小批量 record，避免全量 union source fetch/sort 和每 record 一次 SQL；上界只能多取，不能漏取。
 - migration 先 bulk insert、后建大索引；transaction 与 RSS 由 100k gate 约束。
-- FTS5/gram 只控制 recall set；默认 candidate count 写入 versioned contract。
+- FTS5/gram seed 只控制 execution path 与首批 proof 队列；完备性由共同的 versioned bound proof 决定，默认 scorer budget 写入 versioned contract。
+- sealed/active attestation 只消除同一 immutable byte identity 上的重复语义扫描；任何字节、inode、phase 或 durable evidence 漂移都重新进入完整验证或 fail-stop，不能以 stat/mtime/size 或缓存布尔值代替。
 - read connection 不长时间持有 transaction；rollback journal 下 write transaction 保持短小。
 - WAL 不作为首版性能优化；升级前必须先解决当前 3.51.2 advisory。
 
