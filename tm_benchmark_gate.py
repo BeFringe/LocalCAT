@@ -1,8 +1,8 @@
-"""Task 8.5B gate-combination owner: combine benchmark evidence into Gate D.
+"""Task 8.5C gate owner: combine, run, persist and publish Gate D evidence.
 
 Ownership
 ---------
-This module is the benchmark-v1 gate combiner for Task 8.5B.  It consumes
+This module is the benchmark-v1 gate owner for Task 8.5C.  It consumes
 parent-adjudicated migration/query evidence (``QueryProcessRunResult`` for
 FTS5_TRIGRAM and GRAM_FALLBACK, in enum order) plus exact-type
 ``OracleRecallEvidence`` for the same two paths, re-adjudicates each
@@ -11,11 +11,29 @@ artifact snapshots and nested evidence, derives one strict
 ``BenchmarkReport`` per execution path and one ``BenchmarkSuiteReport``,
 and produces an immutable portable ``BenchmarkEvidenceBundle`` with a strict
 closed-schema canonical JSON codec.  It is an offline validation/batch owner
-only: no production runtime module imports it, and it never publishes or
-mutates a capability manifest.  Gate D publishing in this slice is bounded
-to constructing ``RetrievalBenchmarkEvidence`` values from derived reports
-plus an explicit validity window; ``RetrievalCapabilityPublisher`` and Gate C
-fuzzy-core facts are out of scope.
+only: no production runtime module imports it.
+
+The owner also runs the real Gate D pipeline through one locked entry point
+(``run_benchmark_gate_d``): the real process-migration, query-process and
+oracle-recall-suite ports are bound internally and called in fixed order on
+four exact dedicated roots under one exclusive private run directory; the
+combined bundle is atomically persisted to an absent final path with a
+durable no-follow readback, and only the exact owned temporary tree is
+cleaned afterwards.  Test injection exists only behind an explicit private
+test seam that always marks its result as test-only and can never produce
+final/published evidence.
+
+Gate D capability publication (``publish_retrieval_capability_gate_d``)
+accepts an exact ``RetrievalCapabilityManifest`` base, the exact durable
+runner result, an exact ``RetrievalCapabilityPublisher`` and explicit UTC
+instants;
+it composes one new manifest preserving every envelope and Gate C fact
+byte-for-byte/value-for-value and replacing only the two fuzzy benchmark
+fields from ``retrieval_benchmark_evidence_pair``, calls
+``publisher.refresh`` exactly once, verifies the returned per-path decisions
+match each report truth, and returns an immutable publication result.  The
+owner never constructs a publisher or evaluator, never imports the
+evaluator, and never bypasses the publisher to grant availability.
 
 This module is Gate D combination only.  ``tm_benchmark.py``, latency,
 process, query-process and oracle owners remain authoritative for their
@@ -61,18 +79,41 @@ Invariant capsule
   report drift, path swap/duplication, discarded samples, forged
   self-consistent caller fields and one-path-only input all fail closed.
   A strict round trip reproduces the same exact immutable value.
+- The real runner locks its default ports internally (``test_mode=False``,
+  no caller-supplied oracle facts, one migration per execution path in enum
+  order, one query per retained final process evidence with no migration
+  rerun, one oracle suite, one combination).  The private test seam requires
+  injected exact-type ports and always returns a ``test_mode=True`` result.
+- ``work_root`` must be an existing empty direct native directory; the
+  runner creates one exclusive 0700 private child and four exact dedicated
+  roots under it, and cleans only that exact created directory after a
+  durable readback or a safe failure.  Identity-drifted or ambiguous content
+  is never deleted: the owned root is left and a stable cleanup-pending
+  failure is returned.  The evidence final is published atomically to an
+  absent final only, fsynced, read back no-follow and strictly re-decoded;
+  failures never report success and never overwrite or delete foreign files.
+- Diagnostics are stable codes only: no absolute paths, PIDs, protocol
+  digests or bodies.  The immutable run result carries the strict readback
+  bundle, its stable digest and the final artifact's canonical byte size
+  and SHA-256 digest only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from collections.abc import Mapping
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 import re
+import stat
+import tempfile
 from typing import cast
 
-from tm_benchmark import benchmark_digest
+from tm_benchmark import benchmark_digest, load_benchmark_contract
 from tm_benchmark_latency import (
     LATENCY_EVIDENCE_SCHEMA_VERSION,
     LatencyEvidence,
@@ -84,10 +125,12 @@ from tm_benchmark_oracle import (
     OracleRecallEvidence,
     evidence_from_json as oracle_evidence_from_json,
     evidence_to_json as oracle_evidence_to_json,
+    run_oracle_recall_suite,
 )
 from tm_benchmark_process import (
     PROCESS_EVIDENCE_SCHEMA_VERSION,
     TMBenchmarkProcessEvidence,
+    run_process_migration_evidence,
 )
 from tm_benchmark_query_process import (
     QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION,
@@ -96,6 +139,7 @@ from tm_benchmark_query_process import (
     QueryProcessEvidence,
     QueryProcessRunResult,
     _adjudicate_evidence_against_process_evidence,
+    run_query_process_evidence,
 )
 from tm_contracts import (
     BENCHMARK_SUITE_VERSION,
@@ -110,7 +154,12 @@ from tm_contracts import (
     contract_from_json,
     contract_to_json,
 )
-from tm_retrieval_capability import RetrievalBenchmarkEvidence
+from tm_retrieval_capability import (
+    RetrievalBenchmarkEvidence,
+    RetrievalCapabilityManifest,
+    RetrievalCapabilityPublisher,
+    RetrievalCapabilitySnapshot,
+)
 
 BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v1"
 BENCHMARK_BUNDLE_DIGEST_VERSION = "tm-benchmark-bundle-digest-v1"
@@ -119,6 +168,7 @@ BENCHMARK_PORTABLE_ARTIFACT_KEY_VERSION = (
     "tm-benchmark-portable-artifact-key-v1"
 )
 
+_NATIVE_PATH_TYPE = type(Path())
 REAL_CORPUS_RECORD_COUNT = 100_000
 NANOSECONDS_PER_MILLISECOND = 1_000_000
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -2200,6 +2250,1008 @@ def retrieval_benchmark_evidence_pair(
     return fts5_evidence, fallback_evidence
 
 
+# --- Gate D owner-driven runner ----------------------------------------------
+
+
+class BenchmarkGateDError(RuntimeError):
+    """Code-only Gate D runner/publication failure; never leaks bodies."""
+
+    error_code: str
+
+    def __init__(self, error_code: str) -> None:
+        if type(error_code) is not str or not error_code:
+            raise TypeError("error code must be a non-empty string")
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+@dataclass(frozen=True)
+class BenchmarkGateDRunResult:
+    """Immutable result of one owner-driven Gate D run.
+
+    Carries the strict durable readback bundle, its stable canonical digest
+    and the final artifact's canonical byte size and SHA-256 digest.  It
+    never exposes temporary run roots, PIDs, device/inode identities or
+    paths.
+    """
+
+    bundle: BenchmarkEvidenceBundle
+    bundle_digest: str
+    artifact_size: int
+    artifact_digest: str
+    test_mode: bool
+
+    def __post_init__(self) -> None:
+        if type(self.bundle) is not BenchmarkEvidenceBundle:
+            raise TypeError("run result bundle must be BenchmarkEvidenceBundle")
+        if (
+            type(self.bundle_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.bundle_digest) is None
+        ):
+            raise ValueError("run result digest must be a SHA-256 digest")
+        if self.bundle_digest != benchmark_evidence_bundle_digest(self.bundle):
+            raise ValueError("run result digest must bind the readback bundle")
+        if type(self.artifact_size) is not int or self.artifact_size < 0:
+            raise ValueError(
+                "run result artifact size must be a non-negative int"
+            )
+        if (
+            type(self.artifact_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.artifact_digest) is None
+        ):
+            raise ValueError(
+                "run result artifact digest must be a SHA-256 digest"
+            )
+        artifact_bytes = benchmark_evidence_bundle_to_json(
+            self.bundle
+        ).encode("utf-8")
+        if (
+            len(artifact_bytes) != self.artifact_size
+            or hashlib.sha256(artifact_bytes).hexdigest()
+            != self.artifact_digest
+        ):
+            raise ValueError(
+                "run result artifact size/digest must bind the artifact bytes"
+            )
+        if type(self.test_mode) is not bool:
+            raise TypeError("run result test mode must be a built-in bool")
+
+
+@dataclass(frozen=True)
+class RetrievalCapabilityPublicationResult:
+    """Immutable result of one Gate D capability publication."""
+
+    manifest: RetrievalCapabilityManifest
+    snapshot: RetrievalCapabilitySnapshot
+
+    def __post_init__(self) -> None:
+        if type(self.manifest) is not RetrievalCapabilityManifest:
+            raise TypeError(
+                "publication result manifest must be RetrievalCapabilityManifest"
+            )
+        if type(self.snapshot) is not RetrievalCapabilitySnapshot:
+            raise TypeError(
+                "publication result snapshot must be RetrievalCapabilitySnapshot"
+            )
+
+
+@dataclass(frozen=True)
+class _GateDRunnerPorts:
+    """Private exact-type port set for the owner-driven runner test seam."""
+
+    run_process_migration_evidence: Callable[..., TMBenchmarkProcessEvidence]
+    run_query_process_evidence: Callable[..., QueryProcessRunResult]
+    run_oracle_recall_suite: Callable[
+        ...,
+        tuple[OracleRecallEvidence, OracleRecallEvidence],
+    ]
+    combine_benchmark_evidence: Callable[..., BenchmarkEvidenceBundle]
+
+
+_DEFAULT_GATE_D_RUNNER_PORTS = _GateDRunnerPorts(
+    run_process_migration_evidence=run_process_migration_evidence,
+    run_query_process_evidence=run_query_process_evidence,
+    run_oracle_recall_suite=run_oracle_recall_suite,
+    combine_benchmark_evidence=combine_benchmark_evidence,
+)
+
+
+_PRIVATE_RUN_DIR_PREFIX = ".tm-gate-d-run-"
+_EVIDENCE_TEMP_PREFIX = ".tm-gate-d-evidence-"
+_EVIDENCE_TEMP_SUFFIX = ".tmp"
+_STRICT_UTC_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z"
+)
+
+
+def _directory_identity(path: Path, error_code: str) -> tuple[int, int]:
+    """Return the no-follow identity of one real direct directory."""
+    try:
+        observed = os.lstat(path)
+    except OSError as error:
+        raise BenchmarkGateDError(error_code) from error
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise BenchmarkGateDError(error_code)
+    return (observed.st_dev, observed.st_ino)
+
+
+def _validate_contract_path(contract_path: object) -> None:
+    if type(contract_path) is not _NATIVE_PATH_TYPE:
+        raise BenchmarkGateDError("GATE_D.CONTRACT_INVALID")
+
+
+def _load_contract(contract_path: Path) -> BenchmarkContract:
+    try:
+        return load_benchmark_contract(contract_path)
+    except (TypeError, ValueError) as error:
+        raise BenchmarkGateDError("GATE_D.CONTRACT_INVALID") from error
+
+
+def _validate_work_root(work_root: object) -> Path:
+    if type(work_root) is not _NATIVE_PATH_TYPE:
+        raise BenchmarkGateDError("GATE_D.WORK_ROOT_INVALID")
+    _ = _directory_identity(work_root, "GATE_D.WORK_ROOT_INVALID")
+    try:
+        entries = os.listdir(work_root)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.WORK_ROOT_INVALID") from error
+    if entries:
+        raise BenchmarkGateDError("GATE_D.WORK_ROOT_INVALID")
+    return work_root
+
+
+def _validate_evidence_path(evidence_path: object) -> Path:
+    if (
+        type(evidence_path) is not _NATIVE_PATH_TYPE
+        or not evidence_path.is_absolute()
+    ):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PATH_INVALID")
+    _ = _directory_identity(
+        evidence_path.parent,
+        "GATE_D.EVIDENCE_PATH_INVALID",
+    )
+    return evidence_path
+
+
+def _require_outside_run_subtree(
+    private_dir: Path,
+    evidence_path: Path,
+) -> None:
+    try:
+        private_resolved = private_dir.resolve(strict=True)
+        parent_resolved = evidence_path.parent.resolve(strict=True)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PATH_INVALID") from error
+    if (
+        parent_resolved == private_resolved
+        or private_resolved in parent_resolved.parents
+    ):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PATH_INVALID")
+
+
+def _create_private_run_dir(
+    work_root: Path,
+) -> tuple[Path, tuple[int, int], tuple[int, int]]:
+    """Create one exclusive 0700 private child; return identities."""
+    work_identity = _directory_identity(
+        work_root,
+        "GATE_D.WORK_ROOT_INVALID",
+    )
+    try:
+        private_dir = Path(
+            tempfile.mkdtemp(
+                prefix=_PRIVATE_RUN_DIR_PREFIX,
+                dir=str(work_root),
+            )
+        )
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.RUN_ROOT_CREATION_FAILED") from error
+    private_identity = _directory_identity(
+        private_dir,
+        "GATE_D.RUN_ROOT_CREATION_FAILED",
+    )
+    return private_dir, work_identity, private_identity
+
+
+def _create_dedicated_roots(
+    private_dir: Path,
+) -> tuple[Path, Path, Path, Path]:
+    roots: list[Path] = []
+    try:
+        for prefix in (
+            "process-fts5-",
+            "process-fallback-",
+            "oracle-fts5-",
+            "oracle-fallback-",
+        ):
+            roots.append(
+                Path(
+                    tempfile.mkdtemp(
+                        prefix=prefix,
+                        dir=str(private_dir),
+                    )
+                )
+            )
+        if len({root.resolve() for root in roots}) != 4:
+            raise BenchmarkGateDError("GATE_D.RUN_ROOT_CREATION_FAILED")
+        process_fts5, process_fallback, oracle_fts5, oracle_fallback = roots
+        return process_fts5, process_fallback, oracle_fts5, oracle_fallback
+    except BaseException:
+        # remove only the empty roots this call created; leave anything
+        # that cannot be proven ours for the caller's strict cleanup
+        for root in roots:
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+        raise
+
+
+def _require_test_count(value: object) -> int:
+    if (
+        type(value) is not int
+        or not (1 <= value < REAL_CORPUS_RECORD_COUNT)
+    ):
+        raise BenchmarkGateDError("GATE_D.TEST_PARAMETERS_INVALID")
+    return value
+
+
+def _require_test_seed(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise BenchmarkGateDError("GATE_D.TEST_PARAMETERS_INVALID")
+    return value
+
+
+def _write_all_bytes(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def _fsync_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _fsync_directory(
+    path: Path,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    """Fsync one no-follow directory, optionally bound to its identity."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode) or (
+            expected_identity is not None
+            and (observed.st_dev, observed.st_ino) != expected_identity
+        ):
+            raise OSError("directory identity changed")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_owned_file_bytes(
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> bytes:
+    """No-follow stable read with descriptor and path revalidation."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != expected_identity
+        ):
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+        payload = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            payload.extend(chunk)
+        terminal = os.fstat(descriptor)
+        stable_metadata = (
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(terminal.st_mode)
+            or terminal.st_nlink != 1
+            or (terminal.st_dev, terminal.st_ino) != expected_identity
+            or (
+                terminal.st_size,
+                terminal.st_mtime_ns,
+                terminal.st_ctime_ns,
+            )
+            != stable_metadata
+        ):
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    finally:
+        os.close(descriptor)
+    try:
+        final = os.lstat(path)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_nlink != 1
+        or (final.st_dev, final.st_ino) != expected_identity
+        or (final.st_size, final.st_mtime_ns, final.st_ctime_ns)
+        != stable_metadata
+    ):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+    return bytes(payload)
+
+
+def _remove_owned_file_if_ours(
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Best-effort identity-bound removal; never touches foreign files."""
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink not in (1, 2)
+        or (observed.st_dev, observed.st_ino) != expected_identity
+    ):
+        return
+    try:
+        os.unlink(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        return
+
+
+def _require_absent_final(evidence_path: Path) -> None:
+    try:
+        os.lstat(evidence_path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    raise BenchmarkGateDError("GATE_D.EVIDENCE_EXISTS")
+
+
+def _create_evidence_temp(
+    parent: Path,
+) -> tuple[Path, int, tuple[int, int]]:
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix=_EVIDENCE_TEMP_PREFIX,
+            suffix=_EVIDENCE_TEMP_SUFFIX,
+            dir=str(parent),
+        )
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    try:
+        observed = os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        os.close(descriptor)
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+    return Path(name), descriptor, (observed.st_dev, observed.st_ino)
+
+
+def _write_evidence_temp(
+    descriptor: int,
+    payload: bytes,
+) -> None:
+    try:
+        _write_all_bytes(descriptor, payload)
+        _fsync_descriptor(descriptor)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+
+
+def _revalidate_evidence_temp(
+    temp_path: Path,
+    temp_identity: tuple[int, int],
+    parent_identity: tuple[int, int],
+) -> None:
+    try:
+        observed = os.lstat(temp_path)
+        parent_st = os.lstat(temp_path.parent)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != temp_identity
+        or (parent_st.st_dev, parent_st.st_ino) != parent_identity
+    ):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+
+
+def _verify_replaced_final(
+    evidence_path: Path,
+    temp_identity: tuple[int, int],
+    parent_identity: tuple[int, int],
+) -> None:
+    try:
+        observed = os.lstat(evidence_path)
+        parent_st = os.lstat(evidence_path.parent)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != temp_identity
+        or (parent_st.st_dev, parent_st.st_ino) != parent_identity
+    ):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+
+
+def _publish_evidence_bundle(
+    bundle: BenchmarkEvidenceBundle,
+    evidence_path: Path,
+) -> tuple[str, int, str, BenchmarkEvidenceBundle]:
+    """Atomically persist one bundle and return its strict durable readback.
+
+    Writes the canonical JSON to one exclusive same-parent temporary,
+    fsyncs it, revalidates the temp identity/single-link/parent, atomically
+    links it to an absent final only, unlinks the temporary name, fsyncs the
+    parent, then reads the final
+    no-follow and strictly re-decodes it.  The readback bundle is
+    authoritative only when value/digest/bytes all match.  Returns the
+    stable bundle digest, the final artifact's canonical byte size and its
+    SHA-256 digest alongside the readback bundle.  Foreign files are never
+    overwritten or deleted; failures never report success.
+    """
+
+    serialized = benchmark_evidence_bundle_to_json(bundle)
+    digest = benchmark_evidence_bundle_digest(bundle)
+    payload = serialized.encode("utf-8")
+    artifact_size = len(payload)
+    artifact_digest = hashlib.sha256(payload).hexdigest()
+    parent = evidence_path.parent
+    try:
+        parent_st = os.lstat(parent)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    if stat.S_ISLNK(parent_st.st_mode) or not stat.S_ISDIR(parent_st.st_mode):
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+    parent_identity = (parent_st.st_dev, parent_st.st_ino)
+    _require_absent_final(evidence_path)
+    temp_path, descriptor, temp_identity = _create_evidence_temp(parent)
+    published = False
+    try:
+        try:
+            _write_evidence_temp(descriptor, payload)
+        finally:
+            os.close(descriptor)
+        _revalidate_evidence_temp(
+            temp_path,
+            temp_identity,
+            parent_identity,
+        )
+        _require_absent_final(evidence_path)
+        try:
+            # Same-directory hard-link publication is atomic and refuses an
+            # existing final. Unlike os.replace, it cannot overwrite a file
+            # created after the last absence check.
+            os.link(temp_path, evidence_path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_EXISTS") from error
+        except OSError as error:
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+        published = True
+        try:
+            os.unlink(temp_path)
+        except OSError as error:
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+        _verify_replaced_final(evidence_path, temp_identity, parent_identity)
+        _fsync_directory(parent, parent_identity)
+        readback_bytes = _read_owned_file_bytes(
+            evidence_path,
+            temp_identity,
+        )
+        if readback_bytes != payload:
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_READBACK_MISMATCH")
+        try:
+            readback = benchmark_evidence_bundle_from_json(
+                readback_bytes.decode("utf-8")
+            )
+        except (TypeError, ValueError) as error:
+            raise BenchmarkGateDError(
+                "GATE_D.EVIDENCE_READBACK_MISMATCH"
+            ) from error
+        if (
+            readback != bundle
+            or benchmark_evidence_bundle_digest(readback) != digest
+        ):
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_READBACK_MISMATCH")
+    except BenchmarkGateDError:
+        if published:
+            _remove_owned_file_if_ours(evidence_path, temp_identity)
+        _remove_owned_file_if_ours(temp_path, temp_identity)
+        raise
+    except OSError as error:
+        if published:
+            _remove_owned_file_if_ours(evidence_path, temp_identity)
+        _remove_owned_file_if_ours(temp_path, temp_identity)
+        raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+    return digest, artifact_size, artifact_digest, readback
+
+
+def _remove_owned_tree(
+    path: Path,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    """Recursively remove one owned tree, refusing any identity drift.
+
+    Every directory level is identity-bound: a level whose identity changed
+    or that is not the exact directory observed by its parent is refused
+    before any of its content is touched.  Symlinks and multi-link files are
+    never followed, deleted or replaced; a single-link regular file is
+    unlinked only inside an identity-verified owned directory.  On any
+    doubt the owned root is left untouched and ``GATE_D.CLEANUP_PENDING`` is
+    raised instead of deleting ambiguous content.
+    """
+    try:
+        observed = os.lstat(path)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or (
+            expected_identity is not None
+            and (observed.st_dev, observed.st_ino) != expected_identity
+        )
+    ):
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    identity = (observed.st_dev, observed.st_ino)
+    try:
+        names = os.listdir(path)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    for name in names:
+        entry = path / name
+        try:
+            entry_st = os.lstat(entry)
+        except OSError as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        if stat.S_ISLNK(entry_st.st_mode):
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+        if stat.S_ISDIR(entry_st.st_mode):
+            _remove_owned_tree(entry, (entry_st.st_dev, entry_st.st_ino))
+            try:
+                os.lstat(entry)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+            else:
+                # our recursion removed the owned directory; any entry that
+                # now occupies the name is foreign and is never touched
+                raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+        else:
+            if not stat.S_ISREG(entry_st.st_mode) or entry_st.st_nlink != 1:
+                raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+            try:
+                os.unlink(entry)
+            except OSError as error:
+                raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    try:
+        final_st = os.lstat(path)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    if (
+        stat.S_ISLNK(final_st.st_mode)
+        or not stat.S_ISDIR(final_st.st_mode)
+        or (final_st.st_dev, final_st.st_ino) != identity
+    ):
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    try:
+        os.rmdir(path)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+
+
+def _cleanup_private_run_dir(
+    private_dir: Path,
+    private_identity: tuple[int, int],
+    work_identity: tuple[int, int],
+    *,
+    expected_children: Mapping[str, tuple[int, int]],
+) -> None:
+    """Remove exactly the created private tree or fail closed.
+
+    The immediate children must be exactly the recorded dedicated roots with
+    their exact creation identities; any extra, missing, symlink or replaced
+    entry leaves the whole owned tree untouched and raises
+    ``GATE_D.CLEANUP_PENDING``.  Content inside an identity-verified root is
+    removed by the identity-bound recursive remover only.
+    """
+    parent = private_dir.parent
+    try:
+        parent_st = os.lstat(parent)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    if (
+        stat.S_ISLNK(parent_st.st_mode)
+        or not stat.S_ISDIR(parent_st.st_mode)
+        or (parent_st.st_dev, parent_st.st_ino) != work_identity
+    ):
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    try:
+        observed = os.lstat(private_dir)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != private_identity
+    ):
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    try:
+        entries = os.listdir(private_dir)
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    if set(entries) != set(expected_children):
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    for name in expected_children:
+        entry = private_dir / name
+        try:
+            entry_st = os.lstat(entry)
+        except OSError as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        if (
+            stat.S_ISLNK(entry_st.st_mode)
+            or not stat.S_ISDIR(entry_st.st_mode)
+            or (entry_st.st_dev, entry_st.st_ino)
+            != expected_children[name]
+        ):
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    try:
+        _remove_owned_tree(private_dir, private_identity)
+    except (OSError, BenchmarkGateDError) as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    try:
+        os.lstat(private_dir)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+    raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+
+
+def _run_benchmark_gate_d_core(
+    *,
+    contract_path: Path,
+    work_root: Path,
+    evidence_path: Path,
+    ports: _GateDRunnerPorts,
+    test_mode: bool,
+    test_record_count: int | None,
+    test_seed: int | None,
+) -> BenchmarkGateDRunResult:
+    if not test_mode and ports is not _DEFAULT_GATE_D_RUNNER_PORTS:
+        raise BenchmarkGateDError("GATE_D.PORT_INJECTION_FORBIDDEN")
+    if not test_mode and (
+        test_record_count is not None or test_seed is not None
+    ):
+        raise BenchmarkGateDError("GATE_D.TEST_PARAMETERS_INVALID")
+    _validate_contract_path(contract_path)
+    _validate_work_root(work_root)
+    _validate_evidence_path(evidence_path)
+    private_dir, work_identity, private_identity = _create_private_run_dir(
+        work_root
+    )
+    root_identities: dict[str, tuple[int, int]] = {}
+    try:
+        _require_outside_run_subtree(private_dir, evidence_path)
+        contract = _load_contract(contract_path)
+        (
+            process_fts5_root,
+            process_fallback_root,
+            oracle_fts5_root,
+            oracle_fallback_root,
+        ) = _create_dedicated_roots(private_dir)
+        root_identities = {
+            root.name: _directory_identity(
+                root,
+                "GATE_D.RUN_ROOT_CREATION_FAILED",
+            )
+            for root in (
+                process_fts5_root,
+                process_fallback_root,
+                oracle_fts5_root,
+                oracle_fallback_root,
+            )
+        }
+        fts5_process = ports.run_process_migration_evidence(
+            contract_path=contract_path,
+            execution_path=BenchmarkExecutionPath.FTS5_TRIGRAM,
+            run_root=process_fts5_root,
+            test_mode=test_mode,
+            test_record_count=test_record_count,
+            test_seed=test_seed,
+        )
+        fallback_process = ports.run_process_migration_evidence(
+            contract_path=contract_path,
+            execution_path=BenchmarkExecutionPath.GRAM_FALLBACK,
+            run_root=process_fallback_root,
+            test_mode=test_mode,
+            test_record_count=test_record_count,
+            test_seed=test_seed,
+        )
+        fts5_run = ports.run_query_process_evidence(fts5_process)
+        fallback_run = ports.run_query_process_evidence(fallback_process)
+        fts5_oracle, fallback_oracle = ports.run_oracle_recall_suite(
+            contract=contract,
+            fts5_run_root=oracle_fts5_root,
+            fallback_run_root=oracle_fallback_root,
+        )
+        bundle = ports.combine_benchmark_evidence(
+            fts5_run,
+            fallback_run,
+            fts5_oracle,
+            fallback_oracle,
+        )
+        if type(bundle) is not BenchmarkEvidenceBundle:
+            raise BenchmarkGateDError("GATE_D.BUNDLE_INVALID")
+        bundle_digest, artifact_size, artifact_digest, readback = (
+            _publish_evidence_bundle(bundle, evidence_path)
+        )
+    except BaseException:
+        try:
+            _cleanup_private_run_dir(
+                private_dir,
+                private_identity,
+                work_identity,
+                expected_children=root_identities,
+            )
+        except BenchmarkGateDError as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        raise
+    _cleanup_private_run_dir(
+        private_dir,
+        private_identity,
+        work_identity,
+        expected_children=root_identities,
+    )
+    return BenchmarkGateDRunResult(
+        bundle=readback,
+        bundle_digest=bundle_digest,
+        artifact_size=artifact_size,
+        artifact_digest=artifact_digest,
+        test_mode=test_mode,
+    )
+
+
+def run_benchmark_gate_d(
+    contract_path: Path,
+    work_root: Path,
+    evidence_path: Path,
+) -> BenchmarkGateDRunResult:
+    """Run the real owner-driven Gate D pipeline and persist the bundle.
+
+    The real default ports are locked internally and run with
+    ``test_mode=False``: one process-migration evidence per
+    ``BenchmarkExecutionPath`` in enum order on distinct dedicated process
+    roots, one query-process evidence per retained final process evidence
+    with no migration rerun, one owner-derived oracle-recall suite on
+    distinct dedicated oracle roots (no caller-supplied or precomputed
+    oracle facts), and exactly one ``combine_benchmark_evidence`` on those
+    exact values.  The combined bundle is atomically persisted to the absent
+    ``evidence_path`` with a durable no-follow readback, and only the exact
+    private run tree created under ``work_root`` is cleaned afterwards.
+    Test-mode runs are only reachable through the private port seam and can
+    never produce final evidence.
+    """
+
+    return _run_benchmark_gate_d_core(
+        contract_path=contract_path,
+        work_root=work_root,
+        evidence_path=evidence_path,
+        ports=_DEFAULT_GATE_D_RUNNER_PORTS,
+        test_mode=False,
+        test_record_count=None,
+        test_seed=None,
+    )
+
+
+def _run_benchmark_gate_d_test(
+    contract_path: Path,
+    work_root: Path,
+    evidence_path: Path,
+    *,
+    ports: _GateDRunnerPorts,
+    test_record_count: int,
+    test_seed: int | None = None,
+) -> BenchmarkGateDRunResult:
+    """Private owner test seam: injected exact-type ports, always test-marked.
+
+    This seam is the only way to inject runner ports.  It refuses the
+    default port set, requires explicit small test counts, and always marks
+    its result ``test_mode=True`` so it can never yield final or published
+    evidence.
+    """
+
+    if type(ports) is not _GateDRunnerPorts:
+        raise TypeError("ports must be _GateDRunnerPorts")
+    if ports is _DEFAULT_GATE_D_RUNNER_PORTS:
+        raise BenchmarkGateDError("GATE_D.PORT_INJECTION_REQUIRED")
+    _require_test_count(test_record_count)
+    if test_seed is not None:
+        _require_test_seed(test_seed)
+    return _run_benchmark_gate_d_core(
+        contract_path=contract_path,
+        work_root=work_root,
+        evidence_path=evidence_path,
+        ports=ports,
+        test_mode=True,
+        test_record_count=test_record_count,
+        test_seed=test_seed,
+    )
+
+
+# --- Gate D capability publication ------------------------------------------
+
+
+def _validate_evidence_utc_string(value: object, field_name: str) -> str:
+    if (
+        type(value) is not str
+        or _STRICT_UTC_TIMESTAMP.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field_name} must be a strict UTC timestamp")
+    datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    return value
+
+
+def _require_utc_datetime(value: object) -> datetime:
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() != timezone.utc.utcoffset(value)
+    ):
+        raise ValueError(
+            "evaluated_at_utc must be a timezone-aware UTC datetime"
+        )
+    return value
+
+
+def _report_path_truth(evidence: RetrievalBenchmarkEvidence) -> bool:
+    """True exactly when one path report honestly passes every gate."""
+    report = evidence.report
+    return report.passed is True and report.failed_gates == ()
+
+
+def _verify_path_decisions_match_reports(
+    snapshot: RetrievalCapabilitySnapshot,
+    fts5_evidence: RetrievalBenchmarkEvidence,
+    fallback_evidence: RetrievalBenchmarkEvidence,
+) -> None:
+    """Fail closed unless per-path decisions match each report truth."""
+    for decision, evidence in (
+        (snapshot.fts5_trigram, fts5_evidence),
+        (snapshot.gram_fallback, fallback_evidence),
+    ):
+        if decision.available != _report_path_truth(evidence):
+            raise BenchmarkGateDError(
+                "GATE_D.PUBLICATION_DECISION_MISMATCH"
+            )
+
+
+def publish_retrieval_capability_gate_d(
+    base_manifest: RetrievalCapabilityManifest,
+    run_result: BenchmarkGateDRunResult,
+    publisher: RetrievalCapabilityPublisher,
+    *,
+    generated_at_utc: str,
+    valid_until_utc: str,
+    evaluated_at_utc: datetime,
+) -> RetrievalCapabilityPublicationResult:
+    """Compose and publish one Gate D manifest through the exact publisher.
+
+    Preserves every envelope and Gate C fact of the base manifest
+    byte-for-byte/value-for-value and replaces only the two fuzzy benchmark
+    fields with the pair derived from the durable runner readback at the
+    explicit validity
+    window.  Calls ``publisher.refresh`` exactly once at the explicit
+    evaluated instant, verifies the returned per-path decisions match each
+    report truth (a failed report must stay closed; a passed report must be
+    open), and returns an immutable manifest+snapshot result.  The owner
+    never constructs a publisher/evaluator and never grants availability
+    itself.
+    """
+
+    try:
+        if type(base_manifest) is not RetrievalCapabilityManifest:
+            raise BenchmarkGateDError("GATE_D.MANIFEST_INVALID")
+        if type(run_result) is not BenchmarkGateDRunResult:
+            raise BenchmarkGateDError("GATE_D.RUN_RESULT_INVALID")
+        if run_result.test_mode:
+            raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+        bundle = run_result.bundle
+        if type(publisher) is not RetrievalCapabilityPublisher:
+            raise BenchmarkGateDError("GATE_D.PUBLISHER_INVALID")
+        generated = _validate_evidence_utc_string(
+            generated_at_utc,
+            "generated_at_utc",
+        )
+        valid_until = _validate_evidence_utc_string(
+            valid_until_utc,
+            "valid_until_utc",
+        )
+        if not generated < valid_until:
+            raise BenchmarkGateDError("GATE_D.INSTANTS_INVALID")
+        evaluated = _require_utc_datetime(evaluated_at_utc)
+        fts5_evidence, fallback_evidence = retrieval_benchmark_evidence_pair(
+            bundle,
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+        )
+        new_manifest = RetrievalCapabilityManifest(
+            evidence_schema_version=base_manifest.evidence_schema_version,
+            retrieval_artifact_digest=base_manifest.retrieval_artifact_digest,
+            retrieval_build_digest=base_manifest.retrieval_build_digest,
+            semantics_version=base_manifest.semantics_version,
+            fixture_digest=base_manifest.fixture_digest,
+            evaluator_digest=base_manifest.evaluator_digest,
+            generated_at_utc=base_manifest.generated_at_utc,
+            valid_until_utc=base_manifest.valid_until_utc,
+            context_cohorts=base_manifest.context_cohorts,
+            fuzzy_core_cohorts=base_manifest.fuzzy_core_cohorts,
+            fts5_trigram_benchmark=fts5_evidence,
+            gram_fallback_benchmark=fallback_evidence,
+        )
+        snapshot = publisher.refresh(
+            new_manifest,
+            evaluated_at_utc=evaluated,
+        )
+        _verify_path_decisions_match_reports(
+            snapshot,
+            fts5_evidence,
+            fallback_evidence,
+        )
+    except BenchmarkGateDError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise BenchmarkGateDError("GATE_D.PUBLICATION_FAILED") from error
+    return RetrievalCapabilityPublicationResult(
+        manifest=new_manifest,
+        snapshot=snapshot,
+    )
+
+
 # --- shared strict helpers --------------------------------------------------
 
 
@@ -2238,16 +3290,21 @@ __all__ = [
     "BENCHMARK_BUNDLE_DIGEST_KIND",
     "BENCHMARK_BUNDLE_DIGEST_VERSION",
     "BENCHMARK_BUNDLE_SCHEMA_VERSION",
+    "BenchmarkGateDError",
+    "BenchmarkGateDRunResult",
     "BenchmarkEvidenceBundle",
     "BenchmarkPathBundle",
     "BenchmarkProcessFacts",
     "BenchmarkQueryFacts",
+    "RetrievalCapabilityPublicationResult",
     "benchmark_evidence_bundle_digest",
     "benchmark_evidence_bundle_from_json",
     "benchmark_evidence_bundle_from_payload",
     "benchmark_evidence_bundle_to_json",
     "benchmark_evidence_bundle_to_payload",
     "combine_benchmark_evidence",
+    "publish_retrieval_capability_gate_d",
     "retrieval_benchmark_evidence_by_path",
     "retrieval_benchmark_evidence_pair",
+    "run_benchmark_gate_d",
 ]
