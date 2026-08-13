@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 from tm_benchmark import iter_corpus_records, load_benchmark_contract
 from tm_benchmark_process import (
+    ArtifactFileIdentity,
+    ArtifactSnapshot,
     PROCESS_EVIDENCE_SCHEMA_VERSION,
     PROCESS_WORKER_PROTOCOL_VERSION,
     ProcessEvidenceError,
@@ -24,6 +26,8 @@ from tm_benchmark_process import (
     _canonical_json,
     _evidence_from_stdout,
     _evidence_payload,
+    artifact_snapshot_digest,
+    artifact_snapshot_to_payload,
     collect_process_environment,
     evidence_from_payload,
     process_evidence_digest,
@@ -80,6 +84,22 @@ def _environment(fts5_enabled: bool) -> tuple[tuple[str, str], ...]:
         rss_raw_unit="kib",
         rss_platform="linux",
         rss_scope=BENCHMARK_RSS_SCOPE,
+    )
+
+
+def _artifact_snapshot(
+    *,
+    sidecar_digest: str = "c" * 64,
+    manifest_digest: str = "d" * 64,
+    family_digest: str = "e" * 64,
+) -> ArtifactSnapshot:
+    identity = ArtifactFileIdentity(device=1, inode=2, size=3, mtime_ns=4)
+    return ArtifactSnapshot(
+        sidecar_digest=sidecar_digest,
+        manifest_digest=manifest_digest,
+        family_digest=family_digest,
+        sidecar_identity=identity,
+        manifest_identity=identity,
     )
 
 
@@ -159,6 +179,7 @@ def _small_evidence(**overrides: Any) -> TMBenchmarkProcessEvidence:
             execution_path=execution_path,
             test_mode=test_mode,
         ),
+        "artifact_snapshot": _artifact_snapshot(),
         "child_pid": 424242,
         "child_exit_code": 0,
         "reopen_phase": "GENERATION_PUBLISHED",
@@ -354,6 +375,37 @@ class ProcessEvidenceConstructorTests(unittest.TestCase):
         self.assertNotIn("target_raw", str(payload))
         self.assertNotIn("query_raw", str(payload))
 
+    def test_rejects_missing_or_wrong_type_artifact_snapshot(self) -> None:
+        with self.assertRaises(TypeError):
+            _small_evidence(artifact_snapshot=None)
+        with self.assertRaisesRegex(TypeError, "artifact snapshot"):
+            _small_evidence(artifact_snapshot=_artifact_snapshot().sidecar_digest)
+        with self.assertRaisesRegex(ValueError, "sidecar digest"):
+            _small_evidence(
+                artifact_snapshot=_artifact_snapshot(
+                    sidecar_digest="not-a-digest",
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "manifest digest"):
+            _small_evidence(
+                artifact_snapshot=_artifact_snapshot(
+                    manifest_digest="not-a-digest",
+                )
+            )
+
+    def test_rejects_forged_artifact_identity_scalars(self) -> None:
+        for field_name in ("device", "inode", "size", "mtime_ns"):
+            with self.subTest(field_name=field_name):
+                facts = {
+                    "device": 1,
+                    "inode": 2,
+                    "size": 3,
+                    "mtime_ns": 4,
+                }
+                facts[field_name] = True
+                with self.assertRaises(TypeError):
+                    ArtifactFileIdentity(**facts)
+
 
 class ProcessEvidencePayloadTests(unittest.TestCase):
     def _payload(self) -> dict[str, object]:
@@ -373,6 +425,37 @@ class ProcessEvidencePayloadTests(unittest.TestCase):
         del payload["child_pid"]
         with self.assertRaises(ValueError):
             evidence_from_payload(payload)
+        payload = self._payload()
+        del payload["artifact_snapshot"]
+        with self.assertRaises(ValueError):
+            evidence_from_payload(payload)
+
+    def test_rejects_forged_artifact_snapshot_payload(self) -> None:
+        payload = self._payload()
+        snapshot = payload["artifact_snapshot"]
+        assert isinstance(snapshot, dict)
+        snapshot["sidecar_digest"] = "not-a-digest"
+        with self.assertRaises(ValueError):
+            evidence_from_payload(payload)
+        payload = self._payload()
+        snapshot = payload["artifact_snapshot"]
+        assert isinstance(snapshot, dict)
+        identity = snapshot["sidecar_identity"]
+        assert isinstance(identity, dict)
+        identity["device"] = True
+        with self.assertRaises((TypeError, ValueError)):
+            evidence_from_payload(payload)
+
+    def test_artifact_snapshot_payload_round_trips(self) -> None:
+        snapshot = _artifact_snapshot()
+        payload = artifact_snapshot_to_payload(snapshot)
+        from tm_benchmark_process import artifact_snapshot_from_payload
+
+        self.assertEqual(artifact_snapshot_from_payload(payload), snapshot)
+        self.assertEqual(
+            artifact_snapshot_digest(snapshot),
+            artifact_snapshot_digest(artifact_snapshot_from_payload(payload)),
+        )
 
     def test_rejects_duplicate_json_keys_in_stdout(self) -> None:
         with self.assertRaises(ValueError):
@@ -465,6 +548,27 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertTrue(
                 any("activation-journal" in name for name in names)
             )
+            sidecar = Path(evidence.fixture_path + ".sqlite3")
+            manifest = Path(evidence.fixture_path + ".localcat-snapshot.json")
+            snapshot = evidence.artifact_snapshot
+            self.assertEqual(
+                snapshot.sidecar_digest,
+                hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                snapshot.manifest_digest,
+                hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            )
+            self.assertRegex(snapshot.family_digest, r"[0-9a-f]{64}\Z")
+            sidecar_stat = sidecar.lstat()
+            self.assertEqual(snapshot.sidecar_identity.device, sidecar_stat.st_dev)
+            self.assertEqual(snapshot.sidecar_identity.inode, sidecar_stat.st_ino)
+            self.assertEqual(snapshot.sidecar_identity.size, sidecar_stat.st_size)
+            self.assertEqual(
+                snapshot.sidecar_identity.mtime_ns,
+                sidecar_stat.st_mtime_ns,
+            )
+            self.assertEqual(snapshot.manifest_identity.inode, manifest.lstat().st_ino)
 
     def test_run_root_must_be_closed_before_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

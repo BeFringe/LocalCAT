@@ -55,8 +55,9 @@ clock/statistic/cohort configuration, and returns a stable sorted tuple that
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+import json
 import math
 import os
 import platform
@@ -825,6 +826,405 @@ def latency_evidence_digest(evidence: LatencyEvidence) -> str:
         "latency-evidence",
         items,
     )
+
+
+
+# --- Strict public raw-evidence codec (Task 8.5A query-process bridge) ------
+
+_LATENCY_EVIDENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        "contract_digest",
+        "contract_json",
+        "environment",
+        "environment_digest",
+        "evidence_digest",
+        "exact_cohort_digest",
+        "exact_max_ns",
+        "exact_p50_ns",
+        "exact_p95_ns",
+        "exact_sample_count",
+        "exact_samples",
+        "execution_path",
+        "fuzzy_cohort_digest",
+        "fuzzy_max_ns",
+        "fuzzy_p50_ns",
+        "fuzzy_p95_ns",
+        "fuzzy_sample_count",
+        "fuzzy_samples",
+        "measured_repeats",
+        "minimum_similarity",
+        "path_config_digest",
+        "percentile_method",
+        "schema_version",
+        "timing_clock",
+        "top_k",
+        "warmup_queries_per_cohort",
+    }
+)
+
+
+def _canonical_json(value: Mapping[str, object]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _reject_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_strict_json(raw: str) -> dict[str, object]:
+    """Parse one strict JSON object rejecting duplicate keys and non-finite."""
+
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+    def parse_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(
+                f"non-finite JSON number is not allowed: {value}"
+            )
+        return number
+
+    try:
+        parsed = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=reject_non_finite,
+            parse_float=parse_float,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise ValueError("payload is not strict JSON") from None
+    if type(parsed) is not dict:
+        raise ValueError("payload must be a JSON object")
+    return parsed
+
+
+def _strict_fields(
+    payload: Mapping[str, object],
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if type(payload) is not dict:
+        raise TypeError(f"{label} must be a built-in dict")
+    keys = set(payload)
+    if keys != expected_keys:
+        missing = sorted(expected_keys - keys)
+        unknown = sorted(keys - expected_keys)
+        raise ValueError(
+            f"{label} has missing fields {missing!r} and unknown fields "
+            f"{unknown!r}"
+        )
+    return dict(payload)
+
+
+def _as_float(value: object, field_name: str) -> float:
+    return _require_builtin_float(value, field_name)
+
+
+def _latency_environment_payload(
+    environment: tuple[tuple[str, str], ...],
+) -> list[list[str]]:
+    return [[key, value] for key, value in environment]
+
+
+def _latency_environment_from_payload(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    if type(value) is not list:
+        raise TypeError("environment must be a JSON list")
+    pairs: list[tuple[str, str]] = []
+    for entry in value:
+        if type(entry) is not list or len(entry) != 2:
+            raise TypeError("environment entries must be two-item lists")
+        key = _require_identity(entry[0], "environment key")
+        value_text = _require_identity(entry[1], "environment value")
+        pairs.append((key, value_text))
+    return tuple(pairs)
+
+
+
+def _reject_bool(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{field_name} must be a built-in bool")
+    return value
+
+
+def _latency_sample_from_payload(
+    value: object,
+    label: str,
+) -> LatencySample:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be a JSON object")
+    fields = _strict_fields(
+        value,
+        frozenset(
+            {
+                "actual_path",
+                "cohort",
+                "elapsed_ns",
+                "minimum_similarity",
+                "query_id",
+                "result_count",
+                "succeeded",
+                "top_k",
+            }
+        ),
+        label,
+    )
+    try:
+        actual_path = BenchmarkExecutionPath(
+            _require_identity(fields["actual_path"], "sample actual path")
+        )
+    except ValueError as error:
+        raise ValueError("sample actual path is invalid") from error
+    minimum_similarity = fields["minimum_similarity"]
+    top_k = fields["top_k"]
+    if minimum_similarity is None:
+        if top_k is not None:
+            raise ValueError("fuzzy configuration must be set or absent together")
+    else:
+        minimum_similarity = _as_float(
+            minimum_similarity,
+            "sample minimum similarity",
+        )
+        top_k = _require_builtin_int(top_k, "sample top_k", minimum=1)
+    return LatencySample(
+        query_id=_require_builtin_int(
+            fields["query_id"],
+            "sample query id",
+            minimum=1,
+        ),
+        elapsed_ns=_require_builtin_int(
+            fields["elapsed_ns"],
+            "sample elapsed nanoseconds",
+            minimum=0,
+        ),
+        cohort=_require_identity(fields["cohort"], "sample cohort"),
+        actual_path=actual_path,
+        succeeded=_reject_bool(fields["succeeded"], "sample succeeded"),
+        result_count=_require_builtin_int(
+            fields["result_count"],
+            "sample result count",
+            minimum=0,
+        ),
+        minimum_similarity=minimum_similarity,
+        top_k=top_k,
+    )
+
+
+def latency_evidence_to_payload(
+    evidence: LatencyEvidence,
+) -> dict[str, object]:
+    """Strict public payload snapshot of one latency evidence value."""
+    if type(evidence) is not LatencyEvidence:
+        raise TypeError("evidence must be LatencyEvidence")
+    return {
+        "schema_version": evidence.schema_version,
+        "contract_json": contract_to_json(evidence.contract),
+        "contract_digest": evidence.contract_digest,
+        "exact_cohort_digest": evidence.exact_cohort_digest,
+        "fuzzy_cohort_digest": evidence.fuzzy_cohort_digest,
+        "execution_path": evidence.execution_path.value,
+        "path_config_digest": evidence.path_config_digest,
+        "warmup_queries_per_cohort": evidence.warmup_queries_per_cohort,
+        "measured_repeats": evidence.measured_repeats,
+        "percentile_method": evidence.percentile_method,
+        "timing_clock": evidence.timing_clock,
+        "minimum_similarity": evidence.minimum_similarity,
+        "top_k": evidence.top_k,
+        "exact_samples": [
+            _sample_payload(sample) for sample in evidence.exact_samples
+        ],
+        "fuzzy_samples": [
+            _sample_payload(sample) for sample in evidence.fuzzy_samples
+        ],
+        "exact_sample_count": evidence.exact_sample_count,
+        "fuzzy_sample_count": evidence.fuzzy_sample_count,
+        "exact_p50_ns": evidence.exact_p50_ns,
+        "exact_p95_ns": evidence.exact_p95_ns,
+        "exact_max_ns": evidence.exact_max_ns,
+        "fuzzy_p50_ns": evidence.fuzzy_p50_ns,
+        "fuzzy_p95_ns": evidence.fuzzy_p95_ns,
+        "fuzzy_max_ns": evidence.fuzzy_max_ns,
+        "environment": _latency_environment_payload(evidence.environment),
+        "environment_digest": evidence.environment_digest,
+        "evidence_digest": evidence.evidence_digest,
+    }
+
+
+def latency_evidence_from_payload(
+    payload: Mapping[str, object],
+) -> LatencyEvidence:
+    """Strictly reconstruct a self-validating latency evidence from a payload.
+
+    The payload's ``evidence_digest`` is never trusted: it must equal the
+    digest recomputed from the reconstructed evidence.
+    """
+    fields = _strict_fields(
+        payload,
+        _LATENCY_EVIDENCE_PAYLOAD_FIELDS,
+        "latency evidence payload",
+    )
+    if _require_identity(
+        fields["schema_version"],
+        "schema version",
+    ) != LATENCY_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError(
+            "schema version must be " f"{LATENCY_EVIDENCE_SCHEMA_VERSION}"
+        )
+    contract_json = _require_identity(
+        fields["contract_json"],
+        "contract json",
+    )
+    parsed_contract_json = _parse_strict_json(contract_json)
+    contract = contract_from_json(_canonical_json(parsed_contract_json))
+    if type(contract) is not BenchmarkContract:
+        raise TypeError("latency evidence contract must be BenchmarkContract")
+    try:
+        execution_path = BenchmarkExecutionPath(
+            _require_identity(
+                fields["execution_path"],
+                "execution path",
+            )
+        )
+    except ValueError as error:
+        raise ValueError("execution path is invalid") from error
+    exact_samples_value = fields["exact_samples"]
+    if type(exact_samples_value) is not list:
+        raise TypeError("exact samples must be a JSON list")
+    exact_samples = tuple(
+        _latency_sample_from_payload(sample, "exact sample")
+        for sample in exact_samples_value
+    )
+    fuzzy_samples_value = fields["fuzzy_samples"]
+    if type(fuzzy_samples_value) is not list:
+        raise TypeError("fuzzy samples must be a JSON list")
+    fuzzy_samples = tuple(
+        _latency_sample_from_payload(sample, "fuzzy sample")
+        for sample in fuzzy_samples_value
+    )
+    evidence = LatencyEvidence(
+        schema_version=LATENCY_EVIDENCE_SCHEMA_VERSION,
+        contract=contract,
+        contract_digest=_require_digest(
+            fields["contract_digest"],
+            "contract digest",
+        ),
+        exact_cohort_digest=_require_digest(
+            fields["exact_cohort_digest"],
+            "exact cohort digest",
+        ),
+        fuzzy_cohort_digest=_require_digest(
+            fields["fuzzy_cohort_digest"],
+            "fuzzy cohort digest",
+        ),
+        execution_path=execution_path,
+        path_config_digest=_require_digest(
+            fields["path_config_digest"],
+            "path config digest",
+        ),
+        warmup_queries_per_cohort=_require_builtin_int(
+            fields["warmup_queries_per_cohort"],
+            "warmup queries per cohort",
+            minimum=0,
+        ),
+        measured_repeats=_require_builtin_int(
+            fields["measured_repeats"],
+            "measured repeats",
+            minimum=1,
+        ),
+        percentile_method=_require_identity(
+            fields["percentile_method"],
+            "percentile method",
+        ),
+        timing_clock=_require_identity(fields["timing_clock"], "timing clock"),
+        minimum_similarity=_as_float(
+            fields["minimum_similarity"],
+            "minimum similarity",
+        ),
+        top_k=_require_builtin_int(fields["top_k"], "top_k", minimum=1),
+        exact_samples=exact_samples,
+        fuzzy_samples=fuzzy_samples,
+        exact_sample_count=_require_builtin_int(
+            fields["exact_sample_count"],
+            "exact sample count",
+            minimum=0,
+        ),
+        fuzzy_sample_count=_require_builtin_int(
+            fields["fuzzy_sample_count"],
+            "fuzzy sample count",
+            minimum=0,
+        ),
+        exact_p50_ns=_require_builtin_int(
+            fields["exact_p50_ns"],
+            "exact p50 nanoseconds",
+            minimum=0,
+        ),
+        exact_p95_ns=_require_builtin_int(
+            fields["exact_p95_ns"],
+            "exact p95 nanoseconds",
+            minimum=0,
+        ),
+        exact_max_ns=_require_builtin_int(
+            fields["exact_max_ns"],
+            "exact max nanoseconds",
+            minimum=0,
+        ),
+        fuzzy_p50_ns=_require_builtin_int(
+            fields["fuzzy_p50_ns"],
+            "fuzzy p50 nanoseconds",
+            minimum=0,
+        ),
+        fuzzy_p95_ns=_require_builtin_int(
+            fields["fuzzy_p95_ns"],
+            "fuzzy p95 nanoseconds",
+            minimum=0,
+        ),
+        fuzzy_max_ns=_require_builtin_int(
+            fields["fuzzy_max_ns"],
+            "fuzzy max nanoseconds",
+            minimum=0,
+        ),
+        environment=_latency_environment_from_payload(fields["environment"]),
+        environment_digest=_require_digest(
+            fields["environment_digest"],
+            "environment digest",
+        ),
+    )
+    caller_digest = _require_digest(
+        fields["evidence_digest"],
+        "evidence digest",
+    )
+    if caller_digest != evidence.evidence_digest:
+        raise ValueError(
+            "evidence digest does not match the reconstructed evidence"
+        )
+    return evidence
+
+
+def latency_evidence_to_json(evidence: LatencyEvidence) -> str:
+    """Strict canonical JSON snapshot of one latency evidence value."""
+    return _canonical_json(latency_evidence_to_payload(evidence))
+
+
+def latency_evidence_from_json(serialized: str) -> LatencyEvidence:
+    """Strictly reconstruct latency evidence from one canonical JSON object."""
+    if type(serialized) is not str:
+        raise TypeError("serialized latency evidence must be a string")
+    return latency_evidence_from_payload(_parse_strict_json(serialized))
 
 
 def measure_path_latency(

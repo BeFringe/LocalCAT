@@ -25,7 +25,10 @@ Process/RSS invariant capsule
   and covers source parse, migration stage record insertion and candidate
   index build, full stage/seal/Gate B validation and fsync, durable
   activation publication, a fresh coordinator/runtime reopen health proof,
-  and at least one exact plus one fuzzy/candidate query path proof.  Only
+  at least one exact plus one fuzzy/candidate query path proof, and the
+  terminal canonical artifact-family snapshot proof (sidecar + manifest
+  identity plus a digest over every retained family entry captured after
+  every lifecycle write settles).  Only
   after all of that may the child report success.
 - The fast path runs with actual FTS5 available and proves active health
   ``index_kind == FTS5_TRIGRAM``.  The fallback path forces
@@ -40,11 +43,13 @@ Process/RSS invariant capsule
 - Evidence is frozen and self-validating: it carries a private complete
   ``BenchmarkContract`` snapshot, contract/corpus/path/fixture/environment/
   worker-protocol digests, the path, actual index kind, record counts,
-  generation, ``migration_elapsed_ns``, ``peak_rss_bytes``, RSS unit/scope,
-  child pid/exit and proof facts, and a derived evidence digest
-  (``init=False``).  Bool/subclass scalars, non-finite or negative values,
-  and any contract/count/digest/path/index/environment/process-proof
-  mismatch fail closed.
+  generation, the child-captured canonical artifact snapshot (sidecar +
+  manifest digest/identity plus the complete retained family digest),
+  ``migration_elapsed_ns``,
+  ``peak_rss_bytes``, RSS unit/scope, child pid/exit and proof facts, and a
+  derived evidence digest (``init=False``).  Bool/subclass scalars,
+  non-finite or negative values, and any contract/count/digest/path/index/
+  environment/process-proof/artifact mismatch fail closed.
 - The parent runner requires the exact child schema and closed keys, rejects
   duplicate JSON keys/non-finite/extra stdout/missing fields, checks
   ``returncode == 0``, and recomputes the child evidence/digests.
@@ -116,6 +121,9 @@ from tm_stage_sealer import StageSealer
 PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-process-evidence-v1"
 PROCESS_WORKER_PROTOCOL_VERSION = "tm-benchmark-process-worker-v1"
 PROCESS_EVIDENCE_DIGEST_VERSION = "tm-benchmark-process-digest-v1"
+PROCESS_ARTIFACT_SNAPSHOT_DIGEST_VERSION = (
+    "tm-benchmark-process-artifact-snapshot-v1"
+)
 
 REAL_CORPUS_RECORD_COUNT = 100_000
 WORKER_MODE_FLAG = "--worker"
@@ -488,6 +496,7 @@ class TMBenchmarkProcessEvidence:
     environment: tuple[tuple[str, str], ...]
     environment_digest: str
     worker_protocol_digest: str
+    artifact_snapshot: ArtifactSnapshot
     child_pid: int
     child_exit_code: int
     reopen_phase: str
@@ -527,6 +536,8 @@ class TMBenchmarkProcessEvidence:
             self.worker_protocol_digest,
             "worker protocol digest",
         )
+        if type(self.artifact_snapshot) is not ArtifactSnapshot:
+            raise TypeError("evidence artifact snapshot must be ArtifactSnapshot")
         if type(self.execution_path) is not BenchmarkExecutionPath:
             raise TypeError("execution path must be BenchmarkExecutionPath")
         expected_path_digest = (
@@ -760,6 +771,9 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
         raise TypeError("evidence must be TMBenchmarkProcessEvidence")
     payload: dict[str, object] = {
         "actual_index_kind": evidence.actual_index_kind,
+        "artifact_snapshot": artifact_snapshot_to_payload(
+            evidence.artifact_snapshot
+        ),
         "candidate_proof_available": evidence.candidate_proof_available,
         "candidate_proof_budget": evidence.candidate_proof_budget,
         "candidate_proof_count": evidence.candidate_proof_count,
@@ -805,6 +819,409 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
     )
 
 
+
+
+# --- Strict public raw-evidence codec and locator facts (Task 8.5A) --------
+
+def process_evidence_to_payload(
+    evidence: TMBenchmarkProcessEvidence,
+) -> dict[str, object]:
+    """Strict public payload snapshot of one process evidence value."""
+    if type(evidence) is not TMBenchmarkProcessEvidence:
+        raise TypeError("evidence must be TMBenchmarkProcessEvidence")
+    return _evidence_payload(evidence)
+
+
+def process_evidence_to_json(evidence: TMBenchmarkProcessEvidence) -> str:
+    """Strict canonical JSON snapshot of one process evidence value."""
+    return _canonical_json(process_evidence_to_payload(evidence))
+
+
+def process_canonical_artifact_paths(
+    *,
+    resource_id: str,
+    fixture_path: str,
+) -> tuple[Path, Path, Path]:
+    """Derive the deterministic run-root artifact locators for one resource.
+
+    Returns ``(fixture, canonical_sidecar, snapshot_manifest)`` using the
+    same ``CanonicalResourceIdentity`` authority the Task 8.3 migration
+    child used, so the Task 8.5 query child reopens exactly the artifact
+    the process evidence binds.  The caller still owns the run root and
+    must verify the artifact facts before use.
+    """
+    _require_identity(resource_id, "resource id")
+    _require_absolute_path_string(fixture_path, "fixture path")
+    fixture = Path(fixture_path)
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        resource_id,
+        fixture.resolve(),
+    )
+    return (
+        fixture,
+        identity.canonical_sidecar_path,
+        identity.snapshot_manifest_path,
+    )
+
+
+@dataclass(frozen=True)
+class ArtifactFileIdentity:
+    """No-follow stable identity facts of one canonical artifact file."""
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+    def __post_init__(self) -> None:
+        _require_builtin_int(self.device, "artifact device", minimum=0)
+        _require_builtin_int(self.inode, "artifact inode", minimum=0)
+        _require_builtin_int(self.size, "artifact size", minimum=0)
+        _require_builtin_int(
+            self.mtime_ns,
+            "artifact mtime nanoseconds",
+            minimum=0,
+        )
+
+
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    """Child-captured canonical artifact-family digest and identity proof.
+
+    Owned by the Task 8.3 migration process so the evidence binds the exact
+    artifact bytes and no-follow identities the query child must reopen.
+    Never imported from the Task 8.5 query owner.
+    """
+
+    sidecar_digest: str
+    manifest_digest: str
+    family_digest: str
+    sidecar_identity: ArtifactFileIdentity
+    manifest_identity: ArtifactFileIdentity
+
+    def __post_init__(self) -> None:
+        _require_digest(self.sidecar_digest, "sidecar digest")
+        _require_digest(self.manifest_digest, "manifest digest")
+        _require_digest(self.family_digest, "artifact family digest")
+        if type(self.sidecar_identity) is not ArtifactFileIdentity:
+            raise TypeError("sidecar identity must be ArtifactFileIdentity")
+        if type(self.manifest_identity) is not ArtifactFileIdentity:
+            raise TypeError("manifest identity must be ArtifactFileIdentity")
+
+
+def artifact_snapshot_to_payload(
+    snapshot: ArtifactSnapshot,
+) -> dict[str, object]:
+    """Strict public payload snapshot of one process artifact snapshot."""
+    if type(snapshot) is not ArtifactSnapshot:
+        raise TypeError("snapshot must be ArtifactSnapshot")
+    return {
+        "sidecar_digest": snapshot.sidecar_digest,
+        "manifest_digest": snapshot.manifest_digest,
+        "family_digest": snapshot.family_digest,
+        "sidecar_identity": {
+            "device": snapshot.sidecar_identity.device,
+            "inode": snapshot.sidecar_identity.inode,
+            "size": snapshot.sidecar_identity.size,
+            "mtime_ns": snapshot.sidecar_identity.mtime_ns,
+        },
+        "manifest_identity": {
+            "device": snapshot.manifest_identity.device,
+            "inode": snapshot.manifest_identity.inode,
+            "size": snapshot.manifest_identity.size,
+            "mtime_ns": snapshot.manifest_identity.mtime_ns,
+        },
+    }
+
+
+def artifact_snapshot_from_payload(value: object) -> ArtifactSnapshot:
+    """Strictly reconstruct one process artifact snapshot from a payload."""
+    if type(value) is not dict:
+        raise TypeError("artifact snapshot must be a JSON object")
+    fields = _strict_fields(
+        value,
+        frozenset(
+            {
+                "manifest_digest",
+                "manifest_identity",
+                "family_digest",
+                "sidecar_digest",
+                "sidecar_identity",
+            }
+        ),
+        "artifact snapshot payload",
+    )
+
+    def identity(value: object, label: str) -> ArtifactFileIdentity:
+        if type(value) is not dict:
+            raise TypeError(f"{label} must be a JSON object")
+        identity_fields = _strict_fields(
+            value,
+            frozenset({"device", "inode", "mtime_ns", "size"}),
+            f"{label} identity payload",
+        )
+        return ArtifactFileIdentity(
+            device=_as_int(identity_fields["device"], "artifact device", minimum=0),
+            inode=_as_int(identity_fields["inode"], "artifact inode", minimum=0),
+            size=_as_int(identity_fields["size"], "artifact size", minimum=0),
+            mtime_ns=_as_int(
+                identity_fields["mtime_ns"],
+                "artifact mtime nanoseconds",
+                minimum=0,
+            ),
+        )
+
+    return ArtifactSnapshot(
+        sidecar_digest=_as_digest(fields["sidecar_digest"], "sidecar digest"),
+        manifest_digest=_as_digest(
+            fields["manifest_digest"],
+            "manifest digest",
+        ),
+        family_digest=_as_digest(
+            fields["family_digest"],
+            "artifact family digest",
+        ),
+        sidecar_identity=identity(fields["sidecar_identity"], "sidecar"),
+        manifest_identity=identity(fields["manifest_identity"], "manifest"),
+    )
+
+
+def artifact_snapshot_digest(snapshot: ArtifactSnapshot) -> str:
+    """Versioned digest over one canonical artifact snapshot."""
+    if type(snapshot) is not ArtifactSnapshot:
+        raise TypeError("snapshot must be ArtifactSnapshot")
+    return benchmark_digest(
+        PROCESS_ARTIFACT_SNAPSHOT_DIGEST_VERSION,
+        "process-artifact-snapshot",
+        [artifact_snapshot_to_payload(snapshot)],
+    )
+
+
+def _stable_file_proof(
+    path: Path,
+    label: str,
+) -> tuple[str, os.stat_result]:
+    """Read one no-follow file while proving its path identity stayed fixed."""
+    before = _require_single_link_regular_file(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"cannot open {label}") from error
+
+    def identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_nlink,
+        )
+
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or identity(opened) != identity(before)
+        ):
+            raise ValueError(f"{label} changed before no-follow open")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        terminal = os.fstat(descriptor)
+        if identity(terminal) != identity(opened):
+            raise ValueError(f"{label} changed while being read")
+    except OSError as error:
+        raise ValueError(f"cannot read {label}") from error
+    finally:
+        os.close(descriptor)
+    after = _require_single_link_regular_file(path, label)
+    if identity(after) != identity(terminal):
+        raise ValueError(f"{label} path identity changed after read")
+    return digest.hexdigest(), after
+
+
+def _file_sha256(path: Path, label: str) -> str:
+    digest, _identity = _stable_file_proof(path, label)
+    return digest
+
+
+def _expected_artifact_family_names(
+    *,
+    fixture_path: Path,
+    sidecar_path: Path,
+    manifest_path: Path,
+) -> frozenset[str]:
+    sidecar_name = sidecar_path.name
+    return frozenset(
+        {
+            fixture_path.name,
+            sidecar_name,
+            manifest_path.name,
+            f".{sidecar_name}.localcat-activation-journal.json",
+            f".{sidecar_name}.localcat-activation-terminal.json",
+            f".{sidecar_name}.localcat-activated-lineage.json",
+        }
+    )
+
+
+def _artifact_family_proof(
+    *,
+    entries: tuple[Path, ...],
+) -> tuple[str, dict[str, tuple[str, os.stat_result]]]:
+    """Digest every retained entry and return its no-follow stable proof."""
+    payload: list[dict[str, object]] = []
+    proofs: dict[str, tuple[str, os.stat_result]] = {}
+    for entry in entries:
+        digest, stat_result = _stable_file_proof(
+            entry,
+            f"artifact family entry {entry.name!r}",
+        )
+        proofs[entry.name] = (digest, stat_result)
+        payload.append(
+            {
+                "digest": digest,
+                "identity": {
+                    "device": stat_result.st_dev,
+                    "inode": stat_result.st_ino,
+                    "mtime_ns": stat_result.st_mtime_ns,
+                    "size": stat_result.st_size,
+                },
+                "name": entry.name,
+            }
+        )
+    return (
+        benchmark_digest(
+            PROCESS_ARTIFACT_SNAPSHOT_DIGEST_VERSION,
+            "process-artifact-family",
+            payload,
+        ),
+        proofs,
+    )
+
+
+def _capture_artifact_snapshot(
+    *,
+    run_root: Path,
+    fixture_path: Path,
+    resource_id: str,
+    fixture_digest: str,
+) -> ArtifactSnapshot:
+    """Capture the canonical artifact proof after every lifecycle write.
+
+    Runs inside the measured Task 8.3 lifecycle after all migration writes
+    settle and before the terminal RSS/elapsed sample, so the proof is part
+    of the measured child lifetime and of the evidence digest.  Derives the
+    deterministic locators from ``resource_id`` + ``fixture_path``, proves
+    every retained family entry is a direct no-follow regular single-link
+    run-root child, rejects foreign namespace entries, and binds a full
+    SHA-256/identity digest over the family plus direct sidecar/manifest
+    proofs. Missing, forged, escaped, symlinked, multilink, or foreign
+    artifacts fail closed.
+    """
+    if type(run_root) is not _NATIVE_PATH_TYPE:
+        raise TypeError("run root must be a Path")
+    if type(fixture_path) is not _NATIVE_PATH_TYPE:
+        raise TypeError("fixture path must be a Path")
+    _require_identity(resource_id, "resource id")
+    _require_digest(fixture_digest, "fixture digest")
+    run_root = run_root.resolve()
+    fixture_path = fixture_path.resolve()
+    if not run_root.is_absolute() or not run_root.is_dir():
+        raise ValueError("run root must be an existing absolute directory")
+    if fixture_path.parent != run_root:
+        raise ValueError("fixture path must live directly in the run root")
+    fixture, sidecar_path, manifest_path = process_canonical_artifact_paths(
+        resource_id=resource_id,
+        fixture_path=str(fixture_path),
+    )
+    if fixture != fixture_path:
+        raise ValueError("fixture path is not deterministic for the resource")
+    try:
+        entries = tuple(sorted(run_root.iterdir(), key=lambda path: path.name))
+    except OSError as error:
+        raise ValueError("run root cannot be inspected") from error
+    expected_names = _expected_artifact_family_names(
+        fixture_path=fixture_path,
+        sidecar_path=sidecar_path,
+        manifest_path=manifest_path,
+    )
+    entry_names = {entry.name for entry in entries}
+    foreign_names = sorted(entry_names - expected_names)
+    if foreign_names:
+        raise ValueError(
+            f"run root contains foreign entries {foreign_names!r}"
+        )
+    for required_name in (
+        fixture_path.name,
+        sidecar_path.name,
+        manifest_path.name,
+    ):
+        if required_name not in entry_names:
+            raise ValueError(
+                f"run root is missing required artifact {required_name!r}"
+            )
+    for path, label in (
+        (sidecar_path, "canonical sidecar"),
+        (manifest_path, "snapshot manifest"),
+    ):
+        if path.parent != run_root:
+            raise ValueError(f"{label} must live directly in the run root")
+        if path.resolve() != path:
+            raise ValueError(f"{label} must not escape the run root")
+        _require_single_link_regular_file(path, label)
+    family_digest, family_proofs = _artifact_family_proof(entries=entries)
+    captured_fixture_digest, _fixture_stat = family_proofs[fixture_path.name]
+    if captured_fixture_digest != fixture_digest:
+        raise ValueError("fixture digest does not match the run request")
+    sidecar_digest, sidecar_stat = family_proofs[sidecar_path.name]
+    manifest_digest, manifest_stat = family_proofs[manifest_path.name]
+    return ArtifactSnapshot(
+        sidecar_digest=sidecar_digest,
+        manifest_digest=manifest_digest,
+        family_digest=family_digest,
+        sidecar_identity=ArtifactFileIdentity(
+            device=sidecar_stat.st_dev,
+            inode=sidecar_stat.st_ino,
+            size=sidecar_stat.st_size,
+            mtime_ns=sidecar_stat.st_mtime_ns,
+        ),
+        manifest_identity=ArtifactFileIdentity(
+            device=manifest_stat.st_dev,
+            inode=manifest_stat.st_ino,
+            size=manifest_stat.st_size,
+            mtime_ns=manifest_stat.st_mtime_ns,
+        ),
+    )
+
+
+def rss_peak_bytes_facts(usage: object) -> tuple[str, str, int]:
+    """Normalize one child rusage high-water sample to bytes.
+
+    Returns ``(rss_platform, rss_raw_unit, peak_rss_bytes)`` with the same
+    Linux/macOS unit rules the Task 8.3 child uses: Linux ``ru_maxrss`` is
+    KiB and is multiplied by 1024; macOS reports bytes directly.  The
+    sample is the raw high-water mark with no baseline subtraction.
+    """
+    if type(usage) is not resource.struct_rusage:
+        raise TypeError("usage must be resource.struct_rusage")
+    if sys.platform.startswith("linux"):
+        platform_name, raw_unit = "linux", "kib"
+    elif sys.platform == "darwin":
+        platform_name, raw_unit = "darwin", "bytes"
+    else:
+        raise ValueError("unsupported platform for RSS measurement")
+    value = usage.ru_maxrss
+    if type(value) is not int or isinstance(value, bool) or value < 1:
+        raise ValueError("RSS high-water sample is invalid")
+    if raw_unit == "kib":
+        return platform_name, raw_unit, value * 1024
+    return platform_name, raw_unit, value
+
 def _environment_payload(
     environment: tuple[tuple[str, str], ...],
 ) -> list[list[str]]:
@@ -827,6 +1244,7 @@ def _environment_from_payload(value: object) -> tuple[tuple[str, str], ...]:
 _EVIDENCE_PAYLOAD_FIELDS = frozenset(
     {
         "actual_index_kind",
+        "artifact_snapshot",
         "candidate_proof_available",
         "candidate_proof_budget",
         "candidate_proof_count",
@@ -874,6 +1292,9 @@ _EVIDENCE_PAYLOAD_FIELDS = frozenset(
 def _evidence_payload(evidence: TMBenchmarkProcessEvidence) -> dict[str, object]:
     return {
         "actual_index_kind": evidence.actual_index_kind,
+        "artifact_snapshot": artifact_snapshot_to_payload(
+            evidence.artifact_snapshot
+        ),
         "candidate_proof_available": evidence.candidate_proof_available,
         "candidate_proof_budget": evidence.candidate_proof_budget,
         "candidate_proof_count": evidence.candidate_proof_count,
@@ -1001,6 +1422,9 @@ def evidence_from_payload(
         worker_protocol_digest=_as_digest(
             fields["worker_protocol_digest"],
             "worker protocol digest",
+        ),
+        artifact_snapshot=artifact_snapshot_from_payload(
+            fields["artifact_snapshot"]
         ),
         child_pid=_as_int(fields["child_pid"], "child pid", minimum=1),
         child_exit_code=_as_int(
@@ -1324,6 +1748,7 @@ def _request_payload(
 @dataclass(frozen=True)
 class _MeasuredFacts:
     actual_index_kind: str
+    artifact_snapshot: ArtifactSnapshot
     candidate_proof_available: bool
     candidate_proof_budget: int
     candidate_proof_count: int
@@ -1492,6 +1917,16 @@ def _run_measured_lifecycle(
         captured_generation = generation
         captured_report = report
 
+    try:
+        artifact_snapshot = _capture_artifact_snapshot(
+            run_root=run_root,
+            fixture_path=fixture_path,
+            resource_id=resource_id,
+            fixture_digest=request.fixture_digest,
+        )
+    except (TypeError, ValueError, OSError) as error:
+        raise _WorkerError("PROCESS.ARTIFACT_INVALID") from error
+
     terminal_ns = time.perf_counter_ns()
     terminal_usage = resource.getrusage(resource.RUSAGE_SELF)
     elapsed_ns = terminal_ns - started_ns
@@ -1527,6 +1962,7 @@ def _run_measured_lifecycle(
         raise _WorkerError("PROCESS.PROTOCOL_DIGEST_MISMATCH")
     return _MeasuredFacts(
         actual_index_kind=captured_health.index_kind,
+        artifact_snapshot=artifact_snapshot,
         candidate_proof_available=captured_metadata.fuzzy_available,
         candidate_proof_budget=captured_metadata.candidate_budget,
         candidate_proof_count=len(captured_candidate_report.candidates),
@@ -1603,6 +2039,7 @@ def _evidence_from_facts(facts: _MeasuredFacts) -> TMBenchmarkProcessEvidence:
         environment=facts.environment,
         environment_digest=facts.environment_digest,
         worker_protocol_digest=facts.worker_protocol_digest,
+        artifact_snapshot=facts.artifact_snapshot,
         child_pid=facts.child_pid,
         child_exit_code=facts.child_exit_code,
         reopen_phase=facts.reopen_phase,
@@ -1842,14 +2279,23 @@ def run_process_migration_evidence(
 
 
 __all__ = [
+    "ArtifactFileIdentity",
+    "ArtifactSnapshot",
     "PROCESS_EVIDENCE_DIGEST_VERSION",
     "PROCESS_EVIDENCE_SCHEMA_VERSION",
     "PROCESS_WORKER_PROTOCOL_VERSION",
     "ProcessEvidenceError",
     "TMBenchmarkProcessEvidence",
+    "artifact_snapshot_digest",
+    "artifact_snapshot_from_payload",
+    "artifact_snapshot_to_payload",
     "collect_process_environment",
     "evidence_from_payload",
+    "process_canonical_artifact_paths",
     "process_evidence_digest",
+    "process_evidence_to_json",
+    "process_evidence_to_payload",
+    "rss_peak_bytes_facts",
     "run_process_migration_evidence",
     "worker_protocol_digest",
 ]
