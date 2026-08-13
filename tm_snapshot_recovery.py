@@ -642,46 +642,12 @@ def _classify_refresh_receipts(
             error_code="RECOVERY.BINDING_INVALID",
         )
     for receipt in issued:
-        if (
-            receipt.resource_id != facts.resource_id
-            or receipt.canonical_store_id != facts.canonical_store_id
-        ):
+        row_error = _refresh_receipt_row_error(facts, receipt)
+        if row_error is not None:
             return _RefreshDecision(
                 action="diverged",
                 receipts=issued,
-                error_code="RECOVERY.LEDGER_IDENTITY_INVALID",
-            )
-        if (
-            receipt.destination_jsonl_path
-            != facts.configured_jsonl_path
-            or receipt.destination_manifest_path
-            != facts.snapshot_manifest_path
-        ):
-            return _RefreshDecision(
-                action="diverged",
-                receipts=issued,
-                error_code="RECOVERY.LEDGER_PATH_INVALID",
-            )
-        try:
-            receipt.receipt
-        except (TypeError, ValueError):
-            return _RefreshDecision(
-                action="diverged",
-                receipts=issued,
-                error_code="RECOVERY.LEDGER_RECEIPT_INVALID",
-            )
-        expected_count = _record_count_at(
-            facts,
-            receipt.exported_revision,
-        )
-        if (
-            expected_count is None
-            or receipt.record_count != expected_count
-        ):
-            return _RefreshDecision(
-                action="diverged",
-                receipts=issued,
-                error_code="RECOVERY.ANCESTRY_INVALID",
+                error_code=row_error,
             )
     jsonl_state, jsonl_digest, jsonl_identity = _strict_file_state(
         facts.configured_jsonl_path
@@ -773,6 +739,33 @@ def _classify_refresh_receipts(
         receipts=issued,
         error_code="RECOVERY.PAIR_UNMATCHED",
     )
+
+
+def _refresh_receipt_row_error(
+    facts: _RefreshRecoveryFacts,
+    receipt: IssuedReceiptFacts,
+) -> str | None:
+    """Return the stable structural error for one configured row."""
+
+    if (
+        receipt.resource_id != facts.resource_id
+        or receipt.canonical_store_id != facts.canonical_store_id
+    ):
+        return "RECOVERY.LEDGER_IDENTITY_INVALID"
+    if (
+        receipt.destination_jsonl_path != facts.configured_jsonl_path
+        or receipt.destination_manifest_path
+        != facts.snapshot_manifest_path
+    ):
+        return "RECOVERY.LEDGER_PATH_INVALID"
+    try:
+        receipt.receipt
+    except (TypeError, ValueError):
+        return "RECOVERY.LEDGER_RECEIPT_INVALID"
+    expected_count = _record_count_at(facts, receipt.exported_revision)
+    if expected_count is None or receipt.record_count != expected_count:
+        return "RECOVERY.ANCESTRY_INVALID"
+    return None
 
 
 def _publish_reconstructed_manifest(
@@ -1414,6 +1407,15 @@ def _reconcile_one_export(
                 ("RECOVERY.EXPORT_ANCESTRY_INVALID",),
             )
         )
+    if handoff is None:
+        return _ExportReconciliation(
+            IssuedReceiptRecovery(
+                issued.snapshot_id,
+                RefreshRecoveryState.BLOCKED,
+                ("RECOVERY.HANDOFF_MISSING",),
+            ),
+            ("RECOVERY.HANDOFF_MISSING",),
+        )
     try:
         parent_handle = _bind_recovery_parent(issued, handoff)
     except RecoveryError as error:
@@ -1999,7 +2001,6 @@ def recover_snapshot_publication(
     overall = RefreshRecoveryState.NOOP
     read_error_code: str | None = None
     read_error_retryable = False
-    skip_export_reconcile = False
     rounds = 0
     while True:
         rounds += 1
@@ -2014,26 +2015,6 @@ def recover_snapshot_publication(
             read_error_code = error.error_code
             read_error_retryable = error.retryable
             diagnostics.append(error.error_code)
-            break
-        missing_issued_handoffs = tuple(
-            receipt
-            for receipt in facts.receipts
-            if receipt.status == "issued"
-            and _handoff_for(facts, receipt.snapshot_id) is None
-            and _missing_handoff_artifacts_present(receipt)
-        )
-        if missing_issued_handoffs:
-            for receipt in missing_issued_handoffs:
-                per_receipt.append(
-                    IssuedReceiptRecovery(
-                        receipt.snapshot_id,
-                        RefreshRecoveryState.BLOCKED,
-                        ("RECOVERY.HANDOFF_MISSING",),
-                    )
-                )
-            overall = RefreshRecoveryState.BLOCKED
-            diagnostics.append("RECOVERY.HANDOFF_MISSING")
-            skip_export_reconcile = True
             break
         if facts.divergence_latched:
             diagnostics.append("RECOVERY.DIVERGENCE_PRESERVED")
@@ -2064,6 +2045,27 @@ def recover_snapshot_publication(
         issued_refresh = _issued_refresh_receipts(facts)
         if not issued_refresh:
             break
+        if not facts.binding_invalid and all(
+            _refresh_receipt_row_error(facts, receipt) is None
+            for receipt in issued_refresh
+        ):
+            missing_handoffs = tuple(
+                receipt
+                for receipt in issued_refresh
+                if _handoff_for(facts, receipt.snapshot_id) is None
+            )
+            if missing_handoffs:
+                for receipt in missing_handoffs:
+                    per_receipt.append(
+                        IssuedReceiptRecovery(
+                            receipt.snapshot_id,
+                            RefreshRecoveryState.BLOCKED,
+                            ("RECOVERY.HANDOFF_MISSING",),
+                        )
+                    )
+                overall = RefreshRecoveryState.BLOCKED
+                diagnostics.append("RECOVERY.HANDOFF_MISSING")
+                break
         decision = _classify_refresh_receipts(facts, issued_refresh)
         try:
             if decision.action == "cancel":
@@ -2268,7 +2270,7 @@ def recover_snapshot_publication(
             overall = RefreshRecoveryState.BLOCKED
             diagnostics.append("RECOVERY.IO_FAILED")
             break
-    if read_error_code is None and not skip_export_reconcile:
+    if read_error_code is None:
         try:
             final_facts = port.read_recovery_facts()
         except RecoveryError as error:

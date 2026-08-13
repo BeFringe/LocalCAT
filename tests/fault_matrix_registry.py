@@ -742,6 +742,10 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
             "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
             "test_issued_deleted_or_orphaned_handoff_blocks",
             "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_configured_issued_missing_handoff_and_all_artifacts_absent_blocks",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_export_issued_missing_handoff_and_all_artifacts_absent_blocks",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
             "test_completed_deleted_or_orphaned_handoff_blocks",
             "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
             "test_cancelled_deleted_or_orphaned_handoff_blocks",

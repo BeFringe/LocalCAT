@@ -1294,7 +1294,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                     IssuedReceiptRecovery(
                         receipt.snapshot_id,
                         RefreshRecoveryState.BLOCKED,
-                        ("RECOVERY.EXPORT_PAIR_UNPROVABLE",),
+                        ("RECOVERY.HANDOFF_MISSING",),
                     ),
                 ),
             )
@@ -2127,7 +2127,7 @@ class TMRecoveryIdempotencyTests(unittest.TestCase):
                 stage.resource_identity.configured_jsonl_path.exists()
             )
 
-    def test_cold_store_issued_receipt_latches_divergence(self) -> None:
+    def test_cold_store_issued_receipt_without_handoff_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage = _stage(root)
@@ -2151,11 +2151,28 @@ class TMRecoveryIdempotencyTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
-            self.assertIn("RECOVERY.PAIR_UNMATCHED", outcome.diagnostics)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.HANDOFF_MISSING",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                outcome.diagnostics,
+                ("RECOVERY.HANDOFF_MISSING",),
+            )
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
             )
 
 
@@ -4103,6 +4120,182 @@ class TMClusterFRegressionTests(unittest.TestCase):
     def test_issued_deleted_or_orphaned_handoff_blocks(self) -> None:
         self._assert_deleted_or_orphaned_handoff_blocks("issued")
 
+    def test_configured_issued_missing_handoff_and_all_artifacts_absent_blocks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            receipt = _current_receipt(
+                store,
+                prefix="snapshot.refresh.",
+                payload=_NEW_JSONL,
+            )
+            _register_refresh(store, receipt)
+            paths = _paths(identity)
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                artifact.unlink(missing_ok=True)
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                changed = connection.execute(
+                    "DELETE FROM tm_meta WHERE key = ?",
+                    ("artifact_handoff." + receipt.snapshot_id,),
+                )
+                self.assertEqual(changed.rowcount, 1)
+                connection.commit()
+            finally:
+                connection.close()
+            pair_before = {
+                path: (path.read_bytes(), _identity_of(path))
+                for path in (
+                    identity.configured_jsonl_path,
+                    identity.snapshot_manifest_path,
+                )
+            }
+            binding_before = _binding_row(stage.staged_db_path)
+            canonical_before = store.capture_export_snapshot()
+
+            outcome = _fresh_store(stage).recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertIsNone(outcome.error_code)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.HANDOFF_MISSING",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                outcome.diagnostics,
+                ("RECOVERY.HANDOFF_MISSING",),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertTrue(
+                all(
+                    not artifact.exists()
+                    for artifact in (
+                        paths.jsonl_temp,
+                        paths.manifest_temp,
+                        paths.jsonl_recovery,
+                        paths.manifest_recovery,
+                    )
+                )
+            )
+            for path, expected in pair_before.items():
+                self.assertEqual(
+                    (path.read_bytes(), _identity_of(path)),
+                    expected,
+                    path.name,
+                )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path),
+                binding_before,
+            )
+            self.assertEqual(
+                store.capture_export_snapshot(),
+                canonical_before,
+            )
+
+    def test_export_issued_missing_handoff_and_all_artifacts_absent_blocks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+            paths = _export_artifact_paths(destination)
+            destination.write_bytes(b'{"source":"prior","target":"pair"}\n')
+            paths.manifest.write_bytes(b'{"manifest":"prior"}\n')
+            receipt = self._register_export(store, destination, _NEW_JSONL)
+            for artifact in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            ):
+                artifact.unlink(missing_ok=True)
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                changed = connection.execute(
+                    "DELETE FROM tm_meta WHERE key = ?",
+                    ("artifact_handoff." + receipt.snapshot_id,),
+                )
+                self.assertEqual(changed.rowcount, 1)
+                connection.commit()
+            finally:
+                connection.close()
+            pair_before = {
+                path: (path.read_bytes(), _identity_of(path))
+                for path in (paths.destination, paths.manifest)
+            }
+            binding_before = _binding_row(stage.staged_db_path)
+            canonical_before = store.capture_export_snapshot()
+
+            outcome = _fresh_store(stage).recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+            self.assertIsNone(outcome.error_code)
+            self.assertEqual(
+                outcome.receipts,
+                (
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.HANDOFF_MISSING",),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                outcome.diagnostics,
+                ("RECOVERY.HANDOFF_MISSING",),
+            )
+            self.assertEqual(
+                _status_for(stage.staged_db_path, receipt.snapshot_id),
+                "issued",
+            )
+            self.assertTrue(
+                all(
+                    not artifact.exists()
+                    for artifact in (
+                        paths.jsonl_temp,
+                        paths.manifest_temp,
+                        paths.jsonl_recovery,
+                        paths.manifest_recovery,
+                    )
+                )
+            )
+            for path, expected in pair_before.items():
+                self.assertEqual(
+                    (path.read_bytes(), _identity_of(path)),
+                    expected,
+                    path.name,
+                )
+            self.assertEqual(
+                _binding_row(stage.staged_db_path),
+                binding_before,
+            )
+            self.assertEqual(
+                store.capture_export_snapshot(),
+                canonical_before,
+            )
+
     def test_completed_deleted_or_orphaned_handoff_blocks(self) -> None:
         self._assert_deleted_or_orphaned_handoff_blocks("completed")
 
@@ -4371,7 +4564,7 @@ class TMClusterFRegressionTests(unittest.TestCase):
                     IssuedReceiptRecovery(
                         second.snapshot_id,
                         RefreshRecoveryState.BLOCKED,
-                        ("RECOVERY.EXPORT_PAIR_UNPROVABLE",),
+                        ("RECOVERY.HANDOFF_MISSING",),
                     ),
                 ),
             )
