@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import sys
 import unittest
@@ -55,15 +56,102 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _canonical_source_relative(relative: str) -> Path:
+    relative_path = Path(relative)
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+    ):
+        raise ValueError("fault-matrix source path is not canonical")
+    return relative_path
+
+
+def _strict_source_digest(root: Path, relative: str) -> str:
+    """Hash one source through a root-to-file no-follow descriptor walk."""
+
+    relative_path = _canonical_source_relative(relative)
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+    directory_descriptor = os.open(root, directory_flags)
+    file_descriptor = -1
+    try:
+        for component in relative_path.parts[:-1]:
+            next_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            observed = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(observed.st_mode):
+                os.close(next_descriptor)
+                raise ValueError(
+                    "fault-matrix source parent is not a real directory"
+                )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        filename = relative_path.parts[-1]
+        file_descriptor = os.open(
+            filename,
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("fault-matrix source is not a regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(file_descriptor, 1024 * 1024):
+            digest.update(chunk)
+        terminal = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(terminal.st_mode)
+            or (terminal.st_dev, terminal.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise ValueError("fault-matrix source identity changed")
+        return digest.hexdigest()
+    except OSError as error:
+        raise ValueError("fault-matrix source is not no-follow regular") from error
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        os.close(directory_descriptor)
+
+
+def _strict_source_file(root: Path, relative: str) -> Path:
+    """Validate one source and return its canonical lexical path for tests."""
+
+    relative_path = _canonical_source_relative(relative)
+    _strict_source_digest(root, relative)
+    return root / relative_path
+
+
 def _source_file_digests(root: Path) -> tuple[tuple[str, str], ...]:
     facts: list[tuple[str, str]] = []
-    resolved_root = root.resolve(strict=True)
     for relative in fault_matrix_source_paths():
-        path = (resolved_root / relative).resolve(strict=True)
-        if resolved_root not in path.parents or not path.is_file():
-            raise ValueError("fault-matrix source path escaped the repository")
-        facts.append((relative, hashlib.sha256(path.read_bytes()).hexdigest()))
+        facts.append((relative, _strict_source_digest(root, relative)))
     return tuple(facts)
+
+
+def _validate_evidence_target(path: Path) -> None:
+    """Reject aliases and non-regular existing canonical evidence targets."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError("fault matrix evidence target is not a regular file")
 
 
 def _run_row(row_id: str, test_ids: tuple[str, ...]) -> bool:
@@ -115,13 +203,26 @@ def _atomic_write(path: Path, payload: bytes) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    repository_root = arguments.repository_root.resolve(strict=True)
+    repository_root = arguments.repository_root.absolute()
+    if repository_root != _REPOSITORY_ROOT:
+        raise ValueError("fault matrix repository root must match the validator checkout")
+    if repository_root.resolve(strict=True) != _REPOSITORY_ROOT:
+        raise ValueError("fault matrix repository root is not canonical")
     evidence_path = arguments.emit
     if not evidence_path.is_absolute():
         evidence_path = repository_root / evidence_path
     evidence_path = evidence_path.absolute()
-    if evidence_path.parent.resolve(strict=True) != repository_root:
-        raise ValueError("fault matrix evidence must be emitted at repository root")
+    canonical_evidence_path = repository_root / "fault_matrix_evidence.json"
+    if evidence_path != canonical_evidence_path:
+        raise ValueError("fault matrix evidence must use the canonical output path")
+    _validate_evidence_target(evidence_path)
+
+    registry_digest = fault_matrix_registry_digest()
+    source_files = _source_file_digests(repository_root)
+    source_fingerprint = fault_matrix_source_fingerprint(
+        registry_digest,
+        source_files,
+    )
 
     row_results: list[dict[str, object]] = []
     for row in FAULT_MATRIX_ROWS:
@@ -135,12 +236,6 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
-    registry_digest = fault_matrix_registry_digest()
-    source_files = _source_file_digests(repository_root)
-    source_fingerprint = fault_matrix_source_fingerprint(
-        registry_digest,
-        source_files,
-    )
     evidence = {
         "generated_at_utc": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"

@@ -1937,6 +1937,8 @@ def recover_snapshot_publication(
     per_receipt: list[IssuedReceiptRecovery] = []
     diagnostics: list[str] = []
     overall = RefreshRecoveryState.NOOP
+    read_error_code: str | None = None
+    read_error_retryable = False
     rounds = 0
     while True:
         rounds += 1
@@ -1944,7 +1946,14 @@ def recover_snapshot_publication(
             overall = RefreshRecoveryState.BLOCKED
             diagnostics.append("RECOVERY.ROUND_LIMIT")
             break
-        facts = port.read_recovery_facts()
+        try:
+            facts = port.read_recovery_facts()
+        except RecoveryError as error:
+            overall = RefreshRecoveryState.BLOCKED
+            read_error_code = error.error_code
+            read_error_retryable = error.retryable
+            diagnostics.append(error.error_code)
+            break
         if facts.divergence_latched:
             diagnostics.append("RECOVERY.DIVERGENCE_PRESERVED")
             _replayed, replay_state = _replay_terminal_handoffs(
@@ -2178,10 +2187,24 @@ def recover_snapshot_publication(
             overall = RefreshRecoveryState.BLOCKED
             diagnostics.append("RECOVERY.IO_FAILED")
             break
-    export_results, export_diagnostics = _reconcile_issued_exports(
-        port,
-        port.read_recovery_facts(),
-    )
+    if read_error_code is None:
+        try:
+            final_facts = port.read_recovery_facts()
+        except RecoveryError as error:
+            overall = RefreshRecoveryState.BLOCKED
+            read_error_code = error.error_code
+            read_error_retryable = error.retryable
+            diagnostics.append(error.error_code)
+            export_results = ()
+            export_diagnostics = ()
+        else:
+            export_results, export_diagnostics = _reconcile_issued_exports(
+                port,
+                final_facts,
+            )
+    else:
+        export_results = ()
+        export_diagnostics = ()
     per_receipt.extend(export_results)
     diagnostics.extend(export_diagnostics)
     if overall is RefreshRecoveryState.NOOP and export_results:
@@ -2216,4 +2239,6 @@ def recover_snapshot_publication(
         receipts=tuple(per_receipt),
         snapshot_id=snapshot_id,
         diagnostics=tuple(sorted(set(diagnostics))),
+        error_code=read_error_code,
+        retryable=read_error_retryable,
     )

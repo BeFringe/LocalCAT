@@ -3331,6 +3331,30 @@ def _require_artifact_identity_pair(
 
 _ARTIFACT_HANDOFF_META_PREFIX = "artifact_handoff."
 
+_ARTIFACT_HANDOFF_META_KEYS = frozenset(
+    {
+        "version",
+        "artifact_parent_device",
+        "artifact_parent_inode",
+        "jsonl_temp_device",
+        "jsonl_temp_inode",
+        "manifest_temp_device",
+        "manifest_temp_inode",
+        "jsonl_recovery_device",
+        "jsonl_recovery_inode",
+        "manifest_recovery_device",
+        "manifest_recovery_inode",
+        "prior_jsonl_device",
+        "prior_jsonl_inode",
+        "prior_jsonl_digest",
+        "prior_jsonl_absent",
+        "prior_manifest_device",
+        "prior_manifest_inode",
+        "prior_manifest_digest",
+        "prior_manifest_absent",
+    }
+)
+
 
 def _artifact_handoff_meta_key(snapshot_id: str) -> str:
     return f"{_ARTIFACT_HANDOFF_META_PREFIX}{snapshot_id}"
@@ -3517,16 +3541,37 @@ def _artifact_handoff_from_meta(
     snapshot_id = key[len(_ARTIFACT_HANDOFF_META_PREFIX) :]
     if not snapshot_id:
         return None
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        for field, item in pairs:
+            if field in payload:
+                raise ValueError("artifact handoff contains duplicate fields")
+            payload[field] = item
+        return payload
+
     try:
-        payload = json.loads(value)
+        payload = json.loads(
+            value,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite artifact handoff value: {token}")
+            ),
+        )
     except (TypeError, ValueError):
         return None
-    if type(payload) is not dict or payload.get("version") != 1:
+    if (
+        type(payload) is not dict
+        or set(payload) != _ARTIFACT_HANDOFF_META_KEYS
+        or type(payload["version"]) is not int
+        or payload["version"] != 1
+    ):
         return None
 
     def identity(device_key: str, inode_key: str) -> tuple[int, int] | None:
-        device = payload.get(device_key)
-        inode = payload.get(inode_key)
+        device = payload[device_key]
+        inode = payload[inode_key]
         if device is None and inode is None:
             return None
         if type(device) is not int or type(inode) is not int:
@@ -3541,18 +3586,26 @@ def _artifact_handoff_from_meta(
     ) -> tuple[tuple[int, int] | None, str | None, bool | None]:
         """One strict prior-asset record, or None/Nones when unrecorded."""
 
-        absent_value = payload.get(absent_key)
+        absent_value = payload[absent_key]
         if absent_value is None:
-            if payload.get(identity_key) is not None or payload.get(
-                digest_key
-            ) is not None:
+            inode_key = identity_key.removesuffix("_device") + "_inode"
+            if (
+                payload[identity_key] is not None
+                or payload[inode_key] is not None
+                or payload[digest_key] is not None
+            ):
                 raise ValueError("artifact handoff prior record is partial")
             return (None, None, None)
         if type(absent_value) is not bool:
             raise ValueError("artifact handoff prior absent flag is invalid")
-        digest = payload.get(digest_key)
+        digest = payload[digest_key]
         if absent_value:
-            if digest is not None or payload.get(identity_key) is not None:
+            inode_key = identity_key.removesuffix("_device") + "_inode"
+            if (
+                digest is not None
+                or payload[identity_key] is not None
+                or payload[inode_key] is not None
+            ):
                 raise ValueError("artifact handoff absent record is not empty")
             return (None, None, True)
         if type(digest) is not str or len(digest) != 64 or any(

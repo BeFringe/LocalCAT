@@ -30,8 +30,10 @@ import unittest
 from unittest.mock import patch
 
 import tm_migration
+import tm_snapshot_artifacts
 import tm_snapshot_recovery
 import tm_sqlite_store
+from tests.fault_matrix_registry import SNAPSHOT_PROCESS_DEATH_BOUNDARIES
 from tm_activation_journal import (
     _activation_terminal_path,
     _activation_terminal_temp_path,
@@ -457,6 +459,39 @@ def _meta_value(store_path: Path, key: str) -> str | None:
     return None if row is None else str(row[0])
 
 
+def _set_meta_value(store_path: Path, key: str, value: str) -> None:
+    connection = sqlite3.connect(store_path)
+    try:
+        updated = connection.execute(
+            "UPDATE tm_meta SET value = ? WHERE key = ?",
+            (value, key),
+        )
+        if updated.rowcount != 1:
+            raise AssertionError(f"missing tm_meta row {key!r}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _set_receipt_status(
+    store_path: Path,
+    snapshot_id: str,
+    status: str,
+) -> None:
+    connection = sqlite3.connect(store_path)
+    try:
+        updated = connection.execute(
+            "UPDATE tm_snapshot_receipt SET status = ? "
+            "WHERE snapshot_id = ?",
+            (status, snapshot_id),
+        )
+        if updated.rowcount != 1:
+            raise AssertionError(f"missing receipt {snapshot_id!r}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _insert_ledger_row(
     store_path: Path,
     receipt: SnapshotReceipt,
@@ -668,6 +703,175 @@ def _run_recovery_child(
             str(identity.configured_jsonl_path),
             str(stage.staged_db_path),
             str(stage.manifest_temp_path),
+            str(marker),
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+_PUBLICATION_DEATH_CHILD_SCRIPT = r'''
+import os
+import sys
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+import tm_migration
+import tm_snapshot_artifacts
+from tm_contracts import CanonicalResourceIdentity, MutableStageRef
+from tm_migration import TMMigrationService
+from tm_sqlite_store import SQLiteTMStore
+
+mode = sys.argv[1]
+seam = sys.argv[2]
+ordinal = int(sys.argv[3])
+resource_id = sys.argv[4]
+configured = Path(sys.argv[5])
+staged_db = Path(sys.argv[6])
+manifest_temp = Path(sys.argv[7])
+destination = Path(sys.argv[8])
+marker = Path(sys.argv[9])
+
+stage = MutableStageRef(
+    stage_id="stage." + resource_id,
+    resource_identity=CanonicalResourceIdentity.from_configured_jsonl(
+        resource_id,
+        configured,
+    ),
+    staged_db_path=staged_db,
+    manifest_temp_path=manifest_temp,
+)
+with patch("tm_sqlite_store._probe_fts5", return_value=False):
+    store = SQLiteTMStore(stage, canonical_store_id="store.primary")
+service = TMMigrationService(
+    resource_identity=stage.resource_identity,
+    canonical_store_id="store.primary",
+)
+
+def die() -> None:
+    descriptor = os.open(
+        marker,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        os.write(descriptor, seam.encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os._exit(86)
+
+def counted(original):
+    count = 0
+    def wrapper(*args, **kwargs):
+        nonlocal count
+        result = original(*args, **kwargs)
+        count += 1
+        if count == ordinal:
+            die()
+        return result
+    return wrapper
+
+with ExitStack() as stack:
+    if seam == "file_fsync":
+        stack.enter_context(
+            patch.object(
+                tm_migration,
+                "_fsync_file",
+                side_effect=counted(tm_migration._fsync_file),
+            )
+        )
+    elif seam == "replace":
+        stack.enter_context(
+            patch.object(
+                tm_migration,
+                "_replace_path",
+                side_effect=counted(tm_migration._replace_path),
+            )
+        )
+    elif seam == "directory_fsync":
+        stack.enter_context(
+            patch.object(
+                tm_migration,
+                "_fsync_directory",
+                side_effect=counted(tm_migration._fsync_directory),
+            )
+        )
+    elif seam == "cleanup_unlink":
+        stack.enter_context(
+            patch.object(
+                tm_snapshot_artifacts,
+                "_remove_created_file",
+                side_effect=counted(
+                    tm_snapshot_artifacts._remove_created_file
+                ),
+            )
+        )
+    else:
+        if seam == "register":
+            method_name = (
+                "register_issued_refresh_receipt"
+                if mode == "refresh"
+                else "register_issued_export_receipt"
+            )
+        elif seam == "handoff":
+            method_name = "record_export_recovery_handoff"
+        elif seam == "complete":
+            method_name = (
+                "complete_issued_refresh_receipt"
+                if mode == "refresh"
+                else "complete_issued_export_receipt"
+            )
+        elif seam == "clear":
+            method_name = "clear_issued_receipt_handoff"
+        else:
+            raise AssertionError("unknown process-death seam " + seam)
+        original = getattr(store, method_name)
+        stack.enter_context(
+            patch.object(
+                store,
+                method_name,
+                side_effect=counted(original),
+            )
+        )
+    if mode == "refresh":
+        service.refresh_configured_snapshot(store)
+    elif mode == "export":
+        service.export_jsonl(store, destination)
+    else:
+        raise AssertionError("unknown process-death mode " + mode)
+os._exit(87)
+'''
+
+
+def _run_publication_death_child(
+    stage: Any,
+    *,
+    mode: str,
+    seam: str,
+    ordinal: int,
+    destination: Path,
+    marker: Path,
+) -> subprocess.CompletedProcess[str]:
+    identity = stage.resource_identity
+    repository_root = Path(__file__).resolve().parent.parent
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PUBLICATION_DEATH_CHILD_SCRIPT,
+            mode,
+            seam,
+            str(ordinal),
+            identity.resource_id,
+            str(identity.configured_jsonl_path),
+            str(stage.staged_db_path),
+            str(stage.manifest_temp_path),
+            str(destination),
             str(marker),
         ],
         cwd=repository_root,
@@ -3181,6 +3385,191 @@ class TMRecoveryArtifactSafetyTests(unittest.TestCase):
             )
 
 
+class TMProcessDeathBoundaryTests(unittest.TestCase):
+    """True process-death coverage for the shared pair publisher."""
+
+    def test_export_and_refresh_process_death_boundary_catalog(self) -> None:
+        for mode in ("refresh", "export"):
+            for boundary in SNAPSHOT_PROCESS_DEATH_BOUNDARIES:
+                with self.subTest(
+                    mode=mode,
+                    boundary=boundary.boundary_id,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    stage, store = _prepared_store(root)
+                    identity = stage.resource_identity
+                    _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+                    configured_before = _pair(identity)
+                    binding_before = _binding_row(stage.staged_db_path)
+                    canonical_before = store.capture_export_snapshot()
+                    if mode == "refresh":
+                        destination = identity.configured_jsonl_path
+                        prefix = "snapshot.refresh."
+                    else:
+                        destination = (root / "exports" / "out.jsonl").resolve()
+                        destination.parent.mkdir(parents=True)
+                        destination.write_bytes(
+                            b'{"source":"prior","target":"export"}\n'
+                        )
+                        destination.with_name(
+                            f"{destination.name}.localcat-snapshot.json"
+                        ).write_bytes(b'{"manifest":"prior"}\n')
+                        prefix = "snapshot.export."
+                    paths = _export_artifact_paths(destination)
+                    pair_before = (
+                        paths.destination.read_bytes(),
+                        paths.manifest.read_bytes(),
+                    )
+                    marker = root / (
+                        f"{mode}-{boundary.boundary_id}.marker"
+                    )
+
+                    crashed = _run_publication_death_child(
+                        stage,
+                        mode=mode,
+                        seam=boundary.seam,
+                        ordinal=boundary.ordinal,
+                        destination=destination,
+                        marker=marker,
+                    )
+
+                    self.assertEqual(
+                        crashed.returncode,
+                        86,
+                        msg=crashed.stdout + crashed.stderr,
+                    )
+                    self.assertEqual(
+                        marker.read_text(encoding="ascii"),
+                        boundary.seam,
+                    )
+                    fresh = _fresh_store(stage)
+                    outcome = fresh.recover_configured_refresh()
+                    _assert_recovery_outcome_shape(self, outcome)
+                    rows = tuple(
+                        row
+                        for row in _ledger_rows(
+                            stage.staged_db_path,
+                            destination,
+                        )
+                        if str(row[0]).startswith(prefix)
+                    )
+                    artifacts = (
+                        paths.jsonl_temp,
+                        paths.manifest_temp,
+                        paths.jsonl_recovery,
+                        paths.manifest_recovery,
+                    )
+
+                    if boundary.expected_resolution == "UNJOURNALED":
+                        self.assertIs(
+                            outcome.state,
+                            RefreshRecoveryState.NOOP,
+                        )
+                        self.assertEqual(rows, ())
+                        self.assertTrue(any(path.exists() for path in artifacts))
+                        self.assertEqual(
+                            (
+                                paths.destination.read_bytes(),
+                                paths.manifest.read_bytes(),
+                            ),
+                            pair_before,
+                        )
+                    else:
+                        self.assertEqual(len(rows), 1)
+                        snapshot_id = str(rows[0][0])
+                        meta_key = "artifact_handoff." + snapshot_id
+                        if boundary.expected_resolution == "BLOCKED":
+                            self.assertIs(
+                                outcome.state,
+                                RefreshRecoveryState.BLOCKED,
+                            )
+                            observed_diagnostics = set(outcome.diagnostics)
+                            for receipt_outcome in outcome.receipts:
+                                observed_diagnostics.update(
+                                    receipt_outcome.diagnostics
+                                )
+                            self.assertIn(
+                                "RECOVERY.ARTIFACT_UNPROVEN",
+                                observed_diagnostics,
+                            )
+                            self.assertEqual(str(rows[0][9]), "issued")
+                            self.assertIsNotNone(
+                                _meta_value(stage.staged_db_path, meta_key)
+                            )
+                            self.assertTrue(
+                                any(path.exists() for path in artifacts)
+                            )
+                            self.assertEqual(
+                                (
+                                    paths.destination.read_bytes(),
+                                    paths.manifest.read_bytes(),
+                                ),
+                                pair_before,
+                            )
+                        elif boundary.expected_resolution == "CANCELLED":
+                            self.assertIs(
+                                outcome.state,
+                                RefreshRecoveryState.CANCELLED,
+                            )
+                            self.assertEqual(str(rows[0][9]), "cancelled")
+                            self.assertIsNone(
+                                _meta_value(stage.staged_db_path, meta_key)
+                            )
+                            self.assertEqual(
+                                (
+                                    paths.destination.read_bytes(),
+                                    paths.manifest.read_bytes(),
+                                ),
+                                pair_before,
+                            )
+                        else:
+                            expected_state = (
+                                RefreshRecoveryState.NOOP
+                                if boundary.expected_resolution
+                                == "TERMINAL_NOOP"
+                                else RefreshRecoveryState.COMPLETED
+                            )
+                            self.assertIs(outcome.state, expected_state)
+                            self.assertEqual(str(rows[0][9]), "completed")
+                            self.assertIsNone(
+                                _meta_value(stage.staged_db_path, meta_key)
+                            )
+                            self.assertNotEqual(
+                                (
+                                    paths.destination.read_bytes(),
+                                    paths.manifest.read_bytes(),
+                                ),
+                                pair_before,
+                            )
+                        if boundary.expected_resolution != "BLOCKED":
+                            self.assertFalse(
+                                any(path.exists() for path in artifacts),
+                                tuple(
+                                    path.name
+                                    for path in artifacts
+                                    if path.exists()
+                                ),
+                            )
+
+                    self.assertEqual(
+                        store.capture_export_snapshot(),
+                        canonical_before,
+                    )
+                    binding_after = _binding_row(stage.staged_db_path)
+                    if (
+                        mode == "refresh"
+                        and boundary.expected_resolution
+                        in {"COMPLETED", "TERMINAL_NOOP"}
+                    ):
+                        self.assertTrue(
+                            str(binding_after[4]).startswith(prefix)
+                        )
+                    else:
+                        self.assertEqual(binding_after, binding_before)
+                    if mode == "export":
+                        self.assertEqual(_pair(identity), configured_before)
+
+
 class TMRecoveryServiceTests(unittest.TestCase):
     def test_service_recovery_delegates_to_store(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3437,6 +3826,126 @@ class TMClusterFRegressionTests(unittest.TestCase):
             jsonl_identity=_identity_of(paths.destination),
             manifest_identity=_identity_of(paths.manifest),
         )
+
+    def test_corrupt_issued_and_terminal_handoffs_block_without_mutation(
+        self,
+    ) -> None:
+        """Every malformed durable handoff is explicit fail-stop evidence."""
+
+        def corruptions(raw: str) -> dict[str, str]:
+            payload = json.loads(raw)
+            bool_version = dict(payload)
+            bool_version["version"] = True
+            unknown_field = dict(payload)
+            unknown_field["unexpected"] = None
+            missing_field = dict(payload)
+            del missing_field["manifest_temp_inode"]
+            partial_identity = dict(payload)
+            partial_identity["jsonl_temp_inode"] = None
+            invalid_prior_digest = dict(payload)
+            invalid_prior_digest["prior_jsonl_digest"] = "g" * 64
+            nonfinite = dict(payload)
+            nonfinite["artifact_parent_device"] = float("nan")
+            return {
+                "malformed": "{",
+                "duplicate": raw.replace(
+                    '"version":1',
+                    '"version":1,"version":1',
+                    1,
+                ),
+                "bool-version": json.dumps(bool_version),
+                "unknown-field": json.dumps(unknown_field),
+                "missing-field": json.dumps(missing_field),
+                "partial-identity": json.dumps(partial_identity),
+                "invalid-prior-digest": json.dumps(invalid_prior_digest),
+                "nonfinite": json.dumps(nonfinite),
+            }
+
+        for receipt_status in ("issued", "completed"):
+            for corruption_name in (
+                "malformed",
+                "duplicate",
+                "bool-version",
+                "unknown-field",
+                "missing-field",
+                "partial-identity",
+                "invalid-prior-digest",
+                "nonfinite",
+            ):
+                with self.subTest(
+                    status=receipt_status,
+                    corruption=corruption_name,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    stage, store = _prepared_store(root)
+                    destination = self._destination(root)
+                    receipt = self._register_export(
+                        store,
+                        destination,
+                        _NEW_JSONL,
+                    )
+                    if receipt_status != "issued":
+                        _set_receipt_status(
+                            stage.staged_db_path,
+                            receipt.snapshot_id,
+                            receipt_status,
+                        )
+                    meta_key = "artifact_handoff." + receipt.snapshot_id
+                    original = _meta_value(stage.staged_db_path, meta_key)
+                    self.assertIsNotNone(original)
+                    assert original is not None
+                    _set_meta_value(
+                        stage.staged_db_path,
+                        meta_key,
+                        corruptions(original)[corruption_name],
+                    )
+                    paths = _export_artifact_paths(destination)
+                    assets_before = {
+                        path: (path.read_bytes(), _identity_of(path))
+                        for path in (
+                            paths.destination,
+                            paths.manifest,
+                            paths.jsonl_temp,
+                            paths.manifest_temp,
+                            paths.jsonl_recovery,
+                            paths.manifest_recovery,
+                        )
+                        if path.exists()
+                    }
+                    canonical_before = store.capture_export_snapshot()
+
+                    outcome = _fresh_store(stage).recover_configured_refresh()
+
+                    _assert_recovery_outcome_shape(self, outcome)
+                    self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+                    self.assertEqual(
+                        outcome.error_code,
+                        "STORE.HANDOFF_CORRUPT",
+                    )
+                    self.assertIn(
+                        "STORE.HANDOFF_CORRUPT",
+                        outcome.diagnostics,
+                    )
+                    self.assertEqual(
+                        _status_for(
+                            stage.staged_db_path,
+                            receipt.snapshot_id,
+                        ),
+                        receipt_status,
+                    )
+                    self.assertIsNotNone(
+                        _meta_value(stage.staged_db_path, meta_key)
+                    )
+                    for path, expected in assets_before.items():
+                        self.assertEqual(
+                            (path.read_bytes(), _identity_of(path)),
+                            expected,
+                            path.name,
+                        )
+                    self.assertEqual(
+                        store.capture_export_snapshot(),
+                        canonical_before,
+                    )
 
     def test_export_issued_to_reserved_authority_blocks_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4497,18 +5006,10 @@ class TMClusterFRegressionTests(unittest.TestCase):
 
             _assert_recovery_outcome_shape(self, outcome)
             self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
-            self.assertEqual(
-                outcome.receipts,
-                (
-                    IssuedReceiptRecovery(
-                        receipt.snapshot_id,
-                        RefreshRecoveryState.BLOCKED,
-                        ("RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",),
-                    ),
-                ),
-            )
+            self.assertEqual(outcome.receipts, ())
+            self.assertEqual(outcome.error_code, "STORE.HANDOFF_CORRUPT")
             self.assertIn(
-                "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",
+                "STORE.HANDOFF_CORRUPT",
                 outcome.diagnostics,
             )
             self.assertEqual(

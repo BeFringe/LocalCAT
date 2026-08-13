@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
+import tempfile
 from typing import cast
 import unittest
+from unittest.mock import patch
+
+import tools.validate_tm_fault_matrix as validator
 
 from tests.fault_matrix_registry import (
     FAULT_MATRIX_ROWS,
     FAULT_MATRIX_SCHEMA_VERSION,
+    SNAPSHOT_PROCESS_DEATH_BOUNDARIES,
     TASK_9_1_ROWS,
     TASK_9_2_ROWS,
     fault_matrix_registry_digest,
@@ -67,7 +74,7 @@ class FaultMatrixRegistryTests(unittest.TestCase):
         self.assertTrue(all(row.task == "9.1" for row in TASK_9_1_ROWS))
 
     def test_task_9_2_registry_is_closed_and_unique(self) -> None:
-        self.assertEqual(len(TASK_9_2_ROWS), 29)
+        self.assertEqual(len(TASK_9_2_ROWS), 30)
         self.assertTrue(all(row.task == "9.2" for row in TASK_9_2_ROWS))
         self.assertEqual(
             FAULT_MATRIX_ROWS,
@@ -78,6 +85,36 @@ class FaultMatrixRegistryTests(unittest.TestCase):
         for task_rows in (TASK_9_1_ROWS, TASK_9_2_ROWS):
             test_sets = tuple(row.test_ids for row in task_rows)
             self.assertEqual(len(test_sets), len(set(test_sets)))
+
+    def test_process_death_boundary_catalog_is_closed_and_unique(self) -> None:
+        self.assertEqual(len(SNAPSHOT_PROCESS_DEATH_BOUNDARIES), 15)
+        boundary_ids = tuple(
+            item.boundary_id for item in SNAPSHOT_PROCESS_DEATH_BOUNDARIES
+        )
+        self.assertEqual(len(boundary_ids), len(set(boundary_ids)))
+        self.assertEqual(
+            {
+                (item.seam, item.ordinal)
+                for item in SNAPSHOT_PROCESS_DEATH_BOUNDARIES
+            },
+            {
+                ("file_fsync", 1),
+                ("file_fsync", 2),
+                ("file_fsync", 3),
+                ("file_fsync", 4),
+                ("register", 1),
+                ("handoff", 1),
+                ("replace", 1),
+                ("replace", 2),
+                ("directory_fsync", 1),
+                ("directory_fsync", 2),
+                ("directory_fsync", 3),
+                ("complete", 1),
+                ("cleanup_unlink", 1),
+                ("cleanup_unlink", 2),
+                ("clear", 1),
+            },
+        )
 
     def test_every_reference_resolves_to_one_exact_test(self) -> None:
         loader = unittest.TestLoader()
@@ -201,6 +238,64 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
                     ValueError(token)
                 ),
             )
+
+    def test_validator_rejects_alternate_root_and_arbitrary_emit_before_tests(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            alternate = Path(temporary).resolve()
+            with patch.object(
+                validator,
+                "_run_row",
+                side_effect=AssertionError("tests must not execute"),
+            ):
+                with self.assertRaisesRegex(ValueError, "repository root"):
+                    validator.main(["--repository-root", str(alternate)])
+                with self.assertRaisesRegex(ValueError, "canonical output"):
+                    validator.main(["--emit", "AGENTS.md"])
+
+    def test_validator_source_walk_rejects_final_and_intermediate_symlinks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            real = root / "real"
+            real.mkdir()
+            source = real / "source.py"
+            source.write_text("pass\n", encoding="utf-8")
+            final_alias = root / "alias.py"
+            final_alias.symlink_to(source)
+            parent_alias = root / "alias-parent"
+            parent_alias.symlink_to(real, target_is_directory=True)
+
+            self.assertEqual(
+                validator._strict_source_file(root, "real/source.py"),
+                source,
+            )
+            self.assertTrue(stat.S_ISREG(os.lstat(source).st_mode))
+            with self.assertRaisesRegex(ValueError, "source"):
+                validator._strict_source_file(root, "alias.py")
+            with self.assertRaisesRegex(ValueError, "source"):
+                validator._strict_source_file(
+                    root,
+                    "alias-parent/source.py",
+                )
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                validator._strict_source_file(root, "real/../real/source.py")
+
+    def test_validator_rejects_symlink_or_nonregular_evidence_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            ordinary = root / "ordinary.json"
+            ordinary.write_text("{}\n", encoding="utf-8")
+            alias = root / "evidence.json"
+            alias.symlink_to(ordinary)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                validator._validate_evidence_target(alias)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                validator._validate_evidence_target(root)
 
 
 if __name__ == "__main__":

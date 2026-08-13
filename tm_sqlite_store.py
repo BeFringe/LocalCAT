@@ -6478,16 +6478,19 @@ class SQLiteTMStore:
             )
             for row in rows
         )
+        parsed_handoffs = tuple(
+            _artifact_handoff_from_meta(
+                str(row[0]),
+                str(row[1]),
+            )
+            for row in handoff_rows
+        )
+        if any(handoff is None for handoff in parsed_handoffs):
+            raise SQLiteStoreSchemaError("STORE.HANDOFF_CORRUPT")
         handoffs = tuple(
             handoff
-            for row in handoff_rows
-            if (
-                handoff := _artifact_handoff_from_meta(
-                    str(row[0]),
-                    str(row[1]),
-                )
-            )
-            is not None
+            for handoff in parsed_handoffs
+            if handoff is not None
         )
         binding_invalid = bool(
             set(facts.diagnostic_codes)

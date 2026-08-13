@@ -86,6 +86,90 @@ class FaultMatrixRow:
                 raise ValueError("fault row contains an invalid unittest id")
 
 
+@dataclass(frozen=True)
+class SnapshotProcessDeathBoundary:
+    """One exact shared export/refresh boundary killed by ``os._exit``."""
+
+    boundary_id: str
+    seam: str
+    ordinal: int
+    expected_resolution: str
+
+    def __post_init__(self) -> None:
+        if type(self.boundary_id) is not str or not self.boundary_id:
+            raise TypeError("process-death boundary id must be a string")
+        if self.seam not in {
+            "file_fsync",
+            "register",
+            "handoff",
+            "replace",
+            "directory_fsync",
+            "complete",
+            "cleanup_unlink",
+            "clear",
+        }:
+            raise ValueError("process-death boundary seam is invalid")
+        if type(self.ordinal) is not int or self.ordinal < 1:
+            raise ValueError("process-death boundary ordinal is invalid")
+        if self.expected_resolution not in {
+            "UNJOURNALED",
+            "BLOCKED",
+            "CANCELLED",
+            "COMPLETED",
+            "TERMINAL_NOOP",
+        }:
+            raise ValueError("process-death resolution is invalid")
+
+
+SNAPSHOT_PROCESS_DEATH_BOUNDARIES = (
+    SnapshotProcessDeathBoundary(
+        "JSONL_TEMP_FILE_FSYNC", "file_fsync", 1, "UNJOURNALED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "MANIFEST_TEMP_FILE_FSYNC", "file_fsync", 2, "UNJOURNALED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "ISSUED_COMMIT", "register", 1, "CANCELLED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "JSONL_RECOVERY_FILE_FSYNC", "file_fsync", 3, "BLOCKED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "MANIFEST_RECOVERY_FILE_FSYNC", "file_fsync", 4, "BLOCKED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "RECOVERY_HANDOFF_COMMIT", "handoff", 1, "CANCELLED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "JSONL_REPLACE", "replace", 1, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "JSONL_PARENT_FSYNC", "directory_fsync", 1, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "MANIFEST_REPLACE", "replace", 2, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "MANIFEST_PARENT_FSYNC", "directory_fsync", 2, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "RECEIPT_COMPLETION", "complete", 1, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "MANIFEST_RECOVERY_CLEANUP", "cleanup_unlink", 1, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "JSONL_RECOVERY_CLEANUP", "cleanup_unlink", 2, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "CLEANUP_PARENT_FSYNC", "directory_fsync", 3, "COMPLETED"
+    ),
+    SnapshotProcessDeathBoundary(
+        "HANDOFF_CLEAR_COMMIT", "clear", 1, "TERMINAL_NOOP"
+    ),
+)
+
+
 def _row(
     row_id: str,
     fault_class: FaultClass,
@@ -554,6 +638,25 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
         "Concurrent canonical writes produce a coherent exported revision and recovery never rolls canonical back.",
     ),
     _row(
+        "9.2.EXPORT_CRASH.07",
+        FaultClass.EXPORT_CRASH,
+        "Real process death closes every shared fsync, replace, completion, and cleanup boundary",
+        "tm_migration.py:shared export/refresh durable publication protocol",
+        (
+            "tests.test_tm_snapshot_recovery.TMProcessDeathBoundaryTests."
+            "test_export_and_refresh_process_death_boundary_catalog",
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_failure_injection_restores_prior_pair_and_cancels_ledger",
+            "tests.test_tm_export.TMExportHandoffDurabilityTests."
+            "test_cleanup_fsync_failure_before_handoff_clear_returns_pending",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_terminal_replay_fsync_failure_keeps_handoff_then_replays",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_export_release_fsync_failure_blocks_then_retries",
+        ),
+        "Each boundary is killed by os._exit for both publication modes; replay either preserves unowned evidence, blocks on unprovable ownership, cancels the intact old pair, or converges on one completed pair.",
+    ),
+    _row(
         "9.2.EXTERNAL_CHANGE.01",
         FaultClass.EXTERNAL_CHANGE,
         "External JSONL or manifest change latches divergence",
@@ -807,6 +910,8 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
             "test_source_swap_at_pre_mutation_seam_fails_closed",
             "tests.test_tm_export.TMExportFailureInjectionTests."
             "test_hostile_swap_during_restore_fails_closed_with_locator",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_reconstructed_manifest_source_different_byte_swap_blocks",
         ),
         "Only the exact handed-off source inode may be moved, restored, or cleaned.",
     ),
@@ -820,6 +925,8 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
             "test_destination_swap_at_pre_mutation_seam_fails_closed",
             "tests.test_tm_export.TMExportFailureInjectionTests."
             "test_foreign_destination_created_at_replace_is_not_overwritten",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_reconstructed_manifest_destination_swap_blocks",
         ),
         "A foreign final created after the last absence or identity proof survives unchanged.",
     ),
@@ -837,6 +944,8 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
             "test_same_bytes_foreign_swap_at_identity_proof_fails_closed",
             "tests.test_tm_stage_sealer.StageSealerIdentitySwapTests."
             "test_byte_identical_db_inode_swap_before_registration_denied",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_reconstructed_manifest_source_same_byte_swap_blocks",
         ),
         "Matching bytes never substitute for durable inode ownership and a fresh terminal proof.",
     ),
@@ -986,6 +1095,8 @@ __all__ = [
     "FAULT_MATRIX_SCHEMA_VERSION",
     "FaultClass",
     "FaultMatrixRow",
+    "SNAPSHOT_PROCESS_DEATH_BOUNDARIES",
+    "SnapshotProcessDeathBoundary",
     "TASK_9_1_ROWS",
     "TASK_9_2_ROWS",
     "fault_matrix_payload",
