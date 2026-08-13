@@ -19,6 +19,7 @@ from tests.acceptance_matrix_registry import (
     ACCEPTANCE_MATRIX_ROWS,
     ACCEPTANCE_MATRIX_SCHEMA_VERSION,
     TASK_9_3_ROWS,
+    TASK_9_4_ROWS,
     acceptance_matrix_registry_digest,
     acceptance_matrix_source_fingerprint,
     acceptance_matrix_source_paths,
@@ -70,11 +71,16 @@ def _flatten(suite: unittest.TestSuite) -> tuple[unittest.TestCase, ...]:
 class AcceptanceMatrixRegistryTests(unittest.TestCase):
     def test_task_9_3_registry_is_closed_and_unique(self) -> None:
         self.assertEqual(len(TASK_9_3_ROWS), 18)
-        self.assertEqual(ACCEPTANCE_MATRIX_ROWS, TASK_9_3_ROWS)
         self.assertTrue(all(row.task == "9.3" for row in TASK_9_3_ROWS))
-        row_ids = tuple(row.row_id for row in TASK_9_3_ROWS)
+        self.assertEqual(len(TASK_9_4_ROWS), 14)
+        self.assertTrue(all(row.task == "9.4" for row in TASK_9_4_ROWS))
+        self.assertEqual(
+            ACCEPTANCE_MATRIX_ROWS,
+            TASK_9_3_ROWS + TASK_9_4_ROWS,
+        )
+        row_ids = tuple(row.row_id for row in ACCEPTANCE_MATRIX_ROWS)
         self.assertEqual(len(row_ids), len(set(row_ids)))
-        test_sets = tuple(row.test_ids for row in TASK_9_3_ROWS)
+        test_sets = tuple(row.test_ids for row in ACCEPTANCE_MATRIX_ROWS)
         self.assertEqual(len(test_sets), len(set(test_sets)))
 
     def test_every_reference_resolves_to_one_exact_test(self) -> None:
@@ -125,7 +131,7 @@ class AcceptanceMatrixEvidenceTests(unittest.TestCase):
         if type(registry_digest) is not str:
             raise AssertionError("registry_digest must be a string")
         self.assertIsNotNone(_SHA256.fullmatch(registry_digest))
-        self.assertEqual(evidence["tasks"], ["9.3"])
+        self.assertEqual(evidence["tasks"], ["9.3", "9.4"])
 
         raw_sources = evidence["source_files"]
         if type(raw_sources) is not list:

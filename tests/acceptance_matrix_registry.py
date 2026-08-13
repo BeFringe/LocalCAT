@@ -32,6 +32,56 @@ class AcceptanceDomain(str, Enum):
     SERVICE = "SERVICE"
     NONIMPERSONATE = "NONIMPERSONATE"
     METADATA = "METADATA"
+    COMPAT = "COMPAT"
+    PRIORITY = "PRIORITY"
+    EXCEL = "EXCEL"
+    SELFCHECK = "SELFCHECK"
+    PRIVACY = "PRIVACY"
+    ISOLATION = "ISOLATION"
+    SQLITE_POLICY = "SQLITE_POLICY"
+    ARCH = "ARCH"
+
+
+FEATURE5_CORE_GUARD_PATHS = (
+    "capability_gated_text_matcher.py",
+    "matcher_capability.py",
+    "text_matcher.py",
+    "tm_activation_journal.py",
+    "tm_activation_recovery.py",
+    "tm_benchmark.py",
+    "tm_benchmark_gate.py",
+    "tm_benchmark_latency.py",
+    "tm_benchmark_oracle.py",
+    "tm_benchmark_process.py",
+    "tm_benchmark_query_process.py",
+    "tm_candidate_index.py",
+    "tm_contracts.py",
+    "tm_engine.py",
+    "tm_gate_a.py",
+    "tm_gate_b.py",
+    "tm_json_importer.py",
+    "tm_migration.py",
+    "tm_retrieval.py",
+    "tm_retrieval_capability.py",
+    "tm_retrieval_validation.py",
+    "tm_schema_upgrade.py",
+    "tm_similarity.py",
+    "tm_snapshot_artifacts.py",
+    "tm_snapshot_recovery.py",
+    "tm_sqlite_store.py",
+    "tm_stage_sealer.py",
+    "unicode_word_break_data.py",
+)
+
+CONSUMER_GUARD_PATHS = (
+    "editor_controller.py",
+    "glossary_engine.py",
+    "logic_controller.py",
+    "qt_editor.py",
+    "qt_editor_window.py",
+    "qt_settings_dialog.py",
+    "tm_engine.py",
+)
 
 
 @dataclass(frozen=True)
@@ -360,7 +410,194 @@ TASK_9_3_ROWS: tuple[AcceptanceMatrixRow, ...] = (
     ),
 )
 
-ACCEPTANCE_MATRIX_ROWS = TASK_9_3_ROWS
+TASK_9_4_ROWS: tuple[AcceptanceMatrixRow, ...] = (
+    _row(
+        "9.4.COMPAT.01",
+        AcceptanceDomain.COMPAT,
+        "Legacy and activated exact/save paths preserve compatibility semantics",
+        "tm_engine.py:exact and save compatibility facade",
+        (
+            "tests.test_tm_engine_compat.NeverActivatedLegacyTests."
+            "test_never_activated_legacy_last_write_wins_query_and_save",
+            "tests.test_tm_engine_compat.ActivatedCanonicalTests."
+            "test_activated_facade_exact_and_save_use_canonical_only",
+        ),
+        "Never-activated resources retain JSONL last-write-wins while activated resources use canonical exact/save only.",
+    ),
+    _row(
+        "9.4.COMPAT.02",
+        AcceptanceDomain.COMPAT,
+        "Active, Lookup, and Update gates survive authority transitions",
+        "tm_engine.py:resource option gates",
+        (
+            "tests.test_tm_engine_compat.NeverActivatedLegacyTests."
+            "test_legacy_active_lookup_update_gates",
+            "tests.test_tm_engine_compat.ActivatedCanonicalTests."
+            "test_activated_active_lookup_update_gates",
+            "tests.test_tm_engine_compat.ActivatedCanonicalTests."
+            "test_active_lookup_update_gates_require_exact_bool",
+        ),
+        "The same exact-bool resource options gate legacy and canonical lookup/update without inventing another state.",
+    ),
+    _row(
+        "9.4.COMPAT.03",
+        AcceptanceDomain.COMPAT,
+        "Unprovable canonical authority fails stop and never falls back to JSONL",
+        "tm_engine.py:cold canonical authority",
+        (
+            "tests.test_tm_engine_compat.CanonicalFailStopTests."
+            "test_corrupt_sidecar_fail_stops_never_legacy",
+            "tests.test_tm_engine_compat.CanonicalFailStopTests."
+            "test_missing_manifest_reopens_diverged_never_legacy",
+        ),
+        "After canonical authority exists, corruption or missing evidence cannot reactivate legacy JSONL runtime authority.",
+    ),
+    _row(
+        "9.4.COMPAT.04",
+        AcceptanceDomain.COMPAT,
+        "Legacy import seam preserves activated and unactivated authority rules",
+        "tm_json_importer.py:compatibility import seam",
+        (
+            "tests.test_tm_legacy_facade_import.CanonicalImportSeamTests."
+            "test_activated_import_does_not_touch_binding_or_trigger_divergence",
+            "tests.test_tm_legacy_facade_import.CanonicalImportSeamTests."
+            "test_unactivated_import_keeps_legacy_last_write_wins_folding",
+            "tests.test_tm_legacy_facade_import.CanonicalImportSeamTests."
+            "test_identical_digest_reimport_fails_closed_without_duplicates",
+        ),
+        "Import dispatch respects current authority and cannot duplicate or silently rebind an activated store.",
+    ),
+    _row(
+        "9.4.PRIORITY.01",
+        AcceptanceDomain.PRIORITY,
+        "TM remains higher priority than Glossary with exactly three Excel states",
+        "logic_controller.py:TM-first suggestion priority",
+        (
+            "tests.test_excel_adapter_contract.ExcelAdapterContractTest."
+            "test_legacy_and_activated_sidecar_parity_for_identical_inputs",
+        ),
+        "Identical legacy and canonical inputs yield TM_HIT, TERMS_FOUND, or NO_MATCH only, with TM winning conflicts.",
+    ),
+    _row(
+        "9.4.PRIORITY.02",
+        AcceptanceDomain.PRIORITY,
+        "Caller resource permutations do not change the stable report",
+        "tm_retrieval.py:resource aggregation order",
+        (
+            "tests.test_tm_retrieval.TMRetrievalServicePermutationTests."
+            "test_resource_tuple_permutation_does_not_change_the_report",
+        ),
+        "Resource provenance and stable ranking make equivalent resource cohorts order-independent.",
+    ),
+    _row(
+        "9.4.EXCEL.01",
+        AcceptanceDomain.EXCEL,
+        "Excel adapters preserve the headless three-state contract",
+        "logic_controller.py:Excel adapter contract",
+        (
+            "tests.test_excel_adapter_contract.ExcelAdapterContractTest."
+            "test_headless_file_adapter_preserves_three_status_contract",
+            "tests.test_excel_adapter_contract.ExcelAdapterContractTest."
+            "test_interactive_adapter_compiles_and_only_reaches_engine_via_logic",
+        ),
+        "File and interactive adapters retain existing fields and reach engines through LogicController only.",
+    ),
+    _row(
+        "9.4.SELFCHECK.01",
+        AcceptanceDomain.SELFCHECK,
+        "LogicController retained self-check passes against default resources",
+        "logic_controller.py:legacy self-check",
+        (
+            "tests.test_excel_adapter_contract.ExcelAdapterContractTest."
+            "test_logic_controller_self_test_matches_default_resources",
+        ),
+        "The default TM-first, nested-term, and no-match examples keep their historical outcomes.",
+    ),
+    _row(
+        "9.4.SELFCHECK.02",
+        AcceptanceDomain.SELFCHECK,
+        "TMEngine and both retained runners execute their self-checks safely",
+        "tm_engine.py:retained script self-checks",
+        (
+            "tests.test_tm_core_selfchecks.TMCoreSelfCheckTests."
+            "test_tm_engine_script_selfcheck_uses_disposable_cwd",
+            "tests.test_tm_core_selfchecks.TMCoreSelfCheckTests."
+            "test_stress_runner_main_selfcheck",
+            "tests.test_tm_core_selfchecks.TMCoreSelfCheckTests."
+            "test_translation_runner_main_selfcheck",
+        ),
+        "Each legacy script exits successfully in a bytecode-disabled disposable cwd and leaves no test files behind.",
+    ),
+    _row(
+        "9.4.PRIVACY.01",
+        AcceptanceDomain.PRIVACY,
+        "Feature 5 Core has no network, account, telemetry, credential, or external-service dependency",
+        "tm_contracts.py:Feature 5 local-only dependency closure",
+        (
+            "tests.test_tm_architecture_guards.TMArchitectureGuardTests."
+            "test_core_has_no_network_account_telemetry_or_credentials",
+        ),
+        "The closed Core file set imports no network/external SDK and defines no account, credential, OAuth, or telemetry authority.",
+    ),
+    _row(
+        "9.4.ISOLATION.01",
+        AcceptanceDomain.ISOLATION,
+        "Resources remain physically and operationally isolated",
+        "tm_sqlite_store.py:per-resource isolation",
+        (
+            "tests.test_tm_sqlite_store.SQLiteSchemaTests."
+            "test_schema_keeps_resources_physically_isolated",
+            "tests.test_tm_retrieval.TMRetrievalServiceLeaseTests."
+            "test_inactive_and_update_only_handles_are_silently_skipped",
+            "tests.test_tm_contracts.TMContractTests."
+            "test_resource_handle_collection_requires_unique_identity_and_order",
+        ),
+        "Each resource owns its own store/generation and a local failure or disabled role cannot alter another resource.",
+    ),
+    _row(
+        "9.4.SQLITE_POLICY.01",
+        AcceptanceDomain.SQLITE_POLICY,
+        "Every SQLite connection keeps WAL and extension loading disabled",
+        "tm_sqlite_store.py:safe connection policy",
+        (
+            "tests.test_tm_sqlite_store.SQLiteSchemaTests."
+            "test_existing_wal_database_is_rejected_not_converted",
+            "tests.test_tm_sqlite_store.SQLiteSchemaTests."
+            "test_extension_loading_is_disabled_for_every_connection",
+            "tests.test_tm_sqlite_store.SQLiteSchemaTests."
+            "test_stage_schema_records_safe_connection_and_runtime_policy",
+            "tests.test_tm_sqlite_store.SQLiteSchemaTests."
+            "test_no_fts_runtime_uses_fallback_schema_without_claiming_fuzzy",
+        ),
+        "Rollback journal, FULL synchronous, disabled extensions, and truthful fallback capability apply to every store connection.",
+    ),
+    _row(
+        "9.4.ARCH.01",
+        AcceptanceDomain.ARCH,
+        "Feature 5 Core does not import Qt or take Parser, TMX, or Glossary responsibility",
+        "tm_retrieval.py:Core dependency direction",
+        (
+            "tests.test_tm_architecture_guards.TMArchitectureGuardTests."
+            "test_feature5_core_file_set_is_closed_and_regular",
+            "tests.test_tm_architecture_guards.TMArchitectureGuardTests."
+            "test_core_does_not_import_qt_parser_tmx_or_glossary",
+        ),
+        "The design-owned Core file set stays UI- and adjacent-domain-independent while compatibility remains in explicit facades.",
+    ),
+    _row(
+        "9.4.ARCH.02",
+        AcceptanceDomain.ARCH,
+        "Qt, Glossary, Legacy, and controller consumers cannot own readiness or bypass the gated matcher",
+        "tm_engine.py:consumer capability boundary",
+        (
+            "tests.test_tm_architecture_guards.TMArchitectureGuardTests."
+            "test_consumers_do_not_own_readiness_or_bypass_gated_matcher",
+        ),
+        "Consumers neither import validation/evaluator owners nor execute TextMatcherV1 directly or parse validation summaries.",
+    ),
+)
+
+ACCEPTANCE_MATRIX_ROWS = TASK_9_3_ROWS + TASK_9_4_ROWS
 
 
 def acceptance_matrix_payload(
@@ -404,6 +641,9 @@ def acceptance_matrix_source_paths(
         "tests/test_tm_acceptance_matrix.py",
         "tools/validate_tm_acceptance_matrix.py",
     }
+    if any(row.task == "9.4" for row in rows):
+        paths.update(FEATURE5_CORE_GUARD_PATHS)
+        paths.update(CONSUMER_GUARD_PATHS)
     for row in rows:
         paths.add(row.production_seam.partition(":")[0])
         for test_id in row.test_ids:
@@ -441,7 +681,10 @@ __all__ = [
     "ACCEPTANCE_MATRIX_SCHEMA_VERSION",
     "AcceptanceDomain",
     "AcceptanceMatrixRow",
+    "CONSUMER_GUARD_PATHS",
+    "FEATURE5_CORE_GUARD_PATHS",
     "TASK_9_3_ROWS",
+    "TASK_9_4_ROWS",
     "acceptance_matrix_payload",
     "acceptance_matrix_registry_digest",
     "acceptance_matrix_source_fingerprint",
