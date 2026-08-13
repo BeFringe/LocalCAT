@@ -741,13 +741,37 @@ class TMMigrationStageBuildTests(unittest.TestCase):
 
     def test_reuse_rejects_incomplete_candidate_index(self) -> None:
         source_bytes = b'{"source":"a","target":"b"}\n'
-        for fts5_available, deletion in (
-            (False, "gram"),
-            (True, "fts"),
+        for fts5_available, tamper, statement in (
+            (
+                False,
+                "gram",
+                "DELETE FROM tm_gram WHERE gram_size = 1 AND gram = 'a'",
+            ),
+            (True, "fts", "DELETE FROM tm_fts"),
+            (
+                False,
+                "length",
+                "UPDATE tm_record SET source_fold_length = 2",
+            ),
+            (
+                True,
+                "term-frequency",
+                "UPDATE tm_gram SET term_frequency = 2",
+            ),
+            (
+                False,
+                "block",
+                "UPDATE tm_candidate_block SET record_count = 2",
+            ),
+            (
+                True,
+                "block-maximum",
+                "UPDATE tm_gram_block_max SET max_term_frequency = 2",
+            ),
         ):
             with self.subTest(
                 fts5_available=fts5_available,
-                deletion=deletion,
+                tamper=tamper,
             ):
                 with tempfile.TemporaryDirectory() as temporary:
                     identity = _identity(Path(temporary))
@@ -765,13 +789,7 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                     assert stage is not None
                     connection = sqlite3.connect(stage.staged_db_path)
                     try:
-                        if deletion == "gram":
-                            connection.execute(
-                                "DELETE FROM tm_gram "
-                                "WHERE gram_size = 1 AND gram = 'a'"
-                            )
-                        else:
-                            connection.execute("DELETE FROM tm_fts")
+                        connection.execute(statement)
                         connection.commit()
                     finally:
                         connection.close()

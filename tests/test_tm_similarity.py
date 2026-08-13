@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from collections import Counter
+from itertools import product
 import json
 from pathlib import Path
+import random
 import unicodedata
 import unittest
 from typing import Any, cast
 
+from text_matcher import fold_text_v1
 from tm_contracts import (
+    SCORER_BOUND_VERSION_V1,
     SCORER_VERSION_V1,
     SimilarityEvidence,
     SimilarityScorer,
 )
-from tm_similarity import SimilarityScorerV1
+from tm_similarity import SimilarityScorerV1, scorer_upper_bound_v1
 
 
 _FIXTURE_PATH = (
@@ -39,6 +44,118 @@ _SCORER: SimilarityScorer = SimilarityScorerV1()
 
 
 class SimilarityScorerV1Tests(unittest.TestCase):
+    def _assert_score_bounded(self, query: str, candidate: str) -> None:
+        query_folded = fold_text_v1(query).folded_text
+        candidate_folded = fold_text_v1(candidate).folded_text
+        if not query_folded and not candidate_folded:
+            return
+        query_characters = Counter(query_folded)
+        candidate_characters = Counter(candidate_folded)
+        query_bigrams = Counter(zip(query_folded, query_folded[1:]))
+        candidate_bigrams = Counter(
+            zip(candidate_folded, candidate_folded[1:])
+        )
+        bound = scorer_upper_bound_v1(
+            query_fold_length=len(query_folded),
+            record_fold_length=len(candidate_folded),
+            character_multiset_intersection=(
+                query_characters & candidate_characters
+            ).total(),
+            bigram_multiset_intersection=(
+                query_bigrams & candidate_bigrams
+            ).total(),
+            query_bigram_count=query_bigrams.total(),
+            record_bigram_count=candidate_bigrams.total(),
+        )
+        self.assertEqual(bound.bound_version, SCORER_BOUND_VERSION_V1)
+        self.assertGreaterEqual(
+            bound.final_similarity_upper_bound,
+            _SCORER.score(query, candidate).final_similarity,
+        )
+
+    def test_bound_proves_exhaustive_small_alphabet_scores(self) -> None:
+        values = [
+            "".join(characters)
+            for length in range(6)
+            for characters in product("ab", repeat=length)
+        ]
+        for query in values:
+            for candidate in values:
+                with self.subTest(query=query, candidate=candidate):
+                    self._assert_score_bounded(query, candidate)
+
+    def test_bound_proves_deterministic_unicode_random_scores(self) -> None:
+        randomizer = random.Random(0x8_6)
+        alphabet = ("A", "a", "ß", "é", "\u0301", "İ", "中", "🙂")
+        pairs = [
+            ("Straße", "STRASSE"),
+            ("e\u0301", "é"),
+            ("İ", "i\u0307"),
+            ("ﬀ", "ff"),
+            ("中🙂中", "中🙂"),
+        ]
+        pairs.extend(
+            (
+                "".join(randomizer.choices(alphabet, k=randomizer.randrange(9))),
+                "".join(randomizer.choices(alphabet, k=randomizer.randrange(9))),
+            )
+            for _ in range(1_000)
+        )
+        for query, candidate in pairs:
+            if query or candidate:
+                self._assert_score_bounded(query, candidate)
+
+    def test_bound_closes_exact_single_character_dice(self) -> None:
+        equal = scorer_upper_bound_v1(
+            query_fold_length=1,
+            record_fold_length=1,
+            character_multiset_intersection=1,
+            bigram_multiset_intersection=0,
+            query_bigram_count=0,
+            record_bigram_count=0,
+        )
+        unequal = scorer_upper_bound_v1(
+            query_fold_length=1,
+            record_fold_length=1,
+            character_multiset_intersection=0,
+            bigram_multiset_intersection=0,
+            query_bigram_count=0,
+            record_bigram_count=0,
+        )
+        self.assertEqual(equal.dice_bigram_exact, 1.0)
+        self.assertEqual(equal.final_similarity_upper_bound, 1.0)
+        self.assertEqual(unequal.dice_bigram_exact, 0.0)
+        self.assertEqual(unequal.final_similarity_upper_bound, 0.0)
+
+    def test_bound_rejects_non_exact_or_inconsistent_facts_before_math(
+        self,
+    ) -> None:
+        class IntSubclass(int):
+            def __sub__(self, other: object) -> int:
+                raise AssertionError("subclass arithmetic was dispatched")
+
+        valid = {
+            "query_fold_length": 2,
+            "record_fold_length": 2,
+            "character_multiset_intersection": 2,
+            "bigram_multiset_intersection": 1,
+            "query_bigram_count": 1,
+            "record_bigram_count": 1,
+        }
+        for field, value in (
+            ("query_fold_length", True),
+            ("record_fold_length", IntSubclass(2)),
+            ("character_multiset_intersection", 3),
+            ("bigram_multiset_intersection", 2),
+            ("query_bigram_count", 0),
+        ):
+            facts = dict(valid)
+            facts[field] = value
+            with self.subTest(field=field), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                scorer_upper_bound_v1(**facts)
+
     def test_versioned_golden_vectors_match_every_score_component(
         self,
     ) -> None:

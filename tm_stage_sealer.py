@@ -34,6 +34,7 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
+    CandidateProofIndexError,
     SQLiteSchemaSnapshot,
     SQLiteStoreSchemaError,
     _SCHEMA_UPGRADE_META_KEY,
@@ -42,7 +43,7 @@ from tm_sqlite_store import (
     _legacy_revision_ancestry,
     _schema_digest,
     inspect_stage_schema,
-    unique_character_ngrams,
+    validate_candidate_proof_index,
 )
 from text_matcher import fold_text_v1
 
@@ -546,15 +547,26 @@ def _stage_closure_digest(connection: sqlite3.Connection) -> str:
     frame_table(
         "tm_record",
         "SELECT record_id, source_raw, target_raw, source_fold_v1, "
-        "speaker_raw, context_prev_raw, context_next_raw, file_source, "
+        "source_fold_length, speaker_raw, context_prev_raw, context_next_raw, file_source, "
         "provenance_json, legacy_line_no, usage_count, last_used, "
         "origin_batch_id, origin_ordinal "
         "FROM tm_record ORDER BY record_id",
     )
     frame_table(
         "tm_gram",
-        "SELECT gram_size, gram, record_id FROM tm_gram "
+        "SELECT gram_size, gram, record_id, term_frequency FROM tm_gram "
         "ORDER BY gram_size, gram, record_id",
+    )
+    frame_table(
+        "tm_candidate_block",
+        "SELECT block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length "
+        "FROM tm_candidate_block ORDER BY block_id",
+    )
+    frame_table(
+        "tm_gram_block_max",
+        "SELECT gram_size, gram, block_id, max_term_frequency "
+        "FROM tm_gram_block_max ORDER BY gram_size, gram, block_id",
     )
     if has_table("tm_fts"):
         frame_table(
@@ -739,7 +751,7 @@ def _validate_stage_facts(
 
                 record_cursor = connection.execute(
                     "SELECT record_id, source_raw, target_raw, "
-                    "source_fold_v1, speaker_raw, context_prev_raw, "
+                    "source_fold_v1, source_fold_length, speaker_raw, context_prev_raw, "
                     "context_next_raw, file_source, provenance_json, "
                     "legacy_line_no, origin_batch_id, origin_ordinal "
                     "FROM tm_record ORDER BY record_id"
@@ -840,13 +852,19 @@ def _validate_stage_facts(
                 required_sizes = (
                     (1, 2) if schema.fts5_available else (1, 2, 3)
                 )
-                gram_counts = _validate_gram_index(
-                    connection,
-                    required_sizes=required_sizes,
-                )
-                fts_count = 0
-                if schema.fts5_available:
-                    fts_count = _validate_fts_index(connection)
+                try:
+                    gram_count_rows, fts_count = validate_candidate_proof_index(
+                        connection,
+                        required_sizes=required_sizes,
+                        fts5_available=schema.fts5_available,
+                    )
+                except CandidateProofIndexError as error:
+                    raise StageSealError(
+                        "SEALER.FTS_INDEX_INCOMPLETE"
+                        if "FTS" in str(error)
+                        else "SEALER.CANDIDATE_INDEX_INCOMPLETE"
+                    ) from error
+                gram_counts = dict(gram_count_rows)
                 schema_digest_row = connection.execute(
                     "SELECT value FROM tm_meta "
                     "WHERE key = 'schema_digest'"
@@ -1086,7 +1104,7 @@ def _validate_schema_upgrade_stage_facts(
 
     record_cursor = connection.execute(
         "SELECT record_id, source_raw, target_raw, source_fold_v1, "
-        "speaker_raw, context_prev_raw, context_next_raw, file_source, "
+        "source_fold_length, speaker_raw, context_prev_raw, context_next_raw, file_source, "
         "provenance_json, legacy_line_no, usage_count, last_used, "
         "origin_batch_id, origin_ordinal "
         "FROM tm_record ORDER BY record_id"
@@ -1100,8 +1118,9 @@ def _validate_schema_upgrade_stage_facts(
         source_raw = _text_row(record[1], "record source_raw")
         target_raw = _text_row(record[2], "record target_raw")
         stored_fold = _text_row(record[3], "record source_fold_v1")
-        provenance_json = _text_row(record[8], "record provenance_json")
-        legacy_line_no = record[9]
+        stored_fold_length = _int_row(record[4], "record source_fold_length")
+        provenance_json = _text_row(record[9], "record provenance_json")
+        legacy_line_no = record[10]
         if legacy_line_no is not None:
             legacy_line_no = _int_row(
                 legacy_line_no,
@@ -1109,14 +1128,14 @@ def _validate_schema_upgrade_stage_facts(
             )
             if legacy_line_no < 1:
                 raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        usage_count = _int_row(record[10], "record usage_count")
+        usage_count = _int_row(record[11], "record usage_count")
         if usage_count < 0:
             raise StageSealError("SEALER.RECORD_INVALID")
-        last_used = record[11]
+        last_used = record[12]
         if last_used is not None and type(last_used) is not str:
             raise StageSealError("SEALER.RECORD_INVALID")
-        origin_batch_id = _text_row(record[12], "record origin_batch_id")
-        origin_ordinal = _int_row(record[13], "record origin_ordinal")
+        origin_batch_id = _text_row(record[13], "record origin_batch_id")
+        origin_ordinal = _int_row(record[14], "record origin_ordinal")
         if origin_ordinal < 0:
             raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
         batch_kind = kind_by_batch.get(origin_batch_id)
@@ -1131,6 +1150,7 @@ def _validate_schema_upgrade_stage_facts(
         if (
             type(projected.folded_text) is not str
             or projected.folded_text != stored_fold
+            or stored_fold_length != len(stored_fold)
         ):
             raise StageSealError("SEALER.FOLD_MISMATCH")
         if provenance_json != _EXPECTED_PROVENANCE_JSON:
@@ -1280,13 +1300,19 @@ def _validate_schema_upgrade_stage_facts(
         raise StageSealError("SEALER.RECEIPT_INVALID")
 
     required_sizes = (1, 2) if schema.fts5_available else (1, 2, 3)
-    gram_counts = _validate_gram_index(
-        connection,
-        required_sizes=required_sizes,
-    )
-    fts_count = 0
-    if schema.fts5_available:
-        fts_count = _validate_fts_index(connection)
+    try:
+        gram_count_rows, fts_count = validate_candidate_proof_index(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=schema.fts5_available,
+        )
+    except CandidateProofIndexError as error:
+        raise StageSealError(
+            "SEALER.FTS_INDEX_INCOMPLETE"
+            if "FTS" in str(error)
+            else "SEALER.CANDIDATE_INDEX_INCOMPLETE"
+        ) from error
+    gram_counts = dict(gram_count_rows)
     schema_digest_row = connection.execute(
         "SELECT value FROM tm_meta "
         "WHERE key = 'schema_digest'"
@@ -1415,20 +1441,21 @@ def _validate_record_row(
     source_raw = _text_row(record[1], "record source_raw")
     target_raw = _text_row(record[2], "record target_raw")
     stored_fold = _text_row(record[3], "record source_fold_v1")
-    speaker_raw = _optional_text_row(record[4], "record speaker_raw")
+    stored_fold_length = _int_row(record[4], "record source_fold_length")
+    speaker_raw = _optional_text_row(record[5], "record speaker_raw")
     context_prev_raw = _optional_text_row(
-        record[5],
+        record[6],
         "record context_prev_raw",
     )
     context_next_raw = _optional_text_row(
-        record[6],
+        record[7],
         "record context_next_raw",
     )
-    file_source = _optional_text_row(record[7], "record file_source")
-    provenance_json = _text_row(record[8], "record provenance_json")
-    legacy_line_no = _int_row(record[9], "record legacy_line_no")
-    origin_batch_id = _text_row(record[10], "record origin_batch_id")
-    origin_ordinal = _int_row(record[11], "record origin_ordinal")
+    file_source = _optional_text_row(record[8], "record file_source")
+    provenance_json = _text_row(record[9], "record provenance_json")
+    legacy_line_no = _int_row(record[10], "record legacy_line_no")
+    origin_batch_id = _text_row(record[11], "record origin_batch_id")
+    origin_ordinal = _int_row(record[12], "record origin_ordinal")
     if (
         source_raw != accepted[0]
         or target_raw != accepted[1]
@@ -1447,90 +1474,11 @@ def _validate_record_row(
     projected = fold_text_v1(source_raw)
     if type(projected.folded_text) is not str:
         raise StageSealError("SEALER.STAGE_INVALID")
-    if projected.folded_text != stored_fold:
+    if (
+        projected.folded_text != stored_fold
+        or stored_fold_length != len(stored_fold)
+    ):
         raise StageSealError("SEALER.FOLD_MISMATCH")
-
-
-def _validate_gram_index(
-    connection: sqlite3.Connection,
-    *,
-    required_sizes: tuple[int, ...],
-) -> dict[int, int]:
-    folded_cursor = connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_record "
-        "ORDER BY record_id"
-    )
-    gram_cursor = connection.execute(
-        "SELECT record_id, gram_size, gram FROM tm_gram "
-        "ORDER BY record_id, gram_size, gram"
-    )
-    gram_counts: dict[int, int] = {size: 0 for size in required_sizes}
-    current = gram_cursor.fetchone()
-    for folded_row in folded_cursor:
-        record_id = _int_row(folded_row[0], "fold record_id")
-        folded_source = _text_row(
-            folded_row[1],
-            "fold source_fold_v1",
-        )
-        actual: set[tuple[int, str]] = set()
-        while current is not None:
-            gram_record_id = _int_row(current[0], "gram record_id")
-            if gram_record_id != record_id:
-                break
-            gram_size = _int_row(current[1], "gram_size")
-            gram = _text_row(current[2], "gram")
-            actual.add((gram_size, gram))
-            current = gram_cursor.fetchone()
-        expected: set[tuple[int, str]] = set()
-        for gram_size in required_sizes:
-            expected.update(
-                (gram_size, gram)
-                for gram in unique_character_ngrams(
-                    folded_source,
-                    gram_size,
-                )
-            )
-        if actual != expected:
-            raise StageSealError("SEALER.CANDIDATE_INDEX_INCOMPLETE")
-        for gram_size in required_sizes:
-            gram_counts[gram_size] += sum(
-                1 for size, _gram in actual if size == gram_size
-            )
-    if current is not None:
-        raise StageSealError("SEALER.CANDIDATE_INDEX_INCOMPLETE")
-    return gram_counts
-
-
-def _validate_fts_index(connection: sqlite3.Connection) -> int:
-    folded_cursor = connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_record "
-        "ORDER BY record_id"
-    )
-    fts_cursor = connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
-    )
-    fts_count = 0
-    current = fts_cursor.fetchone()
-    for folded_row in folded_cursor:
-        record_id = _int_row(folded_row[0], "fold record_id")
-        folded_source = _text_row(
-            folded_row[1],
-            "fold source_fold_v1",
-        )
-        actual: set[tuple[int, str]] = set()
-        while current is not None:
-            fts_record_id = _int_row(current[0], "fts record_id")
-            if fts_record_id != record_id:
-                break
-            fts_folded = _text_row(current[1], "fts source_fold_v1")
-            actual.add((fts_record_id, fts_folded))
-            current = fts_cursor.fetchone()
-        if actual != {(record_id, folded_source)}:
-            raise StageSealError("SEALER.FTS_INDEX_INCOMPLETE")
-        fts_count += 1
-    if current is not None:
-        raise StageSealError("SEALER.FTS_INDEX_INCOMPLETE")
-    return fts_count
 
 
 def _artifact_file_identity(

@@ -31,6 +31,7 @@ Authority retained by the owners:
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -1176,6 +1177,14 @@ def _migrate_schema_copy(
             ),
             _ddl_for(plan.schema_statements, "CREATE TABLE tm_record ("),
             _ddl_for(plan.schema_statements, "CREATE TABLE tm_gram ("),
+            _ddl_for(
+                plan.schema_statements,
+                "CREATE TABLE tm_candidate_block (",
+            ),
+            _ddl_for(
+                plan.schema_statements,
+                "CREATE TABLE tm_gram_block_max (",
+            ),
         ):
             connection.execute(statement)
         legacy_batch_cursor = connection.execute(
@@ -1204,44 +1213,124 @@ def _migrate_schema_copy(
                     str(batch[8]),
                 ),
             )
-        connection.execute(
-            "INSERT INTO tm_record("
-            "record_id, source_raw, target_raw, source_fold_v1, "
-            "speaker_raw, context_prev_raw, context_next_raw, "
-            "file_source, provenance_json, legacy_line_no, usage_count, "
-            "last_used, origin_batch_id, origin_ordinal) "
+        record_rows: list[tuple[object, ...]] = []
+        legacy_record_cursor = connection.execute(
             "SELECT record_id, source_raw, target_raw, source_fold_v1, "
             "speaker_raw, context_prev_raw, context_next_raw, "
             "file_source, provenance_json, legacy_line_no, usage_count, "
             "last_used, origin_batch_id, origin_ordinal "
             "FROM tm_record_legacy ORDER BY record_id"
         )
+        for row in legacy_record_cursor:
+            folded_source = str(row[3])
+            record_rows.append((*row[:4], len(folded_source), *row[4:]))
+            if len(record_rows) >= 5000:
+                connection.executemany(
+                    "INSERT INTO tm_record("
+                    "record_id, source_raw, target_raw, source_fold_v1, "
+                    "source_fold_length, speaker_raw, context_prev_raw, "
+                    "context_next_raw, file_source, provenance_json, "
+                    "legacy_line_no, usage_count, last_used, "
+                    "origin_batch_id, origin_ordinal) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    record_rows,
+                )
+                record_rows.clear()
+        if record_rows:
+            connection.executemany(
+                "INSERT INTO tm_record("
+                "record_id, source_raw, target_raw, source_fold_v1, "
+                "source_fold_length, speaker_raw, context_prev_raw, "
+                "context_next_raw, file_source, provenance_json, "
+                "legacy_line_no, usage_count, last_used, "
+                "origin_batch_id, origin_ordinal) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                record_rows,
+            )
         required_sizes = (1, 2) if fts5_available else (1, 2, 3)
-        gram_rows: list[tuple[int, str, int]] = []
+        gram_rows: list[tuple[int, str, int, int]] = []
+        current_block_id: int | None = None
+        block_lengths: list[int] = []
+        block_maxima: dict[tuple[int, str], int] = {}
+
+        def flush_proof_block() -> None:
+            if current_block_id is None:
+                return
+            first_record_id = current_block_id * 256 + 1
+            connection.execute(
+                "INSERT INTO tm_candidate_block("
+                "block_id, first_record_id, last_record_id, record_count, "
+                "min_source_fold_length, max_source_fold_length) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    current_block_id,
+                    first_record_id,
+                    first_record_id + 255,
+                    len(block_lengths),
+                    min(block_lengths),
+                    max(block_lengths),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO tm_gram_block_max("
+                "gram_size, gram, block_id, max_term_frequency) "
+                "VALUES (?, ?, ?, ?)",
+                tuple(
+                    (size, gram, current_block_id, frequency)
+                    for (size, gram), frequency in sorted(block_maxima.items())
+                ),
+            )
+
         record_cursor = connection.execute(
             "SELECT record_id, source_fold_v1 FROM tm_record "
             "ORDER BY record_id"
         )
         for record_id, folded_source in record_cursor:
+            folded_source = str(folded_source)
+            record_id = int(record_id)
+            next_block_id = (record_id - 1) // 256
+            if current_block_id is not None and next_block_id != current_block_id:
+                flush_proof_block()
+                block_lengths.clear()
+                block_maxima.clear()
+            current_block_id = next_block_id
+            block_lengths.append(len(folded_source))
             for gram_size in required_sizes:
+                frequencies = Counter(
+                    folded_source[offset : offset + gram_size]
+                    for offset in range(
+                        max(0, len(folded_source) - gram_size + 1)
+                    )
+                )
                 for gram in plan.unique_character_ngrams(
-                    str(folded_source),
+                    folded_source,
                     gram_size,
                 ):
-                    gram_rows.append((gram_size, gram, int(record_id)))
+                    term_frequency = frequencies[gram]
+                    gram_rows.append(
+                        (gram_size, gram, record_id, term_frequency)
+                    )
+                    if gram_size in {1, 2}:
+                        key = (gram_size, gram)
+                        block_maxima[key] = max(
+                            block_maxima.get(key, 0), term_frequency
+                        )
                     if len(gram_rows) >= 5000:
                         connection.executemany(
-                            "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                            "VALUES (?, ?, ?)",
+                            "INSERT INTO tm_gram("
+                            "gram_size, gram, record_id, term_frequency) "
+                            "VALUES (?, ?, ?, ?)",
                             gram_rows,
                         )
                         gram_rows.clear()
         if gram_rows:
             connection.executemany(
-                "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO tm_gram("
+                "gram_size, gram, record_id, term_frequency) "
+                "VALUES (?, ?, ?, ?)",
                 gram_rows,
             )
+        flush_proof_block()
         for table_name in (
             "tm_gram_legacy",
             "tm_record_legacy",
@@ -1260,6 +1349,10 @@ def _migrate_schema_copy(
             _ddl_for(
                 plan.schema_statements,
                 "CREATE INDEX idx_tm_gram_lookup",
+            ),
+            _ddl_for(
+                plan.schema_statements,
+                "CREATE INDEX idx_tm_gram_block_lookup",
             ),
         ):
             connection.execute(statement)

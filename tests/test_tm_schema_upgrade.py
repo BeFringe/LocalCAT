@@ -62,6 +62,7 @@ from tm_sqlite_store import (
     initialize_stage_schema,
     inspect_stage_schema,
     unique_character_ngrams,
+    validate_candidate_proof_index,
 )
 from text_matcher import fold_text_v1
 from tests.test_tm_activation import (
@@ -376,20 +377,27 @@ def _assert_index_parity(
     required_sizes = (1, 2) if fts5_available else (1, 2, 3)
     connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     try:
-        for record_id, folded in connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+        for record_id, folded, folded_length in connection.execute(
+            "SELECT record_id, source_fold_v1, source_fold_length "
+            "FROM tm_record ORDER BY record_id"
         ):
+            testcase.assertEqual(folded_length, len(folded))
             expected = {
-                (size, gram)
+                (size, gram): sum(
+                    folded[offset : offset + size] == gram
+                    for offset in range(max(0, len(folded) - size + 1))
+                )
                 for size in required_sizes
                 for gram in unique_character_ngrams(folded, size)
             }
-            actual = set(
-                connection.execute(
-                    "SELECT gram_size, gram FROM tm_gram WHERE record_id = ?",
+            actual = {
+                (size, gram): frequency
+                for size, gram, frequency in connection.execute(
+                    "SELECT gram_size, gram, term_frequency FROM tm_gram "
+                    "WHERE record_id = ?",
                     (record_id,),
                 )
-            )
+            }
             testcase.assertEqual(actual, expected)
             if fts5_available:
                 fts_rows = connection.execute(
@@ -397,6 +405,11 @@ def _assert_index_parity(
                     (record_id,),
                 ).fetchall()
                 testcase.assertEqual(fts_rows, [(folded,)])
+        _ = validate_candidate_proof_index(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=fts5_available,
+        )
     finally:
         connection.close()
 

@@ -31,6 +31,7 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_sqlite_store import (
+    CANDIDATE_PROOF_BLOCK_SIZE,
     CANDIDATE_INDEX_VERSION,
     build_candidate_write_plan,
     unique_character_ngrams,
@@ -47,6 +48,7 @@ from tm_sqlite_store import (
     _open_configured_connection,
     initialize_stage_schema,
     inspect_stage_schema,
+    validate_candidate_proof_index,
 )
 
 
@@ -88,6 +90,156 @@ def _draft(
 
 
 class SQLiteTMStoreTests(unittest.TestCase):
+    def test_candidate_proof_index_stores_exact_lengths_tf_and_block_maxima(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stage = _stage(Path(temporary))
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage, canonical_store_id="store.primary"
+                        )
+                        store = SQLiteTMStore(
+                            stage, canonical_store_id="store.primary"
+                        )
+                    _ = store.append_batch(
+                        batch_id="import.proof-index",
+                        kind="import",
+                        drafts=(
+                            _draft("aaba", "first"),
+                            _draft("aaaa", "second"),
+                        ),
+                        source_digest="8" * 64,
+                        source_path=(Path(temporary) / "proof.jsonl").resolve(),
+                    )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT source_fold_length FROM tm_record "
+                                "ORDER BY record_id"
+                            ).fetchall(),
+                            [(4,), (4,)],
+                        )
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT term_frequency FROM tm_gram "
+                                "WHERE record_id = 1 AND gram_size = 1 "
+                                "AND gram = 'a'"
+                            ).fetchone(),
+                            (3,),
+                        )
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT * FROM tm_candidate_block"
+                            ).fetchall(),
+                            [(0, 1, CANDIDATE_PROOF_BLOCK_SIZE, 2, 4, 4)],
+                        )
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT max_term_frequency "
+                                "FROM tm_gram_block_max WHERE block_id = 0 "
+                                "AND gram_size = 1 AND gram = 'a'"
+                            ).fetchone(),
+                            (4,),
+                        )
+                        counts, fts_count = validate_candidate_proof_index(
+                            connection,
+                            required_sizes=(
+                                (1, 2) if fts5_available else (1, 2, 3)
+                            ),
+                            fts5_available=fts5_available,
+                        )
+                        self.assertTrue(counts)
+                        self.assertEqual(fts_count, 2 if fts5_available else 0)
+                        connection.execute(
+                            "UPDATE tm_gram SET term_frequency = 1 "
+                            "WHERE record_id = 1 AND gram_size = 1 AND gram = 'a'"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(
+                        SQLiteStoreSchemaError,
+                        "^STORE.CANDIDATE_INDEX_INVALID$",
+                    ):
+                        _ = store.health()
+
+    def test_proof_summary_sql_failure_rolls_back_every_candidate_fact(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stage = _stage(Path(temporary))
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage, canonical_store_id="store.primary"
+                        )
+                        store = SQLiteTMStore(
+                            stage, canonical_store_id="store.primary"
+                        )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        connection.execute(
+                            "CREATE TRIGGER inject_proof_failure "
+                            "BEFORE INSERT ON tm_candidate_block BEGIN "
+                            "SELECT RAISE(ABORT, 'injected proof failure'); END"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError, "injected proof failure"
+                    ):
+                        _ = store.append_batch(
+                            batch_id="import.proof-rollback",
+                            kind="import",
+                            drafts=(_draft("aaaa", "target"),),
+                            source_digest="7" * 64,
+                            source_path=(
+                                Path(temporary) / "proof-rollback.jsonl"
+                            ).resolve(),
+                        )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        counts = tuple(
+                            connection.execute(
+                                f"SELECT COUNT(*) FROM {table}"
+                            ).fetchone()
+                            for table in (
+                                "tm_origin_batch",
+                                "tm_record",
+                                "tm_gram",
+                                "tm_candidate_block",
+                                "tm_gram_block_max",
+                            )
+                        )
+                        fts_count = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_fts"
+                            ).fetchone()
+                            if fts5_available
+                            else (0,)
+                        )
+                        revision = connection.execute(
+                            "SELECT value FROM tm_meta "
+                            "WHERE key = 'head_revision'"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    self.assertEqual(counts, ((0,),) * 5)
+                    self.assertEqual(fts_count, (0,))
+                    self.assertEqual(revision, ("0",))
+
     def test_chunked_candidate_helpers_hold_one_read_snapshot(self) -> None:
         query = "".join(chr(0x1000 + offset) for offset in range(300))
         for fts5_available in (False, True):
@@ -168,6 +320,11 @@ class SQLiteTMStoreTests(unittest.TestCase):
                                 "SELECT DISTINCT gram_size FROM tm_gram"
                             ).fetchall()
                         }
+                        proof_blocks = connection.execute(
+                            "SELECT block_id, first_record_id, last_record_id, "
+                            "record_count FROM tm_candidate_block "
+                            "ORDER BY block_id"
+                        ).fetchall()
                         fts_count = (
                             connection.execute(
                                 "SELECT COUNT(*) FROM tm_fts"
@@ -180,6 +337,10 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     self.assertEqual(
                         gram_sizes,
                         {1, 2} if fts5_available else {1, 2, 3},
+                    )
+                    self.assertEqual(
+                        proof_blocks,
+                        [(0, 1, CANDIDATE_PROOF_BLOCK_SIZE, 2)],
                     )
                     self.assertEqual(fts_count, 2 if fts5_available else 0)
                     for source, record_id in (
@@ -2042,6 +2203,11 @@ class SQLiteTMStoreTests(unittest.TestCase):
                                 "SELECT DISTINCT gram_size FROM tm_gram"
                             ).fetchall()
                         }
+                        proof_blocks = connection.execute(
+                            "SELECT block_id, first_record_id, last_record_id, "
+                            "record_count FROM tm_candidate_block "
+                            "ORDER BY block_id"
+                        ).fetchall()
                     finally:
                         connection.close()
                     self.assertEqual(
@@ -2063,6 +2229,19 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     self.assertEqual(
                         gram_sizes,
                         {1, 2} if fts5_available else {1, 2, 3},
+                    )
+                    self.assertEqual(
+                        proof_blocks,
+                        [
+                            (block_id, block_id * 256 + 1, block_id * 256 + 256, count)
+                            for block_id, count in (
+                                (0, 256),
+                                (1, 256),
+                                (2, 256),
+                                (3, 256),
+                                (4, 226),
+                            )
+                        ],
                     )
                     records = tuple(store.export_records())
                     self.assertEqual(
@@ -2352,7 +2531,9 @@ class SQLiteSchemaTests(unittest.TestCase):
             self.assertEqual(
                 set(inspected.table_names),
                 {
+                    "tm_candidate_block",
                     "tm_gram",
+                    "tm_gram_block_max",
                     "tm_meta",
                     "tm_origin_batch",
                     "tm_record",
@@ -2371,6 +2552,7 @@ class SQLiteSchemaTests(unittest.TestCase):
                     "idx_tm_context_speaker",
                     "idx_tm_exact",
                     "idx_tm_gram_lookup",
+                    "idx_tm_gram_block_lookup",
                 },
             )
             self.assertEqual(inspected.activation_status, "UNPUBLISHED")

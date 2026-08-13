@@ -9,6 +9,7 @@ journal-authenticated new set cannot be proven at any phase.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
@@ -243,6 +244,8 @@ _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
 CANDIDATE_INDEX_VERSION = "candidate-index-v1"
+CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
+CANDIDATE_PROOF_BLOCK_SIZE = 256
 BUSY_TIMEOUT_MS = 5000
 _CANDIDATE_QUERY_CHUNK_SIZE = 256
 _NATIVE_PATH_TYPE = type(Path())
@@ -261,7 +264,9 @@ _EXPORT_RECORD_COLUMNS = (
 
 _BASE_TABLES = frozenset(
     {
+        "tm_candidate_block",
         "tm_gram",
+        "tm_gram_block_max",
         "tm_meta",
         "tm_origin_batch",
         "tm_record",
@@ -274,7 +279,14 @@ _BASE_INDEXES = frozenset(
         "idx_tm_context_speaker",
         "idx_tm_exact",
         "idx_tm_gram_lookup",
+        "idx_tm_gram_block_lookup",
     }
+)
+_LEGACY_BASE_TABLES = _BASE_TABLES - frozenset(
+    {"tm_candidate_block", "tm_gram_block_max"}
+)
+_LEGACY_BASE_INDEXES = _BASE_INDEXES - frozenset(
+    {"idx_tm_gram_block_lookup"}
 )
 _FTS5_SHADOW_TABLES = frozenset(
     {
@@ -286,8 +298,8 @@ _FTS5_SHADOW_TABLES = frozenset(
     }
 )
 _APPROVED_SCHEMA_DIGESTS = {
-    False: "d807116c449da67b6186a64c500def04923eaecc9eed8edf47aa9cebeac3d751",
-    True: "a8925fe918c9394684eeb61b74052719480f7259cf2fa2ad3322704db21c5b1d",
+    False: "dc45d70bb6e54d141149305a9e5c99a6d85b1a4b4c2857af57029a96f6279bb4",
+    True: "ac0dcfe97473ed0ed71fd3de567f311cb9ef0a4f86e199c9b3994e62e0efe91b",
 }
 _APPROVED_LEGACY_SCHEMA_DIGESTS = {
     False: "725b94300abd64b5c06824ecb63357e2f737111e9fbd42094796183b924532a7",
@@ -407,6 +419,7 @@ _SCHEMA_STATEMENTS = (
         source_raw TEXT NOT NULL CHECK(length(source_raw) > 0),
         target_raw TEXT NOT NULL CHECK(length(target_raw) > 0),
         source_fold_v1 TEXT NOT NULL CHECK(length(source_fold_v1) > 0),
+        source_fold_length INTEGER NOT NULL CHECK(source_fold_length >= 0),
         speaker_raw TEXT,
         context_prev_raw TEXT,
         context_next_raw TEXT,
@@ -437,6 +450,7 @@ _SCHEMA_STATEMENTS = (
         gram_size INTEGER NOT NULL CHECK(gram_size IN (1, 2, 3)),
         gram TEXT NOT NULL CHECK(length(gram) > 0),
         record_id INTEGER NOT NULL,
+        term_frequency INTEGER NOT NULL CHECK(term_frequency > 0),
         PRIMARY KEY(gram_size, gram, record_id),
         FOREIGN KEY(record_id)
             REFERENCES tm_record(record_id)
@@ -446,6 +460,32 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE INDEX idx_tm_gram_lookup
     ON tm_gram(gram_size, gram, record_id)
+    """,
+    """
+    CREATE TABLE tm_candidate_block (
+        block_id INTEGER PRIMARY KEY,
+        first_record_id INTEGER NOT NULL,
+        last_record_id INTEGER NOT NULL,
+        record_count INTEGER NOT NULL CHECK(record_count > 0),
+        min_source_fold_length INTEGER NOT NULL,
+        max_source_fold_length INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE tm_gram_block_max (
+        gram_size INTEGER NOT NULL CHECK(gram_size IN (1, 2)),
+        gram TEXT NOT NULL,
+        block_id INTEGER NOT NULL,
+        max_term_frequency INTEGER NOT NULL CHECK(max_term_frequency > 0),
+        PRIMARY KEY(gram_size, gram, block_id),
+        FOREIGN KEY(block_id)
+            REFERENCES tm_candidate_block(block_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_tm_gram_block_lookup
+    ON tm_gram_block_max(gram_size, gram, block_id)
     """,
 )
 
@@ -582,6 +622,10 @@ class SQLiteStoreSchemaError(RuntimeError):
     """A safe, resource-local schema or connection policy failure."""
 
 
+class CandidateProofIndexError(ValueError):
+    """One canonical candidate-proof fact failed exact recomputation."""
+
+
 class SQLiteStoreLifecycleError(SQLiteStoreSchemaError):
     """A safe lifecycle failure scoped to one resource generation."""
 
@@ -634,6 +678,7 @@ class SQLiteGramRow:
     origin_ordinal: int
     gram_size: int
     gram: str
+    term_frequency: int = 1
 
     def __post_init__(self) -> None:
         if type(self.origin_ordinal) is not int or self.origin_ordinal < 0:
@@ -642,6 +687,8 @@ class SQLiteGramRow:
             raise ValueError("gram_size must be 1, 2, or 3")
         if type(self.gram) is not str or len(self.gram) != self.gram_size:
             raise ValueError("gram length must equal gram_size")
+        if type(self.term_frequency) is not int or self.term_frequency < 1:
+            raise ValueError("term_frequency must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -661,6 +708,7 @@ class SQLiteCandidateWritePlan:
             origin_ordinal = row.origin_ordinal
             gram_size = row.gram_size
             gram = row.gram
+            term_frequency = row.term_frequency
             if type(origin_ordinal) is not int or origin_ordinal < 0:
                 raise ValueError(
                     "origin_ordinal must be a non-negative integer"
@@ -669,6 +717,8 @@ class SQLiteCandidateWritePlan:
                 raise ValueError("gram_size must be 1, 2, or 3")
             if type(gram) is not str or len(gram) != gram_size:
                 raise ValueError("gram length must equal gram_size")
+            if type(term_frequency) is not int or term_frequency < 1:
+                raise ValueError("term_frequency must be a positive integer")
             gram_keys.append((origin_ordinal, gram_size, gram))
         if len(set(gram_keys)) != len(gram_keys):
             raise ValueError("gram_rows must be unique")
@@ -707,6 +757,20 @@ def unique_character_ngrams(
     return tuple(grams)
 
 
+def character_ngram_frequencies(
+    folded_text: str,
+    gram_size: int,
+) -> tuple[tuple[str, int], ...]:
+    """Return exact multiset frequencies in first-occurrence gram order."""
+
+    grams = unique_character_ngrams(folded_text, gram_size)
+    frequencies = Counter(
+        folded_text[offset : offset + gram_size]
+        for offset in range(max(0, len(folded_text) - gram_size + 1))
+    )
+    return tuple((gram, frequencies[gram]) for gram in grams)
+
+
 def build_candidate_write_plan(
     records: tuple[SQLiteCandidateRecord, ...],
     *,
@@ -730,10 +794,13 @@ def build_candidate_write_plan(
     gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
     return SQLiteCandidateWritePlan(
         gram_rows=tuple(
-            SQLiteGramRow(origin_ordinal, gram_size, gram)
+            SQLiteGramRow(origin_ordinal, gram_size, gram, term_frequency)
             for origin_ordinal, folded_source in prepared
             for gram_size in gram_sizes
-            for gram in unique_character_ngrams(folded_source, gram_size)
+            for gram, term_frequency in character_ngram_frequencies(
+                folded_source,
+                gram_size,
+            )
         ),
         fts_origin_ordinals=(
             tuple(origin_ordinal for origin_ordinal, _source in prepared)
@@ -1169,6 +1236,24 @@ class _CoordinatorStorePort:
         gram_size: int,
     ) -> tuple[str, ...]:
         return unique_character_ngrams(folded_text, gram_size)
+
+    def validate_candidate_proof_index(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        required_sizes: tuple[int, ...],
+        fts5_available: bool,
+    ) -> tuple[tuple[tuple[int, int], ...], int]:
+        try:
+            return validate_candidate_proof_index(
+                connection,
+                required_sizes=required_sizes,
+                fts5_available=fts5_available,
+            )
+        except (CandidateProofIndexError, sqlite3.DatabaseError) as error:
+            raise SQLiteStoreSchemaError(
+                "STORE.CANDIDATE_INDEX_INVALID"
+            ) from error
 
     def write_journal(
         self,
@@ -7730,7 +7815,7 @@ def _row_int(value: object) -> int:
 
 
 type _ValidatedCandidateWritePlan = tuple[
-    tuple[tuple[int, int, str], ...],
+    tuple[tuple[int, int, str, int], ...],
     tuple[int, ...],
 ]
 
@@ -7833,10 +7918,16 @@ def _prepare_candidate_write_plan(
     )
     default_grams, default_fts = default_plan
     additional_grams, additional_fts = additional_plan
-    return (
-        tuple(dict.fromkeys((*default_grams, *additional_grams))),
-        tuple(dict.fromkeys((*default_fts, *additional_fts))),
-    )
+    default_by_key = {
+        (ordinal, size, gram): term_frequency
+        for ordinal, size, gram, term_frequency in default_grams
+    }
+    for ordinal, size, gram, term_frequency in additional_grams:
+        if default_by_key.get((ordinal, size, gram)) != term_frequency:
+            raise ValueError("extension candidate gram facts are not canonical")
+    if not set(additional_fts).issubset(default_fts):
+        raise ValueError("extension FTS facts are not canonical")
+    return default_plan
 
 
 def _prepare_record_drafts(
@@ -7888,7 +7979,7 @@ def _validate_and_copy_candidate_plan(
         raise TypeError("gram_rows must be a built-in tuple")
     if type(ordinal_base) is not int or ordinal_base < 0:
         raise ValueError("ordinal_base must be a non-negative integer")
-    gram_rows: list[tuple[int, int, str]] = []
+    gram_rows: list[tuple[int, int, str, int]] = []
     gram_keys: set[tuple[int, int, str]] = set()
     for row in plan.gram_rows:
         if type(row) is not SQLiteGramRow:
@@ -7896,6 +7987,7 @@ def _validate_and_copy_candidate_plan(
         origin_ordinal = row.origin_ordinal
         gram_size = row.gram_size
         gram = row.gram
+        term_frequency = row.term_frequency
         if (
             type(origin_ordinal) is not int
             or not ordinal_base
@@ -7909,11 +8001,13 @@ def _validate_and_copy_candidate_plan(
             raise ValueError("gram_size must be 1, 2, or 3")
         if type(gram) is not str or len(gram) != gram_size:
             raise ValueError("gram length must equal gram_size")
+        if type(term_frequency) is not int or term_frequency < 1:
+            raise ValueError("term_frequency must be a positive integer")
         key = (origin_ordinal, gram_size, gram)
         if key in gram_keys:
             raise ValueError("gram rows must be unique")
         gram_keys.add(key)
-        gram_rows.append(key)
+        gram_rows.append((*key, term_frequency))
     if type(plan.fts_origin_ordinals) is not tuple:
         raise TypeError("fts_origin_ordinals must be a built-in tuple")
     fts_origin_ordinals: list[int] = []
@@ -7950,11 +8044,12 @@ def _apply_candidate_write_plan(
     if type(gram_rows) is not tuple or type(fts_origin_ordinals) is not tuple:
         raise TypeError("validated candidate plan is invalid")
     seen_grams: set[tuple[int, int, str]] = set()
-    validated_gram_rows: list[tuple[int, str, int]] = []
+    validated_gram_rows: list[tuple[int, str, int, int]] = []
     for row in gram_rows:
-        if type(row) is not tuple or len(row) != 3:
+        if type(row) is not tuple or len(row) != 4:
             raise TypeError("validated gram row is invalid")
-        origin_ordinal, gram_size, gram = row
+        origin_ordinal, gram_size, gram, term_frequency = row
+        key = (origin_ordinal, gram_size, gram)
         if (
             type(origin_ordinal) is not int
             or origin_ordinal not in record_ids_by_ordinal
@@ -7962,15 +8057,23 @@ def _apply_candidate_write_plan(
             or gram_size not in {1, 2, 3}
             or type(gram) is not str
             or len(gram) != gram_size
-            or row in seen_grams
+            or type(term_frequency) is not int
+            or term_frequency < 1
+            or key in seen_grams
         ):
             raise ValueError("validated gram row is invalid")
-        seen_grams.add(row)
+        seen_grams.add(key)
         validated_gram_rows.append(
-            (gram_size, gram, record_ids_by_ordinal[origin_ordinal])
+            (
+                gram_size,
+                gram,
+                record_ids_by_ordinal[origin_ordinal],
+                term_frequency,
+            )
         )
     connection.executemany(
-        "INSERT INTO tm_gram(gram_size, gram, record_id) VALUES (?, ?, ?)",
+        "INSERT INTO tm_gram(gram_size, gram, record_id, term_frequency) "
+        "VALUES (?, ?, ?, ?)",
         validated_gram_rows,
     )
     seen_fts_ordinals: set[int] = set()
@@ -7998,6 +8101,225 @@ def _apply_candidate_write_plan(
             )
         except sqlite3.OperationalError as error:
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+    _maintain_candidate_proof_summaries(
+        connection,
+        record_ids_by_ordinal=record_ids_by_ordinal,
+        folded_sources_by_ordinal=folded_sources_by_ordinal,
+        gram_rows=gram_rows,
+    )
+
+
+def _maintain_candidate_proof_summaries(
+    connection: sqlite3.Connection,
+    *,
+    record_ids_by_ordinal: dict[int, int],
+    folded_sources_by_ordinal: dict[int, str],
+    gram_rows: tuple[tuple[int, int, str, int], ...],
+) -> None:
+    """Maintain exact proof blocks inside the owning record transaction."""
+
+    for origin_ordinal, record_id in sorted(
+        record_ids_by_ordinal.items(), key=lambda pair: pair[1]
+    ):
+        folded_source = folded_sources_by_ordinal[origin_ordinal]
+        source_fold_length = len(folded_source)
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
+        last_record_id = first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1
+        connection.execute(
+            "INSERT INTO tm_candidate_block("
+            "block_id, first_record_id, last_record_id, record_count, "
+            "min_source_fold_length, max_source_fold_length) "
+            "VALUES (?, ?, ?, 1, ?, ?) "
+            "ON CONFLICT(block_id) DO UPDATE SET "
+            "record_count = record_count + 1, "
+            "min_source_fold_length = min(min_source_fold_length, excluded.min_source_fold_length), "
+            "max_source_fold_length = max(max_source_fold_length, excluded.max_source_fold_length)",
+            (
+                block_id,
+                first_record_id,
+                last_record_id,
+                source_fold_length,
+                source_fold_length,
+            ),
+        )
+    for origin_ordinal, gram_size, gram, term_frequency in gram_rows:
+        if gram_size not in {1, 2}:
+            continue
+        record_id = record_ids_by_ordinal[origin_ordinal]
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        connection.execute(
+            "INSERT INTO tm_gram_block_max("
+            "gram_size, gram, block_id, max_term_frequency) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
+            "max_term_frequency = max(max_term_frequency, excluded.max_term_frequency)",
+            (gram_size, gram, block_id, term_frequency),
+        )
+
+
+def validate_candidate_proof_index(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+) -> tuple[tuple[tuple[int, int], ...], int]:
+    """Stream-recompute exact length, TF, block and optional FTS facts."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise TypeError("connection must be an exact sqlite3 connection")
+    if type(required_sizes) is not tuple or any(
+        type(size) is not int for size in required_sizes
+    ):
+        raise TypeError("required_sizes must be a tuple of built-in integers")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    expected_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    if required_sizes != expected_sizes:
+        raise ValueError("candidate gram sizes do not match the index path")
+
+    def proof_int(value: object) -> int:
+        if type(value) is not int:
+            raise CandidateProofIndexError("candidate integer fact is invalid")
+        return value
+
+    def proof_text(value: object) -> str:
+        if type(value) is not str or not value:
+            raise CandidateProofIndexError("candidate text fact is invalid")
+        return value
+
+    record_cursor = connection.execute(
+        "SELECT record_id, source_fold_v1, source_fold_length "
+        "FROM tm_record ORDER BY record_id"
+    )
+    gram_cursor = connection.execute(
+        "SELECT record_id, gram_size, gram, term_frequency FROM tm_gram "
+        "ORDER BY record_id, gram_size, gram"
+    )
+    block_cursor = connection.execute(
+        "SELECT block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length "
+        "FROM tm_candidate_block ORDER BY block_id"
+    )
+    maximum_cursor = connection.execute(
+        "SELECT block_id, gram_size, gram, max_term_frequency "
+        "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram"
+    )
+    fts_cursor = (
+        connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
+        )
+        if fts5_available
+        else None
+    )
+    current_gram = gram_cursor.fetchone()
+    current_block = block_cursor.fetchone()
+    current_maximum = maximum_cursor.fetchone()
+    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
+    gram_counts = {size: 0 for size in required_sizes}
+    fts_count = 0
+    block_id: int | None = None
+    block_lengths: list[int] = []
+    block_maxima: dict[tuple[int, str], int] = {}
+
+    def flush_block() -> None:
+        nonlocal current_block, current_maximum
+        if block_id is None:
+            return
+        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
+        expected_block = (
+            block_id,
+            first_record_id,
+            first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1,
+            len(block_lengths),
+            min(block_lengths),
+            max(block_lengths),
+        )
+        if current_block is None or tuple(
+            proof_int(value) for value in current_block
+        ) != expected_block:
+            raise CandidateProofIndexError("candidate block fact is invalid")
+        current_block = block_cursor.fetchone()
+        actual_maxima: dict[tuple[int, str], int] = {}
+        while current_maximum is not None:
+            maximum_block_id = proof_int(current_maximum[0])
+            if maximum_block_id != block_id:
+                break
+            size = proof_int(current_maximum[1])
+            gram = proof_text(current_maximum[2])
+            frequency = proof_int(current_maximum[3])
+            key = (size, gram)
+            if size not in {1, 2} or frequency < 1 or key in actual_maxima:
+                raise CandidateProofIndexError(
+                    "candidate block maximum is invalid"
+                )
+            actual_maxima[key] = frequency
+            current_maximum = maximum_cursor.fetchone()
+        if actual_maxima != block_maxima:
+            raise CandidateProofIndexError("candidate block maximum is invalid")
+
+    expected_record_id = 1
+    for record_row in record_cursor:
+        record_id = proof_int(record_row[0])
+        folded_source = proof_text(record_row[1])
+        source_fold_length = proof_int(record_row[2])
+        if record_id != expected_record_id or source_fold_length != len(
+            folded_source
+        ):
+            raise CandidateProofIndexError("candidate record fact is invalid")
+        expected_record_id += 1
+        next_block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        if block_id is not None and next_block_id != block_id:
+            flush_block()
+            block_lengths.clear()
+            block_maxima.clear()
+        block_id = next_block_id
+        block_lengths.append(source_fold_length)
+
+        actual_grams: dict[tuple[int, str], int] = {}
+        while current_gram is not None:
+            gram_record_id = proof_int(current_gram[0])
+            if gram_record_id != record_id:
+                break
+            size = proof_int(current_gram[1])
+            gram = proof_text(current_gram[2])
+            frequency = proof_int(current_gram[3])
+            key = (size, gram)
+            if size not in required_sizes or frequency < 1 or key in actual_grams:
+                raise CandidateProofIndexError("candidate gram fact is invalid")
+            actual_grams[key] = frequency
+            current_gram = gram_cursor.fetchone()
+        expected_grams = {
+            (size, gram): frequency
+            for size in required_sizes
+            for gram, frequency in character_ngram_frequencies(
+                folded_source, size
+            )
+        }
+        if actual_grams != expected_grams:
+            raise CandidateProofIndexError("candidate gram fact is invalid")
+        for (size, gram), frequency in actual_grams.items():
+            gram_counts[size] += 1
+            if size in {1, 2}:
+                key = (size, gram)
+                block_maxima[key] = max(block_maxima.get(key, 0), frequency)
+
+        if fts5_available:
+            if current_fts is None:
+                raise CandidateProofIndexError("candidate FTS fact is invalid")
+            fts_record_id = proof_int(current_fts[0])
+            fts_source = proof_text(current_fts[1])
+            if (fts_record_id, fts_source) != (record_id, folded_source):
+                raise CandidateProofIndexError("candidate FTS fact is invalid")
+            fts_count += 1
+            current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
+
+    flush_block()
+    if any(row is not None for row in (current_gram, current_block, current_maximum)):
+        raise CandidateProofIndexError("candidate proof index has extra rows")
+    if current_fts is not None:
+        raise CandidateProofIndexError("candidate FTS fact is invalid")
+    return tuple(sorted(gram_counts.items())), fts_count
 
 
 def _next_draft_chunk(
@@ -8047,15 +8369,16 @@ def _insert_prepared_records_and_indexes(
         ) = draft
         cursor = connection.execute(
             "INSERT INTO tm_record("
-            "source_raw, target_raw, source_fold_v1, "
+            "source_raw, target_raw, source_fold_v1, source_fold_length, "
             "speaker_raw, context_prev_raw, context_next_raw, "
             "file_source, provenance_json, legacy_line_no, "
             "origin_batch_id, origin_ordinal) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 source_raw,
                 target_raw,
                 source_fold_v1,
+                len(source_fold_v1),
                 speaker_raw,
                 context_prev_raw,
                 context_next_raw,
@@ -8161,15 +8484,16 @@ def _insert_streamed_records(
         ) = draft
         cursor = connection.execute(
             "INSERT INTO tm_record("
-            "source_raw, target_raw, source_fold_v1, "
+            "source_raw, target_raw, source_fold_v1, source_fold_length, "
             "speaker_raw, context_prev_raw, context_next_raw, "
             "file_source, provenance_json, legacy_line_no, "
             "origin_batch_id, origin_ordinal) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 source_raw,
                 target_raw,
                 source_fold_v1,
+                len(source_fold_v1),
                 speaker_raw,
                 context_prev_raw,
                 context_next_raw,
@@ -8197,7 +8521,7 @@ def _insert_streamed_candidate_index(
     """Bulk-insert one bounded chunk's grams and FTS rows in PK order."""
 
     gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    grams_by_size: dict[int, dict[str, list[int]]] = {
+    grams_by_size: dict[int, dict[str, list[tuple[int, int]]]] = {
         gram_size: {} for gram_size in gram_sizes
     }
     fts_rows: list[tuple[str, int]] = []
@@ -8207,20 +8531,26 @@ def _insert_streamed_candidate_index(
         record_id = record_ids_by_ordinal[origin_ordinal]
         for gram_size in gram_sizes:
             bucket = grams_by_size[gram_size]
-            for gram in unique_character_ngrams(folded_source, gram_size):
-                bucket.setdefault(gram, []).append(record_id)
+            for gram, term_frequency in character_ngram_frequencies(
+                folded_source,
+                gram_size,
+            ):
+                bucket.setdefault(gram, []).append(
+                    (record_id, term_frequency)
+                )
         if fts5_available:
             fts_rows.append((folded_source, record_id))
     for gram_size in gram_sizes:
         bucket = grams_by_size[gram_size]
         rows = [
-            (gram_size, gram, record_id)
+            (gram_size, gram, record_id, term_frequency)
             for gram in sorted(bucket)
-            for record_id in bucket[gram]
+            for record_id, term_frequency in bucket[gram]
         ]
         connection.executemany(
-            "INSERT INTO tm_gram(gram_size, gram, record_id) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO tm_gram("
+            "gram_size, gram, record_id, term_frequency) "
+            "VALUES (?, ?, ?, ?)",
             rows,
         )
     if fts_rows:
@@ -8232,6 +8562,19 @@ def _insert_streamed_candidate_index(
             )
         except sqlite3.OperationalError as error:
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+    _maintain_candidate_proof_summaries(
+        connection,
+        record_ids_by_ordinal=record_ids_by_ordinal,
+        folded_sources_by_ordinal={draft[10]: draft[2] for draft in prepared_drafts},
+        gram_rows=tuple(
+            (draft[10], gram_size, gram, term_frequency)
+            for draft in prepared_drafts
+            for gram_size in gram_sizes
+            for gram, term_frequency in character_ngram_frequencies(
+                draft[2], gram_size
+            )
+        ),
+    )
 
 
 def _complete_streamed_batch(
@@ -8451,6 +8794,20 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
+            if schema_version == TM_SCHEMA_VERSION:
+                fts5_available = _meta_bool(meta, "fts5_available")
+                try:
+                    validate_candidate_proof_index(
+                        connection,
+                        required_sizes=(
+                            (1, 2) if fts5_available else (1, 2, 3)
+                        ),
+                        fts5_available=fts5_available,
+                    )
+                except (CandidateProofIndexError, sqlite3.DatabaseError) as error:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_INDEX_INVALID"
+                    ) from error
             facts = _read_source_binding_facts_in_transaction(
                 connection,
                 lease,
@@ -8798,6 +9155,7 @@ def initialize_stage_schema(
             schema_digest = _schema_digest(
                 connection,
                 fts5_available=runtime.fts5_available,
+                legacy_schema=_legacy_schema,
             )
             approved_digests = (
                 _APPROVED_LEGACY_SCHEMA_DIGESTS
@@ -8890,7 +9248,17 @@ def inspect_stage_schema(
         )
         table_names = _schema_object_names(connection, "table")
         index_names = _schema_object_names(connection, "index")
-        expected_tables = set(_BASE_TABLES)
+        base_tables = (
+            _LEGACY_BASE_TABLES
+            if schema_version == TM_LEGACY_SCHEMA_VERSION
+            else _BASE_TABLES
+        )
+        base_indexes = (
+            _LEGACY_BASE_INDEXES
+            if schema_version == TM_LEGACY_SCHEMA_VERSION
+            else _BASE_INDEXES
+        )
+        expected_tables = set(base_tables)
         fts5_available = _meta_bool(meta, "fts5_available")
         if fts5_available:
             expected_tables.add("tm_fts")
@@ -8901,14 +9269,15 @@ def inspect_stage_schema(
             raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
         if table_names != expected_physical_tables:
             raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
-        if not _BASE_INDEXES.issubset(index_names):
+        if not base_indexes.issubset(index_names):
             raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
-        if index_names != _BASE_INDEXES:
+        if index_names != base_indexes:
             raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
         _validate_schema_object_types(connection)
         actual_schema_digest = _schema_digest(
             connection,
             fts5_available=fts5_available,
+            legacy_schema=schema_version == TM_LEGACY_SCHEMA_VERSION,
         )
         approved_schema_digests = (
             _APPROVED_LEGACY_SCHEMA_DIGESTS
@@ -8921,8 +9290,14 @@ def inspect_stage_schema(
             or actual_schema_digest != approved_schema_digest
         ):
             raise SQLiteStoreSchemaError("STORE.TABLE_SCHEMA_MISMATCH")
-        _validate_index_schema(connection)
-        _validate_foreign_key_schema(connection)
+        _validate_index_schema(
+            connection,
+            legacy_schema=schema_version == TM_LEGACY_SCHEMA_VERSION,
+        )
+        _validate_foreign_key_schema(
+            connection,
+            legacy_schema=schema_version == TM_LEGACY_SCHEMA_VERSION,
+        )
         if fts5_available != runtime.fts5_available:
             raise SQLiteStoreSchemaError("STORE.RUNTIME_CAPABILITY_CHANGED")
         if meta["sqlite_runtime_version"] != runtime.sqlite_version:
@@ -8963,7 +9338,7 @@ def inspect_stage_schema(
             activation_digest=activation_digest,
             fuzzy_available=False,
             table_names=tuple(sorted(expected_tables)),
-            index_names=tuple(sorted(_BASE_INDEXES)),
+            index_names=tuple(sorted(base_indexes)),
         )
 
 
@@ -9018,8 +9393,13 @@ def _schema_digest(
     connection: sqlite3.Connection,
     *,
     fts5_available: bool,
+    legacy_schema: bool = False,
 ) -> str:
-    expected_names = set(_BASE_TABLES | _BASE_INDEXES)
+    if type(legacy_schema) is not bool:
+        raise TypeError("legacy_schema must be a built-in bool")
+    base_tables = _LEGACY_BASE_TABLES if legacy_schema else _BASE_TABLES
+    base_indexes = _LEGACY_BASE_INDEXES if legacy_schema else _BASE_INDEXES
+    expected_names = set(base_tables | base_indexes)
     if fts5_available:
         expected_names.add("tm_fts")
         expected_names.update(_FTS5_SHADOW_TABLES)
@@ -9123,7 +9503,11 @@ def _validate_stage_meta(
     _ = _meta_int(meta, "head_revision")
 
 
-def _validate_index_schema(connection: sqlite3.Connection) -> None:
+def _validate_index_schema(
+    connection: sqlite3.Connection,
+    *,
+    legacy_schema: bool,
+) -> None:
     expected = {
         "idx_tm_exact": (("source_raw", False), ("record_id", True)),
         "idx_tm_context_speaker": (
@@ -9137,6 +9521,12 @@ def _validate_index_schema(connection: sqlite3.Connection) -> None:
             ("record_id", False),
         ),
     }
+    if not legacy_schema:
+        expected["idx_tm_gram_block_lookup"] = (
+            ("gram_size", False),
+            ("gram", False),
+            ("block_id", False),
+        )
     for index_name, expected_columns in expected.items():
         rows = connection.execute(
             f"PRAGMA index_xinfo({index_name})"
@@ -9150,7 +9540,11 @@ def _validate_index_schema(connection: sqlite3.Connection) -> None:
             raise SQLiteStoreSchemaError("STORE.INDEX_SCHEMA_MISMATCH")
 
 
-def _validate_foreign_key_schema(connection: sqlite3.Connection) -> None:
+def _validate_foreign_key_schema(
+    connection: sqlite3.Connection,
+    *,
+    legacy_schema: bool,
+) -> None:
     expected = {
         "tm_snapshot_binding": (
             ("snapshot_id", "tm_snapshot_receipt", "snapshot_id", "NO ACTION"),
@@ -9162,6 +9556,10 @@ def _validate_foreign_key_schema(connection: sqlite3.Connection) -> None:
             ("record_id", "tm_record", "record_id", "CASCADE"),
         ),
     }
+    if not legacy_schema:
+        expected["tm_gram_block_max"] = (
+            ("block_id", "tm_candidate_block", "block_id", "CASCADE"),
+        )
     for table_name, expected_keys in expected.items():
         rows = connection.execute(
             f"PRAGMA foreign_key_list({table_name})"
@@ -10007,6 +10405,9 @@ __all__ = [
     "ActivationRecoveryReport",
     "BUSY_TIMEOUT_MS",
     "CANDIDATE_INDEX_VERSION",
+    "CANDIDATE_PROOF_BLOCK_SIZE",
+    "CANDIDATE_PROOF_BLOCK_VERSION_V1",
+    "CandidateProofIndexError",
     "CanonicalRevisionSnapshot",
     "FOLD_VERSION_V1",
     "ResourceStoreCoordinator",
@@ -10027,4 +10428,5 @@ __all__ = [
     "detect_sqlite_runtime",
     "initialize_stage_schema",
     "inspect_stage_schema",
+    "validate_candidate_proof_index",
 ]

@@ -516,8 +516,9 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                     connection = _raw_connection(stage.staged_db_path)
                     try:
                         connection.execute(
-                            "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                            "VALUES (1, 'z', 3)"
+                            "INSERT INTO tm_gram("
+                            "gram_size, gram, record_id, term_frequency) "
+                            "VALUES (1, 'z', 3, 1)"
                         )
                         connection.commit()
                     finally:
@@ -650,9 +651,20 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                         ):
                             connection.execute(
                                 "INSERT INTO tm_gram("
-                                "gram_size, gram, record_id) "
-                                "VALUES (?, ?, ?)",
-                                (gram_size, gram, record_id),
+                                "gram_size, gram, record_id, term_frequency) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    gram_size,
+                                    gram,
+                                    record_id,
+                                    sum(
+                                        folded[offset : offset + gram_size]
+                                        == gram
+                                        for offset in range(
+                                            max(0, len(folded) - gram_size + 1)
+                                        )
+                                    ),
+                                ),
                             )
                 connection.commit()
             finally:
@@ -727,9 +739,19 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                     ):
                         connection.execute(
                             "INSERT INTO tm_gram("
-                            "gram_size, gram, record_id) "
-                            "VALUES (?, ?, 1)",
-                            (gram_size, gram),
+                            "gram_size, gram, record_id, term_frequency) "
+                            "VALUES (?, ?, 1, ?)",
+                            (
+                                gram_size,
+                                gram,
+                                sum(
+                                    "tampered"[offset : offset + gram_size]
+                                    == gram
+                                    for offset in range(
+                                        max(0, len("tampered") - gram_size + 1)
+                                    )
+                                ),
+                            ),
                         )
                 connection.commit()
             finally:

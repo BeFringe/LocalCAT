@@ -209,11 +209,13 @@ class _StoreValidationPort(Protocol):
         _expected_active_generation: int | None = None,
         _expected_activation_digest: str | None = None,
     ) -> Any: ...
-    def unique_character_ngrams(
+    def validate_candidate_proof_index(
         self,
-        folded_text: str,
-        gram_size: int,
-    ) -> tuple[str, ...]: ...
+        connection: sqlite3.Connection,
+        *,
+        required_sizes: tuple[int, ...],
+        fts5_available: bool,
+    ) -> tuple[tuple[tuple[int, int], ...], int]: ...
     def write_journal(
         self,
         record: _ActivationJournalRecord,
@@ -1211,68 +1213,22 @@ def _validate_activation_indexes(
     fts5_available: bool,
 ) -> None:
     required_sizes = tuple(size for size, _count in evidence.gram_counts)
-    expected_counts = dict(evidence.gram_counts)
-    actual_counts = {size: 0 for size in required_sizes}
-    gram_cursor = connection.execute(
-        "SELECT record_id, gram_size, gram FROM tm_gram "
-        "ORDER BY record_id, gram_size, gram"
+    actual_count_rows, actual_fts_count = port.validate_candidate_proof_index(
+        connection,
+        required_sizes=required_sizes,
+        fts5_available=fts5_available,
     )
-    current_gram = gram_cursor.fetchone()
-    for record_id, folded_source in connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
-    ):
-        if type(record_id) is not int or type(folded_source) is not str:
-            raise port.store_schema_error("STORE.RECORD_INVALID")
-        actual: set[tuple[int, str]] = set()
-        while current_gram is not None and current_gram[0] == record_id:
-            gram_size, gram = current_gram[1], current_gram[2]
-            if type(gram_size) is not int or type(gram) is not str:
-                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-            actual.add((gram_size, gram))
-            current_gram = gram_cursor.fetchone()
-        expected = {
-            (size, gram)
-            for size in required_sizes
-            for gram in port.unique_character_ngrams(folded_source, size)
-        }
-        if actual != expected:
-            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-        for size, _gram in actual:
-            if size not in actual_counts:
-                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-            actual_counts[size] += 1
-    if current_gram is not None or actual_counts != expected_counts:
+    if dict(actual_count_rows) != dict(evidence.gram_counts):
         raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
     schema_upgrade = _schema_upgrade_marker(port, connection)
     if fts5_available:
-        record_cursor = connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
-        )
-        fts_cursor = connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
-        )
-        fts_count = 0
-        while True:
-            record_row = record_cursor.fetchone()
-            fts_row = fts_cursor.fetchone()
-            if record_row is None or fts_row is None:
-                if record_row != fts_row:
-                    raise port.store_schema_error(
-                        "STORE.CANDIDATE_INDEX_INVALID"
-                    )
-                break
-            if fts_row != record_row:
-                raise port.store_schema_error(
-                    "STORE.CANDIDATE_INDEX_INVALID"
-                )
-            fts_count += 1
         if schema_upgrade is not None:
             if connection.execute(
                 "SELECT COUNT(*) FROM tm_fts WHERE record_id <= ?",
                 (evidence.source_binding.receipt.record_count,),
             ).fetchone() != (evidence.fts_count,):
                 raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-        elif fts_count != evidence.fts_count:
+        elif actual_fts_count != evidence.fts_count:
             raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
     elif evidence.fts_count != 0:
         raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
@@ -1709,55 +1665,11 @@ def _recover_activation_indexes(
     """
 
     required_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    expected_counts = {size: 0 for size in required_sizes}
-    gram_cursor = connection.execute(
-        "SELECT record_id, gram_size, gram FROM tm_gram "
-        "ORDER BY record_id, gram_size, gram"
+    _ = port.validate_candidate_proof_index(
+        connection,
+        required_sizes=required_sizes,
+        fts5_available=fts5_available,
     )
-    current_gram = gram_cursor.fetchone()
-    for record_id, folded_source in connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
-    ):
-        if type(record_id) is not int or type(folded_source) is not str:
-            raise port.store_schema_error("STORE.RECORD_INVALID")
-        actual: set[tuple[int, str]] = set()
-        while current_gram is not None and current_gram[0] == record_id:
-            gram_size, gram = current_gram[1], current_gram[2]
-            if type(gram_size) is not int or type(gram) is not str:
-                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-            actual.add((gram_size, gram))
-            current_gram = gram_cursor.fetchone()
-        expected = {
-            (size, gram)
-            for size in required_sizes
-            for gram in port.unique_character_ngrams(folded_source, size)
-        }
-        if actual != expected:
-            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-        for size, _gram in actual:
-            if size not in expected_counts:
-                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-            expected_counts[size] += 1
-    if current_gram is not None:
-        raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
-    if fts5_available:
-        record_cursor = connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
-        )
-        fts_cursor = connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
-        )
-        while True:
-            record_row = record_cursor.fetchone()
-            fts_row = fts_cursor.fetchone()
-            if record_row is None or fts_row is None:
-                if record_row != fts_row:
-                    raise port.store_schema_error(
-                        "STORE.CANDIDATE_INDEX_INVALID"
-                    )
-                break
-            if fts_row != record_row:
-                raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
 
 
 def _recovery_receipt_row(

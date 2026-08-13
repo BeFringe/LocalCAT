@@ -566,8 +566,9 @@ class StageSealerTamperTests(unittest.TestCase):
                     )
                     connection = _raw_connection(stage.staged_db_path)
                     connection.execute(
-                        "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                        "VALUES (1, 'q', 1)"
+                        "INSERT INTO tm_gram("
+                        "gram_size, gram, record_id, term_frequency) "
+                        "VALUES (1, 'q', 1, 1)"
                     )
                     connection.commit()
                     connection.close()
@@ -581,6 +582,58 @@ class StageSealerTamperTests(unittest.TestCase):
                         ),
                         "SEALER.CANDIDATE_INDEX_INCOMPLETE",
                     )
+
+    def test_length_tf_and_block_proof_tamper_matrix_is_rejected(self) -> None:
+        mutations = (
+            (
+                "length",
+                "UPDATE tm_record SET source_fold_length = "
+                "source_fold_length + 1 WHERE record_id = 1",
+                "SEALER.FOLD_MISMATCH",
+            ),
+            (
+                "term-frequency",
+                "UPDATE tm_gram SET term_frequency = term_frequency + 1 "
+                "WHERE record_id = 1 AND gram_size = 1",
+                "SEALER.CANDIDATE_INDEX_INCOMPLETE",
+            ),
+            (
+                "block-count",
+                "UPDATE tm_candidate_block SET record_count = record_count + 1 "
+                "WHERE block_id = 0",
+                "SEALER.CANDIDATE_INDEX_INCOMPLETE",
+            ),
+            (
+                "missing-maximum",
+                "DELETE FROM tm_gram_block_max WHERE rowid IN "
+                "(SELECT rowid FROM tm_gram_block_max LIMIT 1)",
+                "SEALER.CANDIDATE_INDEX_INCOMPLETE",
+            ),
+            (
+                "wrong-maximum",
+                "UPDATE tm_gram_block_max SET max_term_frequency = "
+                "max_term_frequency + 1 WHERE rowid IN "
+                "(SELECT rowid FROM tm_gram_block_max LIMIT 1)",
+                "SEALER.CANDIDATE_INDEX_INCOMPLETE",
+            ),
+            (
+                "extra-block",
+                "INSERT INTO tm_candidate_block VALUES (99, 25345, 25600, 1, 1, 1)",
+                "SEALER.CANDIDATE_INDEX_INCOMPLETE",
+            ),
+        )
+        for name, statement, expected_code in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                _, stage = _build_stage(Path(temporary), fts5_available=True)
+                connection = _raw_connection(stage.staged_db_path)
+                connection.execute(statement)
+                connection.commit()
+                connection.close()
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(_sealer(), stage, fts5_available=True),
+                    expected_code,
+                )
 
     def test_missing_fts_row_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -793,8 +846,9 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
             _, stage = _build_stage(Path(temporary), fts5_available=True)
             connection = _raw_connection(stage.staged_db_path)
             connection.execute(
-                "INSERT INTO tm_gram(gram_size, gram, record_id) "
-                "VALUES (1, '\u0001', 999999)"
+                "INSERT INTO tm_gram("
+                "gram_size, gram, record_id, term_frequency) "
+                "VALUES (1, '\u0001', 999999, 1)"
             )
             connection.commit()
             connection.close()

@@ -86,6 +86,7 @@ from tm_sqlite_store import (
     initialize_stage_schema,
     inspect_stage_schema,
     unique_character_ngrams,
+    validate_candidate_proof_index,
 )
 from tm_stage_sealer import StageSealer
 import tm_schema_upgrade as schema_upgrade_module
@@ -3835,63 +3836,13 @@ def _validate_stage_indexes(
     required_sizes: tuple[int, ...],
     fts5_available: bool,
 ) -> None:
-    """Stream-compare record, gram, and FTS rows with bounded per-record sets."""
+    """Recompute every candidate-proof fact for stage reuse."""
 
-    folded_cursor = connection.execute(
-        "SELECT record_id, source_fold_v1 FROM tm_record ORDER BY record_id"
+    _ = validate_candidate_proof_index(
+        connection,
+        required_sizes=required_sizes,
+        fts5_available=fts5_available,
     )
-    gram_cursor = connection.execute(
-        "SELECT record_id, gram_size, gram FROM tm_gram "
-        "ORDER BY record_id, gram_size, gram"
-    )
-    fts_cursor = (
-        connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_fts "
-            "ORDER BY record_id"
-        )
-        if fts5_available
-        else None
-    )
-    current_gram = gram_cursor.fetchone()
-    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
-    expected_record_id = 1
-    for folded_row in folded_cursor:
-        record_id = int(folded_row[0])
-        folded_source = str(folded_row[1])
-        if record_id != expected_record_id:
-            raise ValueError("record ids are not contiguous")
-        expected_record_id += 1
-        actual_grams: set[tuple[int, str]] = set()
-        while current_gram is not None and int(current_gram[0]) == record_id:
-            actual_grams.add((int(current_gram[1]), str(current_gram[2])))
-            current_gram = gram_cursor.fetchone()
-        if current_gram is not None and int(current_gram[0]) < record_id:
-            raise ValueError("candidate gram index is out of order")
-        expected_grams: set[tuple[int, str]] = set()
-        for gram_size in required_sizes:
-            expected_grams.update(
-                (gram_size, gram)
-                for gram in unique_character_ngrams(
-                    folded_source,
-                    gram_size,
-                )
-            )
-        if actual_grams != expected_grams:
-            raise ValueError("candidate gram index is incomplete")
-        if fts5_available:
-            assert fts_cursor is not None
-            actual_fts: set[tuple[int, str]] = set()
-            while current_fts is not None and int(current_fts[0]) == record_id:
-                actual_fts.add((int(current_fts[0]), str(current_fts[1])))
-                current_fts = fts_cursor.fetchone()
-            if current_fts is not None and int(current_fts[0]) < record_id:
-                raise ValueError("candidate FTS index is out of order")
-            if actual_fts != {(record_id, folded_source)}:
-                raise ValueError("candidate FTS index is incomplete")
-    if current_gram is not None:
-        raise ValueError("candidate gram index has extra rows")
-    if current_fts is not None:
-        raise ValueError("candidate FTS index has extra rows")
 
 
 def _created_file_identity(path: Path) -> _CreatedFileIdentity:

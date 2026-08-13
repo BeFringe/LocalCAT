@@ -349,7 +349,7 @@
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
   - _Boundary: TMBenchmark Gate D_
 
-- [ ] 8.6 固化 scorer 完备性上界与 proof index
+- [x] 8.6 固化 scorer 完备性上界与 proof index
   - 在 record/index 同事务保存 folded length、字符/bigram multiset term frequency 与固定 block 的保守 summary，并为 scorer-v1 冻结可独立验证的分数上界公式
   - 上界必须覆盖长度差、字符 multiset/LCS 下界和 bigram multiset 差异；任何 summary 低估、缺行、重复或计数不守恒均 fail-closed
   - 保持 `candidate-budget-v1` 不变，不使用 oracle identity、固定类别或扩大窗口证明完备
@@ -485,3 +485,4 @@
 - 2026-08-13 / Task 9.3：新增独立于 fault taxonomy 的 `tm-acceptance-matrix-v1` 行为证据矩阵，以 18 行闭集覆盖 matcher 三态/证据降级/用途选项/single-snapshot/无正文诊断、raw context 分类、candidate union/dedupe/truncate、global limit、资源局部失败、gate-closed 与零命中区分、matcher/CONTEXT/FUZZY 不冒充以及逐阶段 metadata 守恒。每行绑定生产 seam、单一断言契约和精确 unittest id；验证器只接受当前 checkout 与 canonical evidence 输出，以逐组件 no-follow regular source 摘要拒绝改名、替代 root、symlink 或 stale 源码。18/18 行、49 个引用及 matrix 8/8 全部通过，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；Gate D 的真实性保持不变，FUZZY 未因行为证据通过而开放。
 - 2026-08-13 / Task 9.4：将 compatibility/priority/Excel/selfcheck/privacy/isolation/SQLite policy/architecture 收束为 14 行验收证据，累计 acceptance matrix 32 行、78 个精确引用。新增 disposable cwd + `-B` 子进程覆盖 TMEngine、stress runner 与 translation runner 旧自检；静态守卫以设计拥有的 28 个 Core 文件闭集和 Qt/Glossary/Legacy/Controller consumer 集合为权威，拒绝网络/账号/telemetry/凭据/外部服务依赖、Core 反向导入 Qt/Parser/TMX/Glossary，以及 consumer 通过普通 import、`__import__`、字面 `importlib.import_module`、readiness 标识符或 validation-summary 字符串取得第二权威。兼容/Excel/Legacy/selfcheck/architecture focused 35/35、matrix 8/8，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；现有 LogicController→Glossary 合法兼容职责没有被误归为 Core 依赖违规。
 - 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
+- 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
