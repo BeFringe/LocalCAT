@@ -3461,10 +3461,20 @@ class TMProcessDeathBoundaryTests(unittest.TestCase):
                     )
 
                     if boundary.expected_resolution == "UNJOURNALED":
-                        self.assertIs(
-                            outcome.state,
-                            RefreshRecoveryState.NOOP,
-                        )
+                        if mode == "refresh":
+                            self.assertIs(
+                                outcome.state,
+                                RefreshRecoveryState.BLOCKED,
+                            )
+                            self.assertIn(
+                                "RECOVERY.HANDOFF_MISSING",
+                                outcome.diagnostics,
+                            )
+                        else:
+                            self.assertIs(
+                                outcome.state,
+                                RefreshRecoveryState.NOOP,
+                            )
                         self.assertEqual(rows, ())
                         self.assertTrue(any(path.exists() for path in artifacts))
                         self.assertEqual(
@@ -3946,6 +3956,205 @@ class TMClusterFRegressionTests(unittest.TestCase):
                         store.capture_export_snapshot(),
                         canonical_before,
                     )
+
+    def _assert_deleted_or_orphaned_handoff_blocks(
+        self,
+        receipt_status: str,
+    ) -> None:
+        for mutation in ("deleted", "orphaned"):
+            with self.subTest(
+                status=receipt_status,
+                mutation=mutation,
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage, store = _prepared_store(root)
+                identity = stage.resource_identity
+                _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+                destination = self._destination(root)
+                paths = _export_artifact_paths(destination)
+                prior_jsonl = b'{"source":"prior","target":"pair"}\n'
+                prior_manifest = b'{"manifest":"prior"}\n'
+                destination.write_bytes(prior_jsonl)
+                paths.manifest.write_bytes(prior_manifest)
+                receipt = self._register_export(
+                    store,
+                    destination,
+                    _NEW_JSONL,
+                )
+                generation = store.capture_export_snapshot().revision.generation
+                paths.jsonl_recovery.write_bytes(prior_jsonl)
+                paths.manifest_recovery.write_bytes(prior_manifest)
+                store.record_export_recovery_handoff(
+                    receipt.snapshot_id,
+                    expected_generation=generation,
+                    jsonl_recovery_identity=_identity_of(
+                        paths.jsonl_recovery
+                    ),
+                    manifest_recovery_identity=_identity_of(
+                        paths.manifest_recovery
+                    ),
+                )
+                if receipt_status == "completed":
+                    _publish_registered_pair(
+                        destination,
+                        receipt,
+                        _NEW_JSONL,
+                    )
+                    self._complete_export(
+                        store,
+                        receipt,
+                        destination,
+                        expected_generation=generation,
+                    )
+                elif receipt_status == "cancelled":
+                    store.cancel_issued_export_receipt(
+                        receipt.snapshot_id,
+                        expected_generation=generation,
+                    )
+                elif receipt_status != "issued":
+                    raise AssertionError("unsupported receipt status")
+                meta_key = "artifact_handoff." + receipt.snapshot_id
+                connection = sqlite3.connect(stage.staged_db_path)
+                try:
+                    if mutation == "deleted":
+                        changed = connection.execute(
+                            "DELETE FROM tm_meta WHERE key = ?",
+                            (meta_key,),
+                        )
+                    else:
+                        changed = connection.execute(
+                            "UPDATE tm_meta SET key = ? WHERE key = ?",
+                            ("artifact_handoff.orphan", meta_key),
+                        )
+                    self.assertEqual(changed.rowcount, 1)
+                    connection.commit()
+                finally:
+                    connection.close()
+                assets_before = {
+                    path: (path.read_bytes(), _identity_of(path))
+                    for path in (
+                        paths.destination,
+                        paths.manifest,
+                        paths.jsonl_temp,
+                        paths.manifest_temp,
+                        paths.jsonl_recovery,
+                        paths.manifest_recovery,
+                    )
+                    if path.exists()
+                }
+                binding_before = _binding_row(stage.staged_db_path)
+                canonical_before = store.capture_export_snapshot()
+
+                outcome = _fresh_store(stage).recover_configured_refresh()
+
+                _assert_recovery_outcome_shape(self, outcome)
+                self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
+                if mutation == "orphaned":
+                    self.assertEqual(
+                        outcome.error_code,
+                        "STORE.HANDOFF_ORPHANED",
+                    )
+                    self.assertIn(
+                        "STORE.HANDOFF_ORPHANED",
+                        outcome.diagnostics,
+                    )
+                    self.assertEqual(outcome.receipts, ())
+                    self.assertIsNotNone(
+                        _meta_value(
+                            stage.staged_db_path,
+                            "artifact_handoff.orphan",
+                        )
+                    )
+                else:
+                    self.assertIsNone(outcome.error_code)
+                    self.assertIn(
+                        "RECOVERY.HANDOFF_MISSING",
+                        outcome.diagnostics,
+                    )
+                    self.assertEqual(
+                        outcome.receipts,
+                        (
+                            IssuedReceiptRecovery(
+                                receipt.snapshot_id,
+                                RefreshRecoveryState.BLOCKED,
+                                ("RECOVERY.HANDOFF_MISSING",),
+                            ),
+                        ),
+                    )
+                self.assertEqual(
+                    _status_for(stage.staged_db_path, receipt.snapshot_id),
+                    receipt_status,
+                )
+                for path, expected in assets_before.items():
+                    self.assertEqual(
+                        (path.read_bytes(), _identity_of(path)),
+                        expected,
+                        path.name,
+                    )
+                self.assertEqual(
+                    _binding_row(stage.staged_db_path),
+                    binding_before,
+                )
+                self.assertEqual(
+                    store.capture_export_snapshot(),
+                    canonical_before,
+                )
+
+    def test_issued_deleted_or_orphaned_handoff_blocks(self) -> None:
+        self._assert_deleted_or_orphaned_handoff_blocks("issued")
+
+    def test_completed_deleted_or_orphaned_handoff_blocks(self) -> None:
+        self._assert_deleted_or_orphaned_handoff_blocks("completed")
+
+    def test_cancelled_deleted_or_orphaned_handoff_blocks(self) -> None:
+        self._assert_deleted_or_orphaned_handoff_blocks("cancelled")
+
+    def test_terminal_without_handoff_and_artifacts_is_legitimate_noop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store = _prepared_store(root)
+            identity = stage.resource_identity
+            _bind_current_snapshot(store, stage, _PRIOR_JSONL)
+            destination = self._destination(root)
+
+            exported = _service(identity).export_jsonl(store, destination)
+
+            self.assertIs(type(exported), ExportReport)
+            rows = tuple(
+                row
+                for row in _ledger_rows(stage.staged_db_path, destination)
+                if str(row[0]).startswith("snapshot.export.")
+            )
+            self.assertEqual(len(rows), 1)
+            snapshot_id = str(rows[0][0])
+            self.assertEqual(str(rows[0][9]), "completed")
+            paths = _export_artifact_paths(destination)
+            self.assertTrue(
+                all(
+                    not path.exists()
+                    for path in (
+                        paths.jsonl_temp,
+                        paths.manifest_temp,
+                        paths.jsonl_recovery,
+                        paths.manifest_recovery,
+                    )
+                )
+            )
+            self.assertIsNone(
+                _meta_value(
+                    stage.staged_db_path,
+                    "artifact_handoff." + snapshot_id,
+                )
+            )
+
+            outcome = _fresh_store(stage).recover_configured_refresh()
+
+            _assert_recovery_outcome_shape(self, outcome)
+            self.assertIs(outcome.state, RefreshRecoveryState.NOOP)
+            self.assertEqual(outcome.receipts, ())
+            self.assertEqual(outcome.diagnostics, ())
 
     def test_export_issued_to_reserved_authority_blocks_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

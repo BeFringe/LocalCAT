@@ -6492,6 +6492,12 @@ class SQLiteTMStore:
             for handoff in parsed_handoffs
             if handoff is not None
         )
+        receipt_ids = {receipt.snapshot_id for receipt in receipts}
+        if any(
+            handoff.snapshot_id not in receipt_ids
+            for handoff in handoffs
+        ):
+            raise SQLiteStoreSchemaError("STORE.HANDOFF_ORPHANED")
         binding_invalid = bool(
             set(facts.diagnostic_codes)
             & {

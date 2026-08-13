@@ -74,7 +74,7 @@ class FaultMatrixRegistryTests(unittest.TestCase):
         self.assertTrue(all(row.task == "9.1" for row in TASK_9_1_ROWS))
 
     def test_task_9_2_registry_is_closed_and_unique(self) -> None:
-        self.assertEqual(len(TASK_9_2_ROWS), 30)
+        self.assertEqual(len(TASK_9_2_ROWS), 31)
         self.assertTrue(all(row.task == "9.2" for row in TASK_9_2_ROWS))
         self.assertEqual(
             FAULT_MATRIX_ROWS,

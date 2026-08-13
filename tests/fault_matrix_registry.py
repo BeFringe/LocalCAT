@@ -732,6 +732,25 @@ TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
         "A completed export receipt cannot be rebound to another revision, path, or generation.",
     ),
     _row(
+        "9.2.MISMATCH.04",
+        FaultClass.MISMATCH,
+        "Corrupt, missing, or orphaned durable handoff relations block without mutation",
+        "tm_sqlite_store.py:receipt-to-handoff relation closure",
+        (
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_corrupt_issued_and_terminal_handoffs_block_without_mutation",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_issued_deleted_or_orphaned_handoff_blocks",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_completed_deleted_or_orphaned_handoff_blocks",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_cancelled_deleted_or_orphaned_handoff_blocks",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_terminal_without_handoff_and_artifacts_is_legitimate_noop",
+        ),
+        "Malformed values, orphan rows, and missing issued or cleanup-pending relations are explicit fail-stop evidence; only a terminal receipt with an absent artifact family may remain post-clear NOOP.",
+    ),
+    _row(
         "9.2.IMPORT_REBUILD.01",
         FaultClass.IMPORT_REBUILD,
         "Explicit import and rebuild publish fresh canonical generations",

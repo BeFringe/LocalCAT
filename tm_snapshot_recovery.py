@@ -1692,32 +1692,17 @@ def _fsync_artifact_parent(
         parent=parent,
     )
 
-def _terminal_handoff_row_blocker(
+def _terminal_receipt_row_blocker(
     facts: _RefreshRecoveryFacts,
     receipt: IssuedReceiptFacts,
-) -> tuple[str | None, _RecoveryParentHandle | None]:
-    """Complete pre-cleanup validation of one terminal handoff row.
+) -> str | None:
+    """Validate one terminal receipt independently of handoff identity.
 
-    Returns ``(blocker_code, None)`` when the terminal receipt must not
-    be cleaned, or ``(None, parent_handle)`` when the row is safe to
-    replay with the handoff's expected parent already bound as a
-    component-safe no-follow dirfd (retained before leaving the
-    validation, so the replay never re-resolves the parent pathname for
-    destructive work).  The sweep may only run identity-bound cleanup
-    after every check passes: resource/canonical identity, a well-formed
-    receipt, exact revision ancestry and record count, the exact
-    configured-vs-arbitrary classification (configured rows must use the
-    configured JSONL+manifest pair), the deterministic manifest path and
-    full authority alias closure, a real non-symlink writable/executable
-    parent chain, and the exact immediate-parent device/inode recorded
-    in the receipt's handoff at issued registration (bound
-    component-by-component with ``O_DIRECTORY|O_NOFOLLOW`` per
-    component).  Configured rows additionally require the safe real
-    parent chain; arbitrary rows must pass ``_recovery_destination_safe``.
-    A missing legacy parent identity fails closed
-    (``RECOVERY.EXPORT_PARENT_IDENTITY_MISSING``) and a renamed/
-    replaced parent fails closed (``RECOVERY.EXPORT_PARENT_REPLACED``)
-    before any destructive cleanup; every file and handoff is preserved.
+    This is the handoff-independent prefix of terminal replay validation:
+    resource/canonical identity, receipt shape, exact ancestry/count and
+    configured-vs-arbitrary destination safety.  It is also used before
+    accepting a terminal receipt with no handoff as a legitimate
+    post-clear NOOP.
     """
 
     configured = (
@@ -1730,41 +1715,44 @@ def _terminal_handoff_row_blocker(
         or receipt.canonical_store_id != facts.canonical_store_id
     ):
         return (
-            (
-                "RECOVERY.LEDGER_IDENTITY_INVALID"
-                if configured
-                else "RECOVERY.EXPORT_LEDGER_IDENTITY_INVALID"
-            ),
-            None,
+            "RECOVERY.LEDGER_IDENTITY_INVALID"
+            if configured
+            else "RECOVERY.EXPORT_LEDGER_IDENTITY_INVALID"
         )
     try:
         receipt.receipt
     except (TypeError, ValueError):
         return (
-            (
-                "RECOVERY.LEDGER_RECEIPT_INVALID"
-                if configured
-                else "RECOVERY.EXPORT_RECEIPT_INVALID"
-            ),
-            None,
+            "RECOVERY.LEDGER_RECEIPT_INVALID"
+            if configured
+            else "RECOVERY.EXPORT_RECEIPT_INVALID"
         )
     expected_count = _record_count_at(facts, receipt.exported_revision)
     if expected_count is None or receipt.record_count != expected_count:
         return (
-            (
-                "RECOVERY.ANCESTRY_INVALID"
-                if configured
-                else "RECOVERY.EXPORT_ANCESTRY_INVALID"
-            ),
-            None,
+            "RECOVERY.ANCESTRY_INVALID"
+            if configured
+            else "RECOVERY.EXPORT_ANCESTRY_INVALID"
         )
     if configured:
         if not _parent_chain_safe(receipt.destination_jsonl_path):
-            return "RECOVERY.EXPORT_PARENT_UNSAFE", None
+            return "RECOVERY.EXPORT_PARENT_UNSAFE"
     else:
         destination_error = _recovery_destination_safe(facts, receipt)
         if destination_error is not None:
-            return destination_error, None
+            return destination_error
+    return None
+
+
+def _terminal_handoff_row_blocker(
+    facts: _RefreshRecoveryFacts,
+    receipt: IssuedReceiptFacts,
+) -> tuple[str | None, _RecoveryParentHandle | None]:
+    """Complete pre-cleanup validation and bind handoff parent authority."""
+
+    blocker = _terminal_receipt_row_blocker(facts, receipt)
+    if blocker is not None:
+        return blocker, None
     handoff = _handoff_for(facts, receipt.snapshot_id)
     identity = (
         None
@@ -1781,6 +1769,59 @@ def _terminal_handoff_row_blocker(
     except RecoveryError as error:
         return error.error_code, None
     return None, parent_handle
+
+
+def _terminal_missing_handoff_blocker(
+    facts: _RefreshRecoveryFacts,
+    receipt: IssuedReceiptFacts,
+) -> str | None:
+    """Fail closed when a terminal missing handoff still has artifacts.
+
+    A terminal receipt with no handoff is the normal state only after
+    handoff clear and when all four deterministic temp/recovery members
+    are provably absent beneath a safe current parent chain.  Any member,
+    unsafe observation, invalid receipt or destination keeps every asset
+    untouched and blocks recovery.
+    """
+
+    blocker = _terminal_receipt_row_blocker(facts, receipt)
+    if blocker is not None:
+        return blocker
+    for handoff in facts.handoffs:
+        linked = _receipt_facts_for(facts, handoff.snapshot_id)
+        if (
+            linked is not None
+            and linked.destination_jsonl_path
+            == receipt.destination_jsonl_path
+            and linked.destination_manifest_path
+            == receipt.destination_manifest_path
+        ):
+            return None
+    if _missing_handoff_artifacts_present(receipt):
+        return "RECOVERY.HANDOFF_MISSING"
+    return None
+
+
+def _missing_handoff_artifacts_present(
+    receipt: IssuedReceiptFacts,
+) -> bool:
+    """Whether any deterministic temp/recovery member is not absent."""
+
+    paths = _recovery_artifact_paths(receipt.destination_jsonl_path)
+    for artifact in (
+        paths.jsonl_temp,
+        paths.manifest_temp,
+        paths.jsonl_recovery,
+        paths.manifest_recovery,
+    ):
+        try:
+            os.lstat(artifact)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        return True
+    return False
 
 
 def _replay_terminal_handoffs(
@@ -1815,6 +1856,25 @@ def _replay_terminal_handoffs(
 
     replayed = False
     state: RefreshRecoveryState | None = None
+    handoff_ids = {handoff.snapshot_id for handoff in facts.handoffs}
+    for receipt in facts.receipts:
+        if (
+            receipt.status not in {"completed", "cancelled"}
+            or receipt.snapshot_id in handoff_ids
+        ):
+            continue
+        blocker = _terminal_missing_handoff_blocker(facts, receipt)
+        if blocker is None:
+            continue
+        per_receipt.append(
+            IssuedReceiptRecovery(
+                receipt.snapshot_id,
+                RefreshRecoveryState.BLOCKED,
+                (blocker,),
+            )
+        )
+        diagnostics.append(blocker)
+        state = RefreshRecoveryState.BLOCKED
     for handoff in facts.handoffs:
         receipt = _receipt_facts_for(facts, handoff.snapshot_id)
         if receipt is None or receipt.status not in {
@@ -1939,6 +1999,7 @@ def recover_snapshot_publication(
     overall = RefreshRecoveryState.NOOP
     read_error_code: str | None = None
     read_error_retryable = False
+    skip_export_reconcile = False
     rounds = 0
     while True:
         rounds += 1
@@ -1953,6 +2014,26 @@ def recover_snapshot_publication(
             read_error_code = error.error_code
             read_error_retryable = error.retryable
             diagnostics.append(error.error_code)
+            break
+        missing_issued_handoffs = tuple(
+            receipt
+            for receipt in facts.receipts
+            if receipt.status == "issued"
+            and _handoff_for(facts, receipt.snapshot_id) is None
+            and _missing_handoff_artifacts_present(receipt)
+        )
+        if missing_issued_handoffs:
+            for receipt in missing_issued_handoffs:
+                per_receipt.append(
+                    IssuedReceiptRecovery(
+                        receipt.snapshot_id,
+                        RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.HANDOFF_MISSING",),
+                    )
+                )
+            overall = RefreshRecoveryState.BLOCKED
+            diagnostics.append("RECOVERY.HANDOFF_MISSING")
+            skip_export_reconcile = True
             break
         if facts.divergence_latched:
             diagnostics.append("RECOVERY.DIVERGENCE_PRESERVED")
@@ -2187,7 +2268,7 @@ def recover_snapshot_publication(
             overall = RefreshRecoveryState.BLOCKED
             diagnostics.append("RECOVERY.IO_FAILED")
             break
-    if read_error_code is None:
+    if read_error_code is None and not skip_export_reconcile:
         try:
             final_facts = port.read_recovery_facts()
         except RecoveryError as error:
