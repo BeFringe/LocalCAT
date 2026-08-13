@@ -64,13 +64,20 @@ def _flatten(suite: unittest.TestSuite) -> tuple[unittest.TestCase, ...]:
 class FaultMatrixRegistryTests(unittest.TestCase):
     def test_task_9_1_registry_is_closed_and_unique(self) -> None:
         self.assertEqual(len(TASK_9_1_ROWS), 29)
-        self.assertEqual(TASK_9_2_ROWS, ())
-        self.assertEqual(FAULT_MATRIX_ROWS, TASK_9_1_ROWS)
+        self.assertTrue(all(row.task == "9.1" for row in TASK_9_1_ROWS))
+
+    def test_task_9_2_registry_is_closed_and_unique(self) -> None:
+        self.assertEqual(len(TASK_9_2_ROWS), 29)
+        self.assertTrue(all(row.task == "9.2" for row in TASK_9_2_ROWS))
+        self.assertEqual(
+            FAULT_MATRIX_ROWS,
+            TASK_9_1_ROWS + TASK_9_2_ROWS,
+        )
         row_ids = tuple(row.row_id for row in FAULT_MATRIX_ROWS)
         self.assertEqual(len(row_ids), len(set(row_ids)))
-        test_sets = tuple(row.test_ids for row in TASK_9_1_ROWS)
-        self.assertEqual(len(test_sets), len(set(test_sets)))
-        self.assertTrue(all(row.task == "9.1" for row in TASK_9_1_ROWS))
+        for task_rows in (TASK_9_1_ROWS, TASK_9_2_ROWS):
+            test_sets = tuple(row.test_ids for row in task_rows)
+            self.assertEqual(len(test_sets), len(set(test_sets)))
 
     def test_every_reference_resolves_to_one_exact_test(self) -> None:
         loader = unittest.TestLoader()
@@ -117,7 +124,7 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
         if type(registry_digest) is not str:
             raise AssertionError("registry_digest must be a string")
         self.assertIsNotNone(_SHA256.fullmatch(registry_digest))
-        self.assertEqual(evidence["tasks"], ["9.1"])
+        self.assertEqual(evidence["tasks"], ["9.1", "9.2"])
 
         raw_sources = evidence["source_files"]
         if type(raw_sources) is not list:

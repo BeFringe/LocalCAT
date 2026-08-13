@@ -478,7 +478,433 @@ TASK_9_1_ROWS: tuple[FaultMatrixRow, ...] = (
 )
 
 
-TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = ()
+TASK_9_2_ROWS: tuple[FaultMatrixRow, ...] = (
+    _row(
+        "9.2.EXPORT_CRASH.01",
+        FaultClass.EXPORT_CRASH,
+        "Crash after issued receipt cancels against the intact old pair",
+        "tm_snapshot_recovery.py:issued receipt cancellation",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_old_pair_plus_issued_cancels_receipt",
+        ),
+        "An issued receipt with the untouched old pair cancels without changing binding or canonical state.",
+    ),
+    _row(
+        "9.2.EXPORT_CRASH.02",
+        FaultClass.EXPORT_CRASH,
+        "Crash after JSONL replace reconstructs and publishes its manifest",
+        "tm_snapshot_recovery.py:JSONL-only recovery",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_crash_after_jsonl_replace_reconstructs_on_recovery",
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_process_death_after_reconstruction_temp_fsync_replays_to_completion",
+        ),
+        "Recovery completes the same snapshot from durable JSONL and handoff facts without a second export.",
+    ),
+    _row(
+        "9.2.EXPORT_CRASH.03",
+        FaultClass.EXPORT_CRASH,
+        "Crash after manifest replace completes the issued receipt",
+        "tm_snapshot_recovery.py:manifest-published recovery",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_crash_after_manifest_replace_completes_on_recovery",
+        ),
+        "A strictly matching published pair completes exactly its issued receipt.",
+    ),
+    _row(
+        "9.2.EXPORT_CRASH.04",
+        FaultClass.EXPORT_CRASH,
+        "Crash after completion commit fails closed then finishes cleanup",
+        "tm_snapshot_recovery.py:post-completion replay",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_crash_after_complete_commit_fails_closed_then_recovery_finishes",
+        ),
+        "A committed receipt is not reported complete until its durable artifact cleanup is reconciled.",
+    ),
+    _row(
+        "9.2.EXPORT_CRASH.05",
+        FaultClass.EXPORT_CRASH,
+        "Arbitrary-path export recovery never changes configured binding",
+        "tm_snapshot_recovery.py:export receipt reconciliation",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryExportTests."
+            "test_export_full_pair_completes_without_touching_binding",
+            "tests.test_tm_export.TMExportDivergenceTests."
+            "test_export_leaves_divergence_latch_and_configured_pair_unchanged",
+            "tests.test_tm_export.TMExportDivergenceTests."
+            "test_damaged_export_destination_never_affects_configured_binding",
+        ),
+        "An export destination is never promoted into configured source authority.",
+    ),
+    _row(
+        "9.2.EXPORT_CRASH.06",
+        FaultClass.EXPORT_CRASH,
+        "Export and recovery pin a revision without mutating canonical state",
+        "tm_migration.py:export read snapshot",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryCanonicalInvariantTests."
+            "test_recovery_never_changes_canonical_state",
+            "tests.test_tm_export.TMExportSnapshotIsolationTests."
+            "test_export_pins_one_stable_revision_under_concurrent_append",
+        ),
+        "Concurrent canonical writes produce a coherent exported revision and recovery never rolls canonical back.",
+    ),
+    _row(
+        "9.2.EXTERNAL_CHANGE.01",
+        FaultClass.EXTERNAL_CHANGE,
+        "External JSONL or manifest change latches divergence",
+        "tm_sqlite_store.py:source binding observation",
+        (
+            "tests.test_tm_source_binding.SourceBindingMonitorTests."
+            "test_external_jsonl_or_manifest_change_latches_divergence",
+        ),
+        "An external configured-pair change becomes SOURCE_DIVERGED and is never silently imported.",
+    ),
+    _row(
+        "9.2.EXTERNAL_CHANGE.02",
+        FaultClass.EXTERNAL_CHANGE,
+        "Ordinary canonical write creates history and cannot clear divergence",
+        "tm_sqlite_store.py:canonical revision and divergence latch",
+        (
+            "tests.test_tm_source_binding.SourceBindingMonitorTests."
+            "test_completed_binding_is_current_then_append_makes_history_only",
+            "tests.test_tm_source_binding.SourceBindingMonitorTests."
+            "test_diverged_store_remains_canonical_and_append_cannot_clear_latch",
+            "tests.test_tm_source_binding.SourceBindingMonitorTests."
+            "test_concurrent_append_during_observation_never_latches_divergence",
+        ),
+        "A local canonical append is VERIFIED_HISTORY, while an existing divergence remains latched.",
+    ),
+    _row(
+        "9.2.MISMATCH.01",
+        FaultClass.MISMATCH,
+        "Receipt, binding, ledger, or ancestry mismatch diverges",
+        "tm_snapshot_recovery.py:configured receipt adjudication",
+        (
+            "tests.test_tm_source_binding.SourceBindingMonitorTests."
+            "test_ledger_identity_digest_and_ancestry_mismatch_diverge",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_ancestry_invalid_receipt_latches_divergence",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_binding_tamper_never_cancels_old_pair",
+        ),
+        "Recovery cannot complete or cancel from mismatched authority facts.",
+    ),
+    _row(
+        "9.2.MISMATCH.02",
+        FaultClass.MISMATCH,
+        "Foreign, missing, symlinked, hardlinked, or directory pair diverges",
+        "tm_snapshot_recovery.py:configured pair proof",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_foreign_manifest_latches_divergence",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_missing_pair_latches_divergence",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_symlink_pair_latches_divergence",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_hardlink_pair_latches_divergence",
+            "tests.test_tm_snapshot_recovery.TMRecoveryConfiguredDecisionTests."
+            "test_directory_manifest_latches_divergence",
+        ),
+        "Only regular single-link files with the issued identities can form a configured pair.",
+    ),
+    _row(
+        "9.2.MISMATCH.03",
+        FaultClass.MISMATCH,
+        "Export ledger enforces ancestry and immutable completion history",
+        "tm_sqlite_store.py:export receipt ledger",
+        (
+            "tests.test_tm_export.TMExportLedgerTests."
+            "test_receipt_revision_ancestry_enforced",
+            "tests.test_tm_export.TMExportLedgerTests."
+            "test_completed_export_history_is_immutable",
+            "tests.test_tm_export.TMExportLedgerTests."
+            "test_stale_and_generation_transitions_rejected",
+        ),
+        "A completed export receipt cannot be rebound to another revision, path, or generation.",
+    ),
+    _row(
+        "9.2.IMPORT_REBUILD.01",
+        FaultClass.IMPORT_REBUILD,
+        "Explicit import and rebuild publish fresh canonical generations",
+        "tm_migration.py:explicit import/rebuild",
+        (
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportRebuildSuccessTests."
+            "test_import_and_rebuild_replace_the_active_canonical",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportRebuildSuccessTests."
+            "test_identical_snapshot_import_twice_succeeds_with_new_ids",
+        ),
+        "Each verified explicit disambiguation uses the normal sealed activation path and a fresh store identity.",
+    ),
+    _row(
+        "9.2.IMPORT_REBUILD.02",
+        FaultClass.IMPORT_REBUILD,
+        "Import validation, seal, and publication failure preserve three assets",
+        "tm_migration.py:explicit import failure reconciliation",
+        (
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportValidationTests."
+            "test_validation_failures_never_mutate",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportValidationTests."
+            "test_seal_failure_removes_exactly_the_fresh_stage_pair",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportPublicationFailureTests."
+            "test_db_replace_failure_auto_restores_ready_old_service",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportPublicationFailureTests."
+            "test_manifest_publish_failure_auto_restores_ready_old_service",
+        ),
+        "Failed disambiguation preserves configured JSONL, active canonical, and matching manifest/binding.",
+    ),
+    _row(
+        "9.2.IMPORT_REBUILD.03",
+        FaultClass.IMPORT_REBUILD,
+        "Only successful verified activation clears divergence",
+        "tm_migration.py:divergence disambiguation",
+        (
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportManifestDivergenceTests."
+            "test_missing_prior_manifest_import_succeeds",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportManifestDivergenceTests."
+            "test_missing_prior_manifest_failure_preserves_absence",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportManifestDivergenceTests."
+            "test_externally_altered_manifest_failure_preserves_bytes",
+            "tests.test_tm_explicit_import_rebuild.ExplicitImportManifestDivergenceTests."
+            "test_foreign_manifest_entries_fail_closed",
+        ),
+        "Divergence clears only after a complete explicit import/rebuild publishes one new authority set.",
+    ),
+    _row(
+        "9.2.SCHEMA_UPGRADE.01",
+        FaultClass.SCHEMA_UPGRADE,
+        "Upgrade copy, seal, journal, or publication failure keeps old READY schema",
+        "tm_schema_upgrade.py:upgrade failure reconciliation",
+        (
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailureReconciliationTests."
+            "test_copy_failure_removes_owned_backup_and_keeps_old_schema",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailureReconciliationTests."
+            "test_seal_failure_keeps_old_schema_and_ready_service",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailureReconciliationTests."
+            "test_journal_write_failure_cancels_and_restores_ready",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailureReconciliationTests."
+            "test_db_replace_failure_auto_restores_ready_old_service",
+        ),
+        "Before durable completion every upgrade failure restores the prior schema and service authority.",
+    ),
+    _row(
+        "9.2.SCHEMA_UPGRADE.02",
+        FaultClass.SCHEMA_UPGRADE,
+        "Upgrade crash-window replay completes the exact durable candidate",
+        "tm_schema_upgrade.py:upgrade backup locator replay",
+        (
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailureReconciliationTests."
+            "test_crash_window_recovery_completes_durable_upgrade",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeRecoveryLocatorStrictnessTests."
+            "test_crash_after_publish_cold_recovery_promotes_exactly_one_backup",
+        ),
+        "Cold recovery promotes only the identity-bound reported upgrade backup and completes one generation.",
+    ),
+    _row(
+        "9.2.SCHEMA_UPGRADE.03",
+        FaultClass.SCHEMA_UPGRADE,
+        "Upgrade rejects tampered, missing, symlinked, or multilink authority",
+        "tm_schema_upgrade.py:old-store and manifest proof",
+        (
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailClosedTests."
+            "test_tampered_old_store_fails_closed",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailClosedTests."
+            "test_missing_manifest_fails_closed_and_is_never_repaired",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailClosedTests."
+            "test_symlink_manifest_fails_closed_and_is_never_repaired",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailClosedTests."
+            "test_multilink_manifest_fails_closed_and_is_never_repaired",
+            "tests.test_tm_schema_upgrade.SchemaUpgradeFailClosedTests."
+            "test_mismatched_source_digest_fails_closed_and_is_never_repaired",
+        ),
+        "Schema upgrade cannot repair or overwrite an authority set it cannot prove.",
+    ),
+    _row(
+        "9.2.REFRESH_RECOVERY.01",
+        FaultClass.REFRESH_RECOVERY,
+        "Refresh recovery survives copy, handoff, and temp-fsync crash windows",
+        "tm_snapshot_recovery.py:configured refresh crash replay",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_crash_after_recovery_copies_cancels_owned",
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_crash_before_recovery_handoff_preserves_copies",
+            "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests."
+            "test_observe_recovers_before_misclassifying_divergence",
+            "tests.test_tm_snapshot_refresh.TMRefreshFailureInjectionTests."
+            "test_failure_injection_restores_pair_and_cancels_ledger",
+        ),
+        "Issued refresh recovery completes, cancels, or diverges from durable artifact facts before observation.",
+    ),
+    _row(
+        "9.2.REFRESH_RECOVERY.02",
+        FaultClass.REFRESH_RECOVERY,
+        "Refresh publishes one complete pair and VERIFIED_CURRENT binding",
+        "tm_migration.py:configured snapshot refresh",
+        (
+            "tests.test_tm_snapshot_refresh.TMRefreshSuccessTests."
+            "test_refresh_publishes_complete_pair_and_reports_verified_current",
+            "tests.test_tm_snapshot_refresh.TMRefreshSuccessTests."
+            "test_refresh_ledger_and_binding_share_same_completed_receipt",
+            "tests.test_tm_snapshot_refresh.TMRefreshSuccessTests."
+            "test_refresh_publication_order_jsonl_before_manifest",
+            "tests.test_tm_snapshot_refresh.TMRefreshSuccessTests."
+            "test_refresh_pins_stable_snapshot_under_concurrent_append",
+        ),
+        "JSONL, manifest, receipt, and binding close over one revision without changing generation.",
+    ),
+    _row(
+        "9.2.REFRESH_RECOVERY.03",
+        FaultClass.REFRESH_RECOVERY,
+        "Refresh while diverged has zero side effects",
+        "tm_migration.py:refresh divergence gate",
+        (
+            "tests.test_tm_snapshot_refresh.TMRefreshDivergenceTests."
+            "test_refresh_rejected_when_diverged_with_zero_side_effects",
+        ),
+        "A latched divergence requires explicit import/rebuild and cannot be cleared by refresh.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.01",
+        FaultClass.MUTATION_PROOF,
+        "Ancestor symlink and direct-parent rename or ABA block mutation",
+        "tm_snapshot_artifacts.py:root-to-parent descriptor binding",
+        (
+            "tests.test_tm_export.TMExportPreflightTests."
+            "test_export_bind_ancestor_symlink_swap_fails_closed",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_store_clear_parent_renamed_with_foreign_temp_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_export_reconcile_parent_renamed_with_owned_temp_moved_blocks",
+        ),
+        "A path string cannot authorize mutation after any bound ancestor or direct parent changes identity.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.02",
+        FaultClass.MUTATION_PROOF,
+        "Parent replacement or symlink after blocker or fsync fails closed",
+        "tm_snapshot_recovery.py:terminal parent revalidation",
+        (
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_terminal_replay_parent_replaced_after_blocker_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_terminal_replay_parent_replaced_between_fsync_and_clear_blocks",
+        ),
+        "Terminal cleanup keeps handoff evidence when the bound parent changes before release.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.03",
+        FaultClass.MUTATION_PROOF,
+        "Source inode swap at the pre-mutation seam fails closed",
+        "tm_snapshot_artifacts.py:source proof before replace",
+        (
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_source_swap_at_pre_mutation_seam_fails_closed",
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_hostile_swap_during_restore_fails_closed_with_locator",
+        ),
+        "Only the exact handed-off source inode may be moved, restored, or cleaned.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.04",
+        FaultClass.MUTATION_PROOF,
+        "Destination inode swap at the pre-mutation seam is never overwritten",
+        "tm_snapshot_artifacts.py:destination proof before replace",
+        (
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_destination_swap_at_pre_mutation_seam_fails_closed",
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_foreign_destination_created_at_replace_is_not_overwritten",
+        ),
+        "A foreign final created after the last absence or identity proof survives unchanged.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.05",
+        FaultClass.MUTATION_PROOF,
+        "Same-byte foreign inode swap after proof is rejected",
+        "tm_snapshot_artifacts.py:terminal identity proof",
+        (
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_same_bytes_swap_before_identity_proof_is_not_overwritten",
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_same_byte_foreign_swap_at_completion_seam_fails_closed",
+            "tests.test_tm_snapshot_refresh.TMRefreshHostileSwapTests."
+            "test_same_bytes_foreign_swap_at_identity_proof_fails_closed",
+            "tests.test_tm_stage_sealer.StageSealerIdentitySwapTests."
+            "test_byte_identical_db_inode_swap_before_registration_denied",
+        ),
+        "Matching bytes never substitute for durable inode ownership and a fresh terminal proof.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.06",
+        FaultClass.MUTATION_PROOF,
+        "Different-byte or missing handed-off temp/recovery blocks replay",
+        "tm_snapshot_recovery.py:durable handoff artifact proof",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_terminal_replay_different_byte_foreign_temp_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_terminal_replay_different_byte_foreign_recovery_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_missing_handed_off_manifest_temp_blocks_closed",
+        ),
+        "Missing or content-drifted durable handoff members remain for manual recovery and are never fabricated.",
+    ),
+    _row(
+        "9.2.MUTATION_PROOF.07",
+        FaultClass.MUTATION_PROOF,
+        "Symlink, hardlink, multilink, dotdot, and authority aliases are rejected",
+        "tm_snapshot_artifacts.py:namespace safety",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryExportTests."
+            "test_export_destination_parent_symlink_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMRecoveryExportTests."
+            "test_export_destination_dotdot_blocks_closed",
+            "tests.test_tm_snapshot_recovery.TMRecoveryExportTests."
+            "test_export_destination_authority_alias_blocks_closed",
+            "tests.test_tm_activation_cluster_d_corrections.ActivationSingleLinkClosureTests."
+            "test_hardlinked_source_denies_first_activation",
+        ),
+        "Snapshot and activation mutations require direct regular single-link files outside authority aliases.",
+    ),
+    _row(
+        "9.2.TERMINAL_REPLAY.01",
+        FaultClass.TERMINAL_REPLAY,
+        "Terminal replay is idempotent across fresh stores and cleanup retries",
+        "tm_snapshot_recovery.py:terminal handoff replay",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryIdempotencyTests."
+            "test_repeated_recovery_is_idempotent",
+            "tests.test_tm_snapshot_recovery.TMRecoveryIdempotencyTests."
+            "test_fresh_store_replay_reaches_same_durable_state",
+            "tests.test_tm_snapshot_recovery.TMClusterFRegressionTests."
+            "test_terminal_handoff_replay_cleans_and_releases",
+        ),
+        "Repeated replay converges on the same receipt, binding, pair, and released handoff state.",
+    ),
+    _row(
+        "9.2.FOREIGN_INODE.01",
+        FaultClass.FOREIGN_INODE,
+        "Foreign temp, recovery, manifest, and final inodes are never deleted or overwritten",
+        "tm_snapshot_artifacts.py:identity-bound cleanup",
+        (
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_foreign_temp_never_deleted",
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_foreign_recovery_copy_never_deleted",
+            "tests.test_tm_snapshot_recovery.TMRecoveryArtifactSafetyTests."
+            "test_foreign_manifest_temp_blocks_reconstruction",
+            "tests.test_tm_export.TMExportFailureInjectionTests."
+            "test_foreign_manifest_created_at_replace_is_not_overwritten",
+        ),
+        "Cleanup and publication mutate only the exact inode recorded by their durable ownership proof.",
+    ),
+)
 FAULT_MATRIX_ROWS = TASK_9_1_ROWS + TASK_9_2_ROWS
 
 
