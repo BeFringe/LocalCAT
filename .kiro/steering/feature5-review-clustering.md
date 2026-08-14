@@ -1,4 +1,4 @@
-# Feature 5 评审集群与推理强度指南（采纳稿 v13）
+# Feature 5 评审集群与推理强度指南（采纳稿 v14）
 
 本文件为 `tm-storage-retrieval-index` 剩余实施（Task 3.3–9.6）提供评审打包策略与 subagent 推理强度约束。受众是执行 Feature 5 的主 agent 及其 dispatch 的实施/复审 subagent。
 
@@ -56,7 +56,7 @@
 | J — Benchmark subsystem | 8.1 + 8.2 + 8.3 + 8.4 + 8.5 | 确定性语料 → latency/process/oracle 三个 evidence owner → 双路径硬门 | `medium` | `high` | 1 | 大 |
 | K — Fault injection | 9.1 + 9.2 | 全量迁移/激活/快照故障矩阵，验证 D+F+E 的负空间 | `high` | `xhigh` | 1 | 中 |
 | L — Evidence baseline | 9.3 + 9.4 | 跨域能力矩阵 + 兼容与架构回归；其源码身份会由补救实现刷新 | `medium` | 并入 O | 0 | 中 |
-| M — Candidate proof + latency | 8.6 + 8.7（重开） | scorer 安全上界 + proof index → exact-fold 等价类预算 + sparse/dense proof traversal → 资源级预算耗尽 | `xhigh` | `xhigh` | 2（第 2 轮待执行） | 大 |
+| M — Candidate proof + latency | 8.6 + 8.7（重开） | scorer 安全上界 + proof index → exact-fold 等价类预算 + sparse/two-phase refinement proof → 资源级预算耗尽 | `xhigh` | `xhigh` | 2（第 2 轮待执行） | 大 |
 | N — Migration attestation | 8.8 | sealed/active 内容证明链 + 保留全部耐久阶段的重复扫描压缩 | `xhigh` | `xhigh` | 1 | 大 |
 | O — Gate D + release refresh | 8.9 + 9.5 + 9.6 | fresh oracle/100k 双路径硬门 → 证据身份刷新 → 86 条映射与完整发布 | `medium` | `xhigh` | 1 | 大 |
 
@@ -93,7 +93,7 @@
 
 **L — Evidence baseline：** 9.3/9.4 已闭合矩阵 owner、兼容回归与架构守卫，但 M/N 会改变它们绑定的生产源码身份。保留已提交实现和诚实证据，不为即将失效的 digest 单独复审；O 必须从 owner 重新生成而非手改摘要，并对刷新后的累计事实做一次 final review。
 
-**M — Candidate proof + latency：** Task 8.4/8.5 的诚实 NO-GO 证明 overlap preorder 只是启发式，不能授权 scorer-v1 的 threshold 全集或无阈值 top-k。M 冻结字符/bigram multiset 与 block summary 的保守上界，在单一 generation view 内让 CandidateRetriever 与真实 scorer 以小批量交替推进；只有 threshold 与第 k 名的未评分上界同时闭合才可返回。Task 8.9 首轮真实 100k 又证明两项实现假设错误：budget 限制的是真实 scorer 调用而非 record identity，且独立 term maxima 会让 94% 以上 block 保持可能命中，逐 block 连接/事务/count 复证无法满足 500 ms。重开后的 proof-query-v2 只允许 Retrieval 从完整 `fold-v1` 相等建立 scorer 等价类，分开守恒 invocation/accounted/unscored identity；稀疏路径保留 block best-first，密集路径以一次 read transaction 从既有 record/gram 生成 exact frontier并在 scorer 前提交，最后复核 generation/head。固定 8,192 窗口、调权、放宽 threshold/top-k、oracle identity 或调用方等价类都不是证明。上界低估、双域计数不守恒或 2,048 scorer 调用耗尽必须资源级 fail-closed，因此第 2 轮实施与复审继续使用原生 `xhigh`；未增加持久 schema，Cluster N 不重开。
+**M — Candidate proof + latency：** Task 8.4/8.5 的诚实 NO-GO 证明 overlap preorder 只是启发式，不能授权 scorer-v1 的 threshold 全集或无阈值 top-k。M 冻结字符/bigram multiset 与 block summary 的保守上界，在单一 generation view 内让 CandidateRetriever 与真实 scorer 以小批量交替推进；只有 threshold 与第 k 名的未评分上界同时闭合才可返回。Task 8.9 首轮真实 100k 又证明两项实现假设错误：budget 限制的是真实 scorer 调用而非 record identity，且独立 term maxima 会让 94% 以上 block 保持可能命中，逐 block 连接/事务/count 复证无法满足 500 ms。v13 的单事务 exact frontier 虽恢复正确性，却在 query 61 的 20 倍重复源规模上仍有约 563–916 ms warm latency，证明全量字符/bigram 聚合不是可发布的密集路径。v14 保留 sparse block best-first，并把密集路径改为严格两阶段：phase 1 用长度与精确 bigram 得到 `U1` 并建立真实 `K0`，session 由 threshold/kth 双义务派生唯一精化集 `R`，phase 2 在同一 generation/head/query binding 下只为 `R` 取得字符事实并形成 `U2`；最终以 `真实分数<=U2<=U1`、`A0/P1/R/A1/P2` 双重守恒和混合 frontier 同时闭合 threshold/top-k。两个只读事务都在 scorer 前提交，phase 间及 scorer 期间漂移一律 fail-closed；bigram/component heuristic、固定窗口、调权、放宽 threshold/top-k、oracle identity 或调用方等价类都不是证明。第 2 轮实施与复审继续使用原生 `xhigh`；未增加持久 schema，Cluster N 保持闭合，O 仍阻塞到 M 重新通过。
 
 **N — Migration attestation：** 性能剖析表明主要成本来自同一 sealed/active 内容在 build、seal、Gate B、activate 和 reopen 间重复展开语义扫描。N 只把“后来有没有变”从重复语义证明改为完整 SHA-256 + inode + phase attestation；首次 sealed 校验、激活写入后的 active-set 校验、两次 Gate B、drain、replace、fsync、四阶段 journal、reopen 和 cold recovery全部保留。same-inode mutation、同字节换 inode、attestation 缺失/损坏/过期继续 fail-stop，故独立 `xhigh` 复审，不与候选算法复审混合。
 
@@ -174,6 +174,7 @@ Task 3.2 的 raw exact、variant history 和 SQLite transaction 主路径较早�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v14 | 2026-08-14 | v13 的 scorer-call/identity 语义修复通过，但真实 query 61 证明单事务全量字符/bigram exact frontier 仍无法为 500 ms Gate D 留出裕量；Cluster M 改用现有 schema 上可证明的 `U1→K0→R→U2` 两阶段精化，冻结跨事务 binding、双分区守恒、混合 frontier 与 20-sample cheap gate，不改变 scorer、预算、语料、threshold/top-k 或硬门，N 保持闭合、O 继续等待。 |
 | v13 | 2026-08-14 | Task 8.9 首轮真实 100k 在 query 61 稳定暴露 identity 计数误占 scorer budget，并以 query 1/61 的 94%+ block 打开率证明逐 block traversal 无法满足 latency gate；在不改 scorer/budget/corpus/threshold/top-k/硬门且不增持久 schema 的前提下重开 M，加入 exact-fold scorer 等价类、invocation/accounted identity 双域守恒与 sparse/dense set-based proof-query-v2，O 暂停至 M 第 2 轮复审闭合。 |
 | v12 | 2026-08-13 | Task 8.5 的诚实 Gate D 失败暴露 overlap 截断无 scorer 完备性证明、全量 union 物化与 sealed/active 重复语义扫描三类根因；新增 M/N/O，固定 proof-or-fail-closed、内容 attestation 与证据刷新边界，不改变既有 86 条需求、scorer/budget/corpus/硬门或耐久阶段。同步修正标题版本与历史最高版本不一致。 |
 | v11 | 2026-08-13 | Task 8.4 暴露调用方派生 oracle 事实自授权风险，Task 8.5 预审又确认 migration child 不能跨进程交付 store handle；因此增加 artifact-identity-bound query child 与 portable evidence bundle 不发布临时路径/PID 的闭合门，保持 Cluster J 边界、强度和硬门不变。 |
