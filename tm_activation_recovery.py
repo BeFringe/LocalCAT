@@ -919,7 +919,7 @@ def _publish_activation_receipt(
     next_generation: int,
     activation_digest: str,
 ) -> str:
-    """Durably complete the receipt and return its owner-proven closure."""
+    """Prove SEALED, durably complete its receipt, and return ACTIVE closure."""
 
     evidence = preparation._sealed_stage.evidence
     binding = evidence.source_binding
@@ -980,6 +980,19 @@ def _publish_activation_receipt(
                     "SELECT COUNT(*) FROM tm_snapshot_binding"
                 ).fetchone() != (0,):
                     raise port.store_schema_error("STORE.BINDING_INVALID")
+                (
+                    _sealed_logical_closure_digest,
+                    pre_activation_closure_digest,
+                ) = port.active_transition_closure_digests(connection)
+                if (
+                    pre_activation_closure_digest
+                    != record.sealed_content_attestation.semantic_facts
+                    .logical_closure_digest
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+                        retryable=False,
+                    )
                 updated = connection.execute(
                     "UPDATE tm_snapshot_receipt SET status = 'completed' "
                     "WHERE snapshot_id = ? AND status = 'issued'",
@@ -2549,9 +2562,10 @@ def _complete_recovered_receipt(
     one transaction (receipt completed, binding inserted, ACTIVE, generation,
     activation digest); an already ACTIVE database whose completed
     receipt/binding and meta exactly match the journal is accepted without
-    rewriting.  Both branches derive the expected active logical closure as
-    the final read under the owner write lock, then fsync and revalidate the
-    database identity.
+    rewriting.  The SEALED branch first reconstructs and proves the exact
+    pre-activation logical closure under the owner write lock, then both
+    branches derive the expected active logical closure before commit, fsync,
+    and database-identity revalidation.
     """
 
     canonical_capture = _capture_journal_closure_file(
@@ -2603,6 +2617,19 @@ def _complete_recovered_receipt(
                     ):
                         raise port.store_schema_error(
                             "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    (
+                        _sealed_logical_closure_digest,
+                        pre_activation_closure_digest,
+                    ) = port.active_transition_closure_digests(connection)
+                    if (
+                        pre_activation_closure_digest
+                        != record.sealed_content_attestation.semantic_facts
+                        .logical_closure_digest
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                            retryable=False,
                         )
                     updated = connection.execute(
                         "UPDATE tm_snapshot_receipt SET status = "

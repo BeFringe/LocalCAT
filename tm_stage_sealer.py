@@ -761,12 +761,13 @@ def _stage_closure_digest(connection: sqlite3.Connection) -> str:
 def _active_transition_closure_digests(
     connection: sqlite3.Connection,
 ) -> tuple[str, str]:
-    """Return ACTIVE and reconstructed pre-activation closures in one pass.
+    """Return current and reconstructed pre-activation closures in one pass.
 
-    Receipt publication changes only deterministic ledger/meta rows.  Cold
-    DB_REPLACED recovery uses the reconstructed digest to prove all other
-    rows still close the sealed attestation before accepting the current
-    ACTIVE digest as the receipt owner's expectation.
+    Receipt publication changes only deterministic ledger/meta rows.  The
+    normal and cold SEALED owners reconstruct the pre-activation digest under
+    their write lock before changing those rows; cold ACTIVE recovery uses the
+    same reconstruction before accepting the current digest as the receipt
+    owner's expectation.
     """
 
     active, pre_activation = _stage_closure_digests(

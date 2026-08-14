@@ -426,6 +426,128 @@ class ActivationRecoveryCancelTests(unittest.TestCase):
 
 
 class ActivationRecoveryCompletionTests(unittest.TestCase):
+    def test_cold_sealed_owner_rejects_same_inode_mutation_before_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, coordinator, _sealed, prepared, journal = (
+                _first_prepared(root)
+            )
+            journal_path = journal.journal_path
+            with patch(
+                "tm_activation_recovery._publish_activation_receipt",
+                side_effect=OSError("injected"),
+            ):
+                with self.assertRaises(OSError):
+                    coordinator.publish_activation(prepared, journal)
+            self.assertIs(_phase(journal_path), DB_REPLACED)
+            journal_bytes = journal_path.read_bytes()
+            source_bytes = identity.configured_jsonl_path.read_bytes()
+            real_complete_receipt = recovery_module._complete_recovered_receipt
+            real_capture = recovery_module._capture_journal_closure_file
+            captured_identity: tuple[int, int] | None = None
+            mutation_injected = False
+
+            def complete_across_mutation_window(
+                *args: Any,
+                **kwargs: Any,
+            ) -> str:
+                def capture_then_mutate(
+                    path: Path,
+                ) -> tuple[Any, str]:
+                    nonlocal captured_identity, mutation_injected
+                    capture = real_capture(path)
+                    self.assertEqual(path, identity.canonical_sidecar_path)
+                    captured_identity = (
+                        capture[0].device,
+                        capture[0].inode,
+                    )
+                    connection = sqlite3.connect(path)
+                    try:
+                        connection.execute(
+                            "UPDATE tm_record SET context_next_raw = ? "
+                            "WHERE record_id = (SELECT MIN(record_id) "
+                            "FROM tm_record)",
+                            ("pre-lock-context-tamper",),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    observed = os.lstat(path)
+                    self.assertEqual(
+                        (observed.st_dev, observed.st_ino),
+                        captured_identity,
+                    )
+                    mutation_injected = True
+                    return capture
+
+                with patch(
+                    "tm_activation_recovery._capture_journal_closure_file",
+                    side_effect=capture_then_mutate,
+                ):
+                    return real_complete_receipt(*args, **kwargs)
+
+            recovered = _fresh(identity)
+            with patch(
+                "tm_activation_recovery._complete_recovered_receipt",
+                side_effect=complete_across_mutation_window,
+            ):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    recovered.recover_durable_activation()
+
+            self.assertTrue(mutation_injected)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(journal_path.read_bytes(), journal_bytes)
+            disk_record = _parse_activation_journal_bytes(
+                journal_bytes,
+                expected_journal_path=journal_path,
+            )
+            self.assertIs(disk_record.phase, DB_REPLACED)
+            self.assertIsNone(disk_record.active_content_attestation)
+            observed = os.lstat(identity.canonical_sidecar_path)
+            self.assertEqual(
+                (observed.st_dev, observed.st_ino),
+                captured_identity,
+            )
+            connection = sqlite3.connect(identity.canonical_sidecar_path)
+            try:
+                meta = _meta(connection)
+                self.assertEqual(meta["activation_status"], "SEALED")
+                self.assertEqual(meta["generation"], "0")
+                self.assertNotIn("activation_digest", meta)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM tm_snapshot_receipt"
+                    ).fetchall(),
+                    [("issued",)],
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_binding"
+                    ).fetchone(),
+                    (0,),
+                )
+            finally:
+                connection.close()
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertTrue(
+                journal._record.candidate_manifest_temp_path.is_file()
+            )
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertFalse(
+                store_module._activation_terminal_path(identity).exists()
+            )
+
     def test_cold_active_receipt_rejects_prior_window_semantic_mutation(
         self,
     ) -> None:
