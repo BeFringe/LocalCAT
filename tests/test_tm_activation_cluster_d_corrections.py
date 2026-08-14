@@ -325,19 +325,19 @@ class ActivationSingleLinkClosureTests(unittest.TestCase):
                 canonical_store_id="store.primary",
                 resource_identity=identity,
             )
-            _stage, sealed = _candidate(
-                coordinator,
-                identity,
-                fts5_available=True,
-                expected_prior_generation=None,
-            )
-            with self.assertRaises(ActivationPreparationError) as raised:
-                coordinator.activate(sealed)
+            from tm_stage_sealer import StageSealError
+
+            with self.assertRaises(StageSealError) as raised:
+                _candidate(
+                    coordinator,
+                    identity,
+                    fts5_available=True,
+                    expected_prior_generation=None,
+                )
             self.assertEqual(
-                raised.exception.code,
-                "ACTIVATION.PRIOR_ASSET_INVALID",
+                raised.exception.error_code,
+                "SEALER.ATTESTATION_FAILED",
             )
-            self.assertFalse(raised.exception.retryable)
             self.assertEqual(coordinator.state, "READY")
             self.assertFalse(
                 _activation_journal_path(identity).exists()

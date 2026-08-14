@@ -3345,15 +3345,6 @@ class TMMigrationService:
                 stage.manifest_temp_path,
                 contract_to_json(manifest).encode("utf-8"),
             )
-            _validate_reusable_stage(
-                stage,
-                canonical_store_id=canonical_store_id,
-                preflight=preflight,
-                batch_kind=batch_kind,
-                batch_prefix=batch_prefix,
-                snapshot_prefix=snapshot_prefix,
-                batch_id=batch_id,
-            )
         except BaseException:
             if manifest_identity is not None:
                 _remove_created_file(

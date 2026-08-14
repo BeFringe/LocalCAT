@@ -24,8 +24,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 from typing import Any, cast
@@ -33,6 +35,7 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+import tm_activation_recovery as recovery_module
 import tm_sqlite_store as store_module
 from tests.test_tm_activation_journal import (
     SOURCE_BYTES,
@@ -113,14 +116,20 @@ def _rewrite_phase(
     journal_path: Path,
     phase: _ActivationJournalPhase,
 ) -> None:
-    """Rewrite one valid journal with a new phase and a fresh digest."""
+    """Rewrite raw phase bytes with a valid envelope digest."""
 
-    record = _parse_activation_journal_bytes(
-        journal_path.read_bytes(),
-        expected_journal_path=journal_path,
-    )
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    payload["phase"] = phase.value
+    payload.pop("record_digest")
+    payload["record_digest"] = contract_module._stable_digest(payload)
     journal_path.write_text(
-        _serialize_activation_journal_record(replace(record, phase=phase)),
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
@@ -417,6 +426,44 @@ class ActivationRecoveryCancelTests(unittest.TestCase):
 
 
 class ActivationRecoveryCompletionTests(unittest.TestCase):
+    def test_db_replaced_builds_active_attestation_once_then_cold_reuses(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, coordinator, _sealed, prepared, journal = (
+                _first_prepared(Path(temporary))
+            )
+            with patch(
+                "tm_activation_recovery._publish_activation_receipt",
+                side_effect=OSError("injected"),
+            ):
+                with self.assertRaises(OSError):
+                    coordinator.publish_activation(prepared, journal)
+            self.assertIs(_phase(journal.journal_path), DB_REPLACED)
+
+            real_validate = recovery_module._validate_published_activation_set
+            recovered = _fresh(identity)
+            with patch(
+                "tm_activation_recovery._validate_published_activation_set",
+                wraps=real_validate,
+            ) as validate:
+                report = recovered.recover_durable_activation()
+            self.assertIsNotNone(report)
+            self.assertEqual(validate.call_count, 1)
+
+            second = _fresh(identity)
+            with patch(
+                "tm_activation_recovery._validate_published_activation_set",
+                side_effect=AssertionError(
+                    "terminal replay must reuse active attestation"
+                ),
+            ):
+                replay = second.recover_durable_activation()
+            self.assertIsNotNone(replay)
+            assert replay is not None
+            self.assertEqual(replay.action, "COMPLETED")
+            self.assertEqual(second.current_generation, 0)
+
     def test_first_activation_db_replaced_recovery_publishes_one_generation(
         self,
     ) -> None:
@@ -1827,22 +1874,15 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
             )
 
             with self.subTest(kind="wrong-terminal-kind"):
-                terminal_path.write_text(
-                    _serialize_activation_journal_record(
-                        replace(
-                            terminal_record,
-                            phase=PREPARED,
-                        )
-                    ),
-                    encoding="utf-8",
-                )
+                terminal_path.write_bytes(journal_path.read_bytes())
+                _rewrite_phase(terminal_path, PREPARED)
                 tampered_bytes = terminal_path.read_bytes()
                 fresh = _fresh(identity)
                 with self.assertRaises(ActivationPreparationError) as raised:
                     fresh.recover_durable_activation()
                 self.assertEqual(
                     raised.exception.code,
-                    "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
+                    "ACTIVATION.RECOVERY_TERMINAL_INVALID",
                 )
                 self.assertFalse(raised.exception.retryable)
                 self.assertEqual(terminal_path.read_bytes(), tampered_bytes)
@@ -2240,6 +2280,65 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
 
 
 class ActivationRecoveryFailStopTests(unittest.TestCase):
+    def test_terminal_active_attestation_rejects_bytes_and_inode_drift(
+        self,
+    ) -> None:
+        for mutation in ("same_inode_bytes", "same_bytes_new_inode"):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    identity, coordinator, _sealed, prepared, journal = (
+                        _first_prepared(Path(temporary))
+                    )
+                    coordinator.publish_activation(prepared, journal)
+                    source_bytes = identity.configured_jsonl_path.read_bytes()
+                    if mutation == "same_inode_bytes":
+                        connection = sqlite3.connect(
+                            identity.canonical_sidecar_path
+                        )
+                        try:
+                            connection.execute("PRAGMA user_version=99")
+                            connection.commit()
+                        finally:
+                            connection.close()
+                    else:
+                        replacement = identity.canonical_sidecar_path.with_name(
+                            ".same-bytes-replacement"
+                        )
+                        shutil.copyfile(
+                            identity.canonical_sidecar_path,
+                            replacement,
+                        )
+                        os.replace(
+                            replacement,
+                            identity.canonical_sidecar_path,
+                        )
+
+                    recovered = _fresh(identity)
+                    if mutation == "same_inode_bytes":
+                        report = _recovered_report(recovered)
+                        self.assertEqual(report.action, "ROLLED_BACK")
+                        self.assertIsNone(recovered.current_generation)
+                        self.assertFalse(
+                            identity.canonical_sidecar_path.exists()
+                        )
+                    else:
+                        with self.assertRaises(
+                            ActivationPreparationError
+                        ) as raised:
+                            recovered.recover_durable_activation()
+                        self.assertEqual(
+                            raised.exception.code,
+                            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                        )
+                        self.assertTrue(
+                            identity.canonical_sidecar_path.exists()
+                        )
+                        self.assertTrue(journal.journal_path.exists())
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        source_bytes,
+                    )
+
     def _assert_fail_stop(
         self,
         recovered: ResourceStoreCoordinator,
@@ -2262,13 +2361,17 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 root
             )
             journal_path = journal.journal_path
-            record = _parse_activation_journal_bytes(
-                journal_path.read_bytes(),
-                expected_journal_path=journal_path,
-            )
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            payload["stage_db_digest"] = "0" * 64
+            payload.pop("record_digest")
+            payload["record_digest"] = contract_module._stable_digest(payload)
             journal_path.write_text(
-                _serialize_activation_journal_record(
-                    replace(record, stage_db_digest="0" * 64)
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
                 ),
                 encoding="utf-8",
             )
@@ -2277,7 +2380,7 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             self._assert_fail_stop(
                 recovered,
                 journal_path,
-                "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
                 tampered,
             )
             self.assertFalse(identity.canonical_sidecar_path.exists())
@@ -2349,13 +2452,11 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             _rewrite_phase(journal_path, GENERATION_PUBLISHED)
             source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
             self.assertEqual(
-                _recovered_report(recovered),
-                ActivationRecoveryReport(
-                    phase="GENERATION_PUBLISHED",
-                    action="ROLLED_BACK",
-                    generation=None,
-                ),
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
             )
             self.assertIsNone(recovered.current_generation)
             self.assertEqual(
@@ -2363,15 +2464,9 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 source_bytes,
             )
             self.assertFalse(identity.canonical_sidecar_path.exists())
-            self.assertFalse(journal_path.exists())
-            self.assertTrue(
-                store_module._activation_terminal_path(identity).is_file()
-            )
-            again = _fresh(identity)
-            self.assertIsNone(again.rollback_durable_activation())
-            self.assertEqual(
-                again.recover_durable_activation(),
-                None,
+            self.assertTrue(journal_path.exists())
+            self.assertFalse(
+                store_module._activation_terminal_path(identity).exists()
             )
 
     def test_candidate_reappeared_in_db_replaced_window_rolls_back(

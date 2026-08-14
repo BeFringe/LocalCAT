@@ -15,6 +15,7 @@ from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
+import tm_migration
 import tm_sqlite_store
 from tm_contracts import (
     CanonicalResourceIdentity,
@@ -515,6 +516,31 @@ class TMMigrationStageBuildTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(counts, (1, 1, 1))
+
+    def test_fresh_build_skips_reuse_scan_but_existing_stage_revalidates(
+        self,
+    ) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            identity.configured_jsonl_path.write_bytes(source_bytes)
+            service = _service(identity)
+            real_validate = tm_migration._validate_reusable_stage
+
+            with patch(
+                "tm_migration._validate_reusable_stage",
+                wraps=real_validate,
+            ) as validate:
+                first = service.build_mutable_stage(
+                    identity.configured_jsonl_path
+                )
+                self.assertEqual(validate.call_count, 0)
+                second = service.build_mutable_stage(
+                    identity.configured_jsonl_path
+                )
+
+            self.assertEqual(second, first)
+            self.assertEqual(validate.call_count, 1)
 
     def test_naked_sidecar_is_not_authority_and_never_reports_reuse(
         self,

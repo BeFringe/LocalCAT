@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+import tm_activation_recovery as recovery_module
 import tm_sqlite_store as store_module
 from tests.test_tm_activation_journal import (
     SOURCE_BYTES,
@@ -42,6 +43,37 @@ def _phase(journal_path: Path) -> _ActivationJournalPhase:
 
 
 class ActivationPublicationHappyPathTests(unittest.TestCase):
+    def test_active_semantic_validation_runs_once_then_attestation_rehashes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _identity_value, coordinator, _sealed, prepared, journal = (
+                _first_prepared(root)
+            )
+            real_validate = store_module._validate_published_activation_set
+            with patch(
+                "tm_activation_recovery._validate_published_activation_set",
+                wraps=real_validate,
+            ) as validate:
+                coordinator.publish_activation(prepared, journal)
+
+            self.assertEqual(validate.call_count, 1)
+            terminal = _parse_activation_journal_bytes(
+                journal.journal_path.read_bytes(),
+                expected_journal_path=journal.journal_path,
+            )
+            self.assertIs(
+                terminal.phase,
+                _ActivationJournalPhase.GENERATION_PUBLISHED,
+            )
+            self.assertIsNotNone(terminal.active_content_attestation)
+            assert terminal.active_content_attestation is not None
+            self.assertEqual(
+                terminal.active_content_attestation.sealed_attestation_digest,
+                terminal.sealed_content_attestation.attestation_digest,
+            )
+
     def test_effects_are_durable_before_each_phase_and_token_consumption(
         self,
     ) -> None:
@@ -592,13 +624,13 @@ class ActivationPublicationFailureTests(unittest.TestCase):
             ) = _existing_fixture(root, fts5_available=True)
             prepared = coordinator.activate(sealed)
             journal = coordinator.publish_prepared_activation(prepared)
-            real_validate = store_module._validate_published_activation_set
+            real_validate = recovery_module._revalidate_active_content_attestation
             calls = 0
 
             def fail_before_generation(*args: Any, **kwargs: Any) -> Any:
                 nonlocal calls
                 calls += 1
-                if calls == 3:
+                if calls == 2:
                     raise ActivationPreparationError(
                         "ACTIVATION.ACTIVE_SET_INVALID",
                         retryable=False,
@@ -606,7 +638,7 @@ class ActivationPublicationFailureTests(unittest.TestCase):
                 return real_validate(*args, **kwargs)
 
             with patch(
-                "tm_activation_recovery._validate_published_activation_set",
+                "tm_activation_recovery._revalidate_active_content_attestation",
                 side_effect=fail_before_generation,
             ):
                 with self.assertRaises(ActivationPreparationError):

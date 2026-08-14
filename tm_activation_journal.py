@@ -19,6 +19,14 @@ from enum import Enum
 from pathlib import Path
 
 import tm_contracts as contract_module
+from tm_content_attestation import (
+    ActiveContentAttestation,
+    SealedContentAttestation,
+    _active_content_attestation_from_mapping,
+    _active_content_attestation_to_mapping,
+    _sealed_content_attestation_from_mapping,
+    _sealed_content_attestation_to_mapping,
+)
 from tm_contracts import (
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -411,7 +419,7 @@ _PHASE_SEQUENCE = (
     _ActivationJournalPhase.GENERATION_PUBLISHED,
 )
 
-_ACTIVATION_JOURNAL_VERSION = "activation-journal-v1"
+_ACTIVATION_JOURNAL_VERSION = "activation-journal-v2"
 _ACTIVATION_JOURNAL_FACTORY_KEY = object()
 
 
@@ -518,11 +526,13 @@ _ACTIVATION_JOURNAL_RECORD_FIELDS = frozenset(
     | _ACTIVATION_JOURNAL_IDENTITY_PAIR_FIELDS
     | _ACTIVATION_JOURNAL_PRIOR_OPTIONAL_FIELDS
     | {
+        "active_content_attestation",
         "expected_prior_generation",
         "had_prior_canonical",
         "phase",
         "prior_generation",
         "prior_manifest_absent",
+        "sealed_content_attestation",
     }
 )
 
@@ -588,6 +598,8 @@ class _ActivationJournalRecord:
     prior_manifest_backup_digest: str | None
     prior_db_backup_identity: tuple[int, int] | None
     prior_manifest_backup_identity: tuple[int, int] | None
+    sealed_content_attestation: SealedContentAttestation
+    active_content_attestation: ActiveContentAttestation | None
 
     def __post_init__(self) -> None:
         _validate_activation_journal_record(self)
@@ -3557,6 +3569,13 @@ def _activation_journal_record_payload(
         return None if value is None else str(value)
 
     return {
+        "active_content_attestation": (
+            None
+            if record.active_content_attestation is None
+            else _active_content_attestation_to_mapping(
+                record.active_content_attestation
+            )
+        ),
         "activation_nonce": record.activation_nonce,
         "artifact_id": record.artifact_id,
         "artifact_seal_digest": record.artifact_seal_digest,
@@ -3611,6 +3630,11 @@ def _activation_journal_record_payload(
         "prior_receipt_digest": record.prior_receipt_digest,
         "registry_namespace": record.registry_namespace,
         "resource_id": record.resource_id,
+        "sealed_content_attestation": (
+            _sealed_content_attestation_to_mapping(
+                record.sealed_content_attestation
+            )
+        ),
         "sealed_stage_digest": record.sealed_stage_digest,
         "snapshot_receipt_digest": record.snapshot_receipt_digest,
         "source_jsonl_digest": record.source_jsonl_digest,
@@ -3952,6 +3976,18 @@ def _decode_activation_journal_record(
             mapping["prior_manifest_backup_identity"],
             "prior_manifest_backup_identity",
         ),
+        sealed_content_attestation=(
+            _sealed_content_attestation_from_mapping(
+                mapping["sealed_content_attestation"]
+            )
+        ),
+        active_content_attestation=(
+            None
+            if mapping["active_content_attestation"] is None
+            else _active_content_attestation_from_mapping(
+                mapping["active_content_attestation"]
+            )
+        ),
     )
     return record
 
@@ -4058,6 +4094,114 @@ def _validate_activation_journal_record(
 ) -> None:
     if record.journal_version != _ACTIVATION_JOURNAL_VERSION:
         raise ValueError("unsupported activation journal version")
+    if type(record.sealed_content_attestation) is not SealedContentAttestation:
+        raise TypeError("sealed content attestation is required")
+    sealed = record.sealed_content_attestation
+    if (
+        sealed.resource_id != record.resource_id
+        or sealed.target_identity != record.target_identity
+        or sealed.canonical_store_id != record.canonical_store_id
+        or sealed.snapshot_receipt_digest
+        != record.snapshot_receipt_digest
+        or sealed.expected_prior_generation
+        != record.expected_prior_generation
+        or sealed.evidence_digest != record.evidence_digest
+        or sealed.database.sha256 != record.stage_db_digest
+        or (sealed.database.device, sealed.database.inode)
+        != record.candidate_stage_db_identity
+        or sealed.manifest.sha256 != record.manifest_temp_digest
+        or (sealed.manifest.device, sealed.manifest.inode)
+        != record.candidate_manifest_temp_identity
+        or sealed.source.sha256 != record.source_jsonl_digest
+        or (sealed.source.device, sealed.source.inode)
+        != record.source_jsonl_identity
+    ):
+        raise ValueError("sealed content attestation does not close journal")
+    if record.phase in {
+        _ActivationJournalPhase.PREPARED,
+        _ActivationJournalPhase.DB_REPLACED,
+    }:
+        if record.active_content_attestation is not None:
+            raise ValueError("active attestation precedes manifest publication")
+    else:
+        active = record.active_content_attestation
+        if type(active) is not ActiveContentAttestation:
+            raise TypeError("published phase requires active attestation")
+        expected_generation = (
+            0
+            if record.expected_prior_generation is None
+            else record.expected_prior_generation + 1
+        )
+        expected_activation_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "activation_nonce": record.activation_nonce,
+                    "artifact_id": record.artifact_id,
+                    "evidence_digest": record.evidence_digest,
+                    "generation": expected_generation,
+                    "journal_id": record.journal_id,
+                    "manifest_digest": record.new_manifest_digest,
+                    "sealed_stage_digest": record.sealed_stage_digest,
+                    "token_id": record.token_id,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        active_semantic = active.semantic_facts
+        sealed_semantic = sealed.semantic_facts
+        if (
+            active.sealed_attestation_digest
+            != sealed.attestation_digest
+            or active.journal_id != record.journal_id
+            or active.resource_id != record.resource_id
+            or active.target_identity != record.target_identity
+            or active.canonical_store_id != record.canonical_store_id
+            or active.snapshot_receipt_digest
+            != record.snapshot_receipt_digest
+            or active.manifest != sealed.manifest
+            or active.source != sealed.source
+            or active.database.device != sealed.database.device
+            or active.database.inode != sealed.database.inode
+            or active.generation != expected_generation
+            or active.activation_digest != expected_activation_digest
+            or active_semantic.schema_version
+            != sealed_semantic.schema_version
+            or active_semantic.schema_digest != sealed_semantic.schema_digest
+            or active_semantic.fold_version != sealed_semantic.fold_version
+            or active_semantic.index_version != sealed_semantic.index_version
+            or active_semantic.candidate_index_kind
+            != sealed_semantic.candidate_index_kind
+            or active_semantic.fts5_available
+            != sealed_semantic.fts5_available
+            or active_semantic.sqlite_runtime_version
+            != sealed_semantic.sqlite_runtime_version
+            or active_semantic.unicode_runtime_version
+            != sealed_semantic.unicode_runtime_version
+            or active_semantic.journal_mode != sealed_semantic.journal_mode
+            or active_semantic.synchronous != sealed_semantic.synchronous
+            or active_semantic.foreign_keys != sealed_semantic.foreign_keys
+            or active_semantic.busy_timeout_ms
+            != sealed_semantic.busy_timeout_ms
+            or active_semantic.wal_enabled != sealed_semantic.wal_enabled
+            or active_semantic.extension_loading_enabled
+            != sealed_semantic.extension_loading_enabled
+            or active_semantic.record_count != sealed_semantic.record_count
+            or active_semantic.origin_batch_count
+            != sealed_semantic.origin_batch_count
+            or active_semantic.origin_batch_id
+            != sealed_semantic.origin_batch_id
+            or active_semantic.origin_batch_kind
+            != sealed_semantic.origin_batch_kind
+            or active_semantic.exported_revision
+            != sealed_semantic.exported_revision
+            or active_semantic.fts_count != sealed_semantic.fts_count
+            or active_semantic.gram_counts != sealed_semantic.gram_counts
+            or active_semantic.exact_parity_digest
+            != sealed_semantic.exact_parity_digest
+        ):
+            raise ValueError("active content attestation does not close journal")
     for field_name in _ACTIVATION_JOURNAL_IDENTITY_FIELDS:
         value = getattr(record, field_name)
         if type(value) is not str or not value.strip():

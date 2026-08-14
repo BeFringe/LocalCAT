@@ -16,6 +16,7 @@ from unittest.mock import patch
 import tm_contracts as contract_module
 import tm_gate_b
 import tm_stage_sealer
+from tm_content_attestation import SealedContentAttestation
 from tm_contracts import (
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -201,6 +202,36 @@ class _StructuralFakeRegistry:
 
 
 class GateBHappyPathTests(unittest.TestCase):
+    def test_gate_b_rehashes_attested_files_without_semantic_rescan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _stage, registry, sealed = _fixture(
+                Path(temporary),
+                fts5_available=True,
+            )
+            real_capture = tm_stage_sealer._capture_content_file
+            with (
+                patch(
+                    "tm_stage_sealer._validate_stage_facts",
+                    side_effect=AssertionError(
+                        "Gate B must not repeat semantic validation"
+                    ),
+                ),
+                patch(
+                    "tm_stage_sealer._capture_content_file",
+                    wraps=real_capture,
+                ) as capture,
+            ):
+                report = _evaluate(
+                    registry,
+                    sealed,
+                    fts5_available=True,
+                )
+
+            self.assertTrue(report.granted)
+            self.assertEqual(capture.call_count, 3)
+
     def test_gate_b_grants_both_index_modes_with_closed_component_facts(
         self,
     ) -> None:
@@ -509,7 +540,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                     _expect_code(
                         self,
                         report,
-                        "GATE_B.CANDIDATE_INDEX_INCOMPLETE",
+                        "GATE_B.ARTIFACT_MUTATED",
                     )
 
                 def extra_gram(stage: MutableStageRef, _identity: Any) -> None:
@@ -538,7 +569,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                     _expect_code(
                         self,
                         report,
-                        "GATE_B.CANDIDATE_INDEX_INCOMPLETE",
+                        "GATE_B.ARTIFACT_MUTATED",
                     )
 
     def test_missing_extra_and_broken_fts_rows_deny(self) -> None:
@@ -559,7 +590,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=missing_fts,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.FTS_INDEX_INCOMPLETE")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def extra_fts(stage: MutableStageRef, _identity: Any) -> None:
             connection = _raw_connection(stage.staged_db_path)
@@ -579,7 +610,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=extra_fts,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.FTS_INDEX_INCOMPLETE")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def broken_fts(stage: MutableStageRef, _identity: Any) -> None:
             connection = _raw_connection(stage.staged_db_path)
@@ -599,7 +630,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=broken_fts,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.FTS_INDEX_INCOMPLETE")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
     def test_same_count_record_and_parity_tamper_denies(self) -> None:
         def target_tamper(stage: MutableStageRef, _identity: Any) -> None:
@@ -620,7 +651,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=target_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.RECORD_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def order_swap(stage: MutableStageRef, _identity: Any) -> None:
             connection = _raw_connection(stage.staged_db_path)
@@ -677,7 +708,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=order_swap,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.RECORD_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def jsonl_target_tamper(
             _stage: MutableStageRef,
@@ -696,7 +727,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=jsonl_target_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.RECORD_MISMATCH")
+            _expect_code(self, report, "GATE_B.SOURCE_MISMATCH")
 
         def jsonl_byte_tamper(
             _stage: MutableStageRef,
@@ -764,7 +795,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=fold_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.FOLD_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
     def test_receipt_manifest_and_binding_mismatch_denies(self) -> None:
         def receipt_tamper(stage: MutableStageRef, _identity: Any) -> None:
@@ -786,7 +817,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=receipt_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.RECEIPT_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def foreign_manifest(
             stage: MutableStageRef,
@@ -811,7 +842,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=foreign_manifest,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.MANIFEST_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def manifest_receipt_mismatch(
             stage: MutableStageRef,
@@ -848,7 +879,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
             )
             manifest_receipt_mismatch(stage, identity, sealed)
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.MANIFEST_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def binding_tamper(
             stage: MutableStageRef,
@@ -879,31 +910,31 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=binding_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.BINDING_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
     def test_schema_runtime_and_version_mismatch_denies(self) -> None:
-        meta_tampers = {
-            "GATE_B.SCHEMA_MISMATCH": ("schema_version", "1"),
-            "GATE_B.RUNTIME_MISMATCH": (
+        meta_tampers = (
+            ("schema_version", "1"),
+            (
                 "sqlite_runtime_version",
                 "3.0.0",
             ),
-            "GATE_B.RUNTIME_MISMATCH": ("journal_mode", "wal"),
-            "GATE_B.VERSION_MISMATCH": (
+            ("journal_mode", "wal"),
+            (
                 "fold_version",
                 "fold-v1-other",
             ),
-            "GATE_B.CANDIDATE_INDEX_MISMATCH": (
+            (
                 "candidate_index_kind",
                 "GRAM_FALLBACK",
             ),
-            "GATE_B.IDENTITY_MISMATCH": ("resource_id", "tm.other"),
-            "GATE_B.IDENTITY_MISMATCH": (
+            ("resource_id", "tm.other"),
+            (
                 "canonical_store_id",
                 "store.other",
             ),
-        }
-        for expected_code, (key, value) in meta_tampers.items():
+        )
+        for key, value in meta_tampers:
             with self.subTest(key=key):
 
                 def tamper(
@@ -934,7 +965,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                         sealed,
                         fts5_available=True,
                     )
-                    _expect_code(self, report, expected_code)
+                    _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def drop_index(stage: MutableStageRef, _identity: Any) -> None:
             connection = _raw_connection(stage.staged_db_path)
@@ -951,7 +982,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=drop_index,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.SCHEMA_INCOMPLETE")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def extra_table(stage: MutableStageRef, _identity: Any) -> None:
             connection = _raw_connection(stage.staged_db_path)
@@ -968,7 +999,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=extra_table,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.SCHEMA_UNEXPECTED")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def target_identity_tamper(
             stage: MutableStageRef,
@@ -992,7 +1023,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=target_identity_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.IDENTITY_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
     def test_db_and_manifest_digest_mutation_denies(self) -> None:
         def usage_count_tamper(stage: MutableStageRef, _identity: Any) -> None:
@@ -1013,7 +1044,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=usage_count_tamper,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.EVIDENCE_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         def manifest_append(stage: MutableStageRef, _identity: Any) -> None:
             with stage.manifest_temp_path.open("ab") as stream:
@@ -1026,7 +1057,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=manifest_append,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.EVIDENCE_MISMATCH")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
     def test_non_sealed_and_unregistered_input_denies(self) -> None:
         def revert_marker(stage: MutableStageRef, _identity: Any) -> None:
@@ -1047,7 +1078,7 @@ class GateBFailClosedMatrixTests(unittest.TestCase):
                 tamper=revert_marker,
             )
             report = _evaluate(registry, sealed, fts5_available=True)
-            _expect_code(self, report, "GATE_B.STAGE_NOT_SEALED")
+            _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
 
         with tempfile.TemporaryDirectory() as temporary_a, tempfile.TemporaryDirectory() as temporary_b:
             identity_a = _identity(Path(temporary_a))
@@ -1151,7 +1182,7 @@ class GateBStalenessTests(unittest.TestCase):
             _expect_code(
                 self,
                 second,
-                "GATE_B.CANDIDATE_INDEX_INCOMPLETE",
+                "GATE_B.ARTIFACT_MUTATED",
             )
             self.assertIsNone(second.grant)
             self.assertIsNone(second.facts)
@@ -1181,20 +1212,20 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_evidence = tm_stage_sealer._build_evidence
+            real_claim = tm_gate_b._require_claim_closure
 
-            def mutate_db_then_build_evidence(*args: Any, **kwargs: Any) -> Any:
+            def mutate_db_after_claim(*args: Any, **kwargs: Any) -> None:
+                real_claim(*args, **kwargs)
                 connection = _raw_connection(stage.staged_db_path)
                 try:
                     connection.execute("PRAGMA user_version=99")
                     connection.commit()
                 finally:
                     connection.close()
-                return real_build_evidence(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_evidence",
-                side_effect=mutate_db_then_build_evidence,
+                "tm_gate_b._require_claim_closure",
+                side_effect=mutate_db_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
@@ -1209,19 +1240,19 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_binding = tm_stage_sealer._build_binding
+            real_claim = tm_gate_b._require_claim_closure
 
-            def mutate_manifest_then_build_binding(
+            def mutate_manifest_after_claim(
                 *args: Any,
                 **kwargs: Any,
-            ) -> Any:
+            ) -> None:
+                real_claim(*args, **kwargs)
                 with stage.manifest_temp_path.open("ab") as stream:
                     stream.write(b"\n")
-                return real_build_binding(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_binding",
-                side_effect=mutate_manifest_then_build_binding,
+                "tm_gate_b._require_claim_closure",
+                side_effect=mutate_manifest_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.ARTIFACT_MUTATED")
@@ -1234,19 +1265,19 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_binding = tm_stage_sealer._build_binding
+            real_claim = tm_gate_b._require_claim_closure
 
-            def mutate_source_then_build_binding(
+            def mutate_source_after_claim(
                 *args: Any,
                 **kwargs: Any,
-            ) -> Any:
+            ) -> None:
+                real_claim(*args, **kwargs)
                 with identity.configured_jsonl_path.open("ab") as stream:
                     stream.write(b'{"source":"y","target":"late"}\n')
-                return real_build_binding(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_binding",
-                side_effect=mutate_source_then_build_binding,
+                "tm_gate_b._require_claim_closure",
+                side_effect=mutate_source_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.SOURCE_MISMATCH")
@@ -1259,18 +1290,18 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_binding = tm_stage_sealer._build_binding
+            real_claim = tm_gate_b._require_claim_closure
 
-            def swap_db_then_build_binding(
+            def swap_db_after_claim(
                 *args: Any,
                 **kwargs: Any,
-            ) -> Any:
+            ) -> None:
+                real_claim(*args, **kwargs)
                 self._swap_with_identical_bytes(stage.staged_db_path)
-                return real_build_binding(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_binding",
-                side_effect=swap_db_then_build_binding,
+                "tm_gate_b._require_claim_closure",
+                side_effect=swap_db_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
@@ -1283,18 +1314,18 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_binding = tm_stage_sealer._build_binding
+            real_claim = tm_gate_b._require_claim_closure
 
-            def swap_manifest_then_build_binding(
+            def swap_manifest_after_claim(
                 *args: Any,
                 **kwargs: Any,
-            ) -> Any:
+            ) -> None:
+                real_claim(*args, **kwargs)
                 self._swap_with_identical_bytes(stage.manifest_temp_path)
-                return real_build_binding(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_binding",
-                side_effect=swap_manifest_then_build_binding,
+                "tm_gate_b._require_claim_closure",
+                side_effect=swap_manifest_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.ARTIFACT_UNSAFE")
@@ -1307,20 +1338,20 @@ class GateBAdversarialClosureTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            real_build_binding = tm_stage_sealer._build_binding
+            real_claim = tm_gate_b._require_claim_closure
 
-            def swap_source_then_build_binding(
+            def swap_source_after_claim(
                 *args: Any,
                 **kwargs: Any,
-            ) -> Any:
+            ) -> None:
+                real_claim(*args, **kwargs)
                 self._swap_with_identical_bytes(
                     identity.configured_jsonl_path
                 )
-                return real_build_binding(*args, **kwargs)
 
             with patch(
-                "tm_stage_sealer._build_binding",
-                side_effect=swap_source_then_build_binding,
+                "tm_gate_b._require_claim_closure",
+                side_effect=swap_source_after_claim,
             ):
                 report = _evaluate(registry, sealed, fts5_available=True)
             _expect_code(self, report, "GATE_B.SOURCE_MISMATCH")
@@ -1377,9 +1408,9 @@ class GateBLinearizationTests(unittest.TestCase):
 
             def mutate_after_claim_closure(
                 snapshot: tm_stage_sealer._PhysicalReadinessSnapshot,
-                recomputed: tm_stage_sealer._SealedRecomputation,
+                attestation: SealedContentAttestation,
             ) -> None:
-                real_require_claim_closure(snapshot, recomputed)
+                real_require_claim_closure(snapshot, attestation)
                 connection = _raw_connection(stage.staged_db_path)
                 try:
                     connection.execute(
@@ -1535,7 +1566,7 @@ class GateBSafeDiagnosticsTests(unittest.TestCase):
                 connection.close()
             report = _evaluate(registry, sealed, fts5_available=True)
             self.assertFalse(report.granted)
-            self.assertEqual(report.error_code, "GATE_B.RECORD_MISMATCH")
+            self.assertEqual(report.error_code, "GATE_B.ARTIFACT_MUTATED")
             rendered = f"{report!r} {report!s}"
             for token in forbidden:
                 self.assertNotIn(token, rendered)

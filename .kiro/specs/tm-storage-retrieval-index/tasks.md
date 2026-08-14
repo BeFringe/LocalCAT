@@ -366,7 +366,7 @@
   - _Boundary: Candidate Proof Query_
   - _Depends: 8.6_
 
-- [ ] 8.8 建立 sealed/active 内容证明链并压缩迁移重复扫描
+- [x] 8.8 建立 sealed/active 内容证明链并压缩迁移重复扫描
   - fresh stage 只在新建路径执行一次完整语义校验；seal 在同一事务流式闭合 parity/index/closure 与 SEALED marker，生成绑定 SHA-256、inode、版本、计数和 closure 的 sealed attestation
   - 保留两次 Gate B、drain、replace、parent fsync、四阶段 journal、reopen 与 cold recovery；immutable 阶段以 no-follow pre/post identity + 完整 rehash 复证，不以缓存布尔值或 stat 元数据授权
   - active receipt/meta 合法写入后执行一次完整 active-set 校验并持久化 active attestation；后续 phase 仅在 exact bytes/inode/journal facts 相等时复用，漂移仍 rollback/fail-stop
@@ -487,3 +487,4 @@
 - 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
 - 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
 - 2026-08-14 / Task 8.7：生产查询在同一 generation view 内以单一 block/record 全局上界前沿打开 256-slot exact proof facts，seed 仅保留真实路径与守恒诊断，原文/scorer 批不超过 32 且单 identity 仅评分一次；threshold 全集和 `(score, record_id DESC)` top-k 双闭合，协调篡改/世代漂移/预算耗尽资源级 fail-closed。Cluster M review correction 进一步以 `source_raw → fold-v1` 作为 health/Stage/Gate B proof-index 独立语义根，拒绝 folded/length/TF/FTS/block 成套伪造，并使 frontier/kth universe、seed→BOUND_PROOF 输入与 scored/unscored identity 在 constructor/strict codec 闭合；主 agent 新鲜 contract/store/proof/retrieval/Stage/schema/Gate B/migration/bound 363/363（1 skip）、mini oracle 3/3 及变更文件 basedpyright 0 errors 通过，本轮未重跑 5k/100k Gate D。
+- 2026-08-14 / Task 8.8：fresh build 取消刚构建 stage 的重复 reuse 扫描，existing reuse 仍完整验证；StageSealer 在同一 `BEGIN IMMEDIATE` 内闭合 parity/proof-index/schema/count/logical closure 与 `SEALED` marker，生成 registry-owned sealed attestation。两次 Gate B 均仅做 DB/manifest/source 的 no-follow inode+full SHA-256 复证；replace/reopen 后 receipt/meta 只执行一次 active 全语义校验，active attestation 以 strict journal/terminal codec 持久并在后续 phase/cold recovery 仅经 exact bytes/inode/phase 复证。journal-owned 新资产缺失可依 proven journal 回滚；same-inode 改字节、同字节换 inode、attestation 字段/版本/计数/闭包/阶段漂移及 v2 published phase 缺 attestation 均 fail-closed。focused 360/360（1 skip）、扩展 activation/recovery 矩阵 324/324（1 skip）、变更文件 basedpyright 0 errors、py_compile 与 diff check 通过。

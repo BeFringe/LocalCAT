@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import tm_contracts as contract_module
 from tm_activation_journal import _ensure_activation_lineage_marker
+from tm_content_attestation import _create_active_content_attestation
 from tm_contracts import (
     ActivationCapabilityState,
     CanonicalResourceIdentity,
@@ -280,20 +281,10 @@ def _advance_all(
     prepared: _ActivationPreparation,
     handle: _ActivationJournalHandle,
 ) -> _ActivationJournalHandle:
-    handle = coordinator._advance_activation_journal(
-        prepared,
-        handle,
-        DB_REPLACED,
-    )
-    handle = coordinator._advance_activation_journal(
-        prepared,
-        handle,
-        MANIFEST_PUBLISHED,
-    )
     return coordinator._advance_activation_journal(
         prepared,
         handle,
-        GENERATION_PUBLISHED,
+        DB_REPLACED,
     )
 
 
@@ -306,6 +297,66 @@ def _overwrite_journal(journal_path: Path, payload: bytes) -> None:
 
 
 class ActivationJournalHappyPathTests(unittest.TestCase):
+    def test_published_phase_strictly_closes_active_attestation_facts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, coordinator, _sealed, prepared, handle = _first_prepared(
+                Path(temporary)
+            )
+            coordinator.publish_activation(prepared, handle)
+            record = _parse_activation_journal_bytes(
+                handle.journal_path.read_bytes(),
+                expected_journal_path=handle.journal_path,
+            )
+            active = record.active_content_attestation
+            self.assertIsNotNone(active)
+            assert active is not None
+
+            with self.assertRaises(TypeError):
+                replace(record, active_content_attestation=None)
+
+            wrong_generation = _create_active_content_attestation(
+                sealed_attestation_digest=active.sealed_attestation_digest,
+                journal_id=active.journal_id,
+                resource_id=active.resource_id,
+                target_identity=active.target_identity,
+                canonical_store_id=active.canonical_store_id,
+                snapshot_receipt_digest=active.snapshot_receipt_digest,
+                generation=active.generation + 1,
+                activation_digest=active.activation_digest,
+                database=active.database,
+                manifest=active.manifest,
+                source=active.source,
+                semantic_facts=active.semantic_facts,
+            )
+            with self.assertRaises(ValueError):
+                replace(
+                    record,
+                    active_content_attestation=wrong_generation,
+                )
+
+            wrong_count_facts = replace(
+                active.semantic_facts,
+                record_count=active.semantic_facts.record_count + 1,
+            )
+            wrong_count = _create_active_content_attestation(
+                sealed_attestation_digest=active.sealed_attestation_digest,
+                journal_id=active.journal_id,
+                resource_id=active.resource_id,
+                target_identity=active.target_identity,
+                canonical_store_id=active.canonical_store_id,
+                snapshot_receipt_digest=active.snapshot_receipt_digest,
+                generation=active.generation,
+                activation_digest=active.activation_digest,
+                database=active.database,
+                manifest=active.manifest,
+                source=active.source,
+                semantic_facts=wrong_count_facts,
+            )
+            with self.assertRaises(ValueError):
+                replace(record, active_content_attestation=wrong_count)
+
     def test_first_activation_prepared_journal_is_canonical_and_closed(
         self,
     ) -> None:
@@ -335,7 +386,7 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
                     self.assertEqual(decoded["phase"], "PREPARED")
                     self.assertEqual(
                         decoded["journal_version"],
-                        "activation-journal-v1",
+                        "activation-journal-v2",
                     )
                     canonical = json.dumps(
                         decoded,
@@ -536,11 +587,7 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
             previous = handle
             digests = [handle.record_digest]
             identities = [handle.file_identity]
-            for phase in (
-                DB_REPLACED,
-                MANIFEST_PUBLISHED,
-                GENERATION_PUBLISHED,
-            ):
+            for phase in (DB_REPLACED,):
                 advanced = coordinator._advance_activation_journal(
                     prepared,
                     previous,
@@ -568,8 +615,8 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
                 digests.append(advanced.record_digest)
                 identities.append(advanced.file_identity)
                 previous = advanced
-            self.assertEqual(len(set(digests)), 4)
-            self.assertEqual(len(set(identities)), 4)
+            self.assertEqual(len(set(digests)), 2)
+            self.assertEqual(len(set(identities)), 2)
             self.assertEqual(coordinator.state, "ACTIVATING")
             self.assertIs(
                 _registry(coordinator).state(sealed),
@@ -1942,7 +1989,7 @@ class ActivationJournalParseTests(unittest.TestCase):
         if kind == "bad_version":
             serialized = payload.decode("utf-8")
             return serialized.replace(
-                '"journal_version":"activation-journal-v1"',
+                '"journal_version":"activation-journal-v2"',
                 '"journal_version":"activation-journal-v9"',
             ).encode("utf-8")
         if kind == "bad_digest":

@@ -17,6 +17,7 @@ generation, and no repeated token consumption.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
@@ -376,7 +377,9 @@ class RollbackFirstActivationTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_generation_published_short_of_complete_rolls_back(self) -> None:
+    def test_phase_only_generation_rewrite_without_attestation_fails_closed(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, sealed, prepared, journal = _first_prepared(
@@ -385,7 +388,57 @@ class RollbackFirstActivationTests(unittest.TestCase):
             journal_path = journal.journal_path
             record = journal._record
             _rewrite_phase(journal_path, GENERATION_PUBLISHED)
+            malformed_bytes = journal_path.read_bytes()
             source_bytes = identity.configured_jsonl_path.read_bytes()
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(journal_path.read_bytes(), malformed_bytes)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                source_bytes,
+            )
+            self.assertTrue(record.candidate_stage_db_path.is_file())
+            self.assertTrue(record.candidate_manifest_temp_path.is_file())
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+
+    def test_valid_generation_journal_missing_new_db_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, coordinator, sealed, prepared, journal = _first_prepared(
+                root
+            )
+            journal_path = journal.journal_path
+            _manifest_published_window(coordinator, prepared, journal)
+            manifest_record = store_module._parse_activation_journal_bytes(
+                journal_path.read_bytes(),
+                expected_journal_path=journal_path,
+            )
+            self.assertIs(manifest_record.phase, MANIFEST_PUBLISHED)
+            self.assertIsNotNone(
+                manifest_record.active_content_attestation
+            )
+            generation_record = replace(
+                manifest_record,
+                phase=GENERATION_PUBLISHED,
+            )
+            journal_path.write_text(
+                store_module._serialize_activation_journal_record(
+                    generation_record
+                ),
+                encoding="utf-8",
+            )
+            identity.canonical_sidecar_path.unlink()
+            source_bytes = identity.configured_jsonl_path.read_bytes()
+
             recovered = _fresh(identity)
             self.assertEqual(
                 _recovered_report(recovered),
@@ -396,17 +449,17 @@ class RollbackFirstActivationTests(unittest.TestCase):
                 ),
             )
             self.assertIsNone(recovered.current_generation)
-            _assert_first_activation_rolled_back(
-                self,
-                identity,
-                record,
-                journal_path,
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
                 source_bytes,
-                "GENERATION_PUBLISHED",
-                expected_quarantine={
-                    record.candidate_manifest_temp_path.name,
-                    record.candidate_stage_db_path.name,
-                },
+            )
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(_activation_terminal_path(identity).is_file())
+            self.assertEqual(
+                set(_quarantine_entries(identity, generation_record)),
+                {identity.snapshot_manifest_path.name},
             )
 
 
@@ -577,7 +630,7 @@ class RollbackExistingCanonicalTests(unittest.TestCase):
                 generation=0,
             )
 
-    def test_generation_published_short_of_complete_keeps_intact_prior(
+    def test_phase_only_generation_rewrite_keeps_prior_and_fails_closed(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -601,23 +654,28 @@ class RollbackExistingCanonicalTests(unittest.TestCase):
             assert prior_manifest_path is not None
             prior_manifest_bytes = prior_manifest_path.read_bytes()
             _rewrite_phase(journal_path, GENERATION_PUBLISHED)
-            recovered = self._assert_prior_restored(
-                identity,
-                record,
-                prior_db_path,
-                prior_db_bytes,
-                prior_manifest_bytes,
-                journal_path,
-                expected_phase="GENERATION_PUBLISHED",
-                generation=0,
-            )
-            self.assertEqual(recovered.current_generation, 0)
+            malformed_bytes = journal_path.read_bytes()
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
             self.assertEqual(
-                set(_quarantine_entries(identity, record)),
-                {
-                    record.candidate_manifest_temp_path.name,
-                    record.candidate_stage_db_path.name,
-                },
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+            )
+            self.assertFalse(raised.exception.retryable)
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIsNone(recovered.current_generation)
+            self.assertEqual(journal_path.read_bytes(), malformed_bytes)
+            self.assertEqual(prior_db_path.read_bytes(), prior_db_bytes)
+            self.assertEqual(
+                prior_manifest_path.read_bytes(),
+                prior_manifest_bytes,
+            )
+            self.assertTrue(record.candidate_stage_db_path.is_file())
+            self.assertTrue(record.candidate_manifest_temp_path.is_file())
+            self.assertEqual(
+                _quarantine_entries(identity, record),
+                [],
             )
 
 

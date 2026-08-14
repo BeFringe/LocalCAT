@@ -1380,6 +1380,13 @@ class _CoordinatorStorePort:
             manifest_temp_digest=manifest_temp_digest,
         )
 
+    def stage_closure_digest(
+        self,
+        connection: sqlite3.Connection,
+    ) -> str:
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return cast(str, stage_sealer._stage_closure_digest(connection))
+
     def advance_after_effect(
         self,
         preparation: _ActivationPreparation,
@@ -1388,6 +1395,7 @@ class _CoordinatorStorePort:
         *,
         next_generation: int | None = None,
         activation_digest: str | None = None,
+        active_content_attestation: Any | None = None,
     ) -> _ActivationJournalHandle:
         return self._coordinator._advance_activation_journal_after_effect_locked(
             preparation,
@@ -1395,6 +1403,7 @@ class _CoordinatorStorePort:
             next_phase,
             next_generation=next_generation,
             activation_digest=activation_digest,
+            active_content_attestation=active_content_attestation,
         )
 
 
@@ -3362,6 +3371,7 @@ class ResourceStoreCoordinator:
         *,
         next_generation: int | None = None,
         activation_digest: str | None = None,
+        active_content_attestation: Any | None = None,
     ) -> _ActivationJournalHandle:
         """Advance only after re-proving the phase-specific durable effect."""
 
@@ -3372,6 +3382,7 @@ class ResourceStoreCoordinator:
             next_phase,
             next_generation=next_generation,
             activation_digest=activation_digest,
+            active_content_attestation=active_content_attestation,
         )
 
     def _write_activation_journal_locked(

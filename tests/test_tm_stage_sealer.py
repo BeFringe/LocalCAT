@@ -192,6 +192,19 @@ class _FakeRegistry:
 
 
 class StageSealerHappyPathTests(unittest.TestCase):
+    def test_fresh_stage_has_one_full_seal_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            real_validate = tm_stage_sealer._validate_stage_facts
+            with patch(
+                "tm_stage_sealer._validate_stage_facts",
+                wraps=real_validate,
+            ) as validate:
+                _seal(_sealer(), stage, fts5_available=True)
+
+            self.assertEqual(validate.call_count, 1)
+            self.assertTrue(validate.call_args.kwargs["seal_stage"])
+
     def test_seal_completes_frozen_artifact_in_both_index_modes(
         self,
     ) -> None:
@@ -898,15 +911,14 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                 real_directory_fsync(path)
 
             def record_marker(
-                path: Path,
-                expected: object,
+                connection: sqlite3.Connection,
                 *,
                 expected_closure_digest: str,
             ) -> None:
-                calls.append(("marker", path.name))
+                self.assertTrue(connection.in_transaction)
+                calls.append(("marker", stage.staged_db_path.name))
                 real_mark_sealed(
-                    path,
-                    cast(Any, expected),
+                    connection,
                     expected_closure_digest=expected_closure_digest,
                 )
 
@@ -915,9 +927,16 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                 reservation: tm_stage_sealer._RegistryReservation,
                 evidence: StageValidationEvidence,
                 generation: GenerationExpectation,
+                attestation: Any,
             ) -> SealedStage:
                 calls.append(("commit", reservation.mutable.staged_db_path.name))
-                return real_commit(self, reservation, evidence, generation)
+                return real_commit(
+                    self,
+                    reservation,
+                    evidence,
+                    generation,
+                    attestation,
+                )
 
             sealer = _sealer()
             with (
@@ -945,11 +964,9 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("file", stage.staged_db_path.name),
-                    ("file", stage.manifest_temp_path.name),
-                    ("dir", stage.staged_db_path.parent.name),
                     ("marker", stage.staged_db_path.name),
                     ("file", stage.staged_db_path.name),
+                    ("file", stage.manifest_temp_path.name),
                     ("dir", stage.staged_db_path.parent.name),
                     ("commit", stage.staged_db_path.name),
                 ],
@@ -983,7 +1000,7 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
         self,
     ) -> None:
         real_fsync = tm_stage_sealer.os.fsync
-        for failed_call in (1, 2, 3, 4, 5):
+        for failed_call in (1, 2, 3):
             with self.subTest(failed_call=failed_call):
                 with tempfile.TemporaryDirectory() as temporary:
                     identity, stage = _build_stage(
@@ -1014,13 +1031,7 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                             ),
                             "SEALER.FSYNC_FAILED",
                         )
-                    if failed_call <= 3:
-                        self.assertEqual(calls[0], failed_call)
-                    else:
-                        self.assertEqual(
-                            calls[0],
-                            failed_call + 2,
-                        )
+                    self.assertEqual(calls[0], failed_call + 2)
                     self.assertEqual(
                         len(_registry(sealer)._entries),
                         0,
@@ -1112,7 +1123,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
     ) -> None:
         real_verify_sealed = tm_stage_sealer._verify_sealed_stage
         real_verify_manifest = tm_stage_sealer._verify_manifest_at_digest
-        real_sha256 = tm_stage_sealer._file_sha256
+        real_capture = tm_stage_sealer._capture_content_file
 
         def one_shot(
             function: Any,
@@ -1132,7 +1143,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
         cases: tuple[tuple[str, str, str], ...] = (
             (
                 "post_marker_db_digest",
-                "tm_stage_sealer._file_sha256",
+                "tm_stage_sealer._capture_content_file",
                 "SEALER.DIGEST_UNREADABLE",
             ),
             (
@@ -1147,7 +1158,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
             ),
         )
         functions = {
-            "tm_stage_sealer._file_sha256": real_sha256,
+            "tm_stage_sealer._capture_content_file": real_capture,
             "tm_stage_sealer._verify_manifest_at_digest": real_verify_manifest,
             "tm_stage_sealer._verify_sealed_stage": real_verify_sealed,
         }
@@ -1211,6 +1222,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
                 reservation: tm_stage_sealer._RegistryReservation,
                 evidence: StageValidationEvidence,
                 generation: GenerationExpectation,
+                attestation: Any,
             ) -> SealedStage:
                 state[0] += 1
                 if state[0] == 1:
@@ -1220,6 +1232,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
                     reservation,
                     evidence,
                     generation,
+                    attestation,
                 )
 
             with patch.object(

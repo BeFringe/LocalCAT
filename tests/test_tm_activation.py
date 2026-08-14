@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+import tm_stage_sealer
 from tm_activation_journal import _ensure_activation_lineage_marker
 from tm_contracts import (
     ActivationCapabilityState,
@@ -231,6 +232,39 @@ class _StringSubclass(str):
 
 
 class ActivationPreparationHappyPathTests(unittest.TestCase):
+    def test_two_gate_b_passes_each_rehash_three_attested_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            identity.configured_jsonl_path.write_bytes(SOURCE_BYTES)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            _stage, sealed = _candidate(
+                coordinator,
+                identity,
+                fts5_available=True,
+                expected_prior_generation=None,
+            )
+            real_capture = tm_stage_sealer._capture_content_file
+            with (
+                patch(
+                    "tm_stage_sealer._validate_stage_facts",
+                    side_effect=AssertionError(
+                        "activation Gate B must not semantically rescan"
+                    ),
+                ),
+                patch(
+                    "tm_stage_sealer._capture_content_file",
+                    wraps=real_capture,
+                ) as capture,
+            ):
+                prepared = coordinator.activate(sealed)
+
+            self.assertEqual(capture.call_count, 6)
+            coordinator.cancel_prepared_activation(prepared)
+
     def test_first_activation_prepares_without_publishing_or_backup(self) -> None:
         for fts5_available in (True, False):
             with self.subTest(fts5_available=fts5_available):

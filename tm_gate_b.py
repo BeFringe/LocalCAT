@@ -1,12 +1,11 @@
 """Feature 5 Task 5.4 Gate B: canonical physical readiness for one artifact.
 
-Gate B freshly recomputes schema/runtime, completed migration ancestry,
-complete candidate indexes, sealed evidence, source binding/receipt/manifest,
-and exact compatibility parity for one registry-backed sealed artifact.  A
-grant proves only that one sealed artifact is physically complete and ready to
-be considered for activation; it never publishes a generation, touches a
-token, drains leases, replaces files, publishes a manifest, writes a journal,
-or modifies any canonical/JSONL asset.
+Gate B freshly rehashes the staged DB, manifest, and configured source through
+no-follow identity captures and compares them with the registry-owned sealed
+content attestation. A grant proves only that one sealed artifact is
+physically complete and ready to be considered for activation; it never
+publishes a generation, touches a token, drains leases, replaces files,
+publishes a manifest, writes a journal, or modifies any canonical/JSONL asset.
 
 All public diagnostics are stable code-only values; they never contain TM
 source/target text or local paths.  Path-bearing facts enter only through the
@@ -25,18 +24,15 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import re
-import sqlite3
 from typing import Any, TypeVar
 
-import tm_stage_sealer
+from tm_content_attestation import SealedContentAttestation
 from tm_contracts import (
     SealedStage,
     stage_validation_evidence_digest,
 )
-from tm_sqlite_store import SQLiteStoreSchemaError
 from tm_stage_sealer import (
     _PhysicalReadinessSnapshot,
-    _SealedRecomputation,
     _require_linearization_closure,
     SealedArtifactRegistry,
     StageSealError,
@@ -670,21 +666,14 @@ def _denial_report(error_code: str) -> GateBPhysicalReadinessReport:
 
 def _require_claim_closure(
     snapshot: _PhysicalReadinessSnapshot,
-    recomputed: _SealedRecomputation,
+    attestation: SealedContentAttestation,
 ) -> None:
-    """Bind freshly rebuilt facts/evidence to the registry-owned sealed claim."""
+    """Bind the registry-owned attestation to the sealed contract claim."""
 
     claim = snapshot.evidence
-    rebuilt = recomputed.evidence
-    if rebuilt != claim:
+    if type(attestation) is not SealedContentAttestation:
         raise _GateBFailure("GATE_B.EVIDENCE_MISMATCH")
-    if recomputed.generation != snapshot.generation:
-        raise _GateBFailure("GATE_B.EVIDENCE_MISMATCH")
-    if (
-        stage_validation_evidence_digest(rebuilt)
-        != stage_validation_evidence_digest(claim)
-    ):
-        raise _GateBFailure("GATE_B.EVIDENCE_MISMATCH")
+    semantic = attestation.semantic_facts
     if (
         claim.resource_id != snapshot.resource_id
         or claim.target_identity != snapshot.target_identity
@@ -692,17 +681,39 @@ def _require_claim_closure(
         != snapshot.canonical_store_id
         or claim.snapshot_receipt_digest
         != snapshot.snapshot_receipt_digest
+        or attestation.resource_id != snapshot.resource_id
+        or attestation.target_identity != snapshot.target_identity
+        or attestation.canonical_store_id != snapshot.canonical_store_id
+        or attestation.snapshot_receipt_digest
+        != snapshot.snapshot_receipt_digest
+        or attestation.expected_prior_generation
+        != snapshot.expected_prior_generation
+        or attestation.evidence_digest
+        != stage_validation_evidence_digest(claim)
+        or attestation.database.sha256 != claim.stage_file_digest
+        or attestation.manifest.sha256 != claim.manifest_temp_digest
+        or attestation.source.sha256
+        != claim.source_binding.receipt.jsonl_digest
+        or semantic.schema_version != claim.schema_version
+        or semantic.fold_version != claim.fold_version
+        or semantic.index_version != claim.index_version
+        or semantic.record_count != claim.record_count
+        or semantic.origin_batch_count != claim.origin_batch_count
+        or semantic.fts_count != claim.fts_count
+        or semantic.gram_counts != claim.gram_counts
+        or semantic.exact_parity_digest != claim.exact_parity_digest
     ):
         raise _GateBFailure("GATE_B.EVIDENCE_MISMATCH")
 
 
 def _grant_report(
     snapshot: _PhysicalReadinessSnapshot,
-    recomputed: _SealedRecomputation,
+    attestation: SealedContentAttestation,
 ) -> GateBPhysicalReadinessReport:
     """Build the inspectable facts and the factory-only grant for one artifact."""
 
-    evidence_digest = stage_validation_evidence_digest(recomputed.evidence)
+    semantic = attestation.semantic_facts
+    evidence_digest = attestation.evidence_digest
     facts = GateBPhysicalFacts(
         facts_version=GATE_B_FACTS_VERSION,
         registry_namespace=snapshot.registry_namespace,
@@ -714,38 +725,38 @@ def _grant_report(
         canonical_store_id=snapshot.canonical_store_id,
         snapshot_receipt_digest=snapshot.snapshot_receipt_digest,
         expected_prior_generation=snapshot.expected_prior_generation,
-        schema_version=recomputed.facts.schema_version,
-        schema_digest=recomputed.facts.schema_digest,
-        fts5_available=recomputed.facts.fts5_available,
-        sqlite_runtime_version=recomputed.facts.sqlite_runtime_version,
-        unicode_runtime_version=recomputed.facts.unicode_runtime_version,
-        journal_mode=recomputed.facts.journal_mode,
-        synchronous=recomputed.facts.synchronous,
-        foreign_keys=recomputed.facts.foreign_keys,
-        busy_timeout_ms=recomputed.facts.busy_timeout_ms,
-        wal_enabled=recomputed.facts.wal_enabled,
+        schema_version=semantic.schema_version,
+        schema_digest=semantic.schema_digest,
+        fts5_available=semantic.fts5_available,
+        sqlite_runtime_version=semantic.sqlite_runtime_version,
+        unicode_runtime_version=semantic.unicode_runtime_version,
+        journal_mode=semantic.journal_mode,
+        synchronous=semantic.synchronous,
+        foreign_keys=semantic.foreign_keys,
+        busy_timeout_ms=semantic.busy_timeout_ms,
+        wal_enabled=semantic.wal_enabled,
         extension_loading_enabled=(
-            recomputed.facts.extension_loading_enabled
+            semantic.extension_loading_enabled
         ),
-        candidate_index_kind=recomputed.facts.candidate_index_kind,
-        candidate_index_version=recomputed.facts.index_version,
-        fold_version=recomputed.facts.fold_version,
-        origin_batch_count=recomputed.facts.origin_batch_count,
+        candidate_index_kind=semantic.candidate_index_kind,
+        candidate_index_version=semantic.index_version,
+        fold_version=semantic.fold_version,
+        origin_batch_count=semantic.origin_batch_count,
         # The frozen field name is the historical migration seam; the value
         # carries the actual single origin batch id (``migration.<digest>``
         # for migration origins, ``import.<uuid>`` for explicit imports) so
         # Gate B binds the exact batch the activation will publish.
-        migration_batch_id=recomputed.facts.origin_batch_id,
-        completed_revision=recomputed.facts.receipt.exported_revision,
-        source_digest=recomputed.facts.receipt.jsonl_digest,
-        record_count=recomputed.facts.record_count,
-        gram_counts=recomputed.facts.gram_counts,
-        fts_count=recomputed.facts.fts_count,
+        migration_batch_id=semantic.origin_batch_id,
+        completed_revision=semantic.exported_revision,
+        source_digest=attestation.source.sha256,
+        record_count=semantic.record_count,
+        gram_counts=semantic.gram_counts,
+        fts_count=semantic.fts_count,
         integrity_ok=True,
         foreign_keys_ok=True,
-        exact_parity_digest=recomputed.facts.exact_parity_digest,
-        manifest_temp_digest=recomputed.manifest_temp_digest,
-        stage_file_digest=recomputed.stage_file_digest,
+        exact_parity_digest=semantic.exact_parity_digest,
+        manifest_temp_digest=attestation.manifest.sha256,
+        stage_file_digest=attestation.database.sha256,
         evidence_digest=evidence_digest,
     )
     facts_digest = gate_b_facts_digest(facts)
@@ -760,8 +771,8 @@ def _grant_report(
         canonical_store_id=snapshot.canonical_store_id,
         snapshot_receipt_digest=snapshot.snapshot_receipt_digest,
         expected_prior_generation=snapshot.expected_prior_generation,
-        stage_db_digest=recomputed.stage_file_digest,
-        manifest_temp_digest=recomputed.manifest_temp_digest,
+        stage_db_digest=attestation.database.sha256,
+        manifest_temp_digest=attestation.manifest.sha256,
         evidence_digest=evidence_digest,
     )
     grant_digest = gate_b_grant_digest(grant)
@@ -805,7 +816,7 @@ class GateBEvaluator:
         self,
         sealed_stage: SealedStage,
     ) -> GateBPhysicalReadinessReport:
-        """Recompute all physical facts from disk and the registry entry.
+        """Re-prove exact sealed bytes from disk and the registry entry.
 
         Denials are returned as inspectable reports without any grant; the
         evaluation never writes, publishes, drains, or issues anything.  The
@@ -831,38 +842,14 @@ class GateBEvaluator:
             if type(snapshot) is not _PhysicalReadinessSnapshot:
                 raise _GateBFailure("GATE_B.REGISTRY_MISMATCH")
             try:
-                recomputed = tm_stage_sealer._recompute_sealed_facts(
-                    snapshot.mutable_stage,
-                    canonical_store_id=snapshot.canonical_store_id,
-                    expected_prior_generation=(
-                        snapshot.expected_prior_generation
-                    ),
-                    expected_database_identity=(
-                        snapshot.database_identity
-                    ),
-                    expected_manifest_identity=(
-                        snapshot.manifest_identity
-                    ),
-                )
+                attestation = snapshot.sealed_content_attestation
+                _require_claim_closure(snapshot, attestation)
+                _require_linearization_closure(snapshot, attestation)
             except StageSealError as error:
                 raise _GateBFailure(_map_gate_b_code(error)) from error
-            except SQLiteStoreSchemaError as error:
-                raise _GateBFailure(_map_gate_b_code(error)) from error
-            except (
-                OSError,
-                sqlite3.DatabaseError,
-                TypeError,
-                ValueError,
-                AttributeError,
-                RuntimeError,
-            ) as error:
+            except (TypeError, ValueError, AttributeError) as error:
                 raise _GateBFailure("GATE_B.READINESS_FAILED") from error
-            try:
-                _require_claim_closure(snapshot, recomputed)
-                _require_linearization_closure(snapshot, recomputed)
-            except StageSealError as error:
-                raise _GateBFailure(_map_gate_b_code(error)) from error
-            return _grant_report(snapshot, recomputed)
+            return _grant_report(snapshot, attestation)
         except _GateBFailure as failure:
             return _denial_report(failure.error_code)
 
