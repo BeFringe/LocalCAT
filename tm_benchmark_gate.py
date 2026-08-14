@@ -14,9 +14,12 @@ closed-schema canonical JSON codec.  It is an offline validation/batch owner
 only: no production runtime module imports it.
 
 The owner also runs the real Gate D pipeline through one locked entry point
-(``run_benchmark_gate_d``): the real process-migration, query-process and
-oracle-recall-suite ports are bound internally and called in fixed order on
-four exact dedicated roots under one exclusive private run directory; the
+(``run_benchmark_gate_d``): the real oracle-recall-suite port is bound
+internally and called first on the two dedicated oracle roots; only when
+both FTS5_TRIGRAM and GRAM_FALLBACK oracle obligations are fully clear
+(no above-threshold and no top-10 miss) do the real process-migration and
+query-process ports run on the two dedicated process roots under the same
+exclusive private run directory; the
 combined bundle is atomically persisted to an absent final path with a
 durable no-follow readback, and only the exact owned temporary tree is
 cleaned afterwards.  Test injection exists only behind an explicit private
@@ -57,8 +60,10 @@ Invariant capsule
   Candidate recall is derived from the raw rows' obligations (availability,
   index-kind, above-threshold and top-10 missing sets), never from
   ``recall_passed`` or caller-supplied totals.  The hard recall gate stays
-  exactly 1.0; the current real truth (both paths miss 27 true top-10
-  identities) must therefore fail ``CANDIDATE_RECALL`` on both paths.
+  exactly 1.0; a path whose literal oracle obligations are not fully clear
+  (``missing_above_threshold_total`` or ``missing_top10_total`` nonzero)
+  must therefore fail ``CANDIDATE_RECALL``, and the runner stops before any
+  100000-record migration/query work for that path.
 - Latency ms come only from integer ns statistics in the nested
   ``LatencyEvidence`` (recomputed from the retained raw samples);
   migration seconds come from the migration child's ``migration_elapsed_ns``;
@@ -80,10 +85,13 @@ Invariant capsule
   self-consistent caller fields and one-path-only input all fail closed.
   A strict round trip reproduces the same exact immutable value.
 - The real runner locks its default ports internally (``test_mode=False``,
-  no caller-supplied oracle facts, one migration per execution path in enum
-  order, one query per retained final process evidence with no migration
-  rerun, one oracle suite, one combination).  The private test seam requires
-  injected exact-type ports and always returns a ``test_mode=True`` result.
+  no caller-supplied oracle facts).  It runs the literal oracle suite first
+  on the dedicated oracle roots and stops before any migration/query work
+  unless both paths show zero above-threshold and zero top-10 misses; only
+  then does it run one migration per execution path in enum order and one
+  query per retained final process evidence with no migration rerun, then
+  one combination.  The private test seam requires injected exact-type ports
+  and always returns a ``test_mode=True`` result.
 - ``work_root`` must be an existing empty direct native directory; the
   runner creates one exclusive 0700 private child and four exact dedicated
   roots under it, and cleans only that exact created directory after a
@@ -2952,6 +2960,32 @@ def _cleanup_private_run_dir(
     raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
 
 
+def _require_oracle_clear(evidence: OracleRecallEvidence) -> None:
+    """Fail closed unless one path's literal oracle obligations are fully clear.
+
+    The owner-derived literal oracle proof for a path must show no
+    above-threshold and no top-10 miss before any real 100000-record
+    migration/query work for that path may start.  One path's miss blocks
+    the whole run before any expensive migration work; the two paths are
+    independent and one clear path never masks the other.
+    """
+
+    if type(evidence) is not OracleRecallEvidence:
+        raise BenchmarkGateDError("GATE_D.ORACLE_EVIDENCE_INVALID")
+    if (
+        evidence.missing_above_threshold_total != 0
+        or evidence.missing_top10_total != 0
+    ):
+        path_code = (
+            "FTS5"
+            if evidence.execution_path is BenchmarkExecutionPath.FTS5_TRIGRAM
+            else "FALLBACK"
+        )
+        raise BenchmarkGateDError(
+            f"GATE_D.ORACLE_{path_code}_MISS_BLOCKS_100K"
+        )
+
+
 def _run_benchmark_gate_d_core(
     *,
     contract_path: Path,
@@ -2996,6 +3030,13 @@ def _run_benchmark_gate_d_core(
                 oracle_fallback_root,
             )
         }
+        fts5_oracle, fallback_oracle = ports.run_oracle_recall_suite(
+            contract=contract,
+            fts5_run_root=oracle_fts5_root,
+            fallback_run_root=oracle_fallback_root,
+        )
+        _require_oracle_clear(fts5_oracle)
+        _require_oracle_clear(fallback_oracle)
         fts5_process = ports.run_process_migration_evidence(
             contract_path=contract_path,
             execution_path=BenchmarkExecutionPath.FTS5_TRIGRAM,
@@ -3014,11 +3055,6 @@ def _run_benchmark_gate_d_core(
         )
         fts5_run = ports.run_query_process_evidence(fts5_process)
         fallback_run = ports.run_query_process_evidence(fallback_process)
-        fts5_oracle, fallback_oracle = ports.run_oracle_recall_suite(
-            contract=contract,
-            fts5_run_root=oracle_fts5_root,
-            fallback_run_root=oracle_fallback_root,
-        )
         bundle = ports.combine_benchmark_evidence(
             fts5_run,
             fallback_run,
@@ -3064,13 +3100,15 @@ def run_benchmark_gate_d(
     """Run the real owner-driven Gate D pipeline and persist the bundle.
 
     The real default ports are locked internally and run with
-    ``test_mode=False``: one process-migration evidence per
+    ``test_mode=False``: first the literal owner-derived oracle-recall suite
+    on distinct dedicated oracle roots (no caller-supplied or precomputed
+    oracle facts); the run stops before any 100000-record work unless both
+    FTS5_TRIGRAM and GRAM_FALLBACK oracle obligations are fully clear.  Only
+    then does it run one process-migration evidence per
     ``BenchmarkExecutionPath`` in enum order on distinct dedicated process
     roots, one query-process evidence per retained final process evidence
-    with no migration rerun, one owner-derived oracle-recall suite on
-    distinct dedicated oracle roots (no caller-supplied or precomputed
-    oracle facts), and exactly one ``combine_benchmark_evidence`` on those
-    exact values.  The combined bundle is atomically persisted to the absent
+    with no migration rerun, and exactly one ``combine_benchmark_evidence``
+    on those exact values.  The combined bundle is atomically persisted to the absent
     ``evidence_path`` with a durable no-follow readback, and only the exact
     private run tree created under ``work_root`` is cleaned afterwards.
     Test-mode runs are only reachable through the private port seam and can

@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+import itertools
 import json
 from pathlib import Path
+import random
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
-from tm_candidate_index import CandidateRetriever
+import tm_sqlite_store
+
+from tm_candidate_index import (
+    CandidateRetriever,
+    _dense_phase1_upper_bound,
+    _dense_phase2_upper_bound,
+    _should_use_dense_traversal,
+)
 from tm_contracts import (
     CandidateStage,
     CanonicalResourceIdentity,
@@ -24,6 +35,7 @@ from tm_retrieval import TMRetrievalService, prove_and_score_fuzzy_candidates
 from tm_similarity import SimilarityScorerV1
 from tm_sqlite_store import (
     ResourceStoreCoordinator,
+    SQLiteCandidateProofDensePhase2,
     SQLiteCandidateProofSnapshot,
     SQLiteTMQueryView,
     SQLiteTMStore,
@@ -156,7 +168,166 @@ class _AppendingScorer:
         return SimilarityScorerV1().score(query, candidate)
 
 
+class _CountingScorer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def score(self, query: str, candidate: str):
+        self.calls.append((query, candidate))
+        return SimilarityScorerV1().score(query, candidate)
+
+
+def _counting_production_score(calls: list[tuple[str, str]]):
+    original = SimilarityScorerV1.score
+
+    def score(owner: SimilarityScorerV1, query: str, candidate: str):
+        calls.append((query, candidate))
+        return original(owner, query, candidate)
+
+    return score
+
+
 class CandidateProofQueryTests(unittest.TestCase):
+    def test_dense_crossover_includes_flat_top_k_frontiers_below_threshold(
+        self,
+    ) -> None:
+        self.assertTrue(
+            _should_use_dense_traversal(
+                (0.46,) * 391,
+                minimum_similarity=0.60,
+            )
+        )
+        self.assertFalse(
+            _should_use_dense_traversal(
+                (0.93,) * 8 + (0.29,) * 383,
+                minimum_similarity=0.60,
+            )
+        )
+
+    def test_two_phase_dense_bounds_order_true_score_u2_u1(self) -> None:
+        scorer = SimilarityScorerV1()
+        alphabet = "ab"
+        values = tuple(
+            "".join(characters)
+            for length in range(1, 6)
+            for characters in itertools.product(
+                alphabet,
+                repeat=length,
+            )
+        )
+        for query_source in values:
+            query_characters = dict(
+                character_ngram_frequencies(query_source, 1)
+            )
+            query_bigrams = dict(
+                character_ngram_frequencies(query_source, 2)
+            )
+            for candidate_source in values:
+                candidate_characters = dict(
+                    character_ngram_frequencies(candidate_source, 1)
+                )
+                candidate_bigrams = dict(
+                    character_ngram_frequencies(candidate_source, 2)
+                )
+                character_intersection = sum(
+                    min(frequency, candidate_characters.get(gram, 0))
+                    for gram, frequency in query_characters.items()
+                )
+                bigram_intersection = sum(
+                    min(frequency, candidate_bigrams.get(gram, 0))
+                    for gram, frequency in query_bigrams.items()
+                )
+                phase1 = _dense_phase1_upper_bound(
+                    query_length=len(query_source),
+                    record_length=len(candidate_source),
+                    bigram_intersection=bigram_intersection,
+                )
+                phase2 = _dense_phase2_upper_bound(
+                    query_length=len(query_source),
+                    record_length=len(candidate_source),
+                    character_intersection=character_intersection,
+                    bigram_intersection=bigram_intersection,
+                )
+                true_score = scorer.score(
+                    query_source,
+                    candidate_source,
+                ).final_similarity
+                self.assertLessEqual(true_score, phase2 + 1e-12)
+                self.assertLessEqual(phase2, phase1 + 1e-12)
+
+    def test_two_phase_dense_bounds_hold_for_fixed_random_vectors(self) -> None:
+        generator = random.Random(0xC0FFEE)
+        scorer = SimilarityScorerV1()
+        for _index in range(2_000):
+            query_source = "".join(
+                generator.choice("abcde")
+                for _ in range(generator.randint(1, 40))
+            )
+            candidate_source = "".join(
+                generator.choice("abcde")
+                for _ in range(generator.randint(1, 40))
+            )
+            query_characters = dict(character_ngram_frequencies(query_source, 1))
+            query_bigrams = dict(character_ngram_frequencies(query_source, 2))
+            candidate_characters = dict(
+                character_ngram_frequencies(candidate_source, 1)
+            )
+            candidate_bigrams = dict(
+                character_ngram_frequencies(candidate_source, 2)
+            )
+            character_intersection = sum(
+                min(frequency, candidate_characters.get(gram, 0))
+                for gram, frequency in query_characters.items()
+            )
+            bigram_intersection = sum(
+                min(frequency, candidate_bigrams.get(gram, 0))
+                for gram, frequency in query_bigrams.items()
+            )
+            phase1 = _dense_phase1_upper_bound(
+                query_length=len(query_source),
+                record_length=len(candidate_source),
+                bigram_intersection=bigram_intersection,
+            )
+            phase2 = _dense_phase2_upper_bound(
+                query_length=len(query_source),
+                record_length=len(candidate_source),
+                character_intersection=character_intersection,
+                bigram_intersection=bigram_intersection,
+            )
+            true_score = scorer.score(
+                query_source,
+                candidate_source,
+            ).final_similarity
+            self.assertLessEqual(true_score, phase2 + 1e-12)
+            self.assertLessEqual(phase2, phase1 + 1e-12)
+
+    def test_two_phase_dense_bounds_cover_single_character_and_repeats(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _dense_phase1_upper_bound(
+                query_length=1,
+                record_length=1,
+                bigram_intersection=0,
+            ),
+            1.0,
+        )
+        scorer = SimilarityScorerV1()
+        true_score = scorer.score("aaaaa", "aaaba").final_similarity
+        phase1 = _dense_phase1_upper_bound(
+            query_length=5,
+            record_length=5,
+            bigram_intersection=2,
+        )
+        phase2 = _dense_phase2_upper_bound(
+            query_length=5,
+            record_length=5,
+            character_intersection=4,
+            bigram_intersection=2,
+        )
+        self.assertLessEqual(true_score, phase2 + 1e-12)
+        self.assertLessEqual(phase2, phase1 + 1e-12)
+
     def test_global_frontier_opens_high_bound_nonseed_before_low_bound_seed(
         self,
     ) -> None:
@@ -223,7 +394,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                         )
                     proof = report.metadata.proof
                     assert proof is not None
-                    self.assertEqual(opened, [1, 0])
+                    self.assertEqual(opened, [1])
                     self.assertEqual(proof.seed_unique_count, 256)
 
     def test_session_initialization_and_unopened_blocks_are_lazy(self) -> None:
@@ -280,6 +451,25 @@ class CandidateProofQueryTests(unittest.TestCase):
         proof["caller_complete"] = True
         with self.assertRaisesRegex(ValueError, "unexpected fields"):
             contract_from_json(json.dumps(payload))
+
+        legacy = json.loads(encoded)
+        legacy_proof = legacy["payload"]["metadata"]["proof"]
+        legacy_proof["proof_version"] = "candidate-proof-query-v1"
+        legacy_proof["scored_count"] = legacy_proof.pop(
+            "accounted_identity_count"
+        )
+        legacy_proof["unscored_count"] = legacy_proof.pop(
+            "unscored_identity_count"
+        )
+        for field_name in (
+            "scorer_invocation_count",
+            "scanned_block_count",
+            "traversal_mode",
+            "traversal_version",
+        ):
+            legacy_proof.pop(field_name)
+        with self.assertRaises(ValueError):
+            contract_from_json(json.dumps(legacy))
 
     def test_proof_contract_closes_universe_stage_and_scored_identities(
         self,
@@ -365,6 +555,22 @@ class CandidateProofQueryTests(unittest.TestCase):
                 "frontier-is-scored",
                 {"kth_score": 0.1, "unscored_possible_record_id": 40},
             ),
+            (
+                "invocations-exceed-accounted",
+                {
+                    "scorer_invocation_count": (
+                        proof.accounted_identity_count + 1
+                    )
+                },
+            ),
+            (
+                "identity-conservation-drift",
+                {
+                    "unscored_identity_count": (
+                        proof.unscored_identity_count + 1
+                    )
+                },
+            ),
         )
         encoded = contract_to_json(report)
         for name, changes in mutations:
@@ -445,8 +651,6 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("a"),
                     view=view,
-                    retriever=CandidateRetriever(),
-                    scorer=SimilarityScorerV1(),
                 )
 
         self.assertEqual(fuzzy.accepted, ())
@@ -455,7 +659,8 @@ class CandidateProofQueryTests(unittest.TestCase):
         assert proof is not None
         self.assertTrue(proof.threshold_closed)
         self.assertTrue(proof.top_k_closed)
-        self.assertEqual(proof.scored_count, 10)
+        self.assertEqual(proof.scorer_invocation_count, 10)
+        self.assertEqual(proof.accounted_identity_count, 10)
         self.assertEqual(proof.kth_score, 0.0)
         self.assertEqual(proof.kth_record_id, 31)
         self.assertIn(CandidateStage.BOUND_PROOF, tuple(
@@ -475,24 +680,84 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("candidate 0", threshold=1.0),
                     view=view,
-                    retriever=CandidateRetriever(),
-                    scorer=SimilarityScorerV1(),
                 )
 
         proof = report.metadata.proof
         assert proof is not None
         self.assertTrue(proof.threshold_closed)
-        self.assertEqual(proof.unscored_count, 0)
+        self.assertEqual(proof.unscored_identity_count, 0)
         self.assertIn(1, tuple(result.record_id for result in _fuzzy.accepted))
 
-    def test_budget_exhaustion_is_stable_and_returns_no_fuzzy_rows(self) -> None:
+    def test_2049_identities_sharing_one_fold_use_one_scorer_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = _store(
                 Path(temporary),
                 tuple("same folded source" for _ in range(2049)),
                 fts5_available=False,
             )
-            with store.query_lease() as view:
+            calls: list[tuple[str, str]] = []
+            phase2_calls = 0
+            original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+
+            def count_phase2(view: SQLiteTMQueryView, **kwargs):
+                nonlocal phase2_calls
+                phase2_calls += 1
+                return original_phase2(view, **kwargs)
+
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase2",
+                new=count_phase2,
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("same folded source", threshold=1.0),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(proof.scorer_invocation_count, 1)
+        self.assertEqual(proof.accounted_identity_count, 2049)
+        self.assertEqual(proof.unscored_identity_count, 0)
+        self.assertEqual(len(report.candidates), 2049)
+        self.assertEqual(phase2_calls, 1)
+
+    def test_2049_distinct_folds_exhaust_after_exactly_2048_calls(self) -> None:
+        query_source = "Shared source sentence 6 about recordx"
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                tuple(
+                    f"Shared source sentence 6 about record{index}"
+                    for index in range(2049)
+                ),
+                fts5_available=False,
+            )
+            calls: list[tuple[str, str]] = []
+            phase2_calls = 0
+            original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+
+            def count_phase2(view: SQLiteTMQueryView, **kwargs):
+                nonlocal phase2_calls
+                phase2_calls += 1
+                return original_phase2(view, **kwargs)
+
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase2",
+                new=count_phase2,
+            ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "^CANDIDATE.PROOF_BUDGET_EXHAUSTED$",
@@ -500,11 +765,618 @@ class CandidateProofQueryTests(unittest.TestCase):
                     prove_and_score_fuzzy_candidates(
                         resource_id="tm.primary",
                         resource_order=0,
-                        query=_query("same folded source"),
+                        query=_query(query_source),
                         view=view,
-                        retriever=CandidateRetriever(),
-                        scorer=SimilarityScorerV1(),
                     )
+
+        self.assertEqual(len(calls), 2048)
+        self.assertEqual(phase2_calls, 1)
+
+    def test_3000_identities_in_300_folds_close_with_300_calls(self) -> None:
+        query_source = "Shared source sentence 6 about recordx"
+        sources = tuple(
+            f"Shared source sentence 6 about record{fold_index}"
+            for fold_index in range(300)
+            for _multiplicity in range(10)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                sources,
+                fts5_available=False,
+            )
+            calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(len(calls), 300)
+        self.assertEqual(proof.scorer_invocation_count, 300)
+        self.assertEqual(proof.accounted_identity_count, 3000)
+        self.assertEqual(proof.unscored_identity_count, 0)
+        refinement = proof.refinement
+        assert refinement is not None
+        self.assertEqual(refinement.a0_accounted_identity_count, 10)
+        self.assertEqual(
+            refinement.refinement_request_count,
+            refinement.refinement_returned_count,
+        )
+        self.assertEqual(
+            refinement.a0_accounted_identity_count
+            + refinement.p1_unscored_identity_count
+            + refinement.r_refinement_identity_count,
+            proof.total_record_count,
+        )
+        self.assertEqual(
+            refinement.a1_accounted_identity_count
+            + refinement.p2_unscored_identity_count,
+            refinement.r_refinement_identity_count,
+        )
+
+    def test_partial_final_batch_stops_at_the_closed_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                (("candidate 0",) * 11)
+                + tuple(chr(0x400 + index) for index in range(31)),
+                fts5_available=False,
+            )
+            with store.query_lease() as view:
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("candidate x"),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(proof.scorer_invocation_count, 1)
+        self.assertEqual(proof.accounted_identity_count, 11)
+        self.assertEqual(proof.unscored_identity_count, 31)
+        self.assertTrue(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+        self.assertTrue(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+
+    def test_full_fold_equivalence_reuses_evidence_and_preserves_raw_rows(
+        self,
+    ) -> None:
+        sources = ("CAFÉ SOURCE", "cafe\u0301 source", "Café Source")
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(Path(temporary), sources, fts5_available=False)
+            calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ):
+                fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("café source!", threshold=0.0),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(proof.scorer_invocation_count, 1)
+        self.assertEqual(proof.accounted_identity_count, 3)
+        self.assertEqual(
+            {result.matched_source for result in fuzzy.accepted},
+            set(sources),
+        )
+        serialized = contract_to_json(report)
+        self.assertNotIn("CAFÉ SOURCE", serialized)
+        self.assertNotIn("cafe\\u0301 source", serialized)
+
+    def test_equal_length_character_and_bigram_facts_do_not_authorize_reuse(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                ("abaca", "acaba"),
+                fts5_available=False,
+            )
+            calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("adada", threshold=0.0),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(proof.scorer_invocation_count, 2)
+        self.assertEqual(proof.accounted_identity_count, 2)
+
+    def test_dense_and_sparse_proof_modes_are_semantically_identical(self) -> None:
+        sources = tuple(
+            f"shared source sentence about record{index % 30}"
+            for index in range(600)
+        )
+        query = _query("shared source sentence about recordx")
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    store = _store(
+                        Path(temporary),
+                        sources,
+                        fts5_available=fts5_available,
+                    )
+                    reports = []
+                    results = []
+                    for dense in (False, True):
+                        with store.query_lease() as view, patch(
+                            "tm_candidate_index._should_use_dense_traversal",
+                            return_value=dense,
+                        ):
+                            fuzzy, report = prove_and_score_fuzzy_candidates(
+                                resource_id="tm.primary",
+                                resource_order=0,
+                                query=query,
+                                view=view,
+                            )
+                        reports.append(report)
+                        results.append(tuple(
+                            (row.record_id, row.similarity)
+                            for row in fuzzy.accepted
+                        ))
+
+                self.assertEqual(results[0], results[1])
+                sparse = reports[0].metadata.proof
+                dense = reports[1].metadata.proof
+                assert sparse is not None and dense is not None
+                self.assertEqual(sparse.traversal_mode, "SPARSE")
+                self.assertEqual(dense.traversal_mode, "DENSE")
+                self.assertEqual(
+                    sparse.scorer_invocation_count,
+                    dense.scorer_invocation_count,
+                )
+
+    def test_dense_equal_score_record_id_tie_closes_only_below_k0(self) -> None:
+        sources = tuple(chr(0x400 + index) for index in range(600))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(Path(temporary), sources, fts5_available=False)
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("a"),
+                    view=view,
+                )
+        proof = report.metadata.proof
+        assert proof is not None and proof.refinement is not None
+        refinement = proof.refinement
+        self.assertEqual(proof.kth_score, 0.0)
+        self.assertEqual(proof.kth_record_id, 591)
+        self.assertEqual(refinement.k0_score, 0.0)
+        self.assertEqual(refinement.k0_record_id, 591)
+        self.assertEqual(refinement.p1_unscored_identity_count, 0)
+        self.assertEqual(refinement.p2_unscored_identity_count, 590)
+        self.assertEqual(refinement.p2_max_upper_bound, 0.0)
+        self.assertEqual(refinement.p2_possible_record_id, 590)
+
+    def test_dense_mixed_frontier_contract_rejects_count_and_tie_forgery(
+        self,
+    ) -> None:
+        sources = tuple("abcdefghij" + ("z" * 90) for _ in range(600))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(Path(temporary), sources, fts5_available=False)
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("abcdefghij"),
+                    view=view,
+                )
+        proof = report.metadata.proof
+        assert proof is not None and proof.refinement is not None
+        refinement = proof.refinement
+        self.assertEqual(refinement.p1_unscored_identity_count, 590)
+        encoded = contract_to_json(report)
+        nested_mutations = (
+            {
+                "refinement_request_count": (
+                    refinement.refinement_request_count + 1
+                )
+            },
+            {
+                "refinement_returned_count": (
+                    refinement.refinement_returned_count + 1
+                )
+            },
+            {
+                "p1_unscored_identity_count": (
+                    refinement.p1_unscored_identity_count + 1
+                )
+            },
+        )
+        for changes in nested_mutations:
+            with self.subTest(changes=changes, boundary="constructor"):
+                with self.assertRaises(ValueError):
+                    _ = replace(
+                        proof,
+                        refinement=replace(refinement, **changes),
+                    )
+            with self.subTest(changes=changes, boundary="decode"):
+                payload = json.loads(encoded)
+                payload["payload"]["metadata"]["proof"]["refinement"].update(
+                    changes
+                )
+                with self.assertRaises(ValueError):
+                    contract_from_json(json.dumps(payload))
+
+        assert proof.kth_score is not None and proof.kth_record_id is not None
+        with self.assertRaises(ValueError):
+            _ = replace(
+                proof,
+                unscored_max_upper_bound=proof.kth_score,
+                unscored_possible_record_id=proof.kth_record_id,
+                refinement=replace(
+                    refinement,
+                    p1_max_upper_bound=proof.kth_score,
+                    p1_possible_record_id=proof.kth_record_id,
+                ),
+            )
+
+    def test_dense_fact_transaction_commits_before_scorer_and_append_is_stale(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = _store(
+                root,
+                tuple(
+                    f"shared source sentence about record{index % 30}"
+                    for index in range(600)
+                ),
+                fts5_available=False,
+            )
+            original = SimilarityScorerV1.score
+            phase1_calls = 0
+            phase2_calls = 0
+            sparse_calls = 0
+            append_elapsed = 0.0
+            appended = False
+
+            def append_then_score(
+                owner: SimilarityScorerV1,
+                query: str,
+                candidate: str,
+            ):
+                nonlocal append_elapsed, appended
+                if not appended:
+                    appended = True
+                    started = time.perf_counter()
+                    store.append_batch(
+                        batch_id="import.concurrent-proof",
+                        kind="import",
+                        drafts=(_draft("concurrent row", 999),),
+                        source_digest="8" * 64,
+                        source_path=(root / "concurrent.jsonl").resolve(),
+                    )
+                    append_elapsed = time.perf_counter() - started
+                return original(owner, query, candidate)
+
+            original_phase1 = SQLiteTMQueryView.candidate_proof_dense_phase1
+            original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+            original_sparse = SQLiteTMQueryView.candidate_proof_block_records
+
+            def count_phase1(view: SQLiteTMQueryView, **kwargs):
+                nonlocal phase1_calls
+                phase1_calls += 1
+                return original_phase1(view, **kwargs)
+
+            def count_phase2(view: SQLiteTMQueryView, **kwargs):
+                nonlocal phase2_calls
+                phase2_calls += 1
+                return original_phase2(view, **kwargs)
+
+            def count_sparse(view: SQLiteTMQueryView, **kwargs):
+                nonlocal sparse_calls
+                sparse_calls += 1
+                return original_sparse(view, **kwargs)
+
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase1",
+                new=count_phase1,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase2",
+                new=count_phase2,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_block_records",
+                new=count_sparse,
+            ), patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=append_then_score,
+            ):
+                with self.assertRaisesRegex(
+                    Exception,
+                    "STORE.CANDIDATE_PROOF_STALE",
+                ):
+                    prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query(
+                            "shared source sentence about recordx"
+                        ),
+                        view=view,
+                    )
+
+        self.assertEqual(phase1_calls, 1)
+        self.assertEqual(phase2_calls, 1)
+        self.assertEqual(sparse_calls, 0)
+        self.assertLess(append_elapsed, 1.0)
+
+    def test_dense_query_maxima_digest_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                tuple(f"candidate {index}" for index in range(2_100)),
+                fts5_available=False,
+            )
+            with store.query_lease() as view:
+                snapshot = view.candidate_proof_snapshot(
+                    folded_query="candidate x",
+                    seed_limit=256,
+                )
+                forged = replace(snapshot, query_maxima_digest="0" * 64)
+                with patch.object(
+                    SQLiteTMQueryView,
+                    "candidate_proof_snapshot",
+                    return_value=forged,
+                ), patch(
+                    "tm_candidate_index._should_use_dense_traversal",
+                    return_value=True,
+                ), self.assertRaisesRegex(
+                    Exception,
+                    "STORE.CANDIDATE_PROOF_INVALID",
+                ):
+                    prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query("candidate x"),
+                        view=view,
+                    )
+
+    def test_dense_refinement_response_is_strict_ordered_and_bound(self) -> None:
+        sources = tuple(
+            f"shared source sentence about record{index % 30}"
+            for index in range(600)
+        )
+        mutations = ("missing", "duplicate", "order", "outside", "extra", "binding")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                store = _store(Path(temporary), sources, fts5_available=False)
+                original = SQLiteTMQueryView.candidate_proof_dense_phase2
+
+                def mutate(view: SQLiteTMQueryView, **kwargs):
+                    response = original(view, **kwargs)
+                    ids = response.record_ids
+                    characters = response.character_multiset_intersections
+                    self.assertGreaterEqual(len(ids), 2)
+                    if mutation == "missing":
+                        return replace(
+                            response,
+                            record_ids=ids[:-1],
+                            character_multiset_intersections=characters[:-1],
+                        )
+                    if mutation == "duplicate":
+                        return replace(response, record_ids=(ids[0], ids[0], *ids[2:]))
+                    if mutation == "order":
+                        return replace(response, record_ids=(ids[1], ids[0], *ids[2:]))
+                    if mutation == "outside":
+                        return replace(
+                            response,
+                            record_ids=(len(sources) + 1, *ids[1:]),
+                        )
+                    if mutation == "extra":
+                        return replace(
+                            response,
+                            record_ids=(*ids, 1),
+                            character_multiset_intersections=(*characters, 0),
+                        )
+                    return replace(response, binding_digest="0" * 64)
+
+                with store.query_lease() as view, patch(
+                    "tm_candidate_index._should_use_dense_traversal",
+                    return_value=True,
+                ), patch.object(
+                    SQLiteTMQueryView,
+                    "candidate_proof_dense_phase2",
+                    new=mutate,
+                ), self.assertRaisesRegex(
+                    Exception,
+                    "STORE.CANDIDATE_PROOF_INVALID",
+                ):
+                    prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query("shared source sentence about recordx"),
+                        view=view,
+                    )
+
+    def test_append_during_dense_phase2_is_stale_without_scorer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = _store(
+                root,
+                tuple(
+                    f"shared source sentence about record{index % 30}"
+                    for index in range(600)
+                ),
+                fts5_available=False,
+            )
+            original_validate = tm_sqlite_store._validate_candidate_proof_dense_binding
+            original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+            validation_calls = 0
+            writer: threading.Thread | None = None
+            writer_errors: list[BaseException] = []
+
+            def append() -> None:
+                try:
+                    store.append_batch(
+                        batch_id="import.concurrent-phase2",
+                        kind="import",
+                        drafts=(_draft("concurrent phase2 row", 999),),
+                        source_digest="7" * 64,
+                        source_path=(root / "concurrent-phase2.jsonl").resolve(),
+                    )
+                except BaseException as error:
+                    writer_errors.append(error)
+
+            def race_validate(connection, **kwargs):
+                nonlocal validation_calls, writer
+                binding = original_validate(connection, **kwargs)
+                validation_calls += 1
+                if validation_calls == 2:
+                    writer = threading.Thread(target=append)
+                    writer.start()
+                return binding
+
+            def join_phase2(view: SQLiteTMQueryView, **kwargs):
+                response = original_phase2(view, **kwargs)
+                assert writer is not None
+                writer.join(timeout=2.0)
+                self.assertFalse(writer.is_alive())
+                return response
+
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch(
+                "tm_sqlite_store._validate_candidate_proof_dense_binding",
+                new=race_validate,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase2",
+                new=join_phase2,
+            ), self.assertRaisesRegex(
+                Exception,
+                "STORE.CANDIDATE_PROOF_STALE",
+            ):
+                prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("shared source sentence about recordx"),
+                    view=view,
+                )
+            self.assertEqual(writer_errors, [])
+
+    def test_append_after_phase2_during_scorer_is_stale_and_nonblocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = _store(
+                root,
+                tuple(
+                    f"shared source sentence about record{index % 30}"
+                    for index in range(600)
+                ),
+                fts5_available=False,
+            )
+            original = SimilarityScorerV1.score
+            calls = 0
+            append_elapsed = 0.0
+
+            def append_on_phase2_score(
+                owner: SimilarityScorerV1,
+                query: str,
+                candidate: str,
+            ):
+                nonlocal calls, append_elapsed
+                calls += 1
+                if calls == 11:
+                    started = time.perf_counter()
+                    store.append_batch(
+                        batch_id="import.concurrent-after-phase2",
+                        kind="import",
+                        drafts=(_draft("concurrent scorer row", 999),),
+                        source_digest="6" * 64,
+                        source_path=(root / "concurrent-scorer.jsonl").resolve(),
+                    )
+                    append_elapsed = time.perf_counter() - started
+                return original(owner, query, candidate)
+
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=append_on_phase2_score,
+            ), self.assertRaisesRegex(
+                Exception,
+                "STORE.CANDIDATE_PROOF_STALE",
+            ):
+                prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("shared source sentence about recordx"),
+                    view=view,
+                )
+            self.assertGreaterEqual(calls, 11)
+            self.assertLess(append_elapsed, 1.0)
+
+    def test_injected_scorer_uses_nonproof_path_without_fold_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _activated_store(
+                Path(temporary) / "custom",
+                ("CAFÉ SOURCE", "cafe\u0301 source"),
+                resource_id="tm.custom",
+                fts5_available=False,
+            )
+            scorer = _CountingScorer()
+            report = TMRetrievalService(
+                scorer=scorer,
+                capability_publisher=_retrieval_capability_publisher(),
+            ).query(
+                (TMResourceHandle("tm.custom", store, True, True, True, 0),),
+                TMQuery(
+                    query_source="café source!",
+                    speaker_raw=None,
+                    context_prev_raw=None,
+                    context_next_raw=None,
+                    minimum_similarity=0.0,
+                    limit=10,
+                    resource_order=("tm.custom",),
+                ),
+            )
+
+        self.assertEqual(len(scorer.calls), 2)
+        self.assertIsNone(report.resource_metadata[0].recall.proof)
 
     def test_understated_or_missing_proof_facts_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -554,7 +1426,27 @@ class CandidateProofQueryTests(unittest.TestCase):
                 fts5_available=False,
             )
             with store.query_lease() as view:
-                with self.assertRaisesRegex(
+                original_score = SimilarityScorerV1.score
+                appended = False
+
+                def append_then_score(scorer, query_source, candidate_source):
+                    nonlocal appended
+                    if not appended:
+                        appended = True
+                        store.append_batch(
+                            batch_id="import.concurrent-proof",
+                            kind="import",
+                            drafts=(_draft("concurrent row", 999),),
+                            source_digest="8" * 64,
+                            source_path=(root / "concurrent.jsonl").resolve(),
+                        )
+                    return original_score(scorer, query_source, candidate_source)
+
+                with patch.object(
+                    SimilarityScorerV1,
+                    "score",
+                    new=append_then_score,
+                ), self.assertRaisesRegex(
                     Exception,
                     "STORE.CANDIDATE_PROOF_STALE",
                 ):
@@ -563,7 +1455,6 @@ class CandidateProofQueryTests(unittest.TestCase):
                         resource_order=0,
                         query=_query("candidate 0"),
                         view=view,
-                        scorer=_AppendingScorer(store, root),
                     )
 
     def test_budget_failure_preserves_exact_context_and_other_resource(self) -> None:
@@ -571,7 +1462,7 @@ class CandidateProofQueryTests(unittest.TestCase):
             root = Path(temporary)
             failed_store = _activated_store(
                 root / "failed",
-                ("same folded source",) * 2049,
+                tuple(f"distinct folded source {index}" for index in range(2049)),
                 resource_id="tm.failed",
                 fts5_available=False,
             )
@@ -582,7 +1473,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                 fts5_available=False,
             )
             query = TMQuery(
-                query_source="same folded source",
+                query_source="distinct folded source 0",
                 speaker_raw="speaker",
                 context_prev_raw=None,
                 context_next_raw=None,

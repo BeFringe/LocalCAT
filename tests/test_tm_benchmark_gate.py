@@ -146,8 +146,8 @@ def _digest(prefix: str) -> str:
 
 def _runner_ports(
     *,
-    fts5_missing: int = 27,
-    fallback_missing: int = 27,
+    fts5_missing: int = 0,
+    fallback_missing: int = 0,
     combine_side_effect: Any = None,
 ) -> tuple[_GateDRunnerPorts, dict[str, list[object]]]:
     """Build exact-type injected runner ports over small synthetic fixtures.
@@ -155,6 +155,8 @@ def _runner_ports(
     The ports record invocation order and the exact dedicated roots the
     runner hands them; the combine port delegates to the real strict
     ``combine_benchmark_evidence`` so the produced bundle is final-shaped.
+    Oracle fixtures are fully clear by default so the pipeline reaches the
+    combine stage; fail-closed oracle tests pass explicit miss counts.
     ``combine_side_effect`` runs after combination to sabotage the owned
     tree for fail-closed cleanup tests.
     """
@@ -1297,8 +1299,8 @@ class GateDRunnerTests(unittest.TestCase):
         work_root: Path,
         evidence_path: Path,
         *,
-        fts5_missing: int = 27,
-        fallback_missing: int = 27,
+        fts5_missing: int = 0,
+        fallback_missing: int = 0,
         combine_side_effect: Any = None,
     ) -> tuple[BenchmarkGateDRunResult, dict[str, list[object]]]:
         ports, record = _runner_ports(
@@ -1342,7 +1344,9 @@ class GateDRunnerTests(unittest.TestCase):
         )
         self._assert_clean_work_root(work_root)
 
-    def test_runner_invokes_ports_in_fixed_order_once_each(self) -> None:
+    def test_runner_invokes_oracle_then_ports_in_fixed_order_once_each(
+        self,
+    ) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         result, record = self._run(work_root, evidence_path)
         self.assertIsInstance(result, BenchmarkGateDRunResult)
@@ -1350,13 +1354,67 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertEqual(
             record["calls"],
             [
+                ("oracle",),
                 ("migration", _FTS5),
                 ("migration", _FALLBACK),
                 ("query", _FTS5),
                 ("query", _FALLBACK),
-                ("oracle",),
                 ("combine",),
             ],
+        )
+
+    def _assert_runner_blocked_by_oracle(
+        self,
+        *,
+        fts5_missing: int,
+        fallback_missing: int,
+        error_code: str,
+    ) -> None:
+        temp, work_root, evidence_path = self._fresh_run_env()
+        ports, record = _runner_ports(
+            fts5_missing=fts5_missing,
+            fallback_missing=fallback_missing,
+        )
+        with self.assertRaises(BenchmarkGateDError) as ctx:
+            _run_benchmark_gate_d_test(
+                _ROOT / "benchmark_tm_contract.json",
+                work_root,
+                evidence_path,
+                ports=ports,
+                test_record_count=_TEST_RECORD_COUNT,
+                test_seed=0,
+            )
+        self.assertEqual(ctx.exception.error_code, error_code)
+        self.assertEqual(record["calls"], [("oracle",)])
+        self.assertEqual(record["migration_roots"], [])
+        self.assertFalse(evidence_path.exists())
+        self._assert_clean_work_root(work_root)
+
+    def test_runner_oracle_miss_blocks_100k_before_any_migration(
+        self,
+    ) -> None:
+        self._assert_runner_blocked_by_oracle(
+            fts5_missing=1,
+            fallback_missing=0,
+            error_code="GATE_D.ORACLE_FTS5_MISS_BLOCKS_100K",
+        )
+
+    def test_runner_fallback_oracle_miss_blocks_100k_without_masking(
+        self,
+    ) -> None:
+        self._assert_runner_blocked_by_oracle(
+            fts5_missing=0,
+            fallback_missing=1,
+            error_code="GATE_D.ORACLE_FALLBACK_MISS_BLOCKS_100K",
+        )
+
+    def test_runner_both_oracle_misses_block_100k_on_first_path(
+        self,
+    ) -> None:
+        self._assert_runner_blocked_by_oracle(
+            fts5_missing=1,
+            fallback_missing=1,
+            error_code="GATE_D.ORACLE_FTS5_MISS_BLOCKS_100K",
         )
 
     def test_runner_uses_distinct_dedicated_roots_then_cleans_work_root(
@@ -1380,7 +1438,7 @@ class GateDRunnerTests(unittest.TestCase):
     def test_runner_persists_durable_readback_before_cleanup(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         ports, _ = _runner_ports()
-        expected_bundle = _combined_bundle()
+        expected_bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
         real_cleanup = tm_benchmark_gate._cleanup_private_run_dir
         observed: dict[str, object] = {}
 
