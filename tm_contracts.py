@@ -648,8 +648,6 @@ def _validate_candidate_proof_metadata(
         raise ValueError("candidate proof scored/unscored counts do not conserve")
     if metadata.scored_count > metadata.inspected_record_count:
         raise ValueError("candidate proof scored count exceeds inspected records")
-    if metadata.seed_unique_count > metadata.inspected_record_count:
-        raise ValueError("candidate proof seed count exceeds inspected records")
     if metadata.seed_unique_count > metadata.total_record_count:
         raise ValueError("candidate proof seed count exceeds total records")
 
@@ -666,6 +664,11 @@ def _validate_candidate_proof_metadata(
             raise TypeError("unscored maximum upper bound must be a float")
         _require_ratio(upper_bound, "unscored maximum upper bound")
         _require_int(record_id, "unscored possible record id", minimum=1)
+        assert type(record_id) is int
+        if record_id > metadata.total_record_count:
+            raise ValueError(
+                "unscored frontier identity is outside the proof universe"
+            )
 
     if metadata.threshold_closed:
         if (
@@ -687,6 +690,9 @@ def _validate_candidate_proof_metadata(
             raise TypeError("closed top-k proof requires a float kth score")
         _require_ratio(kth_score, "candidate proof kth score")
         _require_int(kth_record_id, "candidate proof kth record id", minimum=1)
+        assert type(kth_record_id) is int
+        if kth_record_id > metadata.total_record_count:
+            raise ValueError("kth identity is outside the proof universe")
         if metadata.unscored_count:
             frontier_score = metadata.unscored_max_upper_bound
             frontier_id = metadata.unscored_possible_record_id
@@ -936,6 +942,10 @@ def _validate_candidate_recall_metadata(
         )
     if metadata.proof is not None:
         proof_stage = stages[stage_values.index(CandidateStage.BOUND_PROOF)]
+        if proof_stage.input_count != metadata.proof.seed_unique_count:
+            raise ValueError(
+                "BOUND_PROOF input must equal proof seed unique count"
+            )
         if proof_stage.output_unique_count != metadata.proof.scored_count:
             raise ValueError("BOUND_PROOF output must equal proof scored count")
         if metadata.union_unique_count != metadata.proof.scored_count:
@@ -1082,6 +1092,23 @@ def _validate_candidate_retrieval_report(
     record_ids = tuple(candidate.record_id for candidate in candidates)
     if len(record_ids) != len(set(record_ids)):
         raise ValueError("candidate values must have unique record ids")
+    proof = report.metadata.proof
+    if proof is not None:
+        scored_identities = set(record_ids)
+        if any(record_id > proof.total_record_count for record_id in record_ids):
+            raise ValueError("candidate identity is outside the proof universe")
+        if (
+            proof.kth_record_id is not None
+            and proof.kth_record_id not in scored_identities
+        ):
+            raise ValueError("kth identity must be a scored candidate identity")
+        if (
+            proof.unscored_possible_record_id is not None
+            and proof.unscored_possible_record_id in scored_identities
+        ):
+            raise ValueError(
+                "unscored frontier identity must not be a scored candidate identity"
+            )
     executed_evidence_stages = {
         stage_metadata.stage
         for stage_metadata in report.metadata.stages

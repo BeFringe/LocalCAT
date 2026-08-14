@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import json
 from pathlib import Path
 import sqlite3
@@ -27,11 +27,25 @@ from tm_sqlite_store import (
     SQLiteCandidateProofSnapshot,
     SQLiteTMQueryView,
     SQLiteTMStore,
+    character_ngram_frequencies,
     initialize_stage_schema,
 )
 from tm_stage_sealer import StageSealer
 from tests.test_tm_sqlite_store import _stage
 from tests.test_tm_retrieval import _retrieval_capability_publisher
+
+
+def _unchecked_replace(value, **changes):
+    """Forge a malformed frozen contract for encode-boundary rejection tests."""
+
+    forged = object.__new__(type(value))
+    for field in fields(value):
+        object.__setattr__(
+            forged,
+            field.name,
+            changes.get(field.name, getattr(value, field.name)),
+        )
+    return forged
 
 
 def _draft(source: str, ordinal: int) -> TMRecordDraft:
@@ -143,6 +157,75 @@ class _AppendingScorer:
 
 
 class CandidateProofQueryTests(unittest.TestCase):
+    def test_global_frontier_opens_high_bound_nonseed_before_low_bound_seed(
+        self,
+    ) -> None:
+        query_source = "abcdefghij"
+        low_bound_seed = query_source + ("x" * 990)
+        high_bound_nonseed = "acebdzzzzz"
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    store = _store(
+                        Path(temporary),
+                        (low_bound_seed,) * 256 + (high_bound_nonseed,) * 44,
+                        fts5_available=fts5_available,
+                    )
+                    opened: list[int] = []
+                    original = SQLiteTMQueryView.candidate_proof_block_records
+
+                    def observe_open(view: SQLiteTMQueryView, **kwargs):
+                        opened.append(kwargs["block"].block_id)
+                        return original(view, **kwargs)
+
+                    with store.query_lease() as view, patch.object(
+                        SQLiteTMQueryView,
+                        "candidate_proof_block_records",
+                        new=observe_open,
+                    ):
+                        snapshot = view.candidate_proof_snapshot(
+                            folded_query=query_source,
+                            seed_limit=256,
+                        )
+                        self.assertTrue(snapshot.seed_stages)
+                        self.assertTrue(all(
+                            record_id <= 256
+                            for _stage, record_ids in snapshot.seed_stages
+                            for record_id in record_ids
+                        ))
+                        self.assertGreater(
+                            snapshot.blocks[1].character_intersection_upper,
+                            0,
+                        )
+                        session = CandidateRetriever().proof_session_from_view(
+                            "tm.primary",
+                            view,
+                            query_source,
+                            minimum_similarity=0.60,
+                            result_limit=10,
+                        )
+                        self.assertEqual(opened, [])
+                        _ = session.next_batch()
+
+                    self.assertTrue(opened)
+                    self.assertEqual(opened[0], 1)
+                    opened.clear()
+                    with store.query_lease() as view, patch.object(
+                        SQLiteTMQueryView,
+                        "candidate_proof_block_records",
+                        new=observe_open,
+                    ):
+                        _fuzzy, report = prove_and_score_fuzzy_candidates(
+                            resource_id="tm.primary",
+                            resource_order=0,
+                            query=_query(query_source),
+                            view=view,
+                        )
+                    proof = report.metadata.proof
+                    assert proof is not None
+                    self.assertEqual(opened, [1, 0])
+                    self.assertEqual(proof.seed_unique_count, 256)
+
     def test_session_initialization_and_unopened_blocks_are_lazy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = _store(
@@ -197,6 +280,157 @@ class CandidateProofQueryTests(unittest.TestCase):
         proof["caller_complete"] = True
         with self.assertRaisesRegex(ValueError, "unexpected fields"):
             contract_from_json(json.dumps(payload))
+
+    def test_proof_contract_closes_universe_stage_and_scored_identities(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                tuple(chr(0x400 + index) for index in range(40)),
+                fts5_available=False,
+            )
+            with store.query_lease() as view:
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("a"),
+                    view=view,
+                )
+        proof = report.metadata.proof
+        assert proof is not None
+        self.assertEqual(proof.total_record_count, 40)
+        self.assertEqual(proof.kth_record_id, 31)
+        self.assertEqual(proof.unscored_possible_record_id, 30)
+
+        with self.assertRaises(ValueError):
+            _ = replace(proof, kth_record_id=41)
+        with self.assertRaises(ValueError):
+            _ = replace(
+                proof,
+                kth_score=0.1,
+                unscored_possible_record_id=41,
+            )
+
+        with self.assertRaises(ValueError):
+            _ = replace(
+                report.metadata,
+                proof=replace(proof, seed_unique_count=1),
+            )
+
+        mismatched_proofs = (
+            replace(proof, kth_score=0.1, kth_record_id=1),
+            replace(
+                proof,
+                kth_score=0.1,
+                unscored_possible_record_id=40,
+            ),
+        )
+        for mismatched in mismatched_proofs:
+            with self.subTest(mismatched=mismatched):
+                metadata = replace(report.metadata, proof=mismatched)
+                with self.assertRaises(ValueError):
+                    _ = replace(report, metadata=metadata)
+
+    def test_proof_contract_rejects_identity_mismatches_at_all_boundaries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                tuple(chr(0x400 + index) for index in range(40)),
+                fts5_available=False,
+            )
+            with store.query_lease() as view:
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("a"),
+                    view=view,
+                )
+        proof = report.metadata.proof
+        assert proof is not None
+        mutations = (
+            ("kth-outside-universe", {"kth_record_id": 41}),
+            (
+                "frontier-outside-universe",
+                {"kth_score": 0.1, "unscored_possible_record_id": 41},
+            ),
+            ("seed-stage-mismatch", {"seed_unique_count": 1}),
+            (
+                "kth-not-scored",
+                {"kth_score": 0.1, "kth_record_id": 1},
+            ),
+            (
+                "frontier-is-scored",
+                {"kth_score": 0.1, "unscored_possible_record_id": 40},
+            ),
+        )
+        encoded = contract_to_json(report)
+        for name, changes in mutations:
+            with self.subTest(name=name, boundary="constructor"):
+                with self.assertRaises(ValueError):
+                    bad_proof = replace(proof, **changes)
+                    bad_metadata = replace(report.metadata, proof=bad_proof)
+                    _ = replace(report, metadata=bad_metadata)
+            with self.subTest(name=name, boundary="decode"):
+                payload = json.loads(encoded)
+                payload["payload"]["metadata"]["proof"].update(changes)
+                with self.assertRaises(ValueError):
+                    _ = contract_from_json(json.dumps(payload))
+            with self.subTest(name=name, boundary="encode"):
+                forged_proof = _unchecked_replace(proof, **changes)
+                forged_metadata = _unchecked_replace(
+                    report.metadata,
+                    proof=forged_proof,
+                )
+                forged_report = _unchecked_replace(
+                    report,
+                    metadata=forged_metadata,
+                )
+                with self.assertRaises(ValueError):
+                    _ = contract_to_json(forged_report)
+
+    def test_zero_and_short_proof_corpora_remain_strictly_valid(self) -> None:
+        for total_record_count in (0, 2):
+            with self.subTest(total_record_count=total_record_count):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    if total_record_count:
+                        store = _store(
+                            root,
+                            ("proof target", "other source"),
+                            fts5_available=False,
+                        )
+                    else:
+                        stage = _stage(root)
+                        with patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=False,
+                        ):
+                            initialize_stage_schema(
+                                stage,
+                                canonical_store_id="store.primary",
+                            )
+                            store = SQLiteTMStore(
+                                stage,
+                                canonical_store_id="store.primary",
+                            )
+                    with store.query_lease() as view:
+                        _fuzzy, report = prove_and_score_fuzzy_candidates(
+                            resource_id="tm.primary",
+                            resource_order=0,
+                            query=_query("proof target"),
+                            view=view,
+                        )
+                proof = report.metadata.proof
+                assert proof is not None
+                self.assertEqual(proof.total_record_count, total_record_count)
+                self.assertTrue(proof.threshold_closed)
+                self.assertTrue(proof.top_k_closed)
+                self.assertIsNone(proof.kth_record_id)
+                self.assertIsNone(proof.unscored_possible_record_id)
+                self.assertEqual(contract_from_json(contract_to_json(report)), report)
 
     def test_zero_overlap_true_top_k_closes_by_record_id_tie(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -488,6 +722,108 @@ class CandidateProofQueryTests(unittest.TestCase):
             ),
             (("HEALTH", "STORE.CANDIDATE_INDEX_INVALID"),),
         )
+
+    def test_service_health_rejects_coordinated_fold_root_tamper(self) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary) / "fold-root-tampered"
+                    store = _activated_store(
+                        root,
+                        ("proof target",) + tuple(
+                            f"unrelated row {index}" for index in range(300)
+                        ),
+                        resource_id="tm.tampered",
+                        fts5_available=fts5_available,
+                    )
+                    database = root / "source.jsonl.sqlite3"
+                    forged_fold = "forged source"
+                    connection = sqlite3.connect(database)
+                    try:
+                        connection.execute(
+                            "UPDATE tm_record SET source_fold_v1 = ?, "
+                            "source_fold_length = ? WHERE record_id = 1",
+                            (forged_fold, len(forged_fold)),
+                        )
+                        connection.execute(
+                            "DELETE FROM tm_gram WHERE record_id = 1"
+                        )
+                        required_sizes = (
+                            (1, 2) if fts5_available else (1, 2, 3)
+                        )
+                        connection.executemany(
+                            "INSERT INTO tm_gram("
+                            "record_id, gram_size, gram, term_frequency) "
+                            "VALUES (1, ?, ?, ?)",
+                            tuple(
+                                (size, gram, frequency)
+                                for size in required_sizes
+                                for gram, frequency in character_ngram_frequencies(
+                                    forged_fold, size
+                                )
+                            ),
+                        )
+                        if fts5_available:
+                            connection.execute(
+                                "DELETE FROM tm_fts WHERE record_id = 1"
+                            )
+                            connection.execute(
+                                "INSERT INTO tm_fts(source_fold_v1, record_id) "
+                                "VALUES (?, 1)",
+                                (forged_fold,),
+                            )
+                        connection.execute(
+                            "UPDATE tm_candidate_block SET "
+                            "min_source_fold_length = ("
+                            "SELECT MIN(source_fold_length) FROM tm_record "
+                            "WHERE record_id BETWEEN 1 AND 256), "
+                            "max_source_fold_length = ("
+                            "SELECT MAX(source_fold_length) FROM tm_record "
+                            "WHERE record_id BETWEEN 1 AND 256) "
+                            "WHERE block_id = 0"
+                        )
+                        connection.execute(
+                            "DELETE FROM tm_gram_block_max WHERE block_id = 0"
+                        )
+                        connection.execute(
+                            "INSERT INTO tm_gram_block_max("
+                            "block_id, gram_size, gram, max_term_frequency) "
+                            "SELECT 0, gram_size, gram, MAX(term_frequency) "
+                            "FROM tm_gram WHERE record_id BETWEEN 1 AND 256 "
+                            "AND gram_size IN (1, 2) "
+                            "GROUP BY gram_size, gram"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    report = TMRetrievalService(
+                        capability_publisher=_retrieval_capability_publisher(),
+                    ).query(
+                        (
+                            TMResourceHandle(
+                                "tm.tampered", store, True, True, True, 0
+                            ),
+                        ),
+                        TMQuery(
+                            query_source="proof targat",
+                            speaker_raw=None,
+                            context_prev_raw=None,
+                            context_next_raw=None,
+                            minimum_similarity=0.60,
+                            limit=10,
+                            resource_order=("tm.tampered",),
+                        ),
+                    )
+
+                self.assertEqual(report.results, ())
+                self.assertEqual(report.resource_metadata, ())
+                self.assertEqual(
+                    tuple(
+                        (failure.stage, failure.error_code)
+                        for failure in report.resource_failures
+                    ),
+                    (("HEALTH", "STORE.CANDIDATE_INDEX_INVALID"),),
+                )
 
 
 if __name__ == "__main__":

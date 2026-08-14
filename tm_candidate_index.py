@@ -943,18 +943,6 @@ class CandidateProofSession:
         self._outstanding: set[int] = set()
         self._scores: dict[int, float] = {}
         self._observation_order: list[int] = []
-        seed_ids = {
-            record_id
-            for _stage, ids in snapshot.seed_stages
-            for record_id in ids
-        }
-        self._seed_block_ids = tuple(sorted(
-            {
-                (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
-                for record_id in seed_ids
-            }
-        ))
-        self._seed_blocks_opened = False
 
     @property
     def index_kind(self) -> str:
@@ -1026,13 +1014,6 @@ class CandidateProofSession:
             self._upper_by_id[record.record_id] = upper
             heapq.heappush(self._record_heap, (-upper, -record.record_id, record.record_id))
 
-    def _open_seed_blocks(self) -> None:
-        if self._seed_blocks_opened:
-            return
-        for block_id in self._seed_block_ids:
-            self._open_block(block_id)
-        self._seed_blocks_opened = True
-
     def _discard_opened_block_heads(self) -> None:
         while self._block_heap and self._block_heap[0][2] in self._opened_blocks:
             heapq.heappop(self._block_heap)
@@ -1077,7 +1058,6 @@ class CandidateProofSession:
         return threshold_closed, top_k_closed, frontier
 
     def next_batch(self) -> tuple[int, ...]:
-        self._open_seed_blocks()
         threshold_closed, top_k_closed, _frontier = self._closure()
         if threshold_closed and top_k_closed:
             return ()

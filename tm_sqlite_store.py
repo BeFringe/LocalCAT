@@ -8655,7 +8655,7 @@ def validate_candidate_proof_index(
         return value
 
     record_cursor = connection.execute(
-        "SELECT record_id, source_fold_v1, source_fold_length "
+        "SELECT record_id, source_raw, source_fold_v1, source_fold_length "
         "FROM tm_record ORDER BY record_id"
     )
     gram_cursor = connection.execute(
@@ -8727,10 +8727,15 @@ def validate_candidate_proof_index(
     expected_record_id = 1
     for record_row in record_cursor:
         record_id = proof_int(record_row[0])
-        folded_source = proof_text(record_row[1])
-        source_fold_length = proof_int(record_row[2])
-        if record_id != expected_record_id or source_fold_length != len(
-            folded_source
+        source_raw = proof_text(record_row[1])
+        stored_folded_source = proof_text(record_row[2])
+        source_fold_length = proof_int(record_row[3])
+        folded_source = fold_text_v1(source_raw).folded_text
+        if (
+            not folded_source
+            or record_id != expected_record_id
+            or stored_folded_source != folded_source
+            or source_fold_length != len(folded_source)
         ):
             raise CandidateProofIndexError("candidate record fact is invalid")
         expected_record_id += 1
