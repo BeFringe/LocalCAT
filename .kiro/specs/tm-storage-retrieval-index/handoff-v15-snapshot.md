@@ -1,18 +1,29 @@
-# Feature 5 v15 临时接任快照
+# Feature 5 v15 临时换机接任快照
 
-> 状态：临时、可撤回的跨设备交接提交，不是 Task 8.6、8.7、8.9 或 Feature 5 完成声明。
+> 临时性：本文件只用于跨电脑恢复任务上下文，可能在原始快照提交后继续追加修正。新环境完成接管、且本文件不再承担恢复权威后，应以单独提交删除本文件；不要逐个 revert handoff 更新，也不要回退其中承载的治理或实现 checkpoint。
 >
 > 日期：2026-08-14
 
 ## 1. 身份与边界
 
-- 唯一实施 worktree：`/home/neotag/文档/CAT/localcat-feature5`
+- 源机器唯一实施 worktree：`/home/neotag/文档/CAT/localcat-feature5`。该绝对路径只是旧环境身份；新机器必须由用户重新明确授权唯一 worktree，再从其 Git root 解析路径，不能因本文件出现旧路径就改在其他 checkout 实施。
 - Git branch：`feature5`
+- 原始临时归档提交：`5cda94b52200dfd77eef79f05236c8f3d54b9731`
 - 本快照的父提交：`12fb5a5c2ef5376109d27b9592c696766e2d2c82`（v14 治理）
+- 本文件可能有后续 doc-only 修正；用 `git log --follow -- .kiro/specs/tm-storage-retrieval-index/handoff-v15-snapshot.md` 重建，而不是假定原始归档提交就是最新提示词。
 - 当前 Requirements 不变；Design、Tasks 与评审集群已在本快照中推进到采纳稿 v15。
 - Task 8.6、8.7、8.9、9.5、9.6 均保持未勾选。
 - Cluster M 第二轮仍待实施闭合与原生 xhigh 对抗复审；Cluster N 保持已闭合；Cluster O 在 M 重新通过前阻塞。
-- 本提交故意保存未闭合 tracked 混合态，供换机恢复。后续形成正式 Task 8.6/8.7 提交后，应按用户指示移除或重整该临时快照，而不是把它作为永久完成记录。
+- 原始归档提交故意保存未闭合 tracked 混合态，供换机恢复。它不是 Task 完成记录，也不能单独授予 correctness、performance 或 release authority。
+
+### 设计约束清单
+
+- **设计要求：** scorer-v1、2048 invocation budget、100k frozen corpus、`.60` threshold、真实 top-10、500 ms fuzzy p95、120 s migration 与 512 MiB RSS 均不得放宽；FTS5/fallback 必须分别通过。
+- **已实现：** v13 scorer-call/identity 双域与 Retrieval-owned exact-fold reuse；v14 的 U1/K0/R/U2 两阶段骨架、跨 phase binding 与 A0/P1/R/A1/P2 contract；Cluster N sealed/active attestation 已闭合。
+- **待实现：** v15 exact-LCS U3、ordered folded projection、全部 40 miss 的 budget 闭合、20-sample production-shaped cheap gate、Cluster M 第二轮 review、Cluster O fresh Gate D/evidence/release。
+- **未授权：** 提高 budget、挑选有利 miss、修改 corpus/threshold/top-k/gate、以 component heuristic 或偷跑 Levenshtein/scorer 代替上界、增加持久 schema/index、提前恢复 Cluster O。
+- **Critical Path：** 换机身份重建 → Task 8.6/8.7 v15 → Cluster M xhigh review → Task 8.9 fresh Gate D → 9.5/9.6 → Cluster O final review → Qt handoff。
+- **隐性依赖：** Cluster O 的 source roots、oracle/benchmark bundle、86 条映射与 release decision 都依赖 Cluster M 最终代码和新鲜性能事实；M 未闭合时，即使局部测试全绿也不能刷新或发布 O。
 
 ## 2. 为什么从 aa4916b 走到 v15
 
@@ -103,14 +114,14 @@ efb8ca6aa675c7154631eb30fb0dc8649fc606efd78a68cf245650c4d70c51ce  .fixture.jsonl
 
 ## 6. 主 agent 后续顺序
 
-1. 从远端 `feature5` 的本快照提交恢复，完整读取 `AGENTS.md`、全部 `.kiro/steering/`、spec.json、requirements.md、design.md、tasks.md 与本文件；核对 root/branch/HEAD/status。
+1. Clone/fetch `git@github.com:BeFringe/LocalCAT.git`，由用户明确授权新机器唯一 `feature5` worktree；从该 Git root 完整读取 `AGENTS.md`、全部 `.kiro/steering/`、spec.json、requirements.md、design.md、tasks.md 与本文件，核对 root/branch/full HEAD/status，不假定旧绝对路径仍存在。
 2. dispatch 同一职责的原生 xhigh implementation worker，收敛 v15 current-schema LCS；不得让 worker stage/commit。
 3. 主 agent 从磁盘审查 diff，运行 cheap gate、owner suite、Cluster N tamper regression、basedpyright 与 diff check。
 4. 只有 Task 8.6/8.7 completion definition 全部满足时才同步勾选、写一条自包含 Implementation Note，并形成正式小步提交。
 5. 对 Cluster M 的累计 base..tip 做一次原生 xhigh code-reviewer 对抗复审；修正后跑一次 fresh Cluster M suite。
 6. M 闭合后才恢复 Task 8.9：运行一次新的 5k oracle + 100k FTS/fallback owner pipeline，生成新 evidence bundle；不得复用旧失败 run。
 7. 完成 9.5 evidence roots/86 条映射刷新与 9.6 full suite；Cluster O 做一次原生 xhigh 累计复审。全部 Feature 5 tasks 完成后才向 Qt 增量任务交付。
-8. 经用户确认后，撤回/重整本临时 handoff snapshot，使永久历史只保留正式治理和任务提交。
+8. 新环境完成接管且本文件不再承担恢复权威后，按第 9 节用新的非破坏性提交删除临时文档。不得直接 revert 原始归档提交；若用户还要求从永久历史移除 WIP checkpoint，必须另做有备份、有树等价验证且单独授权的历史整理。
 
 ## 7. 原生 xhigh worker 接任提示词
 
@@ -119,10 +130,10 @@ efb8ca6aa675c7154631eb30fb0dc8649fc606efd78a68cf245650c4d70c51ce  .fixture.jsonl
 ```text
 你负责 Feature 5 Cluster M v15 的 Task 8.6+8.7 current-schema LCS 收敛实现。你不是代码库中的唯一 agent；保留其他人修改，不得回滚、覆盖或顺手清理不属于你的内容。
 
-唯一工作根：/home/neotag/文档/CAT/localcat-feature5
+授权工作根：<新机器上由用户明确指定的唯一 feature5 worktree 绝对路径>
 branch：feature5
 exact base：<恢复后 git rev-parse HEAD 的完整 OID>
-先 fail-closed 核对 root/branch/full HEAD/status；不匹配立即停止。不得创建/switch worktree或branch，不得访问替代 checkout，不得 stage/commit/push。
+源机器旧路径 `/home/neotag/文档/CAT/localcat-feature5` 只用于核对历史身份，不能自动成为新机器权限。先 fail-closed 核对授权 root/branch/full HEAD/status；不匹配立即停止。不得创建/switch worktree或branch，不得访问替代 checkout，不得 stage/commit/push。
 
 开始前完整读取：AGENTS.md；全部 .kiro/steering/（重点 feature5-review-clustering.md v15）；.kiro/specs/tm-storage-retrieval-index/spec.json、requirements.md、design.md、tasks.md、handoff-v15-snapshot.md。Requirements、Design v15、Tasks 与 steering 是权威；snapshot commit 是未闭合恢复态，不是正确性授权。
 
@@ -163,7 +174,22 @@ exact base：<恢复后 git rev-parse HEAD 的完整 OID>
 
 ## 8. 推送与相邻 worktree
 
-- `feature5`、`ui-mvp`、`governance/kiro-steering` 在快照前的远端均无同名 head。
-- `ui-mvp` worktree 是 `/home/neotag/文档/CAT/CAT`，存在用户未提交文件；只推送现有 branch commits，不能暂存或修改这些文件。
-- `governance/kiro-steering` worktree 是 `/home/neotag/.local/share/opencode/worktree/bd10770111131a050c457174553a67d555e13df2/jolly-orchid`，存在未跟踪 `.opencode/bun.lock`；目录名是托管 worktree 名，不影响 branch/remote 身份，只推送现有 commits。
-- 三个分支均推送到 `origin`，不得 force push。
+- 三个远端 head 已通过 SSH 推送并核对：`feature5@5cda94b52200dfd77eef79f05236c8f3d54b9731`、`ui-mvp@fd1b732ced807f344dff420b887834946fe9a6a7`、`governance/kiro-steering@4905a3f51e2b70a37cf4eb72ec3cf620e1e714f0`。本文件的后续修正以 `feature5` 更新为准。
+- 源机器 `ui-mvp` worktree 是 `/home/neotag/文档/CAT/CAT`，存在用户未提交文件；这些文件未进入上述远端 head，新机器不得从“已推送”推断它们已备份。
+- 源机器 `governance/kiro-steering` worktree 是 `/home/neotag/.local/share/opencode/worktree/bd10770111131a050c457174553a67d555e13df2/jolly-orchid`，存在未跟踪 `.opencode/bun.lock`；目录名只是托管 worktree 名，该文件同样未备份。
+- 后续 push 使用 SSH 且不得 force push；除非用户在完成正式 checkpoint 后另行批准第 9 节所述历史整理。
+
+## 9. 临时快照撤回方式
+
+默认“撤回”只表示移除已经失去恢复用途的 handoff 文档。新机器完成身份重建、读回本文件、确认正式 v15 checkpoint 与后续计划已有其他持久权威后，使用一个新的非破坏性清理提交：
+
+```bash
+git rm .kiro/specs/tm-storage-retrieval-index/handoff-v15-snapshot.md
+git diff --cached --name-status
+git commit -m "docs(handoff): 移除 Feature 5 v15 临时快照"
+git push origin feature5
+```
+
+不要直接 `git revert 5cda94b`：该提交同时承载 v15 前混合代码、Cluster O 提前代码和 v15 治理，机械 revert 会反向修改正式实现的祖先内容。也不要使用 `git reset --hard`、无备份 rebase 或普通 `--force`。
+
+如果用户在 Task 8.6/8.7、Cluster M、Cluster O 都已有正式 checkpoint 后，仍明确要求从永久历史中删除 WIP 归档提交，则把它视为独立的历史重写任务，而不是文档清理：先保存可恢复 ref/bundle 与远端 OID，冻结预期最终 tree，重写后重新运行对应 fresh tests/证据并逐文件比较 tree，只允许 `push --force-with-lease`。该动作需要届时的单独授权，不能由本 handoff 文档预先授权。
