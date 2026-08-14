@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import threading
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 import uuid
 
 import tm_contracts as contract_module
@@ -164,6 +164,19 @@ class _PhysicalReadinessSnapshot:
 def _content_semantic_facts(facts: _StageFacts) -> ContentSemanticFacts:
     """Freeze the sealer-owned full semantic result for durable reuse."""
 
+    if facts.schema_upgrade:
+        if (
+            facts.receipt_boundary_record_count is None
+            or facts.fts_boundary_record_count is None
+        ):
+            raise StageSealError("SEALER.STAGE_INVALID")
+        receipt_boundary_record_count = (
+            facts.receipt_boundary_record_count
+        )
+        receipt_boundary_fts_count = facts.fts_boundary_record_count
+    else:
+        receipt_boundary_record_count = facts.record_count
+        receipt_boundary_fts_count = facts.fts_count
     return ContentSemanticFacts(
         schema_version=facts.schema_version,
         schema_digest=facts.schema_digest,
@@ -180,6 +193,7 @@ def _content_semantic_facts(facts: _StageFacts) -> ContentSemanticFacts:
         wal_enabled=facts.wal_enabled,
         extension_loading_enabled=facts.extension_loading_enabled,
         record_count=facts.record_count,
+        receipt_boundary_record_count=receipt_boundary_record_count,
         origin_batch_count=facts.origin_batch_count,
         origin_batch_id=facts.origin_batch_id,
         origin_batch_kind=(
@@ -187,6 +201,7 @@ def _content_semantic_facts(facts: _StageFacts) -> ContentSemanticFacts:
         ),
         exported_revision=facts.receipt.exported_revision,
         fts_count=facts.fts_count,
+        receipt_boundary_fts_count=receipt_boundary_fts_count,
         gram_counts=facts.gram_counts,
         exact_parity_digest=facts.exact_parity_digest,
         logical_closure_digest=facts.closure_digest,
@@ -580,19 +595,26 @@ def _winners_parity_digest(winners: dict[str, str]) -> str:
     return digest.hexdigest()
 
 
-def _stage_closure_digest(connection: sqlite3.Connection) -> str:
+def _stage_closure_digests(
+    connection: sqlite3.Connection,
+    *,
+    reconstruct_pre_activation: bool,
+) -> tuple[str, str | None]:
     """Bounded digest over every table whose facts enter the evidence.
 
-    Captured inside the validation read snapshot and rechecked under the
-    marker write lock, this proves every schema, identity, integrity, FK,
-    record, index, source-binding, and exact-parity fact describes the same
-    committed bytes that transition to SEALED. Streaming cursor reads keep
-    peak memory bounded regardless of the 100k-row stage size.
+    The current digest closes every schema, identity, integrity, FK, record,
+    index, source-binding, and exact-parity row in one snapshot.  The optional
+    second digest counterfactually reverses only the deterministic activation
+    receipt/meta transition.  Streaming cursor reads keep peak memory bounded
+    regardless of the 100k-row stage size.
     """
 
-    digest = hashlib.sha256()
+    active_digest = hashlib.sha256()
+    pre_activation_digest = (
+        hashlib.sha256() if reconstruct_pre_activation else None
+    )
 
-    def frame(value: object) -> None:
+    def frame(digest: Any, value: object) -> None:
         if value is None:
             digest.update(b"n;")
             return
@@ -610,17 +632,44 @@ def _stage_closure_digest(connection: sqlite3.Connection) -> str:
         digest.update(encoded)
         digest.update(b";")
 
+    def pre_activation_row(
+        table: str,
+        row: tuple[object, ...],
+    ) -> tuple[object, ...] | None:
+        if table == "tm_meta":
+            key = row[0]
+            if key == "activation_digest":
+                return None
+            if key == "activation_status":
+                return (key, "UNPUBLISHED")
+            if key == "generation":
+                return (key, "0")
+        elif table == "tm_snapshot_receipt":
+            return (*row[:9], "issued", *row[10:])
+        elif table == "tm_snapshot_binding":
+            return None
+        return row
+
     def frame_table(table: str, query: str) -> None:
-        digest.update(b"table:")
-        frame(table)
+        active_digest.update(b"table:")
+        frame(active_digest, table)
+        if pre_activation_digest is not None:
+            pre_activation_digest.update(b"table:")
+            frame(pre_activation_digest, table)
         cursor = connection.execute(query)
         while True:
             row = cursor.fetchone()
             if row is None:
                 break
             for cell in row:
-                frame(cell)
-            digest.update(b"\n")
+                frame(active_digest, cell)
+            active_digest.update(b"\n")
+            if pre_activation_digest is not None:
+                reconstructed = pre_activation_row(table, row)
+                if reconstructed is not None:
+                    for cell in reconstructed:
+                        frame(pre_activation_digest, cell)
+                    pre_activation_digest.update(b"\n")
 
     def has_table(table: str) -> bool:
         row = connection.execute(
@@ -689,7 +738,44 @@ def _stage_closure_digest(connection: sqlite3.Connection) -> str:
         "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
         "ORDER BY type, name",
     )
-    return digest.hexdigest()
+    return (
+        active_digest.hexdigest(),
+        (
+            None
+            if pre_activation_digest is None
+            else pre_activation_digest.hexdigest()
+        ),
+    )
+
+
+def _stage_closure_digest(connection: sqlite3.Connection) -> str:
+    """Return the one exact logical closure for the current DB snapshot."""
+
+    digest, _pre_activation = _stage_closure_digests(
+        connection,
+        reconstruct_pre_activation=False,
+    )
+    return digest
+
+
+def _active_transition_closure_digests(
+    connection: sqlite3.Connection,
+) -> tuple[str, str]:
+    """Return ACTIVE and reconstructed pre-activation closures in one pass.
+
+    Receipt publication changes only deterministic ledger/meta rows.  Cold
+    DB_REPLACED recovery uses the reconstructed digest to prove all other
+    rows still close the sealed attestation before accepting the current
+    ACTIVE digest as the receipt owner's expectation.
+    """
+
+    active, pre_activation = _stage_closure_digests(
+        connection,
+        reconstruct_pre_activation=True,
+    )
+    if pre_activation is None:
+        raise StageSealError("SEALER.STAGE_INVALID")
+    return active, pre_activation
 
 
 def _import_batch_token(batch_id: str) -> str:
@@ -2335,9 +2421,11 @@ class SealedArtifactRegistry:
                     or semantic.schema_version != claim.schema_version
                     or semantic.fold_version != claim.fold_version
                     or semantic.index_version != claim.index_version
-                    or semantic.record_count != claim.record_count
+                    or semantic.receipt_boundary_record_count
+                    != claim.record_count
                     or semantic.origin_batch_count != claim.origin_batch_count
-                    or semantic.fts_count != claim.fts_count
+                    or semantic.receipt_boundary_fts_count
+                    != claim.fts_count
                     or semantic.gram_counts != claim.gram_counts
                     or semantic.exact_parity_digest
                     != claim.exact_parity_digest

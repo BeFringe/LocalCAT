@@ -4188,6 +4188,8 @@ def _validate_activation_journal_record(
             or active_semantic.extension_loading_enabled
             != sealed_semantic.extension_loading_enabled
             or active_semantic.record_count != sealed_semantic.record_count
+            or active_semantic.receipt_boundary_record_count
+            != sealed_semantic.receipt_boundary_record_count
             or active_semantic.origin_batch_count
             != sealed_semantic.origin_batch_count
             or active_semantic.origin_batch_id
@@ -4197,6 +4199,8 @@ def _validate_activation_journal_record(
             or active_semantic.exported_revision
             != sealed_semantic.exported_revision
             or active_semantic.fts_count != sealed_semantic.fts_count
+            or active_semantic.receipt_boundary_fts_count
+            != sealed_semantic.receipt_boundary_fts_count
             or active_semantic.gram_counts != sealed_semantic.gram_counts
             or active_semantic.exact_parity_digest
             != sealed_semantic.exact_parity_digest

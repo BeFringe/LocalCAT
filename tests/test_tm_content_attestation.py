@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -122,16 +123,45 @@ class ContentAttestationCodecTests(unittest.TestCase):
             busy_timeout_ms=5000,
             wal_enabled=False,
             extension_loading_enabled=False,
-            record_count=1,
+            record_count=3,
+            receipt_boundary_record_count=1,
             origin_batch_count=1,
             origin_batch_id="migration." + "2" * 64,
             origin_batch_kind="migration",
             exported_revision=1,
-            fts_count=1,
+            fts_count=3,
+            receipt_boundary_fts_count=1,
             gram_counts=((1, 1), (2, 0)),
             exact_parity_digest="3" * 64,
             logical_closure_digest="4" * 64,
         )
+
+    def test_semantic_count_domains_are_strict_and_ordered(self) -> None:
+        semantic = self._semantic()
+        with self.assertRaises(TypeError):
+            replace(semantic, receipt_boundary_record_count=False)
+        with self.assertRaises(ValueError):
+            replace(
+                semantic,
+                receipt_boundary_record_count=semantic.record_count + 1,
+            )
+        with self.assertRaises(ValueError):
+            replace(
+                semantic,
+                receipt_boundary_fts_count=(
+                    semantic.receipt_boundary_record_count + 1
+                ),
+            )
+        with self.assertRaises(ValueError):
+            replace(semantic, fts5_available=False)
+        fallback = replace(
+            semantic,
+            fts5_available=False,
+            fts_count=0,
+            receipt_boundary_fts_count=0,
+        )
+        self.assertEqual(fallback.fts_count, 0)
+        self.assertEqual(fallback.receipt_boundary_fts_count, 0)
 
     def test_sealed_and_active_codecs_are_exact_and_digest_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -189,7 +219,52 @@ class ContentAttestationCodecTests(unittest.TestCase):
                     **active_payload,
                     "semantic_facts": {
                         **active_semantic_payload,
-                        "record_count": 2,
+                        "record_count": 4,
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        key: value
+                        for key, value in active_semantic_payload.items()
+                        if key != "receipt_boundary_record_count"
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        key: value
+                        for key, value in active_semantic_payload.items()
+                        if key != "receipt_boundary_fts_count"
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        **active_semantic_payload,
+                        "receipt_boundary_record_count": False,
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        **active_semantic_payload,
+                        "receipt_boundary_fts_count": -1,
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        **active_semantic_payload,
+                        "record_count": 1,
+                        "receipt_boundary_record_count": 3,
+                    },
+                },
+                {
+                    **active_payload,
+                    "semantic_facts": {
+                        **active_semantic_payload,
+                        "receipt_boundary_record_count": 2,
                     },
                 },
                 {

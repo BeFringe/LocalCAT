@@ -697,9 +697,9 @@ def _require_claim_closure(
         or semantic.schema_version != claim.schema_version
         or semantic.fold_version != claim.fold_version
         or semantic.index_version != claim.index_version
-        or semantic.record_count != claim.record_count
+        or semantic.receipt_boundary_record_count != claim.record_count
         or semantic.origin_batch_count != claim.origin_batch_count
-        or semantic.fts_count != claim.fts_count
+        or semantic.receipt_boundary_fts_count != claim.fts_count
         or semantic.gram_counts != claim.gram_counts
         or semantic.exact_parity_digest != claim.exact_parity_digest
     ):
@@ -749,9 +749,9 @@ def _grant_report(
         migration_batch_id=semantic.origin_batch_id,
         completed_revision=semantic.exported_revision,
         source_digest=attestation.source.sha256,
-        record_count=semantic.record_count,
+        record_count=semantic.receipt_boundary_record_count,
         gram_counts=semantic.gram_counts,
-        fts_count=semantic.fts_count,
+        fts_count=semantic.receipt_boundary_fts_count,
         integrity_ok=True,
         foreign_keys_ok=True,
         exact_parity_digest=semantic.exact_parity_digest,

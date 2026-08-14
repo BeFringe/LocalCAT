@@ -227,6 +227,10 @@ class _StoreValidationPort(Protocol):
         self,
         connection: sqlite3.Connection,
     ) -> str: ...
+    def active_transition_closure_digests(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[str, str]: ...
     def write_journal(
         self,
         record: _ActivationJournalRecord,
@@ -914,8 +918,8 @@ def _publish_activation_receipt(
     canonical_store_id: str,
     next_generation: int,
     activation_digest: str,
-) -> None:
-    """Durably complete the issued receipt/binding inside the new DB."""
+) -> str:
+    """Durably complete the receipt and return its owner-proven closure."""
 
     evidence = preparation._sealed_stage.evidence
     binding = evidence.source_binding
@@ -1014,6 +1018,9 @@ def _publish_activation_receipt(
                     raise port.store_schema_error(
                         "STORE.ACTIVATION_STATE_INVALID"
                     )
+                expected_logical_closure_digest = (
+                    port.stage_closure_digest(connection)
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -1029,6 +1036,7 @@ def _publish_activation_receipt(
             "ACTIVATION.RECEIPT_PUBLICATION_FAILED",
             retryable=True,
         ) from error
+    return expected_logical_closure_digest
 
 
 def _publish_activation_manifest(
@@ -1247,8 +1255,22 @@ def _validate_published_activation_set(
     canonical_store_id: str,
     next_generation: int,
     activation_digest: str,
+    expected_logical_closure_digest: str,
 ) -> tuple[_CanonicalStoreRef, Any, ActiveContentAttestation]:
-    """Revalidate the complete active DB/source/receipt/manifest generation."""
+    """Validate the active set against its owner-proven DB closure."""
+
+    if (
+        type(expected_logical_closure_digest) is not str
+        or len(expected_logical_closure_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_logical_closure_digest
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_SET_INVALID",
+            retryable=False,
+        )
 
     database = _capture_journal_closure_file(identity.canonical_sidecar_path)
     manifest = _capture_journal_closure_file(identity.snapshot_manifest_path)
@@ -1336,6 +1358,8 @@ def _validate_published_activation_set(
                     != record.snapshot_receipt_digest
                     or facts.binding.receipt.jsonl_digest
                     != record.source_jsonl_digest
+                    or facts.binding.receipt.record_count
+                    != sealed_semantic.receipt_boundary_record_count
                     or port.configured_pair_diagnostics(
                         facts.binding,
                         identity=identity,
@@ -1346,6 +1370,13 @@ def _validate_published_activation_set(
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
                 logical_closure_digest = port.stage_closure_digest(connection)
+                if (
+                    logical_closure_digest
+                    != expected_logical_closure_digest
+                ):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_LOGICAL_CLOSURE_INVALID"
+                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -1394,11 +1425,17 @@ def _validate_published_activation_set(
         wal_enabled=snapshot.wal_enabled,
         extension_loading_enabled=snapshot.extension_loading_enabled,
         record_count=record_count,
+        receipt_boundary_record_count=(
+            sealed_semantic.receipt_boundary_record_count
+        ),
         origin_batch_count=origin_batch_count,
         origin_batch_id=sealed_semantic.origin_batch_id,
         origin_batch_kind=sealed_semantic.origin_batch_kind,
         exported_revision=facts.binding.receipt.exported_revision,
         fts_count=fts_count,
+        receipt_boundary_fts_count=(
+            sealed_semantic.receipt_boundary_fts_count
+        ),
         gram_counts=gram_counts,
         exact_parity_digest=exact_parity_digest,
         logical_closure_digest=logical_closure_digest,
@@ -2505,14 +2542,16 @@ def _complete_recovered_receipt(
     canonical_store_id: str,
     next_generation: int,
     activation_digest: str,
-) -> None:
+) -> str:
     """Idempotently finish the issued receipt/binding publication.
 
     A SEALED database still holding the exact issued receipt is completed in
     one transaction (receipt completed, binding inserted, ACTIVE, generation,
     activation digest); an already ACTIVE database whose completed
     receipt/binding and meta exactly match the journal is accepted without
-    rewriting.  Both branches fsync the database and revalidate its identity.
+    rewriting.  Both branches derive the expected active logical closure as
+    the final read under the owner write lock, then fsync and revalidate the
+    database identity.
     """
 
     canonical_capture = _capture_journal_closure_file(
@@ -2531,7 +2570,7 @@ def _complete_recovered_receipt(
             identity.canonical_sidecar_path,
             require_existing=True,
         ) as connection:
-            connection.execute("BEGIN")
+            connection.execute("BEGIN IMMEDIATE")
             try:
                 meta = port.read_meta(connection)
                 status = meta.get("activation_status")
@@ -2565,90 +2604,90 @@ def _complete_recovered_receipt(
                         raise port.store_schema_error(
                             "STORE.ACTIVATION_STATE_INVALID"
                         )
-                    connection.commit()
-                    connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        current_meta = port.read_meta(connection)
-                        if (
-                            current_meta.get("activation_status")
-                            != "SEALED"
-                            or port.meta_int(current_meta, "generation") != 0
-                            or "activation_digest" in current_meta
-                        ):
-                            raise port.store_schema_error(
-                                "STORE.ACTIVATION_STATE_INVALID"
-                            )
-                        current_receipt, current_status = (
-                            _recovery_receipt_row(port, connection)
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = "
+                        "'completed' WHERE snapshot_id = ? "
+                        "AND status = 'issued'",
+                        (receipt.snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise port.store_schema_error(
+                            "STORE.RECEIPT_INVALID"
                         )
-                        if (
-                            current_receipt != receipt
-                            or current_status != "issued"
-                        ):
-                            raise port.store_schema_error(
-                                "STORE.RECEIPT_INVALID"
-                            )
-                        updated = connection.execute(
-                            "UPDATE tm_snapshot_receipt SET status = "
-                            "'completed' WHERE snapshot_id = ? "
-                            "AND status = 'issued'",
-                            (receipt.snapshot_id,),
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, "
+                        "manifest_path, snapshot_kind, snapshot_id, "
+                        "binding_version) VALUES (1, ?, ?, ?, ?, ?)",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            SnapshotKind.MIGRATION_SOURCE.value,
+                            receipt.snapshot_id,
+                            contract_module.SNAPSHOT_BINDING_VERSION,
+                        ),
+                    )
+                    active_status = connection.execute(
+                        "UPDATE tm_meta SET value = 'ACTIVE' "
+                        "WHERE key = 'activation_status' "
+                        "AND value = 'SEALED'"
+                    )
+                    generation = connection.execute(
+                        "UPDATE tm_meta SET value = ? "
+                        "WHERE key = 'generation' AND value = '0'",
+                        (str(next_generation),),
+                    )
+                    connection.execute(
+                        "INSERT INTO tm_meta(key, value) VALUES "
+                        "('activation_digest', ?)",
+                        (activation_digest,),
+                    )
+                    if (
+                        active_status.rowcount != 1
+                        or generation.rowcount != 1
+                    ):
+                        raise port.store_schema_error(
+                            "STORE.ACTIVATION_STATE_INVALID"
                         )
-                        if updated.rowcount != 1:
-                            raise port.store_schema_error(
-                                "STORE.RECEIPT_INVALID"
-                            )
-                        connection.execute(
-                            "INSERT INTO tm_snapshot_binding("
-                            "binding_id, configured_jsonl_path, "
-                            "manifest_path, snapshot_kind, snapshot_id, "
-                            "binding_version) VALUES (1, ?, ?, ?, ?, ?)",
-                            (
-                                Path.__str__(identity.configured_jsonl_path),
-                                Path.__str__(
-                                    identity.snapshot_manifest_path
-                                ),
-                                SnapshotKind.MIGRATION_SOURCE.value,
-                                receipt.snapshot_id,
-                                contract_module.SNAPSHOT_BINDING_VERSION,
-                            ),
-                        )
-                        status = connection.execute(
-                            "UPDATE tm_meta SET value = 'ACTIVE' "
-                            "WHERE key = 'activation_status' "
-                            "AND value = 'SEALED'"
-                        )
-                        generation = connection.execute(
-                            "UPDATE tm_meta SET value = ? "
-                            "WHERE key = 'generation' AND value = '0'",
-                            (str(next_generation),),
-                        )
-                        connection.execute(
-                            "INSERT INTO tm_meta(key, value) VALUES "
-                            "('activation_digest', ?)",
-                            (activation_digest,),
-                        )
-                        if status.rowcount != 1 or generation.rowcount != 1:
-                            raise port.store_schema_error(
-                                "STORE.ACTIVATION_STATE_INVALID"
-                            )
-                        connection.commit()
-                    except BaseException:
-                        connection.rollback()
-                        raise
+                    expected_logical_closure_digest = (
+                        port.stage_closure_digest(connection)
+                    )
                 elif status == "ACTIVE":
-                    _ = _recovery_completed_binding(port,
+                    binding = _recovery_completed_binding(port,
                         connection,
                         identity=identity,
                         canonical_store_id=canonical_store_id,
                         record=record,
                     )
+                    receipt, receipt_status = _recovery_receipt_row(
+                        port,
+                        connection,
+                    )
                     if (
                         port.meta_int(meta, "generation") != next_generation
                         or meta.get("activation_digest") != activation_digest
+                        or receipt_status != "completed"
+                        or receipt != binding.receipt
+                        or connection.execute(
+                            "SELECT COUNT(*) FROM tm_snapshot_binding"
+                        ).fetchone()
+                        != (1,)
                     ):
                         raise port.store_schema_error(
                             "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    (
+                        expected_logical_closure_digest,
+                        pre_activation_closure_digest,
+                    ) = port.active_transition_closure_digests(connection)
+                    if (
+                        pre_activation_closure_digest
+                        != record.sealed_content_attestation.semantic_facts
+                        .logical_closure_digest
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                            retryable=False,
                         )
                 else:
                     raise port.store_schema_error(
@@ -2669,6 +2708,7 @@ def _complete_recovered_receipt(
             "ACTIVATION.RECOVERY_RECEIPT_FAILED",
             retryable=True,
         ) from error
+    return expected_logical_closure_digest
 
 
 def _complete_recovered_manifest(
@@ -3616,7 +3656,7 @@ def _recover_manifest_publication(
         record,
         next_generation=next_generation,
     )
-    _complete_recovered_receipt(port,
+    expected_logical_closure_digest = _complete_recovered_receipt(port,
         record,
         identity=identity,
         canonical_store_id=record.canonical_store_id,
@@ -3636,6 +3676,9 @@ def _recover_manifest_publication(
         canonical_store_id=record.canonical_store_id,
         next_generation=next_generation,
         activation_digest=activation_digest,
+        expected_logical_closure_digest=(
+            expected_logical_closure_digest
+        ),
         )
     )
     journal_path = _activation_journal_path(identity)
@@ -5456,7 +5499,7 @@ def publish_activation(
         prepared_record,
         next_generation=next_generation,
     )
-    _publish_activation_receipt(port,
+    expected_logical_closure_digest = _publish_activation_receipt(port,
         prepared_record,
         preparation=preparation,
         identity=port.resource_identity,
@@ -5477,6 +5520,9 @@ def publish_activation(
         canonical_store_id=prepared_record.canonical_store_id,
         next_generation=next_generation,
         activation_digest=activation_digest,
+        expected_logical_closure_digest=(
+            expected_logical_closure_digest
+        ),
         )
     )
     handle = port.advance_after_effect(

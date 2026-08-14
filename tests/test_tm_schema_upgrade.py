@@ -29,6 +29,7 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+import tm_gate_b
 import tm_migration
 import tm_sqlite_store
 from tm_activation_journal import (
@@ -37,7 +38,9 @@ from tm_activation_journal import (
     _ActivationJournalRecord,
     _ActivationPreparation,
     _CanonicalStoreRef,
+    _activation_journal_path,
     _ensure_activation_lineage_marker,
+    _parse_activation_journal_bytes,
     ActivationPreparationError,
     ActivationRecoveryReport,
 )
@@ -503,6 +506,17 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                     source_before = identity.configured_jsonl_path.read_bytes()
                     records_before = _record_rows(prior.staged_db_path)
                     service = _service(coordinator, identity)
+                    gate_b_reports: list[Any] = []
+                    real_gate_b = tm_gate_b.GateBEvaluator.evaluate
+
+                    def capture_gate_b(
+                        evaluator: Any,
+                        sealed_stage: Any,
+                    ) -> Any:
+                        report = real_gate_b(evaluator, sealed_stage)
+                        gate_b_reports.append(report)
+                        return report
+
                     with (
                         patch(
                             "tm_sqlite_store._probe_fts5",
@@ -512,6 +526,11 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                             "tm_migration._copy_store_into_stage",
                             wraps=tm_migration._copy_store_into_stage,
                         ) as copy_store,
+                        patch(
+                            "tm_gate_b.GateBEvaluator.evaluate",
+                            autospec=True,
+                            side_effect=capture_gate_b,
+                        ),
                     ):
                         outcome = service.upgrade_schema(
                             prior.staged_db_path
@@ -575,6 +594,84 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                     )
                     self.assertEqual(coordinator.current_generation, 4)
                     self.assertEqual(coordinator.state, "READY")
+                    self.assertEqual(len(gate_b_reports), 2)
+                    for gate_b_report in gate_b_reports:
+                        self.assertTrue(gate_b_report.granted)
+                        self.assertIsNotNone(gate_b_report.facts)
+                        assert gate_b_report.facts is not None
+                        self.assertEqual(
+                            gate_b_report.facts.record_count,
+                            2,
+                        )
+                        self.assertEqual(
+                            gate_b_report.facts.fts_count,
+                            2 if fts5_available else 0,
+                        )
+                    journal_path = _activation_journal_path(identity)
+                    journal_record = _parse_activation_journal_bytes(
+                        journal_path.read_bytes(),
+                        expected_journal_path=journal_path,
+                    )
+                    sealed_semantic = (
+                        journal_record.sealed_content_attestation
+                        .semantic_facts
+                    )
+                    active_attestation = (
+                        journal_record.active_content_attestation
+                    )
+                    self.assertIsNotNone(active_attestation)
+                    assert active_attestation is not None
+                    active_semantic = active_attestation.semantic_facts
+                    self.assertEqual(sealed_semantic.record_count, 5)
+                    self.assertEqual(
+                        sealed_semantic.receipt_boundary_record_count,
+                        2,
+                    )
+                    self.assertGreater(
+                        sealed_semantic.record_count,
+                        sealed_semantic.receipt_boundary_record_count,
+                    )
+                    self.assertEqual(
+                        sealed_semantic.fts_count,
+                        5 if fts5_available else 0,
+                    )
+                    self.assertEqual(
+                        sealed_semantic.receipt_boundary_fts_count,
+                        2 if fts5_available else 0,
+                    )
+                    self.assertEqual(
+                        active_semantic.record_count,
+                        sealed_semantic.record_count,
+                    )
+                    self.assertEqual(
+                        active_semantic.receipt_boundary_record_count,
+                        sealed_semantic.receipt_boundary_record_count,
+                    )
+                    self.assertEqual(
+                        active_semantic.fts_count,
+                        sealed_semantic.fts_count,
+                    )
+                    self.assertEqual(
+                        active_semantic.receipt_boundary_fts_count,
+                        sealed_semantic.receipt_boundary_fts_count,
+                    )
+                    self.assertEqual(
+                        active_semantic.origin_batch_id,
+                        sealed_semantic.origin_batch_id,
+                    )
+                    self.assertEqual(
+                        active_semantic.origin_batch_kind,
+                        sealed_semantic.origin_batch_kind,
+                    )
+                    self.assertEqual(
+                        sealed_semantic.origin_batch_kind,
+                        "schema_upgrade",
+                    )
+                    self.assertEqual(
+                        sealed_semantic.origin_batch_id,
+                        "migration."
+                        + hashlib.sha256(_HISTORICAL_SOURCE_BYTES).hexdigest(),
+                    )
                     _assert_v2_active_store(
                         self,
                         new_store,

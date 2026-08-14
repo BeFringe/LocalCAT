@@ -426,6 +426,142 @@ class ActivationRecoveryCancelTests(unittest.TestCase):
 
 
 class ActivationRecoveryCompletionTests(unittest.TestCase):
+    def test_cold_active_receipt_rejects_prior_window_semantic_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, coordinator, _sealed, prepared, journal = (
+                _first_prepared(root)
+            )
+            journal_path = journal.journal_path
+            with patch(
+                "tm_activation_recovery._publish_activation_manifest",
+                side_effect=OSError("injected"),
+            ):
+                with self.assertRaises(OSError):
+                    coordinator.publish_activation(prepared, journal)
+            self.assertIs(_phase(journal_path), DB_REPLACED)
+            journal_bytes = journal_path.read_bytes()
+            connection = sqlite3.connect(identity.canonical_sidecar_path)
+            try:
+                self.assertEqual(_meta(connection)["activation_status"], "ACTIVE")
+                connection.execute(
+                    "UPDATE tm_record SET provenance_json = ? "
+                    "WHERE record_id = (SELECT MIN(record_id) FROM tm_record)",
+                    ('{"source":"tampered-but-valid-json"}',),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            recovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                recovered.recover_durable_activation()
+
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_ASSET_MUTATED",
+            )
+            self.assertEqual(recovered.state, "ACTIVATING")
+            self.assertIsNone(recovered.current_generation)
+            self.assertIs(_phase(journal_path), DB_REPLACED)
+            self.assertEqual(journal_path.read_bytes(), journal_bytes)
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertTrue(
+                journal._record.candidate_manifest_temp_path.is_file()
+            )
+
+    def test_cold_receipt_owner_detects_post_transaction_semantic_mutation(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "provenance",
+                "UPDATE tm_record SET provenance_json = ? "
+                "WHERE record_id = (SELECT MIN(record_id) FROM tm_record)",
+                ('{"source":"tampered-but-valid-json"}',),
+            ),
+            (
+                "context",
+                "UPDATE tm_record SET context_next_raw = ? "
+                "WHERE record_id = (SELECT MIN(record_id) FROM tm_record)",
+                ("tampered-context",),
+            ),
+        )
+        for label, statement, parameters in mutations:
+            with self.subTest(field=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    identity, coordinator, _sealed, prepared, journal = (
+                        _first_prepared(root)
+                    )
+                    journal_path = journal.journal_path
+                    with patch(
+                        "tm_activation_recovery._publish_activation_receipt",
+                        side_effect=OSError("injected"),
+                    ):
+                        with self.assertRaises(OSError):
+                            coordinator.publish_activation(prepared, journal)
+                    self.assertIs(_phase(journal_path), DB_REPLACED)
+                    journal_bytes = journal_path.read_bytes()
+                    source_bytes = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    real_complete_receipt = (
+                        recovery_module._complete_recovered_receipt
+                    )
+
+                    def complete_then_mutate(
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> str:
+                        expected_closure = real_complete_receipt(
+                            *args,
+                            **kwargs,
+                        )
+                        connection = sqlite3.connect(
+                            identity.canonical_sidecar_path
+                        )
+                        try:
+                            connection.execute(statement, parameters)
+                            connection.commit()
+                        finally:
+                            connection.close()
+                        return expected_closure
+
+                    recovered = _fresh(identity)
+                    with patch(
+                        "tm_activation_recovery._complete_recovered_receipt",
+                        side_effect=complete_then_mutate,
+                    ):
+                        with self.assertRaises(
+                            ActivationPreparationError
+                        ) as raised:
+                            recovered.recover_durable_activation()
+
+                    self.assertEqual(
+                        raised.exception.code,
+                        "ACTIVATION.ACTIVE_SET_INVALID",
+                    )
+                    self.assertEqual(recovered.state, "ACTIVATING")
+                    self.assertIsNone(recovered.current_generation)
+                    self.assertIs(_phase(journal_path), DB_REPLACED)
+                    self.assertEqual(journal_path.read_bytes(), journal_bytes)
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        source_bytes,
+                    )
+                    self.assertTrue(
+                        identity.canonical_sidecar_path.is_file()
+                    )
+                    self.assertTrue(identity.snapshot_manifest_path.is_file())
+                    self.assertFalse(
+                        store_module._activation_terminal_path(
+                            identity
+                        ).exists()
+                    )
+
     def test_db_replaced_builds_active_attestation_once_then_cold_reuses(
         self,
     ) -> None:

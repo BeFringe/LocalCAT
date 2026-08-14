@@ -103,13 +103,14 @@ class ActivationPublicationHappyPathTests(unittest.TestCase):
                 events.append("validate-db")
                 return value
 
-            def publish_receipt(*args: Any, **kwargs: Any) -> None:
+            def publish_receipt(*args: Any, **kwargs: Any) -> str:
                 self.assertIs(
                     _phase(journal.journal_path),
                     _ActivationJournalPhase.DB_REPLACED,
                 )
-                real_receipt(*args, **kwargs)
+                expected_closure = real_receipt(*args, **kwargs)
                 events.append("publish-receipt")
+                return expected_closure
 
             def publish_manifest(*args: Any, **kwargs: Any) -> None:
                 self.assertIs(
@@ -400,6 +401,100 @@ class ActivationPublicationHappyPathTests(unittest.TestCase):
 
 
 class ActivationPublicationFailureTests(unittest.TestCase):
+    def test_semantic_mutation_after_receipt_owner_never_self_attests(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "provenance",
+                "UPDATE tm_record SET provenance_json = ? "
+                "WHERE record_id = (SELECT MIN(record_id) FROM tm_record)",
+                ('{"source":"tampered-but-valid-json"}',),
+            ),
+            (
+                "context",
+                "UPDATE tm_record SET context_prev_raw = ? "
+                "WHERE record_id = (SELECT MIN(record_id) FROM tm_record)",
+                ("tampered-context",),
+            ),
+        )
+        for label, statement, parameters in mutations:
+            with self.subTest(field=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        _store,
+                        coordinator,
+                        _stage,
+                        sealed,
+                    ) = _existing_fixture(root, fts5_available=True)
+                    prepared = coordinator.activate(sealed)
+                    journal = coordinator.publish_prepared_activation(
+                        prepared
+                    )
+                    record = journal._record
+                    assert record.prior_db_path is not None
+                    assert record.prior_manifest_path is not None
+                    prior_db_bytes = record.prior_db_path.read_bytes()
+                    source_bytes = identity.configured_jsonl_path.read_bytes()
+                    real_publish_manifest = (
+                        store_module._publish_activation_manifest
+                    )
+
+                    def publish_then_mutate(
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> None:
+                        real_publish_manifest(*args, **kwargs)
+                        connection = sqlite3.connect(
+                            identity.canonical_sidecar_path
+                        )
+                        try:
+                            connection.execute(statement, parameters)
+                            connection.commit()
+                        finally:
+                            connection.close()
+
+                    with patch(
+                        "tm_activation_recovery._publish_activation_manifest",
+                        side_effect=publish_then_mutate,
+                    ):
+                        with self.assertRaises(
+                            ActivationPreparationError
+                        ) as raised:
+                            coordinator.publish_activation(
+                                prepared,
+                                journal,
+                            )
+
+                    self.assertEqual(
+                        raised.exception.code,
+                        "ACTIVATION.ACTIVE_SET_INVALID",
+                    )
+                    self.assertEqual(coordinator.state, "ACTIVATING")
+                    self.assertEqual(coordinator.current_generation, 0)
+                    self.assertIs(
+                        _phase(journal.journal_path),
+                        _ActivationJournalPhase.DB_REPLACED,
+                    )
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        source_bytes,
+                    )
+                    self.assertEqual(
+                        record.prior_db_path.read_bytes(),
+                        prior_db_bytes,
+                    )
+                    for asset in prepared._backup_assets:
+                        self.assertTrue(asset.backup_path.is_file())
+                        self.assertEqual(
+                            hashlib.sha256(
+                                asset.backup_path.read_bytes()
+                            ).hexdigest(),
+                            asset.evidence.backup_digest,
+                        )
+
     def test_replace_failure_leaves_prepared_phase_and_unconsumed_token(
         self,
     ) -> None:

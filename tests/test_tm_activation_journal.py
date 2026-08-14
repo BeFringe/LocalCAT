@@ -357,6 +357,32 @@ class ActivationJournalHappyPathTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 replace(record, active_content_attestation=wrong_count)
 
+            wrong_boundary_facts = replace(
+                active.semantic_facts,
+                receipt_boundary_record_count=(
+                    active.semantic_facts.receipt_boundary_record_count - 1
+                ),
+                receipt_boundary_fts_count=(
+                    active.semantic_facts.receipt_boundary_fts_count - 1
+                ),
+            )
+            wrong_boundary = _create_active_content_attestation(
+                sealed_attestation_digest=active.sealed_attestation_digest,
+                journal_id=active.journal_id,
+                resource_id=active.resource_id,
+                target_identity=active.target_identity,
+                canonical_store_id=active.canonical_store_id,
+                snapshot_receipt_digest=active.snapshot_receipt_digest,
+                generation=active.generation,
+                activation_digest=active.activation_digest,
+                database=active.database,
+                manifest=active.manifest,
+                source=active.source,
+                semantic_facts=wrong_boundary_facts,
+            )
+            with self.assertRaises(ValueError):
+                replace(record, active_content_attestation=wrong_boundary)
+
     def test_first_activation_prepared_journal_is_canonical_and_closed(
         self,
     ) -> None:

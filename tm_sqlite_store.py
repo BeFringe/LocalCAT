@@ -1387,6 +1387,16 @@ class _CoordinatorStorePort:
         stage_sealer = importlib.import_module("tm_stage_sealer")
         return cast(str, stage_sealer._stage_closure_digest(connection))
 
+    def active_transition_closure_digests(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[str, str]:
+        stage_sealer = importlib.import_module("tm_stage_sealer")
+        return cast(
+            tuple[str, str],
+            stage_sealer._active_transition_closure_digests(connection),
+        )
+
     def advance_after_effect(
         self,
         preparation: _ActivationPreparation,

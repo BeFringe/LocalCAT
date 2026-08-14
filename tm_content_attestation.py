@@ -154,11 +154,13 @@ class ContentSemanticFacts:
     wal_enabled: bool
     extension_loading_enabled: bool
     record_count: int
+    receipt_boundary_record_count: int
     origin_batch_count: int
     origin_batch_id: str
     origin_batch_kind: str
     exported_revision: int
     fts_count: int
+    receipt_boundary_fts_count: int
     gram_counts: tuple[tuple[int, int], ...]
     exact_parity_digest: str
     logical_closure_digest: str
@@ -181,7 +183,15 @@ class ContentSemanticFacts:
             self.extension_loading_enabled,
             "extension_loading_enabled",
         )
-        _require_int(self.record_count, "record_count")
+        record_count = _require_int(self.record_count, "record_count")
+        boundary_record_count = _require_int(
+            self.receipt_boundary_record_count,
+            "receipt_boundary_record_count",
+        )
+        if boundary_record_count > record_count:
+            raise ValueError(
+                "receipt_boundary_record_count cannot exceed record_count"
+            )
         _require_int(self.origin_batch_count, "origin_batch_count")
         _require_string(self.origin_batch_id, "origin_batch_id")
         origin_batch_kind = _require_string(
@@ -191,9 +201,26 @@ class ContentSemanticFacts:
         if origin_batch_kind not in {"migration", "import", "schema_upgrade"}:
             raise ValueError("origin_batch_kind is not supported")
         _require_int(self.exported_revision, "exported_revision")
-        _require_int(self.fts_count, "fts_count")
-        if self.fts_count > self.record_count:
+        fts_count = _require_int(self.fts_count, "fts_count")
+        boundary_fts_count = _require_int(
+            self.receipt_boundary_fts_count,
+            "receipt_boundary_fts_count",
+        )
+        if fts_count > record_count:
             raise ValueError("fts_count cannot exceed record_count")
+        if boundary_fts_count > boundary_record_count:
+            raise ValueError(
+                "receipt_boundary_fts_count cannot exceed "
+                "receipt_boundary_record_count"
+            )
+        if boundary_fts_count > fts_count:
+            raise ValueError(
+                "receipt_boundary_fts_count cannot exceed fts_count"
+            )
+        if not self.fts5_available and (
+            fts_count != 0 or boundary_fts_count != 0
+        ):
+            raise ValueError("fallback semantic facts cannot carry FTS rows")
         if type(self.gram_counts) is not tuple:
             raise TypeError("gram_counts must be an exact tuple")
         sizes: list[int] = []
@@ -228,6 +255,8 @@ _SEMANTIC_FIELDS = frozenset(
         "origin_batch_id",
         "origin_batch_kind",
         "record_count",
+        "receipt_boundary_fts_count",
+        "receipt_boundary_record_count",
         "schema_digest",
         "schema_version",
         "sqlite_runtime_version",
@@ -261,6 +290,10 @@ def _semantic_facts_to_mapping(
         "origin_batch_id": facts.origin_batch_id,
         "origin_batch_kind": facts.origin_batch_kind,
         "record_count": facts.record_count,
+        "receipt_boundary_fts_count": facts.receipt_boundary_fts_count,
+        "receipt_boundary_record_count": (
+            facts.receipt_boundary_record_count
+        ),
         "schema_digest": facts.schema_digest,
         "schema_version": facts.schema_version,
         "sqlite_runtime_version": facts.sqlite_runtime_version,
@@ -317,6 +350,10 @@ def _semantic_facts_from_mapping(mapping: object) -> ContentSemanticFacts:
             values["extension_loading_enabled"], "extension_loading_enabled"
         ),
         record_count=_require_int(values["record_count"], "record_count"),
+        receipt_boundary_record_count=_require_int(
+            values["receipt_boundary_record_count"],
+            "receipt_boundary_record_count",
+        ),
         origin_batch_count=_require_int(
             values["origin_batch_count"], "origin_batch_count"
         ),
@@ -330,6 +367,10 @@ def _semantic_facts_from_mapping(mapping: object) -> ContentSemanticFacts:
             values["exported_revision"], "exported_revision"
         ),
         fts_count=_require_int(values["fts_count"], "fts_count"),
+        receipt_boundary_fts_count=_require_int(
+            values["receipt_boundary_fts_count"],
+            "receipt_boundary_fts_count",
+        ),
         gram_counts=tuple(gram_counts),
         exact_parity_digest=_require_digest(
             values["exact_parity_digest"], "exact_parity_digest"
