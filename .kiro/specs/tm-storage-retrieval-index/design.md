@@ -898,11 +898,12 @@ class CandidateRetriever:
 - query 长度 ≥3 且 FTS5 capability 可用时，把 fold-v1 query 的 unique character trigrams 分别转义为 phrase，并以 OR union 形成 fast seed；无 FTS5 时按 GRAM_3/2/1 形成 fallback seed。seed 只决定实际 execution path、初始上界队列与可诊断阶段，不能作为 scorer-v1 完备性的证明。
 - canonical index 在 record/index 同一事务保存 `source_fold_length`、字符与 bigram 的 multiset term frequency，以及固定 record block 的长度范围和各 term 最大频次。block summary 只提供保守上界；缺行、重复、计数不守恒或 summary 低估都使该资源 fail-closed。
 - 对 fold-v1 query 与一个 record，令长度为 `m/n`、字符 multiset 交集为 `C`、bigram multiset 交集为 `I`、bigram 总数为 `Bq/Br`。编辑距离安全下界为 `max(abs(m-n), max(m,n)-C, ceil((Bq+Br-2I)/4))`；由此得到 Levenshtein ratio 上界，再与精确 bigram Dice 平均得到 scorer-v1 上界。单字符 Dice 沿用 scorer-v1 特例。实现必须以穷举/随机对照证明上界从不低估真实分数。
-- CandidateRetriever 在同一 generation view 内按 `(score_upper_bound DESC, record_id DESC)` best-first 打开 block、生成有界 record batch；TMRetrievalService 只对这些 batch 运行真实 scorer-v1，并把不可变评分事实交回 proof state。只有“所有未评分上界均低于最低相似度”且“任一未评分 `(upper_bound, record_id)` 都不能超过当前真实第 k 名 `(score, record_id)`”同时成立，候选证明才闭合。
-- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))` 保持不变，并限制单资源为闭合证明执行的真实 scorer 次数。预算耗尽而证明未闭合时返回稳定的资源级 `CANDIDATE.PROOF_BUDGET_EXHAUSTED`，不返回该资源的 fuzzy 结果；不得扩大窗口、使用 oracle identity、固定语料类别或调用方自报 completeness 绕过证明。
-- 每次查询按执行顺序记录 FTS_TRIGRAM/GRAM_3/GRAM_2/GRAM_1 seed、BOUND_PROOF、UNION、DEDUPLICATE 与可选 TRUNCATE 的守恒事实；同时冻结 bound version、总 block/record 数、已打开 block、已检查上界、真实评分数、未评分最大上界、阈值与第 k 名闭合事实。未执行阶段不伪造零计数，proof inspected 与真实 scored 不得冒充最终 global returned count。
+- `proof-query-v2` 保留 256-slot block 作为完整性与稀疏遍历单元；CandidateRetriever 在同一 generation view 内优先按 `(score_upper_bound DESC, record_id DESC)` best-first 打开 block。若保守 block maxima 使大量 block 仍可越过阈值，则在一个只读事务中用既有 `tm_record` 与 `tm_gram` 执行 set-based exact record-bound scan，完成 lease/head/count/block/index 守恒后提交，再把紧凑 exact frontier 交给 scorer。禁止让 SQLite read transaction 跨越 scorer callback；评分结束仍须复核同一 generation/head，append race 必须稳定 fail-closed。
+- 对固定 query，只有完整 `fold-v1(source_raw)` 完全相等的 record 才构成 scorer 等价类。TMRetrievalService 必须从 health-validated record 自行重建等价类；每类首次出现运行一次真实 scorer-v1，后续 identity 复用同一不可变 evidence，但各自的 raw source、target、provenance、record id 与稳定 tie 仍独立保留。hash、长度、gram、seed、调用方分组或自报计数均不能建立等价；任意注入 scorer 也不能冒充可复用的 scorer-v1 owner。
+- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))` 保持不变，并只限制单资源为闭合证明执行的真实 scorer-v1 调用次数。`proof-query-v2` 分开冻结 `scorer_invocation_count`、`accounted_identity_count` 与 `unscored_identity_count`：调用数等于已计入 identity 的 exact folded-source 等价类数且不得超过 budget，已计入与未计入 identity 之和必须等于总 record 数；BOUND_PROOF/UNION/DEDUPLICATE 和候选 identity 数按 `accounted_identity_count` 对账，不再把 identity fan-out 误算为额外 scorer 调用。预算耗尽而证明未闭合时返回稳定的资源级 `CANDIDATE.PROOF_BUDGET_EXHAUSTED`。
+- 每次查询按执行顺序记录 FTS_TRIGRAM/GRAM_3/GRAM_2/GRAM_1 seed、BOUND_PROOF、UNION、DEDUPLICATE 与可选 TRUNCATE 的守恒事实；同时冻结 traversal mode/version、总 block/record 数、扫描/打开 block、已检查上界、scorer 调用、已计入/未计入 identity、未评分最大上界、阈值与第 k 名闭合事实。未执行阶段不伪造零计数，proof inspected、scorer invocation、accounted identity 与最终 global returned count 不得互相冒充。只有“所有未计入 identity 的上界均低于最低相似度”且“任一未计入 `(upper_bound, record_id)` 都不能超过当前真实第 k 名 `(score, record_id)`”同时成立，候选证明才闭合。
 - CandidateRetriever 与 TMRetrievalService 通过私有 proof port 交替推进，公开 `CandidateRetrievalReport` 仍只暴露候选身份与 frozen `CandidateRecallMetadata`；评分 evidence 由 Retrieval 持有并直接用于 threshold、稳定排序和跨资源 global limit，不重复评分、不允许 candidate owner 授予 capability。
-- query report 与 benchmark 复用同一 proof-aware recall metadata contract；阶段计数、union unique、dedupe、truncate、proof scored、returned 必须可对账，任何负数、顺序错乱、上界低估、`proof_scored_count > candidate_budget` 或未闭合证明都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
+- query report 与 benchmark 复用同一 proof-aware recall metadata contract；阶段计数、union unique、dedupe、truncate、scorer invocation、accounted identity、returned 必须可对账，任何负数、顺序错乱、上界低估、`scorer_invocation_count > candidate_budget`、等价类/identity 守恒错误或未闭合证明都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
 - tractable oracle corpus 上，所有高于批准 threshold 的结果与真实 top-10 必须 100% 被 candidate set 覆盖；recall gate 失败不得激活 fuzzy path。
 - 返回顺序不等于最终顺序；Retrieval 必须运行 scorer。
 
@@ -1178,7 +1179,7 @@ query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → se
 ## 性能与可扩展性
 
 - exact B-tree raw index 是独立 fast path，不扫描 candidate index。
-- candidate proof 以 block-level 保守上界 best-first 打开小批量 record，避免全量 union source fetch/sort 和每 record 一次 SQL；上界只能多取，不能漏取。
+- candidate proof 对稀疏 frontier 以 block-level 保守上界 best-first 打开小批量 record；当保守 maxima 退化为近全量 block 时，切换为单事务 set-based exact-bound scan，禁止用每 block 一次连接/事务/count 复证实现同一密集扫描。两种模式共享 exact record bound、fold-equivalence、budget 与闭合语义，上界只能多取，不能漏取。
 - migration 先 bulk insert、后建大索引；transaction 与 RSS 由 100k gate 约束。
 - FTS5/gram seed 只控制 execution path 与首批 proof 队列；完备性由共同的 versioned bound proof 决定，默认 scorer budget 写入 versioned contract。
 - sealed/active attestation 只消除同一 immutable byte identity 上的重复语义扫描；任何字节、inode、phase 或 durable evidence 漂移都重新进入完整验证或 fail-stop，不能以 stat/mtime/size 或缓存布尔值代替。
