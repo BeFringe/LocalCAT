@@ -26,7 +26,7 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, NoReturn, Protocol, SupportsIndex, cast
 import unicodedata
 import uuid
 
@@ -908,6 +908,76 @@ class SQLiteCandidateProofRecord:
     bigram_multiset_intersection: int
 
 
+_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY = object()
+
+
+class _SQLiteCandidateProofDenseReceipt:
+    """Opaque store-issued identity binding for one dense projection."""
+
+    __slots__ = (
+        "phase",
+        "binding_digest",
+        "item_count",
+        "record_ids",
+        "source_folds_v1",
+        "source_fold_lengths",
+        "bigram_multiset_intersections",
+        "_sealed",
+    )
+
+    phase: str
+    binding_digest: str
+    item_count: int
+    record_ids: tuple[int, ...] | None
+    source_folds_v1: tuple[str, ...] | None
+    source_fold_lengths: tuple[int, ...]
+    bigram_multiset_intersections: tuple[int, ...] | None
+    _sealed: bool
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        binding_digest: str,
+        item_count: int,
+        record_ids: tuple[int, ...] | None,
+        source_folds_v1: tuple[str, ...] | None,
+        source_fold_lengths: tuple[int, ...],
+        bigram_multiset_intersections: tuple[int, ...] | None,
+        _factory_key: object,
+    ) -> None:
+        if _factory_key is not _CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY:
+            raise TypeError("dense proof receipts are store-owned")
+        self._sealed = False
+        self.phase = phase
+        self.binding_digest = binding_digest
+        self.item_count = item_count
+        self.record_ids = record_ids
+        self.source_folds_v1 = source_folds_v1
+        self.source_fold_lengths = source_fold_lengths
+        self.bigram_multiset_intersections = bigram_multiset_intersections
+        self._sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("dense proof receipts are immutable")
+        object.__setattr__(self, name, value)
+
+    def __copy__(self) -> _SQLiteCandidateProofDenseReceipt:
+        return self
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> _SQLiteCandidateProofDenseReceipt:
+        memo[id(self)] = self
+        return self
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("dense proof receipts cannot be serialized")
+
+
 @dataclass(frozen=True)
 class SQLiteCandidateProofDensePhase1:
     """Length and exact-bigram facts from the committed dense phase one."""
@@ -915,15 +985,18 @@ class SQLiteCandidateProofDensePhase1:
     source_fold_lengths: tuple[int, ...]
     bigram_multiset_intersections: tuple[int, ...]
     binding_digest: str
+    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
 
 
 @dataclass(frozen=True)
 class SQLiteCandidateProofDensePhase2:
-    """Strict ordered exact-character refinement from committed phase two."""
+    """Strict proof-only folded-source projection from committed phase two."""
 
     record_ids: tuple[int, ...]
-    character_multiset_intersections: tuple[int, ...]
+    source_folds_v1: tuple[str, ...]
+    source_fold_lengths: tuple[int, ...]
     binding_digest: str
+    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -7736,6 +7809,7 @@ def _candidate_proof_snapshot_body(
     *,
     folded_query: str,
     seed_limit: int,
+    connection: sqlite3.Connection | None = None,
 ) -> SQLiteCandidateProofSnapshot:
     """Read one real seed plus block frontiers without record-level facts."""
 
@@ -7749,7 +7823,7 @@ def _candidate_proof_snapshot_body(
         for size, frequencies in ((1, query_characters), (2, query_bigrams))
         for gram, frequency in frequencies.items()
     )
-    with _open_leased_connection(lease) as connection:
+    with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
             _validate_lease_identity(connection, lease)
@@ -7910,6 +7984,7 @@ def _candidate_proof_block_records_body(
     block: SQLiteCandidateProofBlock,
     head_revision: int,
     total_record_count: int,
+    connection: sqlite3.Connection | None = None,
 ) -> tuple[SQLiteCandidateProofRecord, ...]:
     """Read and close exact proof facts for exactly one opened 256-slot block."""
 
@@ -7924,7 +7999,7 @@ def _candidate_proof_block_records_body(
         for gram, frequency in frequencies.items()
     )
     final_record_id = min(block.last_record_id, total_record_count)
-    with _open_leased_connection(lease) as connection:
+    with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
             _validate_lease_identity(connection, lease)
@@ -8069,14 +8144,22 @@ def _candidate_proof_block_records_body(
 
 def _candidate_proof_dense_binding_digest(
     *,
+    lease: _SQLiteGenerationView,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
     head_revision: int,
     total_record_count: int,
     query_maxima_digest: str,
 ) -> str:
+    identity = lease.stage.resource_identity
     payload = json.dumps(
         (
+            contract_module.CANDIDATE_PROOF_TRAVERSAL_VERSION,
+            contract_module.SCORER_BOUND_VERSION_V1,
+            identity.resource_id,
+            lease.canonical_store_id,
+            identity.target_identity,
+            lease.generation,
             hashlib.sha256(folded_query.encode("utf-8")).hexdigest(),
             head_revision,
             total_record_count,
@@ -8088,9 +8171,80 @@ def _candidate_proof_dense_binding_digest(
     return hashlib.sha256(payload).hexdigest()
 
 
+def _validate_candidate_proof_dense_phase1_result(
+    value: object,
+    *,
+    view: SQLiteTMQueryView,
+    folded_query: str,
+    blocks: tuple[SQLiteCandidateProofBlock, ...],
+    head_revision: int,
+    total_record_count: int,
+    query_maxima_digest: str,
+) -> None:
+    """Accept only the exact store-issued phase-one fact objects."""
+
+    if (
+        type(value) is not SQLiteCandidateProofDensePhase1
+        or type(view) is not SQLiteTMQueryView
+    ):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    view._check_lifetime()
+    expected_binding = _candidate_proof_dense_binding_digest(
+        lease=view._lease,
+        folded_query=folded_query,
+        blocks=blocks,
+        head_revision=head_revision,
+        total_record_count=total_record_count,
+        query_maxima_digest=query_maxima_digest,
+    )
+    receipt = getattr(value, "_receipt", None)
+    if (
+        type(receipt) is not _SQLiteCandidateProofDenseReceipt
+        or receipt.phase != "DENSE_PHASE1_V1"
+        or receipt.binding_digest != expected_binding
+        or receipt.binding_digest != value.binding_digest
+        or receipt.item_count != total_record_count
+        or receipt.record_ids is not None
+        or receipt.source_folds_v1 is not None
+        or receipt.source_fold_lengths is not value.source_fold_lengths
+        or receipt.bigram_multiset_intersections
+        is not value.bigram_multiset_intersections
+    ):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+
+
+def _validate_candidate_proof_dense_phase2_result(
+    value: object,
+    *,
+    binding_digest: str,
+    record_ids: tuple[int, ...],
+    source_fold_lengths: tuple[int, ...],
+) -> None:
+    """Accept only the exact store-issued ordered phase-two projection."""
+
+    if type(value) is not SQLiteCandidateProofDensePhase2:
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    receipt = getattr(value, "_receipt", None)
+    if (
+        type(receipt) is not _SQLiteCandidateProofDenseReceipt
+        or receipt.phase != "DENSE_PHASE2_V1"
+        or receipt.binding_digest != binding_digest
+        or receipt.binding_digest != value.binding_digest
+        or receipt.item_count != len(record_ids)
+        or receipt.record_ids is not value.record_ids
+        or receipt.source_folds_v1 is not value.source_folds_v1
+        or receipt.source_fold_lengths is not value.source_fold_lengths
+        or receipt.bigram_multiset_intersections is not None
+        or value.record_ids != record_ids
+        or value.source_fold_lengths != source_fold_lengths
+    ):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+
+
 def _validate_candidate_proof_dense_binding(
     connection: sqlite3.Connection,
     *,
+    lease: _SQLiteGenerationView,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
     head_revision: int,
@@ -8122,13 +8276,14 @@ def _validate_candidate_proof_dense_binding(
     if tuple(block_rows) != expected_blocks:
         raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
 
-    # Dense U1/U2 closure consumes exact tm_gram facts rather than the coarse
-    # persisted maxima.  Rebind the query-maxima snapshot itself while head,
-    # count, lease identity and the complete block layout remain unchanged;
+    # Dense phase one consumes exact bigram facts rather than the coarse
+    # persisted maxima. Rebind the query-maxima snapshot while resource/store,
+    # generation, head, count and the complete block layout remain unchanged;
     # SPARSE continues to validate per-term maxima when each block opens.
     if _candidate_proof_query_maxima_digest(blocks) != query_maxima_digest:
         raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
     return _candidate_proof_dense_binding_digest(
+        lease=lease,
         folded_query=folded_query,
         blocks=blocks,
         head_revision=head_revision,
@@ -8145,6 +8300,7 @@ def _candidate_proof_dense_phase1_body(
     head_revision: int,
     total_record_count: int,
     query_maxima_digest: str,
+    connection: sqlite3.Connection | None = None,
 ) -> SQLiteCandidateProofDensePhase1:
     """Return all lengths and exact bigram intersections, then commit."""
 
@@ -8152,36 +8308,58 @@ def _candidate_proof_dense_phase1_body(
         folded_query[offset : offset + 2]
         for offset in range(max(0, len(folded_query) - 1))
     )
-    with _open_leased_connection(lease) as connection:
+    with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
             _validate_lease_identity(connection, lease)
             binding_digest = _validate_candidate_proof_dense_binding(
                 connection,
+                lease=lease,
                 folded_query=folded_query,
                 blocks=blocks,
                 head_revision=head_revision,
                 total_record_count=total_record_count,
                 query_maxima_digest=query_maxima_digest,
             )
-            record_rows = connection.execute(
+            length_row = connection.execute(
+                "SELECT json_group_array(source_fold_length), "
+                "MIN(record_id), MAX(record_id), COUNT(*) FROM ("
                 "SELECT record_id, source_fold_length FROM tm_record "
-                "ORDER BY record_id"
-            ).fetchall()
-            lengths = [0] * (total_record_count + 1)
-            for expected_record_id, row in enumerate(record_rows, start=1):
-                if type(row) is not tuple or len(row) != 2:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                record_id = _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID")
-                length = _proof_int(row[1], "STORE.CANDIDATE_PROOF_INVALID")
-                if record_id != expected_record_id or length < 1:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                lengths[record_id] = length
-            if len(record_rows) != total_record_count:
+                "ORDER BY record_id)"
+            ).fetchone()
+            if (
+                type(length_row) is not tuple
+                or len(length_row) != 4
+                or type(length_row[0]) is not str
+                or type(length_row[1]) is not int
+                or length_row[1] != 1
+                or type(length_row[2]) is not int
+                or length_row[2] != total_record_count
+                or type(length_row[3]) is not int
+                or length_row[3] != total_record_count
+            ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            try:
+                length_payload = json.loads(length_row[0])
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                ) from error
+            if (
+                type(length_payload) is not list
+                or len(length_payload) != total_record_count
+                or any(
+                    type(length) is not int or length < 1
+                    for length in length_payload
+                )
+            ):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            lengths = tuple(length_payload)
             for block in blocks:
                 final_record_id = min(block.last_record_id, total_record_count)
-                block_lengths = lengths[block.first_record_id : final_record_id + 1]
+                block_lengths = lengths[
+                    block.first_record_id - 1 : final_record_id
+                ]
                 if (
                     len(block_lengths) != block.record_count
                     or not block_lengths
@@ -8195,31 +8373,80 @@ def _candidate_proof_dense_phase1_body(
             for offset in range(0, len(query_terms), _CANDIDATE_QUERY_CHUNK_SIZE):
                 chunk = query_terms[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
                 values_sql = ",".join("(?, ?)" for _ in chunk)
-                rows = connection.execute(
+                intersection_row = connection.execute(
                     "WITH query_terms(gram, query_frequency) "
                     f"AS (VALUES {values_sql}) "
-                    "SELECT facts.record_id, SUM(CASE "
+                    "SELECT json_group_array(record_id), "
+                    "json_group_array(intersection) FROM ("
+                    "SELECT facts.record_id AS record_id, SUM(CASE "
                     "WHEN facts.term_frequency < query_terms.query_frequency "
                     "THEN facts.term_frequency ELSE query_terms.query_frequency END) "
+                    "AS intersection "
                     "FROM query_terms CROSS JOIN tm_gram AS facts "
                     "ON facts.gram_size = 2 AND facts.gram = query_terms.gram "
-                    "GROUP BY facts.record_id",
+                    "GROUP BY facts.record_id ORDER BY facts.record_id)",
                     tuple(value for term in chunk for value in term),
-                ).fetchall()
-                for row in rows:
-                    if type(row) is not tuple or len(row) != 2:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    record_id = _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID")
-                    intersection = _proof_int(
-                        row[1], "STORE.CANDIDATE_PROOF_INVALID"
+                ).fetchone()
+                if (
+                    type(intersection_row) is not tuple
+                    or len(intersection_row) != 2
+                    or any(
+                        type(payload) is not str
+                        for payload in intersection_row
                     )
-                    if not 1 <= record_id <= total_record_count:
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                try:
+                    intersection_record_ids = json.loads(intersection_row[0])
+                    intersection_values = json.loads(intersection_row[1])
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    ) from error
+                if (
+                    type(intersection_record_ids) is not list
+                    or type(intersection_values) is not list
+                    or len(intersection_record_ids) != len(intersection_values)
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                prior_record_id = 0
+                for record_id, intersection in zip(
+                    intersection_record_ids,
+                    intersection_values,
+                    strict=True,
+                ):
+                    record_id = _proof_int(
+                        record_id,
+                        "STORE.CANDIDATE_PROOF_INVALID",
+                    )
+                    intersection = _proof_int(
+                        intersection,
+                        "STORE.CANDIDATE_PROOF_INVALID",
+                    )
+                    if not prior_record_id < record_id <= total_record_count:
                         raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
                     bigram_intersections[record_id] += intersection
-            result = SQLiteCandidateProofDensePhase1(
-                source_fold_lengths=tuple(lengths[1:]),
-                bigram_multiset_intersections=tuple(bigram_intersections[1:]),
+                    prior_record_id = record_id
+            ordered_bigram_intersections = tuple(bigram_intersections[1:])
+            receipt = _SQLiteCandidateProofDenseReceipt(
+                phase="DENSE_PHASE1_V1",
                 binding_digest=binding_digest,
+                item_count=total_record_count,
+                record_ids=None,
+                source_folds_v1=None,
+                source_fold_lengths=lengths,
+                bigram_multiset_intersections=ordered_bigram_intersections,
+                _factory_key=_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
+            )
+            result = SQLiteCandidateProofDensePhase1(
+                source_fold_lengths=lengths,
+                bigram_multiset_intersections=ordered_bigram_intersections,
+                binding_digest=binding_digest,
+                _receipt=receipt,
             )
             connection.commit()
             return result
@@ -8244,16 +8471,33 @@ def _candidate_proof_dense_phase2_body(
     binding_digest: str,
     record_ids: tuple[int, ...],
     source_fold_lengths: tuple[int, ...],
+    connection: sqlite3.Connection | None = None,
 ) -> SQLiteCandidateProofDensePhase2:
-    """Return exact character intersections for exactly the ordered R set."""
+    """Return only the ordered folded-source projection for the exact R set."""
 
-    query_characters = tuple(Counter(folded_query).items())
-    with _open_leased_connection(lease) as connection:
+    if len(record_ids) != len(source_fold_lengths):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    prior_record_id = 0
+    for record_id, source_fold_length in zip(
+        record_ids,
+        source_fold_lengths,
+        strict=True,
+    ):
+        if (
+            type(record_id) is not int
+            or not prior_record_id < record_id <= total_record_count
+            or type(source_fold_length) is not int
+            or source_fold_length < 1
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        prior_record_id = record_id
+    with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
             _validate_lease_identity(connection, lease)
             actual_binding = _validate_candidate_proof_dense_binding(
                 connection,
+                lease=lease,
                 folded_query=folded_query,
                 blocks=blocks,
                 head_revision=head_revision,
@@ -8262,79 +8506,113 @@ def _candidate_proof_dense_phase2_body(
             )
             if actual_binding != binding_digest:
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            intersections = [0] * len(record_ids)
-            position_by_id = {
-                record_id: position for position, record_id in enumerate(record_ids)
-            }
-            connection.execute(
-                "CREATE TEMP TABLE candidate_proof_refinement_request("
-                "ordinal INTEGER PRIMARY KEY, "
-                "record_id INTEGER NOT NULL UNIQUE)"
-            )
-            connection.executemany(
-                "INSERT INTO candidate_proof_refinement_request(ordinal, record_id) "
-                "VALUES (?, ?)",
-                enumerate(record_ids),
-            )
-            length_rows = connection.execute(
-                "SELECT requested.ordinal, records.record_id, "
-                "records.source_fold_length "
-                "FROM candidate_proof_refinement_request AS requested "
-                "JOIN tm_record AS records ON records.record_id = requested.record_id "
-                "ORDER BY requested.ordinal"
-            ).fetchall()
-            if len(length_rows) != len(record_ids):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            for ordinal, row in enumerate(length_rows):
-                if type(row) is not tuple or len(row) != 3:
+            use_dense_projection = total_record_count - len(record_ids) <= 2_048
+            if use_dense_projection:
+                requested = iter(record_ids)
+                current = next(requested, None)
+                excluded: list[int] = []
+                for possible_record_id in range(1, total_record_count + 1):
+                    if current == possible_record_id:
+                        current = next(requested, None)
+                    else:
+                        excluded.append(possible_record_id)
+                if current is not None or len(excluded) > 2_048:
                     raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+                where = ""
+                parameters: tuple[int, ...] = ()
+                if excluded:
+                    placeholders = ",".join("?" for _ in excluded)
+                    where = f"WHERE record_id NOT IN ({placeholders}) "
+                    parameters = tuple(excluded)
+                projection_row = connection.execute(
+                    "SELECT json_group_array(record_id), "
+                    "json_group_array(source_fold_v1), "
+                    "json_group_array(source_fold_length) FROM ("
+                    "SELECT record_id, source_fold_v1, source_fold_length "
+                    f"FROM tm_record {where}ORDER BY record_id)",
+                    parameters,
+                ).fetchone()
+            else:
+                request_json = json.dumps(
+                    record_ids,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                projection_row = connection.execute(
+                    "SELECT json_group_array(record_id), "
+                    "json_group_array(source_fold_v1), "
+                    "json_group_array(source_fold_length) FROM ("
+                    "SELECT records.record_id, records.source_fold_v1, "
+                    "records.source_fold_length "
+                    "FROM json_each(?) AS requested "
+                    "CROSS JOIN tm_record AS records "
+                    "ON records.record_id = CAST(requested.value AS INTEGER) "
+                    "ORDER BY CAST(requested.key AS INTEGER))",
+                    (request_json,),
+                ).fetchone()
+            if (
+                type(projection_row) is not tuple
+                or len(projection_row) != 3
+                or any(type(payload) is not str for payload in projection_row)
+            ):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            try:
+                projected_record_ids = json.loads(projection_row[0])
+                projected_source_folds = json.loads(projection_row[1])
+                projected_source_lengths = json.loads(projection_row[2])
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                ) from error
+            if (
+                type(projected_record_ids) is not list
+                or type(projected_source_folds) is not list
+                or type(projected_source_lengths) is not list
+                or len(projected_record_ids) != len(record_ids)
+                or len(projected_source_folds) != len(record_ids)
+                or len(projected_source_lengths) != len(record_ids)
+            ):
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            copied_record_ids: list[int] = []
+            copied_source_folds: list[str] = []
+            copied_source_lengths: list[int] = []
+            for ordinal, projected_record_id in enumerate(projected_record_ids):
+                projected_source_fold = projected_source_folds[ordinal]
+                projected_source_length = projected_source_lengths[ordinal]
+                expected_source_length = source_fold_lengths[ordinal]
                 if (
-                    _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID") != ordinal
-                    or _proof_int(row[1], "STORE.CANDIDATE_PROOF_INVALID")
-                    != record_ids[ordinal]
-                    or _proof_int(row[2], "STORE.CANDIDATE_PROOF_INVALID")
-                    != source_fold_lengths[ordinal]
+                    type(projected_record_id) is not int
+                    or projected_record_id != record_ids[ordinal]
+                    or type(projected_source_fold) is not str
+                    or not projected_source_fold
+                    or type(projected_source_length) is not int
+                    or projected_source_length != expected_source_length
+                    or len(projected_source_fold) != expected_source_length
                 ):
                     raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            for term_offset in range(0, len(query_characters), 128):
-                terms = query_characters[term_offset : term_offset + 128]
-                values_sql = ",".join("(?, ?)" for _ in terms)
-                rows = connection.execute(
-                    "WITH query_terms(gram, query_frequency) "
-                    f"AS (VALUES {values_sql}) "
-                    "SELECT facts.record_id, SUM(CASE "
-                    "WHEN facts.term_frequency < query_terms.query_frequency "
-                    "THEN facts.term_frequency ELSE query_terms.query_frequency END) "
-                    "FROM query_terms CROSS JOIN tm_gram AS facts "
-                    "ON facts.gram_size = 1 AND facts.gram = query_terms.gram "
-                    "JOIN candidate_proof_refinement_request AS requested "
-                    "ON requested.record_id = facts.record_id "
-                    "GROUP BY facts.record_id",
-                    tuple(value for term in terms for value in term),
-                ).fetchall()
-                for row in rows:
-                    if type(row) is not tuple or len(row) != 2:
-                        raise SQLiteStoreSchemaError(
-                            "STORE.CANDIDATE_PROOF_INVALID"
-                        )
-                    record_id = _proof_int(
-                        row[0], "STORE.CANDIDATE_PROOF_INVALID"
-                    )
-                    position = position_by_id.get(record_id)
-                    if (
-                        position is None
-                        or record_ids[position] != record_id
-                    ):
-                        raise SQLiteStoreSchemaError(
-                            "STORE.CANDIDATE_PROOF_INVALID"
-                        )
-                    intersections[position] += _proof_int(
-                        row[1], "STORE.CANDIDATE_PROOF_INVALID"
-                    )
-            result = SQLiteCandidateProofDensePhase2(
-                record_ids=record_ids,
-                character_multiset_intersections=tuple(intersections),
+                copied_record_ids.append(projected_record_id)
+                copied_source_folds.append(projected_source_fold)
+                copied_source_lengths.append(projected_source_length)
+            ordered_record_ids = tuple(copied_record_ids)
+            ordered_source_folds = tuple(copied_source_folds)
+            ordered_source_lengths = tuple(copied_source_lengths)
+            receipt = _SQLiteCandidateProofDenseReceipt(
+                phase="DENSE_PHASE2_V1",
                 binding_digest=actual_binding,
+                item_count=len(ordered_record_ids),
+                record_ids=ordered_record_ids,
+                source_folds_v1=ordered_source_folds,
+                source_fold_lengths=ordered_source_lengths,
+                bigram_multiset_intersections=None,
+                _factory_key=_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
+            )
+            result = SQLiteCandidateProofDensePhase2(
+                record_ids=ordered_record_ids,
+                source_folds_v1=ordered_source_folds,
+                source_fold_lengths=ordered_source_lengths,
+                binding_digest=actual_binding,
+                _receipt=receipt,
             )
             connection.commit()
             return result
@@ -8353,8 +8631,9 @@ def _validate_candidate_proof_generation_body(
     *,
     head_revision: int,
     total_record_count: int,
+    connection: sqlite3.Connection | None = None,
 ) -> None:
-    with _open_leased_connection(lease) as connection:
+    with _leased_connection_scope(lease, connection) as connection:
         connection.execute("BEGIN")
         try:
             _validate_lease_identity(connection, lease)
@@ -8442,11 +8721,13 @@ def _validate_records_by_id_input(
 def _records_by_id_body(
     lease: _SQLiteGenerationView,
     record_ids: tuple[int, ...],
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> tuple[TMRecord, ...]:
     if not record_ids:
         return ()
     placeholders = ",".join("?" for _ in record_ids)
-    with _open_leased_connection(lease) as connection:
+    with _leased_connection_scope(lease, connection) as connection:
         _validate_lease_identity(connection, lease)
         rows = connection.execute(
             f"SELECT {_RECORD_COLUMNS} FROM tm_record "
@@ -9688,9 +9969,30 @@ class SQLiteTMQueryView:
         self._lease = lease
         self._token = token
         self._expired = False
+        self._connection_manager: (
+            AbstractContextManager[sqlite3.Connection] | None
+        ) = None
+        self._connection: sqlite3.Connection | None = None
 
     def _invalidate(self) -> None:
+        manager = self._connection_manager
+        self._connection = None
+        self._connection_manager = None
+        if manager is not None:
+            manager.__exit__(None, None, None)
         self._expired = True
+
+    def _candidate_connection(self) -> sqlite3.Connection:
+        self._check_lifetime()
+        connection = self._connection
+        if connection is None:
+            manager = _open_leased_connection(self._lease)
+            connection = manager.__enter__()
+            self._connection_manager = manager
+            self._connection = connection
+        if connection.in_transaction:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        return connection
 
     def _check_lifetime(self) -> None:
         resource_id = self._lease.stage.resource_identity.resource_id
@@ -9741,7 +10043,11 @@ class SQLiteTMQueryView:
     ) -> tuple[TMRecord, ...]:
         self._check_lifetime()
         prepared_ids = _validate_records_by_id_input(record_ids)
-        return _records_by_id_body(self._lease, prepared_ids)
+        return _records_by_id_body(
+            self._lease,
+            prepared_ids,
+            connection=self._candidate_connection(),
+        )
 
     def candidate_recall_snapshot(
         self,
@@ -9779,6 +10085,7 @@ class SQLiteTMQueryView:
             self._lease,
             folded_query=folded_query,
             seed_limit=seed_limit,
+            connection=self._candidate_connection(),
         )
 
     def validate_candidate_proof_generation(
@@ -9798,6 +10105,7 @@ class SQLiteTMQueryView:
             self._lease,
             head_revision=head_revision,
             total_record_count=total_record_count,
+            connection=self._candidate_connection(),
         )
 
     def candidate_proof_block_records(
@@ -9825,6 +10133,7 @@ class SQLiteTMQueryView:
             block=block,
             head_revision=head_revision,
             total_record_count=total_record_count,
+            connection=self._candidate_connection(),
         )
 
     def candidate_proof_dense_phase1(
@@ -9880,6 +10189,7 @@ class SQLiteTMQueryView:
             head_revision=head_revision,
             total_record_count=total_record_count,
             query_maxima_digest=query_maxima_digest,
+            connection=self._candidate_connection(),
         )
 
     def candidate_proof_dense_phase2(
@@ -9894,7 +10204,7 @@ class SQLiteTMQueryView:
         record_ids: tuple[int, ...],
         source_fold_lengths: tuple[int, ...],
     ) -> SQLiteCandidateProofDensePhase2:
-        """Return exact character facts for the strict ordered refinement set."""
+        """Return the proof-only folded projection for the ordered R set."""
 
         self._check_lifetime()
         if type(folded_query) is not str or not folded_query:
@@ -9917,18 +10227,9 @@ class SQLiteTMQueryView:
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise ValueError(f"{label} digest must be a SHA-256 digest")
-        if type(record_ids) is not tuple or any(
-            type(record_id) is not int
-            or not 1 <= record_id <= total_record_count
-            for record_id in record_ids
-        ):
+        if type(record_ids) is not tuple:
             raise ValueError("refinement record ids are invalid")
-        if len(set(record_ids)) != len(record_ids):
-            raise ValueError("refinement record ids must be unique")
-        if type(source_fold_lengths) is not tuple or (
-            len(source_fold_lengths) != len(record_ids)
-            or any(type(length) is not int or length < 1 for length in source_fold_lengths)
-        ):
+        if type(source_fold_lengths) is not tuple:
             raise ValueError("refinement source lengths are invalid")
         prepared_blocks = tuple(SQLiteCandidateProofBlock(**block.__dict__) for block in blocks)
         return _candidate_proof_dense_phase2_body(
@@ -9941,6 +10242,7 @@ class SQLiteTMQueryView:
             binding_digest=binding_digest,
             record_ids=tuple(record_ids),
             source_fold_lengths=tuple(source_fold_lengths),
+            connection=self._candidate_connection(),
         )
 
     def health(self) -> StoreHealth:
@@ -10102,6 +10404,22 @@ def _open_leased_connection(
                 retryable=True,
             ) from error
         raise
+
+
+@contextmanager
+def _leased_connection_scope(
+    lease: _SQLiteGenerationView,
+    connection: sqlite3.Connection | None,
+) -> Iterator[sqlite3.Connection]:
+    """Reuse one idle query-view connection without spanning transactions."""
+
+    if connection is not None:
+        if connection.in_transaction:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        yield connection
+        return
+    with _open_leased_connection(lease) as opened:
+        yield opened
 
 
 def initialize_stage_schema(

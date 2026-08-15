@@ -57,6 +57,7 @@ from tm_retrieval import (
     ExactContextClassification,
     FuzzyScoringResult,
     TMRetrievalService,
+    _folded_text_value_v1,
     classify_exact_context,
     compare_context_v1,
     query_resource_exact,
@@ -78,6 +79,28 @@ WINNER_RECORD_ID = 100
 
 class _StrSubclass(str):
     pass
+
+
+class FoldedTextValueV1Tests(unittest.TestCase):
+    def test_spans_free_value_is_exactly_fold_text_v1(self) -> None:
+        vectors = (
+            "Open the door.",
+            "Straße STRASSE",
+            "e\u0301 É",
+            "中한🙂",
+            "\U00010400\U00010428",
+            _StrSubclass("İΣςß"),
+        )
+        for raw in vectors:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    _folded_text_value_v1(raw),
+                    fold_text_v1(raw).folded_text,
+                )
+
+    def test_spans_free_value_rejects_non_text(self) -> None:
+        with self.assertRaises(TypeError):
+            _folded_text_value_v1(cast(Any, 1))
 
 
 def _empty_evidence() -> ContextEvidence:

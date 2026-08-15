@@ -32,13 +32,15 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
-from text_matcher import fold_text_v1
+from text_matcher import UNICODE_VERSION as FOLD_UNICODE_VERSION, fold_text_v1
+from unicode_word_break_data import UNICODE_VERSION as DATA_UNICODE_VERSION
 from tm_candidate_index import (
     CandidateProofBudgetExhausted,
     CandidateProofSession,
@@ -93,6 +95,19 @@ _EMPTY_CONTEXT_EVIDENCE = ContextEvidence(
     mismatched_fields=(),
     strength_v1=(0, 0, 0, 0, 0),
 )
+
+
+def _folded_text_value_v1(raw: str) -> str:
+    """Return the authoritative fold-v1 value when spans are not consumed."""
+
+    if not isinstance(raw, str):
+        raise TypeError("text must be a string")
+    if (
+        DATA_UNICODE_VERSION != FOLD_UNICODE_VERSION
+        or unicodedata.unidata_version != FOLD_UNICODE_VERSION
+    ):
+        raise RuntimeError("fold-v1 Unicode runtime mismatch")
+    return unicodedata.normalize("NFC", raw).casefold()
 
 
 def _require_exact_type(value: object, expected_type: type[Any], label: str) -> None:
@@ -774,12 +789,12 @@ def prove_and_score_fuzzy_candidates(
         raise ValueError("resource_id must not be empty")
     if resource_order < 0:
         raise ValueError("resource_order must be non-negative")
-    if scorer is not None:
+    if scorer is not None and type(scorer) is not SimilarityScorerV1:
         raise ValueError(
             "proof-query-v2 requires the production scorer-v1 owner"
         )
     query_snapshot = _snapshot_query(query)
-    folded_query = fold_text_v1(query_snapshot.query_source).folded_text
+    folded_query = _folded_text_value_v1(query_snapshot.query_source)
     if type(folded_query) is not str or not folded_query:
         raise ValueError("proof query must fold to non-empty text")
     if proof_session_port is None:
@@ -805,6 +820,9 @@ def prove_and_score_fuzzy_candidates(
     records_port = getattr(view, "records_by_id", None)
     if not callable(records_port):
         raise TypeError("query view must implement records_by_id")
+    # A legacy owner may pass an exact scorer-v1 marker, but Retrieval always
+    # constructs and locks its own scorer.  Injected implementations cannot
+    # authorize scoring or exact-fold reuse.
     score_callable = SimilarityScorerV1().score
 
     observed: dict[int, tuple[_FuzzyRecordSnapshot, SimilarityEvidence]] = {}
@@ -831,7 +849,7 @@ def prove_and_score_fuzzy_candidates(
                 raise ValueError("proof identity must be scored exactly once")
             candidate_fold = fold_by_raw_source.get(record.source_raw)
             if candidate_fold is None:
-                candidate_fold = fold_text_v1(record.source_raw).folded_text
+                candidate_fold = _folded_text_value_v1(record.source_raw)
                 fold_by_raw_source[record.source_raw] = candidate_fold
             if type(candidate_fold) is not str or not candidate_fold:
                 raise ValueError("proof candidate must fold to non-empty text")
@@ -1218,7 +1236,7 @@ def _stage_guard(stage: str) -> Iterator[None]:
 
 
 def _fold_query(query: TMQuery) -> str:
-    folded_query = fold_text_v1(query.query_source).folded_text
+    folded_query = _folded_text_value_v1(query.query_source)
     if type(folded_query) is not str:
         raise TypeError("folded query must be a built-in string")
     return folded_query

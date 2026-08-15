@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import heapq
 import math
+import re
 
 from tm_sqlite_store import (
     SQLiteCandidateRecord,
@@ -20,6 +21,8 @@ from tm_sqlite_store import (
     SQLiteStoreSchemaError,
     CANDIDATE_PROOF_BLOCK_SIZE,
     CANDIDATE_PROOF_BLOCK_VERSION_V1,
+    _validate_candidate_proof_dense_phase1_result,
+    _validate_candidate_proof_dense_phase2_result,
     build_candidate_write_plan as _store_build_candidate_write_plan,
     unique_character_ngrams as _store_unique_character_ngrams,
 )
@@ -50,6 +53,7 @@ CANDIDATE_CONTRACT_FLOOR = candidate_budget_v1(1)
 CANDIDATE_PROOF_BATCH_SIZE = 32
 CANDIDATE_PROOF_BUDGET_EXHAUSTED = "CANDIDATE.PROOF_BUDGET_EXHAUSTED"
 _DENSE_CROSSOVER_MIN_BLOCKS = 8
+_ASCII_LCS_TRANSITION_STATE_LIMIT = 4_096
 
 
 class CandidateProofBudgetExhausted(RuntimeError):
@@ -902,19 +906,197 @@ def _dense_phase1_upper_bound(
     ).final_similarity_upper_bound
 
 
-def _dense_phase2_upper_bound(
+def _dense_u2_upper_bound(
     *,
     query_length: int,
     record_length: int,
     character_intersection: int,
     bigram_intersection: int,
 ) -> float:
-    """Return U2 with exact character and bigram intersections."""
+    """Return the algebraic U2 comparator used by bound verification."""
 
     return scorer_upper_bound_v1(
         query_fold_length=query_length,
         record_fold_length=record_length,
         character_multiset_intersection=character_intersection,
+        bigram_multiset_intersection=bigram_intersection,
+        query_bigram_count=max(query_length - 1, 0),
+        record_bigram_count=max(record_length - 1, 0),
+    ).final_similarity_upper_bound
+
+
+def _exact_lcs_query_projection(
+    query: str,
+) -> tuple[dict[str, int], re.Pattern[str]]:
+    """Precompute an exact fixed-query bit projection for repeated LCS."""
+
+    if type(query) is not str:
+        raise TypeError("LCS query must be a built-in string")
+    positions: dict[str, int] = {}
+    for offset, code_point in enumerate(query):
+        positions[code_point] = positions.get(code_point, 0) | (1 << offset)
+    irrelevant = re.compile(f"[^{re.escape(''.join(positions))}]+")
+    return positions, irrelevant
+
+
+def _exact_lcs_ascii_query_projection(
+    query: str,
+) -> tuple[tuple[int, ...], bytes, bytes]:
+    """Precompute the same exact LCS projection for an ASCII query."""
+
+    masks_by_code_point = [0] * 256
+    for offset, code_point in enumerate(query.encode("ascii")):
+        masks_by_code_point[code_point] |= 1 << offset
+    relevant_code_points = tuple(
+        code_point
+        for code_point, mask in enumerate(masks_by_code_point)
+        if mask
+    )
+    translation = bytearray(256)
+    for symbol, code_point in enumerate(relevant_code_points):
+        translation[code_point] = symbol
+    return (
+        tuple(masks_by_code_point[code_point] for code_point in relevant_code_points),
+        bytes(translation),
+        bytes(
+            code_point
+            for code_point, mask in enumerate(masks_by_code_point)
+            if not mask
+        ),
+    )
+
+
+class _ExactLCSQueryProjection:
+    """Compute one exact Unicode code-point LCS fact per identity."""
+
+    def __init__(self, query: str) -> None:
+        self._positions, self._irrelevant_pattern = _exact_lcs_query_projection(
+            query
+        )
+        self._ascii_projection = (
+            _exact_lcs_ascii_query_projection(query) if query.isascii() else None
+        )
+        self._ascii_frontiers = [0]
+        self._ascii_frontier_bit_counts = [0]
+        self._ascii_state_by_frontier = {0: 0}
+        self._ascii_cache_saturated = False
+        self._ascii_transitions = (
+            []
+            if self._ascii_projection is None
+            else [[-1] * len(self._ascii_projection[0])]
+        )
+
+    def facts(
+        self,
+        candidate: str,
+        source_length: int,
+    ) -> int:
+        """Return the exact LCS length for one ordered projection identity."""
+
+        if (
+            type(candidate) is not str
+            or not candidate
+            or type(source_length) is not int
+            or len(candidate) != source_length
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        if self._ascii_projection is not None:
+            return self._ascii_facts(candidate)
+
+        frontier = 0
+        relevant_candidate = self._irrelevant_pattern.sub("", candidate)
+        for code_point in relevant_candidate:
+            matches = self._positions[code_point]
+            union = frontier | matches
+            frontier = union & ~(union - ((frontier << 1) | 1))
+        return frontier.bit_count()
+
+    def _ascii_facts(self, candidate: str) -> int:
+        projection = self._ascii_projection
+        if projection is None:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        masks, translation, irrelevant = projection
+        symbols = candidate.encode("ascii", "ignore").translate(
+            translation,
+            irrelevant,
+        )
+        if self._ascii_cache_saturated:
+            return _exact_ascii_lcs_frontier(symbols, masks).bit_count()
+        state = 0
+        # Transition memoization only accelerates this exact automaton.  Every
+        # identity still invokes ``facts`` and traverses its own folded source;
+        # this state cannot authorize fold equivalence or scorer reuse.
+        for offset, symbol in enumerate(symbols):
+            next_state = self._ascii_transitions[state][symbol]
+            if next_state < 0:
+                frontier = self._ascii_frontiers[state]
+                union = frontier | masks[symbol]
+                updated = union & ~(union - ((frontier << 1) | 1))
+                known_state = self._ascii_state_by_frontier.get(updated)
+                if known_state is None:
+                    if (
+                        len(self._ascii_frontiers)
+                        >= _ASCII_LCS_TRANSITION_STATE_LIMIT
+                    ):
+                        self._ascii_cache_saturated = True
+                        return _exact_ascii_lcs_frontier(
+                            symbols[offset + 1 :],
+                            masks,
+                            frontier=updated,
+                        ).bit_count()
+                    known_state = len(self._ascii_frontiers)
+                    self._ascii_state_by_frontier[updated] = known_state
+                    self._ascii_frontiers.append(updated)
+                    self._ascii_frontier_bit_counts.append(updated.bit_count())
+                    self._ascii_transitions.append([-1] * len(masks))
+                next_state = known_state
+                self._ascii_transitions[state][symbol] = next_state
+            state = next_state
+        return self._ascii_frontier_bit_counts[state]
+
+
+def _exact_ascii_lcs_frontier(
+    symbols: bytes,
+    masks: tuple[int, ...],
+    *,
+    frontier: int = 0,
+) -> int:
+    """Advance exact bit-LCS without retaining identity-dependent states."""
+
+    for symbol in symbols:
+        matches = masks[symbol]
+        union = frontier | matches
+        frontier = union & ~(union - ((frontier << 1) | 1))
+    return frontier
+
+
+def _exact_lcs_length(left: str, right: str) -> int:
+    """Return exact Unicode code-point LCS length without scoring or edits."""
+
+    if type(left) is not str or type(right) is not str:
+        raise TypeError("LCS inputs must be built-in strings")
+    if not left or not right:
+        return 0
+    lcs_length = _ExactLCSQueryProjection(left).facts(
+        right,
+        len(right),
+    )
+    return lcs_length
+
+
+def _dense_phase2_upper_bound(
+    *,
+    query_length: int,
+    record_length: int,
+    lcs_length: int,
+    bigram_intersection: int,
+) -> float:
+    """Return U3 from exact LCS and exact bigram facts after phase two."""
+
+    return scorer_upper_bound_v1(
+        query_fold_length=query_length,
+        record_fold_length=record_length,
+        character_multiset_intersection=lcs_length,
         bigram_multiset_intersection=bigram_intersection,
         query_bigram_count=max(query_length - 1, 0),
         record_bigram_count=max(record_length - 1, 0),
@@ -1029,6 +1211,8 @@ class CandidateProofSession:
         self._record_heap: list[tuple[float, int, int]] = []
         self._dense_phase1: SQLiteCandidateProofDensePhase1 | None = None
         self._dense_phase1_uppers: tuple[float, ...] = ()
+        self._dense_lcs_by_id: dict[int, int] = {}
+        self._dense_p2_floor_frontier: tuple[float, int] | None = None
         self._dense_frontier_groups: list[tuple[float, list[int]]] | None = None
         self._dense_refined = False
         self._dense_a0_count = 0
@@ -1061,6 +1245,15 @@ class CandidateProofSession:
             total_record_count=self._snapshot.total_record_count,
             query_maxima_digest=self._snapshot.query_maxima_digest,
         )
+        _validate_candidate_proof_dense_phase1_result(
+            phase1,
+            view=self._view,
+            folded_query=self._folded_query,
+            blocks=self._snapshot.blocks,
+            head_revision=self._snapshot.head_revision,
+            total_record_count=self._snapshot.total_record_count,
+            query_maxima_digest=self._snapshot.query_maxima_digest,
+        )
         if (
             type(phase1) is not SQLiteCandidateProofDensePhase1
             or type(phase1.source_fold_lengths) is not tuple
@@ -1076,35 +1269,31 @@ class CandidateProofSession:
             )
         ):
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-        block_count = len(self._snapshot.blocks)
-        length_counts = [0] * block_count
-        minimum_lengths: list[int | None] = [None] * block_count
-        maximum_lengths = [0] * block_count
-        bigram_maxima = [0] * block_count
         bound_cache: dict[tuple[int, int], float] = {}
         uppers: list[float] = []
-        dense_ids_by_upper: dict[float, list[int]] = {}
-        for offset in range(self._snapshot.total_record_count):
-            expected_record_id = offset + 1
-            expected_block_id = (
-                expected_record_id - 1
-            ) // CANDIDATE_PROOF_BLOCK_SIZE
-            source_fold_length = phase1.source_fold_lengths[offset]
-            bigram_intersection = phase1.bigram_multiset_intersections[offset]
+        initial_limit = min(
+            self._result_limit,
+            self._snapshot.total_record_count,
+        )
+        initial_frontier: list[tuple[float, int]] = []
+        query_length = len(self._folded_query)
+        query_bigram_count = max(query_length - 1, 0)
+        for record_id, (source_fold_length, bigram_intersection) in enumerate(
+            zip(
+                phase1.source_fold_lengths,
+                phase1.bigram_multiset_intersections,
+                strict=True,
+            ),
+            start=1,
+        ):
             if (
                 type(source_fold_length) is not int
                 or type(bigram_intersection) is not int
                 or source_fold_length < 1
                 or bigram_intersection < 0
                 or bigram_intersection
-                > min(
-                    max(len(self._folded_query) - 1, 0),
-                    max(source_fold_length - 1, 0),
-                )
+                > min(query_bigram_count, source_fold_length - 1)
             ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            block = self._blocks_by_id.get(expected_block_id)
-            if block is None:
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
             bound_key = (
                 source_fold_length,
@@ -1113,41 +1302,36 @@ class CandidateProofSession:
             upper = bound_cache.get(bound_key)
             if upper is None:
                 upper = _dense_phase1_upper_bound(
-                    query_length=len(self._folded_query),
+                    query_length=query_length,
                     record_length=source_fold_length,
                     bigram_intersection=bigram_intersection,
                 )
                 bound_cache[bound_key] = upper
             uppers.append(upper)
-            dense_ids_by_upper.setdefault(upper, []).append(expected_record_id)
-            length_counts[expected_block_id] += 1
-            current_minimum = minimum_lengths[expected_block_id]
-            minimum_lengths[expected_block_id] = (
-                source_fold_length
-                if current_minimum is None
-                else min(current_minimum, source_fold_length)
-            )
-            maximum_lengths[expected_block_id] = max(
-                maximum_lengths[expected_block_id],
-                source_fold_length,
-            )
-            bigram_maxima[expected_block_id] = max(
-                bigram_maxima[expected_block_id],
-                bigram_intersection,
-            )
+            pair = (upper, record_id)
+            if len(initial_frontier) < initial_limit:
+                heapq.heappush(initial_frontier, pair)
+            elif pair > initial_frontier[0]:
+                heapq.heapreplace(initial_frontier, pair)
         for block in self._snapshot.blocks:
+            start = block.first_record_id - 1
+            stop = block.last_record_id
+            block_lengths = phase1.source_fold_lengths[start:stop]
+            block_bigrams = phase1.bigram_multiset_intersections[start:stop]
             if (
-                length_counts[block.block_id] != block.record_count
-                or minimum_lengths[block.block_id]
-                != block.min_source_fold_length
-                or maximum_lengths[block.block_id]
-                != block.max_source_fold_length
-                or bigram_maxima[block.block_id] > block.bigram_intersection_upper
+                len(block_lengths) != block.record_count
+                or not block_lengths
+                or min(block_lengths) != block.min_source_fold_length
+                or max(block_lengths) != block.max_source_fold_length
+                or max(block_bigrams, default=0) > block.bigram_intersection_upper
             ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        initial_ids_by_upper: dict[float, list[int]] = {}
+        for upper, record_id in initial_frontier:
+            initial_ids_by_upper.setdefault(upper, []).append(record_id)
         self._dense_frontier_groups = [
-            (upper, dense_ids_by_upper[upper])
-            for upper in sorted(dense_ids_by_upper)
+            (upper, sorted(initial_ids_by_upper[upper]))
+            for upper in sorted(initial_ids_by_upper)
         ]
         self._dense_phase1 = phase1
         self._dense_phase1_uppers = tuple(uppers)
@@ -1177,16 +1361,27 @@ class CandidateProofSession:
             else None
         )
         refinement_ids: list[int] = []
+        refinement_source_lengths: list[int] = []
         p1_frontier: tuple[float, int] | None = None
-        for upper, record_ids in reversed(groups):
-            for record_id in reversed(record_ids):
-                if upper >= self._minimum_similarity or (
-                    k0 is not None and (upper, record_id) >= k0
-                ):
-                    refinement_ids.append(record_id)
-                elif p1_frontier is None:
-                    p1_frontier = (upper, record_id)
+        for record_id, upper in enumerate(
+            self._dense_phase1_uppers,
+            start=1,
+        ):
+            if record_id in self._scores:
+                continue
+            if upper >= self._minimum_similarity or (
+                k0 is not None and (upper, record_id) >= k0
+            ):
+                refinement_ids.append(record_id)
+                refinement_source_lengths.append(
+                    phase1.source_fold_lengths[record_id - 1]
+                )
+            else:
+                pair = (upper, record_id)
+                if p1_frontier is None or pair > p1_frontier:
+                    p1_frontier = pair
         request = tuple(refinement_ids)
+        requested_source_lengths = tuple(refinement_source_lengths)
         response = self._view.candidate_proof_dense_phase2(
             folded_query=self._folded_query,
             blocks=self._snapshot.blocks,
@@ -1195,40 +1390,55 @@ class CandidateProofSession:
             query_maxima_digest=self._snapshot.query_maxima_digest,
             binding_digest=phase1.binding_digest,
             record_ids=request,
-            source_fold_lengths=tuple(
-                phase1.source_fold_lengths[record_id - 1]
-                for record_id in request
-            ),
+            source_fold_lengths=requested_source_lengths,
+        )
+        _validate_candidate_proof_dense_phase2_result(
+            response,
+            binding_digest=phase1.binding_digest,
+            record_ids=request,
+            source_fold_lengths=requested_source_lengths,
         )
         if (
             type(response) is not SQLiteCandidateProofDensePhase2
             or type(response.record_ids) is not tuple
             or response.record_ids != request
-            or type(response.character_multiset_intersections) is not tuple
-            or len(response.character_multiset_intersections) != len(request)
+            or type(response.source_folds_v1) is not tuple
+            or len(response.source_folds_v1) != len(request)
+            or type(response.source_fold_lengths) is not tuple
+            or response.source_fold_lengths != requested_source_lengths
             or response.binding_digest != phase1.binding_digest
         ):
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
         phase2_ids_by_upper: dict[float, list[int]] = {}
         bound_cache: dict[tuple[int, int, int], float] = {}
         query_length = len(self._folded_query)
-        for record_id, character_intersection in zip(
+        lcs_by_id: dict[int, int] = {}
+        p2_floor_frontier: tuple[float, int] | None = None
+        p2_floor_count = 0
+        lcs_projection = _ExactLCSQueryProjection(self._folded_query)
+        dense_u1_uppers = self._dense_phase1_uppers
+        phase1_bigrams = phase1.bigram_multiset_intersections
+        for (
+            record_id,
+            source_fold_v1,
+            source_fold_length,
+        ) in zip(
             request,
-            response.character_multiset_intersections,
+            response.source_folds_v1,
+            requested_source_lengths,
             strict=True,
         ):
             offset = record_id - 1
-            source_fold_length = phase1.source_fold_lengths[offset]
-            bigram_intersection = phase1.bigram_multiset_intersections[offset]
-            if (
-                type(character_intersection) is not int
-                or character_intersection < 0
-                or character_intersection > min(query_length, source_fold_length)
-            ):
+            bigram_intersection = phase1_bigrams[offset]
+            lcs_length = lcs_projection.facts(
+                source_fold_v1,
+                source_fold_length,
+            )
+            if not 0 <= lcs_length <= min(query_length, source_fold_length):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
             bound_key = (
                 source_fold_length,
-                character_intersection,
+                lcs_length,
                 bigram_intersection,
             )
             upper = bound_cache.get(bound_key)
@@ -1236,25 +1446,32 @@ class CandidateProofSession:
                 upper = _dense_phase2_upper_bound(
                     query_length=query_length,
                     record_length=source_fold_length,
-                    character_intersection=character_intersection,
+                    lcs_length=lcs_length,
                     bigram_intersection=bigram_intersection,
                 )
                 bound_cache[bound_key] = upper
-            if upper > self._dense_phase1_uppers[offset] + 1e-12:
+            if upper > dense_u1_uppers[offset] + 1e-12:
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            self._record_by_id[record_id] = SQLiteCandidateProofRecord(
-                record_id=record_id,
-                block_id=offset // CANDIDATE_PROOF_BLOCK_SIZE,
-                source_fold_length=source_fold_length,
-                character_multiset_intersection=character_intersection,
-                bigram_multiset_intersection=bigram_intersection,
-            )
-            self._upper_by_id[record_id] = upper
-            phase2_ids_by_upper.setdefault(upper, []).append(record_id)
+            if upper >= self._minimum_similarity or (
+                k0 is not None and (upper, record_id) >= k0
+            ):
+                lcs_by_id[record_id] = lcs_length
+                phase2_ids_by_upper.setdefault(upper, []).append(record_id)
+            else:
+                p2_floor_count += 1
+                pair = (upper, record_id)
+                if p2_floor_frontier is None or pair > p2_floor_frontier:
+                    p2_floor_frontier = pair
         self._dense_frontier_groups = [
             (upper, sorted(phase2_ids_by_upper[upper]))
             for upper in sorted(phase2_ids_by_upper)
         ]
+        if p2_floor_count + sum(
+            len(record_ids) for record_ids in phase2_ids_by_upper.values()
+        ) != len(request):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        self._dense_lcs_by_id = lcs_by_id
+        self._dense_p2_floor_frontier = p2_floor_frontier
         self._dense_a0_count = len(self._scores)
         self._dense_r_count = len(request)
         self._dense_p1_count = (
@@ -1345,10 +1562,17 @@ class CandidateProofSession:
 
     def _record_frontier(self) -> tuple[float, int] | None:
         if self._dense_frontier_groups is not None:
-            if not self._dense_frontier_groups:
-                return None
-            upper, record_ids = self._dense_frontier_groups[-1]
-            return upper, record_ids[-1]
+            frontier = None
+            if self._dense_frontier_groups:
+                upper, record_ids = self._dense_frontier_groups[-1]
+                frontier = (upper, record_ids[-1])
+            if self._dense_refined and self._dense_p2_floor_frontier is not None:
+                frontier = (
+                    self._dense_p2_floor_frontier
+                    if frontier is None
+                    else max(frontier, self._dense_p2_floor_frontier)
+                )
+            return frontier
         return (
             (-self._record_heap[0][0], -self._record_heap[0][1])
             if self._record_heap
@@ -1425,11 +1649,7 @@ class CandidateProofSession:
         if threshold_closed and top_k_closed:
             return ()
         batch: list[int] = []
-        batch_limit = (
-            CANDIDATE_PROOF_BLOCK_SIZE
-            if self._dense_frontier_groups is not None
-            else CANDIDATE_PROOF_BATCH_SIZE
-        )
+        batch_limit = CANDIDATE_PROOF_BATCH_SIZE
         if len(self._scores) < self._result_limit:
             batch_limit = min(
                 batch_limit,
@@ -1478,18 +1698,22 @@ class CandidateProofSession:
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
             if self._dense_phase1 is not None and record_id not in self._record_by_id:
                 offset = record_id - 1
+                character_intersection = min(
+                    len(self._folded_query),
+                    self._dense_phase1.source_fold_lengths[offset],
+                )
+                if self._dense_refined:
+                    lcs_length = self._dense_lcs_by_id.get(record_id)
+                    if lcs_length is None:
+                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+                    character_intersection = lcs_length
                 record = SQLiteCandidateProofRecord(
                     record_id=record_id,
                     block_id=offset // CANDIDATE_PROOF_BLOCK_SIZE,
                     source_fold_length=(
                         self._dense_phase1.source_fold_lengths[offset]
                     ),
-                    character_multiset_intersection=(
-                        min(
-                            len(self._folded_query),
-                            self._dense_phase1.source_fold_lengths[offset],
-                        )
-                    ),
+                    character_multiset_intersection=character_intersection,
                     bigram_multiset_intersection=(
                         self._dense_phase1.bigram_multiset_intersections[offset]
                     ),
@@ -1674,21 +1898,18 @@ class CandidateProofSession:
                 output_unique_count=len(scored_ids),
                 dropped_count=0,
             ))
-        query_gram_count = len(self._folded_query) + max(len(self._folded_query) - 1, 0)
+        query_gram_count = max(len(self._folded_query) - 1, 1)
         candidates = tuple(
             CandidateEvidence(
                 record_id=record_id,
                 recall_stages=(CandidateStage.BOUND_PROOF,),
                 matched_grams=(
-                    self._record_by_id[record_id].character_multiset_intersection
-                    + self._record_by_id[record_id].bigram_multiset_intersection
+                    self._record_by_id[record_id].bigram_multiset_intersection
                 ),
                 query_grams=query_gram_count,
                 overlap_ratio=(
-                    (
-                        self._record_by_id[record_id].character_multiset_intersection
-                        + self._record_by_id[record_id].bigram_multiset_intersection
-                    ) / query_gram_count
+                    self._record_by_id[record_id].bigram_multiset_intersection
+                    / query_gram_count
                 ),
                 pretruncate_rank=index,
             )

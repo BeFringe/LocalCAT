@@ -349,7 +349,7 @@
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
   - _Boundary: TMBenchmark Gate D_
 
-- [ ] 8.6 固化 scorer 完备性上界与 proof index
+- [x] 8.6 固化 scorer 完备性上界与 proof index
   - 在 record/index 同事务保存 folded length、字符/bigram multiset term frequency 与固定 block 的保守 summary，并为 scorer-v1 冻结可独立验证的分数上界公式
   - 上界必须覆盖长度差、字符 multiset、bigram multiset 差异与 folded code-point exact LCS 顺序下界；query-time LCS 只收紧 Levenshtein 距离下界，不计算编辑距离/final score、不建立 scorer 等价类，任何 summary 或 ordered refinement 低估、缺行、重复、乱序或计数不守恒均 fail-closed
   - 保持 `candidate-budget-v1` 不变，不使用 oracle identity、固定类别或扩大窗口证明完备
@@ -357,7 +357,7 @@
   - _Requirements: 4.2, 4.7, 5.2, 5.3, 8.2, 8.7_
   - _Boundary: Candidate Proof Index_
 
-- [ ] 8.7 实现有界 proof/scorer 查询流水线
+- [x] 8.7 实现有界 proof/scorer 查询流水线
   - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；同时证明 threshold 全集和无阈值真实 top-k 后才返回 fuzzy 候选
   - 将 `proof-query-v2` 的 scorer 调用数、已计入 identity 与未计入 identity 分开守恒；仅由 Retrieval 对 health-validated record 的完整 `fold-v1` 相等建立 query-local 等价类，一类只执行一次真实 scorer-v1，identity fan-out 仍独立保留 target/provenance/tie 且不得由 hash、gram、调用方或注入 scorer 伪造
   - 稀疏 frontier 保留 block best-first；当 block maxima 或低分 top-k 前沿退化为密集扫描时，phase 1 在一个短只读事务内用长度与精确 bigram 交集生成严格保守 `U1`，提交后先评分足以建立真实 kth 的前缀，再由 session 以 threshold/kth 双义务确定唯一精化集 `R`；phase 2 重新绑定同一 generation/head/count/query/index facts，仅为严格有序的 `R` 取得 private `record_id/source_fold_v1/length` 投影并以 exact LCS 生成 `U3`，两个事务均不得跨 scorer callback，禁止 per-block connection/count avalanche
@@ -491,3 +491,4 @@
 - 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
 - 2026-08-14 / Task 8.7：生产查询在同一 generation view 内以单一 block/record 全局上界前沿打开 256-slot exact proof facts，seed 仅保留真实路径与守恒诊断，原文/scorer 批不超过 32 且单 identity 仅评分一次；threshold 全集和 `(score, record_id DESC)` top-k 双闭合，协调篡改/世代漂移/预算耗尽资源级 fail-closed。Cluster M review correction 进一步以 `source_raw → fold-v1` 作为 health/Stage/Gate B proof-index 独立语义根，拒绝 folded/length/TF/FTS/block 成套伪造，并使 frontier/kth universe、seed→BOUND_PROOF 输入与 scored/unscored identity 在 constructor/strict codec 闭合；主 agent 新鲜 contract/store/proof/retrieval/Stage/schema/Gate B/migration/bound 363/363（1 skip）、mini oracle 3/3 及变更文件 basedpyright 0 errors 通过，本轮未重跑 5k/100k Gate D。
 - 2026-08-14 / Task 8.8：fresh build 取消刚构建 stage 的重复 reuse 扫描，existing reuse 仍完整验证；StageSealer 在同一 `BEGIN IMMEDIATE` 内闭合 parity/proof-index/schema/count/logical closure 与 `SEALED` marker，生成 registry-owned sealed attestation。sealed/active strict semantic 同时冻结全库 record/FTS 计数与历史 receipt-boundary 计数；registry 及两次 Gate B 仍以 boundary claim 对账并仅做 DB/manifest/source 的 no-follow inode+full SHA-256 复证，active 校验则必须闭合全库计数和全量 index facts。replace/reopen 后 normal/cold SEALED receipt owner 在 `BEGIN IMMEDIATE` 内先闭合 receipt/binding/meta 结构，再单次流式重建 pre-activation closure 并 exact 核对 sealed attestation，只有通过后才写 receipt/meta，并在 commit 前以最后一次读取生成独立 active closure 期望；manifest 发布不改写 DB，随后唯一 active 全语义校验重算实际 closure 并 exact 比较后才生成 active attestation；cold `DB_REPLACED` 对已完成 receipt 以同一单次流式扫描同时闭合 ACTIVE 与重建的 pre-activation closure，先核对 sealed attestation 再授权期望。后续 phase/cold recovery 仅经 exact bytes/inode/phase 复证；journal-owned 新资产缺失可依 proven journal 回滚，same-inode 改字节、同字节换 inode、attestation 字段/版本/全库与 boundary 计数/闭包/阶段漂移及 v2 published phase 缺 attestation 均 fail-closed。verifier 定向 154/154、schema-upgrade/module-boundary/explicit-import 91/91、Task 8.8 矩阵 330/330（1 skip）、pre-lock P1 定点 2/2、变更文件 basedpyright 0 errors 与 diff check 通过。
+- 2026-08-15 / Tasks 8.6–8.7 v15（重开）：保留 `proof-query-v2` 双域守恒、2048 预算、Retrieval-owned exact-fold reuse 与稀疏路径；密集路径以同一 generation 的短事务生成 U1/K0/R，再由 store-owned 严格有序私有投影和 opaque receipt 重绑定 facts，提交后逐 identity 计算 exact Unicode LCS/U3 并完成 threshold+top-k 双闭合，append/tamper/injected scorer 均资源级 fail-closed且不增加持久 schema。穷举与固定 Unicode 随机向量闭合 `真实分数<=U3<=U2<=U1`；q61 以 300 次真实 scorer 覆盖 3000 identities，40 条 frozen miss 为 42–481 次调用，字面 5000/200 oracle 在 FTS/fallback 均零遗漏；q240 最终分区为 A0=10、A1=293、invocation=303，handoff 的 302 仅是非完整 U3 原型竞争类估计而非最终调用数。q1/q61/short/q226/q240 各 20 个 warm 样本的 nearest-rank p95 分别为 75.359/378.410/12.259/378.988/332.161 ms、峰值 RSS 91.203 MiB。owner 248/248、Cluster N 330/330（1 skip）、changed-file basedpyright 0 errors、diff check 通过，最终原生 xhigh 累计复审无 P0–P3 并批准。

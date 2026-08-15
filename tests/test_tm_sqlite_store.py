@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+import copy
+from dataclasses import replace
 import hashlib
 import inspect
 import os
@@ -3058,6 +3060,207 @@ class SQLiteTMQueryViewTests(unittest.TestCase):
             ),
         )
         return store, tuple(record.record_id for record in records)
+
+    def test_dense_phase2_returns_only_strict_ordered_fold_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, _record_ids = self._store_with_records(
+                Path(temporary),
+                fts5_available=False,
+            )
+            with store.query_lease() as view:
+                snapshot = view.candidate_proof_snapshot(
+                    folded_query="open",
+                    seed_limit=256,
+                )
+                phase1 = view.candidate_proof_dense_phase1(
+                    folded_query="open",
+                    blocks=snapshot.blocks,
+                    head_revision=snapshot.head_revision,
+                    total_record_count=snapshot.total_record_count,
+                    query_maxima_digest=snapshot.query_maxima_digest,
+                )
+                request = (1, 2, 3)
+                response = view.candidate_proof_dense_phase2(
+                    folded_query="open",
+                    blocks=snapshot.blocks,
+                    head_revision=snapshot.head_revision,
+                    total_record_count=snapshot.total_record_count,
+                    query_maxima_digest=snapshot.query_maxima_digest,
+                    binding_digest=phase1.binding_digest,
+                    record_ids=request,
+                    source_fold_lengths=tuple(
+                        phase1.source_fold_lengths[record_id - 1]
+                        for record_id in request
+                    ),
+                )
+                tm_sqlite_store._validate_candidate_proof_dense_phase1_result(
+                    phase1,
+                    view=view,
+                    folded_query="open",
+                    blocks=snapshot.blocks,
+                    head_revision=snapshot.head_revision,
+                    total_record_count=snapshot.total_record_count,
+                    query_maxima_digest=snapshot.query_maxima_digest,
+                )
+                tm_sqlite_store._validate_candidate_proof_dense_phase2_result(
+                    response,
+                    binding_digest=phase1.binding_digest,
+                    record_ids=request,
+                    source_fold_lengths=tuple(
+                        phase1.source_fold_lengths[record_id - 1]
+                        for record_id in request
+                    ),
+                )
+                self.assertEqual(
+                    response.record_ids,
+                    request,
+                )
+                self.assertEqual(
+                    response.source_folds_v1,
+                    ("open door", "close window", "猫狗"),
+                )
+                self.assertEqual(
+                    response.source_fold_lengths,
+                    tuple(len(value) for value in response.source_folds_v1),
+                )
+                self.assertFalse(any(
+                    hasattr(response, attribute)
+                    for attribute in (
+                        "character_multiset_intersections",
+                        "scorer_evidence",
+                        "similarity_evidence",
+                    )
+                ))
+
+                forged_lengths = replace(
+                    phase1,
+                    source_fold_lengths=(
+                        phase1.source_fold_lengths[0] + 1,
+                        *phase1.source_fold_lengths[1:],
+                    ),
+                )
+                forged_bigrams = replace(
+                    phase1,
+                    bigram_multiset_intersections=(
+                        0,
+                        *phase1.bigram_multiset_intersections[1:],
+                    ),
+                )
+                forged_fold = replace(
+                    response,
+                    source_folds_v1=(
+                        "x" * response.source_fold_lengths[0],
+                        *response.source_folds_v1[1:],
+                    ),
+                )
+                forged_receipt = replace(response, _receipt=phase1._receipt)
+                with self.assertRaises(TypeError):
+                    replace(
+                        cast(Any, response._receipt),
+                        source_folds_v1=forged_fold.source_folds_v1,
+                    )
+                coordinated_phase1 = copy.deepcopy(
+                    phase1,
+                    {
+                        id(phase1.source_fold_lengths): forged_lengths.source_fold_lengths,
+                        id(phase1.bigram_multiset_intersections): (
+                            forged_bigrams.bigram_multiset_intersections
+                        ),
+                    },
+                )
+                coordinated_phase2 = copy.deepcopy(
+                    response,
+                    {
+                        id(response.source_folds_v1): forged_fold.source_folds_v1,
+                    },
+                )
+                for forged_phase1 in (
+                    forged_lengths,
+                    forged_bigrams,
+                    coordinated_phase1,
+                ):
+                    with self.assertRaisesRegex(
+                        SQLiteStoreSchemaError,
+                        "^STORE.CANDIDATE_PROOF_INVALID$",
+                    ):
+                        tm_sqlite_store._validate_candidate_proof_dense_phase1_result(
+                            forged_phase1,
+                            view=view,
+                            folded_query="open",
+                            blocks=snapshot.blocks,
+                            head_revision=snapshot.head_revision,
+                            total_record_count=snapshot.total_record_count,
+                            query_maxima_digest=snapshot.query_maxima_digest,
+                        )
+                for forged_phase2 in (
+                    forged_fold,
+                    forged_receipt,
+                    coordinated_phase2,
+                ):
+                    with self.assertRaisesRegex(
+                        SQLiteStoreSchemaError,
+                        "^STORE.CANDIDATE_PROOF_INVALID$",
+                    ):
+                        tm_sqlite_store._validate_candidate_proof_dense_phase2_result(
+                            forged_phase2,
+                            binding_digest=phase1.binding_digest,
+                            record_ids=request,
+                            source_fold_lengths=tuple(
+                                phase1.source_fold_lengths[record_id - 1]
+                                for record_id in request
+                            ),
+                        )
+
+                other_snapshot = view.candidate_proof_snapshot(
+                    folded_query="other",
+                    seed_limit=256,
+                )
+                with self.assertRaisesRegex(
+                    SQLiteStoreSchemaError,
+                    "^STORE.CANDIDATE_PROOF_INVALID$",
+                ):
+                    tm_sqlite_store._validate_candidate_proof_dense_phase1_result(
+                        phase1,
+                        view=view,
+                        folded_query="other",
+                        blocks=other_snapshot.blocks,
+                        head_revision=other_snapshot.head_revision,
+                        total_record_count=other_snapshot.total_record_count,
+                        query_maxima_digest=other_snapshot.query_maxima_digest,
+                    )
+
+                invalid_calls: tuple[dict[str, Any], ...] = (
+                    {"folded_query": "other"},
+                    {"head_revision": snapshot.head_revision + 1},
+                    {"total_record_count": snapshot.total_record_count + 1},
+                    {"query_maxima_digest": "0" * 64},
+                    {"binding_digest": "0" * 64},
+                    {"record_ids": (2, 1, 3)},
+                    {"record_ids": (1, 1, 3)},
+                    {"record_ids": (1, 2, 4)},
+                )
+                base: dict[str, Any] = {
+                    "folded_query": "open",
+                    "blocks": snapshot.blocks,
+                    "head_revision": snapshot.head_revision,
+                    "total_record_count": snapshot.total_record_count,
+                    "query_maxima_digest": snapshot.query_maxima_digest,
+                    "binding_digest": phase1.binding_digest,
+                    "record_ids": request,
+                    "source_fold_lengths": tuple(
+                        phase1.source_fold_lengths[record_id - 1]
+                        for record_id in request
+                    ),
+                }
+                for changes in invalid_calls:
+                    with self.subTest(changes=changes), self.assertRaises(
+                        (SQLiteStoreSchemaError, ValueError),
+                    ):
+                        view.candidate_proof_dense_phase2(
+                            **{**base, **changes},
+                        )
 
     def test_query_view_is_read_only_and_matches_store_ports_under_one_lease(
         self,

@@ -12,12 +12,16 @@ import time
 import unittest
 from unittest.mock import patch
 
+import tm_candidate_index
 import tm_sqlite_store
 
+from text_matcher import fold_text_v1
 from tm_candidate_index import (
     CandidateRetriever,
     _dense_phase1_upper_bound,
     _dense_phase2_upper_bound,
+    _dense_u2_upper_bound,
+    _exact_lcs_length,
     _should_use_dense_traversal,
 )
 from tm_contracts import (
@@ -57,6 +61,9 @@ def _unchecked_replace(value, **changes):
             field.name,
             changes.get(field.name, getattr(value, field.name)),
         )
+    receipt = getattr(value, "_receipt", None)
+    if receipt is not None:
+        object.__setattr__(forged, "_receipt", receipt)
     return forged
 
 
@@ -137,7 +144,7 @@ def _activated_store(
         build = TMMigrationService(
             resource_identity=identity,
             canonical_store_id=f"store.{resource_id}",
-        ).build_mutable_stage(fixture)
+        ).build_mutable_stage(fixture.resolve())
         assert build.mutable_stage is not None
         sealed = StageSealer(
             registry=coordinator.sealed_registry,
@@ -204,7 +211,7 @@ class CandidateProofQueryTests(unittest.TestCase):
             )
         )
 
-    def test_two_phase_dense_bounds_order_true_score_u2_u1(self) -> None:
+    def test_two_phase_dense_bounds_order_true_score_u3_u2_u1(self) -> None:
         scorer = SimilarityScorerV1()
         alphabet = "ab"
         values = tuple(
@@ -242,31 +249,53 @@ class CandidateProofQueryTests(unittest.TestCase):
                     record_length=len(candidate_source),
                     bigram_intersection=bigram_intersection,
                 )
-                phase2 = _dense_phase2_upper_bound(
+                phase2 = _dense_u2_upper_bound(
                     query_length=len(query_source),
                     record_length=len(candidate_source),
                     character_intersection=character_intersection,
+                    bigram_intersection=bigram_intersection,
+                )
+                phase3 = _dense_phase2_upper_bound(
+                    query_length=len(query_source),
+                    record_length=len(candidate_source),
+                    lcs_length=_exact_lcs_length(
+                        query_source,
+                        candidate_source,
+                    ),
                     bigram_intersection=bigram_intersection,
                 )
                 true_score = scorer.score(
                     query_source,
                     candidate_source,
                 ).final_similarity
-                self.assertLessEqual(true_score, phase2 + 1e-12)
+                self.assertLessEqual(true_score, phase3 + 1e-12)
+                self.assertLessEqual(phase3, phase2 + 1e-12)
                 self.assertLessEqual(phase2, phase1 + 1e-12)
 
     def test_two_phase_dense_bounds_hold_for_fixed_random_vectors(self) -> None:
         generator = random.Random(0xC0FFEE)
         scorer = SimilarityScorerV1()
         for _index in range(2_000):
-            query_source = "".join(
-                generator.choice("abcde")
+            alphabet = (
+                "a",
+                "b",
+                "ß",
+                "é",
+                "e\u0301",
+                "中",
+                "한",
+                "🙂",
+            )
+            query_raw = "".join(
+                generator.choice(alphabet)
                 for _ in range(generator.randint(1, 40))
             )
-            candidate_source = "".join(
-                generator.choice("abcde")
+            candidate_raw = "".join(
+                generator.choice(alphabet)
                 for _ in range(generator.randint(1, 40))
             )
+            query_source = fold_text_v1(query_raw).folded_text
+            candidate_source = fold_text_v1(candidate_raw).folded_text
             query_characters = dict(character_ngram_frequencies(query_source, 1))
             query_bigrams = dict(character_ngram_frequencies(query_source, 2))
             candidate_characters = dict(
@@ -288,18 +317,107 @@ class CandidateProofQueryTests(unittest.TestCase):
                 record_length=len(candidate_source),
                 bigram_intersection=bigram_intersection,
             )
-            phase2 = _dense_phase2_upper_bound(
+            phase2 = _dense_u2_upper_bound(
                 query_length=len(query_source),
                 record_length=len(candidate_source),
                 character_intersection=character_intersection,
                 bigram_intersection=bigram_intersection,
             )
+            phase3 = _dense_phase2_upper_bound(
+                query_length=len(query_source),
+                record_length=len(candidate_source),
+                lcs_length=_exact_lcs_length(query_source, candidate_source),
+                bigram_intersection=bigram_intersection,
+            )
             true_score = scorer.score(
-                query_source,
-                candidate_source,
+                query_raw,
+                candidate_raw,
             ).final_similarity
-            self.assertLessEqual(true_score, phase2 + 1e-12)
+            self.assertLessEqual(true_score, phase3 + 1e-12)
+            self.assertLessEqual(phase3, phase2 + 1e-12)
             self.assertLessEqual(phase2, phase1 + 1e-12)
+
+    def test_fused_lcs_facts_match_independent_unicode_reference(self) -> None:
+        def reference_lcs(left: str, right: str) -> int:
+            prior = [0] * (len(right) + 1)
+            for left_code_point in left:
+                current = [0]
+                for offset, right_code_point in enumerate(right, start=1):
+                    current.append(
+                        prior[offset - 1] + 1
+                        if left_code_point == right_code_point
+                        else max(prior[offset], current[-1])
+                    )
+                prior = current
+            return prior[-1]
+
+        vectors = (
+            ("abca", "caba"),
+            ("Straße", "STRASSE"),
+            ("é中한🙂", "e\u0301x中한🙂"),
+            ("かなカナ", "xかカナ"),
+        )
+        for query_raw, candidate_raw in vectors:
+            with self.subTest(query=query_raw, candidate=candidate_raw):
+                query = fold_text_v1(query_raw).folded_text
+                candidate = fold_text_v1(candidate_raw).folded_text
+                lcs_length = tm_candidate_index._ExactLCSQueryProjection(
+                    query
+                ).facts(
+                    candidate,
+                    len(candidate),
+                )
+                self.assertEqual(lcs_length, reference_lcs(query, candidate))
+
+    def test_ascii_lcs_transition_memo_is_bounded_and_falls_back_exactly(
+        self,
+    ) -> None:
+        def reference_lcs(left: str, right: str) -> int:
+            prior = [0] * (len(right) + 1)
+            for left_code_point in left:
+                current = [0]
+                for offset, right_code_point in enumerate(right, start=1):
+                    current.append(
+                        prior[offset - 1] + 1
+                        if left_code_point == right_code_point
+                        else max(prior[offset], current[-1])
+                    )
+                prior = current
+            return prior[-1]
+
+        query = "abcdefghij"
+        generator = random.Random(0x5A7E)
+        candidates = (
+            "jihgfedcba",
+            "a🙂j",
+            "acegibdfhj",
+            *(
+                "".join(
+                    generator.choice("abcdefghijXYZ")
+                    for _offset in range(40)
+                )
+                for _identity in range(200)
+            ),
+        )
+        with patch(
+            "tm_candidate_index._ASCII_LCS_TRANSITION_STATE_LIMIT",
+            3,
+        ):
+            projection = tm_candidate_index._ExactLCSQueryProjection(query)
+            observed = tuple(
+                projection.facts(candidate, len(candidate))
+                for candidate in candidates
+            )
+
+        self.assertEqual(
+            observed,
+            tuple(reference_lcs(query, candidate) for candidate in candidates),
+        )
+        self.assertTrue(projection._ascii_cache_saturated)
+        self.assertLessEqual(len(projection._ascii_frontiers), 3)
+        self.assertLessEqual(len(projection._ascii_frontier_bit_counts), 3)
+        self.assertLessEqual(len(projection._ascii_state_by_frontier), 3)
+        self.assertLessEqual(len(projection._ascii_transitions), 3)
 
     def test_two_phase_dense_bounds_cover_single_character_and_repeats(
         self,
@@ -319,14 +437,39 @@ class CandidateProofQueryTests(unittest.TestCase):
             record_length=5,
             bigram_intersection=2,
         )
-        phase2 = _dense_phase2_upper_bound(
+        phase2 = _dense_u2_upper_bound(
             query_length=5,
             record_length=5,
             character_intersection=4,
             bigram_intersection=2,
         )
-        self.assertLessEqual(true_score, phase2 + 1e-12)
+        phase3 = _dense_phase2_upper_bound(
+            query_length=5,
+            record_length=5,
+            lcs_length=_exact_lcs_length("aaaaa", "aaaba"),
+            bigram_intersection=2,
+        )
+        self.assertLessEqual(true_score, phase3 + 1e-12)
+        self.assertLessEqual(phase3, phase2 + 1e-12)
         self.assertLessEqual(phase2, phase1 + 1e-12)
+        self.assertEqual(
+            _dense_phase2_upper_bound(
+                query_length=1,
+                record_length=1,
+                lcs_length=_exact_lcs_length("a", "a"),
+                bigram_intersection=0,
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            _dense_phase2_upper_bound(
+                query_length=1,
+                record_length=1,
+                lcs_length=_exact_lcs_length("a", "b"),
+                bigram_intersection=0,
+            ),
+            0.0,
+        )
 
     def test_global_frontier_opens_high_bound_nonseed_before_low_bound_seed(
         self,
@@ -446,6 +589,16 @@ class CandidateProofQueryTests(unittest.TestCase):
                 )
         encoded = contract_to_json(report)
         self.assertEqual(contract_from_json(encoded), report)
+        encoded_lower = encoded.lower()
+        for forbidden in (
+            "source_fold_v1",
+            "lcs",
+            "equivalence",
+            "proof target",
+            "other source",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, encoded_lower)
         payload = json.loads(encoded)
         proof = payload["payload"]["metadata"]["proof"]
         proof["caller_complete"] = True
@@ -979,6 +1132,48 @@ class CandidateProofQueryTests(unittest.TestCase):
         self.assertEqual(refinement.p2_max_upper_bound, 0.0)
         self.assertEqual(refinement.p2_possible_record_id, 590)
 
+    def test_public_candidate_evidence_contains_only_exact_bigram_facts(
+        self,
+    ) -> None:
+        cases = (
+            ("aaaaa", "bbbbb", 0, 4),
+            ("abaca", "acaba", 4, 4),
+        )
+        for query_source, candidate_source, matched, query_grams in cases:
+            with self.subTest(
+                query=query_source,
+                candidate=candidate_source,
+            ), tempfile.TemporaryDirectory() as temporary:
+                store = _store(
+                    Path(temporary),
+                    (candidate_source,) * 600,
+                    fts5_available=False,
+                )
+                with store.query_lease() as view, patch(
+                    "tm_candidate_index._should_use_dense_traversal",
+                    return_value=True,
+                ):
+                    _fuzzy, report = prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query(query_source),
+                        view=view,
+                    )
+
+            self.assertTrue(report.candidates)
+            self.assertEqual(
+                {candidate.matched_grams for candidate in report.candidates},
+                {matched},
+            )
+            self.assertEqual(
+                {candidate.query_grams for candidate in report.candidates},
+                {query_grams},
+            )
+            self.assertEqual(
+                {candidate.overlap_ratio for candidate in report.candidates},
+                {matched / query_grams},
+            )
+
     def test_dense_mixed_frontier_contract_rejects_count_and_tie_forgery(
         self,
     ) -> None:
@@ -1141,6 +1336,95 @@ class CandidateProofQueryTests(unittest.TestCase):
         self.assertEqual(sparse_calls, 0)
         self.assertLess(append_elapsed, 1.0)
 
+    def test_dense_phase2_fuses_each_lcs_fact_before_scorer_resumes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                tuple(
+                    f"shared source sentence about record{index % 30}"
+                    for index in range(600)
+                ),
+                fts5_available=False,
+            )
+            events: list[str] = []
+            batch_sizes: list[int] = []
+            phase2_calls = 0
+            original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+            original_records = SQLiteTMQueryView.records_by_id
+            original_facts = tm_candidate_index._ExactLCSQueryProjection.facts
+            original_score = SimilarityScorerV1.score
+
+            def ordered_phase2(view: SQLiteTMQueryView, **kwargs):
+                nonlocal phase2_calls
+                phase2_calls += 1
+                events.append("phase2-enter")
+                response = original_phase2(view, **kwargs)
+                self.assertFalse(view._candidate_connection().in_transaction)
+                events.append("phase2-return")
+                return response
+
+            def bounded_records(view: SQLiteTMQueryView, record_ids: tuple[int, ...]):
+                batch_sizes.append(len(record_ids))
+                return original_records(view, record_ids)
+
+            def ordered_facts(owner, candidate: str, source_length: int):
+                events.append("lcs-u3")
+                return original_facts(owner, candidate, source_length)
+
+            def ordered_score(
+                owner: SimilarityScorerV1,
+                query: str,
+                candidate: str,
+            ):
+                events.append("score")
+                return original_score(owner, query, candidate)
+
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "candidate_proof_dense_phase2",
+                new=ordered_phase2,
+            ), patch.object(
+                SQLiteTMQueryView,
+                "records_by_id",
+                new=bounded_records,
+            ), patch.object(
+                tm_candidate_index._ExactLCSQueryProjection,
+                "facts",
+                new=ordered_facts,
+            ), patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=ordered_score,
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("shared source sentence about recordx"),
+                    view=view,
+                )
+
+        proof = report.metadata.proof
+        assert proof is not None and proof.refinement is not None
+        phase2_return = events.index("phase2-return")
+        post_phase2 = events[phase2_return + 1 :]
+        refinement_count = proof.refinement.r_refinement_identity_count
+        self.assertEqual(phase2_calls, 1)
+        self.assertTrue(batch_sizes)
+        self.assertLessEqual(max(batch_sizes), 32)
+        self.assertIn(32, batch_sizes)
+        self.assertEqual(
+            post_phase2[:refinement_count],
+            ["lcs-u3"] * refinement_count,
+        )
+        self.assertNotIn("lcs-u3", post_phase2[refinement_count:])
+        self.assertNotIn("score", post_phase2[:refinement_count])
+        self.assertIn("score", post_phase2[refinement_count:])
+
     def test_dense_query_maxima_digest_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = _store(
@@ -1172,44 +1456,153 @@ class CandidateProofQueryTests(unittest.TestCase):
                         view=view,
                     )
 
+    def test_dense_phase1_receipt_rejects_replaced_fact_tuples(self) -> None:
+        sources = tuple(
+            (
+                "shared source sentence about abaca"
+                if index % 2 == 0
+                else "shared source sentence about acabadelta"
+            )
+            for index in range(600)
+        )
+        for mutation in ("length", "bigram"):
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as temporary:
+                store = _store(Path(temporary), sources, fts5_available=False)
+                original = SQLiteTMQueryView.candidate_proof_dense_phase1
+
+                def mutate(view: SQLiteTMQueryView, **kwargs):
+                    response = original(view, **kwargs)
+                    if mutation == "length":
+                        lengths = list(response.source_fold_lengths)
+                        self.assertNotEqual(lengths[0], lengths[1])
+                        lengths[1] = lengths[0]
+                        return _unchecked_replace(
+                            response,
+                            source_fold_lengths=tuple(lengths),
+                        )
+                    bigrams = list(response.bigram_multiset_intersections)
+                    self.assertGreater(bigrams[1], 0)
+                    bigrams[1] -= 1
+                    return _unchecked_replace(
+                        response,
+                        bigram_multiset_intersections=tuple(bigrams),
+                    )
+
+                with store.query_lease() as view, patch(
+                    "tm_candidate_index._should_use_dense_traversal",
+                    return_value=True,
+                ), patch.object(
+                    SQLiteTMQueryView,
+                    "candidate_proof_dense_phase1",
+                    new=mutate,
+                ), self.assertRaisesRegex(
+                    Exception,
+                    "STORE.CANDIDATE_PROOF_INVALID",
+                ):
+                    prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query("shared source sentence about abaca"),
+                        view=view,
+                    )
+
     def test_dense_refinement_response_is_strict_ordered_and_bound(self) -> None:
         sources = tuple(
             f"shared source sentence about record{index % 30}"
             for index in range(600)
         )
-        mutations = ("missing", "duplicate", "order", "outside", "extra", "binding")
+        mutations = (
+            "missing",
+            "duplicate",
+            "order",
+            "outside",
+            "extra",
+            "fold_missing",
+            "length_mismatch",
+            "receipt_fold_same_length",
+            "receipt_ids_equal",
+            "receipt_lengths_equal",
+            "binding",
+        )
         for mutation in mutations:
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as temporary:
                 store = _store(Path(temporary), sources, fts5_available=False)
                 original = SQLiteTMQueryView.candidate_proof_dense_phase2
 
                 def mutate(view: SQLiteTMQueryView, **kwargs):
                     response = original(view, **kwargs)
                     ids = response.record_ids
-                    characters = response.character_multiset_intersections
+                    folds = response.source_folds_v1
+                    lengths = response.source_fold_lengths
                     self.assertGreaterEqual(len(ids), 2)
                     if mutation == "missing":
-                        return replace(
+                        return _unchecked_replace(
                             response,
                             record_ids=ids[:-1],
-                            character_multiset_intersections=characters[:-1],
+                            source_folds_v1=folds[:-1],
+                            source_fold_lengths=lengths[:-1],
                         )
                     if mutation == "duplicate":
-                        return replace(response, record_ids=(ids[0], ids[0], *ids[2:]))
+                        return _unchecked_replace(
+                            response,
+                            record_ids=(ids[0], ids[0], *ids[2:]),
+                        )
                     if mutation == "order":
-                        return replace(response, record_ids=(ids[1], ids[0], *ids[2:]))
+                        return _unchecked_replace(
+                            response,
+                            record_ids=(ids[1], ids[0], *ids[2:]),
+                        )
                     if mutation == "outside":
-                        return replace(
+                        return _unchecked_replace(
                             response,
                             record_ids=(len(sources) + 1, *ids[1:]),
                         )
                     if mutation == "extra":
-                        return replace(
+                        return _unchecked_replace(
                             response,
-                            record_ids=(*ids, 1),
-                            character_multiset_intersections=(*characters, 0),
+                            record_ids=(*ids, ids[0]),
+                            source_folds_v1=(*folds, folds[0]),
+                            source_fold_lengths=(*lengths, lengths[0]),
                         )
-                    return replace(response, binding_digest="0" * 64)
+                    if mutation == "fold_missing":
+                        return _unchecked_replace(
+                            response,
+                            source_folds_v1=("", *folds[1:]),
+                        )
+                    if mutation == "length_mismatch":
+                        return _unchecked_replace(
+                            response,
+                            source_fold_lengths=(lengths[0] + 1, *lengths[1:]),
+                        )
+                    if mutation == "receipt_fold_same_length":
+                        replacement = folds[0][::-1]
+                        self.assertEqual(len(replacement), lengths[0])
+                        self.assertNotEqual(replacement, folds[0])
+                        return _unchecked_replace(
+                            response,
+                            source_folds_v1=(replacement, *folds[1:]),
+                        )
+                    if mutation == "receipt_ids_equal":
+                        replacement_ids = tuple([*ids])
+                        self.assertEqual(replacement_ids, ids)
+                        self.assertIsNot(replacement_ids, ids)
+                        return _unchecked_replace(
+                            response,
+                            record_ids=replacement_ids,
+                        )
+                    if mutation == "receipt_lengths_equal":
+                        replacement_lengths = tuple([*lengths])
+                        self.assertEqual(replacement_lengths, lengths)
+                        self.assertIsNot(replacement_lengths, lengths)
+                        return _unchecked_replace(
+                            response,
+                            source_fold_lengths=replacement_lengths,
+                        )
+                    return _unchecked_replace(response, binding_digest="0" * 64)
 
                 with store.query_lease() as view, patch(
                     "tm_candidate_index._should_use_dense_traversal",
@@ -1377,6 +1770,45 @@ class CandidateProofQueryTests(unittest.TestCase):
 
         self.assertEqual(len(scorer.calls), 2)
         self.assertIsNone(report.resource_metadata[0].recall.proof)
+
+    def test_proof_path_owns_exact_scorer_marker_and_rejects_subclass(
+        self,
+    ) -> None:
+        class ScorerSubclass(SimilarityScorerV1):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                ("open source", "other source") * 300,
+                fts5_available=False,
+            )
+            marker = SimilarityScorerV1()
+            marker_calls: list[tuple[str, str]] = []
+            marker.__dict__["score"] = lambda left, right: marker_calls.append(
+                (left, right)
+            )
+            with store.query_lease() as view:
+                prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("open source!"),
+                    view=view,
+                    scorer=marker,
+                )
+            self.assertEqual(marker_calls, [])
+
+            with store.query_lease() as view, self.assertRaisesRegex(
+                ValueError,
+                "production scorer-v1 owner",
+            ):
+                prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query("open source!"),
+                    view=view,
+                    scorer=ScorerSubclass(),
+                )
 
     def test_understated_or_missing_proof_facts_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
