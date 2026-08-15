@@ -35,7 +35,8 @@ MATCHER_VALIDATION_EVIDENCE_SCHEMA_VERSION = "matcher-validation-v2"
 MATCHER_VALIDATION_MANIFEST_CODEC_VERSION = 2
 CANDIDATE_BUDGET_VERSION = "candidate-budget-v1"
 CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
-CANDIDATE_PROOF_QUERY_VERSION = "candidate-proof-query-v1"
+CANDIDATE_PROOF_QUERY_VERSION = "proof-query-v2"
+CANDIDATE_PROOF_TRAVERSAL_VERSION = "proof-traversal-v2"
 BENCHMARK_CONTRACT_VERSION = "benchmark-v1"
 BENCHMARK_SUITE_VERSION = "benchmark-suite-v1"
 BENCHMARK_PERCENTILE_METHOD = "nearest-rank"
@@ -561,19 +562,47 @@ class CandidateStageMetadata:
 
 
 @dataclass(frozen=True)
+class CandidateProofRefinementMetadata:
+    """Frozen two-phase dense-traversal partitions and frontiers."""
+
+    phase: str
+    refined: bool
+    a0_accounted_identity_count: int
+    p1_unscored_identity_count: int
+    r_refinement_identity_count: int
+    a1_accounted_identity_count: int
+    p2_unscored_identity_count: int
+    refinement_request_count: int
+    refinement_returned_count: int
+    k0_score: float | None
+    k0_record_id: int | None
+    p1_max_upper_bound: float | None
+    p1_possible_record_id: int | None
+    p2_max_upper_bound: float | None
+    p2_possible_record_id: int | None
+
+    def __post_init__(self) -> None:
+        _validate_candidate_proof_refinement_metadata(self)
+
+
+@dataclass(frozen=True)
 class CandidateProofMetadata:
     """Versioned closure facts for one bounded proof/scorer query."""
 
     proof_version: str
     bound_version: str
     block_version: str
+    traversal_version: str
+    traversal_mode: str
     total_block_count: int
     total_record_count: int
+    scanned_block_count: int
     opened_block_count: int
     inspected_record_count: int
     seed_unique_count: int
-    scored_count: int
-    unscored_count: int
+    scorer_invocation_count: int
+    accounted_identity_count: int
+    unscored_identity_count: int
     unscored_max_upper_bound: float | None
     unscored_possible_record_id: int | None
     minimum_similarity: float
@@ -582,6 +611,7 @@ class CandidateProofMetadata:
     kth_score: float | None
     kth_record_id: int | None
     top_k_closed: bool
+    refinement: CandidateProofRefinementMetadata | None
 
     def __post_init__(self) -> None:
         _validate_candidate_proof_metadata(self)
@@ -594,6 +624,8 @@ def _validate_candidate_proof_metadata(
         ("proof version", metadata.proof_version),
         ("bound version", metadata.bound_version),
         ("block version", metadata.block_version),
+        ("traversal version", metadata.traversal_version),
+        ("traversal mode", metadata.traversal_mode),
     ):
         if type(value) is not str or not value:
             raise TypeError(f"candidate {field_name} must be an exact non-empty string")
@@ -610,14 +642,28 @@ def _validate_candidate_proof_metadata(
             "candidate block version must be "
             f"{CANDIDATE_PROOF_BLOCK_VERSION_V1}"
         )
+    if metadata.traversal_version != CANDIDATE_PROOF_TRAVERSAL_VERSION:
+        raise ValueError(
+            "candidate traversal version must be "
+            f"{CANDIDATE_PROOF_TRAVERSAL_VERSION}"
+        )
+    if metadata.traversal_mode not in {"SPARSE", "DENSE"}:
+        raise ValueError("candidate traversal mode is unsupported")
+    if metadata.traversal_mode == "SPARSE":
+        if metadata.refinement is not None:
+            raise ValueError("sparse traversal cannot carry dense refinement")
+    elif type(metadata.refinement) is not CandidateProofRefinementMetadata:
+        raise TypeError("dense traversal requires exact refinement metadata")
     for field_name, value in (
         ("total block count", metadata.total_block_count),
         ("total record count", metadata.total_record_count),
+        ("scanned block count", metadata.scanned_block_count),
         ("opened block count", metadata.opened_block_count),
         ("inspected record count", metadata.inspected_record_count),
         ("seed unique count", metadata.seed_unique_count),
-        ("scored count", metadata.scored_count),
-        ("unscored count", metadata.unscored_count),
+        ("scorer invocation count", metadata.scorer_invocation_count),
+        ("accounted identity count", metadata.accounted_identity_count),
+        ("unscored identity count", metadata.unscored_identity_count),
     ):
         if type(value) is not int:
             raise TypeError(
@@ -640,14 +686,33 @@ def _validate_candidate_proof_metadata(
         (metadata.total_record_count + 255) // 256
     ):
         raise ValueError("candidate proof block count does not close the universe")
+    if metadata.scanned_block_count > metadata.total_block_count:
+        raise ValueError("scanned proof blocks exceed total blocks")
+    if metadata.opened_block_count > metadata.scanned_block_count:
+        raise ValueError("opened proof blocks exceed scanned blocks")
     if metadata.opened_block_count > metadata.total_block_count:
         raise ValueError("opened proof blocks exceed total blocks")
     if metadata.inspected_record_count > metadata.total_record_count:
         raise ValueError("inspected proof records exceed total records")
-    if metadata.scored_count + metadata.unscored_count != metadata.total_record_count:
-        raise ValueError("candidate proof scored/unscored counts do not conserve")
-    if metadata.scored_count > metadata.inspected_record_count:
-        raise ValueError("candidate proof scored count exceeds inspected records")
+    if metadata.traversal_mode == "SPARSE":
+        if metadata.scanned_block_count != metadata.opened_block_count:
+            raise ValueError("sparse traversal must scan exactly its opened blocks")
+    elif (
+        metadata.opened_block_count != 0
+        or metadata.scanned_block_count != metadata.total_block_count
+        or metadata.inspected_record_count != metadata.total_record_count
+    ):
+        raise ValueError("dense traversal must scan the complete exact frontier")
+    if (
+        metadata.accounted_identity_count
+        + metadata.unscored_identity_count
+        != metadata.total_record_count
+    ):
+        raise ValueError("candidate proof identity counts do not conserve")
+    if metadata.accounted_identity_count > metadata.inspected_record_count:
+        raise ValueError("accounted identities exceed inspected records")
+    if metadata.scorer_invocation_count > metadata.accounted_identity_count:
+        raise ValueError("scorer invocations exceed accounted identities")
     if metadata.seed_unique_count > metadata.total_record_count:
         raise ValueError("candidate proof seed count exceeds total records")
 
@@ -655,7 +720,7 @@ def _validate_candidate_proof_metadata(
         metadata.unscored_max_upper_bound,
         metadata.unscored_possible_record_id,
     )
-    if metadata.unscored_count == 0:
+    if metadata.unscored_identity_count == 0:
         if frontier_pair != (None, None):
             raise ValueError("exhausted proof cannot carry an unscored frontier")
     else:
@@ -672,7 +737,7 @@ def _validate_candidate_proof_metadata(
 
     if metadata.threshold_closed:
         if (
-            metadata.unscored_count
+            metadata.unscored_identity_count
             and metadata.unscored_max_upper_bound is not None
             and metadata.unscored_max_upper_bound >= metadata.minimum_similarity
         ):
@@ -682,7 +747,7 @@ def _validate_candidate_proof_metadata(
     if metadata.total_record_count < metadata.top_k:
         if kth_pair != (None, None):
             raise ValueError("short corpus cannot carry a kth proof row")
-        if metadata.top_k_closed and metadata.unscored_count:
+        if metadata.top_k_closed and metadata.unscored_identity_count:
             raise ValueError("short-corpus top-k closes only after exhaustion")
     elif metadata.top_k_closed:
         kth_score, kth_record_id = kth_pair
@@ -693,7 +758,7 @@ def _validate_candidate_proof_metadata(
         assert type(kth_record_id) is int
         if kth_record_id > metadata.total_record_count:
             raise ValueError("kth identity is outside the proof universe")
-        if metadata.unscored_count:
+        if metadata.unscored_identity_count:
             frontier_score = metadata.unscored_max_upper_bound
             frontier_id = metadata.unscored_possible_record_id
             assert frontier_score is not None and frontier_id is not None
@@ -701,6 +766,126 @@ def _validate_candidate_proof_metadata(
                 raise ValueError("unscored frontier can still outrank kth result")
     elif kth_pair != (None, None):
         raise ValueError("open top-k proof cannot publish a kth closure row")
+
+    refinement = metadata.refinement
+    if refinement is not None:
+        _validate_candidate_proof_refinement_metadata(refinement)
+        if (
+            refinement.a0_accounted_identity_count
+            + refinement.p1_unscored_identity_count
+            + refinement.r_refinement_identity_count
+            != metadata.total_record_count
+        ):
+            raise ValueError("dense phase-one partitions do not conserve")
+        if (
+            refinement.a1_accounted_identity_count
+            + refinement.p2_unscored_identity_count
+            != refinement.r_refinement_identity_count
+        ):
+            raise ValueError("dense phase-two partitions do not conserve")
+        if (
+            refinement.a0_accounted_identity_count
+            + refinement.a1_accounted_identity_count
+            != metadata.accounted_identity_count
+            or refinement.p1_unscored_identity_count
+            + refinement.p2_unscored_identity_count
+            != metadata.unscored_identity_count
+        ):
+            raise ValueError("dense partitions disagree with proof conservation")
+        mixed_frontiers = tuple(
+            pair
+            for count, pair in (
+                (
+                    refinement.p1_unscored_identity_count,
+                    (
+                        refinement.p1_max_upper_bound,
+                        refinement.p1_possible_record_id,
+                    ),
+                ),
+                (
+                    refinement.p2_unscored_identity_count,
+                    (
+                        refinement.p2_max_upper_bound,
+                        refinement.p2_possible_record_id,
+                    ),
+                ),
+            )
+            if count
+        )
+        expected_frontier = max(mixed_frontiers) if mixed_frontiers else (None, None)
+        if expected_frontier != frontier_pair:
+            raise ValueError("dense mixed frontier disagrees with proof frontier")
+        if metadata.threshold_closed and any(
+            upper is not None and upper >= metadata.minimum_similarity
+            for upper, _record_id in mixed_frontiers
+        ):
+            raise ValueError("dense threshold does not dominate both frontiers")
+        if metadata.top_k_closed and kth_pair != (None, None) and any(
+            pair >= kth_pair for pair in mixed_frontiers
+        ):
+            raise ValueError("dense kth tuple does not dominate both frontiers")
+
+
+def _validate_candidate_proof_refinement_metadata(
+    metadata: CandidateProofRefinementMetadata,
+) -> None:
+    if type(metadata.phase) is not str or metadata.phase != "PHASE_2_COMPLETE":
+        raise ValueError("candidate refinement phase must be PHASE_2_COMPLETE")
+    if type(metadata.refined) is not bool or not metadata.refined:
+        raise ValueError("candidate dense refinement must be complete")
+    for field_name, value in (
+        ("A0 count", metadata.a0_accounted_identity_count),
+        ("P1 count", metadata.p1_unscored_identity_count),
+        ("R count", metadata.r_refinement_identity_count),
+        ("A1 count", metadata.a1_accounted_identity_count),
+        ("P2 count", metadata.p2_unscored_identity_count),
+        ("refinement request count", metadata.refinement_request_count),
+        ("refinement returned count", metadata.refinement_returned_count),
+    ):
+        _require_int(value, f"candidate refinement {field_name}", minimum=0)
+    if (
+        metadata.refinement_request_count
+        != metadata.r_refinement_identity_count
+        or metadata.refinement_returned_count
+        != metadata.r_refinement_identity_count
+    ):
+        raise ValueError("candidate refinement request/response counts do not close")
+    for label, count, upper, record_id in (
+        (
+            "P1",
+            metadata.p1_unscored_identity_count,
+            metadata.p1_max_upper_bound,
+            metadata.p1_possible_record_id,
+        ),
+        (
+            "P2",
+            metadata.p2_unscored_identity_count,
+            metadata.p2_max_upper_bound,
+            metadata.p2_possible_record_id,
+        ),
+    ):
+        if count == 0:
+            if (upper, record_id) != (None, None):
+                raise ValueError(f"candidate refinement {label} empty frontier is invalid")
+        else:
+            if type(upper) is not float:
+                raise TypeError(f"candidate refinement {label} upper must be a float")
+            _require_ratio(upper, f"candidate refinement {label} upper")
+            _require_int(
+                record_id,
+                f"candidate refinement {label} record id",
+                minimum=1,
+            )
+    if (metadata.k0_score, metadata.k0_record_id) == (None, None):
+        return
+    if type(metadata.k0_score) is not float:
+        raise TypeError("candidate refinement K0 score must be a float")
+    _require_ratio(metadata.k0_score, "candidate refinement K0 score")
+    _require_int(
+        metadata.k0_record_id,
+        "candidate refinement K0 record id",
+        minimum=1,
+    )
 
 
 def _validate_candidate_stage_metadata(
@@ -811,8 +996,10 @@ def _validate_candidate_recall_metadata(
         if type(metadata.proof) is not CandidateProofMetadata:
             raise TypeError("candidate proof must be CandidateProofMetadata or None")
         _validate_candidate_proof_metadata(metadata.proof)
-        if metadata.proof.scored_count > metadata.candidate_budget:
-            raise ValueError("candidate proof scored count exceeds candidate budget")
+        if metadata.proof.scorer_invocation_count > metadata.candidate_budget:
+            raise ValueError(
+                "candidate proof scorer invocations exceed candidate budget"
+            )
 
     stages = _require_tuple(metadata.stages, "candidate stages")
     if any(
@@ -946,16 +1133,28 @@ def _validate_candidate_recall_metadata(
             raise ValueError(
                 "BOUND_PROOF input must equal proof seed unique count"
             )
-        if proof_stage.output_unique_count != metadata.proof.scored_count:
-            raise ValueError("BOUND_PROOF output must equal proof scored count")
-        if metadata.union_unique_count != metadata.proof.scored_count:
-            raise ValueError("proof scored count must equal union unique count")
+        if (
+            proof_stage.output_unique_count
+            != metadata.proof.accounted_identity_count
+        ):
+            raise ValueError(
+                "BOUND_PROOF output must equal accounted identity count"
+            )
+        if (
+            metadata.union_unique_count
+            != metadata.proof.accounted_identity_count
+        ):
+            raise ValueError(
+                "accounted identity count must equal union unique count"
+            )
         if not (
             metadata.proof.threshold_closed
             and metadata.proof.top_k_closed
         ):
             raise ValueError("published candidate proof must close threshold and top-k")
 
+    if metadata.proof is not None and metadata.truncated:
+        raise ValueError("proof-query-v2 must not truncate accounted identities")
     if metadata.truncated:
         truncate_metadata = stages[-1]
         if (
@@ -969,7 +1168,10 @@ def _validate_candidate_recall_metadata(
                 "TRUNCATE counts must reduce deduplicated candidates "
                 "to candidate budget"
             )
-    elif metadata.deduplicated_count > metadata.candidate_budget:
+    elif (
+        metadata.proof is None
+        and metadata.deduplicated_count > metadata.candidate_budget
+    ):
         raise ValueError(
             "candidate pool above budget must include TRUNCATE"
         )
@@ -4568,16 +4770,49 @@ def _encode_candidate_proof_metadata(
         "minimum_similarity": metadata.minimum_similarity,
         "opened_block_count": metadata.opened_block_count,
         "proof_version": metadata.proof_version,
-        "scored_count": metadata.scored_count,
+        "refinement": (
+            None
+            if metadata.refinement is None
+            else _encode_candidate_proof_refinement_metadata(
+                metadata.refinement
+            )
+        ),
+        "accounted_identity_count": metadata.accounted_identity_count,
+        "scanned_block_count": metadata.scanned_block_count,
+        "scorer_invocation_count": metadata.scorer_invocation_count,
         "seed_unique_count": metadata.seed_unique_count,
         "threshold_closed": metadata.threshold_closed,
         "top_k": metadata.top_k,
         "top_k_closed": metadata.top_k_closed,
         "total_block_count": metadata.total_block_count,
         "total_record_count": metadata.total_record_count,
-        "unscored_count": metadata.unscored_count,
+        "traversal_mode": metadata.traversal_mode,
+        "traversal_version": metadata.traversal_version,
+        "unscored_identity_count": metadata.unscored_identity_count,
         "unscored_max_upper_bound": metadata.unscored_max_upper_bound,
         "unscored_possible_record_id": metadata.unscored_possible_record_id,
+    }
+
+
+def _encode_candidate_proof_refinement_metadata(
+    metadata: CandidateProofRefinementMetadata,
+) -> dict[str, Any]:
+    return {
+        "a0_accounted_identity_count": metadata.a0_accounted_identity_count,
+        "a1_accounted_identity_count": metadata.a1_accounted_identity_count,
+        "k0_record_id": metadata.k0_record_id,
+        "k0_score": metadata.k0_score,
+        "p1_max_upper_bound": metadata.p1_max_upper_bound,
+        "p1_possible_record_id": metadata.p1_possible_record_id,
+        "p1_unscored_identity_count": metadata.p1_unscored_identity_count,
+        "p2_max_upper_bound": metadata.p2_max_upper_bound,
+        "p2_possible_record_id": metadata.p2_possible_record_id,
+        "p2_unscored_identity_count": metadata.p2_unscored_identity_count,
+        "phase": metadata.phase,
+        "r_refinement_identity_count": metadata.r_refinement_identity_count,
+        "refined": metadata.refined,
+        "refinement_request_count": metadata.refinement_request_count,
+        "refinement_returned_count": metadata.refinement_returned_count,
     }
 
 
@@ -6319,6 +6554,7 @@ def _decode_candidate_proof_metadata(
         value,
         "CandidateProofMetadata payload",
         (
+            "accounted_identity_count",
             "block_version",
             "bound_version",
             "inspected_record_count",
@@ -6327,19 +6563,58 @@ def _decode_candidate_proof_metadata(
             "minimum_similarity",
             "opened_block_count",
             "proof_version",
-            "scored_count",
+            "refinement",
+            "scanned_block_count",
+            "scorer_invocation_count",
             "seed_unique_count",
             "threshold_closed",
             "top_k",
             "top_k_closed",
             "total_block_count",
             "total_record_count",
-            "unscored_count",
+            "traversal_mode",
+            "traversal_version",
+            "unscored_identity_count",
             "unscored_max_upper_bound",
             "unscored_possible_record_id",
         ),
     )
-    return CandidateProofMetadata(**payload)
+    prepared: dict[str, Any] = dict(payload)
+    prepared["refinement"] = (
+        None
+        if payload["refinement"] is None
+        else _decode_candidate_proof_refinement_metadata(
+            payload["refinement"]
+        )
+    )
+    return CandidateProofMetadata(**prepared)
+
+
+def _decode_candidate_proof_refinement_metadata(
+    value: object,
+) -> CandidateProofRefinementMetadata:
+    payload = _strict_fields(
+        value,
+        "CandidateProofRefinementMetadata payload",
+        (
+            "a0_accounted_identity_count",
+            "a1_accounted_identity_count",
+            "k0_record_id",
+            "k0_score",
+            "p1_max_upper_bound",
+            "p1_possible_record_id",
+            "p1_unscored_identity_count",
+            "p2_max_upper_bound",
+            "p2_possible_record_id",
+            "p2_unscored_identity_count",
+            "phase",
+            "r_refinement_identity_count",
+            "refined",
+            "refinement_request_count",
+            "refinement_returned_count",
+        ),
+    )
+    return CandidateProofRefinementMetadata(**payload)
 
 
 def _decode_candidate_evidence(value: object) -> CandidateEvidence:
@@ -6958,6 +7233,7 @@ __all__ = [
     "CANDIDATE_BUDGET_VERSION",
     "CANDIDATE_PROOF_QUERY_VERSION",
     "CANDIDATE_PROOF_BLOCK_VERSION_V1",
+    "CANDIDATE_PROOF_TRAVERSAL_VERSION",
     "GENERATION_EXPECTATION_VERSION",
     "SCORER_BOUND_VERSION_V1",
     "SCORER_VERSION_V1",
@@ -6978,6 +7254,7 @@ __all__ = [
     "CanonicalResourceIdentity",
     "CandidateEvidence",
     "CandidateProofMetadata",
+    "CandidateProofRefinementMetadata",
     "CandidateRecallMetadata",
     "CandidateRetrievalReport",
     "CandidateStage",
