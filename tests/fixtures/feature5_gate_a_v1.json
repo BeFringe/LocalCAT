@@ -4,14 +4,14 @@
     "CONTRACTS": {
       "artifact_paths": ["tm_contracts.py"],
       "fixture_paths": [],
-      "artifact_digest": "2de65bed42545533bf691043979ed9957b2de359b1535fe86fc45204b240e3c3",
+            "artifact_digest": "2a219a064f496292b1b273757c52c83992c021ee4fd498362ad5be9169d392e8",
       "fixture_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-      "transcript_digest": "d748f0c2de774b25cef1fd24b6cb3a577107752c836ca4c2b80d44b5e5aa18bf"
+      "transcript_digest": "fdf9325a83ef9a5ca76ff450bb9220e2ba75e3bda97b8183d7aa9613b0ada67d"
     },
     "SIMILARITY": {
       "artifact_paths": ["tm_similarity.py"],
       "fixture_paths": ["tests/fixtures/tm_similarity_vectors.json"],
-      "artifact_digest": "715d31e40398e19e3ec4d32de874d71726369f93428d1c1cd5dfd9180531afc4",
+      "artifact_digest": "82304bf2303d4823735fcc1211b30c282f731a4457d3b3adab1f7c6ea267f7bd",
       "fixture_digest": "b16f708f6aba1cedf50cb016f6476a7e065d2574d62d1cb125835b9245b61e5d",
       "transcript_digest": "b1cebe3c74392bf4d3e520acd055da177efe1e2695f7f8baa3634abd12e069c0"
     },
@@ -22,7 +22,7 @@
         "tests/fixtures/text_matcher_v1_vectors.json",
         "tests/fixtures/unicode-16.0.0-WordBreakTest.txt"
       ],
-      "artifact_digest": "e1ccfabb3fb0dbb178632c1bad5aa176373a58fcacee7e5ae4f7d4a7d4ff3b80",
+      "artifact_digest": "c68355e57c37d251d7a34f154f1c1ac71e5a9ee538abba9ae85fe776e51557f7",
       "fixture_digest": "ef13a6158435b6cc4d53b0186e26883618a6ee4951075b35e4bee8b00916a28a",
       "transcript_digest": "a81adbdebc71e91bf8e6c45d6dd651682c397b0fdfe3e574af2f5baeeed78e94"
     }
@@ -40,8 +40,8 @@
     ],
     "evaluator_path": "matcher_capability.py",
     "fixture_paths": ["tests/fixtures/text_matcher_v1_vectors.json"],
-    "matcher_artifact_digest": "e1ccfabb3fb0dbb178632c1bad5aa176373a58fcacee7e5ae4f7d4a7d4ff3b80",
-    "matcher_build_digest": "c6be4f0918b7491f7ae7387e5a11654271c0098c934d2a89213e02ae0919519e",
+    "matcher_artifact_digest": "c68355e57c37d251d7a34f154f1c1ac71e5a9ee538abba9ae85fe776e51557f7",
+        "matcher_build_digest": "7539dfa7bc7abb6dd7757364ba8f0a91448af46682ff39511e86b2ba994d4408",
     "fixture_digest": "09967fd2e72b8f5d748c5754ff76983b55d584b73e55abba15e730fdda528ed1",
     "evaluator_digest": "bf41a588ff902d93beee0ced8b0c015f2f18883bf2db298b90a20cf975003777",
     "semantics_version": "text-v1-unicode-16.0.0",

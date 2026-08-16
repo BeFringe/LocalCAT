@@ -1,5 +1,5 @@
 {
- "artifact_digest": "b626b797791e09e1f963fd6b4eed1f322cd1b349ec5c1685bf3d940b9aaf5e75",
+    "artifact_digest": "617d183d36a80dbc63023f3b5b20db49810e23dc5d664dc8b5a48aa2f1f4daf6",
  "artifact_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",
@@ -9,7 +9,7 @@
   "tm_similarity.py",
   "tm_sqlite_store.py"
  ],
- "build_digest": "a8929340957546036ab77427a81eb221daa0b8fcc654bda126788b65ef86b825",
+    "build_digest": "2898e3d70b2af5dcac9968a89a7c819b6bb48794c8e3dbec35bc182eb3a7ee9f",
  "build_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",
@@ -29,15 +29,15 @@
  "fixture_paths": [
   "tests/fixtures/retrieval_gate_c_vectors_v1.json"
  ],
- "fts5_trigram": {
-  "contract_digest": "9c22b8d04c1bc20fc08882b018994436291e7beadcec9bc911c6bab783cbfacf",
+  "fts5_trigram": {
+    "contract_digest": "fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4",
   "path": "FTS5_TRIGRAM"
  },
  "fuzzy_core_cohorts": {
   "fuzzy.core.correctness.cohort.v1": "3e518b6a2cd813b368a26b4aeee76dc4b7e92ea3a3730194e65f586b42f728e4"
  },
- "gram_fallback": {
-  "contract_digest": "4ff11ef707fa55fa82f87ab0c1053f20b401665706c1c39bcbc254c309916d73",
+  "gram_fallback": {
+    "contract_digest": "fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4",
   "path": "GRAM_FALLBACK"
  },
  "schema_version": "retrieval-gate-c-roots-v1",

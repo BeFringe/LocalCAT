@@ -228,11 +228,12 @@ def _snapshot_recall_metadata(
         for stage_metadata in stages
     )
     proof = metadata.proof
-    proof_snapshot = (
-        None
-        if proof is None
-        else _snapshot_candidate_proof_metadata(proof)
-    )
+    if proof is None:
+        proof_snapshot = None
+    elif type(proof) is CandidateProofMetadata:
+        proof_snapshot = _snapshot_candidate_proof_metadata(proof)
+    else:
+        raise TypeError("production recall requires proof-query-v3")
     return CandidateRecallMetadata(
         resource_id=metadata.resource_id,
         index_kind=metadata.index_kind,
@@ -265,31 +266,9 @@ def _snapshot_candidate_proof_metadata(
             "candidate proof refinement metadata",
         )
         refinement = CandidateProofRefinementMetadata(**refinement.__dict__)
-    return CandidateProofMetadata(
-        proof_version=metadata.proof_version,
-        bound_version=metadata.bound_version,
-        block_version=metadata.block_version,
-        traversal_version=metadata.traversal_version,
-        traversal_mode=metadata.traversal_mode,
-        total_block_count=metadata.total_block_count,
-        total_record_count=metadata.total_record_count,
-        scanned_block_count=metadata.scanned_block_count,
-        opened_block_count=metadata.opened_block_count,
-        inspected_record_count=metadata.inspected_record_count,
-        seed_unique_count=metadata.seed_unique_count,
-        scorer_invocation_count=metadata.scorer_invocation_count,
-        accounted_identity_count=metadata.accounted_identity_count,
-        unscored_identity_count=metadata.unscored_identity_count,
-        unscored_max_upper_bound=metadata.unscored_max_upper_bound,
-        unscored_possible_record_id=metadata.unscored_possible_record_id,
-        minimum_similarity=metadata.minimum_similarity,
-        threshold_closed=metadata.threshold_closed,
-        top_k=metadata.top_k,
-        kth_score=metadata.kth_score,
-        kth_record_id=metadata.kth_record_id,
-        top_k_closed=metadata.top_k_closed,
-        refinement=refinement,
-    )
+    prepared = dict(metadata.__dict__)
+    prepared["refinement"] = refinement
+    return CandidateProofMetadata(**prepared)
 
 
 def _snapshot_candidate_evidence(
@@ -772,6 +751,7 @@ def prove_and_score_fuzzy_candidates(
     retriever: CandidateRetriever | None = None,
     scorer: SimilarityScorer | None = None,
     proof_session_port: Callable[..., CandidateProofSession] | None = None,
+    completion_policy: str = "production",
 ) -> tuple[FuzzyScoringResult, CandidateRetrievalReport]:
     """Alternate conservative proof expansion with scorer-v1 execution.
 
@@ -789,9 +769,12 @@ def prove_and_score_fuzzy_candidates(
         raise ValueError("resource_id must not be empty")
     if resource_order < 0:
         raise ValueError("resource_order must be non-negative")
+    _require_exact_type(completion_policy, str, "proof completion policy")
+    if completion_policy not in {"production", "oracle_full"}:
+        raise ValueError("proof completion policy is unsupported")
     if scorer is not None and type(scorer) is not SimilarityScorerV1:
         raise ValueError(
-            "proof-query-v2 requires the production scorer-v1 owner"
+            "proof-query-v3 requires the production scorer-v1 owner"
         )
     query_snapshot = _snapshot_query(query)
     folded_query = _folded_text_value_v1(query_snapshot.query_source)
@@ -807,6 +790,15 @@ def prove_and_score_fuzzy_candidates(
             Callable[..., CandidateProofSession],
             candidate_port,
         )
+    candidate_owner = getattr(proof_session_port, "__self__", None)
+    candidate_function = getattr(proof_session_port, "__func__", None)
+    if (
+        type(candidate_owner) is not CandidateRetriever
+        or candidate_function is not CandidateRetriever.proof_session_from_view
+    ):
+        raise ValueError(
+            "proof-query-v3 requires the production candidate owner"
+        )
     session = cast(
         CandidateProofSession,
         proof_session_port(
@@ -815,8 +807,10 @@ def prove_and_score_fuzzy_candidates(
             folded_query,
             minimum_similarity=float(query_snapshot.minimum_similarity),
             result_limit=query_snapshot.limit,
+            completion_policy=completion_policy,
         ),
     )
+    _require_exact_type(session, CandidateProofSession, "proof session")
     records_port = getattr(view, "records_by_id", None)
     if not callable(records_port):
         raise TypeError("query view must implement records_by_id")
@@ -843,53 +837,154 @@ def prove_and_score_fuzzy_candidates(
         snapshots = tuple(_snapshot_record(record) for record in records)
         if tuple(record.record_id for record in snapshots) != record_ids:
             raise ValueError("proof records must preserve requested identity order")
-        observations: list[tuple[int, SimilarityEvidence, bool]] = []
+
+        # Freeze the whole batch's raw/fold facts and projected invocation
+        # delta before either scorer execution or any owner cache/session
+        # mutation.  A batch that would require invocation 2,049 therefore
+        # leaves both Retrieval and CandidateProofSession untouched.
+        batch_folds_by_raw: dict[str, str] = {}
+        new_fold_sources: dict[str, str] = {}
+        folds_by_record_id: dict[int, str] = {}
         for record in snapshots:
             if record.record_id in observed:
                 raise ValueError("proof identity must be scored exactly once")
             candidate_fold = fold_by_raw_source.get(record.source_raw)
             if candidate_fold is None:
+                candidate_fold = batch_folds_by_raw.get(record.source_raw)
+            if candidate_fold is None:
                 candidate_fold = _folded_text_value_v1(record.source_raw)
-                fold_by_raw_source[record.source_raw] = candidate_fold
+                batch_folds_by_raw[record.source_raw] = candidate_fold
             if type(candidate_fold) is not str or not candidate_fold:
                 raise ValueError("proof candidate must fold to non-empty text")
+            folds_by_record_id[record.record_id] = candidate_fold
+            if (
+                candidate_fold not in evidence_by_fold
+                and candidate_fold not in new_fold_sources
+            ):
+                new_fold_sources[candidate_fold] = record.source_raw
+        projected_invocation_count = (
+            scorer_invocation_count + len(new_fold_sources)
+        )
+        if projected_invocation_count > scorer_budget:
+            raise CandidateProofBudgetExhausted()
+
+        new_evidence_by_fold: dict[str, SimilarityEvidence] = {}
+        for candidate_fold, source_raw in new_fold_sources.items():
+            new_evidence_by_fold[candidate_fold] = _snapshot_evidence(
+                score_callable(query_snapshot.query_source, source_raw)
+            )
+
+        observations: list[tuple[int, SimilarityEvidence, bool]] = []
+        ranked_record_ids: list[int] = []
+        invocation_emitted: set[str] = set()
+        batch_observed: dict[
+            int,
+            tuple[_FuzzyRecordSnapshot, SimilarityEvidence],
+        ] = {}
+        for record in snapshots:
+            candidate_fold = folds_by_record_id[record.record_id]
             evidence = evidence_by_fold.get(candidate_fold)
-            scorer_invoked = evidence is None
+            if evidence is None:
+                evidence = new_evidence_by_fold[candidate_fold]
+            scorer_invoked = (
+                candidate_fold in new_evidence_by_fold
+                and candidate_fold not in invocation_emitted
+            )
             if scorer_invoked:
-                if scorer_invocation_count >= scorer_budget:
-                    raise CandidateProofBudgetExhausted()
-                evidence = _snapshot_evidence(
-                    score_callable(
-                        query_snapshot.query_source,
-                        record.source_raw,
-                    )
-                )
-                scorer_invocation_count += 1
-                evidence_by_fold[candidate_fold] = evidence
-            assert evidence is not None
+                invocation_emitted.add(candidate_fold)
             if evidence.final_similarity != (
                 evidence.levenshtein_ratio + evidence.dice_bigram
             ) / 2.0:
                 raise ValueError("scorer-v1 evidence components do not close")
-            observed[record.record_id] = (record, evidence)
+            batch_observed[record.record_id] = (record, evidence)
             observations.append((record.record_id, evidence, scorer_invoked))
-        session.observe(tuple(observations))
+            if record.source_raw != query_snapshot.query_source:
+                ranked_record_ids.append(record.record_id)
+        session.observe(
+            tuple(observations),
+            ranked_record_ids=tuple(ranked_record_ids),
+        )
+        observed.update(batch_observed)
+        evidence_by_fold.update(new_evidence_by_fold)
+        fold_by_raw_source.update(batch_folds_by_raw)
+        scorer_invocation_count = projected_invocation_count
 
     report = _snapshot_candidate_report(session.finish())
     candidate_ids = tuple(candidate.record_id for candidate in report.candidates)
     if candidate_ids != tuple(observed):
         raise ValueError("proof report identities must equal scorer observations")
     proof = report.metadata.proof
+    if type(proof) is not CandidateProofMetadata:
+        raise ValueError("proof report must publish proof-query-v3 facts")
+    ranked_scores = tuple(
+        (evidence.final_similarity, record_id)
+        for record_id, (record, evidence) in observed.items()
+        if record.source_raw != query_snapshot.query_source
+    )
+    ranked_kth = (
+        sorted(ranked_scores, reverse=True)[query_snapshot.limit - 1]
+        if len(ranked_scores) >= query_snapshot.limit
+        else None
+    )
+    frontier = (
+        None
+        if proof.unscored_max_upper_bound is None
+        else (
+            proof.unscored_max_upper_bound,
+            proof.unscored_possible_record_id,
+        )
+    )
+    if frontier is not None and type(frontier[1]) is not int:
+        raise ValueError("proof frontier identity is incomplete")
+    expected_threshold_closed = (
+        proof.unscored_identity_count == 0
+        or (
+            frontier is not None
+            and frontier[0] < query_snapshot.minimum_similarity
+        )
+    )
+    expected_top_k_closed = (
+        frontier is None
+        or (
+            ranked_kth is not None
+            and frontier < ranked_kth
+        )
+    )
+    expected_result_complete = (
+        expected_threshold_closed
+        or (
+            ranked_kth is not None
+            and ranked_kth[0] >= query_snapshot.minimum_similarity
+            and expected_top_k_closed
+        )
+    )
     if (
-        proof is None
-        or not proof.threshold_closed
-        or not proof.top_k_closed
-        or proof.scorer_invocation_count != scorer_invocation_count
+        proof.scorer_invocation_count != scorer_invocation_count
         or proof.scorer_invocation_count != len(evidence_by_fold)
         or proof.accounted_identity_count != len(observed)
+        or proof.ranked_eligible_count != len(ranked_scores)
+        or (
+            proof.ranked_kth_score,
+            proof.ranked_kth_record_id,
+        ) != (
+            (None, None) if ranked_kth is None else ranked_kth
+        )
         or (
             proof.accounted_identity_count + proof.unscored_identity_count
             != proof.total_record_count
+        )
+        or proof.threshold_closed is not expected_threshold_closed
+        or proof.top_k_closed is not expected_top_k_closed
+        or proof.result_complete is not expected_result_complete
+        or (
+            completion_policy == "production"
+            and not expected_result_complete
+        )
+        or (
+            completion_policy == "oracle_full"
+            and not (
+                expected_threshold_closed and expected_top_k_closed
+            )
         )
     ):
         raise ValueError("proof report must publish closed scorer conservation")
@@ -1337,7 +1432,7 @@ class TMRetrievalService:
         scorer: SimilarityScorer | None = None,
         capability_publisher: RetrievalCapabilityPublisher | None = None,
     ) -> None:
-        self._proof_query_v2_authority = retriever is None and scorer is None
+        self._proof_query_v3_authority = retriever is None and scorer is None
         if retriever is None:
             retriever = CandidateRetriever()
         if scorer is None:
@@ -1396,7 +1491,7 @@ class TMRetrievalService:
                     lazy_retriever,
                     lazy_scorer,
                     folded_query,
-                    self._proof_query_v2_authority,
+                    self._proof_query_v3_authority,
                 )
             except _ResourcePipelineFailure as failure:
                 failures.append(
@@ -1472,7 +1567,7 @@ class TMRetrievalService:
         lazy_retriever: _LazyRetrieverPort,
         lazy_scorer: _LazyScorerPort,
         folded_query: str,
-        proof_query_v2_authority: bool,
+        proof_query_v3_authority: bool,
     ) -> tuple[
         tuple[TMResult, ...],
         ResourceQueryMetadata,
@@ -1574,7 +1669,7 @@ class TMRetrievalService:
 
                 if fuzzy_available:
                     proof_session_port = lazy_retriever.proof_port()
-                    if proof_session_port is not None and proof_query_v2_authority:
+                    if proof_session_port is not None and proof_query_v3_authority:
                         try:
                             with _stage_guard("PROOF"):
                                 fuzzy, report = prove_and_score_fuzzy_candidates(

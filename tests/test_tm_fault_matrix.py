@@ -70,7 +70,7 @@ def _flatten(suite: unittest.TestSuite) -> tuple[unittest.TestCase, ...]:
 
 class FaultMatrixRegistryTests(unittest.TestCase):
     def test_task_9_1_registry_is_closed_and_unique(self) -> None:
-        self.assertEqual(len(TASK_9_1_ROWS), 29)
+        self.assertEqual(len(TASK_9_1_ROWS), 30)
         self.assertTrue(all(row.task == "9.1" for row in TASK_9_1_ROWS))
 
     def test_task_9_2_registry_is_closed_and_unique(self) -> None:
@@ -254,6 +254,41 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "canonical output"):
                     validator.main(["--emit", "AGENTS.md"])
 
+    def test_validator_rejects_source_drift_before_emit(self) -> None:
+        baseline = validator._source_file_digests(_ROOT)
+        changed = baseline[:-1] + ((baseline[-1][0], "0" * 64),)
+        with (
+            patch.object(validator, "_run_row", return_value=True),
+            patch.object(
+                validator,
+                "_source_file_digests",
+                side_effect=(baseline, baseline, changed),
+            ),
+            patch.object(
+                validator,
+                "_atomic_write",
+                side_effect=lambda _path, _payload, validate: validate(),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "changed before emit"):
+                validator.main([])
+
+    def test_atomic_write_validates_before_and_after_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "evidence.json"
+            calls = 0
+
+            def validate() -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("source drift after replace")
+
+            with self.assertRaisesRegex(ValueError, "after replace"):
+                validator._atomic_write(target, b"{}\n", validate)
+            self.assertEqual(calls, 2)
+            self.assertEqual(target.read_bytes(), b"{}\n")
+
     def test_validator_source_walk_rejects_final_and_intermediate_symlinks(
         self,
     ) -> None:
@@ -296,6 +331,10 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
                 validator._validate_evidence_target(alias)
             with self.assertRaisesRegex(ValueError, "regular file"):
                 validator._validate_evidence_target(root)
+            hardlink = root / "hardlink.json"
+            os.link(ordinary, hardlink)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                validator._validate_evidence_target(ordinary)
 
 
 if __name__ == "__main__":

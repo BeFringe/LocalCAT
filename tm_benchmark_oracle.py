@@ -94,6 +94,7 @@ from tm_benchmark import (
     _query_payload,
     _record_payload,
     benchmark_digest,
+    benchmark_implementation_fingerprint,
     iter_oracle_queries,
     iter_oracle_subset_records,
     load_benchmark_contract,
@@ -102,6 +103,8 @@ from tm_benchmark import (
 from tm_candidate_index import CandidateRetriever
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
+    CandidateProofMetadata,
     CanonicalResourceIdentity,
     SCORER_VERSION_V1,
     BenchmarkContract,
@@ -121,10 +124,9 @@ from tm_sqlite_store import (
     SQLiteTMStore,
     _probe_fts5,
 )
-from tm_stage_sealer import StageSealer
 
-ORACLE_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-oracle-evidence-v1"
-ORACLE_EVIDENCE_DIGEST_VERSION = "tm-benchmark-oracle-digest-v1"
+ORACLE_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-oracle-evidence-v2"
+ORACLE_EVIDENCE_DIGEST_VERSION = "tm-benchmark-oracle-digest-v2"
 ORACLE_DEFAULT_RESOURCE_ID = "tm.benchmark"
 ORACLE_DEFAULT_CANONICAL_STORE_ID = "store.benchmark"
 ORACLE_FIXTURE_NAME = "oracle.fixture.jsonl"
@@ -781,10 +783,11 @@ def _build_oracle_store(
         raise RuntimeError("oracle stage preflight reported invalid rows")
     if build.preflight.valid_count < 1:
         raise RuntimeError("oracle stage preflight reported no valid rows")
-    sealed = StageSealer(
-        registry=coordinator.sealed_registry,
+    sealed = coordinator._seal_stage(
+        stage,
         canonical_store_id=canonical_store_id,
-    ).seal(stage, expected_prior_generation=None)
+        expected_prior_generation=None,
+    )
     if not sealed.evidence.integrity_ok:
         raise RuntimeError("oracle stage seal integrity failed")
     prepared = coordinator.activate(sealed)
@@ -817,6 +820,7 @@ def _run_candidate_path(
         tuple[int, tuple[int, ...], str, bool, str | None, bool],
         ...,
     ],
+    str,
 ]:
     """Execute the real CandidateRetriever/SQLite path for one requested path."""
 
@@ -834,6 +838,7 @@ def _run_candidate_path(
     fixture_digest, fixture_count = _generate_fixture(fixture_path, records)
     if fixture_count != len(records):
         raise ValueError("fixture record count mismatch")
+    fixture_path = fixture_path.resolve()
 
     expected_index_kind = expected_store_index_kind(execution_path)
     force_fallback = execution_path is BenchmarkExecutionPath.GRAM_FALLBACK
@@ -865,6 +870,7 @@ def _run_candidate_path(
             raise RuntimeError("oracle store record count mismatch")
         mapping = _validate_physical_mapping(store, records)
         retriever = CandidateRetriever()
+        observed_proof_versions: set[str] = set()
         rows: list[
             tuple[int, tuple[int, ...], str, bool, str | None, bool]
         ] = []
@@ -886,17 +892,21 @@ def _run_candidate_path(
                     view=view,
                     retriever=retriever,
                     scorer=SimilarityScorerV1(),
+                    completion_policy="oracle_full",
                 )
             metadata = report.metadata
             if metadata.result_limit != contract.top_k:
                 raise RuntimeError("candidate result limit drift")
             if metadata.candidate_budget_version != CANDIDATE_BUDGET_VERSION:
                 raise RuntimeError("candidate budget version drift")
-            if metadata.proof is None or not (
+            if type(metadata.proof) is not CandidateProofMetadata or not (
                 metadata.proof.threshold_closed
                 and metadata.proof.top_k_closed
             ):
                 raise RuntimeError("candidate proof closure is missing")
+            if metadata.proof.proof_version != CANDIDATE_PROOF_QUERY_VERSION:
+                raise RuntimeError("candidate proof version drift")
+            observed_proof_versions.add(metadata.proof.proof_version)
             candidate_original_ids: list[int] = []
             if metadata.fuzzy_available:
                 if metadata.fuzzy_unavailable_code is not None:
@@ -938,7 +948,14 @@ def _run_candidate_path(
                 )
     if len(rows) != len(queries):
         raise RuntimeError("candidate path row count mismatch")
-    return fixture_digest, health.index_kind, tuple(rows)
+    if observed_proof_versions != {CANDIDATE_PROOF_QUERY_VERSION}:
+        raise RuntimeError("candidate proof version was not observed")
+    return (
+        fixture_digest,
+        health.index_kind,
+        tuple(rows),
+        observed_proof_versions.pop(),
+    )
 
 
 @dataclass(frozen=True)
@@ -1197,6 +1214,8 @@ class OracleRecallEvidence:
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     test_mode: bool
     contract: BenchmarkContract
     contract_digest: str
@@ -1230,6 +1249,15 @@ class OracleRecallEvidence:
                 "evidence schema version must be "
                 f"{ORACLE_EVIDENCE_SCHEMA_VERSION}"
             )
+        if self.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+            raise ValueError(
+                "proof query version must be "
+                f"{CANDIDATE_PROOF_QUERY_VERSION}"
+            )
+        _require_digest(
+            self.implementation_fingerprint,
+            "implementation fingerprint",
+        )
         test_mode = _require_builtin_bool(self.test_mode, "test mode")
         object.__setattr__(self, "test_mode", test_mode)
         if type(self.contract) is not BenchmarkContract:
@@ -1452,6 +1480,8 @@ def oracle_evidence_digest(evidence: OracleRecallEvidence) -> str:
     items: list[dict[str, object]] = [
         {
             "schema_version": evidence.schema_version,
+            "proof_query_version": evidence.proof_query_version,
+            "implementation_fingerprint": evidence.implementation_fingerprint,
             "test_mode": evidence.test_mode,
             "contract_digest": evidence.contract_digest,
             "oracle_subset_digest": evidence.oracle_subset_digest,
@@ -1489,6 +1519,8 @@ def oracle_evidence_digest(evidence: OracleRecallEvidence) -> str:
 _EVIDENCE_PAYLOAD_FIELDS = frozenset(
     {
         "schema_version",
+        "proof_query_version",
+        "implementation_fingerprint",
         "test_mode",
         "contract_json",
         "contract_digest",
@@ -1541,6 +1573,8 @@ def _environment_from_payload(value: object) -> tuple[tuple[str, str], ...]:
 def _evidence_payload(evidence: OracleRecallEvidence) -> dict[str, object]:
     return {
         "schema_version": evidence.schema_version,
+        "proof_query_version": evidence.proof_query_version,
+        "implementation_fingerprint": evidence.implementation_fingerprint,
         "test_mode": evidence.test_mode,
         "contract_json": contract_to_json(evidence.contract),
         "contract_digest": evidence.contract_digest,
@@ -1597,6 +1631,14 @@ def evidence_from_payload(payload: object) -> OracleRecallEvidence:
     rows = tuple(_row_from_payload(row) for row in rows_value)
     evidence = OracleRecallEvidence(
         schema_version=_as_str(fields["schema_version"], "schema version"),
+        proof_query_version=_as_str(
+            fields["proof_query_version"],
+            "proof query version",
+        ),
+        implementation_fingerprint=_as_digest(
+            fields["implementation_fingerprint"],
+            "implementation fingerprint",
+        ),
         test_mode=_as_bool(fields["test_mode"], "test mode"),
         contract=contract,
         contract_digest=_as_digest(
@@ -1703,13 +1745,18 @@ def _build_recall_evidence(
     oracle_rows: tuple[FullScanQueryOracle, ...],
     resource_id: str,
     canonical_store_id: str,
+    implementation_fingerprint: str,
 ) -> OracleRecallEvidence:
     """Execute one path against owner-derived, already validated oracle rows."""
 
+    implementation_before = benchmark_implementation_fingerprint()
+    if implementation_before != implementation_fingerprint:
+        raise RuntimeError("oracle implementation changed before candidate run")
     (
         fixture_digest,
         store_index_kind,
         candidate_facts,
+        proof_query_version,
     ) = _run_candidate_path(
         contract=contract,
         execution_path=execution_path,
@@ -1787,6 +1834,12 @@ def _build_recall_evidence(
     environment = collect_oracle_environment(fts5_enabled=fts5_enabled)
     validate_oracle_environment(environment, execution_path)
     environment_digest = benchmark_environment_digest(environment)
+    implementation_after = benchmark_implementation_fingerprint()
+    if (
+        implementation_before != implementation_after
+        or implementation_after != implementation_fingerprint
+    ):
+        raise RuntimeError("oracle implementation changed during evidence run")
 
     all_queries_available = all(row.candidate_available for row in rows)
     index_kind_drift_count = sum(
@@ -1802,6 +1855,8 @@ def _build_recall_evidence(
     )
     return OracleRecallEvidence(
         schema_version=ORACLE_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=proof_query_version,
+        implementation_fingerprint=implementation_fingerprint,
         test_mode=test_mode,
         contract=contract,
         contract_digest=benchmark_contract_digest(contract),
@@ -1914,6 +1969,7 @@ def run_oracle_recall_evidence(
         record_count = contract.oracle_subset_record_count
         query_count = contract.oracle_query_count
 
+    implementation_fingerprint = benchmark_implementation_fingerprint()
     records = tuple(
         iter_oracle_subset_records(
             seed=contract.corpus_seed,
@@ -1967,6 +2023,7 @@ def run_oracle_recall_evidence(
         oracle_rows=oracle_rows,
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
+        implementation_fingerprint=implementation_fingerprint,
     )
 
 
@@ -1993,6 +2050,7 @@ def run_oracle_recall_suite(
             raise TypeError(f"{label} must be a native pathlib.Path")
     if fts5_run_root.resolve() == fallback_run_root.resolve():
         raise ValueError("oracle path run roots must be distinct")
+    implementation_fingerprint = benchmark_implementation_fingerprint()
     records = tuple(
         iter_oracle_subset_records(
             seed=contract.corpus_seed,
@@ -2025,6 +2083,7 @@ def run_oracle_recall_suite(
         oracle_rows=oracle_rows,
         resource_id=f"{ORACLE_DEFAULT_RESOURCE_ID}.fts5",
         canonical_store_id=f"{ORACLE_DEFAULT_CANONICAL_STORE_ID}.fts5",
+        implementation_fingerprint=implementation_fingerprint,
     )
     fallback = _build_recall_evidence(
         contract=contract,
@@ -2036,6 +2095,7 @@ def run_oracle_recall_suite(
         oracle_rows=oracle_rows,
         resource_id=f"{ORACLE_DEFAULT_RESOURCE_ID}.fallback",
         canonical_store_id=f"{ORACLE_DEFAULT_CANONICAL_STORE_ID}.fallback",
+        implementation_fingerprint=implementation_fingerprint,
     )
     return fts5, fallback
 

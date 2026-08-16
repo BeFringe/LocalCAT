@@ -73,14 +73,17 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 
 from tm_contracts import (
     BENCHMARK_CONTRACT_VERSION,
     BENCHMARK_PERCENTILE_METHOD,
     BENCHMARK_RSS_SCOPE,
     CANDIDATE_BUDGET_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
     SCORER_VERSION_V1,
     BenchmarkContract,
     TMRecordDraft,
@@ -92,6 +95,43 @@ TM_BENCHMARK_COMPOSITION_VERSION = "tm-corpus-composition-v1"
 TM_BENCHMARK_DIGEST_SCHEMA = "tm-benchmark-digest-v1"
 TM_BENCHMARK_SCORER_CONFIG_VERSION = "scorer-config-v1"
 TM_BENCHMARK_PATH_CONFIG_VERSION = "benchmark-path-config-v1"
+BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION = (
+    "tm-benchmark-implementation-fingerprint-v1"
+)
+BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
+    "benchmark_tm_contract.json",
+    "capability_gated_text_matcher.py",
+    "matcher_capability.py",
+    "text_matcher.py",
+    "tm_activation_journal.py",
+    "tm_activation_recovery.py",
+    "tm_benchmark.py",
+    "tm_benchmark_gate.py",
+    "tm_benchmark_latency.py",
+    "tm_benchmark_oracle.py",
+    "tm_benchmark_process.py",
+    "tm_benchmark_query_process.py",
+    "tm_candidate_index.py",
+    "tm_content_attestation.py",
+    "tm_contracts.py",
+    "tm_gate_b.py",
+    "tm_migration.py",
+    "tm_retrieval.py",
+    "tm_retrieval_capability.py",
+    "tm_schema_upgrade.py",
+    "tm_similarity.py",
+    "tm_snapshot_artifacts.py",
+    "tm_snapshot_recovery.py",
+    "tm_sqlite_store.py",
+    "tm_stage_sealer.py",
+    "unicode_word_break_data.py",
+)
+if BENCHMARK_IMPLEMENTATION_SOURCE_PATHS != tuple(
+    sorted(set(BENCHMARK_IMPLEMENTATION_SOURCE_PATHS))
+):
+    raise RuntimeError("benchmark implementation source closure is invalid")
+
+_NATIVE_PATH_TYPE = type(Path())
 
 TM_BENCHMARK_DEFAULT_SEED = 20260729
 TM_BENCHMARK_CORPUS_RECORD_COUNT = 100_000
@@ -643,6 +683,131 @@ def _canonical_json(value: Mapping[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _stable_benchmark_source_digest(path: Path) -> str:
+    """Hash one direct regular implementation member without aliases."""
+
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise ValueError("benchmark implementation source is unavailable") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise ValueError("benchmark implementation source is not regular")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("benchmark implementation source cannot be opened") from error
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        stable = (
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != identity
+            or (
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            != stable
+        ):
+            raise ValueError("benchmark implementation source identity changed")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        terminal = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(terminal.st_mode)
+            or terminal.st_nlink != 1
+            or (terminal.st_dev, terminal.st_ino) != identity
+            or (
+                terminal.st_size,
+                terminal.st_mtime_ns,
+                terminal.st_ctime_ns,
+            )
+            != stable
+        ):
+            raise ValueError("benchmark implementation source changed while read")
+    finally:
+        os.close(descriptor)
+    try:
+        after = os.lstat(path)
+    except OSError as error:
+        raise ValueError("benchmark implementation source path changed") from error
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or (after.st_dev, after.st_ino) != identity
+        or (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != stable
+    ):
+        raise ValueError("benchmark implementation source path changed")
+    return digest.hexdigest()
+
+
+def benchmark_implementation_fingerprint(
+    repository_root: Path | None = None,
+) -> str:
+    """Digest one stable two-pass snapshot of the Gate D implementation.
+
+    Each source is already read no-follow with an identity/metadata barrier.
+    The second full inventory pass additionally detects a change to an
+    earlier source while a later source was being read.  A mixed closure is
+    never returned as a valid implementation fingerprint.
+    """
+
+    if repository_root is None:
+        root = Path(__file__).resolve().parent
+    else:
+        if type(repository_root) is not _NATIVE_PATH_TYPE:
+            raise TypeError("repository root must be an exact native Path")
+        try:
+            root = repository_root.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("repository root is unavailable") from error
+    try:
+        root_stat = os.lstat(root)
+    except OSError as error:
+        raise ValueError("repository root is unavailable") from error
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("repository root must be a direct directory")
+    def capture() -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (relative, _stable_benchmark_source_digest(root / relative))
+            for relative in BENCHMARK_IMPLEMENTATION_SOURCE_PATHS
+        )
+
+    source_files = capture()
+    if capture() != source_files:
+        raise ValueError("benchmark implementation changed during snapshot")
+    return hashlib.sha256(
+        (
+            BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION
+            + "\0"
+            + _canonical_json(
+                {
+                    "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
+                    "source_files": [list(item) for item in source_files],
+                }
+            )
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def benchmark_digest(
@@ -1381,6 +1546,8 @@ def recompute_benchmark_inputs(
 
 
 __all__ = [
+    "BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION",
+    "BENCHMARK_IMPLEMENTATION_SOURCE_PATHS",
     "TM_BENCHMARK_CANDIDATE_RECALL_GATE",
     "TM_BENCHMARK_COMPOSITION_VERSION",
     "TM_BENCHMARK_CORPUS_RECORD_COUNT",
@@ -1408,6 +1575,7 @@ __all__ = [
     "BenchmarkQuery",
     "BenchmarkRecord",
     "benchmark_digest",
+    "benchmark_implementation_fingerprint",
     "compute_benchmark_contract",
     "compute_benchmark_input_plan",
     "iter_corpus_records",

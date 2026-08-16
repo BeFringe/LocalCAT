@@ -55,6 +55,7 @@ FEATURE5_CORE_GUARD_PATHS = (
     "tm_benchmark_process.py",
     "tm_benchmark_query_process.py",
     "tm_candidate_index.py",
+    "tm_content_attestation.py",
     "tm_contracts.py",
     "tm_engine.py",
     "tm_gate_a.py",
@@ -278,6 +279,27 @@ TASK_9_3_ROWS: tuple[AcceptanceMatrixRow, ...] = (
             "test_fuzzy_unavailable_requires_empty_recall_and_safe_code",
         ),
         "A closed recall path reports no candidates or stages and carries one stable unavailable code.",
+    ),
+    _row(
+        "9.3.CANDIDATE.03",
+        AcceptanceDomain.CANDIDATE,
+        "Proof-query-v3 closes scorer, ranking, and unscored domains without caller authority",
+        "tm_candidate_index.py:proof-query-v3 state machine",
+        (
+            "tests.test_tm_candidate_proof_query.CandidateProofQueryTests."
+            "test_dense_bounds_order_true_score_u4_u3_u2_u1",
+            "tests.test_tm_candidate_proof_query.CandidateProofQueryTests."
+            "test_projected_2049th_invocation_batch_is_rejected_atomically",
+            "tests.test_tm_candidate_proof_query.CandidateProofQueryTests."
+            "test_production_conditional_closes_same_3000_identity_top10",
+            "tests.test_tm_candidate_proof_query.CandidateProofQueryTests."
+            "test_raw_exact_high_ids_do_not_enter_dense_k0_or_ranked_kth",
+            "tests.test_tm_contracts.CandidateProofV3ContractTests."
+            "test_v3_conditional_completion_round_trips_without_global_codec_bump",
+            "tests.test_tm_contracts.CandidateProofV3ContractTests."
+            "test_v2_is_strict_historical_decode_only",
+        ),
+        "Only Retrieval-derived raw-distinct identities rank; exact-fold calls stay budgeted, U1/U2/U3/U4 frontiers remain conservative, and historical v2 evidence cannot authorize production.",
     ),
     _row(
         "9.3.SERVICE.01",

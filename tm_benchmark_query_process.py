@@ -67,7 +67,11 @@ import sys
 import time
 from unittest.mock import patch
 
-from tm_benchmark import benchmark_digest, iter_fuzzy_queries
+from tm_benchmark import (
+    benchmark_digest,
+    benchmark_implementation_fingerprint,
+    iter_fuzzy_queries,
+)
 from tm_benchmark_latency import (
     DEFAULT_TIMING_CLOCK_NAME,
     LatencyEvidence,
@@ -94,8 +98,10 @@ from tm_benchmark_process import (
 )
 from tm_contracts import (
     BENCHMARK_RSS_SCOPE,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
+    CandidateProofMetadata,
     CanonicalResourceIdentity,
     TMQuery,
     benchmark_contract_digest,
@@ -104,10 +110,10 @@ from tm_contracts import (
 from tm_retrieval import prove_and_score_fuzzy_candidates
 from tm_sqlite_store import ResourceStoreCoordinator, SQLiteTMStore
 
-QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-query-process-evidence-v1"
+QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-query-process-evidence-v2"
 QUERY_PROBE_SCHEMA_VERSION = "tm-benchmark-query-probe-v1"
-QUERY_WORKER_PROTOCOL_VERSION = "tm-benchmark-query-worker-v1"
-QUERY_EVIDENCE_DIGEST_VERSION = "tm-benchmark-query-digest-v1"
+QUERY_WORKER_PROTOCOL_VERSION = "tm-benchmark-query-worker-v2"
+QUERY_EVIDENCE_DIGEST_VERSION = "tm-benchmark-query-digest-v2"
 QUERY_PROBE_DIGEST_VERSION = "tm-benchmark-query-probe-digest-v1"
 QUERY_ARTIFACT_KEY_VERSION = "tm-benchmark-query-artifact-key-v1"
 QUERY_PROCESS_PAIR_VERSION = "tm-benchmark-query-process-pair-v1"
@@ -151,6 +157,16 @@ def _require_absolute_path_string(value: object, field_name: str) -> str:
     if not path.is_absolute():
         raise ValueError(f"{field_name} must be an absolute path")
     return text
+
+
+def _resolved_absolute_path_string(value: object, field_name: str) -> str:
+    """Canonicalize an already-absolute benchmark path before binding it."""
+
+    text = _require_absolute_path_string(value, field_name)
+    try:
+        return str(Path(text).resolve())
+    except OSError as error:
+        raise ValueError(f"{field_name} cannot be resolved") from error
 
 
 def _canonical_json(value: Mapping[str, object]) -> str:
@@ -694,7 +710,7 @@ def query_worker_protocol_digest(
         ),
         "execution_path": execution_path.value,
         "fixture_digest": _require_digest(fixture_digest, "fixture digest"),
-        "fixture_path": _require_absolute_path_string(
+        "fixture_path": _resolved_absolute_path_string(
             fixture_path,
             "fixture path",
         ),
@@ -723,7 +739,7 @@ def query_worker_protocol_digest(
             minimum=1,
         ),
         "resource_id": _require_identity(resource_id, "resource id"),
-        "run_root": _require_absolute_path_string(run_root, "run root"),
+        "run_root": _resolved_absolute_path_string(run_root, "run root"),
     }
     return benchmark_digest(
         QUERY_WORKER_PROTOCOL_VERSION,
@@ -817,6 +833,14 @@ def _validate_worker_request(
         process_evidence = evidence_from_payload(process_evidence_value)
     except (TypeError, ValueError) as error:
         raise _WorkerError("QUERY.PROCESS_EVIDENCE_INVALID") from error
+    if process_evidence.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise _WorkerError("QUERY.PROOF_VERSION_MISMATCH")
+    try:
+        current_fingerprint = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise _WorkerError("QUERY.IMPLEMENTATION_INVALID") from error
+    if process_evidence.implementation_fingerprint != current_fingerprint:
+        raise _WorkerError("QUERY.IMPLEMENTATION_MISMATCH")
     process_evidence_digest_value = _require_digest(
         fields["process_evidence_digest"],
         "process evidence digest",
@@ -828,8 +852,8 @@ def _validate_worker_request(
     if mode == "evidence" and process_evidence.test_mode:
         raise _WorkerError("QUERY.TEST_MODE_MISMATCH")
 
-    run_root = _require_absolute_path_string(fields["run_root"], "run root")
-    fixture_path = _require_absolute_path_string(
+    run_root = _resolved_absolute_path_string(fields["run_root"], "run root")
+    fixture_path = _resolved_absolute_path_string(
         fields["fixture_path"],
         "fixture path",
     )
@@ -879,8 +903,22 @@ def _validate_worker_request(
             artifact_baseline_digest,
             artifact_snapshot_digest(process_evidence.artifact_snapshot),
         ),
-        ("run root", run_root, process_evidence.run_root),
-        ("fixture path", fixture_path, process_evidence.fixture_path),
+        (
+            "run root",
+            run_root,
+            _resolved_absolute_path_string(
+                process_evidence.run_root,
+                "process evidence run root",
+            ),
+        ),
+        (
+            "fixture path",
+            fixture_path,
+            _resolved_absolute_path_string(
+                process_evidence.fixture_path,
+                "process evidence fixture path",
+            ),
+        ),
         ("resource id", resource_id, process_evidence.resource_id),
         (
             "canonical store id",
@@ -992,6 +1030,11 @@ def _request_payload(
     run_root: str,
     fixture_path: str,
 ) -> dict[str, object]:
+    run_root = _resolved_absolute_path_string(run_root, "run root")
+    fixture_path = _resolved_absolute_path_string(
+        fixture_path,
+        "fixture path",
+    )
     artifact_baseline_digest = artifact_snapshot_digest(
         process_evidence.artifact_snapshot
     )
@@ -1533,12 +1576,14 @@ def _query_process_evidence_digest_payload(
         "fixture_digest": evidence.fixture_digest,
         "fixture_record_count": evidence.fixture_record_count,
         "generation": evidence.generation,
+        "implementation_fingerprint": evidence.implementation_fingerprint,
         "latency_evidence_digest": evidence.latency_evidence_digest,
         "path_config_digest": evidence.path_config_digest,
         "process_evidence_digest": evidence.process_evidence_digest,
         "process_pair_digest": evidence.process_pair_digest,
         "process_test_mode": evidence.process_test_mode,
         "processes_distinct": evidence.processes_distinct,
+        "proof_query_version": evidence.proof_query_version,
         "query_protocol_digest": evidence.query_protocol_digest,
         "query_peak_rss_bytes": evidence.query_peak_rss_bytes,
         "query_rss_scope": evidence.query_rss_scope,
@@ -1569,6 +1614,8 @@ class QueryProcessEvidence:
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     artifact_key: str
     contract_digest: str
     corpus_digest: str
@@ -1609,6 +1656,15 @@ class QueryProcessEvidence:
                 "schema version must be "
                 f"{QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION}"
             )
+        if self.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+            raise ValueError(
+                "proof query version must be "
+                f"{CANDIDATE_PROOF_QUERY_VERSION}"
+            )
+        _require_digest(
+            self.implementation_fingerprint,
+            "implementation fingerprint",
+        )
         _require_digest(self.artifact_key, "artifact key")
         _require_digest(self.contract_digest, "contract digest")
         _require_digest(self.corpus_digest, "corpus digest")
@@ -1812,6 +1868,7 @@ _QUERY_EVIDENCE_PAYLOAD_FIELDS = frozenset(
         "fixture_digest",
         "fixture_record_count",
         "generation",
+        "implementation_fingerprint",
         "latency_evidence",
         "latency_evidence_digest",
         "path_config_digest",
@@ -1819,6 +1876,7 @@ _QUERY_EVIDENCE_PAYLOAD_FIELDS = frozenset(
         "process_pair_digest",
         "process_test_mode",
         "processes_distinct",
+        "proof_query_version",
         "query_peak_rss_bytes",
         "query_protocol_digest",
         "query_rss_scope",
@@ -1878,6 +1936,14 @@ def query_process_evidence_from_payload(
         raise ValueError("latency evidence payload is invalid") from error
     evidence = QueryProcessEvidence(
         schema_version=_as_str(fields["schema_version"], "schema version"),
+        proof_query_version=_as_str(
+            fields["proof_query_version"],
+            "proof query version",
+        ),
+        implementation_fingerprint=_as_digest(
+            fields["implementation_fingerprint"],
+            "implementation fingerprint",
+        ),
         artifact_key=_as_digest(fields["artifact_key"], "artifact key"),
         contract_digest=_as_digest(fields["contract_digest"], "contract digest"),
         corpus_digest=_as_digest(fields["corpus_digest"], "corpus digest"),
@@ -2110,6 +2176,14 @@ class _RealStoreExecutor:
         self._resource_id = resource_id
         self._actual_path = actual_path
         self._actual_index_kind = actual_index_kind
+        self._proof_query_version: str | None = None
+
+    @property
+    def proof_query_version(self) -> str:
+        """Return the exact proof version observed on a real fuzzy call."""
+        if self._proof_query_version is None:
+            raise _WorkerError("QUERY.PROOF_NOT_OBSERVED")
+        return self._proof_query_version
 
     def exact_lookup(
         self,
@@ -2165,11 +2239,19 @@ class _RealStoreExecutor:
             raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
         if not metadata.fuzzy_available or metadata.proof is None:
             raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
-        if not (
-            metadata.proof.threshold_closed
-            and metadata.proof.top_k_closed
+        if (
+            type(metadata.proof) is not CandidateProofMetadata
+            or not metadata.proof.result_complete
         ):
             raise _WorkerError("QUERY.CANDIDATE_PROOF_OPEN")
+        if metadata.proof.proof_version != CANDIDATE_PROOF_QUERY_VERSION:
+            raise _WorkerError("QUERY.PROOF_VERSION_MISMATCH")
+        if (
+            self._proof_query_version is not None
+            and self._proof_query_version != metadata.proof.proof_version
+        ):
+            raise _WorkerError("QUERY.PROOF_VERSION_DRIFT")
+        self._proof_query_version = metadata.proof.proof_version
         # The production proof/scoring chain owns threshold filtering and stable
         # per-resource ordering but intentionally leaves the cross-resource
         # limit to the production service.  This benchmark has exactly one
@@ -2359,11 +2441,13 @@ def _run_probe(
                 raise _WorkerError("QUERY.INDEX_KIND_MISMATCH")
             if not metadata.fuzzy_available or metadata.proof is None:
                 raise _WorkerError("QUERY.FUZZY_UNAVAILABLE")
-            if not (
-                metadata.proof.threshold_closed
-                and metadata.proof.top_k_closed
+            if (
+                type(metadata.proof) is not CandidateProofMetadata
+                or not metadata.proof.result_complete
             ):
                 raise _WorkerError("QUERY.CANDIDATE_PROOF_OPEN")
+            if metadata.proof.proof_version != CANDIDATE_PROOF_QUERY_VERSION:
+                raise _WorkerError("QUERY.PROOF_VERSION_MISMATCH")
             fuzzy_result_count += len(result.accepted)
     except _WorkerError:
         raise
@@ -2527,8 +2611,19 @@ def _run_evidence(
         fts5_enabled=fts5_enabled,
         rss_scope=contract.rss_scope,
     )
+    try:
+        implementation_fingerprint = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise _WorkerError("QUERY.IMPLEMENTATION_INVALID") from error
+    if (
+        implementation_fingerprint
+        != request.process_evidence.implementation_fingerprint
+    ):
+        raise _WorkerError("QUERY.IMPLEMENTATION_CHANGED")
     evidence = QueryProcessEvidence(
         schema_version=QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=executor.proof_query_version,
+        implementation_fingerprint=implementation_fingerprint,
         artifact_key=_artifact_key(
             contract_digest=request.contract_digest,
             corpus_digest=request.corpus_digest,
@@ -2671,9 +2766,21 @@ class QueryProcessRunResult:
             raise TypeError("query evidence must be QueryProcessEvidence")
         if not self.evidence.final_evidence:
             raise ValueError("paired query evidence must be final evidence")
-        if self.run_root != self.process_evidence.run_root:
+        if _resolved_absolute_path_string(
+            self.run_root,
+            "paired run root",
+        ) != _resolved_absolute_path_string(
+            self.process_evidence.run_root,
+            "process evidence run root",
+        ):
             raise ValueError("run root must match process evidence")
-        if self.fixture_path != self.process_evidence.fixture_path:
+        if _resolved_absolute_path_string(
+            self.fixture_path,
+            "paired fixture path",
+        ) != _resolved_absolute_path_string(
+            self.process_evidence.fixture_path,
+            "process evidence fixture path",
+        ):
             raise ValueError("fixture path must match process evidence")
         _require_digest(self.request_protocol_digest, "request protocol digest")
         if self.artifact_pre != self.evidence.artifact_pre:
@@ -2937,6 +3044,18 @@ def _adjudicate_evidence_against_process_evidence(
         raise QueryProcessError("QUERY.CHILD_PID_NOT_DISTINCT")
     if evidence.process_evidence_digest != process_evidence.evidence_digest:
         raise QueryProcessError("QUERY.FACT_DRIFT")
+    if (
+        evidence.proof_query_version != process_evidence.proof_query_version
+        or evidence.implementation_fingerprint
+        != process_evidence.implementation_fingerprint
+    ):
+        raise QueryProcessError("QUERY.IMPLEMENTATION_MISMATCH")
+    try:
+        current_fingerprint = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise QueryProcessError("QUERY.IMPLEMENTATION_INVALID") from error
+    if evidence.implementation_fingerprint != current_fingerprint:
+        raise QueryProcessError("QUERY.IMPLEMENTATION_CHANGED")
     if evidence.query_protocol_digest != request_protocol_digest:
         raise QueryProcessError("QUERY.FACT_DRIFT")
     if not evidence.processes_distinct:

@@ -13,6 +13,7 @@ from text_matcher import (
     TEXT_MATCHER_SEMANTICS_VERSION,
     UNICODE_VERSION,
     FoldProjection,
+    fold_text_value_v1,
     fold_text_v1,
     is_pure_cjk_v1,
     is_word_boundary_v1,
@@ -73,6 +74,18 @@ class TextMatcherUnicodeDataTests(unittest.TestCase):
                             raw_vector["source_spans"],
                         )
                     ),
+                )
+
+    def test_fold_v1_value_matches_authoritative_projection(self) -> None:
+        for raw_vector in cast(
+            list[dict[str, object]],
+            _FIXTURE["fold_vectors"],
+        ):
+            with self.subTest(vector=raw_vector["id"]):
+                raw = cast(str, raw_vector["raw"])
+                self.assertEqual(
+                    fold_text_value_v1(raw),
+                    fold_text_v1(raw).folded_text,
                 )
 
     def test_folded_ranges_project_to_minimal_original_spans(self) -> None:
@@ -195,6 +208,11 @@ class TextMatcherUnicodeDataTests(unittest.TestCase):
                 RuntimeError,
                 "^Unicode runtime mismatch: expected 16.0.0, got 15.1.0$",
             ):
+                fold_text_value_v1("Office")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^Unicode runtime mismatch: expected 16.0.0, got 15.1.0$",
+            ):
                 word_boundaries_v1("Office")
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -205,6 +223,8 @@ class TextMatcherUnicodeDataTests(unittest.TestCase):
     def test_invalid_inputs_and_indices_fail_closed(self) -> None:
         with self.assertRaisesRegex(TypeError, "^text must be a string$"):
             fold_text_v1(cast(Any, None))
+        with self.assertRaisesRegex(TypeError, "^text must be a string$"):
+            fold_text_value_v1(cast(Any, None))
         with self.assertRaisesRegex(TypeError, "^text must be a string$"):
             word_boundaries_v1(cast(Any, 1))
         with self.assertRaisesRegex(TypeError, "^query must be a string$"):

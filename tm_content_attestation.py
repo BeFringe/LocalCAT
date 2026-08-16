@@ -18,7 +18,8 @@ import stat
 from typing import Mapping, TypedDict
 
 
-CONTENT_ATTESTATION_VERSION = "tm-content-attestation-v1"
+CONTENT_ATTESTATION_VERSION = "tm-content-attestation-v2"
+LOGICAL_CLOSURE_VERSION = "tm-logical-closure-v2"
 SEALED_CONTENT_PHASE = "SEALED"
 ACTIVE_CONTENT_PHASE = "ACTIVE"
 
@@ -163,6 +164,7 @@ class ContentSemanticFacts:
     receipt_boundary_fts_count: int
     gram_counts: tuple[tuple[int, int], ...]
     exact_parity_digest: str
+    logical_closure_version: str
     logical_closure_digest: str
 
     def __post_init__(self) -> None:
@@ -233,6 +235,8 @@ class ContentSemanticFacts:
         if sizes != sorted(set(sizes)):
             raise ValueError("gram_counts must have unique ordered sizes")
         _require_digest(self.exact_parity_digest, "exact_parity_digest")
+        if self.logical_closure_version != LOGICAL_CLOSURE_VERSION:
+            raise ValueError("unsupported logical closure version")
         _require_digest(self.logical_closure_digest, "logical_closure_digest")
 
 
@@ -251,6 +255,7 @@ _SEMANTIC_FIELDS = frozenset(
         "index_version",
         "journal_mode",
         "logical_closure_digest",
+        "logical_closure_version",
         "origin_batch_count",
         "origin_batch_id",
         "origin_batch_kind",
@@ -286,6 +291,7 @@ def _semantic_facts_to_mapping(
         "index_version": facts.index_version,
         "journal_mode": facts.journal_mode,
         "logical_closure_digest": facts.logical_closure_digest,
+        "logical_closure_version": facts.logical_closure_version,
         "origin_batch_count": facts.origin_batch_count,
         "origin_batch_id": facts.origin_batch_id,
         "origin_batch_kind": facts.origin_batch_kind,
@@ -374,6 +380,10 @@ def _semantic_facts_from_mapping(mapping: object) -> ContentSemanticFacts:
         gram_counts=tuple(gram_counts),
         exact_parity_digest=_require_digest(
             values["exact_parity_digest"], "exact_parity_digest"
+        ),
+        logical_closure_version=_require_string(
+            values["logical_closure_version"],
+            "logical_closure_version",
         ),
         logical_closure_digest=_require_digest(
             values["logical_closure_digest"], "logical_closure_digest"
@@ -971,6 +981,7 @@ def _revalidate_content_file(
 __all__ = [
     "ACTIVE_CONTENT_PHASE",
     "CONTENT_ATTESTATION_VERSION",
+    "LOGICAL_CLOSURE_VERSION",
     "SEALED_CONTENT_PHASE",
     "ActiveContentAttestation",
     "ContentAttestationError",

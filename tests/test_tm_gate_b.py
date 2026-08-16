@@ -37,7 +37,7 @@ from tm_gate_b import (
 from tm_migration import TMMigrationService
 from tm_sqlite_store import unique_character_ngrams
 from tm_stage_sealer import (
-    SealedArtifactRegistry,
+    _SealedArtifactRegistry as SealedArtifactRegistry,
     StageSealer,
 )
 
@@ -119,7 +119,7 @@ def _evaluate(
     *,
     fts5_available: bool,
 ) -> GateBPhysicalReadinessReport:
-    evaluator = GateBEvaluator(registry=registry)
+    evaluator = GateBEvaluator(registry=registry._readiness_view())
     with patch(
         "tm_sqlite_store._probe_fts5",
         return_value=fts5_available,
@@ -1457,8 +1457,11 @@ class GateBBoundaryTests(unittest.TestCase):
     ) -> None:
         with self.assertRaises(TypeError):
             GateBEvaluator(
-                registry=_RegistrySubclass(
-                    registry_namespace="coordinator.primary"
+                registry=cast(
+                    Any,
+                    _RegistrySubclass(
+                        registry_namespace="coordinator.primary"
+                    ),
                 )
             )
 
@@ -1470,7 +1473,9 @@ class GateBBoundaryTests(unittest.TestCase):
                 Path(temporary),
                 fts5_available=True,
             )
-            evaluator = GateBEvaluator(registry=registry)
+            evaluator = GateBEvaluator(
+                registry=registry._readiness_view()
+            )
             for invalid in (
                 stage.staged_db_path,
                 stage,

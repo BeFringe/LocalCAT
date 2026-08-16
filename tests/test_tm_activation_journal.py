@@ -56,7 +56,10 @@ from tm_sqlite_store import (
     _serialize_activation_journal_record,
     initialize_stage_schema,
 )
-from tm_stage_sealer import SealedArtifactRegistry, StageSealer
+from tm_stage_sealer import (
+    _SealedArtifactRegistry as SealedArtifactRegistry,
+    StageSealer,
+)
 
 
 SOURCE_BYTES = (
@@ -83,7 +86,7 @@ def _identity(
 def _registry(
     coordinator: ResourceStoreCoordinator,
 ) -> SealedArtifactRegistry:
-    return cast(SealedArtifactRegistry, coordinator.sealed_registry)
+    return cast(SealedArtifactRegistry, coordinator._sealed_registry)
 
 
 def _candidate(
@@ -103,11 +106,9 @@ def _candidate(
         stage = build.mutable_stage
         if stage is None:
             raise AssertionError("expected a fresh mutable stage")
-        sealed = StageSealer(
-            registry=coordinator.sealed_registry,
-            canonical_store_id=canonical_store_id,
-        ).seal(
+        sealed = coordinator._seal_stage(
             stage,
+            canonical_store_id=canonical_store_id,
             expected_prior_generation=expected_prior_generation,
         )
     return stage, sealed

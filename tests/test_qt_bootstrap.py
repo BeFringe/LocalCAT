@@ -12,6 +12,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import qt_editor
@@ -104,6 +105,7 @@ class QtBootstrapTest(unittest.TestCase):
     def test_installs_linux_desktop_launcher_without_loading_qt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
+                patch("qt_editor.sys.platform", "linux"),
                 patch(
                     "qt_editor._install_linux_icon_resource",
                     return_value="localcat",
@@ -174,7 +176,12 @@ class QtBootstrapTest(unittest.TestCase):
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
-        app = QApplication.instance() or QApplication(["localcat-icon-test"])
+        existing_app = QApplication.instance()
+        app = (
+            QApplication(["localcat-icon-test"])
+            if existing_app is None
+            else cast(QApplication, existing_app)
+        )
         app.setWindowIcon(QIcon())
         captured: dict[str, QIcon] = {}
 
@@ -191,12 +198,17 @@ class QtBootstrapTest(unittest.TestCase):
             def show(self) -> None:
                 super().show()
                 dialog = QDialog(self)
-                captured["application"] = QApplication.instance().windowIcon()
+                current_app = QApplication.instance()
+                assert current_app is not None
+                captured["application"] = cast(
+                    QApplication,
+                    current_app,
+                ).windowIcon()
                 captured["window"] = self.windowIcon()
                 captured["dialog"] = dialog.windowIcon()
 
         fake_window_module = types.ModuleType("qt_editor_window")
-        fake_window_module.QtEditorWindow = CapturingWindow
+        setattr(fake_window_module, "QtEditorWindow", CapturingWindow)
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(
                 sys.modules,

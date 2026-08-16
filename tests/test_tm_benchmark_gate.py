@@ -59,6 +59,7 @@ from tm_benchmark_query_process import (
 )
 from tm_benchmark_gate import (
     BENCHMARK_BUNDLE_SCHEMA_VERSION,
+    BENCHMARK_IMPLEMENTATION_SOURCE_PATHS,
     BenchmarkEvidenceBundle,
     BenchmarkGateDError,
     BenchmarkGateDRunResult,
@@ -72,6 +73,7 @@ from tm_benchmark_gate import (
     benchmark_evidence_bundle_from_payload,
     benchmark_evidence_bundle_to_json,
     benchmark_evidence_bundle_to_payload,
+    benchmark_implementation_fingerprint,
     combine_benchmark_evidence,
     publish_retrieval_capability_gate_d,
     retrieval_benchmark_evidence_by_path,
@@ -81,6 +83,7 @@ from tm_benchmark_gate import (
 from tm_contracts import (
     BENCHMARK_PERCENTILE_METHOD,
     BENCHMARK_SUITE_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkExecutionPath,
     benchmark_contract_digest,
     benchmark_environment_digest,
@@ -104,6 +107,7 @@ from tm_retrieval_capability import (
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CONTRACT = load_benchmark_contract(_ROOT / "benchmark_tm_contract.json")
+_IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
 
 _FTS5 = BenchmarkExecutionPath.FTS5_TRIGRAM
 _FALLBACK = BenchmarkExecutionPath.GRAM_FALLBACK
@@ -519,6 +523,8 @@ def _process_evidence(
     snapshot = _process_artifact_snapshot()
     return TMBenchmarkProcessEvidence(
         schema_version=PROCESS_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         test_mode=False,
         contract=_CONTRACT,
         contract_digest=contract_digest,
@@ -555,6 +561,8 @@ def _process_evidence(
             resource_id="tm.benchmark",
             canonical_store_id="store.benchmark",
             test_mode=False,
+            proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+            implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         ),
         artifact_snapshot=snapshot,
         child_pid=child_pid,
@@ -595,6 +603,8 @@ def _query_evidence(
     snapshot = _query_artifact_snapshot()
     evidence = QueryProcessEvidence(
         schema_version=QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         artifact_key=_digest("c"),
         contract_digest=process_evidence.contract_digest,
         corpus_digest=_CONTRACT.corpus_digest,
@@ -703,6 +713,8 @@ def _oracle_evidence(
     environment = _oracle_environment(path)
     return OracleRecallEvidence(
         schema_version=ORACLE_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         test_mode=False,
         contract=_CONTRACT,
         contract_digest=benchmark_contract_digest(_CONTRACT),
@@ -846,6 +858,29 @@ class CombineBenchmarkEvidenceTests(unittest.TestCase):
             benchmark_evidence_bundle_digest(bundle),
             bundle.bundle_digest,
         )
+
+    def test_combine_accepts_resolved_equivalent_local_paths(self) -> None:
+        fts5_run, fts5_oracle = _fts5_fixture(missing_top10_queries=0)
+        fallback_run, fallback_oracle = _fallback_fixture(
+            missing_top10_queries=0
+        )
+        resolved_fts5_run = QueryProcessRunResult(
+            process_evidence=fts5_run.process_evidence,
+            evidence=fts5_run.evidence,
+            query_child_pid=fts5_run.query_child_pid,
+            run_root=str(Path(fts5_run.run_root).resolve()),
+            fixture_path=str(Path(fts5_run.fixture_path).resolve()),
+            artifact_pre=fts5_run.artifact_pre,
+            artifact_post=fts5_run.artifact_post,
+            request_protocol_digest=fts5_run.request_protocol_digest,
+        )
+        bundle = combine_benchmark_evidence(
+            resolved_fts5_run,
+            fallback_run,
+            fts5_oracle,
+            fallback_oracle,
+        )
+        self.assertTrue(bundle.fts5.report.passed)
 
     def test_combine_mirrors_real_truth_both_paths_fail_candidate_recall(
         self,
@@ -1013,6 +1048,51 @@ class CombineBenchmarkEvidenceTests(unittest.TestCase):
 
 
 class BundleCodecTests(unittest.TestCase):
+    def test_bundle_binds_current_proof_and_implementation_without_paths(
+        self,
+    ) -> None:
+        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        self.assertEqual(
+            bundle.proof_query_version,
+            CANDIDATE_PROOF_QUERY_VERSION,
+        )
+        self.assertEqual(
+            bundle.implementation_fingerprint,
+            benchmark_implementation_fingerprint(_ROOT),
+        )
+        payload = benchmark_evidence_bundle_to_payload(bundle)
+        self.assertEqual(
+            payload["implementation_fingerprint"],
+            bundle.implementation_fingerprint,
+        )
+        encoded = benchmark_evidence_bundle_to_json(bundle)
+        for relative in BENCHMARK_IMPLEMENTATION_SOURCE_PATHS:
+            self.assertNotIn(relative, encoded)
+
+    def test_historical_bundle_or_proof_version_is_not_current(self) -> None:
+        payload = benchmark_evidence_bundle_to_payload(_combined_bundle())
+        payload["schema_version"] = "tm-benchmark-bundle-v1"
+        with self.assertRaisesRegex(ValueError, "schema version"):
+            benchmark_evidence_bundle_from_payload(payload)
+        payload = benchmark_evidence_bundle_to_payload(_combined_bundle())
+        payload["proof_query_version"] = "proof-query-v2"
+        with self.assertRaisesRegex(ValueError, "proof query version"):
+            benchmark_evidence_bundle_from_payload(payload)
+
+    def test_top_level_cannot_rewrap_nested_source_binding_drift(self) -> None:
+        for nested_name in ("process_facts", "query_facts"):
+            with self.subTest(nested_name=nested_name):
+                payload = benchmark_evidence_bundle_to_payload(
+                    _combined_bundle(fts5_missing=0, fallback_missing=0)
+                )
+                nested = _nested(payload, "fts5", nested_name)
+                nested["implementation_fingerprint"] = _digest("0")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "implementation fingerprint",
+                ):
+                    benchmark_evidence_bundle_from_payload(payload)
+
     def test_payload_and_json_strict_round_trip(self) -> None:
         bundle = _combined_bundle()
         payload = benchmark_evidence_bundle_to_payload(bundle)
@@ -1279,6 +1359,34 @@ class GateDEvidenceTests(unittest.TestCase):
 
 
 class GateDRunnerTests(unittest.TestCase):
+    def test_runner_rejects_implementation_change_before_publication(
+        self,
+    ) -> None:
+        temp, work_root, evidence_path = self._fresh_run_env()
+        ports, _ = _runner_ports()
+        before = _digest("a")
+        after = _digest("b")
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_implementation_fingerprint",
+            side_effect=(before, before, after),
+        ):
+            with self.assertRaises(BenchmarkGateDError) as ctx:
+                _run_benchmark_gate_d_test(
+                    _ROOT / "benchmark_tm_contract.json",
+                    work_root,
+                    evidence_path,
+                    ports=ports,
+                    test_record_count=_TEST_RECORD_COUNT,
+                    test_seed=0,
+                )
+        self.assertEqual(
+            ctx.exception.error_code,
+            "GATE_D.IMPLEMENTATION_CHANGED",
+        )
+        self.assertFalse(evidence_path.exists())
+        self._assert_clean_work_root(work_root)
+
     """Owner-driven runner: fixed pipeline, durable readback, fail-closed."""
 
     def _fresh_run_env(
@@ -1429,7 +1537,7 @@ class GateDRunnerTests(unittest.TestCase):
         all_roots = migration_roots + oracle_roots
         self.assertEqual(len({root.resolve() for root in all_roots}), 4)
         for root in all_roots:
-            self.assertIn(work_root, root.resolve().parents)
+            self.assertIn(work_root.resolve(), root.resolve().parents)
         self.assertNotEqual(migration_roots[0], migration_roots[1])
         self.assertNotEqual(oracle_roots[0], oracle_roots[1])
         self.assertTrue(evidence_path.is_file())
@@ -1499,6 +1607,7 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertEqual(
             set(result.__dataclass_fields__),
             {
+                "_receipt",
                 "bundle",
                 "bundle_digest",
                 "artifact_size",
@@ -1613,7 +1722,7 @@ class GateDRunnerTests(unittest.TestCase):
                 self._run(work_root, evidence_path)
         self.assertEqual(
             ctx.exception.error_code,
-            "GATE_D.EVIDENCE_PUBLISH_FAILED",
+            "GATE_D.CLEANUP_PENDING",
         )
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
@@ -1633,6 +1742,33 @@ class GateDRunnerTests(unittest.TestCase):
         )
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
+
+    def test_published_final_cleanup_failure_is_explicit(self) -> None:
+        bundle = _combined_bundle()
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_path = Path(temporary) / "evidence.json"
+            original_unlink = os.unlink
+
+            def fail_final_unlink(path: object, *args: object, **kwargs: object) -> None:
+                if Path(cast(Any, path)) == evidence_path:
+                    raise OSError("final unlink failed")
+                original_unlink(cast(Any, path), *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    tm_benchmark_gate,
+                    "benchmark_implementation_fingerprint",
+                    return_value=_digest("0"),
+                ),
+                mock.patch("os.unlink", side_effect=fail_final_unlink),
+            ):
+                with self.assertRaises(BenchmarkGateDError) as ctx:
+                    tm_benchmark_gate._publish_evidence_bundle(
+                        bundle,
+                        evidence_path,
+                    )
+            self.assertEqual(ctx.exception.error_code, "GATE_D.CLEANUP_PENDING")
+            self.assertTrue(evidence_path.is_file())
 
     def test_runner_cleanup_refuses_foreign_root_replacement(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
@@ -1777,7 +1913,7 @@ class GateDPublicationTests(unittest.TestCase):
         test_mode: bool = False,
     ) -> BenchmarkGateDRunResult:
         artifact_bytes = benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
-        return BenchmarkGateDRunResult(
+        return tm_benchmark_gate._issue_benchmark_gate_d_run_result(
             bundle=bundle,
             bundle_digest=bundle.bundle_digest,
             artifact_size=len(artifact_bytes),
@@ -2001,6 +2137,56 @@ class GateDPublicationTests(unittest.TestCase):
             ctx.exception.error_code,
             "GATE_D.TEST_EVIDENCE_FORBIDDEN",
         )
+
+    def test_publication_rejects_source_drift_before_refresh(self) -> None:
+        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        publisher = _capability_publisher()
+        initial = publisher.snapshot()
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_implementation_fingerprint",
+            return_value=_digest("0"),
+        ):
+            with self.assertRaises(BenchmarkGateDError) as ctx:
+                self._publish(_base_capability_manifest(), bundle, publisher)
+        self.assertEqual(
+            ctx.exception.error_code,
+            "GATE_D.IMPLEMENTATION_CHANGED",
+        )
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_publication_rejects_drift_after_manifest_before_refresh(
+        self,
+    ) -> None:
+        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        publisher = _capability_publisher()
+        initial = publisher.snapshot()
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_implementation_fingerprint",
+            side_effect=(bundle.implementation_fingerprint, _digest("0")),
+        ):
+            with self.assertRaises(BenchmarkGateDError) as ctx:
+                self._publish(_base_capability_manifest(), bundle, publisher)
+        self.assertEqual(
+            ctx.exception.error_code,
+            "GATE_D.IMPLEMENTATION_CHANGED",
+        )
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_public_run_result_constructor_cannot_mint_final_receipt(
+        self,
+    ) -> None:
+        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        artifact = benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
+        with self.assertRaises(TypeError):
+            cast(Any, BenchmarkGateDRunResult)(
+                bundle=bundle,
+                bundle_digest=bundle.bundle_digest,
+                artifact_size=len(artifact),
+                artifact_digest=hashlib.sha256(artifact).hexdigest(),
+                test_mode=False,
+            )
 
 
 class PortabilityAndBoundaryTests(unittest.TestCase):

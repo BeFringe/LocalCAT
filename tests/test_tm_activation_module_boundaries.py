@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import py_compile
 import sys
 import unittest
 from pathlib import Path
@@ -45,7 +44,7 @@ def _dynamic_imported_modules(path: Path) -> set[str]:
 class TMActivationModuleBoundariesTest(unittest.TestCase):
     def test_recovery_module_never_imports_the_store(self) -> None:
         path = PROJECT_ROOT / "tm_activation_recovery.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         self.assertNotIn("tm_sqlite_store", modules)
         self.assertFalse(
@@ -57,7 +56,7 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
 
     def test_journal_module_never_imports_the_store(self) -> None:
         path = PROJECT_ROOT / "tm_activation_journal.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         self.assertNotIn("tm_sqlite_store", modules)
         self.assertFalse(
@@ -86,7 +85,7 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
 
     def test_recovery_module_has_no_stage_sealer_reference(self) -> None:
         path = PROJECT_ROOT / "tm_activation_recovery.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         source = path.read_text(encoding="utf-8")
         self.assertNotIn("tm_stage_sealer", source)
         self.assertNotIn("StageSealError", source)

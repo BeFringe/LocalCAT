@@ -126,7 +126,7 @@
   - 完成时，两条路径的阶段元数据可完整对账，候选顺序不受底层 SQL 返回顺序影响，record/index 不会半提交
   - _Requirements: 4.2, 4.7, 5.3, 5.4, 7.4, 7.7, 8.7_
 
-- [ ] 5. 实现迁移、封存、原子激活与恢复
+- [x] 5. 实现迁移、封存、原子激活与恢复
 
 - [x] 5.1 实现流式 JSONL 预检和幂等迁移计划
   - 在改动资源前计算 SHA-256，并报告有效、无效、重复 source、可保留变体及逐行安全诊断
@@ -265,7 +265,7 @@
   - 完成时，controller、Excel 与现有 Core 自检保持通过，不把 Qt journey 纳入本规格实现范围
   - _Requirements: 1.6, 1.7, 1.8, 6.10_
 
-- [ ] 7. 实现确定性 exact、context 与 fuzzy 检索
+- [x] 7. 实现确定性 exact、context 与 fuzzy 检索
 
 - [x] 7.1 实现 exact winner 与 raw context 分类
   - exact 仅使用 raw source 完全相等，winner 保持同资源最后有效记录；其他同 source 变体仅在存在正面 raw context 证据时分类为 CONTEXT
@@ -309,7 +309,7 @@
   - 完成时，每项 Gate C evidence 都可从固定输入重算，能力矩阵与 opaque summary/稳定 unavailable code 一致且不泄漏 source/target 正文
   - _Requirements: 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 7.4, 7.5, 8.7_
 
-- [ ] 8. 建立 Gate D benchmark-v1
+- [x] 8. 建立 Gate D benchmark-v1
 
 - [x] 8.1 (P) 生成确定性 100k 与 oracle 语料
   - 固定种子生成 100000 条记录、至少 1000 个 exact 查询、至少 200 个 fuzzy 查询
@@ -349,36 +349,41 @@
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
   - _Boundary: TMBenchmark Gate D_
 
-- [x] 8.6 固化 scorer 完备性上界与 proof index
+- [x] 8.6 固化 scorer 完备性上界与 proof index（v16 重开）
   - 在 record/index 同事务保存 folded length、字符/bigram multiset term frequency 与固定 block 的保守 summary，并为 scorer-v1 冻结可独立验证的分数上界公式
   - 上界必须覆盖长度差、字符 multiset、bigram multiset 差异与 folded code-point exact LCS 顺序下界；query-time LCS 只收紧 Levenshtein 距离下界，不计算编辑距离/final score、不建立 scorer 等价类，任何 summary 或 ordered refinement 低估、缺行、重复、乱序或计数不守恒均 fail-closed
   - 保持 `candidate-budget-v1` 不变，不使用 oracle identity、固定类别或扩大窗口证明完备
-  - 完成时，穷举与固定 Unicode 随机向量证明 `真实分数<=U3<=U2<=U1`，40 条冻结 miss 的 U3 竞争类均低于 scorer budget；schema/append/migration/upgrade 的 index parity、ordered projection binding 与事务回滚全部闭合，不增加持久 schema/index
+  - v16 先在已提交的完整 ordered fold projection 上为全部 `R` 形成 U3；仅当当前 completion policy 经 U3-best 真实 scorer batch 后仍未闭合时，才对残余逐 identity 惰性计算 query-derived balanced partition 的 partition-additive exact LCS 下界并形成 `U4/P3`。`m>1` 时 `p=min(m-1,ceil(3m/5))`，禁止逐 code-point 全分区、Levenshtein、final score、scorer 调用或等价类授权
+  - 完成时，穷举与固定 Unicode 随机向量证明 `真实分数<=U4<=U3<=U2<=U1`；schema/append/migration/upgrade 的 index parity、ordered projection binding 与事务回滚全部闭合，不增加持久 schema/index
   - _Requirements: 4.2, 4.7, 5.2, 5.3, 8.2, 8.7_
   - _Boundary: Candidate Proof Index_
 
-- [x] 8.7 实现有界 proof/scorer 查询流水线
-  - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；同时证明 threshold 全集和无阈值真实 top-k 后才返回 fuzzy 候选
-  - 将 `proof-query-v2` 的 scorer 调用数、已计入 identity 与未计入 identity 分开守恒；仅由 Retrieval 对 health-validated record 的完整 `fold-v1` 相等建立 query-local 等价类，一类只执行一次真实 scorer-v1，identity fan-out 仍独立保留 target/provenance/tie 且不得由 hash、gram、调用方或注入 scorer 伪造
+- [x] 8.7 实现有界 proof/scorer 查询流水线（proof-query-v3）
+  - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；production 只有证明 threshold 全集闭合，或 threshold-qualified 真实 top-k 已闭合才可返回，Oracle 则要求 threshold 与无阈值真实 top-k 两项全局闭合
+  - `proof-query-v3` 分开守恒 all-accounted identity、raw-distinct FUZZY ranking identity 与 exact-fold scorer invocation class；仅由 Retrieval 对 health-validated record 的完整 `fold-v1` 相等建立 query-local scorer 复用类，一类只执行一次真实 scorer-v1，identity fan-out 仍独立保留 target/provenance/tie 且不得由 hash、gram、调用方或注入 scorer 伪造
   - 稀疏 frontier 保留 block best-first；当 block maxima 或低分 top-k 前沿退化为密集扫描时，phase 1 在一个短只读事务内用长度与精确 bigram 交集生成严格保守 `U1`，提交后先评分足以建立真实 kth 的前缀，再由 session 以 threshold/kth 双义务确定唯一精化集 `R`；phase 2 重新绑定同一 generation/head/count/query/index facts，仅为严格有序的 `R` 取得 private `record_id/source_fold_v1/length` 投影并以 exact LCS 生成 `U3`，两个事务均不得跨 scorer callback，禁止 per-block connection/count avalanche
-  - 冻结并严格校验 `真实分数<=U3<=U2<=U1`、`total=A0+P1+R`、`R=A1+P2`、accounted/unscored 与 scorer invocation 等价类守恒，以及 U1/U3 混合最终 frontier；禁止 bigram/component heuristic，拒绝精化 identity 缺失、重复、乱序、额外项、binding 伪造及 phase 前中后的 append race
+  - 完整 `R` 的 U3 pass 必须先于任何 phase-2 后 scorer；随后按 `(U3 DESC,record_id DESC)` 取不超过 32 个 identity 的真实 scorer batch。production 可在 U3 严格 threshold 排除，或真实 threshold-qualified raw-distinct kth 严格支配剩余 U3 frontier 时直接闭合；Oracle 的 P2 必须同时闭合 threshold 与 top-k，未闭合残余才逐 identity 计算 U4并继续 scorer
+  - 以 `phase=DENSE_COMPLETE` 冻结并严格校验 `真实分数<=U4<=U3<=U2<=U1`、`total=A0+P1+R`、`R=P2+S`、`S=A1+P3`、`accounted=A0+A1`、`unscored=P1+P2+P3`、`request=returned=R` 与 `P3<=u4_evaluated<=S`；P2 未计算 U4 且仅由 U3 严格排除，A1 可来自 U3 probe 或 U4 后评分，最终 frontier 精确混合 P1/U1、P2/U3、P3/U4。禁止 bigram/component heuristic，拒绝精化 identity 缺失、重复、乱序、额外项、binding 伪造及 phase 前中后的 append race
+  - `proof-query-v3` 严格分离 all-accounted identity、raw-distinct FUZZY ranking identity 与 exact-fold scorer invocation class；同 fold 的 raw-distinct peers 逐 identity 参与 `(score,record_id)` 排名，只有 scorer 调用可复用，observe 必须整批预验且超过 2048 不得部分变更
+  - production 仅在 threshold 全闭合，或至少已有 k 个 raw-distinct threshold 合格 identity 且真实 kth 严格支配全部未评分 U1/U3/U4 frontier 时闭合；Oracle 仍要求 threshold 与 top-k 两项全局闭合。Retrieval 必须从 health-validated raw snapshot 独立派生 eligibility 并复算闭合，拒绝 session/caller/injected scorer 自报
   - 单资源真实 scorer-v1 调用达到 candidate budget 仍不能闭合时，以 `CANDIDATE.PROOF_BUDGET_EXHAUSTED` 局部失败，不影响其他资源、exact、CONTEXT 或 save
-  - FTS5 与 fallback 分别执行各自 seed path 并共享同一 proof closure；禁止 candidate/caller 全量物化 record payload、重复评分或自报 completeness，只允许 store-owned、generation-bound 的 proof-only ordered folded-source 投影留在 private bound API 内
-  - 完成时，200-query oracle 两项义务均为 100%，12-query/27-identity 旧遗漏成为回归用例；100k 重复源反例以 300 个 exact fold/scorer 调用闭合 3000 个 identity，全部 40 条 frozen miss 均在 2048 次调用内闭合；query 1/61/short/q226/q240 的 production-shaped cheap gate 各至少取 20 个 warm 样本且内部 p95 约束不高于 400 ms，为冻结的 500 ms Gate D 留出裕量，阶段/proof/最终元数据逐项守恒
+  - FTS5 与 fallback 分别执行各自 seed path 并共享同一 proof closure；fallback seed 对全部 unique query grams 以确定性分配读取最多 4096 条真实 postings，仅作路径/诊断，不执行全库 record-major 聚合也不授权 completeness；禁止 candidate/caller 全量物化 record payload、重复评分或自报 completeness，只允许 store-owned、generation-bound 的 proof-only ordered folded-source 投影留在 private bound API 内
+  - 完成时，5k oracle threshold/top-10 两项义务均为 100%，12-query/27-identity 旧遗漏与 9 条 U3 budget near-edit 成为回归用例；100k 重复源反例在 `oracle_full` 以 300 个 exact fold/scorer 调用闭合 3000 个 identity，并另证 production conditional 只在真实 top-k 已闭合时安全提前结束，全部 240 条 frozen query 均在 2048 次调用内闭合；query 1/61/short/q183/q226/q240 的 production-shaped cheap gate 各至少取 20 个 warm 样本且内部 p95 约束不高于 400 ms，为冻结的 500 ms Gate D 留出裕量，阶段/proof/最终元数据逐项守恒
   - _Requirements: 4.1, 4.2, 4.4, 4.5, 4.7, 5.1, 5.2, 5.3, 8.2, 8.7_
   - _Boundary: Candidate Proof Query_
   - _Depends: 8.6_
 
 - [x] 8.8 建立 sealed/active 内容证明链并压缩迁移重复扫描
-  - fresh stage 只在新建路径执行一次完整语义校验；seal 在同一事务流式闭合 parity/index/closure 与 SEALED marker，生成绑定 SHA-256、inode、版本、计数和 closure 的 sealed attestation
+  - fresh stage 只在新建路径执行一次完整语义校验；seal 在同一事务流式闭合 parity/index、完整 candidate projection digest、closure 与 SEALED marker，commit+fsync 后在同一只读 snapshot 对最终 sealed bytes 执行唯一完整 integrity check，并重算 projection digest/closure、终端 rehash 同一 database proof，生成绑定 SHA-256、inode、版本、计数和 closure 的 sealed attestation；原子 rename 后只有 exact sealed inode+SHA 可复用该 integrity 事实，active receipt 后的全量 semantic 重算不变
+  - registry 的 reservation/commit/release 与 token lifecycle 只保留在 coordinator/StageSealer 私有 adapter，对外仅暴露 exact read-only readiness view；私有 commit 只消费 StageSealer 在 post-fsync content↔semantic epoch 闭合后铸造并绑定 exact registry+reservation 的单次 capability，拒绝 caller 分别注入 mutable stage/evidence/generation/attestation、普通 dataclass、跨 reservation 与 replay
   - 保留两次 Gate B、drain、replace、parent fsync、四阶段 journal、reopen 与 cold recovery；immutable 阶段以 no-follow pre/post identity + 完整 rehash 复证，不以缓存布尔值或 stat 元数据授权
   - active receipt/meta 合法写入后执行一次完整 active-set 校验并持久化 active attestation；后续 phase 仅在 exact bytes/inode/journal facts 相等时复用，漂移仍 rollback/fail-stop
-  - 完成时，same-inode mutation、同字节换 inode、attestation 缺失/损坏/过期、各 phase crash 与 prior-generation 保全矩阵全绿，迁移仍包含 parse/insert/index/validate/fsync/activate/reopen
+  - 完成时，authority 与 candidate projection 的 same-inode/same-row-count mutation、同字节换 inode、attestation 缺失/损坏/过期、各 phase crash 与 prior-generation 保全矩阵全绿，迁移仍包含 parse/insert/index/validate/fsync/activate/reopen
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14, 8.3, 8.7_
   - _Boundary: Migration Content Attestation_
   - _Depends: 8.6, 5.R1_
 
-- [ ] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
+- [x] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
   - 先在固定 5k oracle 重算 threshold 集与真实 top-10 完备性，再在真实 100k 上分别执行 FTS5_TRIGRAM 与 GRAM_FALLBACK 的迁移、query child 和 portable evidence bundle
   - 不改变 scorer、threshold、top-k、candidate budget、corpus/cohort/seed/digest、硬门或迁移阶段口径；失败路径不得被成功路径掩盖
   - 完成时，两条路径独立达到 recall=100%、exact p95≤50 ms、fuzzy p95≤500 ms、migration≤120 s、RSS≤512 MiB，Gate D evidence 可严格回读与重算
@@ -386,7 +391,7 @@
   - _Boundary: Gate D Remediation Evidence_
   - _Depends: 8.7, 8.8_
 
-- [ ] 9. 完成故障、边界与 86 条验收
+- [x] 9. 完成故障、边界与 86 条验收
 
 - [x] 9.1 执行迁移与激活故障矩阵
   - 覆盖损坏输入、record/index/commit/fsync 失败、并发 lease、busy timeout、token 重放及四个 journal phase 崩溃
@@ -414,13 +419,13 @@
   - 完成时，既有回归零失败且所有依赖方向守卫通过
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.7, 9.10, 9.12_
 
-- [ ] 9.5 对照全部验收标准完成发布门
+- [x] 9.5 对照全部验收标准完成发布门
   - 将 9 项需求的 86 条验收标准逐项关联到最新自动测试、故障证据、oracle 或 benchmark 报告
   - 任一证据缺失、失败、过期或版本不一致时保持对应能力未完成，不宣告 Feature GO
   - 完成时，86/86 覆盖矩阵均指向具体、可重算且版本一致的验证入口
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 9.6 执行完整发布验证
+- [x] 9.6 执行完整发布验证
   - 重新执行核心套件、迁移/导出往返、激活恢复、matcher golden、candidate oracle、fast/fallback benchmark 和兼容回归
   - 核对所有任务勾选、阻断项、设计边界与跨组件集成，失败时保持相应 gate 关闭
   - 完成时，完整测试套件退出码为零、四道门证据为最新状态且不存在未解决阻断项
@@ -490,5 +495,7 @@
 - 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
 - 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
 - 2026-08-14 / Task 8.7：生产查询在同一 generation view 内以单一 block/record 全局上界前沿打开 256-slot exact proof facts，seed 仅保留真实路径与守恒诊断，原文/scorer 批不超过 32 且单 identity 仅评分一次；threshold 全集和 `(score, record_id DESC)` top-k 双闭合，协调篡改/世代漂移/预算耗尽资源级 fail-closed。Cluster M review correction 进一步以 `source_raw → fold-v1` 作为 health/Stage/Gate B proof-index 独立语义根，拒绝 folded/length/TF/FTS/block 成套伪造，并使 frontier/kth universe、seed→BOUND_PROOF 输入与 scored/unscored identity 在 constructor/strict codec 闭合；主 agent 新鲜 contract/store/proof/retrieval/Stage/schema/Gate B/migration/bound 363/363（1 skip）、mini oracle 3/3 及变更文件 basedpyright 0 errors 通过，本轮未重跑 5k/100k Gate D。
-- 2026-08-14 / Task 8.8：fresh build 取消刚构建 stage 的重复 reuse 扫描，existing reuse 仍完整验证；StageSealer 在同一 `BEGIN IMMEDIATE` 内闭合 parity/proof-index/schema/count/logical closure 与 `SEALED` marker，生成 registry-owned sealed attestation。sealed/active strict semantic 同时冻结全库 record/FTS 计数与历史 receipt-boundary 计数；registry 及两次 Gate B 仍以 boundary claim 对账并仅做 DB/manifest/source 的 no-follow inode+full SHA-256 复证，active 校验则必须闭合全库计数和全量 index facts。replace/reopen 后 normal/cold SEALED receipt owner 在 `BEGIN IMMEDIATE` 内先闭合 receipt/binding/meta 结构，再单次流式重建 pre-activation closure 并 exact 核对 sealed attestation，只有通过后才写 receipt/meta，并在 commit 前以最后一次读取生成独立 active closure 期望；manifest 发布不改写 DB，随后唯一 active 全语义校验重算实际 closure 并 exact 比较后才生成 active attestation；cold `DB_REPLACED` 对已完成 receipt 以同一单次流式扫描同时闭合 ACTIVE 与重建的 pre-activation closure，先核对 sealed attestation 再授权期望。后续 phase/cold recovery 仅经 exact bytes/inode/phase 复证；journal-owned 新资产缺失可依 proven journal 回滚，same-inode 改字节、同字节换 inode、attestation 字段/版本/全库与 boundary 计数/闭包/阶段漂移及 v2 published phase 缺 attestation 均 fail-closed。verifier 定向 154/154、schema-upgrade/module-boundary/explicit-import 91/91、Task 8.8 矩阵 330/330（1 skip）、pre-lock P1 定点 2/2、变更文件 basedpyright 0 errors 与 diff check 通过。
+- 2026-08-14 / Task 8.8：fresh build 取消刚构建 stage 的重复 reuse 扫描，existing reuse 仍完整验证；StageSealer 在同一 `BEGIN IMMEDIATE` 内闭合 parity/proof-index/schema/count/logical closure 与 `SEALED` marker，生成 registry-owned sealed attestation。sealed/active strict semantic 同时冻结全库 record/FTS 计数与历史 receipt-boundary 计数；registry 及两次 Gate B 仍以 boundary claim 对账并仅做 DB/manifest/source 的 no-follow inode+full SHA-256 复证，active 校验则必须闭合全库计数和全量 index facts。replace/reopen 后 normal/cold SEALED receipt owner 在 `BEGIN IMMEDIATE` 内先闭合 receipt/binding/meta 结构，再单次流式重建 pre-activation closure 并 exact 核对 sealed attestation，只有通过后才写 receipt/meta，并在 commit 前以最后一次读取生成独立 active closure 期望；manifest 发布不改写 DB，随后唯一 active 全语义校验重算实际 closure 并 exact 比较后才生成 active attestation；cold `DB_REPLACED` 对已完成 receipt 以同一单次流式扫描同时闭合 ACTIVE 与重建的 pre-activation closure，先核对 sealed attestation 再授权期望。未完成 publication phase 仅经 exact bytes/inode/phase 复证；completed cold rehydrate 在 canonical DB 仍是同一 inode+bytes 时复用 active attestation，合法 post-activation append 改变同 inode 字节时改走完整 runtime validator，configured JSONL/manifest 外部分歧则交由 `SourceBindingMonitor` 锁存 `SOURCE_DIVERGED`；canonical inode 替换、attestation 字段/版本/全库与 boundary 计数/闭包/阶段漂移及 v2 published phase 缺 attestation 均 fail-closed。verifier 定向 154/154、schema-upgrade/module-boundary/explicit-import 91/91、Task 8.8 矩阵 330/330（1 skip）、pre-lock P1 定点 2/2、变更文件 basedpyright 0 errors 与 diff check 通过。
 - 2026-08-15 / Tasks 8.6–8.7 v15（重开）：保留 `proof-query-v2` 双域守恒、2048 预算、Retrieval-owned exact-fold reuse 与稀疏路径；密集路径以同一 generation 的短事务生成 U1/K0/R，再由 store-owned 严格有序私有投影和 opaque receipt 重绑定 facts，提交后逐 identity 计算 exact Unicode LCS/U3 并完成 threshold+top-k 双闭合，append/tamper/injected scorer 均资源级 fail-closed且不增加持久 schema。穷举与固定 Unicode 随机向量闭合 `真实分数<=U3<=U2<=U1`；q61 以 300 次真实 scorer 覆盖 3000 identities，40 条 frozen miss 为 42–481 次调用，字面 5000/200 oracle 在 FTS/fallback 均零遗漏；q240 最终分区为 A0=10、A1=293、invocation=303，handoff 的 302 仅是非完整 U3 原型竞争类估计而非最终调用数。q1/q61/short/q226/q240 各 20 个 warm 样本的 nearest-rank p95 分别为 75.359/378.410/12.259/378.988/332.161 ms、峰值 RSS 91.203 MiB。owner 248/248、Cluster N 330/330（1 skip）、changed-file basedpyright 0 errors、diff check 通过，最终原生 xhigh 累计复审无 P0–P3 并批准。
+- 2026-08-15 / Tasks 8.6–8.7 v16：以 `proof-query-v3` 冻结 all-accounted/raw-distinct-ranking/exact-fold-invocation 三域、完整 R 的 U3 pass、最多 32 的 U3-best scorer batch 与残余逐 identity balanced-partition U4/P3；production 只以 threshold 或 threshold-qualified top-k 严格闭合，Oracle 仍要求 threshold+top-k 双闭合，v2 仅允许严格历史解码，任何直接/嵌套重编码均拒绝。穷举/固定 Unicode 向量、single-char/repeat/tie、ordered projection/receipt/binding 伪造、phase2/U4/scorer append race、2049 原子预算及 Cluster N tamper 回归全部闭合；字面 5000/200 oracle 在 FTS/fallback 均 threshold/top-10 零遗漏。以 public migration owner 新建的 100k FTS generation（artifact pre/post 相等）实测 240/240 production 闭合、最大 43 calls、40 miss 最大 0 calls；q61 `oracle_full` 以 300 calls 闭合 3000 identities，q240 以 74 calls 闭合且 top-10 等于 `50040,40046,94009,64049,40900,40498,24009,40091,40421,20040`。六条查询分别 5 次 warmup 后取 20 个只覆盖 binding→ordered reads/LCS→record fetch→真实 scorer→finish/final generation validation 的 production candidate API 样本，q1/q61/q28-short/q183/q226/q240 nearest-rank p95 分别为 23.830/317.532/12.832/390.791/98.852/83.177 ms，查询进程峰值 RSS 117,850,112 bytes。修后 query-process 69/69、M owner+Cluster N 328/328、changed-file basedpyright/py_compile 0 errors、diff check 通过，三路原生 xhigh 最终复审均无 P0–P3 并批准。本轮未运行完整 Gate D；fresh migration 244.866 s 且 per-query health 全扫约 8.3 s，故 Cluster O/Task 8.9 的 migration 与 active-attestation 复用仍诚实 NO-GO。
+- 2026-08-16 / Feature 5 Cluster M→O 最终闭合：`proof-query-v3` 的 U3/U4/P3、2048 budget、batch≤32 与三域守恒保持不变；sealed registry 收束为 StageSealer 在 post-fsync integrity/projection/closure/terminal-rehash 后铸造的 exact registry+reservation 单次 capability，对外仅有 read-only readiness view，active attestation 只在 exact inode+bytes+phase 上复用。274-file immutable epoch fingerprint `1c357b0efcf81eef8bd37498bbb2700e9c3f2fa2add3b830e2f4e3dc7f77fd98` 上 fresh Gate D bundle `071f2787f452c9f07635a85e0626e8538bdb79a1b4f46ea3a37a06d47cf5be7e` 双路径 PASS：FTS exact/fuzzy p95 `0.547/275.833 ms`、migration `65.599 s`、RSS `266.953 MiB`；fallback `0.240/279.757 ms`、`99.223 s`、`291.719 MiB`；两路 5000/200 oracle threshold/top-10 零遗漏且 recall `1.0`。fault `61/61`、acceptance `33/33`、release `86/86 GO`、strict evidence `38/38`、fresh full `1579/1579`（skip 1，含 Qt smoke）与 changed-file basedpyright 0 errors、diff check 全部通过；最终原生 xhigh 对代码、四份 current-source evidence 与 release 输入独立重算后无 P0–P3 并批准。

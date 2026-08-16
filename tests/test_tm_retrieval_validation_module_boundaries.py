@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-import py_compile
 import sys
 import unittest
 
@@ -83,7 +82,7 @@ def _dynamic_imported_modules(path: Path) -> set[str]:
 class TMRetrievalValidationModuleBoundariesTest(unittest.TestCase):
     def test_validation_leaf_depends_only_on_approved_modules(self) -> None:
         path = PROJECT_ROOT / f"{_VALIDATION}.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         for approved in _ALLOWED_VALIDATION_DEPENDENCIES:
             self.assertIn(approved, modules)

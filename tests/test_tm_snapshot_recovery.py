@@ -2618,7 +2618,9 @@ class TMRecoveryExportTests(unittest.TestCase):
             identity = stage.resource_identity
             binding = _bind_current_snapshot(store, stage, _PRIOR_JSONL)
             fragment = identity.target_identity[:16]
-            destination = root / f".localcat-{fragment}.jsonl"
+            destination = (
+                root / f".localcat-{fragment}.jsonl"
+            ).resolve()
             receipt = self._register_export(store, destination, _NEW_JSONL)
 
             outcome = store.recover_configured_refresh()

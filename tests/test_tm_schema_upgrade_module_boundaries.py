@@ -14,7 +14,6 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
-import py_compile
 import sys
 import tempfile
 from typing import Any, cast
@@ -113,7 +112,7 @@ _MOVED_MIGRATION_NAMES = (
 class TMSchemaUpgradeModuleBoundariesTest(unittest.TestCase):
     def test_schema_upgrade_module_never_imports_the_owners(self) -> None:
         path = PROJECT_ROOT / "tm_schema_upgrade.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         self.assertNotIn("tm_sqlite_store", modules)
         self.assertNotIn("tm_migration", modules)

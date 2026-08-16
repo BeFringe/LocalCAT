@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 import copy
@@ -36,6 +37,7 @@ from tm_sqlite_store import (
     CANDIDATE_PROOF_BLOCK_SIZE,
     CANDIDATE_INDEX_VERSION,
     build_candidate_write_plan,
+    character_ngram_frequencies,
     unique_character_ngrams,
     FOLD_VERSION_V1,
     TM_SCHEMA_VERSION,
@@ -241,6 +243,61 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     self.assertEqual(counts, ((0,),) * 5)
                     self.assertEqual(fts_count, (0,))
                     self.assertEqual(revision, ("0",))
+
+    def test_character_ngram_frequencies_preserve_exact_order_and_counts(
+        self,
+    ) -> None:
+        self.assertEqual(
+            character_ngram_frequencies("ababa", 2),
+            (("ab", 2), ("ba", 2)),
+        )
+        self.assertEqual(character_ngram_frequencies("", 1), ())
+        self.assertEqual(character_ngram_frequencies("a", 2), ())
+        self.assertEqual(
+            character_ngram_frequencies("😀a😀", 2),
+            (("😀a", 1), ("a😀", 1)),
+        )
+        self.assertEqual(
+            character_ngram_frequencies("a\u0301a\u0301", 2),
+            (("a\u0301", 2), ("\u0301a", 1)),
+        )
+
+    def test_character_ngram_frequencies_reject_non_exact_inputs(
+        self,
+    ) -> None:
+        class StrSubclass(str):
+            pass
+
+        class IntSubclass(int):
+            pass
+
+        for folded_text in (StrSubclass("ab"), None, 1):
+            with self.subTest(folded_text=folded_text):
+                with self.assertRaisesRegex(
+                    TypeError,
+                    "^folded_text must be a built-in string$",
+                ):
+                    _ = character_ngram_frequencies(
+                        cast(Any, folded_text),
+                        2,
+                    )
+        for gram_size in (IntSubclass(2), True, 2.0, "2"):
+            with self.subTest(gram_size=gram_size):
+                with self.assertRaisesRegex(
+                    TypeError,
+                    "^gram_size must be a built-in integer$",
+                ):
+                    _ = character_ngram_frequencies(
+                        "ab",
+                        cast(Any, gram_size),
+                    )
+        for gram_size in (0, 4):
+            with self.subTest(gram_size=gram_size):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^gram_size must be 1, 2, or 3$",
+                ):
+                    _ = character_ngram_frequencies("ab", gram_size)
 
     def test_chunked_candidate_helpers_hold_one_read_snapshot(self) -> None:
         query = "".join(chr(0x1000 + offset) for offset in range(300))
@@ -1249,7 +1306,7 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 with self.subTest(draft=draft):
                     with (
                         patch(
-                            "tm_sqlite_store.fold_text_v1",
+                            "tm_sqlite_store.fold_text_value_v1",
                             side_effect=AssertionError("source folded"),
                         ) as fold,
                         patch(
@@ -1270,6 +1327,25 @@ class SQLiteTMStoreTests(unittest.TestCase):
                         open_connection.assert_not_called()
                     self.assertEqual(extension_calls, [])
                     self.assertEqual(conversions, [])
+            with patch(
+                "tm_sqlite_store.fold_text_value_v1",
+                side_effect=AssertionError("source folded"),
+            ) as fold:
+                with self.assertRaises(TypeError):
+                    store.append_streamed_batch(
+                        batch_id="migration.draft-subclass",
+                        kind="migration",
+                        drafts=iter(
+                            ((forged_draft(source_raw=DeceptiveStr("")), 1),)
+                        ),
+                        source_digest="c" * 64,
+                        source_path=(root / "streamed.jsonl").resolve(),
+                        invalid_count=0,
+                        duplicate_source_count=0,
+                        chunk_size=500,
+                    )
+                fold.assert_not_called()
+            self.assertEqual(conversions, [])
             connection = sqlite3.connect(stage.staged_db_path)
             try:
                 state = (
@@ -2169,20 +2245,56 @@ class SQLiteTMStoreTests(unittest.TestCase):
                             stage,
                             canonical_store_id="store.primary",
                         )
+                    sources = (
+                        "A",
+                        "a",
+                        "same",
+                        "same",
+                        *(f"source-{index:04d}" for index in range(4, 1250)),
+                    )
                     drafts = (
-                        _draft(f"source-{index:04d}", f"target-{index:04d}")
-                        for index in range(1250)
+                        _draft(source, f"target-{index:04d}")
+                        for index, source in enumerate(sources)
                     )
                     stream = ((draft, index + 1) for index, draft in enumerate(drafts))
-                    store.append_streamed_batch(
-                        batch_id="migration.streamed",
-                        kind="migration",
-                        drafts=stream,
-                        source_digest="a" * 64,
-                        source_path=(root / "streamed.jsonl").resolve(),
-                        invalid_count=0,
-                        duplicate_source_count=0,
-                        chunk_size=500,
+                    original_frequencies = (
+                        tm_sqlite_store.character_ngram_frequencies
+                    )
+                    frequency_calls: dict[tuple[str, int], int] = {}
+
+                    def recording_frequencies(
+                        folded_text: str,
+                        gram_size: int,
+                    ) -> tuple[tuple[str, int], ...]:
+                        key = (folded_text, gram_size)
+                        frequency_calls[key] = frequency_calls.get(key, 0) + 1
+                        return original_frequencies(folded_text, gram_size)
+
+                    with patch(
+                        "tm_sqlite_store.character_ngram_frequencies",
+                        side_effect=recording_frequencies,
+                    ):
+                        store.append_streamed_batch(
+                            batch_id="migration.streamed",
+                            kind="migration",
+                            drafts=stream,
+                            source_digest="a" * 64,
+                            source_path=(root / "streamed.jsonl").resolve(),
+                            invalid_count=0,
+                            duplicate_source_count=0,
+                            chunk_size=500,
+                        )
+                    required_sizes = (
+                        (1, 2) if fts5_available else (1, 2, 3)
+                    )
+                    expected_frequency_calls = Counter(
+                        (tm_sqlite_store.fold_text_value_v1(source), gram_size)
+                        for source in sources
+                        for gram_size in required_sizes
+                    )
+                    self.assertEqual(
+                        frequency_calls,
+                        dict(expected_frequency_calls),
                     )
                     revision = store.canonical_revision()
                     self.assertEqual(revision.head_revision, 1)
@@ -2210,6 +2322,11 @@ class SQLiteTMStoreTests(unittest.TestCase):
                             "record_count FROM tm_candidate_block "
                             "ORDER BY block_id"
                         ).fetchall()
+                        proof_validation = validate_candidate_proof_index(
+                            connection,
+                            required_sizes=required_sizes,
+                            fts5_available=fts5_available,
+                        )
                     finally:
                         connection.close()
                     self.assertEqual(
@@ -2230,7 +2347,15 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         gram_sizes,
-                        {1, 2} if fts5_available else {1, 2, 3},
+                        set(required_sizes),
+                    )
+                    self.assertEqual(
+                        tuple(size for size, _count in proof_validation[0]),
+                        required_sizes,
+                    )
+                    self.assertEqual(
+                        proof_validation[1],
+                        1250 if fts5_available else 0,
                     )
                     self.assertEqual(
                         proof_blocks,
@@ -2312,6 +2437,174 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 state,
                 (("staged", None), (500,), ("0",)),
             )
+
+    def test_streamed_append_rejects_noncontiguous_record_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = _stage(root)
+            initialize_stage_schema(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store = SQLiteTMStore(
+                stage,
+                canonical_store_id="store.primary",
+            )
+            store.append_streamed_batch(
+                batch_id="migration.initial-stream",
+                kind="migration",
+                drafts=iter(
+                    (_draft(f"s{index}", f"t{index}"), index + 1)
+                    for index in range(3)
+                ),
+                source_digest="e" * 64,
+                source_path=(root / "initial-stream.jsonl").resolve(),
+                invalid_count=0,
+                duplicate_source_count=0,
+                chunk_size=3,
+            )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("DELETE FROM tm_record WHERE record_id = 2")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(
+                SQLiteStoreSchemaError,
+                "^STORE.RECORD_ID_SEQUENCE_INVALID$",
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.rejected-stream",
+                    kind="migration",
+                    drafts=iter(((_draft("new", "not inserted"), 4),)),
+                    source_digest="f" * 64,
+                    source_path=(root / "rejected-stream.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=3,
+                )
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT record_id, source_raw FROM tm_record "
+                        "ORDER BY record_id"
+                    ).fetchall(),
+                    [(1, "s0"), (3, "s2")],
+                )
+            finally:
+                connection.close()
+
+    def test_second_streamed_chunk_summary_failure_rolls_back_only_chunk(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    stage = _stage(root)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=fts5_available,
+                    ):
+                        initialize_stage_schema(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                        store = SQLiteTMStore(
+                            stage,
+                            canonical_store_id="store.primary",
+                        )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        connection.execute(
+                            "CREATE TRIGGER inject_second_chunk_failure "
+                            "BEFORE INSERT ON tm_gram_block_max "
+                            "WHEN NEW.gram = 'z' BEGIN "
+                            "SELECT RAISE(ABORT, 'injected second chunk failure'); "
+                            "END"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "injected second chunk failure",
+                    ):
+                        store.append_streamed_batch(
+                            batch_id="migration.second-chunk-failure",
+                            kind="migration",
+                            drafts=iter(
+                                (
+                                    (_draft("aa", "first"), 1),
+                                    (_draft("bb", "second"), 2),
+                                    (_draft("zz", "rolled-back"), 3),
+                                )
+                            ),
+                            source_digest="d" * 64,
+                            source_path=(root / "second-chunk.jsonl").resolve(),
+                            invalid_count=0,
+                            duplicate_source_count=0,
+                            chunk_size=2,
+                        )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        batch = connection.execute(
+                            "SELECT status, valid_count, completed_revision "
+                            "FROM tm_origin_batch"
+                        ).fetchone()
+                        record_rows = connection.execute(
+                            "SELECT record_id, source_raw FROM tm_record "
+                            "ORDER BY record_id"
+                        ).fetchall()
+                        gram_record_ids = connection.execute(
+                            "SELECT DISTINCT record_id FROM tm_gram "
+                            "ORDER BY record_id"
+                        ).fetchall()
+                        proof_blocks = connection.execute(
+                            "SELECT block_id, record_count "
+                            "FROM tm_candidate_block ORDER BY block_id"
+                        ).fetchall()
+                        z_maxima = connection.execute(
+                            "SELECT COUNT(*) FROM tm_gram_block_max "
+                            "WHERE gram IN ('z', 'zz')"
+                        ).fetchone()
+                        head = connection.execute(
+                            "SELECT value FROM tm_meta "
+                            "WHERE key = 'head_revision'"
+                        ).fetchone()
+                        fts_count = (
+                            connection.execute(
+                                "SELECT COUNT(*) FROM tm_fts"
+                            ).fetchone()
+                            if fts5_available
+                            else (0,)
+                        )
+                        validation = validate_candidate_proof_index(
+                            connection,
+                            required_sizes=(
+                                (1, 2) if fts5_available else (1, 2, 3)
+                            ),
+                            fts5_available=fts5_available,
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(batch, ("staged", 0, None))
+                    self.assertEqual(record_rows, [(1, "aa"), (2, "bb")])
+                    self.assertEqual(gram_record_ids, [(1,), (2,)])
+                    self.assertEqual(proof_blocks, [(0, 2)])
+                    self.assertEqual(z_maxima, (0,))
+                    self.assertEqual(head, ("0",))
+                    self.assertEqual(
+                        fts_count,
+                        (2,) if fts5_available else (0,),
+                    )
+                    self.assertEqual(
+                        validation[1],
+                        2 if fts5_available else 0,
+                    )
 
     def test_streamed_append_empty_stream_completes_zero_record_batch(
         self,

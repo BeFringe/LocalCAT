@@ -202,6 +202,8 @@ class Feature5GateATests(unittest.TestCase):
                 "ContextEvidence",
                 "TMResult",
                 "CandidateStageMetadata",
+                "CandidateProofMetadata",
+                "CandidateProofMetadataV2",
                 "CandidateRecallMetadata",
                 "CandidateEvidence",
                 "CandidateRetrievalReport",

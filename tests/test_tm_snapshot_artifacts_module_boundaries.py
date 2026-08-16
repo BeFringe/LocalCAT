@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
-import py_compile
 import sys
 import tempfile
 from typing import Any, cast
@@ -176,7 +175,7 @@ _MOVED_STORE_NAMES = (
 class TMSnapshotArtifactsModuleBoundariesTest(unittest.TestCase):
     def test_snapshot_artifacts_module_never_imports_the_owners(self) -> None:
         path = PROJECT_ROOT / "tm_snapshot_artifacts.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         for owner in _OWNER_MODULES:
             self.assertNotIn(owner, modules)
@@ -400,7 +399,7 @@ class TMSnapshotArtifactsModuleBoundariesTest(unittest.TestCase):
 
     def test_export_parent_bind_seam_is_injected_from_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "candidate.jsonl"
+            destination = (Path(temporary) / "candidate.jsonl").resolve()
             with patch(
                 "tm_migration._after_export_parent_chain_validated",
             ) as validated:
@@ -477,9 +476,11 @@ class TMSnapshotArtifactsModuleBoundariesTest(unittest.TestCase):
             "tm_snapshot_artifacts.py",
         ):
             with self.subTest(name=name):
-                py_compile.compile(
-                    str(PROJECT_ROOT / name),
-                    doraise=True,
+                path = PROJECT_ROOT / name
+                _ = compile(
+                    path.read_text(encoding="utf-8"),
+                    str(path),
+                    "exec",
                 )
 
 

@@ -680,7 +680,7 @@ class ActivationSupersessionCleanupTests(unittest.TestCase):
             contract_to_json(manifest).encode()
         )
         return StageSealer(
-            registry=coordinator.sealed_registry,
+            registry=coordinator._sealed_registry,
             canonical_store_id="store.primary",
         ).seal(
             stage,

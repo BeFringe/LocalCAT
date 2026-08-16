@@ -43,6 +43,23 @@ def _phase(journal_path: Path) -> _ActivationJournalPhase:
 
 
 class ActivationPublicationHappyPathTests(unittest.TestCase):
+    def test_attested_health_reuses_active_semantic_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _identity_value, coordinator, _sealed, prepared, journal = (
+                _first_prepared(Path(temporary))
+            )
+            coordinator.publish_activation(prepared, journal)
+            store = store_module.SQLiteTMStore.from_coordinator(coordinator)
+            with patch(
+                "tm_sqlite_store.validate_candidate_proof_index",
+                side_effect=AssertionError(
+                    "exact active bytes must reuse attested semantics"
+                ),
+            ):
+                health = store.health()
+            self.assertTrue(health.healthy)
+            self.assertEqual(health.record_count, 3)
+
     def test_active_semantic_validation_runs_once_then_attestation_rehashes(
         self,
     ) -> None:
@@ -192,6 +209,7 @@ class ActivationPublicationHappyPathTests(unittest.TestCase):
                 coordinator.publish_activation(prepared, journal)
 
             self.assertLess(events.index("replace-db"), events.index("validate-db"))
+            self.assertEqual(events.count("validate-db"), 1)
             self.assertLess(
                 events.index("validate-db"),
                 events.index("journal-DB_REPLACED"),

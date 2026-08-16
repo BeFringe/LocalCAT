@@ -565,7 +565,8 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                 tuple(
                     path.name
                     for path in Path(temporary).iterdir()
-                    if path != identity.configured_jsonl_path
+                    if path.resolve()
+                    != identity.configured_jsonl_path.resolve()
                 ),
                 (identity.canonical_sidecar_path.name,),
             )
@@ -664,7 +665,8 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                         tuple(
                             path.name
                             for path in Path(temporary).iterdir()
-                            if path != identity.configured_jsonl_path
+                            if path.resolve()
+                            != identity.configured_jsonl_path.resolve()
                         ),
                         (),
                     )
@@ -957,7 +959,10 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                 stage = result.mutable_stage
                 self.assertIsNotNone(stage)
                 assert stage is not None
-                self.assertGreater(observed_calls, 2)
+                expected_calls = (
+                    len(source_lines) + MIGRATION_STREAM_CHUNK_SIZE - 1
+                ) // MIGRATION_STREAM_CHUNK_SIZE
+                self.assertEqual(observed_calls, expected_calls)
                 self.assertLessEqual(
                     max(observed_sizes),
                     MIGRATION_STREAM_CHUNK_SIZE,
@@ -1036,7 +1041,8 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                 tuple(
                     path.name
                     for path in Path(temporary).iterdir()
-                    if path != identity.configured_jsonl_path
+                    if path.resolve()
+                    != identity.configured_jsonl_path.resolve()
                 ),
                 (),
             )

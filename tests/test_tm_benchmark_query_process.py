@@ -15,7 +15,10 @@ import unittest
 from unittest.mock import patch
 
 import tm_benchmark_query_process
-from tm_benchmark import load_benchmark_contract
+from tm_benchmark import (
+    benchmark_implementation_fingerprint,
+    load_benchmark_contract,
+)
 from tm_benchmark_latency import (
     LATENCY_EVIDENCE_SCHEMA_VERSION,
     LatencyEvidence,
@@ -58,6 +61,7 @@ from tm_benchmark_query_process import (
 )
 from tm_contracts import (
     BENCHMARK_PERCENTILE_METHOD,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
     benchmark_contract_digest,
@@ -66,6 +70,7 @@ from tm_contracts import (
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CONTRACT = load_benchmark_contract(_ROOT / "benchmark_tm_contract.json")
+_IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
 
 _FTS5 = BenchmarkExecutionPath.FTS5_TRIGRAM
 _FALLBACK = BenchmarkExecutionPath.GRAM_FALLBACK
@@ -203,6 +208,8 @@ def _query_evidence(**overrides: Any) -> QueryProcessEvidence:
     environment = _query_environment("true")
     kwargs: dict[str, Any] = dict(
         schema_version=QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         artifact_key=_digest("c"),
         contract_digest=latency.contract_digest,
         corpus_digest=_CONTRACT.corpus_digest,

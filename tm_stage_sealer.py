@@ -18,6 +18,7 @@ from tm_content_attestation import (
     ContentAttestationError,
     ContentFileProof,
     ContentSemanticFacts,
+    LOGICAL_CLOSURE_VERSION,
     SealedContentAttestation,
     _capture_content_file,
     _create_sealed_content_attestation,
@@ -48,13 +49,14 @@ from tm_sqlite_store import (
     SQLiteStoreSchemaError,
     _SCHEMA_UPGRADE_META_KEY,
     _SCHEMA_UPGRADE_META_VALUE,
+    _candidate_proof_projection_digest,
     _legacy_completed_origin_blocks,
     _legacy_revision_ancestry,
     _schema_digest,
+    _validate_candidate_proof_index_with_digest,
     inspect_stage_schema,
-    validate_candidate_proof_index,
 )
-from text_matcher import fold_text_v1
+from text_matcher import fold_text_value_v1
 
 
 _NATIVE_PATH_TYPE = type(Path())
@@ -98,6 +100,7 @@ class _StageFacts:
     origin_batch_kind: str
     fts_count: int
     gram_counts: tuple[tuple[int, int], ...]
+    candidate_projection_digest: str
     receipt: SnapshotReceipt
     exact_parity_digest: str
     closure_digest: str
@@ -127,6 +130,82 @@ class _RegistryReservation:
             str(self.mutable.staged_db_path),
             str(self.mutable.manifest_temp_path),
         )
+
+
+_VERIFIED_SEAL_COMMIT_FACTORY_KEY = object()
+
+
+@dataclass(frozen=True, init=False)
+class _VerifiedSealCommitCapability:
+    """Single-use StageSealer authority for one verified reservation."""
+
+    registry_namespace: str
+    registry_authority: object
+    reservation: _RegistryReservation
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
+    attestation: SealedContentAttestation
+    nonce: str
+    _factory_key: object
+
+    def __post_init__(self) -> None:
+        if self._factory_key is not _VERIFIED_SEAL_COMMIT_FACTORY_KEY:
+            raise TypeError("verified seal commit capability is private")
+        if type(self.registry_namespace) is not str:
+            raise TypeError("registry namespace must be a built-in string")
+        if not self.registry_namespace.strip():
+            raise ValueError("registry namespace must not be empty")
+        if type(self.registry_authority) is not object:
+            raise TypeError("registry authority must be exact")
+        if type(self.reservation) is not _RegistryReservation:
+            raise TypeError("reservation must be exact")
+        if type(self.evidence) is not StageValidationEvidence:
+            raise TypeError("evidence must be exact")
+        if type(self.generation) is not GenerationExpectation:
+            raise TypeError("generation must be exact")
+        if type(self.attestation) is not SealedContentAttestation:
+            raise TypeError("attestation must be exact")
+        if type(self.nonce) is not str or not self.nonce.startswith(
+            "verified-seal."
+        ):
+            raise ValueError("verified seal commit nonce is invalid")
+
+
+def _create_verified_seal_commit_capability(
+    registry: _SealedArtifactRegistry,
+    reservation: _RegistryReservation,
+    evidence: StageValidationEvidence,
+    generation: GenerationExpectation,
+    attestation: SealedContentAttestation,
+) -> _VerifiedSealCommitCapability:
+    """Mint the only value accepted by the registry commit boundary."""
+
+    if type(registry) is not _SealedArtifactRegistry:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    try:
+        claim = _snapshot_evidence(evidence)
+        expected_generation = _snapshot_generation(generation)
+    except (TypeError, ValueError) as error:
+        raise StageSealError("SEALER.TYPE_INVALID") from error
+    if type(reservation) is not _RegistryReservation:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    if type(attestation) is not SealedContentAttestation:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    capability = object.__new__(_VerifiedSealCommitCapability)
+    object.__setattr__(capability, "registry_namespace", registry.registry_namespace)
+    object.__setattr__(capability, "registry_authority", registry._commit_authority)
+    object.__setattr__(capability, "reservation", reservation)
+    object.__setattr__(capability, "evidence", claim)
+    object.__setattr__(capability, "generation", expected_generation)
+    object.__setattr__(capability, "attestation", attestation)
+    object.__setattr__(capability, "nonce", f"verified-seal.{uuid.uuid4().hex}")
+    object.__setattr__(
+        capability,
+        "_factory_key",
+        _VERIFIED_SEAL_COMMIT_FACTORY_KEY,
+    )
+    capability.__post_init__()
+    return capability
 
 
 @dataclass(frozen=True)
@@ -204,6 +283,7 @@ def _content_semantic_facts(facts: _StageFacts) -> ContentSemanticFacts:
         receipt_boundary_fts_count=receipt_boundary_fts_count,
         gram_counts=facts.gram_counts,
         exact_parity_digest=facts.exact_parity_digest,
+        logical_closure_version=LOGICAL_CLOSURE_VERSION,
         logical_closure_digest=facts.closure_digest,
     )
 
@@ -600,13 +680,17 @@ def _stage_closure_digests(
     *,
     reconstruct_pre_activation: bool,
 ) -> tuple[str, str | None]:
-    """Bounded digest over every table whose facts enter the evidence.
+    """Build the versioned authority/derived-projection closure.
 
-    The current digest closes every schema, identity, integrity, FK, record,
-    index, source-binding, and exact-parity row in one snapshot.  The optional
-    second digest counterfactually reverses only the deterministic activation
-    receipt/meta transition.  Streaming cursor reads keep peak memory bounded
-    regardless of the 100k-row stage size.
+    Version 2 frames every authority row (metadata, ancestry, receipt,
+    binding, records, and schema) directly.  Candidate gram/block/FTS tables
+    are deterministic projections of those records and are fully recomputed
+    by ``validate_candidate_proof_index`` in the same sealed/active semantic
+    transaction.  This closure frames their exact counts and derived-domain
+    marker; StageSealer separately binds every actual projection row with a
+    bounded digest from that same transaction snapshot and re-reads it
+    post-fsync.  The optional second closure still counterfactually reverses
+    only the closed activation receipt/meta change.
     """
 
     active_digest = hashlib.sha256()
@@ -650,12 +734,21 @@ def _stage_closure_digests(
             return None
         return row
 
-    def frame_table(table: str, query: str) -> None:
+    def frame_table_header(table: str) -> None:
         active_digest.update(b"table:")
         frame(active_digest, table)
         if pre_activation_digest is not None:
             pre_activation_digest.update(b"table:")
             frame(pre_activation_digest, table)
+
+    active_digest.update(b"logical-closure:")
+    frame(active_digest, LOGICAL_CLOSURE_VERSION)
+    if pre_activation_digest is not None:
+        pre_activation_digest.update(b"logical-closure:")
+        frame(pre_activation_digest, LOGICAL_CLOSURE_VERSION)
+
+    def frame_table(table: str, query: str) -> None:
+        frame_table_header(table)
         cursor = connection.execute(query)
         while True:
             row = cursor.fetchone()
@@ -711,28 +804,31 @@ def _stage_closure_digests(
         "origin_batch_id, origin_ordinal "
         "FROM tm_record ORDER BY record_id",
     )
-    frame_table(
+    frame_table_header("candidate-derived-projection")
+    for derived_table in (
         "tm_gram",
-        "SELECT gram_size, gram, record_id, term_frequency FROM tm_gram "
-        "ORDER BY gram_size, gram, record_id",
-    )
-    frame_table(
         "tm_candidate_block",
-        "SELECT block_id, first_record_id, last_record_id, record_count, "
-        "min_source_fold_length, max_source_fold_length "
-        "FROM tm_candidate_block ORDER BY block_id",
-    )
-    frame_table(
         "tm_gram_block_max",
-        "SELECT gram_size, gram, block_id, max_term_frequency "
-        "FROM tm_gram_block_max ORDER BY gram_size, gram, block_id",
-    )
-    if has_table("tm_fts"):
-        frame_table(
-            "tm_fts",
-            "SELECT record_id, source_fold_v1 FROM tm_fts "
-            "ORDER BY record_id",
-        )
+        "tm_fts",
+    ):
+        if not has_table(derived_table):
+            continue
+        count_row = connection.execute(
+            f"SELECT COUNT(*) FROM {derived_table}"
+        ).fetchone()
+        if (
+            type(count_row) is not tuple
+            or len(count_row) != 1
+            or type(count_row[0]) is not int
+            or count_row[0] < 0
+        ):
+            raise StageSealError("SEALER.STAGE_INVALID")
+        for digest in (active_digest, pre_activation_digest):
+            if digest is None:
+                continue
+            frame(digest, derived_table)
+            frame(digest, count_row[0])
+            digest.update(b"\n")
     frame_table(
         "sqlite_master",
         "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
@@ -877,11 +973,6 @@ def _validate_stage_facts(
                     connection.commit()
                     return facts
                 _require_schema_facts_consistent(connection, schema)
-                integrity_rows = connection.execute(
-                    "PRAGMA integrity_check"
-                ).fetchall()
-                if integrity_rows != [("ok",)]:
-                    raise StageSealError("SEALER.INTEGRITY_FAILED")
                 if connection.execute(
                     "PRAGMA foreign_key_check"
                 ).fetchall():
@@ -1066,7 +1157,11 @@ def _validate_stage_facts(
                     (1, 2) if schema.fts5_available else (1, 2, 3)
                 )
                 try:
-                    gram_count_rows, fts_count = validate_candidate_proof_index(
+                    (
+                        gram_count_rows,
+                        fts_count,
+                        candidate_projection_digest,
+                    ) = _validate_candidate_proof_index_with_digest(
                         connection,
                         required_sizes=required_sizes,
                         fts5_available=schema.fts5_available,
@@ -1119,6 +1214,9 @@ def _validate_stage_facts(
                     fts_count=fts_count,
                     gram_counts=tuple(
                         (size, gram_counts[size]) for size in required_sizes
+                    ),
+                    candidate_projection_digest=(
+                        candidate_projection_digest
                     ),
                     receipt=receipt,
                     exact_parity_digest=exact_parity_digest,
@@ -1219,11 +1317,6 @@ def _validate_schema_upgrade_stage_facts(
     """
 
     _require_schema_facts_consistent(connection, schema)
-    integrity_rows = connection.execute(
-        "PRAGMA integrity_check"
-    ).fetchall()
-    if integrity_rows != [("ok",)]:
-        raise StageSealError("SEALER.INTEGRITY_FAILED")
     if connection.execute("PRAGMA foreign_key_check").fetchall():
         raise StageSealError("SEALER.FOREIGN_KEY_FAILED")
     if schema.head_revision < 1:
@@ -1364,10 +1457,10 @@ def _validate_schema_upgrade_stage_facts(
                 raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
         elif legacy_line_no is not None:
             raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        projected = fold_text_v1(source_raw)
+        folded_source = fold_text_value_v1(source_raw)
         if (
-            type(projected.folded_text) is not str
-            or projected.folded_text != stored_fold
+            type(folded_source) is not str
+            or folded_source != stored_fold
             or stored_fold_length != len(stored_fold)
         ):
             raise StageSealError("SEALER.FOLD_MISMATCH")
@@ -1519,7 +1612,11 @@ def _validate_schema_upgrade_stage_facts(
 
     required_sizes = (1, 2) if schema.fts5_available else (1, 2, 3)
     try:
-        gram_count_rows, fts_count = validate_candidate_proof_index(
+        (
+            gram_count_rows,
+            fts_count,
+            candidate_projection_digest,
+        ) = _validate_candidate_proof_index_with_digest(
             connection,
             required_sizes=required_sizes,
             fts5_available=schema.fts5_available,
@@ -1576,6 +1673,7 @@ def _validate_schema_upgrade_stage_facts(
         gram_counts=tuple(
             (size, gram_counts[size]) for size in required_sizes
         ),
+        candidate_projection_digest=candidate_projection_digest,
         receipt=receipt,
         exact_parity_digest=_winners_parity_digest(stage_winners),
         closure_digest=closure_digest,
@@ -1687,11 +1785,11 @@ def _validate_record_row(
         raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
     if origin_batch_id != batch_id:
         raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-    projected = fold_text_v1(source_raw)
-    if type(projected.folded_text) is not str:
+    folded_source = fold_text_value_v1(source_raw)
+    if type(folded_source) is not str:
         raise StageSealError("SEALER.STAGE_INVALID")
     if (
-        projected.folded_text != stored_fold
+        folded_source != stored_fold
         or stored_fold_length != len(stored_fold)
     ):
         raise StageSealError("SEALER.FOLD_MISMATCH")
@@ -1970,9 +2068,13 @@ def _verify_sealed_stage(
     record_count: int,
     origin_batch_count: int,
     receipt_count: int,
+    fts5_available: bool,
+    expected_candidate_projection_digest: str,
     database_identity: _ArtifactFileIdentity,
+    database_proof: ContentFileProof,
+    expected_closure_digest: str,
 ) -> None:
-    """Reopen after fsync and confirm the sealed state closed on disk."""
+    """Bind the post-fsync sealed bytes to the complete validated semantics."""
 
     _require_identity_unchanged(
         stage.staged_db_path,
@@ -2006,12 +2108,46 @@ def _verify_sealed_stage(
                 receipt_count,
             ):
                 raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+            try:
+                candidate_projection_digest = (
+                    _candidate_proof_projection_digest(
+                        connection,
+                        fts5_available=fts5_available,
+                    )
+                )
+            except (CandidateProofIndexError, sqlite3.DatabaseError) as error:
+                raise StageSealError(
+                    "SEALER.STAGE_MUTATED_AFTER_VALIDATION"
+                ) from error
+            if (
+                candidate_projection_digest
+                != expected_candidate_projection_digest
+            ):
+                raise StageSealError(
+                    "SEALER.STAGE_MUTATED_AFTER_VALIDATION"
+                )
+            _active_closure, pre_activation_closure = (
+                _stage_closure_digests(
+                    connection,
+                    reconstruct_pre_activation=True,
+                )
+            )
+            if pre_activation_closure != expected_closure_digest:
+                raise StageSealError(
+                    "SEALER.STAGE_MUTATED_AFTER_VALIDATION"
+                )
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
     finally:
         connection.close()
+    try:
+        _revalidate_content_file(stage.staged_db_path, database_proof)
+    except ContentAttestationError as error:
+        raise StageSealError(
+            "SEALER.STAGE_MUTATED_AFTER_VALIDATION"
+        ) from error
 
 
 def _build_binding(
@@ -2162,16 +2298,51 @@ def _require_linearization_closure(
         raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH")
 
 
-class _SealLifecycleRegistry(
-    contract_module._SealedArtifactRegistryPort,
-    Protocol,
-):
+_READINESS_VIEW_FACTORY_KEY = object()
+
+
+class _SealedArtifactReadinessView:
+    """Exact read-only registry authority used by Gate B and diagnostics."""
+
+    __slots__ = ("__registry", "__factory_key")
+
+    def __init__(
+        self,
+        registry: _SealedArtifactRegistry,
+        *,
+        _factory_key: object,
+    ) -> None:
+        if _factory_key is not _READINESS_VIEW_FACTORY_KEY:
+            raise TypeError("sealed artifact readiness view is private")
+        if type(registry) is not _SealedArtifactRegistry:
+            raise TypeError("sealed artifact registry must be exact")
+        self.__registry = registry
+        self.__factory_key = _factory_key
+
+    @property
+    def registry_namespace(self) -> str:
+        return self.__registry.registry_namespace
+
+    def resolve_physical_readiness(
+        self,
+        stage: SealedStage,
+    ) -> _PhysicalReadinessSnapshot:
+        return self.__registry.resolve_physical_readiness(stage)
+
+    def contains(self, stage: SealedStage) -> bool:
+        return self.__registry.contains(stage)
+
+    def state(self, stage: SealedStage) -> ActivationCapabilityState:
+        return self.__registry.state(stage)
+
+
+class _SealLifecycleRegistry(Protocol):
     """Reservation/commit/release seam the StageSealer requires."""
 
     @property
     def registry_namespace(self) -> str: ...
 
-    def reserve(
+    def _reserve(
         self,
         mutable_stage: MutableStageRef,
         *,
@@ -2179,18 +2350,15 @@ class _SealLifecycleRegistry(
         manifest_identity: _ArtifactFileIdentity,
     ) -> _RegistryReservation: ...
 
-    def commit(
+    def _commit_verified(
         self,
-        reservation: _RegistryReservation,
-        evidence: StageValidationEvidence,
-        generation: GenerationExpectation,
-        attestation: SealedContentAttestation | None = None,
+        capability: _VerifiedSealCommitCapability,
     ) -> SealedStage: ...
 
-    def release(self, reservation: _RegistryReservation) -> None: ...
+    def _release(self, reservation: _RegistryReservation) -> None: ...
 
 
-class SealedArtifactRegistry:
+class _SealedArtifactRegistry:
     """Coordinator-owned sealed artifact authority for one namespace.
 
     The registry is created and owned by the coordinator; the StageSealer
@@ -2216,69 +2384,22 @@ class SealedArtifactRegistry:
             tuple[str, contract_module._ActivationToken],
         ] = {}
         self._claimed_nonces: dict[str, str] = {}
+        self._commit_authority = object()
+        self._used_verified_commit_nonces: set[str] = set()
         self._lock = threading.RLock()
+        self._read_view = _SealedArtifactReadinessView(
+            self,
+            _factory_key=_READINESS_VIEW_FACTORY_KEY,
+        )
 
     @property
     def registry_namespace(self) -> str:
         return self._registry_namespace
 
-    def seal(
-        self,
-        mutable_stage: MutableStageRef,
-        evidence: StageValidationEvidence,
-        generation: GenerationExpectation,
-    ) -> SealedStage:
-        """Single-shot convenience registration for port callers.
+    def _readiness_view(self) -> _SealedArtifactReadinessView:
+        return self._read_view
 
-        The identities captured here are the ones visible at call time; the
-        StageSealer's creation-time identities enter only through reserve(),
-        so the sealer flow stays immune to swaps before registration.
-        """
-
-        try:
-            stage = _snapshot_stage(mutable_stage)
-        except (TypeError, ValueError) as error:
-            raise StageSealError("SEALER.TYPE_INVALID") from error
-        database_identity = _artifact_file_identity(
-            stage.staged_db_path,
-            missing_code="SEALER.STAGE_DATABASE_MISSING",
-            unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
-        )
-        manifest_identity = _artifact_file_identity(
-            stage.manifest_temp_path,
-            missing_code="SEALER.STAGE_MANIFEST_MISSING",
-            unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
-        )
-        reservation = self.reserve(
-            stage,
-            database_identity=database_identity,
-            manifest_identity=manifest_identity,
-        )
-        try:
-            facts = _validate_stage_facts(
-                stage,
-                canonical_store_id=(
-                    evidence.source_binding.receipt.canonical_store_id
-                ),
-                allow_sealed=True,
-            )
-            attestation = _build_sealed_content_attestation(
-                stage,
-                facts,
-                evidence,
-                generation,
-            )
-            return self.commit(
-                reservation,
-                evidence,
-                generation,
-                attestation,
-            )
-        except BaseException:
-            self.release(reservation)
-            raise
-
-    def reserve(
+    def _reserve(
         self,
         mutable_stage: MutableStageRef,
         *,
@@ -2295,7 +2416,7 @@ class SealedArtifactRegistry:
         with self._lock:
             try:
                 stage = _snapshot_stage(mutable_stage)
-            except (TypeError, ValueError) as error:
+            except (AttributeError, TypeError, ValueError) as error:
                 raise StageSealError("SEALER.TYPE_INVALID") from error
             if (
                 type(database_identity) is not _ArtifactFileIdentity
@@ -2335,12 +2456,9 @@ class SealedArtifactRegistry:
             self._reservations[reservation.key] = reservation
             return reservation
 
-    def commit(
+    def _commit_verified(
         self,
-        reservation: _RegistryReservation,
-        evidence: StageValidationEvidence,
-        generation: GenerationExpectation,
-        attestation: SealedContentAttestation | None = None,
+        capability: _VerifiedSealCommitCapability,
     ) -> SealedStage:
         """Finalize one reservation into the authoritative sealed entry.
 
@@ -2351,19 +2469,34 @@ class SealedArtifactRegistry:
         """
 
         with self._lock:
-            if type(reservation) is not _RegistryReservation:
+            if type(capability) is not _VerifiedSealCommitCapability:
                 raise StageSealError("SEALER.TYPE_INVALID")
+            try:
+                capability.__post_init__()
+            except (AttributeError, TypeError, ValueError) as error:
+                raise StageSealError("SEALER.TYPE_INVALID") from error
+            if (
+                capability.registry_namespace != self._registry_namespace
+                or capability.registry_authority is not self._commit_authority
+            ):
+                raise StageSealError("SEALER.RESERVATION_MISMATCH")
+            if capability.nonce in self._used_verified_commit_nonces:
+                raise StageSealError("SEALER.RESERVATION_MISMATCH")
+            reservation = capability.reservation
             existing = self._reservations.get(reservation.key)
             if (
                 existing is None
-                or existing.reservation_id != reservation.reservation_id
+                or existing is not reservation
             ):
                 raise StageSealError("SEALER.RESERVATION_MISMATCH")
             try:
-                claim = _snapshot_evidence(evidence)
-                expected_generation = _snapshot_generation(generation)
+                claim = _snapshot_evidence(capability.evidence)
+                expected_generation = _snapshot_generation(
+                    capability.generation
+                )
             except (TypeError, ValueError) as error:
                 raise StageSealError("SEALER.TYPE_INVALID") from error
+            attestation = capability.attestation
             if type(attestation) is not SealedContentAttestation:
                 raise StageSealError("SEALER.TYPE_INVALID")
             stage = reservation.mutable
@@ -2461,9 +2594,10 @@ class SealedArtifactRegistry:
             )
             self._sealed_paths[reservation.key] = artifact_id
             del self._reservations[reservation.key]
+            self._used_verified_commit_nonces.add(capability.nonce)
             return sealed_stage
 
-    def release(self, reservation: _RegistryReservation) -> None:
+    def _release(self, reservation: _RegistryReservation) -> None:
         """Release one uncommitted reservation; never touches committed entries."""
 
         with self._lock:
@@ -2712,14 +2846,11 @@ class StageSealer:
     def __init__(
         self,
         *,
-        registry: contract_module._SealedArtifactRegistryPort,
+        registry: _SealedArtifactRegistry,
         canonical_store_id: str,
     ) -> None:
-        if not callable(getattr(registry, "seal", None)):
+        if type(registry) is not _SealedArtifactRegistry:
             raise StageSealError("SEALER.TYPE_INVALID")
-        for seam_name in ("reserve", "commit", "release"):
-            if not callable(getattr(registry, seam_name, None)):
-                raise StageSealError("SEALER.TYPE_INVALID")
         namespace = registry.registry_namespace
         if type(namespace) is not str or not namespace.strip():
             raise StageSealError("SEALER.TYPE_INVALID")
@@ -2732,7 +2863,7 @@ class StageSealer:
 
     @property
     def registry(self) -> contract_module._SealedArtifactRegistryPort:
-        return self._registry
+        return self._registry._readiness_view()
 
     @property
     def canonical_store_id(self) -> str:
@@ -2793,7 +2924,7 @@ class StageSealer:
         else:
             raise StageSealError("SEALER.STAGE_INVALID")
         lifecycle = self._lifecycle_registry()
-        reservation = lifecycle.reserve(
+        reservation = lifecycle._reserve(
             stage,
             database_identity=database_identity,
             manifest_identity=manifest_identity,
@@ -2856,7 +2987,13 @@ class StageSealer:
                 record_count=facts.record_count,
                 origin_batch_count=facts.origin_batch_count,
                 receipt_count=1,
+                fts5_available=facts.fts5_available,
+                expected_candidate_projection_digest=(
+                    facts.candidate_projection_digest
+                ),
                 database_identity=database_identity,
+                database_proof=database_proof,
+                expected_closure_digest=facts.closure_digest,
             )
             binding = _build_binding(
                 stage.resource_identity,
@@ -2883,12 +3020,14 @@ class StageSealer:
                 manifest_proof=manifest_proof,
                 source_proof=source_proof,
             )
-            return lifecycle.commit(
+            capability = _create_verified_seal_commit_capability(
+                self._registry,
                 reservation,
                 evidence,
                 generation,
                 attestation,
             )
+            return lifecycle._commit_verified(capability)
         except BaseException as error:
             try:
                 if marker_written:
@@ -2897,10 +3036,10 @@ class StageSealer:
                         database_identity,
                     )
             finally:
-                lifecycle.release(reservation)
+                lifecycle._release(reservation)
             if isinstance(error, StageSealError):
                 raise
             raise StageSealError("SEALER.STAGE_INVALID") from error
 
 
-__all__ = ["SealedArtifactRegistry", "StageSealError", "StageSealer"]
+__all__ = ["StageSealError", "StageSealer"]

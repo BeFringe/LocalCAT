@@ -15,7 +15,11 @@ from typing import Any, Mapping
 import unittest
 from unittest.mock import patch
 
-from tm_benchmark import iter_corpus_records, load_benchmark_contract
+from tm_benchmark import (
+    benchmark_implementation_fingerprint,
+    iter_corpus_records,
+    load_benchmark_contract,
+)
 from tm_benchmark_process import (
     ArtifactFileIdentity,
     ArtifactSnapshot,
@@ -36,6 +40,7 @@ from tm_benchmark_process import (
 )
 from tm_contracts import (
     BENCHMARK_RSS_SCOPE,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
     benchmark_contract_digest,
@@ -52,6 +57,7 @@ _RUN_ROOT = "/tmp/benchmark-run-test"
 _FIXTURE_PATH = f"{_RUN_ROOT}/fixture.jsonl"
 _RESOURCE_ID = "tm.benchmark"
 _STORE_ID = "store.benchmark"
+_IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
 
 _IMPORT_RE = re.compile(
     r"^(?:import|from)\s+([A-Za-z0-9_\.]+)",
@@ -126,6 +132,8 @@ def _protocol_digest(
         resource_id=_RESOURCE_ID,
         canonical_store_id=_STORE_ID,
         test_mode=test_mode,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
     )
 
 
@@ -141,6 +149,8 @@ def _small_evidence(**overrides: Any) -> TMBenchmarkProcessEvidence:
     environment = _environment(execution_path is _FTS5)
     kwargs: dict[str, Any] = {
         "schema_version": PROCESS_EVIDENCE_SCHEMA_VERSION,
+        "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
+        "implementation_fingerprint": _IMPLEMENTATION_FINGERPRINT,
         "test_mode": test_mode,
         "contract": _CONTRACT,
         "contract_digest": contract_digest,
@@ -748,6 +758,8 @@ class WorkerProtocolTests(unittest.TestCase):
             resource_id=_RESOURCE_ID,
             canonical_store_id=_STORE_ID,
             test_mode=True,
+            proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+            implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         )
         request: dict[str, Any] = {
             "canonical_store_id": _STORE_ID,
@@ -759,6 +771,8 @@ class WorkerProtocolTests(unittest.TestCase):
             "fixture_digest": fixture_digest,
             "fixture_path": str(fixture_path),
             "fixture_record_count": 4,
+            "implementation_fingerprint": _IMPLEMENTATION_FINGERPRINT,
+            "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
             "protocol": PROCESS_WORKER_PROTOCOL_VERSION,
             "protocol_digest": protocol_digest,
             "resource_id": _RESOURCE_ID,
@@ -913,6 +927,8 @@ class ModuleBoundaryTests(unittest.TestCase):
             "tm_candidate_index",
             "tm_contracts",
             "tm_migration",
+            "tm_retrieval",
+            "tm_similarity",
             "tm_sqlite_store",
             "tm_stage_sealer",
             "tm_activation_journal",

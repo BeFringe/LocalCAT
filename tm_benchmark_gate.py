@@ -74,7 +74,10 @@ Invariant capsule
 - The environment is combined only from exact frozen owner facts; conflicting
   shared keys fail closed, and the caller can never inject an environment.
 - The portable bundle retains the full latency raw samples, immutable
-  process/query/oracle facts and digests, and strict report codec results.
+  process/query/oracle facts and digests, the current proof-query version,
+  one no-follow exact implementation-source fingerprint, and strict report
+  codec results.  The fingerprint publishes only a digest, not source paths
+  or bytes, and release validation recomputes it from the exact checkout.
   It never contains absolute run-root/fixture paths, PIDs,
   inode/device/mtime, protocol digests that bind those locators, query/
   source/target bodies, or reusable handles.  Raw ``TMBenchmarkProcessEvidence``
@@ -121,7 +124,13 @@ import stat
 import tempfile
 from typing import cast
 
-from tm_benchmark import benchmark_digest, load_benchmark_contract
+from tm_benchmark import (
+    BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION,
+    BENCHMARK_IMPLEMENTATION_SOURCE_PATHS,
+    benchmark_digest,
+    benchmark_implementation_fingerprint,
+    load_benchmark_contract,
+)
 from tm_benchmark_latency import (
     LATENCY_EVIDENCE_SCHEMA_VERSION,
     LatencyEvidence,
@@ -147,10 +156,12 @@ from tm_benchmark_query_process import (
     QueryProcessEvidence,
     QueryProcessRunResult,
     _adjudicate_evidence_against_process_evidence,
+    _resolved_absolute_path_string,
     run_query_process_evidence,
 )
 from tm_contracts import (
     BENCHMARK_SUITE_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
     BenchmarkReport,
@@ -169,8 +180,8 @@ from tm_retrieval_capability import (
     RetrievalCapabilitySnapshot,
 )
 
-BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v1"
-BENCHMARK_BUNDLE_DIGEST_VERSION = "tm-benchmark-bundle-digest-v1"
+BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v2"
+BENCHMARK_BUNDLE_DIGEST_VERSION = "tm-benchmark-bundle-digest-v2"
 BENCHMARK_BUNDLE_DIGEST_KIND = "benchmark-bundle"
 BENCHMARK_PORTABLE_ARTIFACT_KEY_VERSION = (
     "tm-benchmark-portable-artifact-key-v1"
@@ -199,6 +210,8 @@ _BUNDLE_PAYLOAD_FIELDS = frozenset(
         "contract_json",
         "fallback",
         "fts5",
+        "implementation_fingerprint",
+        "proof_query_version",
         "schema_version",
         "suite_contract_digest",
         "suite_report",
@@ -270,11 +283,13 @@ _PROCESS_FACTS_PAYLOAD_FIELDS = frozenset(
         "fixture_digest",
         "fixture_record_count",
         "generation",
+        "implementation_fingerprint",
         "migration_elapsed_ns",
         "path_config_digest",
         "peak_rss_bytes",
         "record_count",
         "resource_id",
+        "proof_query_version",
         "rss_scope",
         "rss_start_bytes",
         "rss_terminal_bytes",
@@ -297,10 +312,12 @@ _QUERY_FACTS_PAYLOAD_FIELDS = frozenset(
         "fixture_digest",
         "fixture_record_count",
         "generation",
+        "implementation_fingerprint",
         "path_config_digest",
         "portable_artifact_key",
         "process_evidence_digest",
         "processes_distinct",
+        "proof_query_version",
         "query_peak_rss_bytes",
         "query_rss_scope",
         "query_rss_start_bytes",
@@ -449,6 +466,8 @@ class BenchmarkProcessFacts:
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     contract_digest: str
     corpus_digest: str
     corpus_record_count: int
@@ -481,6 +500,12 @@ def _validate_benchmark_process_facts(facts: BenchmarkProcessFacts) -> None:
             "process facts schema version must be "
             f"{PROCESS_EVIDENCE_SCHEMA_VERSION}"
         )
+    if facts.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise ValueError("process facts proof query version is not current")
+    _require_evidence_digest(
+        facts.implementation_fingerprint,
+        "process implementation fingerprint",
+    )
     _require_evidence_digest(facts.evidence_digest, "process evidence digest")
     _require_evidence_digest(facts.contract_digest, "process contract digest")
     _require_evidence_digest(facts.corpus_digest, "process corpus digest")
@@ -557,11 +582,13 @@ def _process_facts_payload(facts: BenchmarkProcessFacts) -> dict[str, object]:
         "fixture_digest": facts.fixture_digest,
         "fixture_record_count": facts.fixture_record_count,
         "generation": facts.generation,
+        "implementation_fingerprint": facts.implementation_fingerprint,
         "migration_elapsed_ns": facts.migration_elapsed_ns,
         "path_config_digest": facts.path_config_digest,
         "peak_rss_bytes": facts.peak_rss_bytes,
         "record_count": facts.record_count,
         "resource_id": facts.resource_id,
+        "proof_query_version": facts.proof_query_version,
         "rss_scope": facts.rss_scope,
         "rss_start_bytes": facts.rss_start_bytes,
         "rss_terminal_bytes": facts.rss_terminal_bytes,
@@ -578,6 +605,14 @@ def _process_facts_from_payload(value: object) -> BenchmarkProcessFacts:
     )
     return BenchmarkProcessFacts(
         schema_version=_as_str(fields["schema_version"], "schema version"),
+        proof_query_version=_as_str(
+            fields["proof_query_version"],
+            "proof query version",
+        ),
+        implementation_fingerprint=_as_digest(
+            fields["implementation_fingerprint"],
+            "implementation fingerprint",
+        ),
         contract_digest=_as_digest(
             fields["contract_digest"],
             "contract digest",
@@ -655,6 +690,8 @@ class BenchmarkQueryFacts:
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     portable_artifact_key: str
     contract_digest: str
     corpus_digest: str
@@ -693,6 +730,12 @@ def _validate_benchmark_query_facts(facts: BenchmarkQueryFacts) -> None:
             "query facts schema version must be "
             f"{QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION}"
         )
+    if facts.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise ValueError("query facts proof query version is not current")
+    _require_evidence_digest(
+        facts.implementation_fingerprint,
+        "query implementation fingerprint",
+    )
     _require_evidence_digest(facts.evidence_digest, "query evidence digest")
     _require_evidence_digest(
         facts.portable_artifact_key,
@@ -801,12 +844,14 @@ def _query_facts_payload(facts: BenchmarkQueryFacts) -> dict[str, object]:
         "fixture_digest": facts.fixture_digest,
         "fixture_record_count": facts.fixture_record_count,
         "generation": facts.generation,
+        "implementation_fingerprint": facts.implementation_fingerprint,
         "path_config_digest": facts.path_config_digest,
         "process_evidence_digest": facts.process_evidence_digest,
         "sidecar_digest": facts.sidecar_digest,
         "manifest_digest": facts.manifest_digest,
         "latency_evidence_digest": facts.latency_evidence_digest,
         "processes_distinct": facts.processes_distinct,
+        "proof_query_version": facts.proof_query_version,
         "query_peak_rss_bytes": facts.query_peak_rss_bytes,
         "query_rss_scope": facts.query_rss_scope,
         "query_rss_start_bytes": facts.query_rss_start_bytes,
@@ -826,6 +871,14 @@ def _query_facts_from_payload(value: object) -> BenchmarkQueryFacts:
     )
     return BenchmarkQueryFacts(
         schema_version=_as_str(fields["schema_version"], "schema version"),
+        proof_query_version=_as_str(
+            fields["proof_query_version"],
+            "proof query version",
+        ),
+        implementation_fingerprint=_as_digest(
+            fields["implementation_fingerprint"],
+            "implementation fingerprint",
+        ),
         portable_artifact_key=_as_digest(
             fields["portable_artifact_key"],
             "portable artifact key",
@@ -1657,13 +1710,16 @@ class BenchmarkEvidenceBundle:
 
     The bundle retains one strict ``BenchmarkReport`` per execution path
     (in enum order), the aggregate ``BenchmarkSuiteReport``, the full latency
-    raw samples and immutable process/query/oracle facts and digests.  It is
+    raw samples, immutable process/query/oracle facts and digests, and the
+    proof/source implementation identity measured by the owner.  It is
     safe to persist: it never contains absolute run-root/fixture paths, PIDs,
     inode/device/mtime facts, locator-binding protocol digests, query/source/
     target bodies or reusable handles.
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     contract: BenchmarkContract
     contract_digest: str
     suite_contract: BenchmarkSuiteContract
@@ -1690,6 +1746,18 @@ def _validate_benchmark_evidence_bundle(bundle: BenchmarkEvidenceBundle) -> None
     if bundle.schema_version != BENCHMARK_BUNDLE_SCHEMA_VERSION:
         raise ValueError(
             "bundle schema version must be " f"{BENCHMARK_BUNDLE_SCHEMA_VERSION}"
+        )
+    if bundle.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise ValueError(
+            "bundle proof query version must be "
+            f"{CANDIDATE_PROOF_QUERY_VERSION}"
+        )
+    if (
+        type(bundle.implementation_fingerprint) is not str
+        or _SHA256_DIGEST.fullmatch(bundle.implementation_fingerprint) is None
+    ):
+        raise ValueError(
+            "bundle implementation fingerprint must be a SHA-256 digest"
         )
     if type(bundle.contract) is not BenchmarkContract:
         raise TypeError("bundle contract must be BenchmarkContract")
@@ -1724,6 +1792,26 @@ def _validate_benchmark_evidence_bundle(bundle: BenchmarkEvidenceBundle) -> None
     ):
         raise ValueError("bundle fallback path must execute GRAM_FALLBACK")
     for path_bundle in (bundle.fts5, bundle.fallback):
+        if (
+            path_bundle.process_facts.proof_query_version
+            != bundle.proof_query_version
+            or path_bundle.query_facts.proof_query_version
+            != bundle.proof_query_version
+            or path_bundle.oracle_evidence.proof_query_version
+            != bundle.proof_query_version
+        ):
+            raise ValueError("nested proof query versions must match the bundle")
+        if (
+            path_bundle.process_facts.implementation_fingerprint
+            != bundle.implementation_fingerprint
+            or path_bundle.query_facts.implementation_fingerprint
+            != bundle.implementation_fingerprint
+            or path_bundle.oracle_evidence.implementation_fingerprint
+            != bundle.implementation_fingerprint
+        ):
+            raise ValueError(
+                "nested implementation fingerprints must match the bundle"
+            )
         if path_bundle.oracle_evidence.contract != bundle.contract:
             raise ValueError("path oracle contract must match the bundle contract")
         if path_bundle.latency_evidence.contract != bundle.contract:
@@ -1768,6 +1856,8 @@ def _bundle_payload_fields(bundle: BenchmarkEvidenceBundle) -> dict[str, object]
         "contract_json": contract_to_json(bundle.contract),
         "fallback": _path_bundle_payload(bundle.fallback),
         "fts5": _path_bundle_payload(bundle.fts5),
+        "implementation_fingerprint": bundle.implementation_fingerprint,
+        "proof_query_version": bundle.proof_query_version,
         "schema_version": bundle.schema_version,
         "suite_contract_digest": bundle.suite_contract_digest,
         "suite_report": _suite_report_payload(bundle.suite_report),
@@ -1816,6 +1906,16 @@ def benchmark_evidence_bundle_from_payload(
             "bundle schema version must be " f"{BENCHMARK_BUNDLE_SCHEMA_VERSION}"
         )
     contract_json = _as_str(fields["contract_json"], "contract json")
+    proof_query_version = _as_str(
+        fields["proof_query_version"],
+        "proof query version",
+    )
+    if proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise ValueError("bundle proof query version is unsupported")
+    implementation_fingerprint = _as_digest(
+        fields["implementation_fingerprint"],
+        "implementation fingerprint",
+    )
     contract = contract_from_json(_canonical_json(_parse_strict_json(contract_json)))
     if type(contract) is not BenchmarkContract:
         raise TypeError("bundle contract must be BenchmarkContract")
@@ -1841,6 +1941,8 @@ def benchmark_evidence_bundle_from_payload(
     suite_report = _suite_report_from_payload(fields["suite_report"], suite_contract)
     bundle = BenchmarkEvidenceBundle(
         schema_version=BENCHMARK_BUNDLE_SCHEMA_VERSION,
+        proof_query_version=proof_query_version,
+        implementation_fingerprint=implementation_fingerprint,
         contract=contract,
         contract_digest=contract_digest,
         suite_contract=suite_contract,
@@ -1880,6 +1982,8 @@ def _project_process_facts(evidence: TMBenchmarkProcessEvidence) -> BenchmarkPro
         raise TypeError("process evidence must be TMBenchmarkProcessEvidence")
     return BenchmarkProcessFacts(
         schema_version=evidence.schema_version,
+        proof_query_version=evidence.proof_query_version,
+        implementation_fingerprint=evidence.implementation_fingerprint,
         contract_digest=evidence.contract_digest,
         corpus_digest=evidence.corpus_digest,
         corpus_record_count=evidence.corpus_record_count,
@@ -1909,6 +2013,8 @@ def _project_query_facts(evidence: QueryProcessEvidence) -> BenchmarkQueryFacts:
         raise TypeError("query evidence must be QueryProcessEvidence")
     return BenchmarkQueryFacts(
         schema_version=evidence.schema_version,
+        proof_query_version=evidence.proof_query_version,
+        implementation_fingerprint=evidence.implementation_fingerprint,
         portable_artifact_key=_portable_artifact_key(
             contract_digest=evidence.contract_digest,
             corpus_digest=evidence.corpus_digest,
@@ -1982,9 +2088,21 @@ def _build_path_bundle(
         raise TypeError("process evidence must be TMBenchmarkProcessEvidence")
     if type(evidence) is not QueryProcessEvidence:
         raise TypeError("query evidence must be QueryProcessEvidence")
-    if process_run.run_root != process_evidence.run_root:
+    if _resolved_absolute_path_string(
+        process_run.run_root,
+        "combined run root",
+    ) != _resolved_absolute_path_string(
+        process_evidence.run_root,
+        "process evidence run root",
+    ):
         raise ValueError("run root must match the process evidence")
-    if process_run.fixture_path != process_evidence.fixture_path:
+    if _resolved_absolute_path_string(
+        process_run.fixture_path,
+        "combined fixture path",
+    ) != _resolved_absolute_path_string(
+        process_evidence.fixture_path,
+        "process evidence fixture path",
+    ):
         raise ValueError("fixture path must match the process evidence")
     if process_run.artifact_pre != evidence.artifact_pre:
         raise ValueError("parent pre snapshot must match the query evidence")
@@ -2000,6 +2118,26 @@ def _build_path_bundle(
         raise ValueError("combined evidence requires final query evidence")
     if oracle_evidence.test_mode or not oracle_evidence.final_evidence:
         raise ValueError("combined evidence requires final oracle evidence")
+    source_bindings = {
+        (
+            process_evidence.proof_query_version,
+            process_evidence.implementation_fingerprint,
+        ),
+        (
+            evidence.proof_query_version,
+            evidence.implementation_fingerprint,
+        ),
+        (
+            oracle_evidence.proof_query_version,
+            oracle_evidence.implementation_fingerprint,
+        ),
+    }
+    if source_bindings != {
+        (CANDIDATE_PROOF_QUERY_VERSION, process_evidence.implementation_fingerprint)
+    }:
+        raise ValueError(
+            "process/query/oracle evidence must bind one current implementation"
+        )
     if (
         process_evidence.corpus_record_count != REAL_CORPUS_RECORD_COUNT
         or process_evidence.fixture_record_count != REAL_CORPUS_RECORD_COUNT
@@ -2184,8 +2322,17 @@ def combine_benchmark_evidence(
         fts5.report,
         fallback.report,
     )
+    if (
+        fts5.process_facts.proof_query_version
+        != fallback.process_facts.proof_query_version
+        or fts5.process_facts.implementation_fingerprint
+        != fallback.process_facts.implementation_fingerprint
+    ):
+        raise ValueError("both paths must bind one proof/source implementation")
     return BenchmarkEvidenceBundle(
         schema_version=BENCHMARK_BUNDLE_SCHEMA_VERSION,
+        proof_query_version=fts5.process_facts.proof_query_version,
+        implementation_fingerprint=fts5.process_facts.implementation_fingerprint,
         contract=contract,
         contract_digest=contract_digest,
         suite_contract=suite_contract,
@@ -2273,6 +2420,60 @@ class BenchmarkGateDError(RuntimeError):
         super().__init__(error_code)
 
 
+_GATE_D_RUN_RECEIPT_FACTORY_KEY = object()
+
+
+class _GateDRunReceipt:
+    """Module-private issuance proof for one durable runner readback."""
+
+    __slots__ = (
+        "artifact_digest",
+        "artifact_size",
+        "bundle",
+        "bundle_digest",
+        "_sealed",
+        "test_mode",
+    )
+
+    artifact_digest: str
+    artifact_size: int
+    bundle: BenchmarkEvidenceBundle
+    bundle_digest: str
+    _sealed: bool
+    test_mode: bool
+
+    def __init__(
+        self,
+        *,
+        bundle: BenchmarkEvidenceBundle,
+        bundle_digest: str,
+        artifact_size: int,
+        artifact_digest: str,
+        test_mode: bool,
+        _factory_key: object,
+    ) -> None:
+        if _factory_key is not _GATE_D_RUN_RECEIPT_FACTORY_KEY:
+            raise TypeError("Gate D run receipts are owner-issued")
+        self._sealed = False
+        self.bundle = bundle
+        self.bundle_digest = bundle_digest
+        self.artifact_size = artifact_size
+        self.artifact_digest = artifact_digest
+        self.test_mode = test_mode
+        self._sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("Gate D run receipts are immutable")
+        object.__setattr__(self, name, value)
+
+    def __copy__(self) -> _GateDRunReceipt:
+        return self
+
+    def __deepcopy__(self, _memo: object) -> _GateDRunReceipt:
+        return self
+
+
 @dataclass(frozen=True)
 class BenchmarkGateDRunResult:
     """Immutable result of one owner-driven Gate D run.
@@ -2288,6 +2489,7 @@ class BenchmarkGateDRunResult:
     artifact_size: int
     artifact_digest: str
     test_mode: bool
+    _receipt: _GateDRunReceipt = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.bundle) is not BenchmarkEvidenceBundle:
@@ -2323,6 +2525,40 @@ class BenchmarkGateDRunResult:
             )
         if type(self.test_mode) is not bool:
             raise TypeError("run result test mode must be a built-in bool")
+        if type(self._receipt) is not _GateDRunReceipt or (
+            self._receipt.bundle is not self.bundle
+            or self._receipt.bundle_digest != self.bundle_digest
+            or self._receipt.artifact_size != self.artifact_size
+            or self._receipt.artifact_digest != self.artifact_digest
+            or self._receipt.test_mode is not self.test_mode
+        ):
+            raise TypeError("run result must carry its owner-issued receipt")
+
+
+def _issue_benchmark_gate_d_run_result(
+    *,
+    bundle: BenchmarkEvidenceBundle,
+    bundle_digest: str,
+    artifact_size: int,
+    artifact_digest: str,
+    test_mode: bool,
+) -> BenchmarkGateDRunResult:
+    receipt = _GateDRunReceipt(
+        bundle=bundle,
+        bundle_digest=bundle_digest,
+        artifact_size=artifact_size,
+        artifact_digest=artifact_digest,
+        test_mode=test_mode,
+        _factory_key=_GATE_D_RUN_RECEIPT_FACTORY_KEY,
+    )
+    return BenchmarkGateDRunResult(
+        bundle=bundle,
+        bundle_digest=bundle_digest,
+        artifact_size=artifact_size,
+        artifact_digest=artifact_digest,
+        test_mode=test_mode,
+        _receipt=receipt,
+    )
 
 
 @dataclass(frozen=True)
@@ -2613,25 +2849,25 @@ def _remove_owned_file_if_ours(
     path: Path,
     expected_identity: tuple[int, int],
 ) -> None:
-    """Best-effort identity-bound removal; never touches foreign files."""
+    """Identity-bound removal; fail explicitly when cleanup is incomplete."""
     try:
         observed = os.lstat(path)
     except FileNotFoundError:
         return
-    except OSError:
-        return
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
     if (
         stat.S_ISLNK(observed.st_mode)
         or not stat.S_ISREG(observed.st_mode)
         or observed.st_nlink not in (1, 2)
         or (observed.st_dev, observed.st_ino) != expected_identity
     ):
-        return
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
     try:
         os.unlink(path)
         _fsync_directory(path.parent)
-    except OSError:
-        return
+    except (OSError, BenchmarkGateDError) as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
 
 
 def _require_absent_final(evidence_path: Path) -> None:
@@ -2804,6 +3040,14 @@ def _publish_evidence_bundle(
             or benchmark_evidence_bundle_digest(readback) != digest
         ):
             raise BenchmarkGateDError("GATE_D.EVIDENCE_READBACK_MISMATCH")
+        try:
+            implementation_after_publish = benchmark_implementation_fingerprint()
+        except (TypeError, ValueError) as error:
+            raise BenchmarkGateDError(
+                "GATE_D.IMPLEMENTATION_INVALID"
+            ) from error
+        if implementation_after_publish != bundle.implementation_fingerprint:
+            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
     except BenchmarkGateDError:
         if published:
             _remove_owned_file_if_ours(evidence_path, temp_identity)
@@ -3005,6 +3249,10 @@ def _run_benchmark_gate_d_core(
     _validate_contract_path(contract_path)
     _validate_work_root(work_root)
     _validate_evidence_path(evidence_path)
+    try:
+        implementation_before = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_INVALID") from error
     private_dir, work_identity, private_identity = _create_private_run_dir(
         work_root
     )
@@ -3063,6 +3311,18 @@ def _run_benchmark_gate_d_core(
         )
         if type(bundle) is not BenchmarkEvidenceBundle:
             raise BenchmarkGateDError("GATE_D.BUNDLE_INVALID")
+        try:
+            implementation_after = benchmark_implementation_fingerprint()
+        except (TypeError, ValueError) as error:
+            raise BenchmarkGateDError(
+                "GATE_D.IMPLEMENTATION_INVALID"
+            ) from error
+        if (
+            implementation_before != implementation_after
+            or bundle.implementation_fingerprint != implementation_after
+            or bundle.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION
+        ):
+            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
         bundle_digest, artifact_size, artifact_digest, readback = (
             _publish_evidence_bundle(bundle, evidence_path)
         )
@@ -3083,7 +3343,7 @@ def _run_benchmark_gate_d_core(
         work_identity,
         expected_children=root_identities,
     )
-    return BenchmarkGateDRunResult(
+    return _issue_benchmark_gate_d_run_result(
         bundle=readback,
         bundle_digest=bundle_digest,
         artifact_size=artifact_size,
@@ -3236,9 +3496,29 @@ def publish_retrieval_capability_gate_d(
             raise BenchmarkGateDError("GATE_D.MANIFEST_INVALID")
         if type(run_result) is not BenchmarkGateDRunResult:
             raise BenchmarkGateDError("GATE_D.RUN_RESULT_INVALID")
+        receipt = run_result._receipt
+        if type(receipt) is not _GateDRunReceipt or (
+            receipt.bundle is not run_result.bundle
+            or receipt.bundle_digest != run_result.bundle_digest
+            or receipt.artifact_size != run_result.artifact_size
+            or receipt.artifact_digest != run_result.artifact_digest
+            or receipt.test_mode is not run_result.test_mode
+        ):
+            raise BenchmarkGateDError("GATE_D.RUN_RESULT_INVALID")
         if run_result.test_mode:
             raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
         bundle = run_result.bundle
+        try:
+            current_fingerprint = benchmark_implementation_fingerprint()
+        except (TypeError, ValueError) as error:
+            raise BenchmarkGateDError(
+                "GATE_D.IMPLEMENTATION_INVALID"
+            ) from error
+        if (
+            bundle.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION
+            or bundle.implementation_fingerprint != current_fingerprint
+        ):
+            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
         if type(publisher) is not RetrievalCapabilityPublisher:
             raise BenchmarkGateDError("GATE_D.PUBLISHER_INVALID")
         generated = _validate_evidence_utc_string(
@@ -3271,6 +3551,14 @@ def publish_retrieval_capability_gate_d(
             fts5_trigram_benchmark=fts5_evidence,
             gram_fallback_benchmark=fallback_evidence,
         )
+        try:
+            terminal_fingerprint = benchmark_implementation_fingerprint()
+        except (TypeError, ValueError) as error:
+            raise BenchmarkGateDError(
+                "GATE_D.IMPLEMENTATION_INVALID"
+            ) from error
+        if terminal_fingerprint != current_fingerprint:
+            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
         snapshot = publisher.refresh(
             new_manifest,
             evaluated_at_utc=evaluated,
@@ -3328,6 +3616,8 @@ __all__ = [
     "BENCHMARK_BUNDLE_DIGEST_KIND",
     "BENCHMARK_BUNDLE_DIGEST_VERSION",
     "BENCHMARK_BUNDLE_SCHEMA_VERSION",
+    "BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION",
+    "BENCHMARK_IMPLEMENTATION_SOURCE_PATHS",
     "BenchmarkGateDError",
     "BenchmarkGateDRunResult",
     "BenchmarkEvidenceBundle",
@@ -3340,6 +3630,7 @@ __all__ = [
     "benchmark_evidence_bundle_from_payload",
     "benchmark_evidence_bundle_to_json",
     "benchmark_evidence_bundle_to_payload",
+    "benchmark_implementation_fingerprint",
     "combine_benchmark_evidence",
     "publish_retrieval_capability_gate_d",
     "retrieval_benchmark_evidence_by_path",

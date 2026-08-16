@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-import py_compile
 import sys
 import unittest
 
@@ -58,7 +57,7 @@ class TMRetrievalCapabilityModuleBoundariesTest(unittest.TestCase):
         self,
     ) -> None:
         path = PROJECT_ROOT / f"{_CAPABILITY}.py"
-        py_compile.compile(str(path), doraise=True)
+        _ = compile(path.read_text(encoding="utf-8"), str(path), "exec")
         modules = _imported_modules(path)
         self.assertIn("tm_contracts", modules)
         for forbidden in _FORBIDDEN_CAPABILITY_IMPORTS:

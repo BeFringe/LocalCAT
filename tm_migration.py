@@ -95,7 +95,7 @@ import tm_snapshot_artifacts as snapshot_artifacts_module
 
 
 _NATIVE_PATH_TYPE = type(Path())
-MIGRATION_STREAM_CHUNK_SIZE = 5000
+MIGRATION_STREAM_CHUNK_SIZE = 20_000
 
 _EXPORT_JSONL_RECOVERY_SUFFIX = snapshot_artifacts_module._EXPORT_JSONL_RECOVERY_SUFFIX
 """_EXPORT_JSONL_RECOVERY_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
@@ -2159,11 +2159,9 @@ class TMMigrationService:
                 contract_to_json(manifest).encode("utf-8"),
             )
             stage_label = "ACTIVATION"
-            sealed = StageSealer(
-                registry=coordinator.sealed_registry,
-                canonical_store_id=self._canonical_store_id,
-            ).seal(
+            sealed = coordinator._seal_stage(
                 copy_stage,
+                canonical_store_id=self._canonical_store_id,
                 expected_prior_generation=prior_generation,
                 schema_upgrade=True,
             )
@@ -2322,11 +2320,9 @@ class TMMigrationService:
                 batch_id=f"import.{origin_token}",
             )
             stage_label = "ACTIVATION"
-            sealed = StageSealer(
-                registry=coordinator.sealed_registry,
-                canonical_store_id=new_store_id,
-            ).seal(
+            sealed = coordinator._seal_stage(
                 stage,
+                canonical_store_id=new_store_id,
                 expected_prior_generation=prior_generation,
             )
             prepared = coordinator.activate_replacement(sealed)
@@ -3302,6 +3298,7 @@ class TMMigrationService:
                 invalid_count=preflight.invalid_count,
                 duplicate_source_count=preflight.duplicate_source_count,
                 chunk_size=MIGRATION_STREAM_CHUNK_SIZE,
+                _defer_secondary_indexes=True,
             )
             if not _observation_matches(observation, preflight):
                 raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")

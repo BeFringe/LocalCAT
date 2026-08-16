@@ -32,6 +32,7 @@ import tm_contracts as contract_module
 import tm_gate_b
 import tm_migration
 import tm_sqlite_store
+import tm_stage_sealer
 from tm_activation_journal import (
     _ActivationFileIdentity,
     _ActivationJournalHandle,
@@ -465,6 +466,11 @@ def _assert_legacy_reopenable(
     expected_generation: int = 3,
     allow_diverged_runtime: bool = False,
 ) -> None:
+    # macOS exposes the same temporary inode through /var and /private/var.
+    # Normalize the observed backup before constructing the strict adjacent
+    # stage reference; production authority keeps rejecting real cross-parent
+    # paths rather than treating lexical aliases as caller authorization.
+    path = path.resolve(strict=True)
     meta = _active_meta(path)
     ref = MutableStageRef(
         stage_id="stage.schema-upgrade.source",
@@ -508,6 +514,19 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                     service = _service(coordinator, identity)
                     gate_b_reports: list[Any] = []
                     real_gate_b = tm_gate_b.GateBEvaluator.evaluate
+                    real_open_write = (
+                        tm_stage_sealer._open_stage_write_connection
+                    )
+                    real_open_read = (
+                        tm_stage_sealer._open_stage_read_connection
+                    )
+                    traced_sql: list[str] = []
+
+                    def trace_connection(
+                        connection: sqlite3.Connection,
+                    ) -> sqlite3.Connection:
+                        connection.set_trace_callback(traced_sql.append)
+                        return connection
 
                     def capture_gate_b(
                         evaluator: Any,
@@ -531,10 +550,30 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                             autospec=True,
                             side_effect=capture_gate_b,
                         ),
+                        patch(
+                            "tm_stage_sealer._open_stage_write_connection",
+                            side_effect=lambda path: trace_connection(
+                                real_open_write(path)
+                            ),
+                        ),
+                        patch(
+                            "tm_stage_sealer._open_stage_read_connection",
+                            side_effect=lambda path: trace_connection(
+                                real_open_read(path)
+                            ),
+                        ),
                     ):
                         outcome = service.upgrade_schema(
                             prior.staged_db_path
                         )
+                    self.assertEqual(
+                        sum(
+                            sql.strip().casefold()
+                            == "pragma integrity_check"
+                            for sql in traced_sql
+                        ),
+                        1,
+                    )
                     self.assertIsInstance(outcome, SchemaUpgradeReport)
                     report = cast(SchemaUpgradeReport, outcome)
                     self.assertEqual(
@@ -795,6 +834,91 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
 
 
 class SchemaUpgradeFailClosedTests(unittest.TestCase):
+    def test_candidate_mutation_before_first_content_capture_rejected(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    identity, prior, coordinator, _digest = _legacy_fixture(
+                        root,
+                        fts5_available=fts5_available,
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    service = _service(coordinator, identity)
+                    real_capture = tm_stage_sealer._capture_content_file
+                    mutated = False
+
+                    def mutate_then_capture(path: Path) -> Any:
+                        nonlocal mutated
+                        if not mutated:
+                            mutated = True
+                            connection = sqlite3.connect(
+                                path,
+                                isolation_level=None,
+                            )
+                            try:
+                                connection.execute("BEGIN IMMEDIATE")
+                                row = connection.execute(
+                                    "SELECT gram_size, gram, record_id, "
+                                    "term_frequency FROM tm_gram "
+                                    "ORDER BY gram_size, gram, record_id "
+                                    "LIMIT 1"
+                                ).fetchone()
+                                self.assertIsNotNone(row)
+                                assert row is not None
+                                connection.execute(
+                                    "UPDATE tm_gram SET term_frequency = ? "
+                                    "WHERE gram_size = ? AND gram = ? "
+                                    "AND record_id = ?",
+                                    (
+                                        int(row[3]) + 1,
+                                        int(row[0]),
+                                        str(row[1]),
+                                        int(row[2]),
+                                    ),
+                                )
+                                connection.commit()
+                            except BaseException:
+                                connection.rollback()
+                                raise
+                            finally:
+                                connection.close()
+                        return real_capture(path)
+
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=fts5_available,
+                        ),
+                        patch(
+                            "tm_stage_sealer._capture_content_file",
+                            side_effect=mutate_then_capture,
+                        ),
+                    ):
+                        outcome = service.upgrade_schema(
+                            prior.staged_db_path
+                        )
+
+                    self.assertTrue(mutated)
+                    self.assertIsInstance(outcome, SchemaUpgradeFailure)
+                    failure = cast(SchemaUpgradeFailure, outcome)
+                    self.assertEqual(
+                        failure.error_code,
+                        "SEALER.STAGE_MUTATED_AFTER_VALIDATION",
+                    )
+                    self.assertEqual(failure.stage, "ACTIVATION")
+                    self.assertEqual(
+                        failure.active_store_preservation.state,
+                        AssetPreservationState.VERIFIED_UNCHANGED,
+                    )
+                    self.assertEqual(
+                        prior.staged_db_path.read_bytes(),
+                        store_before,
+                    )
+                    self.assertEqual(coordinator.state, "READY")
+
     def test_coordinator_authority_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1372,7 +1496,7 @@ class SchemaUpgradeConcurrencyTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             identity, prior, coordinator, _digest = _legacy_fixture(
                 root,
                 fts5_available=False,
@@ -2064,7 +2188,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             identity, prior, coordinator, _digest = _legacy_fixture(
                 root,
                 fts5_available=False,
@@ -2908,7 +3032,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (
                 identity,
                 prior,
@@ -2992,7 +3116,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (
                 identity,
                 prior,

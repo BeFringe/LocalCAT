@@ -18,13 +18,19 @@ import tm_sqlite_store
 from text_matcher import fold_text_v1
 from tm_candidate_index import (
     CandidateRetriever,
+    _balanced_lcs_partition_v1,
     _dense_phase1_upper_bound,
     _dense_phase2_upper_bound,
+    _dense_phase3_upper_bound,
     _dense_u2_upper_bound,
     _exact_lcs_length,
+    _partition_additive_lcs_distance_v1,
     _should_use_dense_traversal,
 )
 from tm_contracts import (
+    CandidateProofMetadata,
+    CandidateProofRefinementMetadata,
+    CandidateRetrievalReport,
     CandidateStage,
     CanonicalResourceIdentity,
     TMMatchType,
@@ -65,6 +71,22 @@ def _unchecked_replace(value, **changes):
     if receipt is not None:
         object.__setattr__(forged, "_receipt", receipt)
     return forged
+
+
+def _current_proof(report: CandidateRetrievalReport) -> CandidateProofMetadata:
+    proof = report.metadata.proof
+    if type(proof) is not CandidateProofMetadata:
+        raise AssertionError("expected current proof-query-v3 metadata")
+    return proof
+
+
+def _current_refinement(
+    proof: CandidateProofMetadata,
+) -> CandidateProofRefinementMetadata:
+    refinement = proof.refinement
+    if type(refinement) is not CandidateProofRefinementMetadata:
+        raise AssertionError("expected current dense refinement metadata")
+    return refinement
 
 
 def _draft(source: str, ordinal: int) -> TMRecordDraft:
@@ -147,7 +169,7 @@ def _activated_store(
         ).build_mutable_stage(fixture.resolve())
         assert build.mutable_stage is not None
         sealed = StageSealer(
-            registry=coordinator.sealed_registry,
+            registry=coordinator._sealed_registry,
             canonical_store_id=f"store.{resource_id}",
         ).seal(build.mutable_stage, expected_prior_generation=None)
         prepared = coordinator.activate(sealed)
@@ -211,7 +233,7 @@ class CandidateProofQueryTests(unittest.TestCase):
             )
         )
 
-    def test_two_phase_dense_bounds_order_true_score_u3_u2_u1(self) -> None:
+    def test_dense_bounds_order_true_score_u4_u3_u2_u1(self) -> None:
         scorer = SimilarityScorerV1()
         alphabet = "ab"
         values = tuple(
@@ -264,11 +286,27 @@ class CandidateProofQueryTests(unittest.TestCase):
                     ),
                     bigram_intersection=bigram_intersection,
                 )
+                phase4 = _dense_phase3_upper_bound(
+                    query_length=len(query_source),
+                    record_length=len(candidate_source),
+                    lcs_length=_exact_lcs_length(
+                        query_source,
+                        candidate_source,
+                    ),
+                    partition_lcs_distance=(
+                        _partition_additive_lcs_distance_v1(
+                            query_source,
+                            candidate_source,
+                        )
+                    ),
+                    bigram_intersection=bigram_intersection,
+                )
                 true_score = scorer.score(
                     query_source,
                     candidate_source,
                 ).final_similarity
-                self.assertLessEqual(true_score, phase3 + 1e-12)
+                self.assertLessEqual(true_score, phase4 + 1e-12)
+                self.assertLessEqual(phase4, phase3 + 1e-12)
                 self.assertLessEqual(phase3, phase2 + 1e-12)
                 self.assertLessEqual(phase2, phase1 + 1e-12)
 
@@ -329,11 +367,22 @@ class CandidateProofQueryTests(unittest.TestCase):
                 lcs_length=_exact_lcs_length(query_source, candidate_source),
                 bigram_intersection=bigram_intersection,
             )
+            phase4 = _dense_phase3_upper_bound(
+                query_length=len(query_source),
+                record_length=len(candidate_source),
+                lcs_length=_exact_lcs_length(query_source, candidate_source),
+                partition_lcs_distance=_partition_additive_lcs_distance_v1(
+                    query_source,
+                    candidate_source,
+                ),
+                bigram_intersection=bigram_intersection,
+            )
             true_score = scorer.score(
                 query_raw,
                 candidate_raw,
             ).final_similarity
-            self.assertLessEqual(true_score, phase3 + 1e-12)
+            self.assertLessEqual(true_score, phase4 + 1e-12)
+            self.assertLessEqual(phase4, phase3 + 1e-12)
             self.assertLessEqual(phase3, phase2 + 1e-12)
             self.assertLessEqual(phase2, phase1 + 1e-12)
 
@@ -404,9 +453,17 @@ class CandidateProofQueryTests(unittest.TestCase):
             3,
         ):
             projection = tm_candidate_index._ExactLCSQueryProjection(query)
-            observed = tuple(
-                projection.facts(candidate, len(candidate))
-                for candidate in candidates
+            first = projection.facts(candidates[0], len(candidates[0]))
+            self.assertTrue(projection._ascii_reset_pending)
+            second = projection.facts(candidates[1], len(candidates[1]))
+            self.assertFalse(projection._ascii_reset_pending)
+            observed = (
+                first,
+                second,
+                *(
+                    projection.facts(candidate, len(candidate))
+                    for candidate in candidates[2:]
+                ),
             )
 
         self.assertEqual(
@@ -449,7 +506,18 @@ class CandidateProofQueryTests(unittest.TestCase):
             lcs_length=_exact_lcs_length("aaaaa", "aaaba"),
             bigram_intersection=2,
         )
-        self.assertLessEqual(true_score, phase3 + 1e-12)
+        phase4 = _dense_phase3_upper_bound(
+            query_length=5,
+            record_length=5,
+            lcs_length=_exact_lcs_length("aaaaa", "aaaba"),
+            partition_lcs_distance=_partition_additive_lcs_distance_v1(
+                "aaaaa",
+                "aaaba",
+            ),
+            bigram_intersection=2,
+        )
+        self.assertLessEqual(true_score, phase4 + 1e-12)
+        self.assertLessEqual(phase4, phase3 + 1e-12)
         self.assertLessEqual(phase3, phase2 + 1e-12)
         self.assertLessEqual(phase2, phase1 + 1e-12)
         self.assertEqual(
@@ -470,6 +538,45 @@ class CandidateProofQueryTests(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_partition_additive_lcs_matches_naive_definition(self) -> None:
+        def naive(query: str, candidate: str) -> int:
+            unreachable = len(query) + len(candidate) + 1
+            previous = [0] + [unreachable] * len(candidate)
+            for segment in _balanced_lcs_partition_v1(query):
+                previous = [
+                    min(
+                        previous[start]
+                        + max(len(segment), boundary - start)
+                        - _exact_lcs_length(
+                            segment,
+                            candidate[start:boundary],
+                        )
+                        for start in range(boundary + 1)
+                    )
+                    for boundary in range(len(candidate) + 1)
+                ]
+            return previous[-1]
+
+        values = tuple(
+            "".join(characters)
+            for length in range(1, 7)
+            for characters in itertools.product("ab", repeat=length)
+        )
+        for query_source in values:
+            partition = _balanced_lcs_partition_v1(query_source)
+            self.assertEqual("".join(partition), query_source)
+            self.assertTrue(all(len(segment) in (1, 2) for segment in partition))
+            if len(query_source) > 1:
+                self.assertLess(len(partition), len(query_source))
+            for candidate_source in values:
+                self.assertEqual(
+                    _partition_additive_lcs_distance_v1(
+                        query_source,
+                        candidate_source,
+                    ),
+                    naive(query_source, candidate_source),
+                )
 
     def test_global_frontier_opens_high_bound_nonseed_before_low_bound_seed(
         self,
@@ -517,6 +624,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                             query_source,
                             minimum_similarity=0.60,
                             result_limit=10,
+                            completion_policy="oracle_full",
                         )
                         self.assertEqual(opened, [])
                         _ = session.next_batch()
@@ -534,9 +642,9 @@ class CandidateProofQueryTests(unittest.TestCase):
                             resource_order=0,
                             query=_query(query_source),
                             view=view,
+                            completion_policy="oracle_full",
                         )
-                    proof = report.metadata.proof
-                    assert proof is not None
+                    proof = _current_proof(report)
                     self.assertEqual(opened, [1])
                     self.assertEqual(proof.seed_unique_count, 256)
 
@@ -565,6 +673,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                     "a",
                     minimum_similarity=0.60,
                     result_limit=10,
+                    completion_policy="oracle_full",
                 )
                 self.assertEqual(opened, [])
                 batch = session.next_batch()
@@ -639,19 +748,19 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("a"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(proof.total_record_count, 40)
-        self.assertEqual(proof.kth_record_id, 31)
+        self.assertEqual(proof.ranked_kth_record_id, 31)
         self.assertEqual(proof.unscored_possible_record_id, 30)
 
         with self.assertRaises(ValueError):
-            _ = replace(proof, kth_record_id=41)
+            _ = replace(proof, ranked_kth_record_id=41)
         with self.assertRaises(ValueError):
             _ = replace(
                 proof,
-                kth_score=0.1,
+                ranked_kth_score=0.1,
                 unscored_possible_record_id=41,
             )
 
@@ -662,10 +771,14 @@ class CandidateProofQueryTests(unittest.TestCase):
             )
 
         mismatched_proofs = (
-            replace(proof, kth_score=0.1, kth_record_id=1),
             replace(
                 proof,
-                kth_score=0.1,
+                ranked_kth_score=0.1,
+                ranked_kth_record_id=1,
+            ),
+            replace(
+                proof,
+                ranked_kth_score=0.1,
                 unscored_possible_record_id=40,
             ),
         )
@@ -690,23 +803,32 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("a"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         mutations = (
-            ("kth-outside-universe", {"kth_record_id": 41}),
+            ("kth-outside-universe", {"ranked_kth_record_id": 41}),
             (
                 "frontier-outside-universe",
-                {"kth_score": 0.1, "unscored_possible_record_id": 41},
+                {
+                    "ranked_kth_score": 0.1,
+                    "unscored_possible_record_id": 41,
+                },
             ),
             ("seed-stage-mismatch", {"seed_unique_count": 1}),
             (
                 "kth-not-scored",
-                {"kth_score": 0.1, "kth_record_id": 1},
+                {
+                    "ranked_kth_score": 0.1,
+                    "ranked_kth_record_id": 1,
+                },
             ),
             (
                 "frontier-is-scored",
-                {"kth_score": 0.1, "unscored_possible_record_id": 40},
+                {
+                    "ranked_kth_score": 0.1,
+                    "unscored_possible_record_id": 40,
+                },
             ),
             (
                 "invocations-exceed-accounted",
@@ -782,12 +904,11 @@ class CandidateProofQueryTests(unittest.TestCase):
                             query=_query("proof target"),
                             view=view,
                         )
-                proof = report.metadata.proof
-                assert proof is not None
+                proof = _current_proof(report)
                 self.assertEqual(proof.total_record_count, total_record_count)
                 self.assertTrue(proof.threshold_closed)
                 self.assertTrue(proof.top_k_closed)
-                self.assertIsNone(proof.kth_record_id)
+                self.assertIsNone(proof.ranked_kth_record_id)
                 self.assertIsNone(proof.unscored_possible_record_id)
                 self.assertEqual(contract_from_json(contract_to_json(report)), report)
 
@@ -804,23 +925,23 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("a"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
 
         self.assertEqual(fuzzy.accepted, ())
         self.assertIsNotNone(report.metadata.proof)
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertTrue(proof.threshold_closed)
         self.assertTrue(proof.top_k_closed)
         self.assertEqual(proof.scorer_invocation_count, 10)
         self.assertEqual(proof.accounted_identity_count, 10)
-        self.assertEqual(proof.kth_score, 0.0)
-        self.assertEqual(proof.kth_record_id, 31)
+        self.assertEqual(proof.ranked_kth_score, 0.0)
+        self.assertEqual(proof.ranked_kth_record_id, 31)
         self.assertIn(CandidateStage.BOUND_PROOF, tuple(
             stage.stage for stage in report.metadata.stages
         ))
 
-    def test_threshold_equality_remains_eligible_and_forces_exhaustion(self) -> None:
+    def test_threshold_equality_remains_unclosed_but_top_k_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = _store(
                 Path(temporary),
@@ -835,11 +956,17 @@ class CandidateProofQueryTests(unittest.TestCase):
                     view=view,
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
-        self.assertTrue(proof.threshold_closed)
-        self.assertEqual(proof.unscored_identity_count, 0)
-        self.assertIn(1, tuple(result.record_id for result in _fuzzy.accepted))
+        proof = _current_proof(report)
+        self.assertFalse(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+        self.assertTrue(proof.result_complete)
+        self.assertEqual(proof.accounted_identity_count, 10)
+        self.assertEqual(proof.ranked_eligible_count, 10)
+        self.assertEqual(proof.unscored_identity_count, 2)
+        self.assertEqual(
+            tuple(result.record_id for result in _fuzzy.accepted),
+            tuple(range(12, 2, -1)),
+        )
 
     def test_2049_identities_sharing_one_fold_use_one_scorer_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -873,22 +1000,21 @@ class CandidateProofQueryTests(unittest.TestCase):
                     view=view,
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(len(calls), 1)
         self.assertEqual(proof.scorer_invocation_count, 1)
         self.assertEqual(proof.accounted_identity_count, 2049)
         self.assertEqual(proof.unscored_identity_count, 0)
         self.assertEqual(len(report.candidates), 2049)
-        self.assertEqual(phase2_calls, 1)
+        self.assertEqual(phase2_calls, 0)
 
-    def test_2049_distinct_folds_exhaust_after_exactly_2048_calls(self) -> None:
+    def test_projected_2049th_invocation_batch_is_rejected_atomically(self) -> None:
         query_source = "Shared source sentence 6 about recordx"
         with tempfile.TemporaryDirectory() as temporary:
             store = _store(
                 Path(temporary),
                 tuple(
-                    f"Shared source sentence 6 about record{index}"
+                    f"Shared source sentence 6 about record{index:04d}"
                     for index in range(2049)
                 ),
                 fts5_available=False,
@@ -896,6 +1022,36 @@ class CandidateProofQueryTests(unittest.TestCase):
             calls: list[tuple[str, str]] = []
             phase2_calls = 0
             original_phase2 = SQLiteTMQueryView.candidate_proof_dense_phase2
+            original_next_batch = (
+                tm_candidate_index.CandidateProofSession.next_batch
+            )
+            last_issued_state: tuple[
+                tm_candidate_index.CandidateProofSession,
+                tuple[object, ...],
+            ] | None = None
+
+            def private_session_state(
+                session: tm_candidate_index.CandidateProofSession,
+            ) -> tuple[object, ...]:
+                return (
+                    dict(session._scores),
+                    dict(session._ranked_scores),
+                    tuple(session._observation_order),
+                    frozenset(session._outstanding),
+                    session._scorer_invocation_count,
+                )
+
+            def capture_next_batch(
+                session: tm_candidate_index.CandidateProofSession,
+            ) -> tuple[int, ...]:
+                nonlocal last_issued_state
+                record_ids = original_next_batch(session)
+                if record_ids:
+                    last_issued_state = (
+                        session,
+                        private_session_state(session),
+                    )
+                return record_ids
 
             def count_phase2(view: SQLiteTMQueryView, **kwargs):
                 nonlocal phase2_calls
@@ -910,6 +1066,10 @@ class CandidateProofQueryTests(unittest.TestCase):
                 SQLiteTMQueryView,
                 "candidate_proof_dense_phase2",
                 new=count_phase2,
+            ), patch.object(
+                tm_candidate_index.CandidateProofSession,
+                "next_batch",
+                new=capture_next_batch,
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
@@ -918,12 +1078,23 @@ class CandidateProofQueryTests(unittest.TestCase):
                     prove_and_score_fuzzy_candidates(
                         resource_id="tm.primary",
                         resource_order=0,
-                        query=_query(query_source),
+                        query=_query(query_source, threshold=0.0),
                         view=view,
+                        completion_policy="oracle_full",
                     )
 
+        # Candidate exposes the exact remaining 22 slots, then issues the
+        # next batch so Retrieval can reject invocation 2,049 before scoring
+        # or observing any member of that batch.
         self.assertEqual(len(calls), 2048)
         self.assertEqual(phase2_calls, 1)
+        self.assertIsNotNone(last_issued_state)
+        assert last_issued_state is not None
+        failed_session, state_before_rejection = last_issued_state
+        self.assertEqual(
+            private_session_state(failed_session),
+            state_before_rejection,
+        )
 
     def test_3000_identities_in_300_folds_close_with_300_calls(self) -> None:
         query_source = "Shared source sentence 6 about recordx"
@@ -949,16 +1120,15 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query(query_source),
                     view=view,
+                    completion_policy="oracle_full",
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(len(calls), 300)
         self.assertEqual(proof.scorer_invocation_count, 300)
         self.assertEqual(proof.accounted_identity_count, 3000)
         self.assertEqual(proof.unscored_identity_count, 0)
-        refinement = proof.refinement
-        assert refinement is not None
+        refinement = _current_refinement(proof)
         self.assertEqual(refinement.a0_accounted_identity_count, 10)
         self.assertEqual(
             refinement.refinement_request_count,
@@ -971,10 +1141,117 @@ class CandidateProofQueryTests(unittest.TestCase):
             proof.total_record_count,
         )
         self.assertEqual(
-            refinement.a1_accounted_identity_count
-            + refinement.p2_unscored_identity_count,
+            refinement.p2_unscored_identity_count
+            + refinement.s_post_u3_identity_count,
             refinement.r_refinement_identity_count,
         )
+        self.assertEqual(
+            refinement.a1_accounted_identity_count
+            + refinement.p3_unscored_identity_count,
+            refinement.s_post_u3_identity_count,
+        )
+        self.assertLessEqual(
+            refinement.p3_unscored_identity_count,
+            refinement.u4_evaluated_identity_count,
+        )
+        self.assertLessEqual(
+            refinement.u4_evaluated_identity_count,
+            refinement.s_post_u3_identity_count,
+        )
+
+    def test_production_conditional_closes_same_3000_identity_top10(self) -> None:
+        query_source = "Shared source sentence 6 about recordx"
+        sources = tuple(
+            f"Shared source sentence 6 about record{fold_index}"
+            for fold_index in range(300)
+            for _multiplicity in range(10)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                sources,
+                fts5_available=False,
+            )
+            production_calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(production_calls),
+            ):
+                production, production_report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                )
+            with store.query_lease() as view:
+                oracle, _oracle_report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                    completion_policy="oracle_full",
+                )
+
+        proof = _current_proof(production_report)
+        self.assertEqual(len(production_calls), 1)
+        self.assertEqual(proof.scorer_invocation_count, 1)
+        self.assertEqual(proof.ranked_eligible_count, 10)
+        self.assertTrue(proof.result_complete)
+        self.assertFalse(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+        self.assertEqual(
+            tuple(row.record_id for row in production.accepted[:10]),
+            tuple(row.record_id for row in oracle.accepted[:10]),
+        )
+
+    def test_production_u3_probe_closes_without_any_u4_evaluation(self) -> None:
+        query_source = "abaca"
+        exact_fold_peers = tuple(
+            "".join(
+                character.upper() if (mask >> index) & 1 else character
+                for index, character in enumerate(query_source)
+            )
+            for mask in range(1, 33)
+        )
+        sources = (("acaba",) * 558) + exact_fold_peers + (("acaba",) * 10)
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                sources,
+                fts5_available=False,
+            )
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                tm_candidate_index._PartitionLCSQueryProjectionV1,
+                "distance",
+                side_effect=AssertionError("U4 must remain lazy"),
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                )
+
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
+        self.assertEqual(proof.scorer_invocation_count, 2)
+        self.assertEqual(proof.accounted_identity_count, 42)
+        self.assertFalse(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+        self.assertTrue(proof.result_complete)
+        self.assertEqual(refinement.a0_accounted_identity_count, 10)
+        self.assertEqual(refinement.r_refinement_identity_count, 590)
+        self.assertEqual(refinement.a1_accounted_identity_count, 32)
+        self.assertEqual(refinement.p2_unscored_identity_count, 558)
+        self.assertEqual(refinement.s_post_u3_identity_count, 32)
+        self.assertEqual(refinement.u4_evaluated_identity_count, 0)
+        self.assertEqual(refinement.p3_unscored_identity_count, 0)
+        self.assertEqual(refinement.p2_max_upper_bound, 0.8)
+        self.assertEqual(refinement.p2_possible_record_id, 558)
 
     def test_partial_final_batch_stops_at_the_closed_frontier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -992,15 +1269,14 @@ class CandidateProofQueryTests(unittest.TestCase):
                     view=view,
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(proof.scorer_invocation_count, 1)
-        self.assertEqual(proof.accounted_identity_count, 11)
-        self.assertEqual(proof.unscored_identity_count, 31)
-        self.assertTrue(proof.threshold_closed)
+        self.assertEqual(proof.accounted_identity_count, 10)
+        self.assertEqual(proof.ranked_eligible_count, 10)
+        self.assertEqual(proof.unscored_identity_count, 32)
+        self.assertFalse(proof.threshold_closed)
         self.assertTrue(proof.top_k_closed)
-        self.assertTrue(proof.threshold_closed)
-        self.assertTrue(proof.top_k_closed)
+        self.assertTrue(proof.result_complete)
 
     def test_full_fold_equivalence_reuses_evidence_and_preserves_raw_rows(
         self,
@@ -1021,8 +1297,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                     view=view,
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(len(calls), 1)
         self.assertEqual(proof.scorer_invocation_count, 1)
         self.assertEqual(proof.accounted_identity_count, 3)
@@ -1033,6 +1308,146 @@ class CandidateProofQueryTests(unittest.TestCase):
         serialized = contract_to_json(report)
         self.assertNotIn("CAFÉ SOURCE", serialized)
         self.assertNotIn("cafe\\u0301 source", serialized)
+
+    def test_raw_exact_high_ids_do_not_enter_dense_k0_or_ranked_kth(self) -> None:
+        query_source = "alpha beta gamma"
+        fuzzy_sources = tuple(
+            f"{query_source} variant {index}"
+            for index in range(10)
+        )
+        sources = fuzzy_sources + ((query_source,) * 10)
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(Path(temporary), sources, fts5_available=False)
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ):
+                fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source, threshold=0.0),
+                    view=view,
+                    completion_policy="oracle_full",
+                )
+
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
+        self.assertEqual(proof.accounted_identity_count, 20)
+        self.assertEqual(proof.ranked_eligible_count, 10)
+        self.assertEqual(
+            set(row.record_id for row in fuzzy.accepted),
+            set(range(1, 11)),
+        )
+        self.assertIsNotNone(proof.ranked_kth_record_id)
+        assert proof.ranked_kth_record_id is not None
+        self.assertLessEqual(proof.ranked_kth_record_id, 10)
+        self.assertEqual(
+            (
+                refinement.k0_score,
+                refinement.k0_record_id,
+            ),
+            (
+                proof.ranked_kth_score,
+                proof.ranked_kth_record_id,
+            ),
+        )
+
+    def test_same_fold_raw_exact_and_peers_keep_three_domains_distinct(self) -> None:
+        query_source = "CAFÉ SOURCE"
+        lower = "café source"
+        peers = tuple(
+            "".join(
+                character.upper()
+                if character.isalpha() and (mask >> index) & 1
+                else character
+                for index, character in enumerate(lower)
+            )
+            for mask in range(12)
+        )
+        self.assertEqual(len(set(peers)), 12)
+        self.assertTrue(all(
+            fold_text_v1(peer) == fold_text_v1(query_source)
+            for peer in peers
+        ))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                peers + (query_source,),
+                fts5_available=False,
+            )
+            calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ):
+                fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source, threshold=1.0),
+                    view=view,
+                )
+
+        proof = _current_proof(report)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(proof.scorer_invocation_count, 1)
+        self.assertEqual(proof.accounted_identity_count, 11)
+        self.assertEqual(proof.ranked_eligible_count, 10)
+        self.assertEqual(proof.ranked_kth_score, 1.0)
+        self.assertEqual(proof.ranked_kth_record_id, 3)
+        self.assertEqual(
+            tuple(row.record_id for row in fuzzy.accepted),
+            tuple(range(12, 2, -1)),
+        )
+
+    def test_retrieval_rejects_forged_ranked_subset_containing_raw_exact(self) -> None:
+        query_source = "CAFÉ SOURCE"
+        lower = "café source"
+        peers = tuple(
+            "".join(
+                character.upper()
+                if character.isalpha() and (mask >> index) & 1
+                else character
+                for index, character in enumerate(lower)
+            )
+            for mask in range(10)
+        )
+        original_observe = tm_candidate_index.CandidateProofSession.observe
+
+        def forge_ranked_subset(session, observations, *, ranked_record_ids):
+            observation_ids = tuple(item[0] for item in observations)
+            forged_ranked_ids = tuple(
+                record_id
+                for record_id in observation_ids
+                if record_id == 11 or record_id in ranked_record_ids
+            )
+            return original_observe(
+                session,
+                observations,
+                ranked_record_ids=forged_ranked_ids,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                peers + (query_source,),
+                fts5_available=False,
+            )
+            with store.query_lease() as view, patch.object(
+                tm_candidate_index.CandidateProofSession,
+                "observe",
+                new=forge_ranked_subset,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^proof report must publish closed scorer conservation$",
+                ):
+                    prove_and_score_fuzzy_candidates(
+                        resource_id="tm.primary",
+                        resource_order=0,
+                        query=_query(query_source, threshold=1.0),
+                        view=view,
+                    )
 
     def test_equal_length_character_and_bigram_facts_do_not_authorize_reuse(
         self,
@@ -1056,8 +1471,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                     view=view,
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None
+        proof = _current_proof(report)
         self.assertEqual(len(calls), 2)
         self.assertEqual(proof.scorer_invocation_count, 2)
         self.assertEqual(proof.accounted_identity_count, 2)
@@ -1119,18 +1533,158 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("a"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
-        proof = report.metadata.proof
-        assert proof is not None and proof.refinement is not None
-        refinement = proof.refinement
-        self.assertEqual(proof.kth_score, 0.0)
-        self.assertEqual(proof.kth_record_id, 591)
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
+        self.assertEqual(proof.ranked_kth_score, 0.0)
+        self.assertEqual(proof.ranked_kth_record_id, 591)
         self.assertEqual(refinement.k0_score, 0.0)
         self.assertEqual(refinement.k0_record_id, 591)
         self.assertEqual(refinement.p1_unscored_identity_count, 0)
         self.assertEqual(refinement.p2_unscored_identity_count, 590)
         self.assertEqual(refinement.p2_max_upper_bound, 0.0)
         self.assertEqual(refinement.p2_possible_record_id, 590)
+
+    def test_u4_excludes_p3_without_partition_equivalence_reuse(self) -> None:
+        query_source = "aaabb"
+        high_score_prefix = tuple(
+            "".join(
+                character.upper() if (mask >> index) & 1 else character
+                for index, character in enumerate(query_source)
+            )
+            for mask in range(1, 11)
+        )
+        partition_calls: list[str] = []
+        original_partition_distance = (
+            tm_candidate_index._PartitionLCSQueryProjectionV1.distance
+        )
+
+        def count_partition_distance(
+            projection: tm_candidate_index._PartitionLCSQueryProjectionV1,
+            candidate: str,
+        ) -> int:
+            partition_calls.append(candidate)
+            return original_partition_distance(projection, candidate)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _store(
+                Path(temporary),
+                high_score_prefix + (("abbaa",) * 590),
+                fts5_available=False,
+            )
+            calls: list[tuple[str, str]] = []
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                tm_candidate_index._PartitionLCSQueryProjectionV1,
+                "distance",
+                new=count_partition_distance,
+            ), patch.object(
+                SimilarityScorerV1,
+                "score",
+                new=_counting_production_score(calls),
+            ):
+                _fuzzy, report = prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                    completion_policy="oracle_full",
+                )
+
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
+        self.assertEqual(
+            len(partition_calls),
+            refinement.u4_evaluated_identity_count,
+        )
+        self.assertEqual(set(partition_calls), {"abbaa"})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(proof.scorer_invocation_count, 2)
+        self.assertEqual(refinement.a0_accounted_identity_count, 10)
+        self.assertEqual(refinement.p1_unscored_identity_count, 0)
+        self.assertEqual(refinement.r_refinement_identity_count, 590)
+        self.assertEqual(refinement.p2_unscored_identity_count, 0)
+        self.assertEqual(refinement.s_post_u3_identity_count, 590)
+        self.assertEqual(refinement.a1_accounted_identity_count, 32)
+        self.assertEqual(refinement.u4_evaluated_identity_count, 558)
+        self.assertEqual(refinement.p3_unscored_identity_count, 558)
+        self.assertEqual(refinement.p3_max_upper_bound, 0.475)
+        self.assertEqual(refinement.p3_possible_record_id, 568)
+        self.assertEqual(
+            (
+                proof.unscored_max_upper_bound,
+                proof.unscored_possible_record_id,
+            ),
+            (
+                refinement.p3_max_upper_bound,
+                refinement.p3_possible_record_id,
+            ),
+        )
+
+    def test_append_during_lazy_u4_is_caught_by_final_validation(self) -> None:
+        query_source = "aaabb"
+        high_score_prefix = tuple(
+            "".join(
+                character.upper() if (mask >> index) & 1 else character
+                for index, character in enumerate(query_source)
+            )
+            for mask in range(1, 11)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = _store(
+                root,
+                high_score_prefix + (("abbaa",) * 590),
+                fts5_available=False,
+            )
+            original_distance = (
+                tm_candidate_index._PartitionLCSQueryProjectionV1.distance
+            )
+            distance_calls = 0
+            append_elapsed = 0.0
+
+            def append_during_distance(
+                projection: tm_candidate_index._PartitionLCSQueryProjectionV1,
+                candidate: str,
+            ) -> int:
+                nonlocal distance_calls, append_elapsed
+                distance_calls += 1
+                if distance_calls == 1:
+                    started = time.perf_counter()
+                    store.append_batch(
+                        batch_id="import.concurrent-u4",
+                        kind="import",
+                        drafts=(_draft("concurrent U4 row", 999),),
+                        source_digest="5" * 64,
+                        source_path=(root / "concurrent-u4.jsonl").resolve(),
+                    )
+                    append_elapsed = time.perf_counter() - started
+                return original_distance(projection, candidate)
+
+            with store.query_lease() as view, patch(
+                "tm_candidate_index._should_use_dense_traversal",
+                return_value=True,
+            ), patch.object(
+                tm_candidate_index._PartitionLCSQueryProjectionV1,
+                "distance",
+                new=append_during_distance,
+            ), self.assertRaisesRegex(
+                Exception,
+                "STORE.CANDIDATE_PROOF_STALE",
+            ):
+                prove_and_score_fuzzy_candidates(
+                    resource_id="tm.primary",
+                    resource_order=0,
+                    query=_query(query_source),
+                    view=view,
+                    completion_policy="oracle_full",
+                )
+
+        self.assertGreater(distance_calls, 0)
+        self.assertLess(append_elapsed, 1.0)
 
     def test_public_candidate_evidence_contains_only_exact_bigram_facts(
         self,
@@ -1158,6 +1712,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                         resource_order=0,
                         query=_query(query_source),
                         view=view,
+                        completion_policy="oracle_full",
                     )
 
             self.assertTrue(report.candidates)
@@ -1189,10 +1744,10 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("abcdefghij"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
-        proof = report.metadata.proof
-        assert proof is not None and proof.refinement is not None
-        refinement = proof.refinement
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
         self.assertEqual(refinement.p1_unscored_identity_count, 590)
         encoded = contract_to_json(report)
         nested_mutations = (
@@ -1227,16 +1782,19 @@ class CandidateProofQueryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     contract_from_json(json.dumps(payload))
 
-        assert proof.kth_score is not None and proof.kth_record_id is not None
+        assert (
+            proof.ranked_kth_score is not None
+            and proof.ranked_kth_record_id is not None
+        )
         with self.assertRaises(ValueError):
             _ = replace(
                 proof,
-                unscored_max_upper_bound=proof.kth_score,
-                unscored_possible_record_id=proof.kth_record_id,
+                unscored_max_upper_bound=proof.ranked_kth_score,
+                unscored_possible_record_id=proof.ranked_kth_record_id,
                 refinement=replace(
                     refinement,
-                    p1_max_upper_bound=proof.kth_score,
-                    p1_possible_record_id=proof.kth_record_id,
+                    p1_max_upper_bound=proof.ranked_kth_score,
+                    p1_possible_record_id=proof.ranked_kth_record_id,
                 ),
             )
 
@@ -1406,13 +1964,14 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("shared source sentence about recordx"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
 
-        proof = report.metadata.proof
-        assert proof is not None and proof.refinement is not None
+        proof = _current_proof(report)
+        refinement = _current_refinement(proof)
         phase2_return = events.index("phase2-return")
         post_phase2 = events[phase2_return + 1 :]
-        refinement_count = proof.refinement.r_refinement_identity_count
+        refinement_count = refinement.r_refinement_identity_count
         self.assertEqual(phase2_calls, 1)
         self.assertTrue(batch_sizes)
         self.assertLessEqual(max(batch_sizes), 32)
@@ -1686,6 +2245,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("shared source sentence about recordx"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
             self.assertEqual(writer_errors, [])
 
@@ -1739,6 +2299,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                     resource_order=0,
                     query=_query("shared source sentence about recordx"),
                     view=view,
+                    completion_policy="oracle_full",
                 )
             self.assertGreaterEqual(calls, 11)
             self.assertLess(append_elapsed, 1.0)
@@ -1847,6 +2408,7 @@ class CandidateProofQueryTests(unittest.TestCase):
                                     resource_order=0,
                                     query=_query("proof target"),
                                     view=view,
+                                    completion_policy="oracle_full",
                                 )
 
     def test_generation_change_after_snapshot_fails_closed(self) -> None:
@@ -1913,15 +2475,40 @@ class CandidateProofQueryTests(unittest.TestCase):
                 limit=10,
                 resource_order=("tm.failed", "tm.healthy"),
             )
-            report = TMRetrievalService(
-                capability_publisher=_retrieval_capability_publisher(),
-            ).query(
-                (
-                    TMResourceHandle("tm.failed", failed_store, True, True, True, 0),
-                    TMResourceHandle("tm.healthy", healthy_store, True, True, True, 1),
-                ),
-                query,
-            )
+            original_proof = prove_and_score_fuzzy_candidates
+
+            def fail_one_resource(**kwargs):
+                if kwargs["resource_id"] == "tm.failed":
+                    raise tm_candidate_index.CandidateProofBudgetExhausted()
+                return original_proof(**kwargs)
+
+            with patch(
+                "tm_retrieval.prove_and_score_fuzzy_candidates",
+                new=fail_one_resource,
+            ):
+                report = TMRetrievalService(
+                    capability_publisher=_retrieval_capability_publisher(),
+                ).query(
+                    (
+                        TMResourceHandle(
+                            "tm.failed",
+                            failed_store,
+                            True,
+                            True,
+                            True,
+                            0,
+                        ),
+                        TMResourceHandle(
+                            "tm.healthy",
+                            healthy_store,
+                            True,
+                            True,
+                            True,
+                            1,
+                        ),
+                    ),
+                    query,
+                )
 
         self.assertEqual(
             tuple((failure.resource_id, failure.stage, failure.error_code)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -103,7 +104,7 @@ def _strict_source_digest(root: Path, relative: str) -> str:
             dir_fd=directory_descriptor,
         )
         opened = os.fstat(file_descriptor)
-        if not stat.S_ISREG(opened.st_mode):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise ValueError("acceptance-matrix source is not regular")
         digest = hashlib.sha256()
         while chunk := os.read(file_descriptor, 1024 * 1024):
@@ -115,6 +116,7 @@ def _strict_source_digest(root: Path, relative: str) -> str:
         )
         if (
             not stat.S_ISREG(terminal.st_mode)
+            or terminal.st_nlink != 1
             or (terminal.st_dev, terminal.st_ino)
             != (opened.st_dev, opened.st_ino)
         ):
@@ -148,7 +150,7 @@ def _validate_evidence_target(path: Path) -> None:
         observed = os.lstat(path)
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(observed.st_mode):
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
         raise ValueError("acceptance matrix evidence target is not regular")
 
 
@@ -166,7 +168,11 @@ def _run_row(row_id: str, test_ids: tuple[str, ...]) -> bool:
     return True
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(
+    path: Path,
+    payload: bytes,
+    validate_snapshot: Callable[[], None],
+) -> None:
     parent = path.parent.resolve(strict=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".tm-acceptance-matrix-",
@@ -179,6 +185,8 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+            published_identity = os.fstat(stream.fileno())
+        validate_snapshot()
         os.replace(temporary, path)
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
@@ -188,6 +196,33 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             os.fsync(parent_descriptor)
         finally:
             os.close(parent_descriptor)
+        observed = os.lstat(path)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino)
+            != (published_identity.st_dev, published_identity.st_ino)
+        ):
+            raise ValueError("acceptance matrix evidence identity changed")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        read_descriptor = os.open(path, flags)
+        try:
+            readback = bytearray()
+            while chunk := os.read(read_descriptor, 1024 * 1024):
+                readback.extend(chunk)
+            terminal = os.fstat(read_descriptor)
+        finally:
+            os.close(read_descriptor)
+        if (
+            bytes(readback) != payload
+            or terminal.st_nlink != 1
+            or (terminal.st_dev, terminal.st_ino)
+            != (published_identity.st_dev, published_identity.st_ino)
+        ):
+            raise ValueError("acceptance matrix evidence readback changed")
+        validate_snapshot()
     except BaseException:
         try:
             temporary.unlink()
@@ -235,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                 "test_ids": list(row.test_ids),
             }
         )
+    source_files_after = _source_file_digests(repository_root)
+    if source_files_after != source_files:
+        raise ValueError("acceptance-matrix sources changed during validation")
 
     evidence = {
         "generated_at_utc": datetime.now(timezone.utc).strftime(
@@ -257,9 +295,14 @@ def main(argv: list[str] | None = None) -> int:
         },
         "tasks": sorted({row.task for row in ACCEPTANCE_MATRIX_ROWS}),
     }
+    def validate_snapshot() -> None:
+        if _source_file_digests(repository_root) != source_files:
+            raise ValueError("acceptance-matrix sources changed before emit")
+
     _atomic_write(
         evidence_path,
         (_canonical_json(evidence) + "\n").encode("utf-8"),
+        validate_snapshot,
     )
     print(
         _canonical_json(

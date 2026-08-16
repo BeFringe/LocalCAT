@@ -254,6 +254,25 @@ TASK_9_1_ROWS: tuple[FaultMatrixRow, ...] = (
         "Opening a store requires the exact approved schema and semantics facts.",
     ),
     _row(
+        "9.1.CORRUPT_INPUT.06",
+        FaultClass.CORRUPT_INPUT,
+        "Sealed and active attestations reject codec, byte, inode, and semantic drift",
+        "tm_content_attestation.py:sealed and active content proof boundary",
+        (
+            "tests.test_tm_content_attestation.ContentAttestationCodecTests."
+            "test_sealed_and_active_codecs_are_exact_and_digest_closed",
+            "tests.test_tm_content_attestation.ContentFileProofTests."
+            "test_capture_binds_exact_bytes_and_inode",
+            "tests.test_tm_activation_recovery.ActivationRecoveryFailStopTests."
+            "test_terminal_active_attestation_rejects_bytes_and_inode_drift",
+            "tests.test_tm_activation_publication.ActivationPublicationFailureTests."
+            "test_semantic_mutation_after_receipt_owner_never_self_attests",
+            "tests.test_tm_activation_recovery.ActivationRecoveryCompletionTests."
+            "test_second_fresh_coordinator_rehydrates_after_terminal_completion",
+        ),
+        "Only exact, digest-closed content identities and semantic facts can be reused; drift fails before health or generation publication.",
+    ),
+    _row(
         "9.1.WRITE_FAULT.01",
         FaultClass.WRITE_FAULT,
         "Origin or record write failure leaves no partial batch",

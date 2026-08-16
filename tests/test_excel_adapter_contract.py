@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import json
-import py_compile
 import subprocess
 import sys
 import tempfile
@@ -209,7 +208,11 @@ class ExcelAdapterContractTest(unittest.TestCase):
 
     def test_interactive_adapter_compiles_and_only_reaches_engine_via_logic(self) -> None:
         adapter_path = PROJECT_ROOT / "excel_adapter.py"
-        py_compile.compile(str(adapter_path), doraise=True)
+        _ = compile(
+            adapter_path.read_text(encoding="utf-8"),
+            str(adapter_path),
+            "exec",
+        )
         tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
         imported_modules = {
             node.module

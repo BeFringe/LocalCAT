@@ -33,8 +33,8 @@ from tm_contracts import (
 )
 from tm_stage_sealer import (
     _PhysicalReadinessSnapshot,
+    _SealedArtifactReadinessView,
     _require_linearization_closure,
-    SealedArtifactRegistry,
     StageSealError,
 )
 
@@ -799,16 +799,16 @@ def _grant_report(
 class GateBEvaluator:
     """Fresh canonical physical readiness evaluation for one sealed artifact.
 
-    Authority comes only from the coordinator-owned SealedArtifactRegistry;
-    structurally compatible fakes and registry subclasses are rejected at the
+    Authority comes only from the coordinator-owned exact read-only registry
+    view; structurally compatible fakes and subclasses are rejected at the
     boundary, so no caller-created snapshot can reach the grant factory.
     """
 
-    def __init__(self, *, registry: SealedArtifactRegistry) -> None:
-        if type(registry) is not SealedArtifactRegistry:
+    def __init__(self, *, registry: _SealedArtifactReadinessView) -> None:
+        if type(registry) is not _SealedArtifactReadinessView:
             raise TypeError(
                 "Gate B requires the coordinator-owned "
-                "SealedArtifactRegistry"
+                "sealed artifact readiness view"
             )
         self._registry = registry
 

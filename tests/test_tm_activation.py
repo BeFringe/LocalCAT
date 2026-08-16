@@ -39,7 +39,10 @@ from tm_sqlite_store import (
     SQLiteTMStore,
     initialize_stage_schema,
 )
-from tm_stage_sealer import SealedArtifactRegistry, StageSealer
+from tm_stage_sealer import (
+    _SealedArtifactRegistry as SealedArtifactRegistry,
+    StageSealer,
+)
 
 
 SOURCE_BYTES = (
@@ -62,7 +65,7 @@ def _identity(
 def _registry(
     coordinator: ResourceStoreCoordinator,
 ) -> SealedArtifactRegistry:
-    return cast(SealedArtifactRegistry, coordinator.sealed_registry)
+    return cast(SealedArtifactRegistry, coordinator._sealed_registry)
 
 
 def _candidate(
@@ -82,11 +85,9 @@ def _candidate(
         stage = build.mutable_stage
         if stage is None:
             raise AssertionError("expected a fresh mutable stage")
-        sealed = StageSealer(
-            registry=coordinator.sealed_registry,
-            canonical_store_id=canonical_store_id,
-        ).seal(
+        sealed = coordinator._seal_stage(
             stage,
+            canonical_store_id=canonical_store_id,
             expected_prior_generation=expected_prior_generation,
         )
     return stage, sealed
@@ -220,7 +221,24 @@ def _clone_sealed_stage(
     )
     shutil.copyfile(stage.staged_db_path, clone.staged_db_path)
     shutil.copyfile(stage.manifest_temp_path, clone.manifest_temp_path)
-    return registry.seal(clone, sealed.evidence, sealed.generation)
+    connection = sqlite3.connect(str(clone.staged_db_path))
+    try:
+        connection.execute(
+            "UPDATE tm_meta SET value = 'UNPUBLISHED' "
+            "WHERE key = 'activation_status' AND value = 'SEALED'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return StageSealer(
+        registry=registry,
+        canonical_store_id=(
+            sealed.evidence.source_binding.receipt.canonical_store_id
+        ),
+    ).seal(
+        clone,
+        expected_prior_generation=sealed.expected_prior_generation,
+    )
 
 
 class _SealedStageSubclass(SealedStage):
@@ -559,7 +577,7 @@ class ActivationPreparationBoundaryTests(unittest.TestCase):
                         expected_prior_generation=None,
                     )
                     report = GateBEvaluator(
-                        registry=_registry(coordinator)
+                        registry=_registry(coordinator)._readiness_view()
                     ).evaluate(sealed)
                     self.assertTrue(report.granted)
                     path = {

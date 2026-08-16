@@ -10,7 +10,8 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -19,10 +20,13 @@ import tools.validate_tm_release_criteria as validator
 from tests.acceptance_matrix_registry import ACCEPTANCE_MATRIX_ROWS
 from tests.fault_matrix_registry import FAULT_MATRIX_ROWS
 from tests.release_criteria_registry import (
+    BENCHMARK_CLAIMS,
     RELEASE_CRITERIA_BINDINGS,
     RELEASE_CRITERIA_SCHEMA_VERSION,
     parse_requirement_criteria,
     release_criteria_registry_digest,
+    release_criteria_source_fingerprint,
+    release_criteria_source_paths,
 )
 from tm_benchmark_gate import benchmark_evidence_bundle_from_json
 
@@ -74,6 +78,22 @@ def _flatten(suite: unittest.TestSuite) -> tuple[unittest.TestCase, ...]:
 
 
 class ReleaseCriteriaRegistryTests(unittest.TestCase):
+    def test_release_owner_source_inventory_is_closed(self) -> None:
+        paths = release_criteria_source_paths()
+        self.assertEqual(paths, tuple(sorted(set(paths))))
+        self.assertIn("tools/validate_tm_release_criteria.py", paths)
+        self.assertIn("tests/release_criteria_registry.py", paths)
+        self.assertIn("tests/test_editor_controller_writes.py", paths)
+        source_files = tuple(
+            (path, hashlib.sha256((_ROOT / path).read_bytes()).hexdigest())
+            for path in paths
+        )
+        fingerprint = release_criteria_source_fingerprint(
+            release_criteria_registry_digest(),
+            source_files,
+        )
+        self.assertIsNotNone(_SHA256.fullmatch(fingerprint))
+
     def test_requirements_parser_and_registry_are_exactly_86(self) -> None:
         criteria = parse_requirement_criteria(
             _REQUIREMENTS.read_text(encoding="utf-8")
@@ -120,14 +140,28 @@ class ReleaseCriteriaRegistryTests(unittest.TestCase):
                     self.assertEqual(resolved[0].id(), value)
                     direct_tests.add(value)
                 elif kind == "benchmark":
-                    self.assertIn(value, validator._benchmark_claim_statuses(
-                        benchmark_evidence_bundle_from_json(
-                            _BENCHMARK.read_text(encoding="utf-8")
-                        )
-                    ))
+                    self.assertIn(value, BENCHMARK_CLAIMS)
                 else:
                     self.fail(f"unknown evidence kind: {kind}")
         self.assertEqual(len(direct_tests), 12)
+
+    def test_release_execution_replays_every_matrix_test(self) -> None:
+        matrix_ids, direct_ids, executed_ids = (
+            validator._release_execution_test_ids()
+        )
+        expected_matrix = tuple(
+            dict.fromkeys(
+                test_id
+                for row in (*ACCEPTANCE_MATRIX_ROWS, *FAULT_MATRIX_ROWS)
+                for test_id in row.test_ids
+            )
+        )
+        self.assertEqual(matrix_ids, expected_matrix)
+        self.assertEqual(len(direct_ids), 12)
+        self.assertEqual(
+            executed_ids,
+            tuple(dict.fromkeys((*matrix_ids, *direct_ids))),
+        )
 
     def test_parser_rejects_unowned_or_duplicate_criteria(self) -> None:
         with self.assertRaisesRegex(ValueError, "no requirement"):
@@ -142,7 +176,7 @@ class ReleaseCriteriaRegistryTests(unittest.TestCase):
 
 
 class ReleaseCriteriaEvidenceTests(unittest.TestCase):
-    def test_evidence_is_fresh_complete_and_truthfully_no_go(self) -> None:
+    def test_evidence_is_fresh_complete_and_truthfully_go(self) -> None:
         evidence = _load_evidence()
         self.assertEqual(
             set(evidence),
@@ -155,6 +189,7 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
                 "release_decision",
                 "rows",
                 "schema_version",
+                "source_files",
                 "source_fingerprint",
                 "summary",
             },
@@ -184,6 +219,7 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
                 "benchmark_evidence_sha256",
                 "fault_evidence_sha256",
                 "fault_source_fingerprint",
+                "release_owner_source_fingerprint",
                 "requirements_sha256",
             },
         )
@@ -207,6 +243,36 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
             if type(value) is not str:
                 raise AssertionError("input digest must be a string")
             self.assertIsNotNone(_SHA256.fullmatch(value))
+
+        raw_source_files = evidence["source_files"]
+        if type(raw_source_files) is not list:
+            raise AssertionError("release source files must be a list")
+        source_files: list[tuple[str, str]] = []
+        for raw_source in raw_source_files:
+            if type(raw_source) is not dict:
+                raise AssertionError("release source fact must be an object")
+            source = cast(dict[str, object], raw_source)
+            self.assertEqual(set(source), {"path", "sha256"})
+            path = source["path"]
+            digest = source["sha256"]
+            if type(path) is not str or type(digest) is not str:
+                raise AssertionError("release source fact must use strings")
+            self.assertEqual(
+                digest,
+                hashlib.sha256((_ROOT / path).read_bytes()).hexdigest(),
+            )
+            source_files.append((path, digest))
+        self.assertEqual(
+            tuple(path for path, _digest_value in source_files),
+            release_criteria_source_paths(),
+        )
+        self.assertEqual(
+            inputs["release_owner_source_fingerprint"],
+            release_criteria_source_fingerprint(
+                registry_digest,
+                tuple(source_files),
+            ),
+        )
 
         benchmark_bundle = benchmark_evidence_bundle_from_json(
             _BENCHMARK.read_text(encoding="utf-8")
@@ -261,19 +327,25 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
             statuses[criterion.criterion_id] = status
         self.assertEqual(
             Counter(statuses.values()),
-            Counter({"PASS": 84, "BLOCKED": 2}),
+            Counter({"PASS": 86}),
         )
-        self.assertEqual(statuses["8.2"], "BLOCKED")
-        self.assertEqual(statuses["8.3"], "BLOCKED")
-        self.assertEqual(evidence["blocked_criteria"], ["8.2", "8.3"])
-        self.assertEqual(evidence["release_decision"], "NO_GO")
+        self.assertEqual(statuses["8.2"], "PASS")
+        self.assertEqual(statuses["8.3"], "PASS")
+        self.assertEqual(evidence["blocked_criteria"], [])
+        self.assertEqual(evidence["release_decision"], "GO")
         self.assertEqual(
             evidence["summary"],
             {
-                "blocked_criteria": 2,
+                "blocked_criteria": 0,
                 "direct_tests": 12,
+                "executed_tests": len(
+                    validator._release_execution_test_ids()[2]
+                ),
+                "matrix_tests": len(
+                    validator._release_execution_test_ids()[0]
+                ),
                 "mapped_criteria": 86,
-                "passed_criteria": 84,
+                "passed_criteria": 86,
                 "total_criteria": 86,
             },
         )
@@ -286,13 +358,13 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
         self.assertEqual(
             validator._benchmark_claim_statuses(bundle),
             {
-                "CANDIDATE_RECALL": "BLOCKED",
+                "CANDIDATE_RECALL": "PASS",
                 "ENVIRONMENT": "PASS",
                 "EXACT_P95": "PASS",
                 "FAILURE_REPORT": "PASS",
-                "FUZZY_P95": "BLOCKED",
+                "FUZZY_P95": "PASS",
                 "METRICS": "PASS",
-                "MIGRATION": "BLOCKED",
+                "MIGRATION": "PASS",
                 "PEAK_RSS": "PASS",
             },
         )
@@ -300,7 +372,7 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
             evidence["benchmark_blockers"],
             list(validator._benchmark_blockers(bundle)),
         )
-        self.assertEqual(len(cast(list[object], evidence["benchmark_blockers"])), 6)
+        self.assertEqual(len(cast(list[object], evidence["benchmark_blockers"])), 0)
 
     def test_evidence_parser_rejects_duplicates_and_nonfinite(self) -> None:
         with self.assertRaises(ValueError):
@@ -313,6 +385,74 @@ class ReleaseCriteriaEvidenceTests(unittest.TestCase):
 
 
 class ReleaseCriteriaValidatorTests(unittest.TestCase):
+    def test_matrix_metadata_is_recomputed_not_self_reported(self) -> None:
+        rows = ACCEPTANCE_MATRIX_ROWS
+        valid: dict[str, object] = {
+            "generated_at_utc": "2026-08-15T00:00:00Z",
+            "tasks": sorted({row.task for row in rows}),
+            "summary": {
+                "passed_rows": len(rows),
+                "referenced_tests": sum(len(row.test_ids) for row in rows),
+                "total_rows": len(rows),
+            },
+        }
+        validator._validate_matrix_metadata(valid, rows)
+        for field, forged in (
+            ("generated_at_utc", "not-utc"),
+            ("tasks", []),
+            ("summary", {"passed_rows": len(rows)}),
+        ):
+            altered = dict(valid)
+            altered[field] = forged
+            with self.assertRaises((TypeError, ValueError)):
+                validator._validate_matrix_metadata(altered, rows)
+
+    def test_full_pass_satisfies_conditional_failure_report_claim(self) -> None:
+        contract = SimpleNamespace(
+            candidate_recall_gate=1.0,
+            exact_p95_gate_ms=50.0,
+            fuzzy_p95_gate_ms=500.0,
+            migration_gate_seconds=120.0,
+            peak_rss_gate_mib=512.0,
+            exact_cohort_count=1200,
+            fuzzy_cohort_count=240,
+            oracle_query_count=200,
+        )
+        report = SimpleNamespace(
+            candidate_recall=1.0,
+            environment=(
+                ("cpu", "test"),
+                ("os", "test"),
+                ("python_version", "test"),
+                ("ram_mib", "1024"),
+                ("sqlite_version", "test"),
+                ("unicode_version", "test"),
+            ),
+            exact_p95_ms=49.0,
+            fuzzy_top10_p95_ms=499.0,
+            migration_seconds=119.0,
+            peak_rss_mib=511.0,
+            exact_sample_count=1200,
+            fuzzy_sample_count=240,
+            oracle_query_count=200,
+            failed_gates=(),
+            passed=True,
+        )
+        bundle = SimpleNamespace(
+            contract=contract,
+            suite_report=SimpleNamespace(
+                path_reports=(report, report),
+                failed_paths=(),
+                passed=True,
+            ),
+        )
+        self.assertEqual(
+            validator._benchmark_claim_statuses(cast(Any, bundle))[
+                "FAILURE_REPORT"
+            ],
+            "PASS",
+        )
+
     def test_validator_rejects_alternate_root_and_emit_before_tests(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             alternate = Path(temporary).resolve()
@@ -326,12 +466,12 @@ class ReleaseCriteriaValidatorTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "canonical output"):
                     validator.main(["--emit", "AGENTS.md"])
 
-    def test_require_go_fails_after_truthful_no_go_adjudication(self) -> None:
+    def test_require_go_succeeds_after_truthful_go_adjudication(self) -> None:
         with (
             patch.object(validator, "_run_direct_tests", return_value=True),
             patch.object(validator, "_atomic_write"),
         ):
-            self.assertEqual(validator.main(["--require-go"]), 1)
+            self.assertEqual(validator.main(["--require-go"]), 0)
 
     def test_source_walk_rejects_symlink_and_dotdot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -376,6 +516,26 @@ class ReleaseCriteriaValidatorTests(unittest.TestCase):
                 validator._validate_evidence_target(alias)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(root)
+            hardlink = root / "hardlink.json"
+            os.link(ordinary, hardlink)
+            with self.assertRaisesRegex(ValueError, "regular"):
+                validator._validate_evidence_target(ordinary)
+
+    def test_atomic_write_validates_before_and_after_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "evidence.json"
+            calls = 0
+
+            def validate() -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("input drift after replace")
+
+            with self.assertRaisesRegex(ValueError, "after replace"):
+                validator._atomic_write(target, b"{}\n", validate)
+            self.assertEqual(calls, 2)
+            self.assertEqual(target.read_bytes(), b"{}\n")
 
 
 if __name__ == "__main__":

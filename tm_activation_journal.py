@@ -118,6 +118,7 @@ class _SQLiteGenerationView:
     canonical_store_id: str
     generation: int
     fts5_available: bool
+    active_content_attestation: ActiveContentAttestation | None = None
 
 
 class ActivationPreparationError(RuntimeError):

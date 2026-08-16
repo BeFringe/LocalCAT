@@ -41,10 +41,13 @@ from tests.release_criteria_registry import (  # noqa: E402
     RELEASE_CRITERIA_SCHEMA_VERSION,
     parse_requirement_criteria,
     release_criteria_registry_digest,
+    release_criteria_source_fingerprint,
+    release_criteria_source_paths,
 )
 from tm_benchmark_gate import (  # noqa: E402
     BenchmarkEvidenceBundle,
     benchmark_evidence_bundle_from_json,
+    benchmark_implementation_fingerprint,
 )
 
 
@@ -61,6 +64,9 @@ class _EvidenceRow(Protocol):
 
     @property
     def test_ids(self) -> tuple[str, ...]: ...
+
+    @property
+    def task(self) -> str: ...
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -164,7 +170,7 @@ def _read_strict_regular(root: Path, relative: str) -> tuple[bytes, str]:
             dir_fd=directory_descriptor,
         )
         opened = os.fstat(file_descriptor)
-        if not stat.S_ISREG(opened.st_mode):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise ValueError("release evidence source is not regular")
         chunks: list[bytes] = []
         digest = hashlib.sha256()
@@ -178,6 +184,7 @@ def _read_strict_regular(root: Path, relative: str) -> tuple[bytes, str]:
         )
         if (
             not stat.S_ISREG(terminal.st_mode)
+            or terminal.st_nlink != 1
             or (terminal.st_dev, terminal.st_ino)
             != (opened.st_dev, opened.st_ino)
         ):
@@ -198,8 +205,15 @@ def _validate_evidence_target(path: Path) -> None:
         observed = os.lstat(path)
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(observed.st_mode):
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
         raise ValueError("release evidence target is not regular")
+
+
+def _release_source_file_digests(root: Path) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (relative, _read_strict_regular(root, relative)[1])
+        for relative in release_criteria_source_paths()
+    )
 
 
 def _matrix_row_map(
@@ -209,6 +223,29 @@ def _matrix_row_map(
     if len(result) != len(rows):
         raise ValueError("matrix registry row ids are not unique")
     return result
+
+
+def _validate_matrix_metadata(
+    evidence: dict[str, object],
+    rows: Sequence[_EvidenceRow],
+) -> None:
+    generated_at = evidence["generated_at_utc"]
+    if type(generated_at) is not str:
+        raise TypeError("matrix generated_at_utc must be a string")
+    try:
+        datetime.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError("matrix generated_at_utc is invalid") from None
+    expected_tasks = sorted({row.task for row in rows})
+    if evidence["tasks"] != expected_tasks:
+        raise ValueError("matrix task inventory is stale")
+    expected_summary = {
+        "passed_rows": len(rows),
+        "referenced_tests": sum(len(row.test_ids) for row in rows),
+        "total_rows": len(rows),
+    }
+    if evidence["summary"] != expected_summary:
+        raise ValueError("matrix summary is stale")
 
 
 def _validate_matrix_evidence(
@@ -240,6 +277,7 @@ def _validate_matrix_evidence(
         raise ValueError("matrix evidence schema is stale")
     if evidence["registry_digest"] != registry_digest:
         raise ValueError("matrix registry digest is stale")
+    _validate_matrix_metadata(evidence, rows)
 
     raw_sources = evidence["source_files"]
     if type(raw_sources) is not list:
@@ -319,6 +357,35 @@ def _run_direct_tests(test_ids: tuple[str, ...]) -> bool:
     return True
 
 
+def _release_execution_test_ids() -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    """Return matrix, direct and de-duplicated release execution IDs."""
+
+    matrix_test_ids = tuple(
+        dict.fromkeys(
+            test_id
+            for row in (*ACCEPTANCE_MATRIX_ROWS, *FAULT_MATRIX_ROWS)
+            for test_id in row.test_ids
+        )
+    )
+    direct_test_ids = tuple(
+        dict.fromkeys(
+            evidence_ref.partition(":")[2]
+            for binding in RELEASE_CRITERIA_BINDINGS
+            for evidence_ref in binding.evidence_refs
+            if evidence_ref.startswith("test:")
+        )
+    )
+    return (
+        matrix_test_ids,
+        direct_test_ids,
+        tuple(dict.fromkeys((*matrix_test_ids, *direct_test_ids))),
+    )
+
+
 def _benchmark_claim_statuses(
     bundle: BenchmarkEvidenceBundle,
 ) -> dict[str, str]:
@@ -355,9 +422,20 @@ def _benchmark_claim_statuses(
         "FAILURE_REPORT": (
             "PASS"
             if (
-                not bundle.suite_report.passed
-                and bool(bundle.suite_report.failed_paths)
-                and all(report.failed_gates for report in reports if not report.passed)
+                (
+                    bundle.suite_report.passed
+                    and not bundle.suite_report.failed_paths
+                    and all(report.passed for report in reports)
+                )
+                or (
+                    not bundle.suite_report.passed
+                    and bool(bundle.suite_report.failed_paths)
+                    and all(
+                        report.failed_gates
+                        for report in reports
+                        if not report.passed
+                    )
+                )
             )
             else "BLOCKED"
         ),
@@ -404,7 +482,11 @@ def _benchmark_blockers(bundle: BenchmarkEvidenceBundle) -> tuple[str, ...]:
     )
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(
+    path: Path,
+    payload: bytes,
+    validate_snapshot: Callable[[], None],
+) -> None:
     parent = path.parent.resolve(strict=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".tm-release-criteria-",
@@ -417,6 +499,8 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+            published_identity = os.fstat(stream.fileno())
+        validate_snapshot()
         os.replace(temporary, path)
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
@@ -426,6 +510,33 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             os.fsync(parent_descriptor)
         finally:
             os.close(parent_descriptor)
+        observed = os.lstat(path)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino)
+            != (published_identity.st_dev, published_identity.st_ino)
+        ):
+            raise ValueError("release evidence identity changed")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        read_descriptor = os.open(path, flags)
+        try:
+            readback = bytearray()
+            while chunk := os.read(read_descriptor, 1024 * 1024):
+                readback.extend(chunk)
+            terminal = os.fstat(read_descriptor)
+        finally:
+            os.close(read_descriptor)
+        if (
+            bytes(readback) != payload
+            or terminal.st_nlink != 1
+            or (terminal.st_dev, terminal.st_ino)
+            != (published_identity.st_dev, published_identity.st_ino)
+        ):
+            raise ValueError("release evidence readback changed")
+        validate_snapshot()
     except BaseException:
         try:
             temporary.unlink()
@@ -459,6 +570,12 @@ def main(argv: list[str] | None = None) -> int:
     binding_ids = tuple(item.criterion_id for item in RELEASE_CRITERIA_BINDINGS)
     if len(criteria) != 86 or binding_ids != criterion_ids:
         raise ValueError("release registry must exactly bind all 86 criteria")
+    registry_digest = release_criteria_registry_digest()
+    release_source_files = _release_source_file_digests(repository_root)
+    release_source_fingerprint = release_criteria_source_fingerprint(
+        registry_digest,
+        release_source_files,
+    )
 
     acceptance_status, acceptance_digest, acceptance_fingerprint = (
         _validate_matrix_evidence(
@@ -487,20 +604,85 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_bundle = benchmark_evidence_bundle_from_json(
         benchmark_bytes.decode("utf-8")
     )
+    if (
+        benchmark_bundle.implementation_fingerprint
+        != benchmark_implementation_fingerprint(repository_root)
+    ):
+        raise ValueError("benchmark implementation fingerprint is stale")
     benchmark_status = _benchmark_claim_statuses(benchmark_bundle)
 
     acceptance_rows = _matrix_row_map(ACCEPTANCE_MATRIX_ROWS)
     fault_rows = _matrix_row_map(FAULT_MATRIX_ROWS)
-    direct_test_ids = tuple(
-        dict.fromkeys(
-            evidence_ref.partition(":")[2]
-            for binding in RELEASE_CRITERIA_BINDINGS
-            for evidence_ref in binding.evidence_refs
-            if evidence_ref.startswith("test:")
-        )
+    matrix_test_ids, direct_test_ids, executed_test_ids = (
+        _release_execution_test_ids()
     )
-    if not _run_direct_tests(direct_test_ids):
+    if not _run_direct_tests(executed_test_ids):
         return 1
+
+    def validate_snapshot() -> None:
+        if _release_source_file_digests(repository_root) != release_source_files:
+            raise ValueError("release owner sources changed during validation")
+        requirements_after, requirements_digest_after = _read_strict_regular(
+            repository_root,
+            _REQUIREMENTS_PATH,
+        )
+        if (
+            requirements_after != requirements_bytes
+            or requirements_digest_after != requirements_digest
+        ):
+            raise ValueError("requirements changed during release validation")
+        acceptance_after = _validate_matrix_evidence(
+            root=repository_root,
+            relative=_ACCEPTANCE_EVIDENCE_PATH,
+            schema_version=ACCEPTANCE_MATRIX_SCHEMA_VERSION,
+            rows=ACCEPTANCE_MATRIX_ROWS,
+            registry_digest=acceptance_matrix_registry_digest(),
+            source_paths=acceptance_matrix_source_paths(),
+            source_fingerprint=acceptance_matrix_source_fingerprint,
+        )
+        if acceptance_after != (
+            acceptance_status,
+            acceptance_digest,
+            acceptance_fingerprint,
+        ):
+            raise ValueError(
+                "acceptance evidence changed during release validation"
+            )
+        fault_after = _validate_matrix_evidence(
+            root=repository_root,
+            relative=_FAULT_EVIDENCE_PATH,
+            schema_version=FAULT_MATRIX_SCHEMA_VERSION,
+            rows=FAULT_MATRIX_ROWS,
+            registry_digest=fault_matrix_registry_digest(),
+            source_paths=fault_matrix_source_paths(),
+            source_fingerprint=fault_matrix_source_fingerprint,
+        )
+        if fault_after != (fault_status, fault_digest, fault_fingerprint):
+            raise ValueError("fault evidence changed during release validation")
+        benchmark_bytes_after, benchmark_digest_after = _read_strict_regular(
+            repository_root,
+            _BENCHMARK_EVIDENCE_PATH,
+        )
+        if (
+            benchmark_bytes_after != benchmark_bytes
+            or benchmark_digest_after != benchmark_digest
+        ):
+            raise ValueError(
+                "benchmark evidence changed during release validation"
+            )
+        benchmark_bundle_after = benchmark_evidence_bundle_from_json(
+            benchmark_bytes_after.decode("utf-8")
+        )
+        if (
+            benchmark_bundle_after != benchmark_bundle
+            or benchmark_bundle_after.implementation_fingerprint
+            != benchmark_implementation_fingerprint(repository_root)
+        ):
+            raise ValueError(
+                "benchmark implementation changed during release validation"
+            )
+
+    validate_snapshot()
 
     row_results: list[dict[str, object]] = []
     blocked_criteria: list[str] = []
@@ -546,7 +728,6 @@ def main(argv: list[str] | None = None) -> int:
     release_decision = (
         "GO" if not blocked_criteria and not benchmark_blockers else "NO_GO"
     )
-    registry_digest = release_criteria_registry_digest()
     source_fingerprint = hashlib.sha256(
         _canonical_json(
             {
@@ -557,6 +738,9 @@ def main(argv: list[str] | None = None) -> int:
                 "fault_evidence_sha256": fault_digest,
                 "fault_source_fingerprint": fault_fingerprint,
                 "registry_digest": registry_digest,
+                "release_owner_source_fingerprint": (
+                    release_source_fingerprint
+                ),
                 "requirements_sha256": requirements_digest,
             }
         ).encode("utf-8")
@@ -574,16 +758,23 @@ def main(argv: list[str] | None = None) -> int:
             "benchmark_evidence_sha256": benchmark_digest,
             "fault_evidence_sha256": fault_digest,
             "fault_source_fingerprint": fault_fingerprint,
+            "release_owner_source_fingerprint": release_source_fingerprint,
             "requirements_sha256": requirements_digest,
         },
         "registry_digest": registry_digest,
         "release_decision": release_decision,
         "rows": row_results,
         "schema_version": RELEASE_CRITERIA_SCHEMA_VERSION,
+        "source_files": [
+            {"path": path, "sha256": digest}
+            for path, digest in release_source_files
+        ],
         "source_fingerprint": source_fingerprint,
         "summary": {
             "blocked_criteria": len(blocked_criteria),
             "direct_tests": len(direct_test_ids),
+            "executed_tests": len(executed_test_ids),
+            "matrix_tests": len(matrix_test_ids),
             "mapped_criteria": len(row_results),
             "passed_criteria": len(row_results) - len(blocked_criteria),
             "total_criteria": len(criteria),
@@ -592,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     _atomic_write(
         evidence_path,
         (_canonical_json(evidence) + "\n").encode("utf-8"),
+        validate_snapshot,
     )
     print(
         _canonical_json(

@@ -208,7 +208,7 @@ def _second_sealed(
     )
     stage.manifest_temp_path.write_bytes(contract_to_json(manifest).encode())
     return StageSealer(
-        registry=coordinator.sealed_registry,
+        registry=coordinator._sealed_registry,
         canonical_store_id="store.primary",
     ).seal(
         stage,
@@ -838,14 +838,23 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
             )
             _terminal_after_completion(journal_path)
             second = _fresh(identity)
-            self.assertEqual(
-                second.recover_durable_activation(),
-                ActivationRecoveryReport(
-                    phase="GENERATION_PUBLISHED",
-                    action="COMPLETED",
-                    generation=0,
+            with patch(
+                "tm_sqlite_store.validate_candidate_proof_index",
+                side_effect=AssertionError(
+                    "cold exact attestation must reuse active semantics"
                 ),
-            )
+            ):
+                self.assertEqual(
+                    second.recover_durable_activation(),
+                    ActivationRecoveryReport(
+                        phase="GENERATION_PUBLISHED",
+                        action="COMPLETED",
+                        generation=0,
+                    ),
+                )
+                self.assertTrue(
+                    SQLiteTMStore.from_coordinator(second).health().healthy
+                )
             self.assertEqual(second.state, "READY")
             self.assertEqual(second.current_generation, 0)
             with second._operation_lease() as lease:

@@ -11,10 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import Path
 import re
 
 
-RELEASE_CRITERIA_SCHEMA_VERSION = "tm-release-criteria-v1"
+RELEASE_CRITERIA_SCHEMA_VERSION = "tm-release-criteria-v2"
+RELEASE_CRITERIA_SOURCE_VERSION = "tm-release-criteria-source-v1"
 
 _CRITERION_ID = re.compile(r"[1-9]\.(?:[1-9]|1[0-4])\Z")
 _TEST_ID = re.compile(
@@ -174,10 +176,25 @@ RELEASE_CRITERIA_BINDINGS: tuple[ReleaseCriterionBinding, ...] = (
         "test:tests.test_tm_export.TMExportSuccessTests.test_export_publishes_complete_deterministic_snapshot",
     ),
     _binding("2.8", "fault:9.2.EXPORT_CRASH.01", "fault:9.2.FOREIGN_INODE.01"),
-    _binding("2.9", "fault:9.1.PHASE_CRASH.02", "fault:9.1.PHASE_CRASH.03"),
+    _binding(
+        "2.9",
+        "fault:9.1.PHASE_CRASH.02",
+        "fault:9.1.PHASE_CRASH.03",
+        "fault:9.1.CORRUPT_INPUT.06",
+    ),
     _binding("2.10", "fault:9.1.LEASE.02", "fault:9.1.PRESERVATION.03"),
-    _binding("2.11", "fault:9.1.PRESERVATION.02", "fault:9.1.PHASE_CRASH.02"),
-    _binding("2.12", "fault:9.1.PHASE_CRASH.01", "acceptance:9.4.COMPAT.01"),
+    _binding(
+        "2.11",
+        "fault:9.1.PRESERVATION.02",
+        "fault:9.1.PHASE_CRASH.02",
+        "fault:9.1.CORRUPT_INPUT.06",
+    ),
+    _binding(
+        "2.12",
+        "fault:9.1.PHASE_CRASH.01",
+        "fault:9.1.CORRUPT_INPUT.06",
+        "acceptance:9.4.COMPAT.01",
+    ),
     _binding("2.13", "fault:9.2.EXTERNAL_CHANGE.01", "fault:9.1.PRESERVATION.01"),
     _binding(
         "3.1",
@@ -198,7 +215,12 @@ RELEASE_CRITERIA_BINDINGS: tuple[ReleaseCriterionBinding, ...] = (
     _binding("3.6", "acceptance:9.3.NONIMPERSONATE.01", "acceptance:9.3.CONTEXT.01"),
     _binding("3.7", "acceptance:9.4.ISOLATION.01", "acceptance:9.3.METADATA.02"),
     _binding("4.1", "acceptance:9.3.SERVICE.01"),
-    _binding("4.2", "acceptance:9.4.PRIORITY.02", "acceptance:9.3.SERVICE.01"),
+    _binding(
+        "4.2",
+        "acceptance:9.4.PRIORITY.02",
+        "acceptance:9.3.CANDIDATE.03",
+        "acceptance:9.3.SERVICE.01",
+    ),
     _binding(
         "4.3",
         "test:tests.test_tm_contracts.TMContractTests.test_resource_query_result_and_partial_failure_round_trip",
@@ -207,8 +229,13 @@ RELEASE_CRITERIA_BINDINGS: tuple[ReleaseCriterionBinding, ...] = (
     _binding(
         "4.4",
         "test:tests.test_tm_retrieval.FuzzyScoringTests.test_threshold_boundary_equality_is_accepted_and_below_is_excluded",
+        "acceptance:9.3.CANDIDATE.03",
     ),
-    _binding("4.5", "acceptance:9.3.SERVICE.01"),
+    _binding(
+        "4.5",
+        "acceptance:9.3.CANDIDATE.03",
+        "acceptance:9.3.SERVICE.01",
+    ),
     _binding("4.6", "acceptance:9.3.CANDIDATE.02", "acceptance:9.3.SERVICE.03"),
     _binding("4.7", "acceptance:9.3.SERVICE.02"),
     _binding(
@@ -222,10 +249,12 @@ RELEASE_CRITERIA_BINDINGS: tuple[ReleaseCriterionBinding, ...] = (
     _binding(
         "5.3",
         "test:tests.test_tm_retrieval.FuzzyScoringTests.test_order_is_final_similarity_desc_then_record_id_desc",
+        "acceptance:9.3.CANDIDATE.03",
     ),
     _binding(
         "5.4",
         "test:tests.test_tm_retrieval.FuzzyScoringTests.test_repeated_scoring_is_deterministic_without_mutating_inputs",
+        "acceptance:9.3.CANDIDATE.03",
     ),
     _binding(
         "5.5",
@@ -316,12 +345,67 @@ def release_criteria_registry_digest() -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def release_criteria_source_paths(
+    bindings: tuple[ReleaseCriterionBinding, ...] = RELEASE_CRITERIA_BINDINGS,
+) -> tuple[str, ...]:
+    """Closed source inventory for the release decision owner/direct tests."""
+
+    paths = {
+        "tests/release_criteria_registry.py",
+        "tests/test_tm_release_criteria.py",
+        "tools/validate_tm_release_criteria.py",
+    }
+    for binding in bindings:
+        for evidence_ref in binding.evidence_refs:
+            kind, _separator, value = evidence_ref.partition(":")
+            if kind == "test":
+                module_name = ".".join(value.split(".")[:2])
+                paths.add(module_name.replace(".", "/") + ".py")
+    return tuple(sorted(paths))
+
+
+def release_criteria_source_fingerprint(
+    registry_digest: str,
+    source_files: tuple[tuple[str, str], ...],
+) -> str:
+    if type(registry_digest) is not str or re.fullmatch(
+        r"[0-9a-f]{64}", registry_digest
+    ) is None:
+        raise ValueError("registry digest must be SHA-256")
+    expected_paths = release_criteria_source_paths()
+    if tuple(path for path, _digest in source_files) != expected_paths:
+        raise ValueError("release source inventory is not closed")
+    for path, digest in source_files:
+        if (
+            type(path) is not str
+            or Path(path).is_absolute()
+            or type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValueError("release source fact is invalid")
+    canonical = json.dumps(
+        {
+            "registry_digest": registry_digest,
+            "source_files": [list(item) for item in source_files],
+            "version": RELEASE_CRITERIA_SOURCE_VERSION,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "BENCHMARK_CLAIMS",
     "RELEASE_CRITERIA_BINDINGS",
     "RELEASE_CRITERIA_SCHEMA_VERSION",
+    "RELEASE_CRITERIA_SOURCE_VERSION",
     "ReleaseCriterionBinding",
     "RequirementCriterion",
     "parse_requirement_criteria",
     "release_criteria_registry_digest",
+    "release_criteria_source_fingerprint",
+    "release_criteria_source_paths",
 ]

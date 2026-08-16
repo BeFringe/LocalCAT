@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from collections.abc import Callable
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -33,9 +34,13 @@ from tm_contracts import (
     stage_validation_evidence_digest,
 )
 from tm_migration import TMMigrationService
-from tm_sqlite_store import SQLiteStoreSchemaError, SQLiteTMStore
+from tm_sqlite_store import (
+    ResourceStoreCoordinator,
+    SQLiteStoreSchemaError,
+    SQLiteTMStore,
+)
 from tm_stage_sealer import (
-    SealedArtifactRegistry,
+    _SealedArtifactRegistry as SealedArtifactRegistry,
     StageSealError,
     StageSealer,
 )
@@ -110,7 +115,7 @@ def _seal(
 
 
 def _registry(sealer: StageSealer) -> SealedArtifactRegistry:
-    return cast(SealedArtifactRegistry, sealer.registry)
+    return cast(SealedArtifactRegistry, sealer._registry)
 
 
 def _raw_connection(database_path: Path) -> sqlite3.Connection:
@@ -162,14 +167,6 @@ class _FakeRegistry:
     def registry_namespace(self) -> Any:
         return self._namespace
 
-    def seal(
-        self,
-        mutable_stage: object,
-        evidence: object,
-        generation: object,
-    ) -> object:
-        raise AssertionError("seal must not be reached")
-
     def reserve(
         self,
         mutable_stage: object,
@@ -192,18 +189,127 @@ class _FakeRegistry:
 
 
 class StageSealerHappyPathTests(unittest.TestCase):
+    def test_projection_digest_uses_bounded_multichunk_readback(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    _, stage = _build_stage(
+                        Path(temporary),
+                        fts5_available=fts5_available,
+                    )
+                    with patch.object(
+                        tm_sqlite_store,
+                        "_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS",
+                        2,
+                    ):
+                        sealed = _seal(
+                            _sealer(),
+                            stage,
+                            fts5_available=fts5_available,
+                        )
+                    self.assertEqual(sealed.evidence.record_count, 3)
+
+    def test_logical_closure_v2_composes_authority_and_validated_projection(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    _, stage = _build_stage(
+                        root,
+                        fts5_available=fts5_available,
+                    )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        baseline = tm_stage_sealer._stage_closure_digests(
+                            connection,
+                            reconstruct_pre_activation=True,
+                        )
+                        gram_row = connection.execute(
+                            "SELECT gram_size, gram, record_id, "
+                            "term_frequency FROM tm_gram LIMIT 1"
+                        ).fetchone()
+                        self.assertIsNotNone(gram_row)
+                        assert gram_row is not None
+                        connection.execute(
+                            "UPDATE tm_gram SET term_frequency = ? WHERE "
+                            "gram_size = ? AND gram = ? AND record_id = ?",
+                            (
+                                int(gram_row[3]) + 1,
+                                int(gram_row[0]),
+                                str(gram_row[1]),
+                                int(gram_row[2]),
+                            ),
+                        )
+                        same_count = tm_stage_sealer._stage_closure_digests(
+                            connection,
+                            reconstruct_pre_activation=True,
+                        )
+                        self.assertEqual(same_count, baseline)
+                        with self.assertRaises(
+                            tm_sqlite_store.CandidateProofIndexError
+                        ):
+                            tm_sqlite_store.validate_candidate_proof_index(
+                                connection,
+                                required_sizes=(
+                                    (1, 2)
+                                    if fts5_available
+                                    else (1, 2, 3)
+                                ),
+                                fts5_available=fts5_available,
+                            )
+                        connection.rollback()
+                        connection.execute(
+                            "UPDATE tm_record SET target_raw = 'changed' "
+                            "WHERE record_id = 1"
+                        )
+                        authority_changed = (
+                            tm_stage_sealer._stage_closure_digests(
+                                connection,
+                                reconstruct_pre_activation=True,
+                            )
+                        )
+                        self.assertNotEqual(authority_changed, baseline)
+                    finally:
+                        connection.close()
+
     def test_fresh_stage_has_one_full_seal_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, stage = _build_stage(Path(temporary), fts5_available=True)
             real_validate = tm_stage_sealer._validate_stage_facts
+            real_open_write = tm_stage_sealer._open_stage_write_connection
+            real_open_read = tm_stage_sealer._open_stage_read_connection
+            traced_sql: list[str] = []
+
+            def trace_connection(connection: sqlite3.Connection) -> sqlite3.Connection:
+                connection.set_trace_callback(traced_sql.append)
+                return connection
+
             with patch(
                 "tm_stage_sealer._validate_stage_facts",
                 wraps=real_validate,
-            ) as validate:
-                _seal(_sealer(), stage, fts5_available=True)
+            ) as validate, patch(
+                "tm_stage_sealer._open_stage_write_connection",
+                side_effect=lambda path: trace_connection(real_open_write(path)),
+            ), patch(
+                "tm_stage_sealer._open_stage_read_connection",
+                side_effect=lambda path: trace_connection(real_open_read(path)),
+            ):
+                sealed = _seal(_sealer(), stage, fts5_available=True)
 
             self.assertEqual(validate.call_count, 1)
             self.assertTrue(validate.call_args.kwargs["seal_stage"])
+            self.assertTrue(sealed.evidence.integrity_ok)
+            self.assertEqual(
+                sum(
+                    sql.strip().casefold() == "pragma integrity_check"
+                    for sql in traced_sql
+                ),
+                1,
+            )
 
     def test_seal_completes_frozen_artifact_in_both_index_modes(
         self,
@@ -448,7 +554,227 @@ class StageSealerTamperTests(unittest.TestCase):
                 lambda: _seal(sealer, stage, fts5_available=True),
                 "SEALER.RECORD_MISMATCH",
             )
+
+    def test_authority_mutation_before_first_content_capture_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            real_capture = tm_stage_sealer._capture_content_file
+            mutated = False
+
+            def mutate_then_capture(path: Path) -> Any:
+                nonlocal mutated
+                if not mutated and path == stage.staged_db_path:
+                    mutated = True
+                    connection = _raw_connection(stage.staged_db_path)
+                    try:
+                        connection.execute(
+                            "UPDATE tm_record SET usage_count = usage_count + 1 "
+                            "WHERE record_id = 1"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                return real_capture(path)
+
+            sealer = _sealer()
+            self.assertFalse(hasattr(sealer.registry, "seal"))
+            with patch(
+                "tm_stage_sealer._capture_content_file",
+                side_effect=mutate_then_capture,
+            ):
+                _expect_seal_code(
+                    self,
+                    lambda: _seal(sealer, stage, fts5_available=True),
+                    "SEALER.STAGE_MUTATED_AFTER_VALIDATION",
+                )
+
+            self.assertTrue(mutated)
             self.assertEqual(len(_registry(sealer)._entries), 0)
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM tm_meta "
+                        "WHERE key = 'activation_status'"
+                    ).fetchone(),
+                    ("UNPUBLISHED",),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT usage_count FROM tm_record WHERE record_id = 1"
+                    ).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
+            self.assertEqual(len(_registry(sealer)._entries), 0)
+
+    def test_candidate_mutation_before_first_content_capture_rejected(
+        self,
+    ) -> None:
+        for fts5_available in (False, True):
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    _, stage = _build_stage(
+                        Path(temporary),
+                        fts5_available=fts5_available,
+                    )
+                    real_capture = tm_stage_sealer._capture_content_file
+                    mutated = False
+
+                    def mutate_then_capture(path: Path) -> Any:
+                        nonlocal mutated
+                        if not mutated and path == stage.staged_db_path:
+                            mutated = True
+                            connection = _raw_connection(
+                                stage.staged_db_path
+                            )
+                            try:
+                                row = connection.execute(
+                                    "SELECT gram_size, gram, record_id, "
+                                    "term_frequency FROM tm_gram "
+                                    "ORDER BY gram_size, gram, record_id "
+                                    "LIMIT 1"
+                                ).fetchone()
+                                self.assertIsNotNone(row)
+                                assert row is not None
+                                connection.execute(
+                                    "UPDATE tm_gram SET term_frequency = ? "
+                                    "WHERE gram_size = ? AND gram = ? "
+                                    "AND record_id = ?",
+                                    (
+                                        int(row[3]) + 1,
+                                        int(row[0]),
+                                        str(row[1]),
+                                        int(row[2]),
+                                    ),
+                                )
+                                connection.commit()
+                            finally:
+                                connection.close()
+                        return real_capture(path)
+
+                    sealer = _sealer()
+                    self.assertFalse(hasattr(sealer.registry, "seal"))
+                    with patch(
+                        "tm_stage_sealer._capture_content_file",
+                        side_effect=mutate_then_capture,
+                    ):
+                        _expect_seal_code(
+                            self,
+                            lambda: _seal(
+                                sealer,
+                                stage,
+                                fts5_available=fts5_available,
+                            ),
+                            "SEALER.STAGE_MUTATED_AFTER_VALIDATION",
+                        )
+
+                    self.assertTrue(mutated)
+                    self.assertEqual(len(_registry(sealer)._entries), 0)
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT value FROM tm_meta "
+                                "WHERE key = 'activation_status'"
+                            ).fetchone(),
+                            ("UNPUBLISHED",),
+                        )
+                        with self.assertRaises(
+                            tm_sqlite_store.CandidateProofIndexError
+                        ):
+                            tm_sqlite_store.validate_candidate_proof_index(
+                                connection,
+                                required_sizes=(
+                                    (1, 2)
+                                    if fts5_available
+                                    else (1, 2, 3)
+                                ),
+                                fts5_available=fts5_available,
+                            )
+                    finally:
+                        connection.close()
+
+    def test_each_candidate_projection_domain_is_bound_post_fsync(
+        self,
+    ) -> None:
+        base_mutations = (
+            (
+                "gram",
+                "UPDATE tm_gram SET term_frequency = term_frequency + 1 "
+                "WHERE rowid = (SELECT rowid FROM tm_gram LIMIT 1)",
+            ),
+            (
+                "block",
+                "UPDATE tm_candidate_block SET max_source_fold_length = "
+                "max_source_fold_length + 1 WHERE block_id = "
+                "(SELECT MIN(block_id) FROM tm_candidate_block)",
+            ),
+            (
+                "block_maximum",
+                "UPDATE tm_gram_block_max SET max_term_frequency = "
+                "max_term_frequency + 1 WHERE rowid = "
+                "(SELECT rowid FROM tm_gram_block_max LIMIT 1)",
+            ),
+        )
+        for fts5_available in (False, True):
+            mutations = base_mutations + (
+                (
+                    "fts",
+                    "UPDATE tm_fts SET source_fold_v1 = "
+                    "source_fold_v1 || 'x' WHERE rowid = "
+                    "(SELECT MIN(rowid) FROM tm_fts)",
+                ),
+            ) if fts5_available else base_mutations
+            for domain, statement in mutations:
+                with self.subTest(
+                    fts5_available=fts5_available,
+                    domain=domain,
+                ):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        _, stage = _build_stage(
+                            Path(temporary),
+                            fts5_available=fts5_available,
+                        )
+                        real_capture = tm_stage_sealer._capture_content_file
+                        mutated = False
+
+                        def mutate_then_capture(path: Path) -> Any:
+                            nonlocal mutated
+                            if not mutated and path == stage.staged_db_path:
+                                mutated = True
+                                connection = _raw_connection(
+                                    stage.staged_db_path
+                                )
+                                try:
+                                    connection.execute(statement)
+                                    connection.commit()
+                                finally:
+                                    connection.close()
+                            return real_capture(path)
+
+                        sealer = _sealer()
+                        with patch(
+                            "tm_stage_sealer._capture_content_file",
+                            side_effect=mutate_then_capture,
+                        ):
+                            _expect_seal_code(
+                                self,
+                                lambda: _seal(
+                                    sealer,
+                                    stage,
+                                    fts5_available=fts5_available,
+                                ),
+                                "SEALER.STAGE_MUTATED_AFTER_VALIDATION",
+                            )
+                        self.assertTrue(mutated)
+                        self.assertEqual(
+                            len(_registry(sealer)._entries),
+                            0,
+                        )
 
     def test_record_order_swap_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -900,7 +1226,7 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
             real_file_fsync = tm_stage_sealer._fsync_file
             real_directory_fsync = tm_stage_sealer._fsync_directory
             real_mark_sealed = tm_stage_sealer._mark_stage_sealed
-            real_commit = SealedArtifactRegistry.commit
+            real_commit = SealedArtifactRegistry._commit_verified
 
             def record_file(path: Path, expected: object) -> None:
                 calls.append(("file", path.name))
@@ -924,19 +1250,15 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
 
             def record_commit(
                 self: SealedArtifactRegistry,
-                reservation: tm_stage_sealer._RegistryReservation,
-                evidence: StageValidationEvidence,
-                generation: GenerationExpectation,
-                attestation: Any,
+                capability: tm_stage_sealer._VerifiedSealCommitCapability,
             ) -> SealedStage:
-                calls.append(("commit", reservation.mutable.staged_db_path.name))
-                return real_commit(
-                    self,
-                    reservation,
-                    evidence,
-                    generation,
-                    attestation,
+                calls.append(
+                    (
+                        "commit",
+                        capability.reservation.mutable.staged_db_path.name,
+                    )
                 )
+                return real_commit(self, capability)
 
             sealer = _sealer()
             with (
@@ -954,7 +1276,7 @@ class StageSealerPhysicalFailureTests(unittest.TestCase):
                 ),
                 patch.object(
                     SealedArtifactRegistry,
-                    "commit",
+                    "_commit_verified",
                     autospec=True,
                     side_effect=record_commit,
                 ),
@@ -1101,7 +1423,7 @@ class StageSealerDurableRetryTests(unittest.TestCase):
             sealer = _sealer()
             with patch.object(
                 SealedArtifactRegistry,
-                "reserve",
+                "_reserve",
                 side_effect=StageSealError("SEALER.ALREADY_RESERVED"),
             ):
                 _expect_seal_code(
@@ -1214,30 +1536,21 @@ class StageSealerDurableRetryTests(unittest.TestCase):
                 fts5_available=True,
             )
             sealer = _sealer()
-            real_commit = SealedArtifactRegistry.commit
+            real_commit = SealedArtifactRegistry._commit_verified
             state = [0]
 
             def one_shot_commit(
                 self_registry: SealedArtifactRegistry,
-                reservation: tm_stage_sealer._RegistryReservation,
-                evidence: StageValidationEvidence,
-                generation: GenerationExpectation,
-                attestation: Any,
+                capability: tm_stage_sealer._VerifiedSealCommitCapability,
             ) -> SealedStage:
                 state[0] += 1
                 if state[0] == 1:
                     raise OSError("injected registry commit failure")
-                return real_commit(
-                    self_registry,
-                    reservation,
-                    evidence,
-                    generation,
-                    attestation,
-                )
+                return real_commit(self_registry, capability)
 
             with patch.object(
                 SealedArtifactRegistry,
-                "commit",
+                "_commit_verified",
                 autospec=True,
                 side_effect=one_shot_commit,
             ):
@@ -1383,7 +1696,7 @@ class StageSealerIdentitySwapTests(unittest.TestCase):
                 missing_code="SEALER.STAGE_MANIFEST_MISSING",
                 unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
             )
-            reservation = registry.reserve(
+            reservation = registry._reserve(
                 stage,
                 database_identity=database_identity,
                 manifest_identity=manifest_identity,
@@ -1392,21 +1705,17 @@ class StageSealerIdentitySwapTests(unittest.TestCase):
                 StageSealError,
                 "^SEALER.ALREADY_RESERVED$",
             ):
-                registry.reserve(
+                registry._reserve(
                     stage,
                     database_identity=database_identity,
                     manifest_identity=manifest_identity,
                 )
-            registry.release(reservation)
+            registry._release(reservation)
             with self.assertRaisesRegex(
                 StageSealError,
-                "^SEALER.RESERVATION_MISMATCH$",
+                "^SEALER.TYPE_INVALID$",
             ):
-                registry.commit(
-                    reservation,
-                    cast(Any, object()),
-                    cast(Any, object()),
-                )
+                registry._commit_verified(cast(Any, object()))
             self.assertEqual(len(registry._reservations), 0)
             self.assertEqual(len(registry._entries), 0)
             sealer = StageSealer(
@@ -1421,7 +1730,7 @@ class StageSealerIdentitySwapTests(unittest.TestCase):
                 StageSealError,
                 "^SEALER.ALREADY_SEALED$",
             ):
-                registry.reserve(
+                registry._reserve(
                     stage,
                     database_identity=database_identity,
                     manifest_identity=manifest_identity,
@@ -1443,13 +1752,13 @@ class StageSealerIdentitySwapTests(unittest.TestCase):
                 missing_code="SEALER.STAGE_MANIFEST_MISSING",
                 unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
             )
-            reservation = registry.reserve(
+            reservation = registry._reserve(
                 stage,
                 database_identity=database_identity,
                 manifest_identity=manifest_identity,
             )
-            registry.release(reservation)
-            registry.release(reservation)
+            registry._release(reservation)
+            registry._release(reservation)
             self.assertEqual(len(registry._reservations), 0)
             sealer = StageSealer(
                 registry=registry,
@@ -1528,20 +1837,157 @@ class StageSealerRegistryTests(unittest.TestCase):
                 "SEALER.STAGE_INVALID",
             )
 
-    def test_direct_registry_double_seal_rejected(self) -> None:
+    def test_registry_exposes_no_direct_seal_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, stage = _build_stage(Path(temporary), fts5_available=True)
             sealer = _sealer()
-            sealed = _seal(sealer, stage, fts5_available=True)
-            _expect_seal_code(
-                self,
-                lambda: sealer.registry.seal(
-                    stage,
-                    sealed.evidence,
-                    sealed.generation,
-                ),
-                "SEALER.ALREADY_SEALED",
+            for name in (
+                "seal",
+                "reserve",
+                "commit",
+                "release",
+                "_reserve",
+                "_commit_verified",
+                "_release",
+                "issue_token",
+                "consume",
+                "cancel",
+            ):
+                self.assertFalse(hasattr(sealer.registry, name), name)
+            self.assertNotIn("SealedArtifactRegistry", tm_stage_sealer.__all__)
+            self.assertFalse(
+                hasattr(tm_stage_sealer, "SealedArtifactRegistry")
             )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertFalse(hasattr(sealer.registry, "seal"))
+
+    def test_coordinator_exposes_no_registry_mutation_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            identity.configured_jsonl_path.write_bytes(SOURCE_BYTES)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            self.assertFalse(hasattr(coordinator, "sealed_registry"))
+            public_names = {
+                name
+                for name in dir(coordinator)
+                if not name.startswith("_")
+            }
+            self.assertNotIn("reserve", public_names)
+            self.assertNotIn("commit", public_names)
+            self.assertNotIn("release", public_names)
+
+    def test_verified_commit_capability_is_exact_bound_and_single_use(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, stage = _build_stage(Path(temporary), fts5_available=True)
+            sealer = _sealer()
+            registry = _registry(sealer)
+            captured: list[
+                tm_stage_sealer._VerifiedSealCommitCapability
+            ] = []
+            real_commit = SealedArtifactRegistry._commit_verified
+
+            def capture_commit(
+                self_registry: SealedArtifactRegistry,
+                capability: tm_stage_sealer._VerifiedSealCommitCapability,
+            ) -> SealedStage:
+                captured.append(capability)
+                return real_commit(self_registry, capability)
+
+            with patch.object(
+                SealedArtifactRegistry,
+                "_commit_verified",
+                autospec=True,
+                side_effect=capture_commit,
+            ):
+                sealed = _seal(sealer, stage, fts5_available=True)
+            self.assertTrue(sealer.registry.contains(sealed))
+            self.assertEqual(len(captured), 1)
+            capability = captured[0]
+
+            with self.assertRaises(TypeError):
+                dataclass_replace(capability)
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.RESERVATION_MISMATCH$",
+            ):
+                registry._commit_verified(capability)
+            foreign = SealedArtifactRegistry(
+                registry_namespace=registry.registry_namespace
+            )
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.RESERVATION_MISMATCH$",
+            ):
+                foreign._commit_verified(capability)
+
+            second_root = Path(temporary) / "second"
+            second_root.mkdir()
+            _, second_stage = _build_stage(
+                second_root,
+                fts5_available=True,
+            )
+            second_reservation = registry._reserve(
+                second_stage,
+                database_identity=tm_stage_sealer._artifact_file_identity(
+                    second_stage.staged_db_path,
+                    missing_code="SEALER.STAGE_DATABASE_MISSING",
+                    unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+                ),
+                manifest_identity=tm_stage_sealer._artifact_file_identity(
+                    second_stage.manifest_temp_path,
+                    missing_code="SEALER.STAGE_MANIFEST_MISSING",
+                    unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
+                ),
+            )
+            cross = object.__new__(
+                tm_stage_sealer._VerifiedSealCommitCapability
+            )
+            for name, value in vars(capability).items():
+                object.__setattr__(cross, name, value)
+            object.__setattr__(cross, "reservation", second_reservation)
+            object.__setattr__(
+                cross,
+                "nonce",
+                "verified-seal.cross-reservation",
+            )
+            with self.assertRaises(StageSealError):
+                registry._commit_verified(cross)
+            registry._release(second_reservation)
+            self.assertEqual(len(registry._reservations), 0)
+
+            @dataclass(frozen=True)
+            class ForgedCapability:
+                reservation: object
+                evidence: object
+                generation: object
+                attestation: object
+
+            forged = ForgedCapability(
+                capability.reservation,
+                capability.evidence,
+                capability.generation,
+                capability.attestation,
+            )
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.TYPE_INVALID$",
+            ):
+                registry._commit_verified(cast(Any, forged))
+            uninitialized = (
+                tm_stage_sealer._VerifiedSealCommitCapability()
+            )
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.TYPE_INVALID$",
+            ):
+                registry._commit_verified(uninitialized)
 
     def test_forged_stage_rejected(self) -> None:
         temporary, sealer, _, sealed = self._sealed_fixture()

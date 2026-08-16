@@ -369,7 +369,7 @@ def _drive_to_prepared(
             batch_id=f"import.{origin_token}",
         )
         sealed = StageSealer(
-            registry=coordinator.sealed_registry,
+            registry=coordinator._sealed_registry,
             canonical_store_id=new_store_id,
         ).seal(
             stage,
@@ -1318,7 +1318,7 @@ class ExplicitImportPublicationFailureTests(unittest.TestCase):
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                     patch.object(
-                        coordinator.sealed_registry,
+                        coordinator._sealed_registry,
                         "consume",
                         side_effect=fail_consume,
                     ),
@@ -2211,7 +2211,7 @@ class ExplicitImportOriginBindingTests(unittest.TestCase):
                 )
             registry = __import__(
                 "tm_stage_sealer"
-            ).SealedArtifactRegistry(
+            )._SealedArtifactRegistry(
                 registry_namespace="coordinator.primary"
             )
             with patch("tm_sqlite_store._probe_fts5", return_value=False):
@@ -2223,7 +2223,7 @@ class ExplicitImportOriginBindingTests(unittest.TestCase):
                     expected_prior_generation=0,
                 )
                 report = tm_gate_b.GateBEvaluator(
-                    registry=registry
+                    registry=registry._readiness_view()
                 ).evaluate(sealed)
             self.assertTrue(report.granted)
             facts = report.facts

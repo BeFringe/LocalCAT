@@ -15,11 +15,13 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
+import tm_benchmark_oracle
 from text_matcher import fold_text_v1
 from tm_benchmark import (
     BenchmarkQuery,
     BenchmarkRecord,
     _LANGUAGES,
+    benchmark_implementation_fingerprint,
     compute_benchmark_input_plan,
     iter_oracle_queries,
     iter_oracle_subset_records,
@@ -45,6 +47,7 @@ from tm_benchmark_oracle import (
     validate_oracle_environment,
 )
 from tm_contracts import (
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
     benchmark_contract_digest,
@@ -59,6 +62,7 @@ _CONTRACT = load_benchmark_contract(_ROOT / "benchmark_tm_contract.json")
 _FTS5 = BenchmarkExecutionPath.FTS5_TRIGRAM
 _FALLBACK = BenchmarkExecutionPath.GRAM_FALLBACK
 _SCORER = SimilarityScorerV1()
+_IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
 
 _IMPORT_RE = re.compile(
     r"^(?:import|from)\s+([A-Za-z0-9_\.]+)",
@@ -211,6 +215,8 @@ def _small_evidence(**overrides: Any) -> OracleRecallEvidence:
         raise TypeError(f"unexpected overrides: {sorted(overrides)}")
     evidence = OracleRecallEvidence(
         schema_version=ORACLE_EVIDENCE_SCHEMA_VERSION,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=_IMPLEMENTATION_FINGERPRINT,
         test_mode=test_mode,
         contract=contract,
         contract_digest=contract_digest,
@@ -887,6 +893,37 @@ class OracleRunnerTests(unittest.TestCase):
                     test_record_count=200,
                     test_query_count=40,
                 )
+
+    def test_full_scan_and_candidate_share_one_source_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(
+                    tm_benchmark_oracle,
+                    "benchmark_implementation_fingerprint",
+                    side_effect=("a" * 64, "b" * 64),
+                ),
+                patch.object(
+                    tm_benchmark_oracle,
+                    "compute_full_scan_oracle",
+                    return_value=(),
+                ),
+                patch.object(
+                    tm_benchmark_oracle,
+                    "_run_candidate_path",
+                    side_effect=AssertionError(
+                        "candidate path must not run after source drift"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "before candidate"):
+                    run_oracle_recall_evidence(
+                        contract=_CONTRACT,
+                        execution_path=_FTS5,
+                        run_root=Path(temporary),
+                        test_mode=True,
+                        test_record_count=10,
+                        test_query_count=1,
+                    )
 
     def test_fts5_path_real_store_integration(self) -> None:
         evidence = self._run_mini(_FTS5)

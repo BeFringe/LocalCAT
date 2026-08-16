@@ -29,6 +29,9 @@ from tm_sqlite_store import (
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
     CANDIDATE_PROOF_QUERY_VERSION,
+    CANDIDATE_PROOF_PARTITION_VERSION,
+    CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+    CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION,
     CANDIDATE_PROOF_TRAVERSAL_VERSION,
     CandidateEvidence,
     CandidateProofMetadata,
@@ -52,6 +55,8 @@ GRAM_CANDIDATE_HARD_CAP = 8192
 CANDIDATE_CONTRACT_FLOOR = candidate_budget_v1(1)
 CANDIDATE_PROOF_BATCH_SIZE = 32
 CANDIDATE_PROOF_BUDGET_EXHAUSTED = "CANDIDATE.PROOF_BUDGET_EXHAUSTED"
+PRODUCTION_COMPLETION_POLICY = "production"
+ORACLE_FULL_COMPLETION_POLICY = "oracle_full"
 _DENSE_CROSSOVER_MIN_BLOCKS = 8
 _ASCII_LCS_TRANSITION_STATE_LIMIT = 4_096
 
@@ -980,6 +985,7 @@ class _ExactLCSQueryProjection:
         self._ascii_frontier_bit_counts = [0]
         self._ascii_state_by_frontier = {0: 0}
         self._ascii_cache_saturated = False
+        self._ascii_reset_pending = False
         self._ascii_transitions = (
             []
             if self._ascii_projection is None
@@ -1020,8 +1026,12 @@ class _ExactLCSQueryProjection:
             translation,
             irrelevant,
         )
-        if self._ascii_cache_saturated:
-            return _exact_ascii_lcs_frontier(symbols, masks).bit_count()
+        if self._ascii_reset_pending:
+            self._ascii_frontiers = [0]
+            self._ascii_frontier_bit_counts = [0]
+            self._ascii_state_by_frontier = {0: 0}
+            self._ascii_transitions = [[-1] * len(masks)]
+            self._ascii_reset_pending = False
         state = 0
         # Transition memoization only accelerates this exact automaton.  Every
         # identity still invokes ``facts`` and traverses its own folded source;
@@ -1039,6 +1049,7 @@ class _ExactLCSQueryProjection:
                         >= _ASCII_LCS_TRANSITION_STATE_LIMIT
                     ):
                         self._ascii_cache_saturated = True
+                        self._ascii_reset_pending = True
                         return _exact_ascii_lcs_frontier(
                             symbols[offset + 1 :],
                             masks,
@@ -1103,6 +1114,292 @@ def _dense_phase2_upper_bound(
     ).final_similarity_upper_bound
 
 
+def _balanced_lcs_partition_v1(query: str) -> tuple[str, ...]:
+    """Return the frozen query-only partition used by proof-query-v3.
+
+    The floor cut points distribute the code points deterministically.  The
+    approved partition count makes every segment one or two code points long,
+    while ``m == 2`` deliberately remains one segment rather than degenerating
+    into the forbidden per-code-point partition.
+    """
+
+    if type(query) is not str:
+        raise TypeError("partition query must be a built-in string")
+    if not query:
+        raise ValueError("partition query must not be empty")
+    query_length = len(query)
+    partition_count = (
+        1
+        if query_length == 1
+        else min(query_length - 1, (3 * query_length + 4) // 5)
+    )
+    cut_points = tuple(
+        (offset * query_length) // partition_count
+        for offset in range(partition_count + 1)
+    )
+    segments = tuple(
+        query[start:stop]
+        for start, stop in zip(cut_points, cut_points[1:])
+    )
+    if (
+        len(segments) != partition_count
+        or "".join(segments) != query
+        or any(len(segment) not in (1, 2) for segment in segments)
+        or (query_length > 1 and len(segments) >= query_length)
+    ):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    return segments
+
+
+def _partition_lcs_transition_v1(
+    previous: tuple[int, ...],
+    *,
+    segment: str,
+    candidate: str,
+    unreachable: int,
+) -> tuple[int, ...]:
+    """Apply one exact O(n) partition-additive LCS min-plus transition."""
+
+    if (
+        type(previous) is not tuple
+        or type(segment) is not str
+        or len(segment) not in (1, 2)
+        or type(candidate) is not str
+        or type(unreachable) is not int
+    ):
+        raise TypeError("partition transition facts are invalid")
+    candidate_length = len(candidate)
+    if len(previous) != candidate_length + 1:
+        raise TypeError("partition transition facts are invalid")
+
+    return tuple(_partition_lcs_transition_prepared_v1(
+        list(previous),
+        segment=segment,
+        candidate=candidate,
+    ))
+
+
+def _partition_lcs_transition_prepared_v1(
+    previous: list[int],
+    *,
+    segment: str,
+    candidate: str,
+) -> list[int]:
+    """Apply the frozen transition to owner-prepared rows with low overhead."""
+
+    segment_length = len(segment)
+    # Every prior row produced by this DP satisfies F(j+1) <= F(j)+1:
+    # extend the last candidate slice by one code point, whose g cost rises by
+    # at most one.  Therefore A(j)=F(j)-j is non-increasing, and every interval
+    # minimum in the min-plus transition is its right endpoint.  The initial
+    # row is built separately; all later rows are private outputs of this same
+    # recurrence, so no caller-supplied DP state crosses the proof boundary.
+
+    if segment_length == 1:
+        result = [0] * (len(candidate) + 1)
+        last_match = -1
+        symbol = segment[0]
+        for boundary in range(len(result)):
+            if boundary and candidate[boundary - 1] == symbol:
+                last_match = boundary - 1
+
+            # The only short slice is empty (start == boundary).
+            best = previous[boundary] + 1
+            if last_match >= 0:
+                competing = (
+                    boundary - 1
+                    + previous[last_match]
+                    - last_match
+                )
+                if competing < best:
+                    best = competing
+            if last_match < boundary - 1:
+                competing = previous[boundary - 1] + 1
+                if competing < best:
+                    best = competing
+            result[boundary] = best
+        return result
+
+    # q=2 has prefix LCS=2 plus LCS=1/0 intervals; the same right-endpoint
+    # property eliminates all range-minimum data structures.
+    result = [0] * (len(candidate) + 1)
+    last_first = -1
+    last_second = -1
+    threshold_two = -1
+    first_symbol, second_symbol = segment
+    for boundary in range(len(result)):
+        if boundary:
+            position = boundary - 1
+            code_point = candidate[position]
+            # Consume the old first-symbol occurrence before publishing the
+            # current occurrence; this is required when both symbols match.
+            if code_point == second_symbol and last_first >= 0:
+                if last_first > threshold_two:
+                    threshold_two = last_first
+            if code_point == first_symbol:
+                last_first = position
+            if code_point == second_symbol:
+                last_second = position
+
+        threshold_one = (
+            last_first if last_first > last_second else last_second
+        )
+        long_right = boundary - 2
+        one_left = threshold_two + 1
+        one_right = (
+            threshold_one
+            if threshold_one < long_right
+            else long_right
+        )
+
+        # Short empty and one-code-point slices.
+        best = previous[boundary] + 2
+        if boundary:
+            code_point = candidate[boundary - 1]
+            short_cost = (
+                1
+                if code_point == first_symbol or code_point == second_symbol
+                else 2
+            )
+            competing = previous[boundary - 1] + short_cost
+            if competing < best:
+                best = competing
+        if threshold_two >= 0:
+            competing = (
+                boundary - 2
+                + previous[threshold_two]
+                - threshold_two
+            )
+            if competing < best:
+                best = competing
+        if one_left <= one_right:
+            competing = (
+                boundary - 1
+                + previous[one_right]
+                - one_right
+            )
+            if competing < best:
+                best = competing
+        if threshold_one < long_right:
+            competing = previous[long_right] + 2
+            if competing < best:
+                best = competing
+        result[boundary] = best
+    return result
+
+
+def _partition_lcs_initial_row_v1(
+    segment: str,
+    candidate: str,
+) -> tuple[int, ...]:
+    """Build F1 directly because F0's unreachable tail is not Lipschitz."""
+
+    if type(segment) is not str or len(segment) not in (1, 2):
+        raise TypeError("initial partition segment is invalid")
+    if type(candidate) is not str:
+        raise TypeError("initial partition candidate is invalid")
+    if len(segment) == 1:
+        symbol = segment[0]
+        matched = False
+        result = [1]
+        for boundary, code_point in enumerate(candidate, start=1):
+            matched = matched or code_point == symbol
+            result.append(boundary - int(matched))
+        return tuple(result)
+
+    first_symbol, second_symbol = segment
+    seen_first = False
+    lcs_length = 0
+    result = [2]
+    for boundary, code_point in enumerate(candidate, start=1):
+        if code_point == second_symbol and seen_first:
+            lcs_length = 2
+        if code_point == first_symbol:
+            seen_first = True
+        if code_point == first_symbol or code_point == second_symbol:
+            lcs_length = max(lcs_length, 1)
+        result.append(max(2, boundary) - lcs_length)
+    return tuple(result)
+
+
+def _partition_additive_lcs_distance_v1(query: str, candidate: str) -> int:
+    """Return exact DΠ for the frozen balanced ordered query partition."""
+
+    return _PartitionLCSQueryProjectionV1(query).distance(candidate)
+
+
+class _PartitionLCSQueryProjectionV1:
+    """Query-owned exact DΠ projection with precomputed frozen segments."""
+
+    def __init__(self, query: str) -> None:
+        if type(query) is not str:
+            raise TypeError("partition LCS query must be a built-in string")
+        if not query:
+            raise ValueError("partition query must not be empty")
+        self._query = query
+        self._segments = _balanced_lcs_partition_v1(query)
+
+    def distance(self, candidate: str) -> int:
+        """Return exact DΠ for one independently evaluated identity."""
+
+        if type(candidate) is not str:
+            raise TypeError("partition LCS candidate must be a built-in string")
+        if not candidate:
+            return len(self._query)
+        segments = self._segments
+        previous = list(_partition_lcs_initial_row_v1(
+            segments[0],
+            candidate,
+        ))
+        for segment in segments[1:]:
+            previous = _partition_lcs_transition_prepared_v1(
+                previous,
+                segment=segment,
+                candidate=candidate,
+            )
+        distance = previous[-1]
+        longest = len(self._query)
+        if len(candidate) > longest:
+            longest = len(candidate)
+        if not 0 <= distance <= longest:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        return distance
+
+
+def _dense_phase3_upper_bound(
+    *,
+    query_length: int,
+    record_length: int,
+    lcs_length: int,
+    partition_lcs_distance: int,
+    bigram_intersection: int,
+) -> float:
+    """Return U4 by tightening U3 with the exact partition lower bound."""
+
+    if type(partition_lcs_distance) is not int or partition_lcs_distance < 0:
+        raise ValueError("partition LCS distance must be non-negative")
+    u3 = scorer_upper_bound_v1(
+        query_fold_length=query_length,
+        record_fold_length=record_length,
+        character_multiset_intersection=lcs_length,
+        bigram_multiset_intersection=bigram_intersection,
+        query_bigram_count=max(query_length - 1, 0),
+        record_bigram_count=max(record_length - 1, 0),
+    )
+    longest_length = max(query_length, record_length)
+    if partition_lcs_distance > longest_length:
+        raise ValueError("partition LCS distance exceeds folded lengths")
+    edit_distance_lower_bound = max(
+        u3.edit_distance_lower_bound,
+        partition_lcs_distance,
+    )
+    levenshtein_upper = 1.0 - edit_distance_lower_bound / longest_length
+    upper = (levenshtein_upper + u3.dice_bigram_exact) / 2.0
+    if not math.isfinite(upper) or not 0.0 <= upper <= u3.final_similarity_upper_bound:
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    return upper
+
+
 def _should_use_dense_traversal(
     block_upper_bounds: tuple[float, ...],
     *,
@@ -1138,6 +1435,7 @@ class CandidateProofSession:
         folded_query: str,
         minimum_similarity: float,
         result_limit: int,
+        completion_policy: str = PRODUCTION_COMPLETION_POLICY,
     ) -> None:
         _validate_candidate_scalars(folded_query, result_limit)
         if not folded_query:
@@ -1148,11 +1446,17 @@ class CandidateProofSession:
             raise ValueError("minimum_similarity must be in [0, 1]")
         if type(view) is not SQLiteTMQueryView or view.resource_id != resource_id:
             raise TypeError("proof view must be the resource's exact query view")
+        if type(completion_policy) is not str or completion_policy not in {
+            PRODUCTION_COMPLETION_POLICY,
+            ORACLE_FULL_COMPLETION_POLICY,
+        }:
+            raise ValueError("candidate proof completion policy is invalid")
         self._view = view
         self._resource_id = resource_id
         self._folded_query = folded_query
         self._minimum_similarity = minimum_similarity
         self._result_limit = result_limit
+        self._completion_policy = completion_policy
         self._budget = candidate_budget_v1(result_limit)
         try:
             snapshot = _copy_proof_snapshot(
@@ -1212,18 +1516,26 @@ class CandidateProofSession:
         self._dense_phase1: SQLiteCandidateProofDensePhase1 | None = None
         self._dense_phase1_uppers: tuple[float, ...] = ()
         self._dense_lcs_by_id: dict[int, int] = {}
+        self._dense_fold_by_id: dict[int, str] = {}
         self._dense_p2_floor_frontier: tuple[float, int] | None = None
+        self._dense_p3_floor_frontier: tuple[float, int] | None = None
         self._dense_frontier_groups: list[tuple[float, list[int]]] | None = None
         self._dense_refined = False
+        self._dense_u4_refined = False
+        self._dense_u3_probe_issued = False
+        self._dense_u4_evaluated_count = 0
         self._dense_a0_count = 0
         self._dense_p1_count = 0
         self._dense_r_count = 0
+        self._dense_p2_count = 0
+        self._dense_s_count = 0
         self._dense_phase2_returned_count = 0
         self._dense_k0: tuple[float, int] | None = None
         self._dense_p1_frontier: tuple[float, int] | None = None
         self._opened_blocks: set[int] = set()
         self._outstanding: set[int] = set()
         self._scores: dict[int, float] = {}
+        self._ranked_scores: dict[int, float] = {}
         self._observation_order: list[int] = []
         self._scorer_invocation_count = 0
         self._traversal_mode = "SPARSE"
@@ -1271,11 +1583,10 @@ class CandidateProofSession:
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
         bound_cache: dict[tuple[int, int], float] = {}
         uppers: list[float] = []
-        initial_limit = min(
-            self._result_limit,
-            self._snapshot.total_record_count,
-        )
-        initial_frontier: list[tuple[float, int]] = []
+        initial_ids_by_upper: dict[float, list[int]] = {}
+        bound_cache_get = bound_cache.get
+        grouped_ids_get = initial_ids_by_upper.get
+        append_upper = uppers.append
         query_length = len(self._folded_query)
         query_bigram_count = max(query_length - 1, 0)
         for record_id, (source_fold_length, bigram_intersection) in enumerate(
@@ -1291,15 +1602,15 @@ class CandidateProofSession:
                 or type(bigram_intersection) is not int
                 or source_fold_length < 1
                 or bigram_intersection < 0
-                or bigram_intersection
-                > min(query_bigram_count, source_fold_length - 1)
+                or bigram_intersection > query_bigram_count
+                or bigram_intersection >= source_fold_length
             ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
             bound_key = (
                 source_fold_length,
                 bigram_intersection,
             )
-            upper = bound_cache.get(bound_key)
+            upper = bound_cache_get(bound_key)
             if upper is None:
                 upper = _dense_phase1_upper_bound(
                     query_length=query_length,
@@ -1307,12 +1618,17 @@ class CandidateProofSession:
                     bigram_intersection=bigram_intersection,
                 )
                 bound_cache[bound_key] = upper
-            uppers.append(upper)
-            pair = (upper, record_id)
-            if len(initial_frontier) < initial_limit:
-                heapq.heappush(initial_frontier, pair)
-            elif pair > initial_frontier[0]:
-                heapq.heapreplace(initial_frontier, pair)
+            append_upper(upper)
+            # K0 belongs to the Retrieval-owned raw-distinct ranking domain.
+            # Candidate cannot know in advance which all-accounted identities
+            # Retrieval will exclude (for example raw-exact rows), so the
+            # phase-one frontier must retain every identity until k ranked
+            # observations have actually been supplied.
+            grouped_ids = grouped_ids_get(upper)
+            if grouped_ids is None:
+                initial_ids_by_upper[upper] = [record_id]
+            else:
+                grouped_ids.append(record_id)
         for block in self._snapshot.blocks:
             start = block.first_record_id - 1
             stop = block.last_record_id
@@ -1326,11 +1642,8 @@ class CandidateProofSession:
                 or max(block_bigrams, default=0) > block.bigram_intersection_upper
             ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-        initial_ids_by_upper: dict[float, list[int]] = {}
-        for upper, record_id in initial_frontier:
-            initial_ids_by_upper.setdefault(upper, []).append(record_id)
         self._dense_frontier_groups = [
-            (upper, sorted(initial_ids_by_upper[upper]))
+            (upper, initial_ids_by_upper[upper])
             for upper in sorted(initial_ids_by_upper)
         ]
         self._dense_phase1 = phase1
@@ -1347,17 +1660,17 @@ class CandidateProofSession:
             self._result_limit,
             self._snapshot.total_record_count,
         )
-        if len(self._scores) < required_prefix or self._outstanding:
+        if len(self._ranked_scores) < required_prefix or self._outstanding:
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
         k0 = (
             heapq.nlargest(
                 self._result_limit,
                 (
                     (score, record_id)
-                    for record_id, score in self._scores.items()
+                    for record_id, score in self._ranked_scores.items()
                 ),
             )[-1]
-            if self._snapshot.total_record_count >= self._result_limit
+            if len(self._ranked_scores) >= self._result_limit
             else None
         )
         refinement_ids: list[int] = []
@@ -1410,9 +1723,10 @@ class CandidateProofSession:
         ):
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
         phase2_ids_by_upper: dict[float, list[int]] = {}
-        bound_cache: dict[tuple[int, int, int], float] = {}
+        u3_bound_cache: dict[tuple[int, int, int], float] = {}
         query_length = len(self._folded_query)
         lcs_by_id: dict[int, int] = {}
+        fold_by_id: dict[int, str] = {}
         p2_floor_frontier: tuple[float, int] | None = None
         p2_floor_count = 0
         lcs_projection = _ExactLCSQueryProjection(self._folded_query)
@@ -1436,44 +1750,54 @@ class CandidateProofSession:
             )
             if not 0 <= lcs_length <= min(query_length, source_fold_length):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            bound_key = (
+            u3_bound_key = (
                 source_fold_length,
                 lcs_length,
                 bigram_intersection,
             )
-            upper = bound_cache.get(bound_key)
-            if upper is None:
-                upper = _dense_phase2_upper_bound(
+            u3_upper = u3_bound_cache.get(u3_bound_key)
+            if u3_upper is None:
+                u3_upper = _dense_phase2_upper_bound(
                     query_length=query_length,
                     record_length=source_fold_length,
                     lcs_length=lcs_length,
                     bigram_intersection=bigram_intersection,
                 )
-                bound_cache[bound_key] = upper
-            if upper > dense_u1_uppers[offset] + 1e-12:
+                u3_bound_cache[u3_bound_key] = u3_upper
+            if u3_upper > dense_u1_uppers[offset] + 1e-12:
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            if upper >= self._minimum_similarity or (
-                k0 is not None and (upper, record_id) >= k0
+            if not (
+                u3_upper >= self._minimum_similarity
+                or (k0 is not None and (u3_upper, record_id) >= k0)
             ):
-                lcs_by_id[record_id] = lcs_length
-                phase2_ids_by_upper.setdefault(upper, []).append(record_id)
-            else:
                 p2_floor_count += 1
-                pair = (upper, record_id)
+                pair = (u3_upper, record_id)
                 if p2_floor_frontier is None or pair > p2_floor_frontier:
                     p2_floor_frontier = pair
+                continue
+            lcs_by_id[record_id] = lcs_length
+            fold_by_id[record_id] = source_fold_v1
+            phase2_ids_by_upper.setdefault(u3_upper, []).append(record_id)
         self._dense_frontier_groups = [
             (upper, sorted(phase2_ids_by_upper[upper]))
             for upper in sorted(phase2_ids_by_upper)
         ]
-        if p2_floor_count + sum(
-            len(record_ids) for record_ids in phase2_ids_by_upper.values()
-        ) != len(request):
+        s_count = len(request) - p2_floor_count
+        if (
+            p2_floor_count < 0
+            or s_count < 0
+            or sum(len(record_ids) for record_ids in phase2_ids_by_upper.values())
+            != s_count
+        ):
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
         self._dense_lcs_by_id = lcs_by_id
+        self._dense_fold_by_id = fold_by_id
         self._dense_p2_floor_frontier = p2_floor_frontier
+        self._dense_p3_floor_frontier = None
         self._dense_a0_count = len(self._scores)
         self._dense_r_count = len(request)
+        self._dense_p2_count = p2_floor_count
+        self._dense_s_count = s_count
         self._dense_p1_count = (
             self._snapshot.total_record_count
             - self._dense_a0_count
@@ -1488,6 +1812,181 @@ class CandidateProofSession:
         self._dense_phase2_returned_count = len(response.record_ids)
         self._dense_k0 = k0
         self._dense_p1_frontier = p1_frontier
+        self._dense_refined = True
+        self._dense_u4_refined = False
+        self._dense_u3_probe_issued = False
+        self._dense_u4_evaluated_count = 0
+
+    def _refine_dense_u4_frontier(self) -> None:
+        """Evaluate U4 only after one U3-best batch failed to close policy."""
+
+        phase1 = self._dense_phase1
+        groups = self._dense_frontier_groups
+        if (
+            phase1 is None
+            or groups is None
+            or not self._dense_refined
+            or self._dense_u4_refined
+            or not self._dense_u3_probe_issued
+            or self._outstanding
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        kth = self._ranked_kth()
+        query_length = len(self._folded_query)
+        partition_projection = _PartitionLCSQueryProjectionV1(
+            self._folded_query
+        )
+        u4_bound_cache: dict[tuple[int, int, int, int], float] = {}
+        u4_ids_by_upper: dict[float, list[int]] = {}
+        p2_floor_frontier = self._dense_p2_floor_frontier
+        p2_floor_count = self._dense_p2_count
+        p3_floor_frontier: tuple[float, int] | None = None
+        p3_floor_count = 0
+        evaluated_count = 0
+        phase1_bigrams = phase1.bigram_multiset_intersections
+        phase1_lengths = phase1.source_fold_lengths
+        for u3_upper, record_ids in groups:
+            if type(u3_upper) is not float or type(record_ids) is not list:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            prior_record_id = 0
+            for record_id in record_ids:
+                if (
+                    type(record_id) is not int
+                    or record_id <= prior_record_id
+                    or record_id in self._scores
+                    or record_id in self._outstanding
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                prior_record_id = record_id
+                offset = record_id - 1
+                source_fold_v1 = self._dense_fold_by_id.get(record_id)
+                lcs_length = self._dense_lcs_by_id.get(record_id)
+                if type(source_fold_v1) is not str or type(lcs_length) is not int:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                source_fold_length = phase1_lengths[offset]
+                if len(source_fold_v1) != source_fold_length:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                pair = (u3_upper, record_id)
+                threshold_dominated = u3_upper < self._minimum_similarity
+                top_k_dominated = (
+                    kth is not None
+                    and pair < kth
+                )
+                safely_excluded = (
+                    threshold_dominated
+                    and top_k_dominated
+                    if self._completion_policy
+                    == ORACLE_FULL_COMPLETION_POLICY
+                    else threshold_dominated
+                    or (
+                        kth is not None
+                        and kth[0] >= self._minimum_similarity
+                        and top_k_dominated
+                    )
+                )
+                if safely_excluded:
+                    p2_floor_count += 1
+                    if p2_floor_frontier is None or pair > p2_floor_frontier:
+                        p2_floor_frontier = pair
+                    continue
+                bigram_intersection = phase1_bigrams[offset]
+                partition_distance = partition_projection.distance(
+                    source_fold_v1
+                )
+                u4_bound_key = (
+                    source_fold_length,
+                    lcs_length,
+                    partition_distance,
+                    bigram_intersection,
+                )
+                u4_upper = u4_bound_cache.get(u4_bound_key)
+                if u4_upper is None:
+                    u4_upper = _dense_phase3_upper_bound(
+                        query_length=query_length,
+                        record_length=source_fold_length,
+                        lcs_length=lcs_length,
+                        partition_lcs_distance=partition_distance,
+                        bigram_intersection=bigram_intersection,
+                    )
+                    u4_bound_cache[u4_bound_key] = u4_upper
+                if u4_upper > u3_upper + 1e-12:
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                evaluated_count += 1
+                u4_pair = (u4_upper, record_id)
+                threshold_dominated = u4_upper < self._minimum_similarity
+                top_k_dominated = kth is not None and u4_pair < kth
+                safely_excluded = (
+                    threshold_dominated
+                    and top_k_dominated
+                    if self._completion_policy
+                    == ORACLE_FULL_COMPLETION_POLICY
+                    else threshold_dominated
+                    or (
+                        kth is not None
+                        and kth[0] >= self._minimum_similarity
+                        and top_k_dominated
+                    )
+                )
+                if not safely_excluded:
+                    u4_ids_by_upper.setdefault(u4_upper, []).append(record_id)
+                    continue
+                p3_floor_count += 1
+                if p3_floor_frontier is None or u4_pair > p3_floor_frontier:
+                    p3_floor_frontier = u4_pair
+        if (
+            evaluated_count
+            != p3_floor_count
+            + sum(len(record_ids) for record_ids in u4_ids_by_upper.values())
+            or p2_floor_count
+            + (len(self._scores) - self._dense_a0_count)
+            + evaluated_count
+            != self._dense_r_count
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        self._dense_frontier_groups = [
+            (upper, sorted(u4_ids_by_upper[upper]))
+            for upper in sorted(u4_ids_by_upper)
+        ]
+        self._dense_p2_count = p2_floor_count
+        self._dense_p2_floor_frontier = p2_floor_frontier
+        self._dense_p3_floor_frontier = p3_floor_frontier
+        self._dense_u4_evaluated_count = evaluated_count
+        self._dense_u4_refined = True
+        self._dense_fold_by_id.clear()
+
+    def _finalize_dense_at_phase1(self) -> None:
+        """Freeze an R=0 proof when U1 already satisfies the policy."""
+
+        groups = self._dense_frontier_groups
+        if self._dense_phase1 is None or groups is None or self._dense_refined:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        remaining_count = sum(len(record_ids) for _upper, record_ids in groups)
+        expected_remaining = self._snapshot.total_record_count - len(self._scores)
+        if remaining_count != expected_remaining or self._outstanding:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        p1_frontier = None
+        if groups:
+            upper, record_ids = groups[-1]
+            if not record_ids:
+                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            p1_frontier = (upper, record_ids[-1])
+        self._dense_a0_count = len(self._scores)
+        self._dense_p1_count = remaining_count
+        self._dense_r_count = 0
+        self._dense_p2_count = 0
+        self._dense_s_count = 0
+        self._dense_phase2_returned_count = 0
+        self._dense_k0 = self._ranked_kth()
+        self._dense_p1_frontier = p1_frontier
+        self._dense_frontier_groups = []
         self._dense_refined = True
 
     def _open_block(self, block_id: int) -> None:
@@ -1562,10 +2061,7 @@ class CandidateProofSession:
 
     def _record_frontier(self) -> tuple[float, int] | None:
         if self._dense_frontier_groups is not None:
-            frontier = None
-            if self._dense_frontier_groups:
-                upper, record_ids = self._dense_frontier_groups[-1]
-                frontier = (upper, record_ids[-1])
+            frontier = self._dense_phase3_frontier()
             if self._dense_refined and self._dense_p2_floor_frontier is not None:
                 frontier = (
                     self._dense_p2_floor_frontier
@@ -1578,6 +2074,22 @@ class CandidateProofSession:
             if self._record_heap
             else None
         )
+
+    def _dense_phase3_frontier(self) -> tuple[float, int] | None:
+        """Return only P3/U4 facts, excluding the independent P2 floor."""
+
+        frontier = None
+        if self._dense_frontier_groups is not None:
+            if self._dense_frontier_groups:
+                upper, record_ids = self._dense_frontier_groups[-1]
+                frontier = (upper, record_ids[-1])
+            if self._dense_refined and self._dense_p3_floor_frontier is not None:
+                frontier = (
+                    self._dense_p3_floor_frontier
+                    if frontier is None
+                    else max(frontier, self._dense_p3_floor_frontier)
+                )
+        return frontier
 
     def _pop_record_frontier(self) -> tuple[float, int]:
         if self._dense_frontier_groups is not None:
@@ -1616,62 +2128,104 @@ class CandidateProofSession:
             return block_frontier
         return max(block_frontier, record_frontier)
 
-    def _closure(self) -> tuple[bool, bool, tuple[float, int] | None]:
+    def _ranked_kth(self) -> tuple[float, int] | None:
+        if len(self._ranked_scores) < self._result_limit:
+            return None
+        return heapq.nlargest(
+            self._result_limit,
+            (
+                (score, record_id)
+                for record_id, score in self._ranked_scores.items()
+            ),
+        )[-1]
+
+    def _closure(
+        self,
+    ) -> tuple[bool, bool, bool, tuple[float, int] | None]:
         frontier = self._frontier()
         threshold_closed = (
             frontier is None or frontier[0] < self._minimum_similarity
         )
-        total = self._snapshot.total_record_count
-        if total < self._result_limit:
-            top_k_closed = frontier is None
-        elif len(self._scores) < self._result_limit:
-            top_k_closed = False
-        else:
-            kth = heapq.nlargest(
-                self._result_limit,
-                (
-                    (score, record_id)
-                    for record_id, score in self._scores.items()
-                ),
-            )[-1]
-            top_k_closed = frontier is None or frontier < kth
-        return threshold_closed, top_k_closed, frontier
+        kth = self._ranked_kth()
+        top_k_closed = (
+            frontier is None
+            if kth is None
+            else frontier is None or frontier < kth
+        )
+        result_complete = threshold_closed or (
+            kth is not None
+            and kth[0] >= self._minimum_similarity
+            and top_k_closed
+        )
+        return threshold_closed, top_k_closed, result_complete, frontier
+
+    def _policy_complete(self) -> bool:
+        threshold_closed, top_k_closed, result_complete, _frontier = (
+            self._closure()
+        )
+        if self._completion_policy == ORACLE_FULL_COMPLETION_POLICY:
+            return threshold_closed and top_k_closed
+        return result_complete
 
     def next_batch(self) -> tuple[int, ...]:
         if (
             self._dense_phase1 is not None
             and not self._dense_refined
-            and len(self._scores)
+            and len(self._ranked_scores)
             >= min(self._result_limit, self._snapshot.total_record_count)
         ):
             self._refine_dense_frontier()
-        threshold_closed, top_k_closed, _frontier = self._closure()
-        if threshold_closed and top_k_closed:
+        if self._policy_complete():
+            if self._dense_phase1 is not None and not self._dense_refined:
+                self._finalize_dense_at_phase1()
             return ()
+        if (
+            self._dense_phase1 is not None
+            and self._dense_refined
+            and not self._dense_u4_refined
+            and self._dense_u3_probe_issued
+        ):
+            self._refine_dense_u4_frontier()
+            if self._policy_complete():
+                return ()
         batch: list[int] = []
         batch_limit = CANDIDATE_PROOF_BATCH_SIZE
-        if len(self._scores) < self._result_limit:
+        remaining_invocation_budget = (
+            self._budget - self._scorer_invocation_count
+        )
+        # Identity batches may reuse already-observed exact-fold evidence, so
+        # a depleted invocation budget does not by itself close traversal.
+        # While positive budget remains, however, cap the batch to the exact
+        # remainder.  Retrieval can then consume invocation 2,048 exactly;
+        # the following batch is still issued and rejected atomically if it
+        # introduces a new fold requiring invocation 2,049.
+        if remaining_invocation_budget > 0:
+            batch_limit = min(batch_limit, remaining_invocation_budget)
+        if len(self._ranked_scores) < self._result_limit:
             batch_limit = min(
                 batch_limit,
-                self._result_limit - len(self._scores),
+                self._result_limit - len(self._ranked_scores),
             )
-        known_kth = (
-            heapq.nlargest(
-                self._result_limit,
-                (
-                    (score, record_id)
-                    for record_id, score in self._scores.items()
-                ),
-            )[-1]
-            if len(self._scores) >= self._result_limit
-            else None
-        )
+        known_kth = self._ranked_kth()
         while len(batch) < batch_limit:
             if batch and known_kth is not None:
                 frontier = self._frontier()
-                if frontier is None or (
-                    frontier[0] < self._minimum_similarity
-                    and frontier < known_kth
+                threshold_dominated = (
+                    frontier is None
+                    or frontier[0] < self._minimum_similarity
+                )
+                top_k_dominated = (
+                    frontier is None or frontier < known_kth
+                )
+                if (
+                    threshold_dominated and top_k_dominated
+                    if self._completion_policy
+                    == ORACLE_FULL_COMPLETION_POLICY
+                    else threshold_dominated
+                    or (
+                        known_kth[0] >= self._minimum_similarity
+                        and top_k_dominated
+                    )
                 ):
                     break
             self._discard_opened_block_heads()
@@ -1687,8 +2241,7 @@ class CandidateProofSession:
                 _neg_upper, _neg_id, block_id = heapq.heappop(self._block_heap)
                 self._open_block(block_id)
                 if not batch:
-                    threshold_closed, top_k_closed, _frontier = self._closure()
-                    if threshold_closed and top_k_closed:
+                    if self._policy_complete():
                         return ()
                 continue
             if record_key is None:
@@ -1723,18 +2276,30 @@ class CandidateProofSession:
             self._outstanding.add(record_id)
             batch.append(record_id)
         if not batch:
-            threshold_closed, top_k_closed, _frontier = self._closure()
-            if not (threshold_closed and top_k_closed):
+            if not self._policy_complete():
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        elif (
+            self._dense_phase1 is not None
+            and self._dense_refined
+            and not self._dense_u4_refined
+        ):
+            self._dense_u3_probe_issued = True
         return tuple(batch)
 
     def observe(
         self,
         observations: tuple[tuple[int, SimilarityEvidence, bool], ...],
+        *,
+        ranked_record_ids: tuple[int, ...],
     ) -> None:
         if type(observations) is not tuple:
             raise TypeError("proof observations must be a tuple")
+        if type(ranked_record_ids) is not tuple:
+            raise TypeError("ranked proof identities must be a tuple")
         seen: set[int] = set()
+        observation_ids: list[int] = []
+        prepared_scores: list[tuple[int, float]] = []
+        invocation_delta = 0
         for item in observations:
             if type(item) is not tuple or len(item) != 3:
                 raise TypeError("proof observation is invalid")
@@ -1755,23 +2320,59 @@ class CandidateProofSession:
             ):
                 raise ValueError("proof score evidence does not close")
             seen.add(record_id)
-            self._scores[record_id] = score
-            self._observation_order.append(record_id)
+            observation_ids.append(record_id)
+            prepared_scores.append((record_id, score))
             if scorer_invoked:
-                self._scorer_invocation_count += 1
-                if self._scorer_invocation_count > self._budget:
-                    raise CandidateProofBudgetExhausted()
+                invocation_delta += 1
         if seen != self._outstanding:
             raise ValueError("proof observations must close the outstanding batch")
+        ranked_seen: set[int] = set()
+        ranked_positions: list[int] = []
+        position_by_id = {
+            record_id: position
+            for position, record_id in enumerate(observation_ids)
+        }
+        for record_id in ranked_record_ids:
+            if (
+                type(record_id) is not int
+                or record_id in ranked_seen
+                or record_id not in position_by_id
+            ):
+                raise ValueError("ranked proof identity is invalid")
+            ranked_seen.add(record_id)
+            ranked_positions.append(position_by_id[record_id])
+        if ranked_positions != sorted(ranked_positions):
+            raise ValueError("ranked proof identities must preserve batch order")
+        if self._scorer_invocation_count + invocation_delta > self._budget:
+            raise CandidateProofBudgetExhausted()
+
+        # Commit only after the complete batch, ranked subset and projected
+        # invocation budget have all closed.  Every failure above leaves all
+        # session domains and the outstanding batch byte-for-byte unchanged.
+        for record_id, score in prepared_scores:
+            self._scores[record_id] = score
+            self._observation_order.append(record_id)
+            if record_id in ranked_seen:
+                self._ranked_scores[record_id] = score
+        self._scorer_invocation_count += invocation_delta
         self._outstanding.clear()
 
     def finish(self) -> CandidateRetrievalReport:
         if self._outstanding:
             raise ValueError("proof has an outstanding scorer batch")
-        if self._dense_phase1 is not None and not self._dense_refined:
+        if (
+            self._dense_phase1 is not None
+            and not self._dense_refined
+            and self._frontier() is not None
+        ):
             raise ValueError("dense proof must complete phase-two refinement")
-        threshold_closed, top_k_closed, frontier = self._closure()
-        if not (threshold_closed and top_k_closed):
+        threshold_closed, top_k_closed, result_complete, frontier = self._closure()
+        policy_complete = (
+            threshold_closed and top_k_closed
+            if self._completion_policy == ORACLE_FULL_COMPLETION_POLICY
+            else result_complete
+        )
+        if not policy_complete:
             if self._scorer_invocation_count >= self._budget:
                 raise CandidateProofBudgetExhausted()
             raise ValueError("candidate proof is not closed")
@@ -1779,32 +2380,52 @@ class CandidateProofSession:
             head_revision=self._snapshot.head_revision,
             total_record_count=self._snapshot.total_record_count,
         )
-        kth = (
-            heapq.nlargest(
-                self._result_limit,
-                (
-                    (score, record_id)
-                    for record_id, score in self._scores.items()
-                ),
-            )[-1]
-            if self._snapshot.total_record_count >= self._result_limit
-            else None
-        )
+        kth = self._ranked_kth()
         refinement: CandidateProofRefinementMetadata | None = None
-        if self._traversal_mode == "DENSE":
-            phase2_frontier = self._record_frontier()
+        if self._traversal_mode == "DENSE" and self._dense_refined:
+            active_frontier = self._dense_phase3_frontier()
             a1_count = len(self._scores) - self._dense_a0_count
-            p2_count = self._dense_r_count - a1_count
-            if a1_count < 0 or p2_count < 0:
+            if self._dense_u4_refined:
+                p2_count = self._dense_p2_count
+                p2_frontier = self._dense_p2_floor_frontier
+                p3_count = self._dense_r_count - a1_count - p2_count
+                p3_frontier = active_frontier
+            else:
+                p2_count = self._dense_r_count - a1_count
+                p2_frontier = self._dense_p2_floor_frontier
+                if active_frontier is not None:
+                    p2_frontier = (
+                        active_frontier
+                        if p2_frontier is None
+                        else max(p2_frontier, active_frontier)
+                    )
+                p3_count = 0
+                p3_frontier = None
+            s_count = self._dense_r_count - p2_count
+            if (
+                a1_count < 0
+                or p2_count < 0
+                or p3_count < 0
+                or p2_count + s_count != self._dense_r_count
+                or a1_count + p3_count != s_count
+                or self._dense_u4_evaluated_count > s_count
+                or p3_count > self._dense_u4_evaluated_count
+            ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
             refinement = CandidateProofRefinementMetadata(
-                phase="PHASE_2_COMPLETE",
+                phase="DENSE_COMPLETE",
                 refined=True,
+                partition_version=CANDIDATE_PROOF_PARTITION_VERSION,
                 a0_accounted_identity_count=self._dense_a0_count,
                 p1_unscored_identity_count=self._dense_p1_count,
                 r_refinement_identity_count=self._dense_r_count,
                 a1_accounted_identity_count=a1_count,
                 p2_unscored_identity_count=p2_count,
+                s_post_u3_identity_count=s_count,
+                u4_evaluated_identity_count=(
+                    self._dense_u4_evaluated_count
+                ),
+                p3_unscored_identity_count=p3_count,
                 refinement_request_count=self._dense_r_count,
                 refinement_returned_count=self._dense_phase2_returned_count,
                 k0_score=(None if self._dense_k0 is None else self._dense_k0[0]),
@@ -1822,10 +2443,20 @@ class CandidateProofSession:
                     else self._dense_p1_frontier[1]
                 ),
                 p2_max_upper_bound=(
-                    None if phase2_frontier is None else phase2_frontier[0]
+                    None
+                    if p2_frontier is None
+                    else p2_frontier[0]
                 ),
                 p2_possible_record_id=(
-                    None if phase2_frontier is None else phase2_frontier[1]
+                    None
+                    if p2_frontier is None
+                    else p2_frontier[1]
+                ),
+                p3_max_upper_bound=(
+                    None if p3_frontier is None else p3_frontier[0]
+                ),
+                p3_possible_record_id=(
+                    None if p3_frontier is None else p3_frontier[1]
                 ),
             )
         proof = CandidateProofMetadata(
@@ -1833,6 +2464,10 @@ class CandidateProofSession:
             bound_version=SCORER_BOUND_VERSION_V1,
             block_version=CANDIDATE_PROOF_BLOCK_VERSION_V1,
             traversal_version=CANDIDATE_PROOF_TRAVERSAL_VERSION,
+            ranking_domain_version=CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+            invocation_domain_version=(
+                CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION
+            ),
             traversal_mode=self._traversal_mode,
             total_block_count=len(self._snapshot.blocks),
             total_record_count=self._snapshot.total_record_count,
@@ -1857,6 +2492,7 @@ class CandidateProofSession:
             }),
             scorer_invocation_count=self._scorer_invocation_count,
             accounted_identity_count=len(self._scores),
+            ranked_eligible_count=len(self._ranked_scores),
             unscored_identity_count=(
                 self._snapshot.total_record_count - len(self._scores)
             ),
@@ -1865,9 +2501,10 @@ class CandidateProofSession:
             minimum_similarity=self._minimum_similarity,
             threshold_closed=threshold_closed,
             top_k=self._result_limit,
-            kth_score=(None if kth is None else kth[0]),
-            kth_record_id=(None if kth is None else kth[1]),
+            ranked_kth_score=(None if kth is None else kth[0]),
+            ranked_kth_record_id=(None if kth is None else kth[1]),
             top_k_closed=top_k_closed,
+            result_complete=result_complete,
             refinement=refinement,
         )
         seed_pool: set[int] = set()
@@ -1998,6 +2635,7 @@ class CandidateRetriever:
         *,
         minimum_similarity: float,
         result_limit: int,
+        completion_policy: str = PRODUCTION_COMPLETION_POLICY,
     ) -> CandidateProofSession:
         """Create the private alternating proof port on one query view."""
 
@@ -2009,6 +2647,7 @@ class CandidateRetriever:
             folded_query=folded_query,
             minimum_similarity=minimum_similarity,
             result_limit=result_limit,
+            completion_policy=completion_policy,
         )
 
 
@@ -2026,6 +2665,8 @@ __all__ = [
     "GRAM_CANDIDATE_HARD_CAP",
     "GRAM_EMPTY_QUERY_CODE",
     "GRAM_LONG_QUERY_FTS_SELECTED_CODE",
+    "ORACLE_FULL_COMPLETION_POLICY",
+    "PRODUCTION_COMPLETION_POLICY",
     "GramCandidateResult",
     "GramPostingEvidence",
     "GramPostingIndex",

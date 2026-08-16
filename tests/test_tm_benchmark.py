@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import tm_benchmark
 from tm_benchmark import (
@@ -114,6 +115,26 @@ _BANNED_RUNTIME_MODULES = {
     "matcher_capability",
     "matcher_validation",
 }
+
+
+class BenchmarkImplementationFingerprintTests(unittest.TestCase):
+    def test_two_pass_snapshot_rejects_earlier_source_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (
+                patch.object(
+                    tm_benchmark,
+                    "BENCHMARK_IMPLEMENTATION_SOURCE_PATHS",
+                    ("a.py", "b.py"),
+                ),
+                patch.object(
+                    tm_benchmark,
+                    "_stable_benchmark_source_digest",
+                    side_effect=("a" * 64, "b" * 64, "c" * 64, "b" * 64),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "during snapshot"):
+                    tm_benchmark.benchmark_implementation_fingerprint(root)
 
 
 def _canonical_json(value: object) -> str:
@@ -599,7 +620,9 @@ class BenchmarkCorpusTests(unittest.TestCase):
         for write_api in (
             "write_text",
             "write_bytes",
-            "open(",
+            "os.O_WRONLY",
+            "os.O_RDWR",
+            "os.O_CREAT",
             "unlink",
             "remove(",
             "os.replace",

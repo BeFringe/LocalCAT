@@ -1,24 +1,238 @@
-"""Focused current-schema index tests for candidate proof-query-v2."""
+"""Focused current-schema index tests for candidate proof-query-v3."""
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 
+import tm_sqlite_store
 from tm_benchmark import (
+    iter_corpus_records,
+    iter_fuzzy_queries,
     iter_oracle_queries,
     iter_oracle_subset_records,
     load_benchmark_contract,
 )
 from tm_benchmark_oracle import _run_candidate_path
+from tm_candidate_index import (
+    _ExactLCSQueryProjection,
+    _dense_phase2_upper_bound,
+)
 from tm_contracts import BenchmarkExecutionPath
-from tm_sqlite_store import SQLiteStoreSchemaError
+from tm_sqlite_store import SQLiteStoreSchemaError, unique_character_ngrams
+from text_matcher import fold_text_value_v1
 from tests.test_tm_candidate_proof_query import _draft, _store
 
 
-class CandidateProofIndexV15Tests(unittest.TestCase):
+class CandidateProofIndexV16Tests(unittest.TestCase):
+    def test_fallback_seed_is_real_deterministic_and_posting_bounded(
+        self,
+    ) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE tm_gram("
+            "gram_size INTEGER NOT NULL, gram TEXT NOT NULL, "
+            "record_id INTEGER NOT NULL)"
+        )
+        short_query = "abcdefghijklmnopqrstuvwxyz"
+        long_query = "".join(chr(0x400 + index) for index in range(300))
+        inserted: set[tuple[int, str, int]] = set()
+        for query in (short_query, long_query):
+            for size in (1, 2, 3):
+                grams = unique_character_ngrams(query, size)
+                for record_id in range(1, 321):
+                    for offset, gram in enumerate(grams):
+                        if (record_id * 7 + offset * 11 + size) % 23 < 5:
+                            inserted.add((size, gram, record_id))
+        connection.executemany(
+            "INSERT INTO tm_gram(gram_size, gram, record_id) VALUES (?, ?, ?)",
+            sorted(inserted),
+        )
+        postings: dict[tuple[int, str], list[int]] = {}
+        for gram_size, gram, record_id in inserted:
+            postings.setdefault((gram_size, gram), []).append(record_id)
+        for record_ids in postings.values():
+            record_ids.sort(reverse=True)
+
+        def expected(query: str) -> tuple[tuple[str, tuple[int, ...]], ...]:
+            stages = []
+            for size in (3, 2, 1):
+                grams = unique_character_ngrams(query, size)
+                posting_budget = 4096
+                per_gram, remainder = divmod(posting_budget, len(grams))
+                counts: Counter[int] = Counter()
+                for ordinal, gram in enumerate(grams):
+                    gram_limit = per_gram + (1 if ordinal < remainder else 0)
+                    counts.update(postings.get((size, gram), ())[:gram_limit])
+                stages.append((
+                    f"GRAM_{size}",
+                    tuple(
+                        record_id
+                        for record_id, _count in sorted(
+                            counts.items(),
+                            key=lambda item: (-item[1], -item[0]),
+                        )[:37]
+                    ),
+                ))
+            return tuple(stages)
+
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(
+                tm_sqlite_store._bounded_seed_stages(
+                    connection,
+                    folded_query=short_query,
+                    fts5_available=False,
+                    seed_limit=37,
+                ),
+                expected(short_query),
+            )
+            self.assertFalse(any("GROUP BY" in statement for statement in statements))
+            statements.clear()
+            observed = tm_sqlite_store._bounded_seed_stages(
+                connection,
+                folded_query=long_query,
+                fts5_available=False,
+                seed_limit=37,
+            )
+            self.assertEqual(observed, expected(long_query))
+            expected_statement_count = sum(
+                len(unique_character_ngrams(long_query, size))
+                for size in (3, 2, 1)
+            )
+            self.assertEqual(
+                sum(
+                    "SELECT record_id FROM tm_gram" in statement
+                    for statement in statements
+                ),
+                expected_statement_count,
+            )
+            for stage_name, record_ids in observed:
+                size = int(stage_name.removeprefix("GRAM_"))
+                query_grams = set(unique_character_ngrams(long_query, size))
+                self.assertTrue(all(
+                    any(record_id in postings.get((size, gram), ()) for gram in query_grams)
+                    for record_id in record_ids
+                ))
+        finally:
+            connection.close()
+
+    def test_fallback_seed_never_exceeds_posting_cap_for_many_unique_grams(
+        self,
+    ) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE tm_gram("
+            "gram_size INTEGER NOT NULL, gram TEXT NOT NULL, "
+            "record_id INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_tm_gram_lookup "
+            "ON tm_gram(gram_size, gram, record_id)"
+        )
+        query = "".join(chr(0x10000 + index) for index in range(4_205))
+        rows = []
+        expected_statement_count = 0
+        for size in (3, 2, 1):
+            grams = unique_character_ngrams(query, size)
+            self.assertGreater(len(grams), 4_096)
+            expected_statement_count += len(grams)
+            rows.extend(
+                (size, gram, ordinal)
+                for ordinal, gram in enumerate(grams, start=1)
+            )
+        connection.executemany(
+            "INSERT INTO tm_gram(gram_size, gram, record_id) VALUES (?, ?, ?)",
+            rows,
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            stages = tm_sqlite_store._bounded_seed_stages(
+                connection,
+                folded_query=query,
+                fts5_available=False,
+                seed_limit=5_000,
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(tuple(stage for stage, _ids in stages), (
+            "GRAM_3",
+            "GRAM_2",
+            "GRAM_1",
+        ))
+        for _stage, record_ids in stages:
+            self.assertEqual(len(record_ids), 4_096)
+            self.assertEqual(record_ids[0], 4_096)
+            self.assertEqual(record_ids[-1], 1)
+        self.assertEqual(
+            sum(
+                statement.startswith("SELECT record_id FROM tm_gram")
+                for statement in statements
+            ),
+            expected_statement_count,
+        )
+
+    def test_nine_frozen_near_edits_retain_u3_budget_regression(self) -> None:
+        expected_threshold_competitors = {
+            183: 2_800,
+            185: 2_104,
+            186: 2_192,
+            189: 3_620,
+            193: 3_224,
+            195: 2_261,
+            196: 3_074,
+            197: 2_414,
+            199: 2_290,
+        }
+        queries = tuple(iter_fuzzy_queries())
+        query_facts = tuple(
+            (
+                query_id,
+                folded_query,
+                Counter(
+                    folded_query[offset : offset + 2]
+                    for offset in range(len(folded_query) - 1)
+                ),
+                _ExactLCSQueryProjection(folded_query),
+            )
+            for query_id in expected_threshold_competitors
+            for folded_query in (
+                fold_text_value_v1(queries[query_id - 1].query_raw),
+            )
+        )
+        observed = dict.fromkeys(expected_threshold_competitors, 0)
+        for record in iter_corpus_records():
+            source_fold = fold_text_value_v1(record.source_raw)
+            source_bigrams = Counter(
+                source_fold[offset : offset + 2]
+                for offset in range(len(source_fold) - 1)
+            )
+            for query_id, folded_query, query_bigrams, projection in query_facts:
+                bigram_intersection = sum(
+                    min(frequency, source_bigrams.get(gram, 0))
+                    for gram, frequency in query_bigrams.items()
+                )
+                lcs_length = projection.facts(source_fold, len(source_fold))
+                if (
+                    _dense_phase2_upper_bound(
+                        query_length=len(folded_query),
+                        record_length=len(source_fold),
+                        lcs_length=lcs_length,
+                        bigram_intersection=bigram_intersection,
+                    )
+                    >= 0.60
+                ):
+                    observed[query_id] += 1
+
+        self.assertEqual(observed, expected_threshold_competitors)
+        self.assertTrue(all(count > 2_048 for count in observed.values()))
+
     def test_legacy_12_query_27_identity_oracle_misses_are_regressions(
         self,
     ) -> None:
@@ -65,7 +279,12 @@ class CandidateProofIndexV15Tests(unittest.TestCase):
             (BenchmarkExecutionPath.GRAM_FALLBACK, "fallback"),
         ):
             with self.subTest(path=execution_path), tempfile.TemporaryDirectory() as temporary:
-                _store_kind, _fixture_digest, rows = _run_candidate_path(
+                    (
+                        _fixture_digest,
+                        _store_kind,
+                        rows,
+                        _proof_query_version,
+                    ) = _run_candidate_path(
                     contract=contract,
                     execution_path=execution_path,
                     records=records,

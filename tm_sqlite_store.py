@@ -10,7 +10,7 @@ journal-authenticated new set cannot be proven at any phase.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -34,7 +34,7 @@ import tm_contracts as contract_module
 from text_matcher import (
     TEXT_MATCHER_SEMANTICS_VERSION,
     UNICODE_VERSION,
-    fold_text_v1,
+    fold_text_value_v1,
 )
 from tm_contracts import (
     SCORER_VERSION_V1,
@@ -54,6 +54,11 @@ from tm_contracts import (
     contract_from_json,
     contract_to_json,
     snapshot_receipt_digest,
+)
+from tm_content_attestation import (
+    ActiveContentAttestation,
+    ContentAttestationError,
+    _capture_content_file,
 )
 
 
@@ -221,6 +226,8 @@ from tm_activation_recovery import (
     _revalidate_recovered_prior_set,
     _revalidate_recovered_sealed_database,
     _revalidate_recovery_authority,
+    _revalidate_active_content_attestation,
+    _require_bound_active_content_attestation,
     _rollback_inconsistent_activation,
     _rollback_restored_prior_view,
     _validate_activation_indexes,
@@ -248,6 +255,7 @@ CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
 CANDIDATE_PROOF_BLOCK_SIZE = 256
 BUSY_TIMEOUT_MS = 5000
 _CANDIDATE_QUERY_CHUNK_SIZE = 256
+_CANDIDATE_SEED_POSTING_CAP = 4096
 _NATIVE_PATH_TYPE = type(Path())
 
 _RECORD_COLUMNS = (
@@ -488,6 +496,25 @@ _SCHEMA_STATEMENTS = (
     ON tm_gram_block_max(gram_size, gram, block_id)
     """,
 )
+
+_STREAMED_STAGE_SECONDARY_INDEX_NAMES = (
+    "idx_tm_exact",
+    "idx_tm_context_speaker",
+    "idx_tm_gram_lookup",
+    "idx_tm_gram_block_lookup",
+)
+_STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS = tuple(
+    statement
+    for statement in _SCHEMA_STATEMENTS
+    if any(
+        f"CREATE INDEX {name}" in statement
+        for name in _STREAMED_STAGE_SECONDARY_INDEX_NAMES
+    )
+)
+if len(_STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS) != len(
+    _STREAMED_STAGE_SECONDARY_INDEX_NAMES
+):
+    raise RuntimeError("streamed-stage secondary index closure is invalid")
 
 _LEGACY_SCHEMA_STATEMENTS = (
     """
@@ -763,12 +790,17 @@ def character_ngram_frequencies(
 ) -> tuple[tuple[str, int], ...]:
     """Return exact multiset frequencies in first-occurrence gram order."""
 
-    grams = unique_character_ngrams(folded_text, gram_size)
-    frequencies = Counter(
-        folded_text[offset : offset + gram_size]
-        for offset in range(max(0, len(folded_text) - gram_size + 1))
-    )
-    return tuple((gram, frequencies[gram]) for gram in grams)
+    if type(folded_text) is not str:
+        raise TypeError("folded_text must be a built-in string")
+    if type(gram_size) is not int:
+        raise TypeError("gram_size must be a built-in integer")
+    if gram_size not in {1, 2, 3}:
+        raise ValueError("gram_size must be 1, 2, or 3")
+    frequencies: dict[str, int] = {}
+    for offset in range(max(0, len(folded_text) - gram_size + 1)):
+        gram = folded_text[offset : offset + gram_size]
+        frequencies[gram] = frequencies.get(gram, 0) + 1
+    return tuple(frequencies.items())
 
 
 def build_candidate_write_plan(
@@ -1753,17 +1785,6 @@ def _rehydrate_completed_activation(
             "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
             retryable=False,
         )
-    database = _recovery_capture_journal_file(
-        identity.canonical_sidecar_path
-    )
-    if (
-        (database[0].device, database[0].inode)
-        != record.candidate_stage_db_identity
-    ):
-        raise ActivationPreparationError(
-            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
-            retryable=False,
-        )
     next_generation = (
         0
         if record.expected_prior_generation is None
@@ -1773,18 +1794,60 @@ def _rehydrate_completed_activation(
         record,
         next_generation=next_generation,
     )
-    active_ref = _canonical_activation_ref(
-        identity,
-        journal_id=record.journal_id,
-    )
-    snapshot = port.inspect_stage_schema(
-        active_ref,
+    active_attestation = _require_bound_active_content_attestation(
+        record,
         canonical_store_id=record.canonical_store_id,
-        _allow_diverged_runtime=True,
-        _allow_active=True,
-        _expected_active_generation=next_generation,
-        _expected_activation_digest=activation_digest,
+        next_generation=next_generation,
+        activation_digest=activation_digest,
     )
+    try:
+        database = _capture_content_file(identity.canonical_sidecar_path)
+    except ContentAttestationError as error:
+        code = (
+            "ACTIVATION.ACTIVE_ATTESTATION_ASSET_MISSING"
+            if error.error_code == "CONTENT_ATTESTATION.FILE_MISSING"
+            else "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID"
+        )
+        raise ActivationPreparationError(code, retryable=False) from error
+    if (database.device, database.inode) != (
+        active_attestation.database.device,
+        active_attestation.database.inode,
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        )
+    database_is_attested = database == active_attestation.database
+    if database_is_attested:
+        active_ref, snapshot = _revalidate_active_content_attestation(
+            port,
+            record,
+            identity=identity,
+            canonical_store_id=record.canonical_store_id,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+            # A completed canonical generation remains last-known-good
+            # authority when its configured JSONL/manifest pair later
+            # diverges. SourceBindingMonitor owns that comparison.
+            require_configured_pair=False,
+        )
+    else:
+        # A legitimate post-activation append keeps the canonical inode but
+        # changes its bytes.  The attestation can no longer authorize the
+        # semantic fast path, so cold rehydrate falls back to the complete
+        # runtime validator.  A foreign inode was rejected above.
+        active_ref = _canonical_activation_ref(
+            identity,
+            journal_id=record.journal_id,
+        )
+        snapshot = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=record.canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=next_generation,
+            _expected_activation_digest=activation_digest,
+        )
     with port.open_configured_connection(
         identity.canonical_sidecar_path,
         require_existing=True,
@@ -1797,16 +1860,19 @@ def _rehydrate_completed_activation(
                 canonical_store_id=record.canonical_store_id,
                 target_identity=identity.target_identity,
             )
-            if connection.execute("PRAGMA integrity_check").fetchall() != [
-                ("ok",)
-            ]:
-                raise port.store_schema_error(
-                    "STORE.INTEGRITY_CHECK_FAILED"
-                )
-            if connection.execute("PRAGMA foreign_key_check").fetchall():
-                raise port.store_schema_error(
-                    "STORE.FOREIGN_KEY_CHECK_FAILED"
-                )
+            if not database_is_attested:
+                if connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchall() != [("ok",)]:
+                    raise port.store_schema_error(
+                        "STORE.INTEGRITY_CHECK_FAILED"
+                    )
+                if connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall():
+                    raise port.store_schema_error(
+                        "STORE.FOREIGN_KEY_CHECK_FAILED"
+                    )
             lease = _SQLiteGenerationView(
                 stage=active_ref,
                 canonical_store_id=record.canonical_store_id,
@@ -1832,10 +1898,12 @@ def _rehydrate_completed_activation(
                 raise port.store_schema_error(
                     "STORE.ACTIVE_BINDING_INVALID"
                 )
-            _recover_activation_indexes(port,
-                connection,
-                fts5_available=snapshot.fts5_available,
-            )
+            if not database_is_attested:
+                _recover_activation_indexes(
+                    port,
+                    connection,
+                    fts5_available=snapshot.fts5_available,
+                )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -1845,6 +1913,7 @@ def _rehydrate_completed_activation(
         canonical_store_id=record.canonical_store_id,
         generation=next_generation,
         fts5_available=snapshot.fts5_available,
+        active_content_attestation=record.active_content_attestation,
     )
     _ensure_activation_lineage_marker(identity)
     port._activate_candidate_store_id(record.canonical_store_id)
@@ -1934,7 +2003,7 @@ class ResourceStoreCoordinator:
         self._drain_timeout_seconds = timeout
         registry_type = getattr(
             importlib.import_module("tm_stage_sealer"),
-            "SealedArtifactRegistry",
+            "_SealedArtifactRegistry",
         )
         self._sealed_registry = registry_type(
             registry_namespace=f"coordinator.{identity.target_identity}",
@@ -1977,9 +2046,28 @@ class ResourceStoreCoordinator:
         with self._condition:
             return None if self._view is None else self._view.generation
 
-    @property
-    def sealed_registry(self) -> contract_module._SealedArtifactRegistryPort:
-        return self._sealed_registry
+    def _seal_stage(
+        self,
+        mutable_stage: MutableStageRef,
+        *,
+        canonical_store_id: str,
+        expected_prior_generation: int | None,
+        schema_upgrade: bool = False,
+    ) -> SealedStage:
+        """Run the sole verified seal factory without exposing its registry."""
+
+        stage_sealer = getattr(
+            importlib.import_module("tm_stage_sealer"),
+            "StageSealer",
+        )
+        return cast(SealedStage, stage_sealer(
+            registry=self._sealed_registry,
+            canonical_store_id=canonical_store_id,
+        ).seal(
+            mutable_stage,
+            expected_prior_generation=expected_prior_generation,
+            schema_upgrade=schema_upgrade,
+        ))
 
     @property
     def state(self) -> str:
@@ -2676,7 +2764,7 @@ class ResourceStoreCoordinator:
             )
 
         first_report = gate_b_evaluator(
-            registry=registry
+            registry=registry._readiness_view()
         ).evaluate(sealed_stage)
         if not first_report.granted or first_report.grant is None:
             raise ActivationPreparationError(
@@ -2790,7 +2878,7 @@ class ResourceStoreCoordinator:
                 self._condition.notify_all()
 
             second_report = gate_b_evaluator(
-                registry=registry
+                registry=registry._readiness_view()
             ).evaluate(sealed_stage)
             if not second_report.granted or second_report.grant is None:
                 raise ActivationPreparationError(
@@ -7123,6 +7211,7 @@ class SQLiteTMStore:
         invalid_count: int,
         duplicate_source_count: int,
         chunk_size: int,
+        _defer_secondary_indexes: bool = False,
     ) -> None:
         """Append one ordered origin batch from a bounded draft stream.
 
@@ -7151,10 +7240,19 @@ class SQLiteTMStore:
             raise TypeError("chunk_size must be a built-in integer")
         if chunk_size < 1:
             raise ValueError("chunk_size must be a positive integer")
+        if type(_defer_secondary_indexes) is not bool:
+            raise TypeError(
+                "_defer_secondary_indexes must be a built-in bool"
+            )
         timestamp = datetime.now(UTC).isoformat()
 
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
+                if _defer_secondary_indexes:
+                    _suspend_streamed_stage_secondary_indexes(
+                        connection,
+                        lease,
+                    )
                 chunk_index = 0
                 completed_revision = 0
                 prior_head_revision = 0
@@ -7222,7 +7320,12 @@ class SQLiteTMStore:
                     connection.commit()
                     chunk_index += 1
                     if is_last:
-                        return
+                        break
+                if _defer_secondary_indexes:
+                    _restore_streamed_stage_secondary_indexes(
+                        connection,
+                        lease,
+                    )
 
     def records_by_id(
         self,
@@ -7774,26 +7877,32 @@ def _bounded_seed_stages(
     stages: list[tuple[str, tuple[int, ...]]] = []
     for size in sizes:
         grams = unique_character_ngrams(folded_query, size)
+        posting_budget = _CANDIDATE_SEED_POSTING_CAP
+        per_gram, remainder = divmod(posting_budget, len(grams))
         matched: dict[int, int] = {}
-        for chunk in _chunked(grams):
-            placeholders = ",".join("?" for _ in chunk)
+        for gram_ordinal, gram in enumerate(grams):
+            gram_limit = per_gram + (1 if gram_ordinal < remainder else 0)
             rows = connection.execute(
-                "SELECT record_id, COUNT(*) FROM tm_gram "
-                "WHERE gram_size = ? "
-                f"AND gram IN ({placeholders}) GROUP BY record_id",
-                (size, *chunk),
+                "SELECT record_id FROM tm_gram "
+                "WHERE gram_size = ? AND gram = ? "
+                "ORDER BY record_id DESC LIMIT ?",
+                (size, gram, gram_limit),
             ).fetchall()
+            previous_record_id: int | None = None
             for row in rows:
                 if (
                     type(row) is not tuple
-                    or len(row) != 2
+                    or len(row) != 1
                     or type(row[0]) is not int
                     or row[0] < 1
-                    or type(row[1]) is not int
-                    or row[1] < 1
+                    or (
+                        previous_record_id is not None
+                        and row[0] >= previous_record_id
+                    )
                 ):
                     raise SQLiteStoreSchemaError("STORE.CANDIDATE_SEED_INVALID")
-                matched[row[0]] = matched.get(row[0], 0) + row[1]
+                previous_record_id = row[0]
+                matched[row[0]] = matched.get(row[0], 0) + 1
         ordered = tuple(
             record_id
             for record_id, _count in sorted(
@@ -7826,8 +7935,8 @@ def _candidate_proof_snapshot_body(
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
-            _validate_lease_identity(connection, lease)
             meta = _read_meta(connection)
+            _validate_lease_identity_meta(meta, lease)
             head_revision = _meta_int(meta, "head_revision")
             fts5_available = _meta_bool(meta, "fts5_available")
             if fts5_available != lease.fts5_available:
@@ -8252,6 +8361,7 @@ def _validate_candidate_proof_dense_binding(
     query_maxima_digest: str,
 ) -> str:
     meta = _read_meta(connection)
+    _validate_lease_identity_meta(meta, lease)
     if (
         _meta_int(meta, "head_revision") != head_revision
         or _table_count(connection, "tm_record") != total_record_count
@@ -8311,7 +8421,6 @@ def _candidate_proof_dense_phase1_body(
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
-            _validate_lease_identity(connection, lease)
             binding_digest = _validate_candidate_proof_dense_binding(
                 connection,
                 lease=lease,
@@ -8378,10 +8487,9 @@ def _candidate_proof_dense_phase1_body(
                     f"AS (VALUES {values_sql}) "
                     "SELECT json_group_array(record_id), "
                     "json_group_array(intersection) FROM ("
-                    "SELECT facts.record_id AS record_id, SUM(CASE "
-                    "WHEN facts.term_frequency < query_terms.query_frequency "
-                    "THEN facts.term_frequency ELSE query_terms.query_frequency END) "
-                    "AS intersection "
+                    "SELECT facts.record_id AS record_id, "
+                    "SUM(MIN(facts.term_frequency, "
+                    "query_terms.query_frequency)) AS intersection "
                     "FROM query_terms CROSS JOIN tm_gram AS facts "
                     "ON facts.gram_size = 2 AND facts.gram = query_terms.gram "
                     "GROUP BY facts.record_id ORDER BY facts.record_id)",
@@ -8494,7 +8602,6 @@ def _candidate_proof_dense_phase2_body(
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
-            _validate_lease_identity(connection, lease)
             actual_binding = _validate_candidate_proof_dense_binding(
                 connection,
                 lease=lease,
@@ -8636,8 +8743,8 @@ def _validate_candidate_proof_generation_body(
     with _leased_connection_scope(lease, connection) as connection:
         connection.execute("BEGIN")
         try:
-            _validate_lease_identity(connection, lease)
             meta = _read_meta(connection)
+            _validate_lease_identity_meta(meta, lease)
             if (
                 _meta_int(meta, "head_revision") != head_revision
                 or _table_count(connection, "tm_record") != total_record_count
@@ -8657,6 +8764,21 @@ def _validate_store_identity(
     target_identity: str,
 ) -> None:
     meta = _read_meta(connection)
+    _validate_store_identity_meta(
+        meta,
+        resource_id=resource_id,
+        canonical_store_id=canonical_store_id,
+        target_identity=target_identity,
+    )
+
+
+def _validate_store_identity_meta(
+    meta: dict[str, str],
+    *,
+    resource_id: str,
+    canonical_store_id: str,
+    target_identity: str,
+) -> None:
     if (
         meta["resource_id"] != resource_id
         or meta["canonical_store_id"] != canonical_store_id
@@ -8674,6 +8796,19 @@ def _validate_lease_identity(
     identity = lease.stage.resource_identity
     _validate_store_identity(
         connection,
+        resource_id=identity.resource_id,
+        canonical_store_id=lease.canonical_store_id,
+        target_identity=identity.target_identity,
+    )
+
+
+def _validate_lease_identity_meta(
+    meta: dict[str, str],
+    lease: _SQLiteGenerationView,
+) -> None:
+    identity = lease.stage.resource_identity
+    _validate_store_identity_meta(
+        meta,
         resource_id=identity.resource_id,
         canonical_store_id=lease.canonical_store_id,
         target_identity=identity.target_identity,
@@ -9036,7 +9171,7 @@ def _prepare_record_drafts(
             (
                 source_raw,
                 draft.target_raw,
-                fold_text_v1(source_raw).folded_text,
+                fold_text_value_v1(source_raw),
                 draft.speaker_raw,
                 draft.context_prev_raw,
                 draft.context_next_raw,
@@ -9201,7 +9336,7 @@ def _maintain_candidate_proof_summaries(
     *,
     record_ids_by_ordinal: dict[int, int],
     folded_sources_by_ordinal: dict[int, str],
-    gram_rows: tuple[tuple[int, int, str, int], ...],
+    gram_rows: Sequence[tuple[int, int, str, int]],
 ) -> None:
     """Maintain exact proof blocks inside the owning record transaction."""
 
@@ -9245,13 +9380,243 @@ def _maintain_candidate_proof_summaries(
         )
 
 
-def validate_candidate_proof_index(
+_CANDIDATE_PROJECTION_DIGEST_VERSION = "candidate-projection-digest-v2"
+_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS = 50_000
+
+
+def _candidate_projection_table_digest(table: str) -> Any:
+    digest = hashlib.sha256()
+    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(table.encode("ascii"))
+    digest.update(b"\0")
+    return digest
+
+
+def _update_candidate_projection_digest(
+    digest: Any,
+    row: tuple[object, ...],
+) -> None:
+    framed = bytearray()
+    for value in row:
+        if type(value) is int and not isinstance(value, bool):
+            encoded = str(value).encode("ascii")
+            framed.extend(b"i")
+        elif type(value) is str:
+            encoded = value.encode("utf-8")
+            framed.extend(b"s")
+        else:
+            raise CandidateProofIndexError(
+                "candidate projection digest fact is invalid"
+            )
+        framed.extend(str(len(encoded)).encode("ascii"))
+        framed.extend(b":")
+        framed.extend(encoded)
+        framed.extend(b";")
+    framed.extend(b"\n")
+    digest.update(framed)
+
+
+def _finish_candidate_projection_digest(
+    table_digests: dict[str, Any],
+    *,
+    fts5_available: bool,
+) -> str:
+    expected_tables = (
+        "tm_gram",
+        "tm_candidate_block",
+        "tm_gram_block_max",
+        *(("tm_fts",) if fts5_available else ()),
+    )
+    if tuple(table_digests) != expected_tables:
+        raise CandidateProofIndexError(
+            "candidate projection digest domain is invalid"
+        )
+    digest = hashlib.sha256()
+    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
+    digest.update(b"\0complete\0")
+    for table in expected_tables:
+        digest.update(table.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(table_digests[table].digest())
+    return digest.hexdigest()
+
+
+def _update_candidate_gram_projection_digest(
+    connection: sqlite3.Connection,
+    digest: Any,
+) -> None:
+    """Hash term-major gram rows in bounded SQLite-native chunks."""
+
+    count_row = connection.execute(
+        "SELECT COUNT(*) FROM tm_gram NOT INDEXED"
+    ).fetchone()
+    if (
+        type(count_row) is not tuple
+        or len(count_row) != 1
+        or type(count_row[0]) is not int
+        or count_row[0] < 0
+    ):
+        raise CandidateProofIndexError(
+            "candidate projection digest count is invalid"
+        )
+    actual_count = count_row[0]
+    processed_count = 0
+    last_rowid: int | None = None
+    row_payload = (
+        "json_array("
+        "typeof(rowid), hex(CAST(rowid AS BLOB)), "
+        "typeof(record_id), hex(CAST(record_id AS BLOB)), "
+        "typeof(gram_size), hex(CAST(gram_size AS BLOB)), "
+        "typeof(gram), hex(CAST(gram AS BLOB)), "
+        "typeof(term_frequency), hex(CAST(term_frequency AS BLOB)), "
+        "rowid)"
+    )
+    while True:
+        where = ""
+        parameters: tuple[object, ...] = (
+            _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+        )
+        if last_rowid is not None:
+            where = "WHERE rowid > ?"
+            parameters = (
+                last_rowid,
+                _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+            )
+        row = connection.execute(
+            "SELECT group_concat(row_payload, char(10)), COUNT(*) FROM ("
+            f"SELECT {row_payload} AS row_payload "
+            f"FROM tm_gram NOT INDEXED {where} "
+            "ORDER BY rowid LIMIT ?)",
+            parameters,
+        ).fetchone()
+        if (
+            type(row) is not tuple
+            or len(row) != 2
+            or type(row[1]) is not int
+            or row[1] < 0
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest chunk is invalid"
+            )
+        chunk_count = row[1]
+        if chunk_count == 0:
+            if row[0] is not None:
+                raise CandidateProofIndexError(
+                    "candidate projection digest chunk is invalid"
+                )
+            break
+        if (
+            chunk_count
+            > _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS
+            or type(row[0]) is not str
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest chunk is invalid"
+            )
+        payload = row[0]
+        encoded = payload.encode("utf-8")
+        digest.update(b"chunk:")
+        digest.update(str(chunk_count).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(len(encoded)).encode("ascii"))
+        digest.update(b":")
+        digest.update(encoded)
+        digest.update(b";")
+        try:
+            tail = json.loads(payload.rsplit("\n", 1)[-1])
+        except (TypeError, ValueError) as error:
+            raise CandidateProofIndexError(
+                "candidate projection digest tail is invalid"
+            ) from error
+        if (
+            type(tail) is not list
+            or len(tail) != 11
+            or type(tail[10]) is not int
+            or isinstance(tail[10], bool)
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest tail is invalid"
+            )
+        next_rowid = tail[10]
+        if last_rowid is not None and next_rowid <= last_rowid:
+            raise CandidateProofIndexError(
+                "candidate projection digest order is invalid"
+            )
+        last_rowid = next_rowid
+        processed_count += chunk_count
+        if processed_count > actual_count:
+            raise CandidateProofIndexError(
+                "candidate projection digest count is invalid"
+            )
+    if processed_count != actual_count:
+        raise CandidateProofIndexError(
+            "candidate projection digest count is invalid"
+        )
+
+
+def _candidate_proof_projection_digest(
+    connection: sqlite3.Connection,
+    *,
+    fts5_available: bool,
+) -> str:
+    """Hash every actual candidate projection row in canonical order."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise TypeError("connection must be an exact sqlite3 connection")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    queries = (
+        (
+            "tm_candidate_block",
+            "SELECT block_id, first_record_id, last_record_id, "
+            "record_count, min_source_fold_length, "
+            "max_source_fold_length FROM tm_candidate_block "
+            "ORDER BY block_id",
+        ),
+        (
+            "tm_gram_block_max",
+            "SELECT block_id, gram_size, gram, max_term_frequency "
+            "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram",
+        ),
+        *(
+            (
+                (
+                    "tm_fts",
+                    "SELECT record_id, source_fold_v1 FROM tm_fts "
+                    "ORDER BY record_id",
+                ),
+            )
+            if fts5_available
+            else ()
+        ),
+    )
+    table_digests: dict[str, Any] = {
+        "tm_gram": _candidate_projection_table_digest("tm_gram")
+    }
+    _update_candidate_gram_projection_digest(
+        connection,
+        table_digests["tm_gram"],
+    )
+    for table, query in queries:
+        table_digest = _candidate_projection_table_digest(table)
+        for row in connection.execute(query):
+            _update_candidate_projection_digest(table_digest, row)
+        table_digests[table] = table_digest
+    return _finish_candidate_projection_digest(
+        table_digests,
+        fts5_available=fts5_available,
+    )
+
+
+def _validate_candidate_proof_index_core(
     connection: sqlite3.Connection,
     *,
     required_sizes: tuple[int, ...],
     fts5_available: bool,
-) -> tuple[tuple[tuple[int, int], ...], int]:
-    """Stream-recompute exact length, TF, block and optional FTS facts."""
+    include_projection_digest: bool,
+) -> tuple[tuple[tuple[int, int], ...], int, str | None]:
+    """Stream-recompute exact facts, optionally binding projection rows."""
 
     if type(connection) is not sqlite3.Connection:
         raise TypeError("connection must be an exact sqlite3 connection")
@@ -9261,9 +9626,26 @@ def validate_candidate_proof_index(
         raise TypeError("required_sizes must be a tuple of built-in integers")
     if type(fts5_available) is not bool:
         raise TypeError("fts5_available must be a built-in bool")
+    if type(include_projection_digest) is not bool:
+        raise TypeError("include_projection_digest must be a built-in bool")
     expected_sizes = (1, 2) if fts5_available else (1, 2, 3)
     if required_sizes != expected_sizes:
         raise ValueError("candidate gram sizes do not match the index path")
+    try:
+        worker_row = connection.execute("PRAGMA threads=2").fetchone()
+    except sqlite3.Error as error:
+        raise CandidateProofIndexError(
+            "candidate proof worker configuration is invalid"
+        ) from error
+    if (
+        type(worker_row) is not tuple
+        or len(worker_row) != 1
+        or type(worker_row[0]) is not int
+        or worker_row[0] not in {0, 1, 2}
+    ):
+        raise CandidateProofIndexError(
+            "candidate proof worker configuration is invalid"
+        )
 
     def proof_int(value: object) -> int:
         if type(value) is not int:
@@ -9351,7 +9733,7 @@ def validate_candidate_proof_index(
         source_raw = proof_text(record_row[1])
         stored_folded_source = proof_text(record_row[2])
         source_fold_length = proof_int(record_row[3])
-        folded_source = fold_text_v1(source_raw).folded_text
+        folded_source = fold_text_value_v1(source_raw)
         if (
             not folded_source
             or record_id != expected_record_id
@@ -9377,8 +9759,14 @@ def validate_candidate_proof_index(
             gram = proof_text(current_gram[2])
             frequency = proof_int(current_gram[3])
             key = (size, gram)
-            if size not in required_sizes or frequency < 1 or key in actual_grams:
-                raise CandidateProofIndexError("candidate gram fact is invalid")
+            if (
+                size not in required_sizes
+                or frequency < 1
+                or key in actual_grams
+            ):
+                raise CandidateProofIndexError(
+                    "candidate gram fact is invalid"
+                )
             actual_grams[key] = frequency
             current_gram = gram_cursor.fetchone()
         expected_grams = {
@@ -9407,11 +9795,164 @@ def validate_candidate_proof_index(
             current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
 
     flush_block()
-    if any(row is not None for row in (current_gram, current_block, current_maximum)):
+    if any(
+        row is not None
+        for row in (current_gram, current_block, current_maximum)
+    ):
         raise CandidateProofIndexError("candidate proof index has extra rows")
     if current_fts is not None:
         raise CandidateProofIndexError("candidate FTS fact is invalid")
-    return tuple(sorted(gram_counts.items())), fts_count
+    return (
+        tuple(sorted(gram_counts.items())),
+        fts_count,
+        (
+            _candidate_proof_projection_digest(
+                connection,
+                fts5_available=fts5_available,
+            )
+            if include_projection_digest
+            else None
+        ),
+    )
+
+
+def _validate_candidate_proof_index_with_digest(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+) -> tuple[tuple[tuple[int, int], ...], int, str]:
+    gram_counts, fts_count, projection_digest = (
+        _validate_candidate_proof_index_core(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=fts5_available,
+            include_projection_digest=True,
+        )
+    )
+    if type(projection_digest) is not str:
+        raise AssertionError("candidate projection digest is missing")
+    return gram_counts, fts_count, projection_digest
+
+
+def validate_candidate_proof_index(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+) -> tuple[tuple[tuple[int, int], ...], int]:
+    """Stream-recompute exact length, TF, block and optional FTS facts."""
+
+    gram_counts, fts_count, projection_digest = (
+        _validate_candidate_proof_index_core(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=fts5_available,
+            include_projection_digest=False,
+        )
+    )
+    if projection_digest is not None:
+        raise AssertionError("candidate projection digest is unexpected")
+    return gram_counts, fts_count
+
+
+def _suspend_streamed_stage_secondary_indexes(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> None:
+    """Drop only rebuildable secondary indexes on one empty private stage."""
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = lease.stage.resource_identity
+        _validate_store_identity(
+            connection,
+            resource_id=identity.resource_id,
+            canonical_store_id=lease.canonical_store_id,
+            target_identity=identity.target_identity,
+        )
+        meta = _read_meta(connection)
+        if (
+            meta.get("activation_status") != "UNPUBLISHED"
+            or _meta_int(meta, "head_revision") != 0
+            or lease.active_content_attestation is not None
+            or connection.execute(
+                "SELECT COUNT(*) FROM tm_origin_batch"
+            ).fetchone()
+            != (0,)
+            or connection.execute("SELECT COUNT(*) FROM tm_record").fetchone()
+            != (0,)
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+        actual = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name IN (?, ?, ?, ?)",
+                _STREAMED_STAGE_SECONDARY_INDEX_NAMES,
+            ).fetchall()
+        }
+        if actual != set(_STREAMED_STAGE_SECONDARY_INDEX_NAMES):
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_INDEX_INVALID"
+            )
+        for name in _STREAMED_STAGE_SECONDARY_INDEX_NAMES:
+            connection.execute(f"DROP INDEX {name}")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _restore_streamed_stage_secondary_indexes(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+) -> None:
+    """Bulk-build the exact frozen secondary-index schema before exposure."""
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = lease.stage.resource_identity
+        _validate_store_identity(
+            connection,
+            resource_id=identity.resource_id,
+            canonical_store_id=lease.canonical_store_id,
+            target_identity=identity.target_identity,
+        )
+        meta = _read_meta(connection)
+        if (
+            meta.get("activation_status") != "UNPUBLISHED"
+            or _meta_int(meta, "head_revision") != 1
+            or lease.active_content_attestation is not None
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+        existing = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+            "AND name IN (?, ?, ?, ?)",
+            _STREAMED_STAGE_SECONDARY_INDEX_NAMES,
+        ).fetchone()
+        if existing != (0,):
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_INDEX_INVALID"
+            )
+        for statement in _STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS:
+            connection.execute(statement)
+        fts5_available = _meta_bool(meta, "fts5_available")
+        if _schema_digest(
+            connection,
+            fts5_available=fts5_available,
+        ) != _APPROVED_SCHEMA_DIGESTS[fts5_available]:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_INDEX_INVALID"
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def _next_draft_chunk(
@@ -9559,46 +10100,70 @@ def _insert_streamed_records(
 ) -> dict[int, int]:
     """Insert one bounded chunk of records and return ordinal-to-id mapping."""
 
-    record_ids_by_ordinal: dict[int, int] = {}
-    for draft in prepared_drafts:
+    if not prepared_drafts:
+        return {}
+    before_row = connection.execute(
+        "SELECT COUNT(*), COALESCE(MAX(record_id), 0) FROM tm_record"
+    ).fetchone()
+    if (
+        type(before_row) is not tuple
+        or len(before_row) != 2
+        or type(before_row[0]) is not int
+        or before_row[0] < 0
+        or type(before_row[1]) is not int
+        or before_row[1] < 0
+        or before_row[0] != before_row[1]
+    ):
+        raise SQLiteStoreSchemaError("STORE.RECORD_ID_SEQUENCE_INVALID")
+    prior_count, prior_max_record_id = before_row
+    connection.executemany(
+        "INSERT INTO tm_record("
+        "source_raw, target_raw, source_fold_v1, source_fold_length, "
+        "speaker_raw, context_prev_raw, context_next_raw, "
+        "file_source, provenance_json, legacy_line_no, "
+        "origin_batch_id, origin_ordinal) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            source_raw,
-            target_raw,
-            source_fold_v1,
-            speaker_raw,
-            context_prev_raw,
-            context_next_raw,
-            file_source,
-            provenance,
-            _provenance_json,
-            legacy_line_no,
-            origin_ordinal,
-        ) = draft
-        cursor = connection.execute(
-            "INSERT INTO tm_record("
-            "source_raw, target_raw, source_fold_v1, source_fold_length, "
-            "speaker_raw, context_prev_raw, context_next_raw, "
-            "file_source, provenance_json, legacy_line_no, "
-            "origin_batch_id, origin_ordinal) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                source_raw,
-                target_raw,
-                source_fold_v1,
-                len(source_fold_v1),
-                speaker_raw,
-                context_prev_raw,
-                context_next_raw,
-            file_source,
-            _provenance_json,
-            legacy_line_no,
-            batch_id,
-            origin_ordinal,
-            ),
-        )
-        record_id = cursor.lastrowid
-        if record_id is None:
-            raise SQLiteStoreSchemaError("STORE.RECORD_ID_MISSING")
+                draft[0],
+                draft[1],
+                draft[2],
+                len(draft[2]),
+                draft[3],
+                draft[4],
+                draft[5],
+                draft[6],
+                draft[8],
+                draft[9],
+                batch_id,
+                draft[10],
+            )
+            for draft in prepared_drafts
+        ),
+    )
+    after_row = connection.execute(
+        "SELECT COUNT(*), COALESCE(MAX(record_id), 0), "
+        "last_insert_rowid() FROM tm_record"
+    ).fetchone()
+    expected_last_record_id = prior_max_record_id + len(prepared_drafts)
+    if (
+        type(after_row) is not tuple
+        or len(after_row) != 3
+        or type(after_row[0]) is not int
+        or type(after_row[1]) is not int
+        or type(after_row[2]) is not int
+        or after_row[0] != prior_count + len(prepared_drafts)
+        or after_row[1] != expected_last_record_id
+        or after_row[2] != expected_last_record_id
+    ):
+        raise SQLiteStoreSchemaError("STORE.RECORD_ID_SEQUENCE_INVALID")
+    record_ids_by_ordinal: dict[int, int] = {}
+    first_record_id = prior_max_record_id + 1
+    for offset, draft in enumerate(prepared_drafts):
+        origin_ordinal = draft[10]
+        record_id = first_record_id + offset
+        if origin_ordinal in record_ids_by_ordinal:
+            raise SQLiteStoreSchemaError("STORE.RECORD_ID_SEQUENCE_INVALID")
         record_ids_by_ordinal[origin_ordinal] = record_id
     return record_ids_by_ordinal
 
@@ -9616,11 +10181,22 @@ def _insert_streamed_candidate_index(
     grams_by_size: dict[int, dict[str, list[tuple[int, int]]]] = {
         gram_size: {} for gram_size in gram_sizes
     }
+    block_stats: dict[int, list[int]] = {}
+    block_maxima: dict[tuple[int, str, int], int] = {}
     fts_rows: list[tuple[str, int]] = []
     for draft in prepared_drafts:
         origin_ordinal = draft[10]
         folded_source = draft[2]
         record_id = record_ids_by_ordinal[origin_ordinal]
+        source_fold_length = len(folded_source)
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        stats = block_stats.setdefault(
+            block_id,
+            [0, source_fold_length, source_fold_length],
+        )
+        stats[0] += 1
+        stats[1] = min(stats[1], source_fold_length)
+        stats[2] = max(stats[2], source_fold_length)
         for gram_size in gram_sizes:
             bucket = grams_by_size[gram_size]
             for gram, term_frequency in character_ngram_frequencies(
@@ -9630,20 +10206,25 @@ def _insert_streamed_candidate_index(
                 bucket.setdefault(gram, []).append(
                     (record_id, term_frequency)
                 )
+                if gram_size in {1, 2}:
+                    maximum_key = (gram_size, gram, block_id)
+                    block_maxima[maximum_key] = max(
+                        block_maxima.get(maximum_key, 0),
+                        term_frequency,
+                    )
         if fts5_available:
             fts_rows.append((folded_source, record_id))
     for gram_size in gram_sizes:
         bucket = grams_by_size[gram_size]
-        rows = [
-            (gram_size, gram, record_id, term_frequency)
-            for gram in sorted(bucket)
-            for record_id, term_frequency in bucket[gram]
-        ]
         connection.executemany(
             "INSERT INTO tm_gram("
             "gram_size, gram, record_id, term_frequency) "
             "VALUES (?, ?, ?, ?)",
-            rows,
+            (
+                (gram_size, gram, record_id, term_frequency)
+                for gram in sorted(bucket)
+                for record_id, term_frequency in bucket[gram]
+            ),
         )
     if fts_rows:
         try:
@@ -9654,16 +10235,40 @@ def _insert_streamed_candidate_index(
             )
         except sqlite3.OperationalError as error:
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
-    _maintain_candidate_proof_summaries(
-        connection,
-        record_ids_by_ordinal=record_ids_by_ordinal,
-        folded_sources_by_ordinal={draft[10]: draft[2] for draft in prepared_drafts},
-        gram_rows=tuple(
-            (draft[10], gram_size, gram, term_frequency)
-            for draft in prepared_drafts
-            for gram_size in gram_sizes
-            for gram, term_frequency in character_ngram_frequencies(
-                draft[2], gram_size
+    connection.executemany(
+        "INSERT INTO tm_candidate_block("
+        "block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(block_id) DO UPDATE SET "
+        "record_count = record_count + excluded.record_count, "
+        "min_source_fold_length = min(min_source_fold_length, "
+        "excluded.min_source_fold_length), "
+        "max_source_fold_length = max(max_source_fold_length, "
+        "excluded.max_source_fold_length)",
+        tuple(
+            (
+                block_id,
+                block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1,
+                (block_id + 1) * CANDIDATE_PROOF_BLOCK_SIZE,
+                stats[0],
+                stats[1],
+                stats[2],
+            )
+            for block_id, stats in sorted(block_stats.items())
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO tm_gram_block_max("
+        "gram_size, gram, block_id, max_term_frequency) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
+        "max_term_frequency = max(max_term_frequency, "
+        "excluded.max_term_frequency)",
+        tuple(
+            (gram_size, gram, block_id, maximum)
+            for (gram_size, gram, block_id), maximum in sorted(
+                block_maxima.items()
             )
         ),
     )
@@ -9862,9 +10467,51 @@ def _source_binding_health_state(
     return state, tuple(sorted(set(diagnostics)))
 
 
+def _active_attestation_for_health(
+    lease: _SQLiteGenerationView,
+) -> ActiveContentAttestation | None:
+    """Re-prove one immutable active byte set for semantic-health reuse.
+
+    A legitimate post-activation write changes the database bytes and falls
+    back to the full runtime validator.  Replacing the canonical database
+    inode is never such a write and fails closed even when its bytes are
+    identical.  The configured JSONL/manifest pair is intentionally outside
+    this reuse decision: SourceBindingMonitor owns its divergence semantics.
+    """
+
+    active = lease.active_content_attestation
+    if active is None:
+        return None
+    identity = lease.stage.resource_identity
+    if type(active) is not ActiveContentAttestation or (
+        active.resource_id != identity.resource_id
+        or active.target_identity != identity.target_identity
+        or active.canonical_store_id != lease.canonical_store_id
+        or active.generation != lease.generation
+    ):
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+    try:
+        database = _capture_content_file(identity.canonical_sidecar_path)
+    except ContentAttestationError as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.ACTIVE_ATTESTATION_INVALID"
+        ) from error
+    if (database.device, database.inode) != (
+        active.database.device,
+        active.database.inode,
+    ):
+        raise SQLiteStoreSchemaError(
+            "STORE.ACTIVE_ATTESTATION_INVALID"
+        )
+    if database != active.database:
+        return None
+    return active
+
+
 def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
     """Build one health snapshot from one already-held canonical lease."""
 
+    active_attestation = _active_attestation_for_health(lease)
     with _open_leased_connection(lease) as connection:
         connection.execute("BEGIN")
         try:
@@ -9886,7 +10533,10 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
-            if schema_version == TM_SCHEMA_VERSION:
+            if (
+                schema_version == TM_SCHEMA_VERSION
+                and active_attestation is None
+            ):
                 fts5_available = _meta_bool(meta, "fts5_available")
                 try:
                     validate_candidate_proof_index(
@@ -9904,6 +10554,28 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
                 connection,
                 lease,
             )
+            if active_attestation is not None:
+                semantic = active_attestation.semantic_facts
+                binding = facts.binding
+                if (
+                    schema_version != semantic.schema_version
+                    or meta.get("schema_digest") != semantic.schema_digest
+                    or meta.get("fold_version") != semantic.fold_version
+                    or meta.get("candidate_index_version")
+                    != semantic.index_version
+                    or index_kind != semantic.candidate_index_kind
+                    or _meta_bool(meta, "fts5_available")
+                    != semantic.fts5_available
+                    or meta.get("activation_digest")
+                    != active_attestation.activation_digest
+                    or facts.record_count != semantic.record_count
+                    or binding is None
+                    or snapshot_receipt_digest(binding.receipt)
+                    != active_attestation.snapshot_receipt_digest
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.ACTIVE_ATTESTATION_INVALID"
+                    )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -9988,6 +10660,26 @@ class SQLiteTMQueryView:
         if connection is None:
             manager = _open_leased_connection(self._lease)
             connection = manager.__enter__()
+            try:
+                worker_row = connection.execute("PRAGMA threads=1").fetchone()
+            except sqlite3.Error as error:
+                manager.__exit__(None, None, None)
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_THREADS_INVALID"
+                ) from error
+            except BaseException:
+                manager.__exit__(None, None, None)
+                raise
+            if (
+                type(worker_row) is not tuple
+                or len(worker_row) != 1
+                or type(worker_row[0]) is not int
+                or worker_row[0] not in {0, 1}
+            ):
+                manager.__exit__(None, None, None)
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_THREADS_INVALID"
+                )
             self._connection_manager = manager
             self._connection = connection
         if connection.in_transaction:

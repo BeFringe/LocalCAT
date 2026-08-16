@@ -88,11 +88,11 @@ import time
 import unicodedata
 from unittest.mock import patch
 
-from text_matcher import fold_text_v1
 from tm_benchmark import (
     BenchmarkRecord,
     _record_payload,
     benchmark_digest,
+    benchmark_implementation_fingerprint,
     iter_corpus_records,
     load_benchmark_contract,
     recompute_benchmark_inputs,
@@ -101,9 +101,12 @@ from tm_benchmark_latency import validate_environment_for_path
 from tm_candidate_index import CandidateRetriever
 from tm_contracts import (
     BENCHMARK_RSS_SCOPE,
+    CANDIDATE_PROOF_QUERY_VERSION,
     BenchmarkContract,
     BenchmarkExecutionPath,
+    CandidateProofMetadata,
     CanonicalResourceIdentity,
+    TMQuery,
     benchmark_contract_digest,
     benchmark_environment_digest,
     candidate_budget_v1,
@@ -111,16 +114,17 @@ from tm_contracts import (
     contract_to_json,
 )
 from tm_migration import TMMigrationService
+from tm_retrieval import prove_and_score_fuzzy_candidates
+from tm_similarity import SimilarityScorerV1
 from tm_sqlite_store import (
     ResourceStoreCoordinator,
     SQLiteTMStore,
     _probe_fts5,
 )
-from tm_stage_sealer import StageSealer
 
-PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-process-evidence-v1"
-PROCESS_WORKER_PROTOCOL_VERSION = "tm-benchmark-process-worker-v1"
-PROCESS_EVIDENCE_DIGEST_VERSION = "tm-benchmark-process-digest-v1"
+PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-process-evidence-v2"
+PROCESS_WORKER_PROTOCOL_VERSION = "tm-benchmark-process-worker-v2"
+PROCESS_EVIDENCE_DIGEST_VERSION = "tm-benchmark-process-digest-v2"
 PROCESS_ARTIFACT_SNAPSHOT_DIGEST_VERSION = (
     "tm-benchmark-process-artifact-snapshot-v1"
 )
@@ -421,6 +425,8 @@ def worker_protocol_digest(
     resource_id: str,
     canonical_store_id: str,
     test_mode: bool,
+    proof_query_version: str,
+    implementation_fingerprint: str,
 ) -> str:
     """Canonical digest over every machine-readable worker request fact."""
     if type(execution_path) is not BenchmarkExecutionPath:
@@ -448,6 +454,14 @@ def worker_protocol_digest(
             "fixture record count",
             minimum=1,
         ),
+        "implementation_fingerprint": _require_digest(
+            implementation_fingerprint,
+            "implementation fingerprint",
+        ),
+        "proof_query_version": _require_identity(
+            proof_query_version,
+            "proof query version",
+        ),
         "resource_id": _require_identity(resource_id, "resource id"),
         "run_root": _require_absolute_path_string(run_root, "run root"),
         "test_mode": _require_builtin_bool(test_mode, "test mode"),
@@ -471,6 +485,8 @@ class TMBenchmarkProcessEvidence:
     """
 
     schema_version: str
+    proof_query_version: str
+    implementation_fingerprint: str
     test_mode: bool
     contract: BenchmarkContract
     contract_digest: str
@@ -518,6 +534,15 @@ class TMBenchmarkProcessEvidence:
             raise ValueError(
                 "schema version must be " f"{PROCESS_EVIDENCE_SCHEMA_VERSION}"
             )
+        if self.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+            raise ValueError(
+                "proof query version must be "
+                f"{CANDIDATE_PROOF_QUERY_VERSION}"
+            )
+        _require_digest(
+            self.implementation_fingerprint,
+            "implementation fingerprint",
+        )
         test_mode = _require_builtin_bool(self.test_mode, "test mode")
         if type(self.contract) is not BenchmarkContract:
             raise TypeError("evidence contract must be BenchmarkContract")
@@ -658,6 +683,8 @@ class TMBenchmarkProcessEvidence:
             resource_id=self.resource_id,
             canonical_store_id=self.canonical_store_id,
             test_mode=test_mode,
+            proof_query_version=self.proof_query_version,
+            implementation_fingerprint=self.implementation_fingerprint,
         )
         if self.worker_protocol_digest != expected_protocol_digest:
             raise ValueError(
@@ -792,6 +819,7 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
         "fixture_path": evidence.fixture_path,
         "fixture_record_count": evidence.fixture_record_count,
         "generation": evidence.generation,
+        "implementation_fingerprint": evidence.implementation_fingerprint,
         "migration_elapsed_ns": evidence.migration_elapsed_ns,
         "path_config_digest": evidence.path_config_digest,
         "peak_rss_bytes": evidence.peak_rss_bytes,
@@ -803,6 +831,7 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
         "reopen_health_record_count": evidence.reopen_health_record_count,
         "reopen_phase": evidence.reopen_phase,
         "resource_id": evidence.resource_id,
+        "proof_query_version": evidence.proof_query_version,
         "rss_scope": evidence.rss_scope,
         "rss_start_bytes": evidence.rss_start_bytes,
         "rss_terminal_bytes": evidence.rss_terminal_bytes,
@@ -1266,6 +1295,7 @@ _EVIDENCE_PAYLOAD_FIELDS = frozenset(
         "fixture_path",
         "fixture_record_count",
         "generation",
+        "implementation_fingerprint",
         "migration_elapsed_ns",
         "path_config_digest",
         "peak_rss_bytes",
@@ -1277,6 +1307,7 @@ _EVIDENCE_PAYLOAD_FIELDS = frozenset(
         "reopen_health_record_count",
         "reopen_phase",
         "resource_id",
+        "proof_query_version",
         "rss_scope",
         "rss_start_bytes",
         "rss_terminal_bytes",
@@ -1316,6 +1347,7 @@ def _evidence_payload(evidence: TMBenchmarkProcessEvidence) -> dict[str, object]
         "fixture_path": evidence.fixture_path,
         "fixture_record_count": evidence.fixture_record_count,
         "generation": evidence.generation,
+        "implementation_fingerprint": evidence.implementation_fingerprint,
         "migration_elapsed_ns": evidence.migration_elapsed_ns,
         "path_config_digest": evidence.path_config_digest,
         "peak_rss_bytes": evidence.peak_rss_bytes,
@@ -1327,6 +1359,7 @@ def _evidence_payload(evidence: TMBenchmarkProcessEvidence) -> dict[str, object]
         "reopen_health_record_count": evidence.reopen_health_record_count,
         "reopen_phase": evidence.reopen_phase,
         "resource_id": evidence.resource_id,
+        "proof_query_version": evidence.proof_query_version,
         "rss_scope": evidence.rss_scope,
         "rss_start_bytes": evidence.rss_start_bytes,
         "rss_terminal_bytes": evidence.rss_terminal_bytes,
@@ -1356,6 +1389,14 @@ def evidence_from_payload(
         raise ValueError("evidence execution path is invalid") from error
     return TMBenchmarkProcessEvidence(
         schema_version=_as_str(fields["schema_version"], "schema version"),
+        proof_query_version=_as_str(
+            fields["proof_query_version"],
+            "proof query version",
+        ),
+        implementation_fingerprint=_as_digest(
+            fields["implementation_fingerprint"],
+            "implementation fingerprint",
+        ),
         test_mode=_as_bool(fields["test_mode"], "test mode"),
         contract=contract,
         contract_digest=_as_digest(
@@ -1559,6 +1600,8 @@ _WORKER_REQUEST_FIELDS = frozenset(
         "fixture_digest",
         "fixture_path",
         "fixture_record_count",
+        "implementation_fingerprint",
+        "proof_query_version",
         "protocol",
         "protocol_digest",
         "resource_id",
@@ -1582,6 +1625,8 @@ class _WorkerRequest:
     resource_id: str
     canonical_store_id: str
     test_mode: bool
+    proof_query_version: str
+    implementation_fingerprint: str
     protocol_digest: str
 
 
@@ -1638,6 +1683,22 @@ def _validate_worker_request(
         "canonical store id",
     )
     test_mode = _require_builtin_bool(fields["test_mode"], "test mode")
+    proof_query_version = _require_identity(
+        fields["proof_query_version"],
+        "proof query version",
+    )
+    if proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
+        raise _WorkerError("PROCESS.PROOF_VERSION_MISMATCH")
+    implementation_fingerprint = _require_digest(
+        fields["implementation_fingerprint"],
+        "implementation fingerprint",
+    )
+    try:
+        current_fingerprint = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise _WorkerError("PROCESS.IMPLEMENTATION_INVALID") from error
+    if implementation_fingerprint != current_fingerprint:
+        raise _WorkerError("PROCESS.IMPLEMENTATION_MISMATCH")
     if not test_mode:
         if corpus_digest != contract.corpus_digest:
             raise _WorkerError("PROCESS.CORPUS_DIGEST_MISMATCH")
@@ -1663,6 +1724,8 @@ def _validate_worker_request(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         test_mode=test_mode,
+        proof_query_version=proof_query_version,
+        implementation_fingerprint=implementation_fingerprint,
     )
     caller_protocol_digest = _require_digest(
         fields["protocol_digest"],
@@ -1695,6 +1758,8 @@ def _validate_worker_request(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         test_mode=test_mode,
+        proof_query_version=proof_query_version,
+        implementation_fingerprint=implementation_fingerprint,
         protocol_digest=caller_protocol_digest,
     )
 
@@ -1714,6 +1779,7 @@ def _request_payload(
     canonical_store_id: str,
     test_mode: bool,
 ) -> dict[str, object]:
+    implementation_fingerprint = benchmark_implementation_fingerprint()
     protocol_digest = worker_protocol_digest(
         contract_digest=contract_digest,
         corpus_digest=corpus_digest,
@@ -1726,6 +1792,8 @@ def _request_payload(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         test_mode=test_mode,
+        proof_query_version=CANDIDATE_PROOF_QUERY_VERSION,
+        implementation_fingerprint=implementation_fingerprint,
     )
     return {
         "canonical_store_id": canonical_store_id,
@@ -1737,6 +1805,8 @@ def _request_payload(
         "fixture_digest": fixture_digest,
         "fixture_path": fixture_path,
         "fixture_record_count": fixture_record_count,
+        "implementation_fingerprint": implementation_fingerprint,
+        "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
         "protocol": PROCESS_WORKER_PROTOCOL_VERSION,
         "protocol_digest": protocol_digest,
         "resource_id": resource_id,
@@ -1769,6 +1839,7 @@ class _MeasuredFacts:
     fixture_path: str
     fixture_record_count: int
     generation: int
+    implementation_fingerprint: str
     migration_elapsed_ns: int
     path_config_digest: str
     peak_rss_bytes: int
@@ -1780,6 +1851,7 @@ class _MeasuredFacts:
     reopen_health_record_count: int
     reopen_phase: str
     resource_id: str
+    proof_query_version: str
     rss_scope: str
     rss_start_bytes: int
     rss_terminal_bytes: int
@@ -1852,10 +1924,11 @@ def _run_measured_lifecycle(
             raise _WorkerError("PROCESS.COUNT_MISMATCH")
         if build.preflight.invalid_count != 0:
             raise _WorkerError("PROCESS.FIXTURE_INVALID")
-        sealed = StageSealer(
-            registry=coordinator.sealed_registry,
+        sealed = coordinator._seal_stage(
+            stage,
             canonical_store_id=canonical_store_id,
-        ).seal(stage, expected_prior_generation=None)
+            expected_prior_generation=None,
+        )
         seal_evidence = sealed.evidence
         if not seal_evidence.integrity_ok:
             raise _WorkerError("PROCESS.GATE_B_FAILED")
@@ -1896,13 +1969,25 @@ def _run_measured_lifecycle(
             raise _WorkerError("PROCESS.EXACT_PROOF_FAILED")
         if exact[0].source_raw != first_source:
             raise _WorkerError("PROCESS.EXACT_PROOF_FAILED")
-        folded_query = fold_text_v1(first_source).folded_text
-        candidate_report = CandidateRetriever().candidates(
-            resource_id,
-            store,
-            folded_query,
-            result_limit=contract.top_k,
+        production_query = TMQuery(
+            query_source=first_source,
+            speaker_raw=None,
+            context_prev_raw=None,
+            context_next_raw=None,
+            minimum_similarity=contract.minimum_similarity,
+            limit=contract.top_k,
+            resource_order=(resource_id,),
         )
+        with store.query_lease() as view:
+            _fuzzy, candidate_report = prove_and_score_fuzzy_candidates(
+                resource_id=resource_id,
+                resource_order=0,
+                query=production_query,
+                view=view,
+                retriever=CandidateRetriever(),
+                scorer=SimilarityScorerV1(),
+                completion_policy="oracle_full",
+            )
         metadata = candidate_report.metadata
         if metadata.index_kind != expected_index_kind:
             raise _WorkerError("PROCESS.INDEX_KIND_MISMATCH")
@@ -1910,6 +1995,13 @@ def _run_measured_lifecycle(
             raise _WorkerError("PROCESS.CANDIDATE_PROOF_FAILED")
         if not metadata.fuzzy_available:
             raise _WorkerError("PROCESS.CANDIDATE_PROOF_FAILED")
+        if (
+            type(metadata.proof) is not CandidateProofMetadata
+            or metadata.proof.proof_version != request.proof_query_version
+            or not metadata.proof.result_complete
+        ):
+            raise _WorkerError("PROCESS.PROOF_VERSION_MISMATCH")
+        captured_proof_query_version = metadata.proof.proof_version
         captured_health = health
         captured_metadata = metadata
         captured_exact = exact
@@ -1957,9 +2049,17 @@ def _run_measured_lifecycle(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         test_mode=request.test_mode,
+        proof_query_version=request.proof_query_version,
+        implementation_fingerprint=request.implementation_fingerprint,
     )
     if worker_protocol != request.protocol_digest:
         raise _WorkerError("PROCESS.PROTOCOL_DIGEST_MISMATCH")
+    try:
+        implementation_fingerprint = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise _WorkerError("PROCESS.IMPLEMENTATION_INVALID") from error
+    if implementation_fingerprint != request.implementation_fingerprint:
+        raise _WorkerError("PROCESS.IMPLEMENTATION_CHANGED")
     return _MeasuredFacts(
         actual_index_kind=captured_health.index_kind,
         artifact_snapshot=artifact_snapshot,
@@ -1985,6 +2085,7 @@ def _run_measured_lifecycle(
         fixture_path=request.fixture_path,
         fixture_record_count=request.fixture_record_count,
         generation=captured_generation,
+        implementation_fingerprint=implementation_fingerprint,
         migration_elapsed_ns=elapsed_ns,
         path_config_digest=(
             contract.fast_path_config_digest
@@ -2000,6 +2101,7 @@ def _run_measured_lifecycle(
         reopen_health_record_count=captured_health.record_count,
         reopen_phase=captured_report.phase,
         resource_id=resource_id,
+        proof_query_version=captured_proof_query_version,
         rss_scope=contract.rss_scope,
         rss_start_bytes=start_rss,
         rss_terminal_bytes=terminal_rss,
@@ -2014,6 +2116,8 @@ def _run_measured_lifecycle(
 def _evidence_from_facts(facts: _MeasuredFacts) -> TMBenchmarkProcessEvidence:
     return TMBenchmarkProcessEvidence(
         schema_version=facts.schema_version,
+        proof_query_version=facts.proof_query_version,
+        implementation_fingerprint=facts.implementation_fingerprint,
         test_mode=facts.test_mode,
         contract=facts.contract,
         contract_digest=facts.contract_digest,
@@ -2264,6 +2368,18 @@ def run_process_migration_evidence(
         raise ProcessEvidenceError("PROCESS.CHILD_PID_INVALID")
     if evidence.worker_protocol_digest != request["protocol_digest"]:
         raise ProcessEvidenceError("PROCESS.PROTOCOL_DIGEST_MISMATCH")
+    if (
+        evidence.proof_query_version != request["proof_query_version"]
+        or evidence.implementation_fingerprint
+        != request["implementation_fingerprint"]
+    ):
+        raise ProcessEvidenceError("PROCESS.IMPLEMENTATION_MISMATCH")
+    try:
+        implementation_after = benchmark_implementation_fingerprint()
+    except (TypeError, ValueError) as error:
+        raise ProcessEvidenceError("PROCESS.IMPLEMENTATION_INVALID") from error
+    if evidence.implementation_fingerprint != implementation_after:
+        raise ProcessEvidenceError("PROCESS.IMPLEMENTATION_CHANGED")
     if evidence.contract_digest != contract_digest:
         raise ProcessEvidenceError("PROCESS.CONTRACT_DIGEST_MISMATCH")
     if evidence.fixture_digest != fixture_digest:

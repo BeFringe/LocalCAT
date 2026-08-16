@@ -9,6 +9,7 @@ from typing import cast
 
 from tm_content_attestation import (
     ContentSemanticFacts,
+    LOGICAL_CLOSURE_VERSION,
     ContentAttestationError,
     _active_content_attestation_from_mapping,
     _active_content_attestation_to_mapping,
@@ -133,6 +134,7 @@ class ContentAttestationCodecTests(unittest.TestCase):
             receipt_boundary_fts_count=1,
             gram_counts=((1, 1), (2, 0)),
             exact_parity_digest="3" * 64,
+            logical_closure_version=LOGICAL_CLOSURE_VERSION,
             logical_closure_digest="4" * 64,
         )
 

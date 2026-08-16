@@ -941,9 +941,9 @@ class TMExportPreflightTests(unittest.TestCase):
             service = _service(identity)
             sidecar = identity.canonical_sidecar_path
             cases = (
-                root / f".{sidecar.name}.localcat-anything.jsonl",
-                root / f".localcat-{identity.target_identity[:16]}-x.jsonl",
-                root / f".localcat-{identity.target_identity[:16]}",
+                (root / f".{sidecar.name}.localcat-anything.jsonl").resolve(),
+                (root / f".localcat-{identity.target_identity[:16]}-x.jsonl").resolve(),
+                (root / f".localcat-{identity.target_identity[:16]}").resolve(),
             )
             for destination in cases:
                 with self.subTest(destination=destination.name):
@@ -1139,7 +1139,7 @@ class TMExportPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
-            destination = Path(f"{root}/bad\0name.jsonl")
+            destination = Path(f"{root.resolve()}/bad\0name.jsonl")
 
             result = _service(stage.resource_identity).export_jsonl(
                 store,
