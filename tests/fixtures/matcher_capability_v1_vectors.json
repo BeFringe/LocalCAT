@@ -1,0 +1,235 @@
+{
+  "fixture_version": "matcher-capability-v1",
+  "expectation": {
+    "evidence_schema_version": "matcher-validation-v2",
+    "matcher_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "matcher_build_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "semantics_version": "text-v1-unicode-16.0.0",
+    "basic_cohorts": [
+      {
+        "cohort_id": "matcher-basic-v1",
+        "cohort_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    ],
+    "full_cohorts": [
+      {
+        "cohort_id": "matcher-text-v1",
+        "cohort_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "cohort_id": "matcher-unicode-v1",
+        "cohort_digest": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    ],
+    "fixture_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "evaluator_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "manifest_window": {
+    "generated_at_utc": "2030-01-01T00:00:00Z",
+    "valid_until_utc": "2030-02-01T00:00:00Z"
+  },
+  "state_matrix": [
+    {
+      "id": "missing_manifest",
+      "manifest_kind": "missing",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "basic_only_valid",
+      "manifest_kind": "basic",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "basic_and_full_valid",
+      "manifest_kind": "basic_full",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "TEXT_V1_VALIDATED"
+    },
+    {
+      "id": "partial_full_missing_is_a_basic_downgrade",
+      "manifest_kind": "partial_full",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "basic_failed",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-basic-v1": {
+          "passed": false
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "basic_digest_mismatch",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-basic-v1": {
+          "cohort_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "full_failed",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-text-v1": {
+          "passed": false
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "full_digest_mismatch",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-text-v1": {
+          "cohort_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "full_expired_while_manifest_and_basic_remain_valid",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-text-v1": {
+          "valid_until_utc": "2030-01-10T00:00:00Z"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "full_future_while_manifest_and_basic_are_valid",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-text-v1": {
+          "generated_at_utc": "2030-01-20T00:00:00Z"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "BASIC_VALIDATED"
+    },
+    {
+      "id": "basic_expired",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-basic-v1": {
+          "valid_until_utc": "2030-01-10T00:00:00Z"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "basic_future",
+      "manifest_kind": "basic_full",
+      "cohort_overrides": {
+        "matcher-basic-v1": {
+          "generated_at_utc": "2030-01-20T00:00:00Z"
+        }
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "full_only_is_not_a_basic_manifest",
+      "manifest_kind": "full_only",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "unknown_extra_cohort",
+      "manifest_kind": "extra",
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "artifact_mismatch",
+      "manifest_kind": "basic_full",
+      "manifest_overrides": {
+        "matcher_artifact_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "build_mismatch",
+      "manifest_kind": "basic_full",
+      "manifest_overrides": {
+        "matcher_build_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "fixture_mismatch_is_manifest_wide",
+      "manifest_kind": "basic",
+      "manifest_overrides": {
+        "fixture_digest": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "evaluator_mismatch_is_manifest_wide",
+      "manifest_kind": "basic",
+      "manifest_overrides": {
+        "evaluator_digest": "6666666666666666666666666666666666666666666666666666666666666666"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "semantics_mismatch",
+      "manifest_kind": "basic_full",
+      "manifest_overrides": {
+        "semantics_version": "text-v0"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "evidence_schema_mismatch",
+      "manifest_kind": "basic_full",
+      "unsafe_manifest_overrides": {
+        "evidence_schema_version": "matcher-validation-v0"
+      },
+      "evaluated_at_utc": "2030-01-15T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "future_generated",
+      "manifest_kind": "basic_full",
+      "evaluated_at_utc": "2029-12-31T23:59:59Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "generated_boundary_is_inclusive",
+      "manifest_kind": "basic_full",
+      "evaluated_at_utc": "2030-01-01T00:00:00Z",
+      "expected_state": "TEXT_V1_VALIDATED"
+    },
+    {
+      "id": "expired",
+      "manifest_kind": "basic_full",
+      "evaluated_at_utc": "2030-02-01T00:00:01Z",
+      "expected_state": "UNAVAILABLE"
+    },
+    {
+      "id": "valid_until_boundary_is_exclusive",
+      "manifest_kind": "basic_full",
+      "evaluated_at_utc": "2030-02-01T00:00:00Z",
+      "expected_state": "UNAVAILABLE"
+    }
+  ]
+}

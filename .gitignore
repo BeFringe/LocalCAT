@@ -1,2 +1,10 @@
 .trae/
+.idea/
+.opencode/*
+!.opencode/skills/
+.opencode/skills/*
+!.opencode/skills/kiro-*/
+!.opencode/skills/kiro-*/**
+!.opencode/skills/governance-summary/
+!.opencode/skills/governance-summary/**
 *.pyc
