@@ -26,6 +26,13 @@ Before writing `design.md`, review the draft design and repair local issues unti
 - If the boundary cannot be explained in a few direct bullets, it is probably still too vague for task generation.
 - If the design reveals multiple independent responsibility seams that could move separately, stop and split the spec or return to roadmap discovery instead of forcing them into one spec.
 
+## Governance Readiness Review
+
+- `Governance Impact` must name applicable Steering and adopted ADRs, or explicitly record `None` with a reason.
+- A spec that amends or reintroduces prior out-of-scope behavior must link its approved scope amendment.
+- New or superseding ADR candidates must be explicit. If a pending decision changes the implementation boundary, the design is NO-GO until a human approves it.
+- Required Steering sync and downstream revalidation must have named targets; vague “update docs later” statements do not pass.
+
 ## Executability Review
 
 - The design must be implementable as a sequence of bounded tasks without hidden prerequisites.
@@ -41,6 +48,7 @@ Before applying judgment, verify these mechanically:
 - **File Structure Plan populated**: The File Structure Plan section must contain concrete file paths (not just "TBD" or empty). Scan for placeholder text in that section.
 - **Boundary ↔ file structure alignment**: The File Structure Plan must reflect the stated responsibility boundary. If files imply broader ownership than the boundary section claims, report a mismatch.
 - **No orphan components**: Every component mentioned in the design must appear in the File Structure Plan with a file path. Scan for component names that have no corresponding file entry.
+- **Governance disposition populated**: `Governance Impact` must not be empty, placeholder-only, or treat a draft ADR as adopted.
 
 ## Review Loop
 

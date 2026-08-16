@@ -16,6 +16,17 @@
 | 架构重构 | 改变层级结构或依赖方向 | product / structure / tech |
 | Steering 引用冲突 | 实现中发现 Steering 与实际不符 | 涉及的具体文件 |
 
+## 1.1 cc-sdd 阶段接入
+
+`.kiro/settings/rules/governance.md` 是本机制在 cc-sdd 中的执行入口：
+
+1. **Requirements**：范围修订或相邻 Spec 依赖必须记录 `Scope Lineage`，防止曾明确排除的能力被代码静默纳入。
+2. **Design**：每份设计必须记录 `Governance Impact`，明确适用 Steering/ADR、候选或取代关系、scope amendment 与同步结论。
+3. **Tasks**：只有存在治理影响时才生成显式闭合任务；无影响时保留设计中的“无需同步”理由。
+4. **Feature GO**：仍影响已交付行为的未决 ADR、scope amendment、Steering 同步或下游重验会阻塞 GO。
+
+Skill 负责执行这些阶段门，不定义新的治理内容；治理 owner 和人工审批权不转移给 Skill。
+
 ## 2. 同步决策流程
 
 触发事件发生后，按以下顺序判定：
@@ -94,10 +105,11 @@ ADR 理论上不可修改。若发生：视为新增 ADR，旧 ADR 标记"已取
 | 多个 spec 对同一 Steering 条目有不同解释 | 更新 Steering 措辞 |
 | ADR 约束与 Steering 原则矛盾 | 以 Steering 为准，评估 ADR 是否需标记"已取代" |
 
-**与 architect-decision 的集成**：如果当前会话涉及触发事件，architect-decision 在 Session Requirement Template 中追加"Steering 同步检查需求"。本机制不修改 Skill 行为规则，仅在触发条件层面增加检查点。
+**与规格工作流的集成**：Requirements/Design/Tasks/Feature GO 的 Kiro Skills 必须读取项目治理规则；architect-decision 继续负责设计忠实度与隐式降级拦截。两者都不能自行批准 ADR 或 scope amendment。
 
 ---
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1 | 2026-05-16 | 初始版本。解决 Steering 文档静止和 border.md 归属问题。定义 border.md 生命周期和 ADR 提升通道。 |
+| v2 | 2026-08-16 | 将 ADR、scope lineage 与 Steering 同步处置接入 cc-sdd 阶段门。 |

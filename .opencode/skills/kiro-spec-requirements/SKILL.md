@@ -25,6 +25,7 @@ metadata:
    - Read `.kiro/specs/$1/brief.md` if it exists (discovery context: problem, approach, scope decisions, boundary candidates)
    - Read `.kiro/specs/$1/requirements.md` for project description
    - Core steering context: `product.md`, `tech.md`, `structure.md`
+   - Read `.kiro/settings/rules/governance.md` for scope-lineage and amendment gates
    - Additional steering files only when directly relevant to feature scope, user personas, business/domain rules, compliance/security constraints, operational constraints, or existing product boundaries
    - Relevant local agent skills or playbooks only when they clearly match the feature's host environment or use case and contain domain terminology or workflow rules that shape user-observable requirements
 
@@ -62,10 +63,12 @@ After all research completes, synthesize findings in main context before generat
      - design = `Boundary Commitments`
      - tasks = `_Boundary:_`
    - If scope could be misread, add lightweight boundary context without introducing implementation or architecture ownership detail
+   - If this spec amends an existing spec, reintroduces previously excluded scope, or depends on an adjacent spec, populate `Scope Lineage` with the owning spec, exact prior scope reference, adjacent contracts, and approval status
    - Keep this as a draft until the review gate passes; do not write `requirements.md` yet
 
 4. **Review Requirements Draft**:
    - Run the `Requirements Review Gate` from `rules/requirements-review-gate.md`
+   - Apply `.kiro/settings/rules/governance.md`; unresolved scope amendments remain explicit and cannot be treated as approved by generation
    - Review coverage, EARS compliance, ambiguity, adjacent expectations, and scope boundaries before finalizing
    - If issues are local to the draft, repair the requirements and review again
    - Keep the review bounded to at most 2 repair passes

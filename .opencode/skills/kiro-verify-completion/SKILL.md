@@ -38,6 +38,7 @@ Provide:
   - design alignment status
   - integration status
   - blocked task status
+  - governance closure status from `.kiro/settings/rules/governance.md`
 
 ## Outputs
 
@@ -90,8 +91,10 @@ Require:
 - cross-task integration assessment
 - design end-to-end alignment assessment
 - blocked tasks assessment
+- approved scope amendments and boundary-changing ADRs
+- completed Steering sync and downstream revalidation required by the design
 
-A passing test suite alone is not enough for `FEATURE_GO`.
+A passing test suite alone is not enough for `FEATURE_GO`. Draft ADRs and historical evidence cannot authorize unresolved governance changes.
 
 ## Stop / Escalate
 

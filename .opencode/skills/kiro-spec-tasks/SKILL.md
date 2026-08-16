@@ -26,6 +26,7 @@ metadata:
 - `.kiro/specs/$1/spec.json`, `requirements.md`, `design.md`
 - `.kiro/specs/$1/tasks.md` (if exists, for merge mode)
 - Core steering context: `product.md`, `tech.md`, `structure.md`
+- Read `.kiro/settings/rules/governance.md` and the design's `Governance Impact`
 - Additional steering files only when directly relevant to requirements coverage, design boundaries, runtime prerequisites, or team conventions that affect task executability
 
 **Validate approvals**:
@@ -57,6 +58,8 @@ After all parallel research completes, synthesize findings before generating tas
 - Ensure all design components included
 - Verify task progression is logical and incremental
 - Ensure each executable sub-task includes at least one detail bullet that states what "done" looks like in observable terms
+- When `Governance Impact` requires ADR approval, Steering sync, scope amendment, or downstream revalidation, include an explicit non-parallel governance closure task with owner, dependency, and observable evidence
+- Do not generate empty governance bookkeeping when the design records no governance impact
 - Keep normal implementation tasks within a single responsibility boundary; if work crosses boundaries, make it an explicit integration task
 - Collapse single-subtask structures by promoting them to major tasks and avoid duplicating details on container-only major tasks (use template patterns accordingly)
 - Apply `(P)` markers to tasks that satisfy parallel criteria (omit markers when sequential mode requested)
@@ -74,7 +77,8 @@ After all parallel research completes, synthesize findings before generating tas
   - Each sub-task is an executable 1-3 hour work unit
   - Each sub-task has a verifiable deliverable
   - Each executable sub-task includes an observable completion bullet
-  - No implicit prerequisites remain hidden
+- No implicit prerequisites remain hidden
+- Governance prerequisites and downstream revalidation named by the design are represented; unresolved boundary-changing approvals return to design instead of becoming implementation filler
   - `_Depends:_`, `_Boundary:_`, and `(P)` markers still match the dependency graph and architecture boundaries
 - If issues are task-plan-local, repair the draft and re-run the review gate before writing
 - Keep the review bounded to at most 2 repair passes

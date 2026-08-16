@@ -28,6 +28,7 @@ Interactive design quality review for feature **$1** based on approved requireme
    - Read `.kiro/specs/$1/requirements.md` for requirements
    - Read `.kiro/specs/$1/design.md` for design document
    - Core steering context: `product.md`, `tech.md`, `structure.md`
+   - Read `.kiro/settings/rules/governance.md`, `.kiro/steering/adr/README.md`, and ADRs referenced by `design.md`
    - Additional steering files only when directly relevant to architecture boundaries, integrations, runtime prerequisites, domain rules, security/performance constraints, or team conventions that affect implementation readiness
    - Relevant local agent skills or playbooks only when they clearly match the feature's host environment or use case and provide review-relevant context
 
@@ -44,6 +45,7 @@ After all parallel research completes, synthesize findings for review.
 2. **Execute Design Review**:
    - Reference conversation history when available: leverage prior requirements discussion and user's stated design intent
    - Follow design-review.md process: Analysis → Critical Issues → Strengths → GO/NO-GO
+   - Reject GO when the design relies on an unapproved scope amendment, treats a draft ADR as authority, or leaves a boundary-changing ADR/Steering disposition unresolved
    - Limit to 3 most important concerns
    - Engage interactively with user — ask clarifying questions, propose alternatives
    - Use language specified in spec.json for output

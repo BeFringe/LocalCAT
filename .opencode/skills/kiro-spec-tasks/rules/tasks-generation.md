@@ -117,6 +117,7 @@ Before writing `tasks.md`, review the draft task plan and repair local issues un
 
 - Every requirement ID from `requirements.md` must appear in at least one task.
 - Every design component, interface/contract, integration point, runtime prerequisite, and validation concern from `design.md` must be represented by at least one task.
+- Every required item in `Governance Impact` must be represented by a governance closure task; an explicit no-impact disposition requires no bookkeeping task.
 - If coverage is missing because the task plan is incomplete, repair the draft tasks and review again.
 - If coverage cannot be added cleanly because requirements or design are ambiguous, contradictory, or underspecified, stop and return to the requirements/design phase instead of papering over the gap in `tasks.md`.
 
@@ -130,6 +131,7 @@ Before writing `tasks.md`, review the draft task plan and repair local issues un
 - If many tasks require broad `_Boundary:_` scopes or repeated cross-boundary coordination, stop and return to design or roadmap decomposition instead of forcing the spec through task generation.
 - Merge or collapse tasks that are too small, bookkeeping-only, or not meaningful execution units.
 - Make implicit prerequisites explicit as preceding tasks.
+- Do not convert a pending ADR or scope amendment into an implementation task; return boundary-changing approval gaps to design and human review.
 - Re-check `_Depends:_`, `_Boundary:_`, and `(P)` markers after edits so concurrency claims still match the design boundaries and dependency graph.
 
 ### Review Loop

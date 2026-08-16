@@ -27,6 +27,7 @@ If steering/spec context is already available from conversation, skip redundant 
 Otherwise, load all necessary context:
 - `.kiro/specs/{feature}/spec.json`, `requirements.md`, `design.md`, `tasks.md`
 - Core steering context: `product.md`, `tech.md`, `structure.md`
+- Project governance context: `.kiro/settings/rules/governance.md` and the spec's `Scope Lineage` / `Governance Impact`
 - Additional steering files only when directly relevant to the selected task's boundary, runtime prerequisites, integrations, domain rules, security/performance constraints, or team conventions that affect implementation or validation
 - Relevant local agent skills or playbooks only when they clearly match the task's host environment or use case; read the specific artifact(s) you need, not entire directories
 
@@ -162,6 +163,7 @@ Before writing any code, read the relevant sections of requirements.md and desig
 - What observable behaviors must be true when done (acceptance criteria)
 - What files/functions/tests must exist (completion definition)
 - What technical decisions to follow from design.md (design constraints)
+- Whether the task depends on a pending scope amendment or boundary-changing ADR; if so, stop for human approval instead of implementing
 - How to confirm the task works (verification method)
 
 **2. Execute TDD cycle** (Kent Beck's RED → GREEN → REFACTOR):

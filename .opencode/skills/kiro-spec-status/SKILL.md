@@ -23,6 +23,7 @@ description: Show specification status and progress
 - Read existing files: `requirements.md`, `design.md`, `tasks.md` (if they exist)
 - Check `.kiro/specs/$1/` directory for available files
 - Read `.kiro/steering/roadmap.md` if it exists and this spec appears in it
+- Read `.kiro/settings/rules/governance.md` and inspect `Scope Lineage` / `Governance Impact` when present
 
 ### Step 2: Analyze Status
 
@@ -38,6 +39,9 @@ description: Show specification status and progress
 - **Revalidation watchlist**:
   - Identify downstream specs, neighboring existing-spec updates, or rollout-sensitive design notes that may need revalidation if this spec changes
   - Call out when the current spec shape looks too broad and may want roadmap/design splitting instead of more local repair
+- **Governance status**:
+  - Surface pending scope amendments, draft/superseding ADRs, required Steering sync, and downstream revalidation
+  - Do not report an unapproved ADR candidate as an active constraint
 
 ### Step 3: Generate Report
 
@@ -49,6 +53,7 @@ Create report in the language specified in spec.json covering:
 5. **Revalidation Watchlist**: Downstream or adjacent work likely affected by changes to this spec
 6. **Next Actions**: What needs to be done next
 7. **Blockers**: Any issues preventing progress
+8. **Governance**: Scope lineage, ADR disposition, Steering sync, and downstream revalidation status
 
 </instructions>
 

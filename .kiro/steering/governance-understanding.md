@@ -1,4 +1,4 @@
-# Governance Understanding Summary v1.1
+# Governance Understanding Summary v1.2
 
 > Agent 对 LocalCAT 治理模型的理解快照。本文件记录 Agent "如何理解治理"，而非治理规则本身。
 > 治理规则见 governance-baseline.md。
@@ -27,7 +27,7 @@ LocalCAT 的治理系统本质上是一个**双层认知架构**，核心问题�
 - **product.md** — 系统身份：local-first CAT tool、100% local、zero telemetry、数据驱动而非功能驱动
 - **structure.md** — 架构身份：Layer-first flat-file、4 层严格分离、向下依赖、无状态 LogicController
 - **tech.md** — 运行时身份：Python 3.14+、stdlib-only core、frozen dataclass 数据合约
-- **border.md**（待建立）— 需求级身份：每次需求从 Steering 提取的红线
+- **border.md**（机制已建立）— 需求级身份：每次需求从 Steering 提取、执行、归档并可提升为 ADR 的红线
 
 **变更条件：** 仅当项目本质变化时。不是功能变更，不是优先级调整。
 
@@ -35,14 +35,7 @@ LocalCAT 的治理系统本质上是一个**双层认知架构**，核心问题�
 
 **核心理解：** ADR 是永久记录，追加式，不可修改旧记录。
 
-当前缺位。但 tech.md 中已散落多个 ADR 级别决策：
-- Trie 用于 Glossary
-- JSONL append-only TM
-- Stateless LogicController
-- TM-priority strategy
-- 条件性 openpyxl import
-
-这些是"已做但未记录"的架构决策。
+机制已建立：ADR-001～006 已采纳并保存初始架构决策，ADR-007～011 总结 Feature 5 与 UI 集成产生的长期选择，当前仍是待人工审阅的草案。草案只提供可审计候选，不授权实现或范围扩张。
 
 ### Spec = 功能生命周期
 
@@ -61,7 +54,7 @@ Spec 的三大工件：
 
 - **architect-decision** — 忠实度守门：检查实现是否忠实于设计
 - **stage-keeper** — 阶段检测：判断当前在哪个阶段，是否漂移
-- **omc-reference** — 提交协议：结构化 git trailer
+- **cc-sdd Kiro Skills** — 在 Requirements、Design、Tasks 与 Feature GO 阶段执行项目治理规则
 
 **分工：**
 - stage-keeper 管辖"在哪个层级操作"
@@ -111,7 +104,8 @@ Skill ──gates──→ Spec            (architect-decision 守门设计忠�
 
 NO RELATIONSHIPS:
   Code ─╳→ Steering              (代码不直接修改 Steering)
-  Spec ─╳→ ADR                   (规格不直接产生 ADR)
+  Spec ──proposes──→ ADR candidate (规格提出候选，治理 owner 与人工审批决定)
+  Spec ─╳→ approve ADR           (规格不能自行批准 ADR)
   Skill ─╳→ Steering             (Skill 不修改 Steering 内容)
 ```
 
@@ -119,15 +113,15 @@ NO RELATIONSHIPS:
 
 ## 5. 演进风险排序理解
 
-### 当前优先级（v1.1）
+### 当前优先级（v1.2）
 
 | 优先级 | 风险 | 理解 |
 |--------|------|------|
-| 1 | ADR 缺位 🔴 | 不可逆决策散落在 tech.md 和 spec 中，随时可能被静默覆盖 |
-| 2 | Steering 文档静止 🔴 | L2A/2B 拆分和 parser 子系统已引入，但 Steering 未同步 |
-| 3 | border.md 归属模糊 🔴 | 需求级红线无生命周期管理，约束可能随功能完成而丢失 |
+| 1 | ADR 漏提/未决 🟡 | 机制已经建立；风险转为新决策未分类、草案被误当授权或取代关系未批准 |
+| 2 | Steering 同步遗漏 🟡 | 同步机制和 cc-sdd 检查点已经建立，仍需防止实际阶段跳过处置 |
+| 3 | border.md 生命周期执行 🟡 | 归属和流程已定义，风险转为功能归档时未实际执行或提升 |
 | 4 | Spec-Steering 边界侵蚀 🟡 | design.md 中包含超出功能生命周期的架构决策 |
-| 5 | Skill 触发覆盖率不足 🟡 | 未覆盖设计阶段、ADR 提取、Steering 更新 |
+| 5 | Skill 触发执行漂移 🟡 | 阶段门已覆盖设计、ADR 与 Steering 处置，仍需验证各入口真实加载项目规则 |
 | 6 | Steering 演进失控 🟢 | 当前集中治理，缺乏触发条件 |
 | 7 | 灰线判定主观性 🟢 | 需先例积累，不阻塞 |
 
@@ -147,3 +141,4 @@ parser-subsystem-extraction 产生了 33 个 correctness properties。这些约�
 |------|------|------|
 | v1.0 | 2026-05-13 | 初始版本 |
 | v1.1 | 2026-05-13 | 校准修正：Steering 身份认知定义、灰线修正为有限自由度、风险拆分重排、border.md 优先级恢复 |
+| v1.2 | 2026-08-16 | 校准 ADR/border 现状，并把治理检查接入 cc-sdd 阶段门。 |

@@ -1,4 +1,4 @@
-# Evolution Risk Analysis v1.1
+# Evolution Risk Analysis v1.2
 
 > LocalCAT 治理系统演进风险分析。独立于基线文档，提供详细的风险上下文和漂移模式说明。
 > 风险优先级表见 governance-baseline.md 第 4 节。
@@ -7,15 +7,22 @@
 
 ## 1. 风险总览
 
-当前阶段：最小化治理系统 v1（初始基线已建立，ADR 和 border.md 机制待建）。
+当前阶段：治理系统 v2 接入期。ADR 与 border 生命周期已经建立，cc-sdd 已加入 scope lineage、ADR/Steering disposition 与 Feature GO 闭合点。
 
-三个高风险项均与"治理对象存在但缺乏机制保护"有关——这不是理论风险，是正在发生的治理缺口。
+下文 R1～R7 保留 2026-05 初始风险的形成背景。当前残余风险不再是“没有文件”，而是新决策漏提、草案被误当授权、同步处置被跳过，以及阶段门未真实执行。
+
+### 2026-08-16 校准
+
+- R1：ADR-001～006 已采纳，ADR-007～011 为待审草案；严重度由“机制缺位”转为“漏提/未决”中风险。
+- R2：Steering 同步机制已接入 Requirements、Design、Tasks 与 Feature GO；残余风险是执行遗漏。
+- R3：border.md 的创建、执行、归档和 ADR 提升通道已定义；残余风险是功能归档时漏做。
+- R5：项目规则已由 cc-sdd Skills 显式加载；后续监控真实入口覆盖率，不再另造治理立法 Skill。
 
 ---
 
-## 2. 高风险
+## 2. 2026-05 高风险形成背景
 
-### R1: ADR 缺位
+### R1: ADR 缺位（历史基线）
 
 **严重度：** 🔴 高
 **当前状态：** 活跃

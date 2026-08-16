@@ -12,6 +12,8 @@
 目录归属：
 
 - `.kiro/settings/templates/`：需求、设计、任务、research 和 steering 文档结构；
+- `.kiro/settings/templates/adr.md`：项目 ADR 的统一追加式记录结构；
+- `.kiro/settings/rules/governance.md`：Requirements → Design → Tasks → Feature GO 的项目治理门；
 - `.opencode/skills/kiro-*`：执行审批工作流的 Agent Skills；
 - `.kiro/specs/`：项目实际规格，不是模板；
 - `.kiro/steering/`：项目实际长期认知与治理文件，不是模板。

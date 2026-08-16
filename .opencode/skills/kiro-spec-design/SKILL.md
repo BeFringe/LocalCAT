@@ -26,6 +26,7 @@ metadata:
 - `.kiro/specs/$1/spec.json`, `requirements.md`, `design.md` (if exists)
 - `.kiro/specs/$1/research.md` (if exists, contains gap analysis from `/kiro-validate-gap`)
 - Core steering context: `product.md`, `tech.md`, `structure.md`
+- Project governance context: `.kiro/settings/rules/governance.md`, `.kiro/steering/adr/README.md`, and ADRs directly relevant to the design
 - Additional steering files only when directly relevant to requirement coverage, architecture boundaries, integrations, runtime prerequisites, security/performance constraints, or team conventions that affect implementation readiness
 - `.kiro/settings/templates/specs/design.md` for document structure
 - Read `rules/design-principles.md` from this skill's directory for design principles
@@ -111,6 +112,7 @@ After all findings return, synthesize in main context before proceeding.
    - **Integrate all discovery findings and synthesis outcomes**: Use researched information (APIs, patterns, technologies) and synthesis decisions (generalizations, build-vs-adopt, simplifications) throughout component definitions, architecture decisions, and integration points
    - **File Structure Plan** (required): Populate the File Structure Plan section with concrete file paths and responsibilities. Analyze the codebase to determine which files need to be created vs. modified. Each file must have one clear responsibility. This section directly drives task `_Boundary:_` annotations and implementation Task Briefs — vague file structures produce vague implementations.
    - **Testing Strategy**: Derive test items from requirements' acceptance criteria, not generic patterns. Each test item should reference specific components and behaviors from this design. E2E paths must map to the critical user flows identified in requirements. Avoid vague entries like "test login works" -- instead specify what is being verified and why it matters.
+   - **Governance Impact** (required): State applicable Steering/ADRs, ADR disposition, scope-amendment status, Steering sync, and downstream revalidation. A draft ADR is not authorization.
    - If existing design.md found in Step 1, use it as reference context (merge mode)
    - Apply design rules: Type Safety, Visual Communication, Formal Tone
    - Use language specified in spec.json
@@ -119,6 +121,7 @@ After all findings return, synthesize in main context before proceeding.
 ### Step 5: Review Design Draft
 
 - Read and apply `rules/design-review-gate.md` from this skill's directory
+- Apply `.kiro/settings/rules/governance.md`; if a pending ADR or scope amendment changes the implementation boundary, return NO-GO for human decision
 - Verify requirements coverage, architecture readiness, and implementation executability before finalizing the design
 - If issues are local to the draft, repair the design and review again
 - Keep the review bounded to at most 2 repair passes

@@ -9,6 +9,13 @@
 - **Out of scope**: {{OUT_OF_SCOPE_BEHAVIORS}}
 - **Adjacent expectations**: {{ADJACENT_SYSTEM_OR_SPEC_EXPECTATIONS}}
 
+<!-- Required when amending an existing spec, reintroducing previously excluded scope, or depending on an adjacent spec -->
+## Scope Lineage (Conditional)
+- **Owning spec**: {{OWNING_SPEC}}
+- **Existing scope statement being amended**: {{EXISTING_SCOPE_REFERENCE_OR_NONE}}
+- **Adjacent specs / contracts**: {{ADJACENT_SPEC_REFERENCES_OR_NONE}}
+- **Approval status**: {{APPROVED_REFERENCE_OR_PENDING}}
+
 ## Requirements
 
 ### Requirement 1: {{REQUIREMENT_AREA_1}}

@@ -1,4 +1,4 @@
-# Governance Cognitive Baseline v1
+# Governance Cognitive Baseline v1.1
 
 > LocalCAT 项目治理认知基线。定义治理系统的定位、认知模型、风险分析和对象分类。
 > 本文档是治理系统的身份锚点，不是功能规格。
@@ -47,7 +47,7 @@ LocalCAT 治理系统是一个**双层认知架构**，核心问题是：如何�
 | 层级 | 职责 | 生命周期 | 变更频率 | 代表物 |
 |------|------|----------|----------|--------|
 | **Steering（领航层）** | 项目身份认知：系统是什么、不做什么、架构原则与运行时边界 | 长期稳定 | 极低（仅当项目本质变化时） | product.md / structure.md / tech.md |
-| **ADR（架构决策记录）** | 不可逆或高成本的架构决策 | 永久记录 | 低（重大变更时新增，不修改旧记录） | （待建立） |
+| **ADR（架构决策记录）** | 不可逆或高成本的架构决策 | 永久记录 | 低（重大变更时新增，不修改旧记录） | `.kiro/steering/adr/adr-NNN.md` |
 | **Spec（规格层 / cc-sdd）** | 功能生命周期：需求→设计→任务 | 功能级 | 中（每个功能一组，完成后归档） | .kiro/specs/*/ |
 
 ### 层级间判定规则
@@ -74,8 +74,8 @@ LocalCAT 治理系统是一个**双层认知架构**，核心问题是：如何�
 | Steering: product.md | ✅ 已存在 | 项目定位、核心价值、不做什么 |
 | Steering: structure.md | ✅ 已存在 | 分层架构、依赖方向、命名规则 |
 | Steering: tech.md | ✅ 已存在 | 技术栈、运行时边界、外部依赖红线 |
-| Steering: border.md | ⚠️ 未建立 | 需求级红线的生命周期未治理 |
-| ADR | ❌ 未建立 | tech.md 中散落着 ADR 级别决策，需提取 |
+| Steering: border.md | ✅ 机制已建立 | `steering-sync-mechanism.md` 定义创建、执行、归档与 ADR 提升；现有 border 作为先例 |
+| ADR | ✅ 已建立 | ADR-001～006 已采纳；ADR-007～011 为待人工审阅草案 |
 | cc-sdd: parser-subsystem-extraction | ✅ 已存在 | 14 需求 / 903 行设计 / 20 任务 |
 | Skill: architect-decision | ✅ 已存在 | 设计忠实度守门 |
 | Skill: stage-keeper | ✅ 已存在 | 阶段/漂移检测 |
@@ -129,11 +129,11 @@ LocalCAT 治理系统是一个**双层认知架构**，核心问题是：如何�
 
 | 优先级 | 风险 | 严重度 | 触发条件 |
 |--------|------|--------|----------|
-| 1 | ADR 缺位 | 🔴 高 | 不可逆决策散落在 tech.md 和 spec 中，无治理保护 |
-| 2 | Steering 文档静止 | 🔴 高 | 架构已演化（L2A/2B 拆分、parser 子系统），Steering 缺乏同步更新机制 |
-| 3 | border.md 归属模糊 | 🔴 高 | 需求级红线生命周期未治理，存在约束丢失风险 |
+| 1 | ADR 漏提或未决 | 🟡 中 | 新决策未分类、草案被误当授权或取代关系未批准 |
+| 2 | Steering 同步遗漏 | 🟡 中 | 同步机制已建立，但阶段执行可能被跳过 |
+| 3 | border.md 生命周期执行 | 🟡 中 | 归属已定义，但归档/提升仍可能漏做 |
 | 4 | Spec-Steering 边界侵蚀 | 🟡 中 | Spec 承载了超出 feature 生命周期的架构决策 |
-| 5 | Skill 触发覆盖率不足 | 🟡 中 | 治理机制未覆盖全生命周期（设计阶段、ADR 提取、Steering 更新） |
+| 5 | Skill 触发执行漂移 | 🟡 中 | cc-sdd 已加入阶段门，需持续验证入口实际加载项目规则 |
 | 6 | Steering 演进失控 | 🟢 低 | 当前主 Agent 集中治理，缺乏触发条件 |
 | 7 | 灰线判定主观性 | 🟢 低 | 需先例积累，不阻塞当前阶段 |
 
@@ -224,18 +224,17 @@ GovernanceRelation
 
 ### P0（立即）
 
-1. **建立 ADR 机制** — 从 tech.md 和 parser-subsystem spec 中提取已有架构决策
-   - 候选：Trie for Glossary / JSONL append-only TM / Stateless LogicController / 单向依赖 / TM-priority strategy
-2. **定义 border.md 生命周期** — 谁创建、何时创建、何时归档、归档到哪
+1. **审阅 Feature 5 ADR 草案** — 对 ADR-007～011 逐项采纳、修订或拒绝；草案期间不得作为 UI 实施授权
+2. **运行 cc-sdd 治理阶段门** — Requirements 记录 scope lineage，Design 记录 ADR/Steering disposition，Tasks 与 Feature GO 闭合未决项
 
 ### P1（本迭代内）
 
-3. **同步 Steering 与当前架构** — structure.md 需反映 L2A/2B 拆分和 parser 子系统
-4. **审查 Spec 中的 ADR 级内容** — parser-subsystem design.md 的 33 correctness properties 中哪些应提升为 ADR
+3. **同步 Steering 与当前架构** — 以明确触发事件更新，不从代码既成事实反推批准
+4. **审查 Spec 中的 ADR 级内容** — 从 active specs 中持续识别跨生命周期决策候选
 
 ### P2（基线稳定后）
 
-5. **评估 Skill 触发覆盖率** — architect-decision 是否覆盖设计阶段和 ADR 提取
+5. **评估 Skill 触发覆盖率** — 验证各 cc-sdd 入口实际执行项目治理规则
 6. **建立灰线先例库** — 为灰线判定提供定量参考
 
 ---
@@ -245,3 +244,4 @@ GovernanceRelation
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1 | 2026-05-13 | 初始基线。基于初版认知产物 + 用户校准修正（Steering 身份认知定义、风险拆分重排、border.md 优先级恢复、灰线定义修正） |
+| v1.1 | 2026-08-16 | 记录 ADR/border 机制现状，并将风险焦点从机制缺位转为阶段执行与未决处置。 |

@@ -17,6 +17,7 @@ Requirements should clarify the feature boundary in user- or operator-observable
 
 - The draft must cover the feature's core user journeys, major scope boundaries, primary error cases, and meaningful edge conditions that are visible to the user or operator.
 - If the feature touches adjacent systems, specs, or workflows, the draft must make clear what this feature expects from them and what it does not own when that distinction affects user-visible behavior or operator expectations.
+- If the feature amends an existing spec or reintroduces previously excluded behavior, `Scope Lineage` must cite the prior scope statement and record approval as approved or pending; generation alone never changes pending to approved.
 - Business/domain rules, compliance constraints, security/privacy expectations, and operational constraints that materially shape user-visible behavior must be reflected explicitly when they are in scope.
 - If coverage is missing because the draft is incomplete, repair the draft and review again.
 - If coverage cannot be completed cleanly because the project description or steering context is ambiguous, contradictory, or underspecified, stop and ask the user to clarify instead of guessing.
@@ -42,6 +43,7 @@ Before applying judgment, verify these mechanically:
 - **Numeric IDs present**: Every requirement heading has a numeric ID (1, 1.1, 2, etc.). Scan the draft for headings without IDs.
 - **Acceptance criteria exist**: Every requirement has at least one EARS-format acceptance criterion. Scan for requirements with no "When/If/While/Where" acceptance statements.
 - **No implementation language**: Scan for technology-specific terms (database names, framework names, API patterns) that belong in design, not requirements. Flag any found.
+- **Scope lineage present when required**: Scan amendments and adjacent-spec dependencies for an owning spec, exact prior scope reference, adjacent contracts, and approval state.
 
 ## Review Loop
 

@@ -58,6 +58,19 @@ List the kinds of changes that should force dependent specs or consumers to re-c
 - Dependency direction changes
 - Startup/runtime prerequisite changes
 
+## Governance Impact
+
+Complete this section for every design. Use `None` with a short reason when no item applies; do not omit the governance disposition.
+
+- **Applicable Steering**: Project principles and cross-line boundaries that constrain the design
+- **Applicable ADRs**: Existing adopted ADRs followed by this design, or `None`
+- **ADR disposition**: Follow existing / New candidate / Supersede / None
+- **Scope amendment**: Approved reference / Not required / Pending
+- **Steering sync**: Required (name target files) / Not required (state why)
+- **Downstream revalidation**: Affected specs or integration seams / None
+
+> A draft ADR is not implementation authorization. If a new or superseding decision changes the implementation boundary, keep the design at NO-GO until human approval is recorded.
+
 ## Architecture
 
 > Reference detailed discovery notes in `research.md` only for background; keep design.md self-contained for reviewers by capturing all decisions and contracts here.

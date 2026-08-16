@@ -69,6 +69,7 @@ For each detected feature:
 - Read `.kiro/specs/<feature>/design.md` for design structure
 - Read `.kiro/specs/<feature>/tasks.md` for task list and Implementation Notes
 - Core steering context: `product.md`, `tech.md`, `structure.md`
+- Read `.kiro/settings/rules/governance.md`, `.kiro/steering/adr/README.md`, and the spec's `Scope Lineage` / `Governance Impact`
 - Additional steering files only when directly relevant to the validated boundaries, runtime prerequisites, integrations, domain rules, security/performance constraints, or team conventions that affect the GO/NO-GO call
 
 **Discover canonical validation commands**:
@@ -135,6 +136,11 @@ For each detected feature:
 - Check for any tasks still marked `_Blocked:_` — report why and assess impact on feature completeness
 - Review `## Implementation Notes` in tasks.md for cross-cutting insights that need attention
 
+**I. Governance Closure**
+- Verify boundary-changing ADRs and scope amendments are approved rather than merely drafted
+- Verify required Steering sync and downstream revalidation named by the design are complete
+- Treat unresolved governance items affecting delivered behavior as NO-GO
+
 ### 4. Generate Report
 
 Before returning `GO`, apply the `kiro-verify-completion` protocol to the feature-level claim. Tests alone are insufficient: include full-suite, runtime liveness, coverage, integration, design-alignment, and blocked-task status in the evidence.
@@ -170,6 +176,7 @@ Provide summary in the language specified in spec.json:
 - OWNERSHIP: LOCAL | UPSTREAM | UNCLEAR
 - UPSTREAM_SPEC: <feature-name | N/A>
 - BLOCKED_TASKS: <list and impact assessment>
+- GOVERNANCE: <scope amendment / ADR / Steering sync / downstream revalidation status>
 - REMEDIATION: <if NO-GO: specific, actionable steps to fix each issue>
 ```
 
