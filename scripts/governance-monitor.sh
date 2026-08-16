@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKSPACE="/home/neotag/.local/share/opencode/worktree/bd10770111131a050c457174553a67d555e13df2/jolly-orchid"
-MODEL="${GOV_MONITOR_MODEL:-zhipuai-coding-plan/glm-5.1}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+WORKSPACE="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel)"
+MODEL="${GOV_MONITOR_MODEL:-}"
 SESSION="${GOV_MONITOR_SESSION:-}"
 AGENT="${GOV_MONITOR_AGENT:-governance-monitor}"
 MODE="${GOV_MONITOR_MODE:-full}"
@@ -12,8 +13,7 @@ INTERACTIVE="${GOV_MONITOR_INTERACTIVE:-0}"
 DRY_RUN="${GOV_MONITOR_DRY_RUN:-0}"
 
 AGENT_FILE="$WORKSPACE/.opencode/agents/governance-monitor.md"
-SYNC_MECHANISM="/home/neotag/文档/CAT/CAT/.kiro/steering/steering-sync-mechanism.md"
-SYNC_SNAPSHOT="$WORKSPACE/.opencode/runtime/steering-sync-mechanism.md"
+SYNC_MECHANISM="$WORKSPACE/.kiro/steering/steering-sync-mechanism.md"
 SESSION_SNAPSHOT="$WORKSPACE/.opencode/runtime/governance-monitor-session"
 NODE_BIN="${GOV_MONITOR_NODE:-node}"
 
@@ -26,7 +26,7 @@ Environment:
   GOV_MONITOR_SESSION=ses_xxx              Continue a prior opencode session.
   GOV_MONITOR_MODE=full|session|diff       Run mode. Defaults to full.
   GOV_MONITOR_TITLE_PREFIX=GM              Title prefix for new sessions.
-  GOV_MONITOR_MODEL=provider/model         Override model. Defaults to configured GLM model.
+  GOV_MONITOR_MODEL=provider/model         Optional model override. Defaults to the host configuration.
   GOV_MONITOR_AGENT=name                   Override opencode agent. Defaults to governance-monitor.
   GOV_MONITOR_INTERACTIVE=1                Open interactive split-footer mode.
   GOV_MONITOR_DRY_RUN=1                    Print the command instead of running it.
@@ -50,6 +50,8 @@ for required in \
   "$WORKSPACE/.kiro/steering/governance-understanding.md" \
   "$WORKSPACE/.kiro/steering/governance-baseline.md" \
   "$WORKSPACE/.kiro/steering/evolution-risk-analysis.md" \
+  "$WORKSPACE/.kiro/steering/adr/README.md" \
+  "$WORKSPACE/.kiro/settings/rules/governance.md" \
   "$SYNC_MECHANISM"; do
   if [[ ! -f "$required" ]]; then
     echo "Missing required governance input: $required" >&2
@@ -57,8 +59,7 @@ for required in \
   fi
 done
 
-mkdir -p "$(dirname "$SYNC_SNAPSHOT")"
-cp "$SYNC_MECHANISM" "$SYNC_SNAPSHOT"
+mkdir -p "$(dirname "$SESSION_SNAPSHOT")"
 
 case "$MODE" in
   full|session|diff) ;;
@@ -160,15 +161,15 @@ fi
 
 EXTRA_PROMPT="${*:-}"
 MESSAGE="执行一次治理体系分支监控。
-- Governance-Monitor-Session-Key: $SESSION_KEY。
-- 运行模式：$MODE。
+- Governance-Monitor-Session-Key: ${SESSION_KEY}。
+- 运行模式：${MODE}。
 - 只监控治理体系分支。
-- 先读取固定输入，包括 .opencode/runtime/steering-sync-mechanism.md，再检查 git status 与治理文件变化。
+- 先读取固定输入，包括 ADR 索引、项目治理规则和 .kiro/steering/steering-sync-mechanism.md，再检查 git status 与治理文件变化。
 - 输出 governance todolist，不要直接修改文件。"
 
 if [[ "$MODE" == "session" ]]; then
   MESSAGE="$MESSAGE
-- 这是 session check：如果已续接上一轮 Governance Monitor 会话，优先使用已有上下文；只刷新同步机制快照、git 状态和用户指定对象。必要时再重读完整固定输入。"
+- 这是 session check：如果已续接上一轮 Governance Monitor 会话，优先使用已有上下文；只刷新当前治理规则、ADR 索引、同步机制、git 状态和用户指定对象。必要时再重读完整固定输入。"
 elif [[ "$MODE" == "diff" ]]; then
   MESSAGE="$MESSAGE
 - 这是 diff check：优先检查当前 git diff / 最近变更是否触发 Steering、ADR、Spec、Skill 边界风险。必要时再读取完整固定输入。"
@@ -187,10 +188,13 @@ fi
 cmd=(
   opencode run
   --dir "$WORKSPACE"
-  --model "$MODEL"
   --agent "$AGENT"
   --title "$(make_title "$EXTRA_PROMPT")"
 )
+
+if [[ -n "$MODEL" ]]; then
+  cmd+=(--model "$MODEL")
+fi
 
 if [[ -n "$SESSION" ]]; then
   cmd+=(--session "$SESSION")
@@ -203,8 +207,8 @@ fi
 cmd+=("$MESSAGE")
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  printf '%q ' "${cmd[@]}"
-  printf '\n'
+  printf 'Command arguments:\n'
+  printf '  %s\n' "${cmd[@]}"
   exit 0
 fi
 

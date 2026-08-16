@@ -37,6 +37,8 @@ GM-YYMMDD-<summary>
 
 The summary is derived from the extra prompt and kept short to avoid duplicate `Governance Monitor` titles.
 
-## Runtime Snapshots
+## Workspace and Model Resolution
 
-`.opencode/runtime/steering-sync-mechanism.md` is a runtime snapshot copied from the main LocalCAT workspace. It remains ignored by git because the main workspace owns that source document for now.
+The runner derives the workspace from its own tracked script with `git rev-parse --show-toplevel`. It reads `.kiro/steering/steering-sync-mechanism.md` from that same checkout and never copies a host-specific source snapshot.
+
+No model provider is pinned in the repository. The host's OpenCode configuration is used by default; `GOV_MONITOR_MODEL` is an explicit per-run override.

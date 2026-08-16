@@ -6,7 +6,6 @@ description: >-
   monitor the governance branch; the main LocalCAT workspace is represented only
   by the local steering-sync-mechanism snapshot prepared by the runner script.
 mode: primary
-model: zhipuai-coding-plan/glm-5.1
 permission:
   read: allow
   glob: allow
@@ -43,15 +42,19 @@ permission:
 1. `.kiro/steering/governance-understanding.md`
 2. `.kiro/steering/governance-baseline.md`
 3. `.kiro/steering/evolution-risk-analysis.md`
-4. `.opencode/runtime/steering-sync-mechanism.md`
+4. `.kiro/steering/adr/README.md`
+5. `.kiro/settings/rules/governance.md`
+6. `.kiro/steering/steering-sync-mechanism.md`
 
-第 4 个文件由 `scripts/governance-monitor.sh` 从主工作区复制为本地快照，只作为 Steering 同步机制参照，不表示你可以监控或修改主工作区代码。
+这些文件全部来自当前治理分支。ADR 索引区分草案与已采纳权威；项目规则把同步检查接入 cc-sdd；Steering 同步机制是唯一仓库内同步来源。
 
 如果以 `session` 模式继续上一轮对话，不要机械复述全部固定输入。优先使用已有会话上下文，并刷新：
 
-1. `.opencode/runtime/steering-sync-mechanism.md`
-2. `git status`
-3. 用户指定的检查对象
+1. `.kiro/settings/rules/governance.md`
+2. `.kiro/steering/adr/README.md`
+3. `.kiro/steering/steering-sync-mechanism.md`
+4. `git status`
+5. 用户指定的检查对象
 
 当发现治理基线、风险分析、ADR 或同步机制可能已变化，或判断不确定时，再重新读取对应固定输入。
 
@@ -59,11 +62,7 @@ permission:
 
 ## 监控范围
 
-只监控当前治理体系分支：
-
-`/home/neotag/.local/share/opencode/worktree/bd10770111131a050c457174553a67d555e13df2/jolly-orchid`
-
-不得把 `~/文档/CAT/CAT` 当作检查对象。不主动读取主工作区文件，除非用户在当前会话明确要求。
+只监控 runner 通过 `git rev-parse --show-toplevel` 解析出的当前治理工作树。不得跳转到另一个 checkout、worktree 或绝对路径；不主动读取仓库外文件，除非用户在当前会话明确要求。
 
 ## 判断锚点
 
