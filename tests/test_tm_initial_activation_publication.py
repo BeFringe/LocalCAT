@@ -12,15 +12,21 @@ from unittest.mock import patch
 
 from tm_contracts import (
     CanonicalResourceIdentity,
+    MigrationFailure,
     MigrationReport,
     SourceBindingState,
     TMMatchType,
     TMQuery,
     TMResourceHandle,
 )
-from tm_migration import MigrationPreflightError, TMMigrationService
+from tm_engine import TMEngine
+from tm_migration import TMMigrationService
 from tm_retrieval import TMRetrievalService
-from tm_sqlite_store import ResourceStoreCoordinator, SQLiteTMStore
+from tm_sqlite_store import (
+    ResourceStoreCoordinator,
+    SQLiteStoreSchemaError,
+    SQLiteTMStore,
+)
 
 
 SOURCE_BYTES = (
@@ -100,43 +106,29 @@ class InitialActivationPublicationTests(unittest.TestCase):
                     "publish_activation",
                     side_effect=publish_then_rebind,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
+            self.assertIs(type(outcome), MigrationFailure)
+            assert isinstance(outcome, MigrationFailure)
             self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RUNTIME_INVALID",
+                outcome.error_code,
+                "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
             )
+            self.assertFalse(outcome.canonical_authority_published)
+            self.assertTrue(outcome.canonical_authority_ambiguous)
+            self.assertIsNone(outcome.active_generation)
+            self.assertFalse(outcome.retryable)
+            self.assertEqual(outcome.recovery_locators, ())
             self.assertEqual(coordinator.current_generation, 0)
-            self.assertEqual(
-                coordinator.durable_activation_phase,
-                "GENERATION_PUBLISHED",
-            )
-            reopened = SQLiteTMStore.from_coordinator(coordinator)
-            health = reopened.health()
-            self.assertTrue(health.healthy)
-            self.assertTrue(health.exact_available)
-            self.assertFalse(health.context_available)
-            self.assertFalse(health.fuzzy_available)
-            self.assertEqual(health.generation, 0)
-            self.assertEqual(health.record_count, 3)
-            self.assertEqual(health.diagnostic_codes, ())
-            self.assertIsNotNone(health.snapshot_binding_digest)
-            self.assertIs(
-                health.source_binding_state,
-                SourceBindingState.VERIFIED_CURRENT,
-            )
-            self.assertEqual(
-                tuple(
-                    record.target_raw
-                    for record in reopened.exact_records("same")
-                ),
-                ("winner", "first"),
-            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "TM.CANONICAL_(?:ACTIVATION_AMBIGUOUS|RECOVERY_FAILED)",
+            ):
+                TMEngine(str(identity.configured_jsonl_path), update=False)
 
     def test_both_index_paths_publish_generation_zero_and_reopen_for_exact_query(
         self,
@@ -244,13 +236,17 @@ class InitialActivationPublicationTests(unittest.TestCase):
                         runtime_patch = patch.object(
                             SQLiteTMStore,
                             "from_coordinator",
-                            side_effect=RuntimeError("forced reopen failure"),
+                            side_effect=SQLiteStoreSchemaError(
+                                "STORE.FORCED_REOPEN_FAILURE"
+                            ),
                         )
                     else:
                         runtime_patch = patch.object(
                             SQLiteTMStore,
                             "health",
-                            side_effect=RuntimeError("forced health failure"),
+                            side_effect=SQLiteStoreSchemaError(
+                                "STORE.FORCED_HEALTH_FAILURE"
+                            ),
                         )
                     with (
                         patch(
@@ -258,17 +254,23 @@ class InitialActivationPublicationTests(unittest.TestCase):
                             return_value=False,
                         ),
                         runtime_patch,
-                        self.assertRaises(MigrationPreflightError) as raised,
                     ):
-                        service.activate_initial(
+                        outcome = service.activate_initial(
                             identity.configured_jsonl_path,
                             identity.resource_id,
                         )
 
+                    self.assertIs(type(outcome), MigrationFailure)
+                    assert isinstance(outcome, MigrationFailure)
                     self.assertEqual(
-                        raised.exception.error_code,
-                        "MIGRATION.INITIAL_RUNTIME_REOPEN_FAILED",
+                        outcome.error_code,
+                        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
                     )
+                    self.assertTrue(outcome.canonical_authority_published)
+                    self.assertFalse(outcome.canonical_authority_ambiguous)
+                    self.assertEqual(outcome.active_generation, 0)
+                    self.assertFalse(outcome.retryable)
+                    self.assertEqual(outcome.recovery_locators, ())
                     self.assertEqual(coordinator.current_generation, 0)
                     self.assertEqual(
                         coordinator.durable_activation_phase,
@@ -296,17 +298,15 @@ class InitialActivationPublicationTests(unittest.TestCase):
                     "publish_activation",
                     side_effect=publish_with_false_return,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RUNTIME_INVALID",
-            )
+            self.assertIs(type(outcome), MigrationReport)
+            assert isinstance(outcome, MigrationReport)
+            self.assertEqual(outcome.activated_generation, 0)
             self.assertEqual(coordinator.current_generation, 0)
             self.assertEqual(
                 coordinator.durable_activation_phase,

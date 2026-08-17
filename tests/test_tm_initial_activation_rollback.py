@@ -109,6 +109,25 @@ def _assert_legacy_safe(
     testcase.assertNotIn("sensitive", rendered)
 
 
+def _assert_authority_unavailable(
+    testcase: unittest.TestCase,
+    outcome: object,
+) -> MigrationFailure:
+    testcase.assertIs(type(outcome), MigrationFailure)
+    failure = outcome
+    assert isinstance(failure, MigrationFailure)
+    testcase.assertEqual(
+        failure.error_code,
+        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
+    )
+    testcase.assertFalse(failure.retryable)
+    testcase.assertFalse(failure.canonical_authority_published)
+    testcase.assertTrue(failure.canonical_authority_ambiguous)
+    testcase.assertIsNone(failure.active_generation)
+    testcase.assertEqual(failure.recovery_locators, ())
+    return failure
+
+
 class InitialActivationRollbackTests(unittest.TestCase):
     def test_linux_exclusive_move_uses_renameat2_noreplace_flag(self) -> None:
         renameat2 = Mock(return_value=0)
@@ -170,9 +189,8 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "_exclusive_initial_quarantine_move",
                     side_effect=substitute_before_quarantine,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
@@ -181,10 +199,7 @@ class InitialActivationRollbackTests(unittest.TestCase):
             self.assertTrue(all(path.exists() for path in moved_owned))
             self.assertTrue(quarantined_foreign)
             self.assertEqual(quarantined_foreign[0].read_bytes(), foreign_payload)
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
             self.assertEqual(
                 identity.configured_jsonl_path.read_bytes(),
                 SOURCE_BYTES,
@@ -226,17 +241,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "_exclusive_initial_quarantine_move",
                     side_effect=occupy_target_before_move,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
             self.assertTrue(raced_targets)
             self.assertEqual(raced_targets[0].read_bytes(), foreign_payload)
             self.assertEqual(identity.configured_jsonl_path.read_bytes(), SOURCE_BYTES)
@@ -270,17 +281,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "_build_stage",
                     side_effect=leave_attempt_asset,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
             self.assertEqual(len(residue), 1)
             self.assertEqual(residue[0].read_bytes(), b"foreign attempt residue")
             self.assertEqual(identity.configured_jsonl_path.read_bytes(), SOURCE_BYTES)
@@ -350,17 +357,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "rollback_durable_activation",
                     side_effect=rollback_then_tamper,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
             self.assertEqual(terminal.read_bytes(), b"tampered terminal")
             with self.assertRaisesRegex(
                 ValueError,
@@ -403,17 +406,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "rollback_durable_activation",
                     side_effect=rollback_then_tamper,
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
             self.assertEqual(len(tampered), 1)
             self.assertEqual(len(displaced), 1)
             self.assertTrue(displaced[0].is_file())
@@ -638,17 +637,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                         retryable=True,
                     ),
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
-            self.assertNotIn("sensitive", str(raised.exception))
+            failure = _assert_authority_unavailable(self, outcome)
+            self.assertNotIn("sensitive", repr(failure))
 
     def test_unprovable_stage_cleanup_never_returns_legacy_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -665,16 +660,12 @@ class InitialActivationRollbackTests(unittest.TestCase):
                         "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
                     ),
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
+            _assert_authority_unavailable(self, outcome)
 
     def test_ambiguous_existing_terminal_never_returns_legacy_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -689,17 +680,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     "_seal_stage",
                     side_effect=StageSealError("SEALER.STAGE_INVALID"),
                 ),
-                self.assertRaises(MigrationPreflightError) as raised,
             ):
-                service.activate_initial(
+                outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
-            self.assertEqual(
-                raised.exception.error_code,
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED",
-            )
-            self.assertNotIn("sensitive", str(raised.exception))
+            failure = _assert_authority_unavailable(self, outcome)
+            self.assertNotIn("sensitive", repr(failure))
 
     def test_public_signature_accepts_no_cancellation_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -3271,7 +3271,22 @@ class MigrationReport:
 
 @dataclass(frozen=True)
 class MigrationFailure:
-    """Fail-stop migration result with explicit asset preservation facts."""
+    """Fail-stop migration result with explicit authority/preservation facts.
+
+    ``canonical_authority_published`` means Core has re-proved a durable
+    canonical publication, but a later runtime/health projection could not
+    be made available to the caller.  ``canonical_authority_ambiguous``
+    means durable facts could not prove either legacy authority or one
+    canonical publication.  Both states forbid retry/rollback locators and
+    therefore forbid callers from treating the result as legacy-safe.  The
+    flags are mutually exclusive and default to False so legacy payloads and
+    existing update failures retain their original contract.
+
+    ``active_store_preservation`` describes a *prior* active store.  It may
+    remain NOT_APPLICABLE for a first activation even when one of the flags
+    says a new canonical candidate was published or may exist; the flags are
+    the explicit prohibition against inferring candidate absence.
+    """
 
     stage: str
     error_code: str
@@ -3281,6 +3296,8 @@ class MigrationFailure:
     original_source_preservation: AssetPreservationEvidence
     active_store_preservation: AssetPreservationEvidence
     recovery_locators: tuple[RecoveryLocator, ...]
+    canonical_authority_published: bool = False
+    canonical_authority_ambiguous: bool = False
 
     def __post_init__(self) -> None:
         _require_diagnostic_identifier(self.stage, "migration failure stage")
@@ -3289,6 +3306,33 @@ class MigrationFailure:
             "migration failure error code",
         )
         _require_bool(self.retryable, "migration failure retryable")
+        _require_bool(
+            self.canonical_authority_published,
+            "migration canonical authority published",
+        )
+        _require_bool(
+            self.canonical_authority_ambiguous,
+            "migration canonical authority ambiguous",
+        )
+        if (
+            self.canonical_authority_published
+            and self.canonical_authority_ambiguous
+        ):
+            raise ValueError(
+                "migration canonical authority state is contradictory"
+            )
+        authority_state_count = int(self.canonical_authority_published) + int(
+            self.canonical_authority_ambiguous
+        )
+        if self.error_code == "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE":
+            if self.stage != "RECOVERY" or authority_state_count != 1:
+                raise ValueError(
+                    "migration unavailable authority state is not closed"
+                )
+        elif authority_state_count:
+            raise ValueError(
+                "migration authority flags require the unavailable outcome"
+            )
         _require_migration_diagnostics(self.diagnostics)
         if self.active_generation is not None:
             _require_int(
@@ -3345,9 +3389,24 @@ class MigrationFailure:
             self.active_generation is not None
             and self.active_store_preservation.state
             is AssetPreservationState.NOT_APPLICABLE
+            and not self.canonical_authority_published
         ):
             raise ValueError(
                 "existing generation requires active store preservation"
+            )
+        if (
+            self.canonical_authority_published
+            and self.active_generation is None
+        ):
+            raise ValueError(
+                "published canonical authority requires its generation"
+            )
+        if (
+            self.canonical_authority_ambiguous
+            and self.active_generation is not None
+        ):
+            raise ValueError(
+                "ambiguous canonical authority cannot claim a generation"
             )
         _validate_preservation_and_recovery(
             evidence=(
@@ -3357,6 +3416,10 @@ class MigrationFailure:
             recovery_locators=self.recovery_locators,
             retryable=self.retryable,
             field_name="migration preservation evidence",
+            publication_committed=self.canonical_authority_published,
+            publication_commit_ambiguous=(
+                self.canonical_authority_ambiguous
+            ),
         )
 
 
@@ -5536,7 +5599,7 @@ def _encode_migration_report(report: MigrationReport) -> dict[str, Any]:
 def _encode_migration_failure(
     failure: MigrationFailure,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "active_generation": failure.active_generation,
         "active_store_preservation": (
             _encode_asset_preservation_evidence(
@@ -5560,6 +5623,17 @@ def _encode_migration_failure(
         "retryable": failure.retryable,
         "stage": failure.stage,
     }
+    if (
+        failure.canonical_authority_published
+        or failure.canonical_authority_ambiguous
+    ):
+        payload["canonical_authority_ambiguous"] = (
+            failure.canonical_authority_ambiguous
+        )
+        payload["canonical_authority_published"] = (
+            failure.canonical_authority_published
+        )
+    return payload
 
 
 def _encode_export_report(report: ExportReport) -> dict[str, Any]:
@@ -6637,6 +6711,21 @@ def _decode_migration_report(value: object) -> MigrationReport:
 
 
 def _decode_migration_failure(value: object) -> MigrationFailure:
+    mapping = _as_mapping(value, "MigrationFailure payload")
+    published_present = "canonical_authority_published" in mapping
+    ambiguous_present = "canonical_authority_ambiguous" in mapping
+    if published_present != ambiguous_present:
+        raise ValueError(
+            "migration authority fields must be present as one pair"
+        )
+    present_optional = (
+        (
+            "canonical_authority_published",
+            "canonical_authority_ambiguous",
+        )
+        if published_present
+        else ()
+    )
     payload = _strict_fields(
         value,
         "MigrationFailure payload",
@@ -6649,8 +6738,17 @@ def _decode_migration_failure(value: object) -> MigrationFailure:
             "recovery_locators",
             "retryable",
             "stage",
-        ),
+        )
+        + present_optional,
     )
+    if (
+        published_present
+        and payload["canonical_authority_published"] is False
+        and payload["canonical_authority_ambiguous"] is False
+    ):
+        raise ValueError(
+            "present migration authority fields require one state"
+        )
     return MigrationFailure(
         stage=payload["stage"],
         error_code=payload["error_code"],
@@ -6667,6 +6765,14 @@ def _decode_migration_failure(value: object) -> MigrationFailure:
         ),
         recovery_locators=_decode_recovery_locators(
             payload["recovery_locators"]
+        ),
+        canonical_authority_published=payload.get(
+            "canonical_authority_published",
+            False,
+        ),
+        canonical_authority_ambiguous=payload.get(
+            "canonical_authority_ambiguous",
+            False,
         ),
     )
 
@@ -7754,9 +7860,30 @@ def contract_from_json(serialized: str) -> TMContract:
     def reject_non_finite(value: str) -> None:
         raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
+    class DuplicateJSONObjectKeyError(ValueError):
+        pass
+
+    def reject_duplicate_object(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        decoded: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in decoded:
+                raise DuplicateJSONObjectKeyError
+            decoded[key] = item
+        return decoded
+
     try:
-        value = json.loads(serialized, parse_constant=reject_non_finite)
-    except (json.JSONDecodeError, TypeError):
+        value = json.loads(
+            serialized,
+            parse_constant=reject_non_finite,
+            object_pairs_hook=reject_duplicate_object,
+        )
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        DuplicateJSONObjectKeyError,
+    ):
         raise ValueError("serialized contract is not valid JSON") from None
     envelope = _strict_fields(
         value,

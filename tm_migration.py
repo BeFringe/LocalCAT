@@ -94,7 +94,7 @@ from tm_sqlite_store import (
     unique_character_ngrams,
     validate_candidate_proof_index,
 )
-from tm_stage_sealer import StageSealer
+from tm_stage_sealer import StageSealError, StageSealer
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
 
@@ -288,6 +288,32 @@ class MigrationPreflightError(RuntimeError):
             raise TypeError("error_code must be a built-in string")
         self.error_code = error_code
         super().__init__(error_code)
+
+
+def _is_initial_activation_operational_error(error: Exception) -> bool:
+    """Return whether one exception is a safe initial-activation failure.
+
+    The list is deliberately closed.  Programmer failures such as
+    AssertionError, AttributeError, and TypeError must cross the public
+    seam unchanged instead of being mislabeled as resource unavailability.
+    Durable parsers/coordinators are responsible for translating corrupt
+    bytes and facts into these code-only exception families first.
+    """
+
+    return isinstance(
+        error,
+        (
+            MigrationPreflightError,
+            ActivationPreparationError,
+            RecoveryError,
+            snapshot_artifacts_module.ExportPreflightError,
+            SQLiteStoreSchemaError,
+            StageSealError,
+            OSError,
+            sqlite3.Error,
+            UnicodeError,
+        ),
+    )
 
 
 ExportPreflightError = snapshot_artifacts_module.ExportPreflightError
@@ -1000,6 +1026,18 @@ class TMMigrationService:
         if source_before is None:
             raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
 
+        # A fresh application facade may be constructed over durable facts
+        # left by a prior process after the publication linearization point.
+        # Reconcile those facts before preflight's intentional sidecar-reuse
+        # rejection and, critically, before allocating another stage/token.
+        recovered_initial = self._recover_existing_initial_activation(
+            coordinator=coordinator,
+            source=source,
+            source_before=source_before,
+        )
+        if recovered_initial is not None:
+            return recovered_initial
+
         preflight: MigrationPreflight | None = None
         build: MigrationStageBuild | None = None
         mutable_stage: MutableStageRef | None = None
@@ -1088,35 +1126,388 @@ class TMMigrationService:
                 generation=generation,
             )
         except Exception as error:
-            failure = self._reconcile_initial_activation_failure(
-                error,
-                stage_label=stage_label,
-                source_before=source_before,
-                preflight=preflight,
-                attempt=attempt,
-                prepared=prepared,
-                coordinator=coordinator,
-            )
+            if not _is_initial_activation_operational_error(error):
+                raise
+            try:
+                failure = self._reconcile_initial_activation_failure(
+                    error,
+                    stage_label=stage_label,
+                    source_before=source_before,
+                    preflight=preflight,
+                    attempt=attempt,
+                    prepared=prepared,
+                    coordinator=coordinator,
+                )
+            except Exception as reconciliation_error:
+                if not _is_initial_activation_operational_error(
+                    reconciliation_error
+                ):
+                    raise
+                return self._initial_authority_unavailable_failure(
+                    source_before=source_before,
+                    preflight=preflight,
+                    published_generation=None,
+                )
             if failure is not None:
                 return failure
-            # Task 2.4 owns published-tail recovery and ambiguous durable
-            # facts.  Preserve already-frozen safe codes where available;
-            # unknown exception text is never allowed to cross the Core
-            # boundary while this operation remains fail-stopped.
-            if isinstance(
-                error,
-                (
-                    MigrationPreflightError,
-                    ActivationPreparationError,
-                ),
-            ):
+            return self._recover_published_initial_tail(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=preflight,
+                sealed=sealed,
+            )
+
+    def _recover_existing_initial_activation(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source: Path,
+        source_before: str,
+    ) -> MigrationOutcome | None:
+        """Reconcile durable first-activation facts before any new build.
+
+        ``None`` is the only clean no-facts result.  A completed generation
+        is re-proved and projected as the same MigrationReport; a proven
+        cancellation/rollback returns a retryable legacy-safe failure; any
+        unreadable or contradictory fact becomes a frozen unavailable
+        failure and never falls through to JSONL activation/query behavior.
+        """
+
+        try:
+            recovery_probe = ResourceStoreCoordinator(
+                canonical_store_id=self._canonical_store_id,
+                resource_identity=self._resource_identity,
+            )
+            recovered = recovery_probe.recover_durable_activation()
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
                 raise
-            error_code = getattr(error, "error_code", None)
-            if type(error_code) is str and error_code:
-                raise MigrationPreflightError(error_code) from error
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=None,
+                published_generation=None,
+            )
+        if recovered is None:
+            return None
+        try:
+            preflight = _scan_jsonl(source)
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=None,
+                published_generation=(
+                    recovered.generation
+                    if recovered.action == "COMPLETED"
+                    else None
+                ),
+            )
+        if preflight.source_digest != source_before:
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=(
+                    recovered.generation
+                    if recovered.action == "COMPLETED"
+                    else None
+                ),
+            )
+        if recovered.action == "COMPLETED":
+            generation = recovered.generation
+            if generation != 0:
+                raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
+            try:
+                probed_report = self._recovered_initial_success_report(
+                    coordinator=recovery_probe,
+                    preflight=preflight,
+                    generation=generation,
+                )
+                live_recovered = coordinator.recover_durable_activation()
+                if (
+                    live_recovered is None
+                    or live_recovered.action != "COMPLETED"
+                    or live_recovered.generation != generation
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RUNTIME_INVALID"
+                    )
+                live_report = self._recovered_initial_success_report(
+                    coordinator=coordinator,
+                    preflight=preflight,
+                    generation=generation,
+                )
+                if live_report != probed_report:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RUNTIME_INVALID"
+                    )
+                return live_report
+            except Exception as error:
+                if not _is_initial_activation_operational_error(error):
+                    raise
+                return self._initial_authority_unavailable_failure(
+                    source_before=source_before,
+                    preflight=preflight,
+                    published_generation=generation,
+                )
+        if (
+            recovered.action not in {"CANCELLED", "ROLLED_BACK"}
+            or recovered.generation is not None
+        ):
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        try:
+            _require_proven_initial_legacy_state(
+                coordinator=recovery_probe,
+                source_digest=source_before,
+                attempt=None,
+                activation_retired_attempt=True,
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        return MigrationFailure(
+            stage="RECOVERY",
+            error_code=(
+                "MIGRATION.INITIAL_RECOVERED_CANCELLED"
+                if recovered.action == "CANCELLED"
+                else "MIGRATION.INITIAL_RECOVERED_ROLLBACK"
+            ),
+            retryable=True,
+            diagnostics=preflight.diagnostics,
+            active_generation=None,
+            original_source_preservation=_unchanged_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            ),
+            active_store_preservation=AssetPreservationEvidence(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                state=AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            recovery_locators=(),
+        )
+
+    def _recover_published_initial_tail(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+        preflight: MigrationPreflight | None,
+        sealed: SealedStage | None,
+    ) -> MigrationOutcome:
+        """Cold-recover one published tail and adopt exactly generation 0."""
+
+        if preflight is None or sealed is None:
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        try:
+            recovered_coordinator = ResourceStoreCoordinator(
+                canonical_store_id=self._canonical_store_id,
+                resource_identity=self._resource_identity,
+            )
+            recovered = recovered_coordinator.recover_durable_activation()
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        if (
+            recovered is None
+            or recovered.action != "COMPLETED"
+            or recovered.generation != 0
+        ):
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        generation = recovered.generation
+        try:
+            self._verify_initial_activation_runtime(
+                coordinator=recovered_coordinator,
+                preflight=preflight,
+                sealed=sealed,
+                generation=generation,
+            )
+            if coordinator.state == "ACTIVATING":
+                coordinator.adopt_recovered_authority(
+                    recovered_coordinator
+                )
+            elif not (
+                coordinator.state == "READY"
+                and coordinator.current_generation == generation
+                and coordinator.active_store_path
+                == self._resource_identity.canonical_sidecar_path
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_RUNTIME_INVALID"
+                )
+            self._verify_initial_activation_runtime(
+                coordinator=coordinator,
+                preflight=preflight,
+                sealed=sealed,
+                generation=generation,
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=generation,
+            )
+        return self._success_report(
+            preflight=preflight,
+            sealed=sealed,
+            canonical_store_id=self._canonical_store_id,
+            generation=generation,
+        )
+
+    def _recovered_initial_success_report(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        preflight: MigrationPreflight,
+        generation: int,
+    ) -> MigrationReport:
+        """Project a cold-recovered binding without rebuilding a stage."""
+
+        try:
+            manifest_payload = self._resource_identity.snapshot_manifest_path.read_text(
+                encoding="utf-8"
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
             raise MigrationPreflightError(
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
             ) from error
+        try:
+            decoded = contract_from_json(manifest_payload)
+        except ValueError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            ) from error
+        if type(decoded) is not SnapshotManifest:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            )
+        manifest = decoded
+        try:
+            binding = SnapshotBinding(
+                configured_jsonl_path=(
+                    self._resource_identity.configured_jsonl_path
+                ),
+                manifest_path=self._resource_identity.snapshot_manifest_path,
+                snapshot_kind=manifest.snapshot_kind,
+                receipt=manifest.receipt,
+                manifest=manifest,
+            )
+        except ValueError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            ) from error
+        receipt = binding.receipt
+        if (
+            binding.snapshot_kind is not SnapshotKind.MIGRATION_SOURCE
+            or receipt.resource_id != self._resource_identity.resource_id
+            or receipt.canonical_store_id != self._canonical_store_id
+            or receipt.jsonl_digest != preflight.source_digest
+            or receipt.record_count != preflight.valid_count
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            )
+        self._verify_initial_runtime_binding(
+            coordinator=coordinator,
+            preflight=preflight,
+            receipt=receipt,
+            expected_binding_digest=_sealed_source_binding_digest(binding),
+            generation=generation,
+        )
+        return MigrationReport(
+            resource_id=self._resource_identity.resource_id,
+            canonical_store_id=self._canonical_store_id,
+            source_digest=preflight.source_digest,
+            snapshot_receipt=receipt,
+            migrated_count=preflight.valid_count,
+            variant_count=preflight.variant_count,
+            skipped_count=preflight.invalid_count,
+            diagnostics=preflight.diagnostics,
+            activated_generation=generation,
+            canonical_exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+        )
+
+    def _initial_authority_unavailable_failure(
+        self,
+        *,
+        source_before: str,
+        preflight: MigrationPreflight | None,
+        published_generation: int | None,
+    ) -> MigrationFailure:
+        """Build one code-only outcome that explicitly forbids legacy use."""
+
+        observed = _try_file_digest(
+            self._resource_identity.configured_jsonl_path
+        )
+        if observed is None:
+            source_evidence = AssetPreservationEvidence(
+                asset_kind=AssetKind.ORIGINAL_SOURCE,
+                state=AssetPreservationState.UNVERIFIED,
+                before_digest=source_before,
+                observed_digest=None,
+            )
+        elif observed == source_before:
+            source_evidence = _unchanged_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            )
+        else:
+            source_evidence = AssetPreservationEvidence(
+                asset_kind=AssetKind.ORIGINAL_SOURCE,
+                state=AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=source_before,
+                observed_digest=observed,
+            )
+        return MigrationFailure(
+            stage="RECOVERY",
+            error_code="MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
+            retryable=False,
+            diagnostics=(() if preflight is None else preflight.diagnostics),
+            active_generation=published_generation,
+            original_source_preservation=source_evidence,
+            active_store_preservation=AssetPreservationEvidence(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                state=AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            recovery_locators=(),
+            canonical_authority_published=(
+                published_generation is not None
+            ),
+            canonical_authority_ambiguous=(
+                published_generation is None
+            ),
+        )
 
     def _reconcile_initial_activation_failure(
         self,
@@ -1142,6 +1533,10 @@ class TMMigrationService:
         try:
             durable_phase = coordinator.durable_activation_phase
         except Exception as reconciliation_error:
+            if not _is_initial_activation_operational_error(
+                reconciliation_error
+            ):
+                raise
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_RECOVERY_REQUIRED"
             ) from reconciliation_error
@@ -1156,6 +1551,10 @@ class TMMigrationService:
                 try:
                     coordinator.cancel_prepared_activation(prepared)
                 except Exception as reconciliation_error:
+                    if not _is_initial_activation_operational_error(
+                        reconciliation_error
+                    ):
+                        raise
                     raise MigrationPreflightError(
                         "MIGRATION.INITIAL_RECOVERY_REQUIRED"
                     ) from reconciliation_error
@@ -1168,6 +1567,10 @@ class TMMigrationService:
                 try:
                     cancelled = coordinator.rollback_durable_activation()
                 except Exception as reconciliation_error:
+                    if not _is_initial_activation_operational_error(
+                        reconciliation_error
+                    ):
+                        raise
                     raise MigrationPreflightError(
                         "MIGRATION.INITIAL_RECOVERY_REQUIRED"
                     ) from reconciliation_error
@@ -1189,6 +1592,10 @@ class TMMigrationService:
                 try:
                     cancelled = coordinator.rollback_durable_activation()
                 except Exception as reconciliation_error:
+                    if not _is_initial_activation_operational_error(
+                        reconciliation_error
+                    ):
+                        raise
                     raise MigrationPreflightError(
                         "MIGRATION.INITIAL_RECOVERY_REQUIRED"
                     ) from reconciliation_error
@@ -1208,6 +1615,10 @@ class TMMigrationService:
             try:
                 rollback = coordinator.rollback_durable_activation()
             except Exception as reconciliation_error:
+                if not _is_initial_activation_operational_error(
+                    reconciliation_error
+                ):
+                    raise
                 raise MigrationPreflightError(
                     "MIGRATION.INITIAL_RECOVERY_REQUIRED"
                 ) from reconciliation_error
@@ -1235,6 +1646,10 @@ class TMMigrationService:
                 activation_retired_attempt=durable_or_cancelled_attempt,
             )
         except Exception as reconciliation_error:
+            if not _is_initial_activation_operational_error(
+                reconciliation_error
+            ):
+                raise
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_RECOVERY_REQUIRED"
             ) from reconciliation_error
@@ -1283,6 +1698,25 @@ class TMMigrationService:
         expected_binding_digest = _sealed_source_binding_digest(
             sealed.evidence.source_binding
         )
+        self._verify_initial_runtime_binding(
+            coordinator=coordinator,
+            preflight=preflight,
+            receipt=receipt,
+            expected_binding_digest=expected_binding_digest,
+            generation=generation,
+        )
+
+    def _verify_initial_runtime_binding(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        preflight: MigrationPreflight,
+        receipt: SnapshotReceipt,
+        expected_binding_digest: str,
+        generation: int,
+    ) -> None:
+        """Re-prove one generation-zero runtime against one frozen binding."""
+
         if (
             type(generation) is not int
             or generation != 0
@@ -1313,6 +1747,8 @@ class TMMigrationService:
         except MigrationPreflightError:
             raise
         except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_RUNTIME_REOPEN_FAILED"
             ) from error
@@ -4465,6 +4901,8 @@ def _freeze_initial_stage_attempt(
     except MigrationPreflightError:
         raise
     except Exception as error:
+        if not _is_initial_activation_operational_error(error):
+            raise
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
         ) from error
@@ -4688,6 +5126,8 @@ def _cleanup_initial_unpublished_stage(
     except MigrationPreflightError:
         raise
     except Exception as error:
+        if not _is_initial_activation_operational_error(error):
+            raise
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
         ) from error
@@ -4718,6 +5158,8 @@ def _require_proven_initial_legacy_state(
         )
         recovered = fresh.rehydrate_runtime_authority()
     except Exception as error:
+        if not _is_initial_activation_operational_error(error):
+            raise
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
         ) from error
@@ -4787,6 +5229,8 @@ def _require_proven_initial_legacy_state(
         except MigrationPreflightError:
             raise
         except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
             ) from error
