@@ -921,6 +921,68 @@ class TMMigrationService:
             reused_completed_revision=None,
         )
 
+    def activate_initial(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationOutcome:
+        """Publish the first canonical generation for one configured resource.
+
+        This is the sole application-facing first-activation seam.  It
+        accepts only the service's exact configured JSONL/resource identity
+        and the exact unactivated coordinator injected at construction.
+        Mutable/sealed stages, the sealed registry, activation preparation,
+        journal handle, and capability token remain inside Core.
+        """
+
+        coordinator = self._coordinator
+        if type(resource_id) is not str or not resource_id.strip():
+            raise MigrationPreflightError("MIGRATION.RESOURCE_ID_INVALID")
+        if resource_id != self._resource_identity.resource_id:
+            raise MigrationPreflightError(
+                "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
+            )
+        if coordinator is None:
+            raise MigrationPreflightError(
+                "MIGRATION.COORDINATOR_UNAVAILABLE"
+            )
+        if (
+            coordinator._resource_identity != self._resource_identity
+            or coordinator.resource_id != resource_id
+            or coordinator.canonical_store_id != self._canonical_store_id
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.COORDINATOR_IDENTITY_MISMATCH"
+            )
+        if (
+            coordinator.current_generation is not None
+            or coordinator.active_store_path is not None
+        ):
+            raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
+        if coordinator.state != "READY":
+            raise MigrationPreflightError("MIGRATION.ACTIVATION_NOT_READY")
+
+        build = self.build_mutable_stage(source)
+        mutable_stage = build.mutable_stage
+        if mutable_stage is None:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
+            )
+        sealed = coordinator._seal_stage(
+            mutable_stage,
+            canonical_store_id=self._canonical_store_id,
+            expected_prior_generation=None,
+        )
+        prepared = coordinator.activate(sealed)
+        handle = coordinator.publish_prepared_activation(prepared)
+        generation = coordinator.publish_activation(prepared, handle)
+        return self._success_report(
+            preflight=build.preflight,
+            sealed=sealed,
+            canonical_store_id=self._canonical_store_id,
+            generation=generation,
+        )
+
     def export_jsonl(
         self,
         store: SQLiteTMStore,

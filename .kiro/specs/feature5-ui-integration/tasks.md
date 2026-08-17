@@ -31,7 +31,7 @@
 
 - [ ] 2. 补齐 Feature 5 Requirement 2 的首次激活公开合同
 
-- [ ] 2.1 冻结首次激活入口、身份前置与私有边界
+- [x] 2.1 冻结首次激活入口、身份前置与私有边界
   - 提供唯一 application-facing 首次激活入口，精确绑定 configured source、resource identity 与 Core-owned coordinator
   - 只接受没有 active generation 的首次激活；already-active、foreign identity 或无效前置返回稳定结果并保持零修改
   - private registry、mutable/sealed stage、prepared activation 与 capability token 不得暴露给 application、Controller 或 Qt
@@ -346,6 +346,8 @@
   - _Boundary: Feature GO and Cross-Spec Revalidation_
 
 ## Implementation Notes
+
+- Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
 - 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
