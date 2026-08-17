@@ -14,6 +14,7 @@ from editor_contracts import (
     DisplayPreferences,
     RecentProject,
     SegmentDensity,
+    TMPreferences,
     WorkspaceMode,
 )
 
@@ -39,9 +40,14 @@ class WorkspaceStateRepository:
             raise WorkspaceStateError(f"unable to prepare workspace directory: {exc}") from exc
         self._recent: tuple[RecentProject, ...] = ()
         self._preferences = DisplayPreferences()
+        self._tm_preferences = TMPreferences()
         if self.state_path.exists():
             try:
-                self._recent, self._preferences = self._read_state()
+                (
+                    self._recent,
+                    self._preferences,
+                    self._tm_preferences,
+                ) = self._read_state()
             except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 LOGGER.warning("Ignoring invalid workspace state: %s", exc)
 
@@ -68,7 +74,7 @@ class WorkspaceStateRepository:
             remembered,
             *(item for item in self._recent if item.path != remembered.path),
         )[:MAX_RECENT_PROJECTS]
-        self._write_state(updated, self._preferences)
+        self._write_state(updated, self._preferences, self._tm_preferences)
         self._recent = updated
         return remembered
 
@@ -79,7 +85,7 @@ class WorkspaceStateRepository:
         updated = tuple(item for item in self._recent if item.path != normalized)
         if updated == self._recent:
             return
-        self._write_state(updated, self._preferences)
+        self._write_state(updated, self._preferences, self._tm_preferences)
         self._recent = updated
 
     def display_preferences(self) -> DisplayPreferences:
@@ -95,11 +101,34 @@ class WorkspaceStateRepository:
 
         if not isinstance(preferences, DisplayPreferences):
             raise WorkspaceStateError("display preferences contract is required")
-        self._write_state(self._recent, preferences)
+        self._write_state(self._recent, preferences, self._tm_preferences)
         self._preferences = preferences
         return preferences
 
-    def _read_state(self) -> tuple[tuple[RecentProject, ...], DisplayPreferences]:
+    def tm_preferences(self) -> TMPreferences:
+        """Return persisted device-local TM query preferences."""
+
+        return self._tm_preferences
+
+    def update_tm_preferences(self, preferences: TMPreferences) -> TMPreferences:
+        """Validate and atomically persist device-local TM query preferences."""
+
+        if type(preferences) is not TMPreferences:
+            raise WorkspaceStateError("TM preferences contract is required")
+        try:
+            validated = TMPreferences(
+                minimum_similarity=preferences.minimum_similarity,
+                result_limit=preferences.result_limit,
+            )
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceStateError(f"invalid TM preferences: {exc}") from exc
+        self._write_state(self._recent, self._preferences, validated)
+        self._tm_preferences = validated
+        return validated
+
+    def _read_state(
+        self,
+    ) -> tuple[tuple[RecentProject, ...], DisplayPreferences, TMPreferences]:
         payload = cast(object, json.loads(self.state_path.read_text(encoding="utf-8")))
         if not isinstance(payload, dict):
             raise ValueError("workspace state root must be an object")
@@ -175,12 +204,37 @@ class WorkspaceStateRepository:
                     workspace_mode=workspace_mode,
                     editor_font_size=editor_font_size,
                 )
-        return tuple(recent[:MAX_RECENT_PROJECTS]), preferences
+
+        tm_preferences = TMPreferences()
+        raw_tm_preferences = mapping.get("tm_preferences")
+        if raw_tm_preferences is not None:
+            if not isinstance(raw_tm_preferences, dict):
+                LOGGER.warning("Using default TM preferences from invalid workspace state")
+            else:
+                tm_mapping = cast(dict[str, object], raw_tm_preferences)
+                try:
+                    tm_preferences = TMPreferences(
+                        minimum_similarity=cast(
+                            float,
+                            tm_mapping.get("minimum_similarity", 0.60),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    LOGGER.warning(
+                        "Using default TM preferences from invalid workspace state"
+                    )
+
+        return (
+            tuple(recent[:MAX_RECENT_PROJECTS]),
+            preferences,
+            tm_preferences,
+        )
 
     def _write_state(
         self,
         recent: tuple[RecentProject, ...],
         preferences: DisplayPreferences,
+        tm_preferences: TMPreferences,
     ) -> None:
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -196,6 +250,9 @@ class WorkspaceStateRepository:
                 "segment_density": preferences.segment_density.value,
                 "workspace_mode": preferences.workspace_mode.value,
                 "editor_font_size": preferences.editor_font_size,
+            },
+            "tm_preferences": {
+                "minimum_similarity": tm_preferences.minimum_similarity,
             },
         }
         temp_path: Path | None = None

@@ -203,6 +203,28 @@ class DisplayPreferences:
 
 
 @dataclass(frozen=True)
+class TMPreferences:
+    """Device-local TM query preferences shared across projects."""
+
+    minimum_similarity: float = 0.60
+    result_limit: int = 10
+
+    def __post_init__(self) -> None:
+        if type(self.minimum_similarity) is not float:
+            raise TypeError("TM minimum similarity must be an exact float")
+        if not math.isfinite(self.minimum_similarity) or not (
+            0.60 <= self.minimum_similarity <= 1.00
+        ):
+            raise ValueError(
+                "TM minimum similarity must be finite and between 0.60 and 1.00"
+            )
+        if type(self.result_limit) is not int:
+            raise TypeError("TM result limit must be an exact integer")
+        if self.result_limit != 10:
+            raise ValueError("TM result limit must be fixed at 10")
+
+
+@dataclass(frozen=True)
 class EditorSegment:
     """One editable bilingual segment."""
 
