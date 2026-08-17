@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -10,8 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 from types import MappingProxyType
-from typing import cast
+from typing import Any, cast
 import uuid
 
 from tm_activation_journal import (
@@ -22,6 +25,8 @@ from tm_activation_journal import (
     _activation_lineage_marker_temp_path,
     _activation_terminal_path,
     _activation_terminal_temp_path,
+    _lstat_any_entry,
+    _require_quarantine_directory,
 )
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -196,6 +201,20 @@ class _StreamingBuildObservation:
 
 _CreatedFileIdentity = snapshot_artifacts_module._CreatedFileIdentity
 """_CreatedFileIdentity late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+
+
+@dataclass
+class _InitialStageAttempt:
+    """Private ownership closure for one first-activation stage attempt."""
+
+    stage: MutableStageRef
+    parent_identity: tuple[int, int]
+    quarantine_dir: Path
+    stage_identity: _CreatedFileIdentity | None = None
+    manifest_identity: _CreatedFileIdentity | None = None
+    primary_error: Exception | None = None
+
+
 class _ExportParentHandle(snapshot_artifacts_module._ExportParentHandle):
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts.
 
@@ -972,31 +991,276 @@ class TMMigrationService:
         if coordinator.state != "READY":
             raise MigrationPreflightError("MIGRATION.ACTIVATION_NOT_READY")
 
-        build = self.build_mutable_stage(source)
-        mutable_stage = build.mutable_stage
-        if mutable_stage is None:
-            raise MigrationPreflightError(
-                "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
+        # The public outcome needs a before-digest even when the build fails
+        # before it can return its preflight value.  Invalid caller identity
+        # remains the Task 2.1 zero-mutation exception surface; only a valid
+        # configured source enters the failure-outcome transaction below.
+        self._validate_source_preconditions(source)
+        source_before = _try_file_digest(source)
+        if source_before is None:
+            raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
+
+        preflight: MigrationPreflight | None = None
+        build: MigrationStageBuild | None = None
+        mutable_stage: MutableStageRef | None = None
+        attempt: _InitialStageAttempt | None = None
+        sealed: SealedStage | None = None
+        prepared: _ActivationPreparation | None = None
+        stage_label = "BUILD"
+        try:
+            # A first-activation attempt gets its own unpublished namespace.
+            # Cancelled/sealed registry entries are intentionally immutable;
+            # reusing their deterministic path would make a later safe retry
+            # collide with an old cancelled capability.  The migration batch
+            # and receipt identities remain source-digest deterministic.
+            preflight = self.preflight(source)
+            path_salt = f"initial-{uuid.uuid4().hex}"
+            attempt_stage = _deterministic_stage_ref(
+                self._resource_identity,
+                source_digest=preflight.source_digest,
+                stage_prefix="migration",
+                path_salt=path_salt,
             )
-        sealed = coordinator._seal_stage(
-            mutable_stage,
-            canonical_store_id=self._canonical_store_id,
-            expected_prior_generation=None,
+            attempt = _freeze_initial_stage_attempt(
+                attempt_stage,
+                path_salt=path_salt,
+            )
+            initial_stage, _stage_identity, _manifest_identity = (
+                self._build_stage(
+                    source,
+                    preflight=preflight,
+                    canonical_store_id=self._canonical_store_id,
+                    batch_kind="migration",
+                    batch_prefix="migration",
+                    snapshot_prefix="snapshot.migration",
+                    stage_prefix="migration",
+                    path_salt=path_salt,
+                    initial_attempt=attempt,
+                )
+            )
+            if initial_stage != attempt.stage:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+            build = MigrationStageBuild(
+                preflight=preflight,
+                mutable_stage=initial_stage,
+                reused_completed_revision=None,
+            )
+            if build.preflight.source_digest != source_before:
+                raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+            mutable_stage = build.mutable_stage
+            if mutable_stage is None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
+                )
+            stage_identities = _capture_initial_stage_identities(mutable_stage)
+            if (
+                attempt.stage_identity != stage_identities[0]
+                or attempt.manifest_identity != stage_identities[1]
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+            stage_label = "SEAL"
+            sealed = coordinator._seal_stage(
+                mutable_stage,
+                canonical_store_id=self._canonical_store_id,
+                expected_prior_generation=None,
+            )
+            stage_label = "PREPARE"
+            prepared = coordinator.activate(sealed)
+            stage_label = "JOURNAL"
+            handle = coordinator.publish_prepared_activation(prepared)
+            stage_label = "PUBLISH"
+            generation = coordinator.publish_activation(prepared, handle)
+            stage_label = "VERIFY"
+            self._verify_initial_activation_runtime(
+                coordinator=coordinator,
+                preflight=build.preflight,
+                sealed=sealed,
+                generation=generation,
+            )
+            return self._success_report(
+                preflight=build.preflight,
+                sealed=sealed,
+                canonical_store_id=self._canonical_store_id,
+                generation=generation,
+            )
+        except Exception as error:
+            failure = self._reconcile_initial_activation_failure(
+                error,
+                stage_label=stage_label,
+                source_before=source_before,
+                preflight=preflight,
+                attempt=attempt,
+                prepared=prepared,
+                coordinator=coordinator,
+            )
+            if failure is not None:
+                return failure
+            # Task 2.4 owns published-tail recovery and ambiguous durable
+            # facts.  Preserve already-frozen safe codes where available;
+            # unknown exception text is never allowed to cross the Core
+            # boundary while this operation remains fail-stopped.
+            if isinstance(
+                error,
+                (
+                    MigrationPreflightError,
+                    ActivationPreparationError,
+                ),
+            ):
+                raise
+            error_code = getattr(error, "error_code", None)
+            if type(error_code) is str and error_code:
+                raise MigrationPreflightError(error_code) from error
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            ) from error
+
+    def _reconcile_initial_activation_failure(
+        self,
+        error: Exception,
+        *,
+        stage_label: str,
+        source_before: str,
+        preflight: MigrationPreflight | None,
+        attempt: _InitialStageAttempt | None,
+        prepared: _ActivationPreparation | None,
+        coordinator: ResourceStoreCoordinator,
+    ) -> MigrationFailure | None:
+        """Return a legacy-safe failure only from fully proven states.
+
+        No journal means the live preparation, when present, must first be
+        cancelled through the coordinator.  PREPARED through
+        MANIFEST_PUBLISHED must complete the existing durable rollback.
+        GENERATION_PUBLISHED, unreadable journals, failed rollback/cleanup,
+        or any other ambiguous fact deliberately return ``None`` for Task
+        2.4 rather than claiming that legacy remains authoritative.
+        """
+
+        try:
+            durable_phase = coordinator.durable_activation_phase
+        except Exception as reconciliation_error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            ) from reconciliation_error
+        if durable_phase == "GENERATION_PUBLISHED":
+            # Task 2.4 owns the published tail.  Preserve the frozen
+            # verification/publication error while never manufacturing a
+            # legacy-safe failure from an already-published generation.
+            return None
+        durable_or_cancelled_attempt = False
+        if durable_phase is None:
+            if prepared is not None:
+                try:
+                    coordinator.cancel_prepared_activation(prepared)
+                except Exception as reconciliation_error:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    ) from reconciliation_error
+                # A successful cancellation terminal deliberately retains
+                # the candidate pair until its authenticated replay can
+                # retire it into the deterministic quarantine.  Complete
+                # that replay now; deleting the pair directly would leave
+                # a terminal whose cold recovery correctly reports
+                # QUARANTINE_MISSING.
+                try:
+                    cancelled = coordinator.rollback_durable_activation()
+                except Exception as reconciliation_error:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    ) from reconciliation_error
+                if cancelled is not None and (
+                    cancelled.action != "CANCELLED"
+                    or cancelled.generation is not None
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    )
+                durable_or_cancelled_attempt = True
+            elif _lstat_any_entry(
+                _activation_terminal_path(self._resource_identity)
+            ):
+                # A terminal from an earlier cancelled attempt is a durable
+                # fact too.  Re-prove/replay it before allowing an otherwise
+                # pre-publication failure to report legacy-safe; a foreign,
+                # completed, or ambiguous terminal remains fail-stopped.
+                try:
+                    cancelled = coordinator.rollback_durable_activation()
+                except Exception as reconciliation_error:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    ) from reconciliation_error
+                if cancelled is not None and (
+                    cancelled.action != "CANCELLED"
+                    or cancelled.generation is not None
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    )
+                durable_or_cancelled_attempt = True
+        elif durable_phase in {
+            "PREPARED",
+            "DB_REPLACED",
+            "MANIFEST_PUBLISHED",
+        }:
+            try:
+                rollback = coordinator.rollback_durable_activation()
+            except Exception as reconciliation_error:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                ) from reconciliation_error
+            if (
+                rollback is None
+                or rollback.action not in {"ROLLED_BACK", "CANCELLED"}
+                or rollback.generation is not None
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                )
+            durable_or_cancelled_attempt = True
+        else:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            )
+
+        try:
+            if attempt is not None and not durable_or_cancelled_attempt:
+                _cleanup_initial_unpublished_stage(attempt)
+            _require_proven_initial_legacy_state(
+                coordinator=coordinator,
+                source_digest=source_before,
+                attempt=attempt,
+                activation_retired_attempt=durable_or_cancelled_attempt,
+            )
+        except Exception as reconciliation_error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            ) from reconciliation_error
+        primary_error = (
+            None if attempt is None else attempt.primary_error
         )
-        prepared = coordinator.activate(sealed)
-        handle = coordinator.publish_prepared_activation(prepared)
-        generation = coordinator.publish_activation(prepared, handle)
-        self._verify_initial_activation_runtime(
-            coordinator=coordinator,
-            preflight=build.preflight,
-            sealed=sealed,
-            generation=generation,
+        classified_error = (
+            primary_error if primary_error is not None else error
         )
-        return self._success_report(
-            preflight=build.preflight,
-            sealed=sealed,
-            canonical_store_id=self._canonical_store_id,
-            generation=generation,
+        return MigrationFailure(
+            stage=stage_label,
+            error_code=_initial_activation_error_code(classified_error),
+            retryable=_initial_activation_retryable(classified_error),
+            diagnostics=(() if preflight is None else preflight.diagnostics),
+            active_generation=None,
+            original_source_preservation=_unchanged_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            ),
+            active_store_preservation=AssetPreservationEvidence(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                state=AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            recovery_locators=(),
         )
 
     def _verify_initial_activation_runtime(
@@ -3387,6 +3651,7 @@ class TMMigrationService:
         stage_prefix: str,
         path_salt: str | None = None,
         batch_id: str | None = None,
+        initial_attempt: _InitialStageAttempt | None = None,
     ) -> tuple[
         MutableStageRef,
         _CreatedFileIdentity | None,
@@ -3417,6 +3682,10 @@ class TMMigrationService:
             stage_prefix=stage_prefix,
             path_salt=path_salt,
         )
+        if initial_attempt is not None and initial_attempt.stage != stage:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+            )
         if stage.staged_db_path.exists() or stage.manifest_temp_path.exists():
             _validate_reusable_stage(
                 stage,
@@ -3434,6 +3703,8 @@ class TMMigrationService:
             canonical_store_id=canonical_store_id,
         )
         stage_identity = _created_file_identity(stage.staged_db_path)
+        if initial_attempt is not None:
+            initial_attempt.stage_identity = stage_identity
         manifest_identity: _CreatedFileIdentity | None = None
         try:
             store = SQLiteTMStore(
@@ -3494,13 +3765,20 @@ class TMMigrationService:
                 stage.manifest_temp_path,
                 contract_to_json(manifest).encode("utf-8"),
             )
-        except BaseException:
-            if manifest_identity is not None:
-                _remove_created_file(
-                    stage.manifest_temp_path,
-                    manifest_identity,
-                )
-            _remove_created_file(stage.staged_db_path, stage_identity)
+            if initial_attempt is not None:
+                initial_attempt.manifest_identity = manifest_identity
+        except BaseException as primary_error:
+            if initial_attempt is not None:
+                if isinstance(primary_error, Exception):
+                    initial_attempt.primary_error = primary_error
+                _cleanup_initial_unpublished_stage(initial_attempt)
+            else:
+                if manifest_identity is not None:
+                    _remove_created_file(
+                        stage.manifest_temp_path,
+                        manifest_identity,
+                    )
+                _remove_created_file(stage.staged_db_path, stage_identity)
             raise
         return stage, stage_identity, manifest_identity
 
@@ -4117,6 +4395,455 @@ def _unchanged_preservation(
         before_digest=digest,
         observed_digest=digest,
     )
+
+
+def _capture_initial_stage_identities(
+    stage: MutableStageRef,
+) -> tuple[_CreatedFileIdentity, _CreatedFileIdentity]:
+    """Capture the exact single-link pair eligible for later cleanup."""
+
+    identities: list[_CreatedFileIdentity] = []
+    for path in (stage.staged_db_path, stage.manifest_temp_path):
+        try:
+            observed = os.lstat(path)
+        except OSError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+            ) from error
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+            )
+        identities.append(
+            _CreatedFileIdentity(observed.st_dev, observed.st_ino)
+        )
+    return (identities[0], identities[1])
+
+
+def _freeze_initial_stage_attempt(
+    stage: MutableStageRef,
+    *,
+    path_salt: str,
+) -> _InitialStageAttempt:
+    """Freeze an absent attempt namespace and its exact parent identity."""
+
+    if (
+        type(stage) is not MutableStageRef
+        or type(path_salt) is not str
+        or not path_salt.startswith("initial-")
+        or stage.staged_db_path.parent != stage.manifest_temp_path.parent
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        )
+    token = hashlib.sha256(
+        (
+            f"{stage.staged_db_path.name}\0"
+            f"{stage.manifest_temp_path.name}\0{path_salt}"
+        ).encode("utf-8")
+    ).hexdigest()
+    try:
+        with _ExportParentHandle.bind(stage.staged_db_path) as parent:
+            parent.reprove()
+            for path in (stage.staged_db_path, stage.manifest_temp_path):
+                try:
+                    parent.lstat(path.name)
+                except FileNotFoundError:
+                    continue
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_CONFLICT"
+                )
+            return _InitialStageAttempt(
+                stage=stage,
+                parent_identity=parent.identity,
+                quarantine_dir=(
+                    stage.staged_db_path.parent
+                    / ".localcat-activation-quarantine-v1"
+                    / f"initial-{token}"
+                ),
+            )
+    except MigrationPreflightError:
+        raise
+    except Exception as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        ) from error
+
+
+def _exclusive_initial_quarantine_move(
+    source_parent: snapshot_artifacts_module._ExportParentHandle,
+    source_name: str,
+    target_parent: snapshot_artifacts_module._ExportParentHandle,
+    target_name: str,
+) -> None:
+    """Atomically move one basename without ever replacing a target.
+
+    Darwin uses ``renameatx_np(RENAME_EXCL)`` and Linux uses
+    ``renameat2(RENAME_NOREPLACE)``.  Both calls are directory-descriptor
+    relative.  No check-then-rename fallback exists: an unsupported platform
+    or unavailable libc entry point fails closed.
+    """
+
+    _require_export_basename(source_name)
+    _require_export_basename(target_name)
+    if sys.platform == "darwin":
+        _darwin_rename_exclusive_at(
+            source_parent.descriptor,
+            source_name,
+            target_parent.descriptor,
+            target_name,
+        )
+        return
+    if sys.platform.startswith("linux"):
+        _linux_rename_noreplace_at(
+            source_parent.descriptor,
+            source_name,
+            target_parent.descriptor,
+            target_name,
+        )
+        return
+    raise OSError(
+        errno.ENOTSUP,
+        "exclusive directory-relative rename is unavailable",
+    )
+
+
+def _darwin_rename_exclusive_at(
+    source_dirfd: int,
+    source_name: str,
+    target_dirfd: int,
+    target_name: str,
+) -> None:
+    """Darwin ``renameatx_np`` with the kernel-enforced EXCL flag."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = cast(Any, getattr(libc, "renameatx_np"))
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "renameatx_np is unavailable",
+        ) from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        source_dirfd,
+        os.fsencode(source_name),
+        target_dirfd,
+        os.fsencode(target_name),
+        0x00000004,  # RENAME_EXCL from Darwin's sys/stdio.h.
+    )
+    if result != 0:
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, "exclusive renameatx_np failed")
+
+
+def _linux_rename_noreplace_at(
+    source_dirfd: int,
+    source_name: str,
+    target_dirfd: int,
+    target_name: str,
+) -> None:
+    """Linux ``renameat2`` with the kernel-enforced NOREPLACE flag."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = cast(Any, getattr(libc, "renameat2"))
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "renameat2 is unavailable",
+        ) from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        source_dirfd,
+        os.fsencode(source_name),
+        target_dirfd,
+        os.fsencode(target_name),
+        0x00000001,  # RENAME_NOREPLACE from Linux's uapi/linux/fs.h.
+    )
+    if result != 0:
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, "exclusive renameat2 failed")
+
+
+def _cleanup_initial_unpublished_stage(
+    attempt: _InitialStageAttempt,
+) -> None:
+    """Retire an unpublished pair into an authenticated quarantine.
+
+    The stage basenames are never unlinked.  Each builder-owned inode is
+    atomically renamed to a no-clobber attempt quarantine and the exact
+    inode is re-proven there.  A replaced basename is foreign: it is
+    preserved and the operation fails closed.  When the builder failed
+    before recording ownership, only proven absence is acceptable.
+    """
+
+    if (
+        type(attempt) is not _InitialStageAttempt
+        or attempt.stage.staged_db_path.parent
+        != attempt.stage.manifest_temp_path.parent
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+        )
+    try:
+        with _ExportParentHandle.bind(
+            attempt.stage.staged_db_path
+        ) as parent:
+            if parent.identity != attempt.parent_identity:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                )
+            parent.reprove()
+            if (
+                attempt.stage_identity is not None
+                or attempt.manifest_identity is not None
+            ):
+                _require_quarantine_directory(attempt.quarantine_dir)
+            with _ExportParentHandle.bind(
+                attempt.quarantine_dir / attempt.stage.staged_db_path.name
+            ) as quarantine_parent:
+                quarantine_parent.reprove()
+                for path, expected in zip(
+                    (
+                        attempt.stage.staged_db_path,
+                        attempt.stage.manifest_temp_path,
+                    ),
+                    (attempt.stage_identity, attempt.manifest_identity),
+                    strict=True,
+                ):
+                    target = attempt.quarantine_dir / path.name
+                    if expected is None:
+                        if _lstat_any_entry(path) or _lstat_any_entry(target):
+                            raise MigrationPreflightError(
+                                "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                            )
+                        continue
+                    try:
+                        source_observed = parent.lstat(path.name)
+                    except FileNotFoundError:
+                        source_observed = None
+                    if source_observed is not None:
+                        if (
+                            not stat.S_ISREG(source_observed.st_mode)
+                            or source_observed.st_nlink != 1
+                            or (
+                                source_observed.st_dev,
+                                source_observed.st_ino,
+                            )
+                            != (expected.device, expected.inode)
+                        ):
+                            raise MigrationPreflightError(
+                                "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                            )
+                        _exclusive_initial_quarantine_move(
+                            parent,
+                            path.name,
+                            quarantine_parent,
+                            target.name,
+                        )
+                    try:
+                        parent.lstat(path.name)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                        )
+                    try:
+                        observed = quarantine_parent.lstat(target.name)
+                    except OSError as error:
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                        ) from error
+                    if (
+                        not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                        or (observed.st_dev, observed.st_ino)
+                        != (expected.device, expected.inode)
+                    ):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                        )
+                parent.fsync()
+                quarantine_parent.fsync()
+                parent.reprove()
+                quarantine_parent.reprove()
+    except MigrationPreflightError:
+        raise
+    except Exception as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+        ) from error
+
+
+def _require_proven_initial_legacy_state(
+    *,
+    coordinator: ResourceStoreCoordinator,
+    source_digest: str,
+    attempt: _InitialStageAttempt | None,
+    activation_retired_attempt: bool,
+) -> None:
+    """Cold-reprove the only state from which legacy may safely continue."""
+
+    identity = coordinator._resource_identity
+    source_proof = _strict_locator_proof(
+        identity.configured_jsonl_path,
+        source_digest,
+    )
+    if source_proof is None:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+    try:
+        fresh = ResourceStoreCoordinator(
+            canonical_store_id=coordinator.canonical_store_id,
+            resource_identity=identity,
+        )
+        recovered = fresh.rehydrate_runtime_authority()
+    except Exception as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        ) from error
+    if (
+        recovered is not None
+        and (
+            recovered.action != "CANCELLED"
+            or recovered.generation is not None
+        )
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+    if (
+        fresh.state != "READY"
+        or fresh.current_generation is not None
+        or fresh.active_store_path is not None
+        or fresh.durable_activation_phase is not None
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+
+    journal_path = _activation_journal_path(identity)
+    marker_path = _activation_lineage_marker_path(identity)
+    terminal_path = _activation_terminal_path(identity)
+    prohibited = (
+        identity.canonical_sidecar_path,
+        identity.snapshot_manifest_path,
+        journal_path,
+        _activation_journal_temp_path(journal_path),
+        marker_path,
+        _activation_lineage_marker_temp_path(marker_path),
+        _activation_terminal_temp_path(terminal_path),
+    )
+    if (
+        coordinator.state != "READY"
+        or coordinator.current_generation is not None
+        or coordinator.active_store_path is not None
+        or coordinator.durable_activation_phase is not None
+        or any(_lstat_any_entry(path) for path in prohibited)
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+    if attempt is not None:
+        try:
+            with _ExportParentHandle.bind(
+                attempt.stage.staged_db_path
+            ) as parent:
+                if parent.identity != attempt.parent_identity:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    )
+                parent.reprove()
+                for path in (
+                    attempt.stage.staged_db_path,
+                    attempt.stage.manifest_temp_path,
+                ):
+                    try:
+                        parent.lstat(path.name)
+                    except FileNotFoundError:
+                        continue
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    )
+        except MigrationPreflightError:
+            raise
+        except Exception as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+            ) from error
+        if not activation_retired_attempt:
+            for path, expected in zip(
+                (
+                    attempt.stage.staged_db_path,
+                    attempt.stage.manifest_temp_path,
+                ),
+                (attempt.stage_identity, attempt.manifest_identity),
+                strict=True,
+            ):
+                target = attempt.quarantine_dir / path.name
+                if expected is None:
+                    if _lstat_any_entry(target):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                        )
+                    continue
+                try:
+                    observed = os.lstat(target)
+                except OSError as error:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    ) from error
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or (observed.st_dev, observed.st_ino)
+                    != (expected.device, expected.inode)
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    )
+    if _strict_locator_proof(identity.configured_jsonl_path, source_digest) is None:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+
+
+def _initial_activation_error_code(error: Exception) -> str:
+    error_code = getattr(error, "error_code", None)
+    if type(error_code) is str and error_code:
+        return error_code
+    code = getattr(error, "code", None)
+    if type(code) is str and code:
+        return code
+    if isinstance(error, OSError):
+        return "MIGRATION.INITIAL_IO_FAILED"
+    return "MIGRATION.INITIAL_FAILED"
+
+
+def _initial_activation_retryable(error: Exception) -> bool:
+    retryable = getattr(error, "retryable", None)
+    if type(retryable) is bool:
+        return retryable
+    return isinstance(error, OSError)
 
 
 def _changed_preservation(

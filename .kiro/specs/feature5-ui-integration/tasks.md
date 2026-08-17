@@ -46,7 +46,7 @@
   - _Requirements: 5.7, 5.8_
   - _Boundary: Feature 5 Initial Activation Publication_
 
-- [ ] 2.3 证明未发布与完整回滚时保留 legacy
+- [x] 2.3 证明未发布与完整回滚时保留 legacy
   - 用户取消只发生在进入 Core transaction 之前；正式调用后不接受 UI cancellation token
   - 已证明从未发布 canonical authority 或已完整 rollback 时，保持原 JSONL 字节、资源配置与 legacy exact-only 能力
   - 不允许部分 stage、journal 或配置变化伪装为可继续使用的 legacy 状态
@@ -349,6 +349,7 @@
 
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
 - Task 2.2：首次激活仅在 generation 0 durable publication、sealed source-binding canonical digest、正式 `SQLiteTMStore` health/revision/query-view 重开全部一致后返回成功；FTS5/fallback 均经默认 fail-closed `TMRetrievalService` 证明 canonical EXACT，同 source variants 保留而 context/fuzzy 继续关闭。独立评审两次拒绝并闭合 ledger 路径一致改绑反例与测试 connection 泄漏后 APPROVED；parent fresh completion 聚焦 4/4（强制 ResourceWarning 无告警）、相关 264/264、changed-file basedpyright 0，四个 WIP hash 不变。published-tail recovery 仍归 2.4。
+- Task 2.3：仅在 Core 证明从未发布或 PREPARED/DB_REPLACED/MANIFEST_PUBLISHED 已完整回滚、fresh coordinator 冷复证 legacy authority 后返回 preservation-backed `MigrationFailure`；普通 I/O 完整回滚稳定为 `MIGRATION.INITIAL_IO_FAILED` 且可重试。独立评审三轮拒绝并闭合 source/target basename 置换、builder residue、terminal/quarantine 篡改、primary-error masking；unpublished pair 采用 Darwin `renameatx_np(RENAME_EXCL)` / Linux `renameat2(RENAME_NOREPLACE)` 的 dirfd-relative exclusive quarantine，无普通 rename 回退。最终评审 APPROVED；parent fresh completion mutation-negative 19/19、相关 336/336（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变；ambiguous 与 GENERATION_PUBLISHED 仍归 2.4。
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
 - 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
