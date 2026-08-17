@@ -48,6 +48,7 @@ from tm_contracts import (
     SealedStage,
     SnapshotKind,
     SourceBindingState,
+    SnapshotBinding,
     SnapshotManifest,
     SnapshotReceipt,
     TMRecordDraft,
@@ -96,6 +97,15 @@ import tm_snapshot_artifacts as snapshot_artifacts_module
 
 _NATIVE_PATH_TYPE = type(Path())
 MIGRATION_STREAM_CHUNK_SIZE = 20_000
+
+
+def _sealed_source_binding_digest(binding: SnapshotBinding) -> str:
+    """Hash one frozen source binding with the canonical contract encoding."""
+
+    return hashlib.sha256(
+        contract_to_json(binding).encode("utf-8")
+    ).hexdigest()
+
 
 _EXPORT_JSONL_RECOVERY_SUFFIX = snapshot_artifacts_module._EXPORT_JSONL_RECOVERY_SUFFIX
 """_EXPORT_JSONL_RECOVERY_SUFFIX late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
@@ -976,12 +986,92 @@ class TMMigrationService:
         prepared = coordinator.activate(sealed)
         handle = coordinator.publish_prepared_activation(prepared)
         generation = coordinator.publish_activation(prepared, handle)
+        self._verify_initial_activation_runtime(
+            coordinator=coordinator,
+            preflight=build.preflight,
+            sealed=sealed,
+            generation=generation,
+        )
         return self._success_report(
             preflight=build.preflight,
             sealed=sealed,
             canonical_store_id=self._canonical_store_id,
             generation=generation,
         )
+
+    def _verify_initial_activation_runtime(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        preflight: MigrationPreflight,
+        sealed: SealedStage,
+        generation: int,
+    ) -> None:
+        """Require one complete generation-zero runtime before success.
+
+        Publication remains coordinator-owned.  This post-publication check
+        consumes only the formal reopened store/query ports and their safe
+        immutable health/revision facts; it neither repairs nor rolls back a
+        durable tail failure.  Task 2.4 owns that recovery classification.
+        """
+
+        receipt = sealed.evidence.source_binding.receipt
+        expected_binding_digest = _sealed_source_binding_digest(
+            sealed.evidence.source_binding
+        )
+        if (
+            type(generation) is not int
+            or generation != 0
+            or coordinator.state != "READY"
+            or coordinator.current_generation != generation
+            or coordinator.canonical_store_id != self._canonical_store_id
+            or coordinator.resource_id != self._resource_identity.resource_id
+            or coordinator.active_store_path is None
+            or type(receipt) is not SnapshotReceipt
+            or receipt.resource_id != self._resource_identity.resource_id
+            or receipt.canonical_store_id != self._canonical_store_id
+            or receipt.jsonl_digest != preflight.source_digest
+            or receipt.record_count != preflight.valid_count
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            )
+        try:
+            if coordinator.durable_activation_phase != "GENERATION_PUBLISHED":
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_RUNTIME_INVALID"
+                )
+            store = SQLiteTMStore.from_coordinator(coordinator)
+            health = store.health()
+            revision = store.canonical_revision()
+            with store.query_lease() as query_view:
+                query_health = query_view.health()
+        except MigrationPreflightError:
+            raise
+        except Exception as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_REOPEN_FAILED"
+            ) from error
+        if (
+            not health.healthy
+            or not health.exact_available
+            or health.context_available
+            or health.fuzzy_available
+            or health.generation != generation
+            or health.record_count != preflight.valid_count
+            or health.snapshot_binding_digest != expected_binding_digest
+            or health.source_binding_state is not SourceBindingState.VERIFIED_CURRENT
+            or health.diagnostic_codes
+            or query_health != health
+            or revision.resource_id != self._resource_identity.resource_id
+            or revision.canonical_store_id != self._canonical_store_id
+            or revision.generation != generation
+            or revision.head_revision != receipt.exported_revision
+            or revision.record_count != receipt.record_count
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RUNTIME_INVALID"
+            )
 
     def export_jsonl(
         self,
