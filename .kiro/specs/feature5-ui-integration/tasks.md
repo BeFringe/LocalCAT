@@ -2,7 +2,7 @@
 
 > 本计划只拥有 Feature 5 Core 到当前段 TM suggestions 的跨层闭环与 macOS 入口。owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 thread；同一 thread 可以依次执行不同簇，但必须重新载入 owning Spec。独立 Qt maintenance、原 Qt Requirement 3 单 JSON 搜索和 Requirement 7 术语 CRUD/管理入口分别在其 owning Spec 记账，不得用本计划的 checkbox 代替。
 
-- [ ] 1. 闭合治理、精确身份与 Feature 5 合并基线
+- [x] 1. 闭合治理、精确身份与 Feature 5 合并基线
 
 - [x] 1.1 闭合获批治理顺序与三方所有权
   - 由 Governance owner 同步已批准的八步实施顺序、Feature 5 Requirement 2 public-contract completion 和 Feature 5 Core / Integration / 原 Qt increment 三方职责
@@ -19,7 +19,7 @@
   - _Requirements: 5.3, 9.5, 9.7_
   - _Boundary: Repository Identity and WIP Safety Gate_
 
-- [ ] 1.3 形成精确可追踪 merge 并建立 Core 绿色基线
+- [x] 1.3 形成精确可追踪 merge 并建立 Core 绿色基线
   - 从授权来源根引入精确 `dd7c9f…`，保留其为 merge parent，不 squash、不 cherry-pick 重建历史
   - merge 不得吸收用户 WIP；完成后再次核对 branch、full HEAD、merge parent、status 与四个受保护文件 SHA-256
   - 运行 Feature 5 frozen contracts、canonical migration/retrieval、matcher/capability 与防篡改基线，并执行 diff check
@@ -352,3 +352,4 @@
 - canonical 红线：legacy importer 的 source-LWW 与当前 100% 卡片只验 exact compatibility；多译文、非 100%、阈值、排序和 fuzzy 必须使用真实 activated SQLite 与 production retrieval API。
 - 每个实现子任务经独立 review 与 fresh completion evidence 后，使用显式路径暂存该任务文件和本 `tasks.md` checkbox；不得 `git add -A`、`git add .`、stash 或吸收用户 WIP。
 - cluster review 是逐任务门后的额外退出证据：按 `.kiro/steering/feature5-ui-integration-review-clustering.md` 记录 full base/tip、累计 diff 与共享故障矩阵；Checkpoint M/Q 仍只更新 owning Spec，不得在本文件代勾。
+- 2026-08-17 / Task 1.3：以 merge commit `482dd5b` 保留精确 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 为第二父；唯一 roadmap 冲突保留 Integration contract 与 Core gate 事实，acceptance/release evidence 由官方工具绑定 merged UI source（33/33、86/86 GO），canonical suite 1629 tests 全绿并保留 1 个明确 opt-in 100k envelope skip；四个用户 WIP SHA-256 未变化。
