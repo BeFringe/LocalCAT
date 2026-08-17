@@ -278,7 +278,7 @@
 
 - [ ] 11. 完成 Checkpoint M：修复 Qt 跨平台编辑交互回归
 
-- [ ] 11.1 修正现有确认与段落导航快捷键
+- [x] 11.1 修正现有确认与段落导航快捷键
   - 让确认动作响应平台主修饰键与主 Return，并保留需要支持的数字键盘 Enter 等价入口；macOS 物理 Control + Return 继续由译文编辑器处理换行
   - 上一段、下一段使用不劫持译文编辑的可发现绑定，按钮提示从实际 `QKeySequence` 的 NativeText 生成，不再硬编码 Ctrl、Alt 或 macOS 键名
   - 使用真实 Qt 按键事件覆盖主 Return、数字键盘 Enter、macOS Control + Return 和上一段/下一段，禁止以 `activated.emit()` 代替行为验收
@@ -310,3 +310,8 @@
   - _Depends: 11.1, 11.2, 11.3_
   - _Requirements: 1.4, 3.3, 3.4, 5.4, 5.5, 6.3, 6.4, 6.7, 6.8, 8.4, 8.5, 8.6_
   - _Boundary: Qt Maintenance Verification_
+
+## Checkpoint M Implementation Notes
+
+- Cluster base：`2df687055c43839a726d2a98f0ed73b72c4a7129`。
+- Task 11.1：macOS 主 Return、keypad Enter、物理 Control + Return 与 Option 导航均以真实 Qt 键事件通过；Qt editor 定向套件 35/35 通过。`qt_editor_window.py` 的 changed-file basedpyright 在 base/当前均有 42 个既存诊断，本任务未增加；最终零诊断门由 Task 11.4 闭合。

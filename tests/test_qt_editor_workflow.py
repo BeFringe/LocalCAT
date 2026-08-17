@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -9,10 +10,12 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
+from PySide6.QtGui import QKeySequence
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from editor_contracts import EditorProject, EditorSegment, ResourceKind
+from editor_contracts import EditorProject, EditorSegment, ResourceConfig, ResourceKind
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
@@ -29,7 +32,7 @@ class QtEditorWorkflowTest(unittest.TestCase):
         root: Path,
         *,
         with_tm: bool = True,
-    ) -> tuple[QtEditorWindow, object | None]:
+    ) -> tuple[QtEditorWindow, ResourceConfig | None]:
         repository = ResourceRepository(root / "app-data")
         tm = (
             repository.create_resource("Writable TM", ResourceKind.TRANSLATION_MEMORY)
@@ -64,7 +67,9 @@ class QtEditorWorkflowTest(unittest.TestCase):
 
             window.confirm_button.click()
             self._events()
+            assert tm is not None
             persisted = TMEngine(str(tm.path)).query_exact("Two")
+            assert persisted is not None
 
             self.assertTrue(window.controller.project.segments[1].confirmed)
             self.assertEqual(window.controller.current_index, 3)
@@ -74,19 +79,108 @@ class QtEditorWorkflowTest(unittest.TestCase):
             window._confirm_unsaved = lambda: True
             window.close()
 
-    def test_confirm_shortcut_uses_same_action(self) -> None:
+    def test_platform_primary_return_shortcut_uses_same_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             window, _ = self._window(Path(temp_dir), with_tm=False)
             window.controller.go_to(1)
             window._render_project()
             window.target_editor.setPlainText("二")
+            window.show()
+            window.activateWindow()
+            window.target_editor.setFocus()
             self._events()
 
-            window.shortcuts["confirm"].activated.emit()
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Return,
+                Qt.KeyboardModifier.ControlModifier,
+            )
             self._events()
 
             self.assertTrue(window.controller.project.segments[1].confirmed)
             self.assertEqual(window.controller.current_index, 3)
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    def test_platform_primary_keypad_enter_confirms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self._window(Path(temp_dir), with_tm=False)
+            window.controller.go_to(1)
+            window._render_project()
+            window.target_editor.setPlainText("二")
+            window.show()
+            window.activateWindow()
+            window.target_editor.setFocus()
+            self._events()
+
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Enter,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+            self._events()
+
+            self.assertTrue(window.controller.project.segments[1].confirmed)
+            self.assertEqual(window.controller.current_index, 3)
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS physical Control semantics")
+    def test_macos_physical_control_return_inserts_newline_without_confirming(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self._window(Path(temp_dir), with_tm=False)
+            window.controller.go_to(1)
+            window._render_project()
+            window.target_editor.setPlainText("第一行")
+            window.target_editor.moveCursor(window.target_editor.textCursor().MoveOperation.End)
+            window.show()
+            window.activateWindow()
+            window.target_editor.setFocus()
+            self._events()
+
+            # On macOS Qt's MetaModifier represents the physical Control key;
+            # ControlModifier is the platform Command shortcut modifier.
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Return,
+                Qt.KeyboardModifier.MetaModifier,
+            )
+            self._events()
+
+            self.assertEqual(window.controller.current_index, 1)
+            self.assertFalse(window.controller.current_segment.confirmed)
+            self.assertEqual(window.target_editor.toPlainText(), "第一行\n")
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    def test_navigation_shortcuts_use_real_key_events_without_editing_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window, _ = self._window(Path(temp_dir), with_tm=False)
+            window.controller.go_to(1)
+            window._render_project()
+            window.target_editor.setPlainText("保留草稿")
+            window.show()
+            window.activateWindow()
+            window.target_editor.setFocus()
+            self._events()
+
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Down,
+                Qt.KeyboardModifier.AltModifier,
+            )
+            self._events()
+            self.assertEqual(window.controller.current_index, 2)
+            self.assertEqual(window.controller.project.segments[1].target, "保留草稿")
+
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Up,
+                Qt.KeyboardModifier.AltModifier,
+            )
+            self._events()
+            self.assertEqual(window.controller.current_index, 1)
+            self.assertEqual(window.target_editor.toPlainText(), "保留草稿")
             window._confirm_unsaved = lambda: True
             window.close()
 
@@ -97,10 +191,11 @@ class QtEditorWorkflowTest(unittest.TestCase):
             window._render_project()
             window.target_editor.setPlainText("二")
             self._events()
+            assert tm is not None
             tm.path.unlink()
             tm.path.mkdir()
             errors: list[str] = []
-            window._show_error = lambda _title, message: errors.append(message)
+            window._show_error = lambda title, message: errors.append(message)
 
             with redirect_stdout(io.StringIO()):
                 window.confirm_button.click()
@@ -131,7 +226,7 @@ class QtEditorWorkflowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             window, _ = self._window(Path(temp_dir), with_tm=False)
             sequences = {
-                name: shortcut.key().toString()
+                name: shortcut.key().toString(QKeySequence.SequenceFormat.PortableText)
                 for name, shortcut in window.shortcuts.items()
             }
 
@@ -140,7 +235,7 @@ class QtEditorWorkflowTest(unittest.TestCase):
                 {
                     "open": "Ctrl+O",
                     "save": "Ctrl+S",
-                    "confirm": "Ctrl+Enter",
+                    "confirm": "Ctrl+Return",
                     "previous": "Alt+Up",
                     "next": "Alt+Down",
                     "settings": "Ctrl+,",
@@ -148,12 +243,23 @@ class QtEditorWorkflowTest(unittest.TestCase):
                     "quit": "Ctrl+Q",
                 },
             )
-            self.assertIn("Ctrl+O", window.open_button.toolTip())
-            self.assertIn("Ctrl+S", window.save_button.toolTip())
-            self.assertIn("Ctrl+,", window.settings_button.toolTip())
-            self.assertIn("Ctrl+Enter", window.confirm_button.toolTip())
-            self.assertIn("Alt+Up", window.previous_button.toolTip())
-            self.assertIn("Alt+Down", window.next_button.toolTip())
+            native = {
+                name: shortcut.key().toString(QKeySequence.SequenceFormat.NativeText)
+                for name, shortcut in window.shortcuts.items()
+            }
+            self.assertIn(native["open"], window.open_button.toolTip())
+            self.assertIn(native["save"], window.save_button.toolTip())
+            self.assertIn(native["settings"], window.settings_button.toolTip())
+            self.assertIn(native["confirm"], window.confirm_button.toolTip())
+            self.assertIn(native["previous"], window.previous_button.toolTip())
+            self.assertIn(native["next"], window.next_button.toolTip())
+            self.assertEqual(
+                [
+                    key.toString(QKeySequence.SequenceFormat.PortableText)
+                    for key in window.shortcuts["confirm"].keys()
+                ],
+                ["Ctrl+Return", "Ctrl+Enter"],
+            )
             window.close()
 
     def test_editing_confirmed_segment_reappears_in_unconfirmed_filter(self) -> None:

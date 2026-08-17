@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -124,6 +125,9 @@ def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> s
 class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
+    shortcuts: dict[str, QShortcut]
+    target_editor_shortcuts: dict[str, QShortcut]
+
     def __init__(self, controller: EditorController) -> None:
         super().__init__()
         self.controller = controller
@@ -231,7 +235,7 @@ class QtEditorWindow(QMainWindow):
         self.open_button = QToolButton()
         self.open_button.setObjectName("openProjectButton")
         self.open_button.setText("项目")
-        self.open_button.setToolTip("打开或切换项目 (Ctrl+O)")
+        self.open_button.setToolTip("打开或切换项目")
         self.open_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.open_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.project_menu = QMenu(self)
@@ -248,13 +252,13 @@ class QtEditorWindow(QMainWindow):
         self.save_button = QToolButton()
         self.save_button.setObjectName("saveProjectButton")
         self.save_button.setText("保存")
-        self.save_button.setToolTip("保存项目 (Ctrl+S)")
+        self.save_button.setToolTip("保存项目")
         self.save_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         layout.addWidget(self.save_button)
         self.settings_button = QToolButton()
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.setText("⚙ 设置")
-        self.settings_button.setToolTip("语言资源设置 (Ctrl+,)")
+        self.settings_button.setToolTip("语言资源设置")
         self.settings_button.setFixedSize(QSize(72, 34))
         layout.addWidget(self.settings_button)
         return top_bar
@@ -473,13 +477,13 @@ class QtEditorWindow(QMainWindow):
         actions = QHBoxLayout()
         self.previous_button = QPushButton("← 上一段")
         self.previous_button.setObjectName("previousSegmentButton")
-        self.previous_button.setToolTip("上一段 (Alt+Up)")
+        self.previous_button.setToolTip("上一段")
         self.next_button = QPushButton("下一段 →")
         self.next_button.setObjectName("nextSegmentButton")
-        self.next_button.setToolTip("下一段 (Alt+Down)")
+        self.next_button.setToolTip("下一段")
         self.confirm_button = QPushButton("确认译文")
         self.confirm_button.setObjectName("confirmTranslationButton")
-        self.confirm_button.setToolTip("确认译文并前往下一未确认段 (Ctrl+Enter)")
+        self.confirm_button.setToolTip("确认译文并前往下一未确认段")
         actions.addWidget(self.previous_button)
         actions.addWidget(self.next_button)
         actions.addStretch()
@@ -562,23 +566,58 @@ class QtEditorWindow(QMainWindow):
 
     def _install_shortcuts(self) -> None:
         bindings = (
-            ("open", "Ctrl+O", self._choose_open),
-            ("save", "Ctrl+S", self._choose_save),
-            ("confirm", "Ctrl+Enter", self.confirm_current),
-            ("previous", "Alt+Up", lambda: self._navigate(-1)),
-            ("next", "Alt+Down", lambda: self._navigate(1)),
-            ("settings", "Ctrl+,", self._open_settings),
-            ("close_project", "Ctrl+Shift+W", self.close_current_project),
-            ("quit", "Ctrl+Q", self.close),
+            ("open", ("Ctrl+O",), self._choose_open),
+            ("save", ("Ctrl+S",), self._choose_save),
+            (
+                "confirm",
+                ("Ctrl+Return", "Ctrl+Enter"),
+                self.confirm_current,
+            ),
+            ("previous", ("Alt+Up",), lambda: self._navigate(-1)),
+            ("next", ("Alt+Down",), lambda: self._navigate(1)),
+            ("settings", ("Ctrl+,",), self._open_settings),
+            ("close_project", ("Ctrl+Shift+W",), self.close_current_project),
+            ("quit", ("Ctrl+Q",), self.close),
         )
         self.shortcuts: dict[str, QShortcut] = {}
-        for name, sequence, callback in bindings:
-            shortcut = QShortcut(QKeySequence(sequence), self)
+        for name, sequences, callback in bindings:
+            keys = [QKeySequence(sequence) for sequence in sequences]
+            shortcut = QShortcut(keys[0], self)
+            shortcut.setKeys(keys)
             shortcut.setObjectName(f"{name}Shortcut")
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
             self.shortcuts[name] = shortcut
         self._install_target_editor_shortcuts()
+        self._update_shortcut_tooltips()
+
+    @staticmethod
+    def _native_shortcut_text(shortcut: QShortcut) -> str:
+        return " / ".join(
+            key.toString(QKeySequence.SequenceFormat.NativeText)
+            for key in shortcut.keys()
+        )
+
+    def _update_shortcut_tooltips(self) -> None:
+        self.open_button.setToolTip(
+            f"打开或切换项目 ({self._native_shortcut_text(self.shortcuts['open'])})"
+        )
+        self.save_button.setToolTip(
+            f"保存项目 ({self._native_shortcut_text(self.shortcuts['save'])})"
+        )
+        self.settings_button.setToolTip(
+            f"语言资源设置 ({self._native_shortcut_text(self.shortcuts['settings'])})"
+        )
+        self.confirm_button.setToolTip(
+            "确认译文并前往下一未确认段 "
+            f"({self._native_shortcut_text(self.shortcuts['confirm'])})"
+        )
+        self.previous_button.setToolTip(
+            f"上一段 ({self._native_shortcut_text(self.shortcuts['previous'])})"
+        )
+        self.next_button.setToolTip(
+            f"下一段 ({self._native_shortcut_text(self.shortcuts['next'])})"
+        )
 
     def _install_target_editor_shortcuts(self) -> None:
         bindings = (
@@ -609,6 +648,20 @@ class QtEditorWindow(QMainWindow):
             shortcut.setWhatsThis(description)
             shortcut.activated.connect(callback)
             self.target_editor_shortcuts[object_name] = shortcut
+        if sys.platform == "darwin":
+            for key_name in ("Return", "Enter"):
+                object_name = f"targetPhysicalControl{key_name}Shortcut"
+                shortcut = QShortcut(
+                    QKeySequence(f"Meta+{key_name}"),
+                    self.target_editor,
+                )
+                shortcut.setObjectName(object_name)
+                shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+                shortcut.setWhatsThis("在译文框中插入换行")
+                shortcut.activated.connect(
+                    lambda: self.target_editor.insertPlainText("\n")
+                )
+                self.target_editor_shortcuts[object_name] = shortcut
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         """Handle Ctrl+wheel only for the two editor viewports."""
