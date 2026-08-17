@@ -18,11 +18,11 @@
 
 | 开发线 | 可写 Spec | 只读相邻 Spec |
 |---|---|---|
-| `feature5` | `tm-storage-retrieval-index` | 从 `ui-mvp` 基线继承的 `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`、Parser 与未来格式规格 |
-| `ui-mvp` | `qt-editor-json-mvp-increment`、`qt-editor-font-zoom`；维护既有 `qt-editor-mvp` 验证事实 | Parser 与未来格式规格；Feature 5 正式规格留在 `feature5` 分支 |
+| `feature5` | `tm-storage-retrieval-index` | 从 `ui-mvp` 基线继承的 `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`qt-editor-font-zoom`、Parser 与未来格式规格 |
+| `ui-mvp` | `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`qt-editor-font-zoom`；维护既有 `qt-editor-mvp` 验证事实 | Parser 与未来格式规格；Feature 5 Core 正式规格由精确 merge 继承，不在 UI 线重写 |
 | `governance/kiro-steering` | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
 
-`feature5-ui-integration.md`、`roadmap.md` 和 `repository-safety.md` 是共享治理文件。任一垂直线发现冲突时可以提出修订，但共享补丁只能提交一次，再通过 merge/rebase 由其他活动线继承，并同时复核两侧正式 Requirements/Design。
+`feature5-ui-integration.md`、`roadmap.md` 和 `repository-safety.md` 是共享治理文件。任一垂直线发现冲突时可以提出修订，但共享补丁只能在 `ui-mvp` 提交一次，再通过可追踪 merge 由其他活动线继承，并同时复核三侧正式 Requirements/Design。`feature5-ui-integration` 的 Spec 与集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
 
 ## 当前规格权威顺序
 
@@ -31,7 +31,7 @@
 3. `brief.md`、`research.md` 和旧横向规格仅作为来源与历史上下文；
 4. 对话、截图和 Agent 记忆只用于抢救缺失裁决：若能从成功补丁链逐字恢复并核对原审批记录，可保留历史阶段；凡依据摘要、现状或推断重新生成/改写的内容，必须写回正式文件并重新过人工审批门。
 
-旧 `qt-editor-mvp` 是已完成的横向基线；`qt-editor-json-mvp-increment` 是当前 Qt 单 JSON 纵向权威；`qt-editor-font-zoom` 是独立 Qt 规格；`tm-storage-retrieval-index` 是 Feature 5 唯一可写规格。Parser 与多文档/格式 briefs 不属于当前两条实施线。
+旧 `qt-editor-mvp` 是已完成的横向基线；`qt-editor-json-mvp-increment` 是当前 Qt 单 JSON 纵向权威；`feature5-ui-integration` 是 Feature 5/Core 与 UI 的独立跨层权威；`qt-editor-font-zoom` 是独立 Qt 规格；`tm-storage-retrieval-index` 是 Feature 5 Core 唯一可写规格。Parser 与多文档/格式 briefs 不属于当前两条实施线。
 
 ## 暂存与提交规则
 
