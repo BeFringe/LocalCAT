@@ -424,6 +424,9 @@ class CanonicalActivationContractTests(unittest.TestCase):
             contract_module.__all__,
         )
         self.assertNotIn("_ActivationToken", contract_module.__all__)
+        self.assertFalse(
+            hasattr(contract_module._SealedArtifactRegistryPort, "seal")
+        )
 
         self.assertTrue(hasattr(ResourceStoreCoordinatorPort, "activate"))
         for hidden_method in (

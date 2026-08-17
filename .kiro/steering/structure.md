@@ -33,7 +33,14 @@ Layer 1 Storage
 ├── logic_controller.py          # 旧 Excel 无状态三态入口
 ├── excel_adapter*.py            # Excel Layer 4
 ├── glossary_engine.py
+├── tm_contracts.py              # canonical TM frozen contracts
 ├── tm_engine.py
+├── tm_sqlite_store.py           # per-resource store/coordinator authority
+├── tm_activation_journal.py     # activation durable records/protocol
+├── tm_activation_recovery.py    # activation completion/rollback
+├── tm_schema_upgrade.py         # schema copy data plane + upgrade artifacts
+├── tm_snapshot_artifacts.py     # snapshot artifact namespace/proof/handoff primitives
+├── tm_migration.py              # migration/import/export/upgrade orchestration
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实
 └── .kiro/steering/              # 当前项目级产品、技术与结构约束
@@ -49,6 +56,8 @@ Layer 1 Storage
 - `logic_controller.py` 不导入 Qt/xlwings，保持无历史状态的三态接口。
 - `resource_importer.py` 不导入 PySide6；openpyxl 仅在 XLSX 路径中条件导入。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；未来 canonical TMRecord 落地后替换。
+- `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。
+- `tm_snapshot_artifacts.py` 只拥有 snapshot/export deterministic artifact family、no-follow parent dirfd、strict file identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码；不反向导入 `tm_sqlite_store.py`、`tm_migration.py` 或 `tm_snapshot_recovery.py`，不拥有 ledger/binding/transaction 或 receipt reconciliation 状态。
 - 核心 Engine 不向上导入 Controller 或 Frontend。
 
 该边界由 `tests/test_qt_user_journey.py` 的 AST 守卫和 Excel 适配器契约测试持续验证。
@@ -69,6 +78,8 @@ Layer 1 Storage
 - `tests/test_renpy_tm_compat.py`：安全 speaker token、引号转义与拒绝猜测性解包。
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
+- `tests/test_tm_schema_upgrade_module_boundaries.py`：schema-upgrade 依赖方向、owner 权威与 late-bound 兼容接缝。
+- `tests/test_tm_snapshot_artifacts_module_boundaries.py`：snapshot artifact 依赖方向、owner 权威、late-bound fault seam 与移动等价性。
 - 五个旧脚本自检仍是发布前回归矩阵的一部分。
 
 ## 开发上下文

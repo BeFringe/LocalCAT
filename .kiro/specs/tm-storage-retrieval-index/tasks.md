@@ -32,7 +32,7 @@
   - 完成时，缺少或篡改参数、计数不守恒、能力路径混报的报告都会被验证器拒绝
   - _Requirements: 4.2, 4.4, 4.5, 5.3, 5.4, 8.5, 8.6, 8.7_
 
-- [ ] 2. 实现无存储依赖的匹配与评分算法
+- [x] 2. 实现无存储依赖的匹配与评分算法
 
 - [x] 2.1 (P) 实现 similarity-v1 确定性评分
   - 实现 Levenshtein ratio 与多重集字符 bigram Dice，保留两个分项并以算术平均产生最终分数
@@ -70,214 +70,248 @@
   - 完成时，profile×state×options、single-snapshot race 和无正文拒绝信息测试全部通过
   - _Requirements: 6.9, 6.10, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 2.6 建立 Gate A 与 matcher 独立发布证据
+- [x] 2.6 建立 Gate A 与 matcher 独立发布证据
   - Gate A 汇总契约、similarity 和纯文本算法的版本化 golden 结果；matcher gate 单独消费 matcher validation manifest
   - 证据失败只关闭对应算法或匹配用途，不从 SQLite、FTS5 或后续 benchmark 推断能力
   - 完成时，两道证据均可独立重算并阻止下游消费未验证契约或 matcher profile
   - _Requirements: 4.2, 6.10, 9.1, 9.2, 9.3, 9.4, 9.5, 9.9, 9.12_
 
-- [ ] 3. 建立事务化 SQLite canonical store
+- [x] 3. 建立事务化 SQLite canonical store
 
-- [ ] 3.1 创建 per-resource schema 与安全连接策略
+- [x] 3.1 创建 per-resource schema 与安全连接策略
   - 每个 TM 资源建立独立 canonical sidecar，包含 metadata、origin batch、完整 record、snapshot ledger/binding 和候选索引所需表
   - 建立 raw source exact B-tree、外键与版本字段，并启用 DELETE journal、FULL synchronous、foreign keys、5000 ms busy timeout
   - 显式记录运行时 SQLite/FTS5/Unicode 能力，保持扩展加载和 WAL 关闭
   - 完成时，schema、pragma、索引、外键、版本与运行时能力快照均通过自动检查
   - _Requirements: 1.1, 3.3, 7.1, 7.2, 7.3, 7.7_
 
-- [ ] 3.2 实现 raw exact、变体历史和事务化追加
+- [x] 3.2 实现 raw exact、变体历史和事务化追加
   - exact 只按 source 原始字符串完全相等查询，并以最大有效 record identity 选择最后 winner
   - 按输入顺序追加 migration、local_write 或 import 批次，完整保存上下文、provenance、来源 ordinal 和预折叠文本
   - 为后续候选索引接入提供受控的同事务扩展边界，record/origin 写入任一阶段失败都整体回滚
   - 完成时，重复 source、多 target、record/origin 批次失败、并发 reader 和重开后的 exact winner 均保持兼容语义
   - _Requirements: 1.1, 1.2, 1.3, 1.5, 3.1, 3.2, 3.3, 7.6, 7.7_
 
-- [ ] 3.3 实现 generation lease 与资源隔离
+- [x] 3.3 实现 generation lease 与资源隔离
   - 每次公开读写先取得当前 generation lease，再在线程内使用短连接；draining 后不发新 lease
   - 有界等待旧 lease 排空，阻止旧读者跨 generation 继续使用失效连接，并隔离各资源错误
   - 完成时，并发读写、busy timeout、drain timeout 和 generation 变化测试都只观察到一个完整版本
   - _Requirements: 2.10, 7.4, 7.5, 7.6, 7.7_
 
-- [ ] 3.4 实现 canonical revision、snapshot ledger 与来源状态机
+- [x] 3.4 实现 canonical revision、snapshot ledger 与来源状态机
   - 绑定配置 JSONL 路径、deterministic adjacent sidecar、manifest、snapshot receipt、canonical store identity 和 ancestry
   - canonical 正常写入只推进 revision 并形成 VERIFIED_HISTORY，不修改 snapshot、不触发或清除 divergence
   - identity、digest、manifest、ledger 或 ancestry 不一致时报告 SOURCE_DIVERGED，保持 last-known-good canonical 为读写权威
   - 完成时，VERIFIED_CURRENT、VERIFIED_HISTORY、SOURCE_DIVERGED 的转换和禁止双向隐式覆盖规则全部可验证
   - _Requirements: 1.9, 2.13, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13_
 
-- [ ] 4. 建立可替换且可核对的候选索引
+- [x] 4. 建立可替换且可核对的候选索引
 
-- [ ] 4.1 实现 FTS5 trigram 快速召回
+- [x] 4.1 实现 FTS5 trigram 快速召回
   - 对已由 fold-v1 生成的索引文本建立内容型 trigram，禁止再次折叠或把 tokenizer 大小写当作产品 Match Case
   - 为长度至少三的查询构造唯一 trigram 候选请求，并保持索引行与 canonical record 同事务
   - 完成时，预折叠输入、索引内容、回滚行为和候选集合通过确定性测试
   - _Requirements: 4.2, 5.3, 5.4_
 
-- [ ] 4.2 实现 1/2/3-gram fallback 与短查询召回
+- [x] 4.2 实现 1/2/3-gram fallback 与短查询召回
   - 一、二字符查询使用对应 posting；无 FTS5 时由 1/2/3-gram union 提供完整 fallback
   - 保持能力选择显式可诊断，并使相同配置的候选阶段顺序稳定
   - 完成时，短查询、纯 CJK 和禁用 FTS5 环境都能返回非空、可重复、受预算约束的候选集合
   - _Requirements: 4.2, 5.3, 5.4, 7.7_
 
-- [ ] 4.3 合并候选阶段、预算与召回证据
+- [x] 4.3 合并候选阶段、预算与召回证据
   - 对 overlap、union、去重、稳定预排序和截断逐阶段记录可守恒计数，输出索引路径与候选预算
   - 使用版本化预算限制候选，并保持召回层只返回候选身份，不承担最终 CAT 相似度排序
   - 把 canonical record、FTS 和 gram posting 写入接到同一事务，在每个索引阶段注入失败验证整体回滚
   - 完成时，两条路径的阶段元数据可完整对账，候选顺序不受底层 SQL 返回顺序影响，record/index 不会半提交
   - _Requirements: 4.2, 4.7, 5.3, 5.4, 7.4, 7.7, 8.7_
 
-- [ ] 5. 实现迁移、封存、原子激活与恢复
+- [x] 5. 实现迁移、封存、原子激活与恢复
 
-- [ ] 5.1 实现流式 JSONL 预检和幂等迁移计划
+- [x] 5.1 实现流式 JSONL 预检和幂等迁移计划
   - 在改动资源前计算 SHA-256，并报告有效、无效、重复 source、可保留变体及逐行安全诊断
   - 流式处理大型 JSONL，预先检查输入可读性、sidecar 条件、资源身份、目标可写性和已有 completed batch
   - 完成时，损坏行、摘要变化、不可写目标和重复同 digest 均在任何激活前得到确定结果
   - _Requirements: 2.1, 2.2, 2.5, 2.6, 7.14_
 
-- [ ] 5.2 构建完整 mutable stage
+- [x] 5.2 构建完整 mutable stage
   - 在同目录新工作副本中按输入顺序写入 records、origin batches、全部候选索引、snapshot receipt 和 temporary manifest
   - 保留相同 source 的所有变体，不折叠或覆盖历史；同 digest 安全重试复用已完成结果
   - 完成时，尚未 sealed 的 stage 已具备记录/索引/receipt/manifest 全量内容，且记录数、顺序和逐字段内容与接受输入一致
   - _Requirements: 1.2, 1.9, 2.2, 2.3, 2.6, 3.1, 3.2, 3.3_
 
-- [ ] 5.3 校验、关闭并封存不可变 artifact
+- [x] 5.3 校验、关闭并封存不可变 artifact
   - 在 mutable stage 上完成 integrity、foreign key、record/index count、exact parity、资源身份、来源绑定、版本和 digest 校验
   - 关闭全部连接并 fsync 数据库、temporary manifest 与 parent 后，才登记 opaque artifact 并产生单次 sealed stage
   - seal 后任何文件变化、registry/ref 不一致、错资源、错目标或 stale generation 均必须拒绝
   - 完成时，未闭合索引的工作副本无法 seal，已 seal artifact 无法继续写入或以裸路径激活
   - _Requirements: 2.3, 2.4, 2.9, 7.5, 7.14_
 
-- [ ] 5.4 建立 Gate B canonical physical readiness
+- [x] 5.4 建立 Gate B canonical physical readiness
   - 汇总 schema/runtime、迁移、完整候选索引、sealed evidence、来源绑定和 exact parity 证据
   - 未闭合索引、错 binding、无效 artifact 或 parity 失败都使 Gate B fail-closed，不允许进入激活
   - 完成时，Gate B 证据可独立重算，且只证明待激活版本完整，不提前发布 generation
   - _Requirements: 1.1, 1.2, 2.3, 2.9, 7.5, 7.14_
 
-- [ ] 5.5 实现唯一协调器的激活准备与排空
+- [x] 5.5 实现唯一协调器的激活准备与排空
   - 仅在 Gate B 通过后接受登记且未消费的 sealed stage，并从证据生成绑定同一 artifact 的单次 token
   - 排空旧 lease，复核 prior generation、资源、目标、DB/manifest digest 和 source binding，并在修改资产前形成恢复备份
   - 完成时，token 重用、nonce 重放、过期 generation、错资源和 drain 失败都在 replace 前被拒绝
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
   - _Depends: 5.4_
 
-- [ ] 5.6 实现 durable activation journal
+- [x] 5.6 实现 durable activation journal
   - 在任何替换前持久化 PREPARED，并为 DB_REPLACED、MANIFEST_PUBLISHED、GENERATION_PUBLISHED 定义单调阶段转换
   - 每个阶段落盘并 fsync，journal 与 token、nonce、artifact、new/prior receipt 和 manifest digest 必须一致
   - 完成时，重放、错配或已消费 token 无法推进 journal，正常路径留下可恢复的逐阶段证据
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.7 实现 DB/manifest 成套替换与 generation 发布
+- [x] 5.7 实现 DB/manifest 成套替换与 generation 发布
   - 只有 PREPARED 已持久化后才替换 DB、fsync parent、重开并校验 schema/digest/integrity/foreign key/count，再推进 DB_REPLACED
   - DB 验证后发布 receipt 与 manifest 并推进 MANIFEST_PUBLISHED，全部复核成功才发布 generation 并推进最终阶段
   - 完成时，并发查询和保存只观察切换前或切换后的完整版本，不出现空白、混合或过渡性版本
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
 
-- [ ] 5.8 实现同一 activation token 的幂等完成恢复
+- [x] 5.8 实现同一 activation token 的幂等完成恢复
   - 重启后复核新 DB、receipt、manifest、journal 与 token；只有全部匹配才从当前 phase 幂等继续
   - PREPARED 可安全取消，DB_REPLACED 可继续发布 manifest，MANIFEST_PUBLISHED 可发布唯一 generation
   - 完成时，各 phase 的同 token 重放只产生一个 generation，已完成 token 不可再次消费
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.9 实现不一致 activation 的成套回滚
+- [x] 5.9 实现不一致 activation 的成套回滚
   - 新资产任一复核失败时同时恢复 prior DB 与 prior manifest/binding，fsync parent 并重新执行健康校验
   - 首次激活失败且没有 prior canonical 时隔离未发布资产并继续原 JSONL；已有 canonical 时继续 last-known-good generation
   - 完成时，各 journal phase 的不一致注入都恢复一个完整可查询/可保存版本，DB 与 manifest 不会跨代
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.10 实现显式 import 与 rebuild 消歧
+- [x] 5.R1 收束 activation/recovery 模块边界
+  - 在 5.9 闭合完整恢复矩阵后，将 journal/terminal codec、durable file protocol 与逐 phase completion/rollback 从 `tm_sqlite_store.py` 提取到设计指定模块；coordinator 只经窄 store-validation port 编排
+  - 保持既有 `ResourceStoreCoordinator` 导入入口、journal phase、错误码、token/nonce 单次语义、fault-injection 顺序和 public lease/activation 行为，不夹带功能修改，也不拆分 `tm_contracts.py` 或 `tm_stage_sealer.py`
+  - 用移动前后的同一 Cluster D characterization/failure matrix、二次冷启动、架构依赖守卫和全量回归证明等价；测试文件不设行数限制，已有 `test_tm_*` 继续作为行为权威
+  - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
+  - _Depends: 5.9_
+
+- [x] 5.10 实现显式 import 与 rebuild 消歧
   - 已激活资源的显式 import/rebuild 通过 fresh mutable stage、完整索引、seal 与同一协调器切换
   - 仅完整验证和激活成功才清除 SOURCE_DIVERGED；失败保持 canonical、原 JSONL、manifest 与 divergence 不变
   - 完成时，成功消歧产生新 generation，失败路径不改变三方资产且 last-known-good canonical 继续服务
   - _Requirements: 2.13, 7.5, 7.12, 7.13, 7.14_
 
-- [ ] 5.11 实现 schema upgrade 的复制切换
+- [x] 5.11 实现 schema upgrade 的复制切换
   - 升级先创建一致快照备份，再在 fresh mutable copy 中迁移 schema、重建完整索引并复用 seal/activate
   - 不原地破坏唯一可用副本，保存升级前后版本、generation 与恢复证据
   - 完成时，成功升级产生等价新 generation，每个失败阶段都能重开旧 schema
   - _Requirements: 2.4, 2.9, 2.11, 7.5, 7.14_
 
-- [ ] 5.12 实现任意路径兼容 JSONL 导出
+- [x] 5.R2 收束 schema upgrade 模块边界
+  - 在 Cluster E 行为与故障矩阵闭合后，将 v1→v2 copy 数据面、backup/locator pending→reported 持久化协议、strict locator file proof 与纯候选事实校验提取到设计指定模块
+  - coordinator 继续独占 ticket/locator snapshot、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService` 继续编排公开 schema-upgrade 成败流程
+  - 保留原导入入口、错误码、分支/cleanup/fault-injection 顺序和磁盘效果；不拆分 `tm_contracts.py` 或 `tm_stage_sealer.py`，不夹带异常分支简化或功能修改
+  - 用移动前后的同一 Cluster E failure/interleaving matrix、public API 契约、依赖方向守卫、basedpyright 和 fresh 全量回归证明等价；测试文件不设行数限制
+  - _Requirements: 2.4, 2.9, 2.11, 7.5, 7.14_
+  - _Depends: 5.11_
+
+- [x] 5.12 实现任意路径兼容 JSONL 导出
   - 按 canonical record identity 顺序向调用方选择的非配置路径导出完整 variants、上下文和 provenance，并生成 receipt 与 adjacent manifest
   - 使用 temporary file、file fsync、atomic replace、directory fsync、manifest publish 的显式协议
   - 不修改活动 snapshot binding、不清除 SOURCE_DIVERGED；导出目标后续损坏不影响活动资源状态
   - 完成时，export→migrate 的逐字段、变体和 exact winner parity 通过，报告绑定 canonical revision 与 snapshot receipt
   - _Requirements: 2.3, 2.7, 2.8, 2.13, 3.1, 3.2, 3.3, 7.10, 7.11_
 
-- [ ] 5.13 实现配置 JSONL 快照刷新发布
+- [x] 5.13 实现配置 JSONL 快照刷新发布
   - 只允许未 diverged 资源显式刷新配置 JSONL；先生成并验证 JSONL/manifest temporary pair，再提交 issued receipt
   - 按 JSONL replace、parent fsync、manifest replace、parent fsync、binding completed 的顺序发布
   - 完成时，成功刷新产生一致的 JSONL/manifest/ledger completed pair，且不改变 canonical records
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 5.14 实现配置快照 refresh 崩溃恢复
+- [x] 5.14 实现配置快照 refresh 崩溃恢复
   - issued receipt 对应旧 completed pair 时取消，JSONL 已替换但 manifest 未发布时由 ledger 重建 manifest
   - 未闭合 pair 不得报告成功；与 completed/issued ledger 均不一致时进入 SOURCE_DIVERGED，不回滚 canonical revision
   - 完成时，每个刷新阶段的失败注入都保持旧 completed pair、发布一致新 pair或明确进入 divergence
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 6. 接入 physical canonical 与现有兼容入口
+- [x] 5.R3 收束 snapshot artifact 模块边界
+  - 在 Cluster F 发布/恢复状态机、命名空间故障矩阵和 mutation-proof ledger 闭合后，将 deterministic artifact family、no-follow parent dirfd、strict identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码提取到设计指定模块
+  - `TMMigrationService` 仍独占公开 export/refresh 编排和 outcome，`tm_snapshot_recovery.py` 仍独占 receipt reconciliation/terminal replay/divergence 决策，`tm_sqlite_store.py` 仍独占 ledger/binding SQL、transaction、generation 与 coordinator 状态；新模块不反向导入三个 owner
+  - 保留原导入入口、错误码、late-bound fault seam、mutation/清理顺序、durable handoff 生命周期、交易边界与磁盘效果；不夹带异常分支简化、公开 API 改写或 `tm_contracts.py`/`tm_stage_sealer.py` 拆分
+  - 用移动前后同一 Cluster F failure/interleaving matrix、mutation-proof ledger、public API 契约、依赖方向守卫、basedpyright 和 fresh 全量回归证明等价；不设生产或测试文件行数目标
+  - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
+  - _Depends: 5.14_
 
-- [ ] 6.1 接入 canonical import seam 并保持资源配置身份
+- [x] 6. 接入 physical canonical 与现有兼容入口
+
+- [x] 6.1 接入 canonical import seam 并保持资源配置身份
   - 已激活资源按验证后的输入顺序直接写入 canonical，不先修改 JSONL、不折叠相同 source；未激活资源保留既有原子 JSONL 路径
   - 普通 canonical merge import 不修改 snapshot binding，也不清除或触发 SOURCE_DIVERGED
+  - import 推进 head revision 后，fresh process 必须从同一 canonical lineage 重开并观察 `VERIFIED_HISTORY`；不得把快照落后误判为 activation 损坏或回退 JSONL
+  - 同 digest 重复 import 必须给出确定的幂等结果，不新增变体，且不影响之后的 fresh canonical reopen
   - 配置入口继续指向原 JSONL，sidecar 保持 deterministic adjacent path，Active/Lookup/Update 选择迁移前后不变
   - 不改变 Parser、TMX context mapping、Glossary 或 Qt 语义
   - 完成时，同一导入批次在两种激活状态下都保持顺序、资源身份、选择状态和明确回退行为
-  - _Requirements: 1.2, 1.4, 1.5, 1.9, 3.1, 3.2, 3.7, 7.1, 7.2, 7.3, 7.7_
+  - _Requirements: 1.2, 1.4, 1.5, 1.9, 2.13, 3.1, 3.2, 3.7, 7.1, 7.2, 7.3, 7.7_
 
-- [ ] 6.2 切换 Legacy exact 查询与受控保存
+- [x] 6.2 切换 Legacy exact 查询与受控保存
   - physical gate 与 exact parity 通过后，legacy exact/save 适配使用 canonical；未激活或首次迁移失败仍保持 JSONL 兼容
   - facade 不向旧调用约定注入 context/fuzzy；只有 Active+Update 且 generation 稳定时允许保存
   - SOURCE_DIVERGED 期间 Lookup/Update 继续使用 canonical，成功保存不修改 JSONL、不清除 divergence
-  - 完成时，成功保存、拒绝保存、事务回滚、generation 变化和 divergence 矩阵的 exact winner 均符合预期
+  - 进程重开时重放 never-activated、cancelled-first、`VERIFIED_CURRENT`、`VERIFIED_HISTORY`、`SOURCE_DIVERGED` 与 unhealthy/ambiguous artifact 矩阵；前两者之外不得回退 JSONL
+  - 完成时，成功保存、拒绝保存、事务回滚、generation 变化、冷重开和 divergence 矩阵的 exact winner 均符合预期
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.3, 2.11, 2.12, 2.13, 7.5, 7.6, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 6.3 保持 LogicController 与 Excel 三态兼容
+- [x] 6.3 保持 LogicController 与 Excel 三态兼容
   - 保持 TM_HIT、TERMS_FOUND、NO_MATCH 三态和字段含义，不新增 context/fuzzy 第四态
   - 保持 exact 未命中后先查术语、再返回 NO_MATCH，以及既有资源优先级和 Excel 输出
   - 在不修改 Qt 控件或产品逻辑的前提下验证 sidecar 激活前后同输入 parity
   - 完成时，controller、Excel 与现有 Core 自检保持通过，不把 Qt journey 纳入本规格实现范围
   - _Requirements: 1.6, 1.7, 1.8, 6.10_
 
-- [ ] 7. 实现确定性 exact、context 与 fuzzy 检索
+- [x] 7. 实现确定性 exact、context 与 fuzzy 检索
 
-- [ ] 7.1 实现 exact winner 与 raw context 分类
+- [x] 7.1 实现 exact winner 与 raw context 分类
   - exact 仅使用 raw source 完全相等，winner 保持同资源最后有效记录；其他同 source 变体仅在存在正面 raw context 证据时分类为 CONTEXT
   - context-v1 只比较双方非空的 speaker/previous/next 原始完整字段，保持大小写和空白敏感，不伪造缺失事实
   - 完成时，EXACT→CONTEXT 类型、context strength 和 retained-only 变体黄金向量逐项一致
   - _Requirements: 1.1, 1.2, 1.3, 3.3, 3.4, 3.5, 3.6, 4.1, 4.2, 4.3_
 
-- [ ] 7.2 实现 fuzzy 评分、阈值和显式选择安全
+- [x] 7.2 实现 fuzzy 评分、阈值和显式选择安全
   - 从有界候选中批量读取 canonical records，使用两个分项和最终平均分，保留查询 source 与实际 matched source
   - 在排序和 limit 前应用 minimum similarity，按记录身份去重，并拒绝缺失 source/target/有效分数的建议
   - 查询只返回候选 target，不执行自动应用、确认或持久化副作用
   - 完成时，阈值边界、双 source、重复记录、limit 和无写副作用测试全部通过
   - _Requirements: 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
 
-- [ ] 7.3 聚合多资源稳定顺序与部分失败
-  - 只为 Active+Lookup 资源获取查询 lease，Lookup 不授予写权限，Update 不授予查询权限
+- [x] 7.3 聚合多资源稳定顺序与部分失败
+  - 只为 Active+Lookup 资源获取且只获取一次查询 lease；同资源的 health、raw exact、candidate recall 与 candidate record 批量读取共享一个只读 generation view，任一步失败不得用新 lease 拼接局部结果
+  - Lookup 不授予写权限，Update 不授予查询权限；query view 不暴露 append、export、activation 或 update 端口，退出 lease 后立即失效
   - 按 EXACT、CONTEXT、FUZZY，最终分数、context strength、调用方资源顺序和稳定记录身份排序
   - 单资源失败不丢弃其他资源结果，并保留每条结果的资源、批次和 provenance
   - global limit 只在跨资源聚合后应用，最终资源元数据在评分/过滤/limit 后填入 scored 和 returned count
   - 完成时，置换底层执行顺序不改变结果、失败列表、provenance 或阶段计数
   - _Requirements: 1.4, 3.2, 3.7, 4.1, 4.2, 4.3, 4.5, 4.7, 5.3, 5.4, 7.4, 7.7_
 
-- [ ] 7.4 建立 CONTEXT 与 FUZZY 独立可用性
-  - physical canonical 激活只开放 exact/save；raw context correctness 证据单独开放 CONTEXT，oracle/benchmark 证据单独开放 FUZZY
-  - 明确区分“能力可用但本次无命中”和“能力门未开放”，并提供稳定 unavailable code
-  - CONTEXT 或 FUZZY 失败不得撤销 canonical authority、exact/save 或另一项已验证能力
-  - 完成时，能力组合矩阵中的 QueryReport 和 health 状态与门禁证据一致
+- [x] 7.4 建立 CONTEXT 与 FUZZY 独立可用性
+  - 新增独立 retrieval capability evaluator/publisher；SQLite store 只报告 physical/canonical health，Retrieval 在内存中用整次 query 唯一不可变 capability snapshot 组合 query-effective availability
+  - CONTEXT、fuzzy-core correctness、FTS5_TRIGRAM Gate D 和 GRAM_FALLBACK Gate D 独立决定；FUZZY 仅在 fuzzy-core 与本次 intended execution path 同时开放时执行
+  - 门关闭时不得读取 candidate/records/scorer，返回 intended path、空阶段和 evaluator stable unavailable code；门开放但零命中时 available 为 true 且 code 为空
+  - publisher 只接受精确 evaluator/manifest 值并在锁内原子 refresh；任意 callback、自报 passed、store diagnostic 或调用方布尔值不能授予能力
+  - CONTEXT 或任一 FUZZY path 降级不得撤销 canonical authority、exact/save 或另一项已验证能力；跨资源在途查询不混用 refresh 前后快照
+  - 完成时，closed/open/zero-hit、双 path、refresh race、真实 ACTIVE-store journey、依赖方向和无写副作用矩阵全部通过
   - _Requirements: 4.6, 4.7, 7.4, 7.5, 7.7, 8.7_
 
-- [ ] 7.5 建立 Gate C retrieval correctness
-  - 分别汇总 raw context 分类、candidate 阶段计数、fuzzy 评分排序、事务回滚、局部失败和 global limit 证据
-  - CONTEXT correctness 与 FUZZY oracle/benchmark 使用独立子门；未通过时只关闭对应查询类型
-  - 完成时，Gate C 的每项证据可重算，且不会撤销 Gate B 已发布的 canonical exact/save
+- [x] 7.5 建立 Gate C retrieval correctness
+  - 在独立 `tm_retrieval_validation.py` 中以固定 cohort/fixture/build/semantics/evaluator digest 重跑纯验证入口并生成 manifest；fixture codec、向量执行和 observed digest 不进入 capability publisher 模块
+  - approved roots 可覆盖 evaluator/build 文件自身；禁止把 observed digest 回填为被哈希生产模块的默认常量。默认无 evidence publisher 保持 fail-closed，外层 composition root 只用 validation release 的 exact expectation/manifest 构造并注入 evaluator/publisher
+  - service cohort 只可在 validation 函数内用 approved expectation 与已重算的 CONTEXT evidence 构造不返回、不持久化且 fuzzy/Gate D 关闭的 harness publisher；完整 transcript 之后才计算 fuzzy-core digest，禁止用最终 evidence 自授权同一次重放
+  - 分别汇总 raw context 分类和 fuzzy-core 的 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据
+  - evaluator 重新计算每个 vector/cohort 的实际结果，拒绝仅凭 manifest 自报 passed、未知/重复 cohort、过期、version/digest mismatch 或不完整证据开放能力
+  - CONTEXT correctness 通过即可独立开放；fuzzy-core correctness 通过只满足 FUZZY 的 Gate C 前提，Task 8.4/8.5 发布对应 execution path 的 oracle/benchmark evidence 前 FUZZY 仍保持关闭
+  - refresh 可使任一子门独立开放或降级；在途 query 保持旧快照，新 query 使用新快照，且任何降级都不撤销 Gate B canonical exact/save
+  - 完成时，每项 Gate C evidence 都可从固定输入重算，能力矩阵与 opaque summary/稳定 unavailable code 一致且不泄漏 source/target 正文
   - _Requirements: 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 7.4, 7.5, 8.7_
 
-- [ ] 8. 建立 Gate D benchmark-v1
+- [x] 8. 建立 Gate D benchmark-v1
 
-- [ ] 8.1 (P) 生成确定性 100k 与 oracle 语料
+- [x] 8.1 (P) 生成确定性 100k 与 oracle 语料
   - 固定种子生成 100000 条记录、至少 1000 个 exact 查询、至少 200 个 fuzzy 查询
   - 另生成固定 5000 条、200 查询的全扫描 oracle，阈值 0.60、limit 10
   - 完成时，相同版本与种子产生相同 corpus、cohort 和 oracle digest
@@ -285,51 +319,99 @@
   - _Boundary: TMBenchmark Corpus_
   - _Depends: 1.5, 2.1_
 
-- [ ] 8.2 实现 exact/fuzzy 延迟测量运行器
+- [x] 8.2 实现 exact/fuzzy 延迟测量运行器
   - 每个 cohort 预热 100 次，以 nearest-rank 计算 p95，并保留可重算的原始逐查询样本
   - 分别执行 FTS5 与 fallback，记录运行环境、能力、索引路径、查询数量和统计口径
   - 完成时，固定原始样本可重算 warm exact 与 fuzzy top-10 的 p50/p95/max
   - _Requirements: 8.1, 8.2, 8.5, 8.6_
+  - _Boundary: TMBenchmark Latency_
 
-- [ ] 8.3 实现隔离迁移与 RSS 测量运行器
+- [x] 8.3 实现隔离迁移与 RSS 测量运行器
   - 在独立子进程中测量从启动到完成的峰值 RSS，迁移计时包含 parse、insert、索引、校验、fsync、激活和 reopen
   - 排除预生成 fixture 成本，并记录两条索引路径的环境与原始样本
   - 完成时，固定样本可重算报告中的迁移耗时和峰值 RSS
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6_
+  - _Boundary: TMBenchmark Process/RSS_
 
-- [ ] 8.4 实现全扫描 oracle 与召回硬门
+- [x] 8.4 实现全扫描 oracle 与召回硬门
   - 对阈值以上集合和真实 top-10 与固定全扫描 oracle 比较，逐查询报告缺失 candidate identity
   - FTS5 与 fallback 分别核对，任一遗漏都把对应 candidate recall gate 标记失败
   - 完成时，两条路径都有可重算的 recall 报告，只有 100% 才允许进入 fuzzy 性能发布门
   - _Requirements: 4.2, 5.3, 5.4, 8.7_
+  - _Boundary: TMBenchmark Oracle_
 
-- [ ] 8.5 执行 fast/fallback 性能硬门并发布 Gate D
+- [x] 8.5 执行 fast/fallback 性能硬门并发布 Gate D
   - 两条路径分别验证 warm exact p95≤50 ms、fuzzy top-10 p95≤500 ms、迁移≤120 s、峰值 RSS≤512 MiB、recall=100%
+  - 迁移 child 退出后，查询 child 只能按已重验的 artifact identity/digest 重开同一 canonical store；两进程峰值 RSS 取较大值，可移植 evidence bundle 不发布临时绝对路径或 PID
   - 任一配置或指标失败时报告超限项并保持对应 FUZZY capability 关闭；成功路径不得掩盖失败路径
   - matcher BASIC/TEXT_V1 只按 matcher evidence 发布，不受 fuzzy benchmark 成败推断
   - 完成时，报告对每条索引路径和每个能力门给出独立 PASS/FAIL，且失败不撤销 canonical exact/save
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
+  - _Boundary: TMBenchmark Gate D_
 
-- [ ] 9. 完成故障、边界与 86 条验收
+- [x] 8.6 固化 scorer 完备性上界与 proof index（v16 重开）
+  - 在 record/index 同事务保存 folded length、字符/bigram multiset term frequency 与固定 block 的保守 summary，并为 scorer-v1 冻结可独立验证的分数上界公式
+  - 上界必须覆盖长度差、字符 multiset、bigram multiset 差异与 folded code-point exact LCS 顺序下界；query-time LCS 只收紧 Levenshtein 距离下界，不计算编辑距离/final score、不建立 scorer 等价类，任何 summary 或 ordered refinement 低估、缺行、重复、乱序或计数不守恒均 fail-closed
+  - 保持 `candidate-budget-v1` 不变，不使用 oracle identity、固定类别或扩大窗口证明完备
+  - v16 先在已提交的完整 ordered fold projection 上为全部 `R` 形成 U3；仅当当前 completion policy 经 U3-best 真实 scorer batch 后仍未闭合时，才对残余逐 identity 惰性计算 query-derived balanced partition 的 partition-additive exact LCS 下界并形成 `U4/P3`。`m>1` 时 `p=min(m-1,ceil(3m/5))`，禁止逐 code-point 全分区、Levenshtein、final score、scorer 调用或等价类授权
+  - 完成时，穷举与固定 Unicode 随机向量证明 `真实分数<=U4<=U3<=U2<=U1`；schema/append/migration/upgrade 的 index parity、ordered projection binding 与事务回滚全部闭合，不增加持久 schema/index
+  - _Requirements: 4.2, 4.7, 5.2, 5.3, 8.2, 8.7_
+  - _Boundary: Candidate Proof Index_
 
-- [ ] 9.1 执行迁移与激活故障矩阵
+- [x] 8.7 实现有界 proof/scorer 查询流水线（proof-query-v3）
+  - 在单一 generation view 内按 block/record 上界 best-first 取小批量，真实 scorer 与 proof state 交替推进；production 只有证明 threshold 全集闭合，或 threshold-qualified 真实 top-k 已闭合才可返回，Oracle 则要求 threshold 与无阈值真实 top-k 两项全局闭合
+  - `proof-query-v3` 分开守恒 all-accounted identity、raw-distinct FUZZY ranking identity 与 exact-fold scorer invocation class；仅由 Retrieval 对 health-validated record 的完整 `fold-v1` 相等建立 query-local scorer 复用类，一类只执行一次真实 scorer-v1，identity fan-out 仍独立保留 target/provenance/tie 且不得由 hash、gram、调用方或注入 scorer 伪造
+  - 稀疏 frontier 保留 block best-first；当 block maxima 或低分 top-k 前沿退化为密集扫描时，phase 1 在一个短只读事务内用长度与精确 bigram 交集生成严格保守 `U1`，提交后先评分足以建立真实 kth 的前缀，再由 session 以 threshold/kth 双义务确定唯一精化集 `R`；phase 2 重新绑定同一 generation/head/count/query/index facts，仅为严格有序的 `R` 取得 private `record_id/source_fold_v1/length` 投影并以 exact LCS 生成 `U3`，两个事务均不得跨 scorer callback，禁止 per-block connection/count avalanche
+  - 完整 `R` 的 U3 pass 必须先于任何 phase-2 后 scorer；随后按 `(U3 DESC,record_id DESC)` 取不超过 32 个 identity 的真实 scorer batch。production 可在 U3 严格 threshold 排除，或真实 threshold-qualified raw-distinct kth 严格支配剩余 U3 frontier 时直接闭合；Oracle 的 P2 必须同时闭合 threshold 与 top-k，未闭合残余才逐 identity 计算 U4并继续 scorer
+  - 以 `phase=DENSE_COMPLETE` 冻结并严格校验 `真实分数<=U4<=U3<=U2<=U1`、`total=A0+P1+R`、`R=P2+S`、`S=A1+P3`、`accounted=A0+A1`、`unscored=P1+P2+P3`、`request=returned=R` 与 `P3<=u4_evaluated<=S`；P2 未计算 U4 且仅由 U3 严格排除，A1 可来自 U3 probe 或 U4 后评分，最终 frontier 精确混合 P1/U1、P2/U3、P3/U4。禁止 bigram/component heuristic，拒绝精化 identity 缺失、重复、乱序、额外项、binding 伪造及 phase 前中后的 append race
+  - `proof-query-v3` 严格分离 all-accounted identity、raw-distinct FUZZY ranking identity 与 exact-fold scorer invocation class；同 fold 的 raw-distinct peers 逐 identity 参与 `(score,record_id)` 排名，只有 scorer 调用可复用，observe 必须整批预验且超过 2048 不得部分变更
+  - production 仅在 threshold 全闭合，或至少已有 k 个 raw-distinct threshold 合格 identity 且真实 kth 严格支配全部未评分 U1/U3/U4 frontier 时闭合；Oracle 仍要求 threshold 与 top-k 两项全局闭合。Retrieval 必须从 health-validated raw snapshot 独立派生 eligibility 并复算闭合，拒绝 session/caller/injected scorer 自报
+  - 单资源真实 scorer-v1 调用达到 candidate budget 仍不能闭合时，以 `CANDIDATE.PROOF_BUDGET_EXHAUSTED` 局部失败，不影响其他资源、exact、CONTEXT 或 save
+  - FTS5 与 fallback 分别执行各自 seed path 并共享同一 proof closure；fallback seed 对全部 unique query grams 以确定性分配读取最多 4096 条真实 postings，仅作路径/诊断，不执行全库 record-major 聚合也不授权 completeness；禁止 candidate/caller 全量物化 record payload、重复评分或自报 completeness，只允许 store-owned、generation-bound 的 proof-only ordered folded-source 投影留在 private bound API 内
+  - 完成时，5k oracle threshold/top-10 两项义务均为 100%，12-query/27-identity 旧遗漏与 9 条 U3 budget near-edit 成为回归用例；100k 重复源反例在 `oracle_full` 以 300 个 exact fold/scorer 调用闭合 3000 个 identity，并另证 production conditional 只在真实 top-k 已闭合时安全提前结束，全部 240 条 frozen query 均在 2048 次调用内闭合；query 1/61/short/q183/q226/q240 的 production-shaped cheap gate 各至少取 20 个 warm 样本且内部 p95 约束不高于 400 ms，为冻结的 500 ms Gate D 留出裕量，阶段/proof/最终元数据逐项守恒
+  - _Requirements: 4.1, 4.2, 4.4, 4.5, 4.7, 5.1, 5.2, 5.3, 8.2, 8.7_
+  - _Boundary: Candidate Proof Query_
+  - _Depends: 8.6_
+
+- [x] 8.8 建立 sealed/active 内容证明链并压缩迁移重复扫描
+  - fresh stage 只在新建路径执行一次完整语义校验；seal 在同一事务流式闭合 parity/index、完整 candidate projection digest、closure 与 SEALED marker，commit+fsync 后在同一只读 snapshot 对最终 sealed bytes 执行唯一完整 integrity check，并重算 projection digest/closure、终端 rehash 同一 database proof，生成绑定 SHA-256、inode、版本、计数和 closure 的 sealed attestation；原子 rename 后只有 exact sealed inode+SHA 可复用该 integrity 事实，active receipt 后的全量 semantic 重算不变
+  - registry 的 reservation/commit/release 与 token lifecycle 只保留在 coordinator/StageSealer 私有 adapter，对外仅暴露 exact read-only readiness view；私有 commit 只消费 StageSealer 在 post-fsync content↔semantic epoch 闭合后铸造并绑定 exact registry+reservation 的单次 capability，拒绝 caller 分别注入 mutable stage/evidence/generation/attestation、普通 dataclass、跨 reservation 与 replay
+  - 保留两次 Gate B、drain、replace、parent fsync、四阶段 journal、reopen 与 cold recovery；immutable 阶段以 no-follow pre/post identity + 完整 rehash 复证，不以缓存布尔值或 stat 元数据授权
+  - active receipt/meta 合法写入后执行一次完整 active-set 校验并持久化 active attestation；后续 phase 仅在 exact bytes/inode/journal facts 相等时复用，漂移仍 rollback/fail-stop
+  - 完成时，authority 与 candidate projection 的 same-inode/same-row-count mutation、同字节换 inode、attestation 缺失/损坏/过期、各 phase crash 与 prior-generation 保全矩阵全绿，迁移仍包含 parse/insert/index/validate/fsync/activate/reopen
+  - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14, 8.3, 8.7_
+  - _Boundary: Migration Content Attestation_
+  - _Depends: 8.6, 5.R1_
+
+- [x] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
+  - 先在固定 5k oracle 重算 threshold 集与真实 top-10 完备性，再在真实 100k 上分别执行 FTS5_TRIGRAM 与 GRAM_FALLBACK 的迁移、query child 和 portable evidence bundle
+  - 不改变 scorer、threshold、top-k、candidate budget、corpus/cohort/seed/digest、硬门或迁移阶段口径；失败路径不得被成功路径掩盖
+  - 完成时，两条路径独立达到 recall=100%、exact p95≤50 ms、fuzzy p95≤500 ms、migration≤120 s、RSS≤512 MiB，Gate D evidence 可严格回读与重算
+  - _Requirements: 4.2, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.5, 9.12_
+  - _Boundary: Gate D Remediation Evidence_
+  - _Depends: 8.7, 8.8_
+
+- [x] 9. 完成故障、边界与 86 条验收
+
+- [x] 9.1 执行迁移与激活故障矩阵
   - 覆盖损坏输入、record/index/commit/fsync 失败、并发 lease、busy timeout、token 重放及四个 journal phase 崩溃
   - 完成时，每个故障都有稳定证据，原 JSONL、last-known-good canonical 和 matching manifest/binding 按规则保持或成套恢复
   - _Requirements: 2.4, 2.5, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14_
 
-- [ ] 9.2 执行 snapshot 与 divergence 故障矩阵
+- [x] 9.2 执行 snapshot 与 divergence 故障矩阵
   - 覆盖 export DB/JSONL/manifest crash、外部 JSONL 变化、正常 canonical 写入和 receipt/manifest/ledger/ancestry 错配
+  - 重放 snapshot mutation-proof 负空间：ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节/异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失/损坏与 terminal replay 幂等
   - 覆盖显式 import/rebuild 成败、schema upgrade 失败和配置快照 refresh 恢复
-  - 完成时，只有验证并激活成功的显式消歧会清除 divergence，其他路径均保持三方资产与 canonical authority
+  - 完成时，只有验证并激活成功的显式消歧会清除 divergence，其他路径均保持三方资产、durable replay 证据与 canonical authority，外来 inode 不被删除或覆盖
   - _Requirements: 2.4, 2.8, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
-- [ ] 9.3 执行 matcher、context、fuzzy 与元数据证据矩阵
+- [x] 9.3 执行 matcher、context、fuzzy 与元数据证据矩阵
   - 覆盖 matcher 三态、证据过期/版本错配、用途×选项、single-snapshot race 和无正文诊断
   - 覆盖 same-source context vectors、candidate union/dedupe/truncate、global limit、部分资源失败和能力未开放
   - 完成时，matcher、CONTEXT、FUZZY 互不冒充，召回元数据与最终资源元数据逐阶段守恒
   - _Requirements: 3.4, 3.5, 4.1, 4.2, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 9.4 执行兼容回归与架构守卫
+- [x] 9.4 执行兼容回归与架构守卫
   - 重新运行 legacy exact/save、资源优先级、LogicController、Excel formatter 与现有 Core 自检
   - 检查无网络、账号、telemetry、凭据或外部服务依赖，并验证每资源隔离、WAL/extension loading 关闭
   - 禁止 Core 导入 Qt 或改变 Parser/TMX/Glossary 职责
@@ -337,13 +419,13 @@
   - 完成时，既有回归零失败且所有依赖方向守卫通过
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.7, 9.10, 9.12_
 
-- [ ] 9.5 对照全部验收标准完成发布门
+- [x] 9.5 对照全部验收标准完成发布门
   - 将 9 项需求的 86 条验收标准逐项关联到最新自动测试、故障证据、oracle 或 benchmark 报告
   - 任一证据缺失、失败、过期或版本不一致时保持对应能力未完成，不宣告 Feature GO
   - 完成时，86/86 覆盖矩阵均指向具体、可重算且版本一致的验证入口
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 9.6 执行完整发布验证
+- [x] 9.6 执行完整发布验证
   - 重新执行核心套件、迁移/导出往返、激活恢复、matcher golden、candidate oracle、fast/fallback benchmark 和兼容回归
   - 核对所有任务勾选、阻断项、设计边界与跨组件集成，失败时保持相应 gate 关闭
   - 完成时，完整测试套件退出码为零、四道门证据为最新状态且不存在未解决阻断项
@@ -361,3 +443,59 @@
 - 2026-07-29 / Task 2.3：实现 Core 内部纯 `TextMatcherV1`，固定 legacy、basic 与 configurable 四组合行为；overlap、NFC/casefold expansion、原文 span 投影去重、稳定排序、原文 UAX #29 Whole Word 过滤及 pure-CJK 连续匹配 tailoring 均由版本化 golden 闭合，且不携带 capability/readiness 权威。独立复审通过；focused 29/29（1,938 subtests）、全量 203/203（2,056 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.4：实现 Core 内部唯一 `MatcherCapabilityEvaluator` 与原子不可变快照 publisher，以独立 basic/full cohort 时间窗闭合 UNAVAILABLE、BASIC_VALIDATED、TEXT_V1_VALIDATED 三态；为忠实表达 full-only 过期降级，内部 evidence schema/manifest codec 升至 v2，旧 v1 严格拒绝且公开 matcher 契约形状不变。第一轮复审拦截多 full cohort 部分缺失误判 UNAVAILABLE 的缺陷，修复为“完整 BASIC + 任意 full 子集”降级语义并加入双 full cohort 矩阵；独立复审第二轮通过；focused 23/23（67 subtests）、全量 211/211（2,080 subtests）、basedpyright 0 errors。
 - 2026-07-29 / Task 2.5：实现唯一公开 `CapabilityGatedTextMatcherV1` 执行端口，每次调用只读取一次不可变 capability 快照，复用冻结的用途/选项矩阵并将 success/rejection、请求摘要和同一快照成套返回；拒绝路径不执行算法且不泄露正文，授权路径只调用一次 `TextMatcherV1`。独立复审连续拦截 evaluator 语义重绑、发布窗口 TOCTOU 与 caller expectation ABA，最终改为 publisher 构造时深复制私有 expectation/evaluator，并在发布锁内二次核对身份、摘要及语义版本，任何漂移均 fail-closed 为 UNAVAILABLE。独立复审第四轮通过；matcher focused 45/45（1,998 subtests）、全量 219/219（2,116 subtests）、basedpyright 0 errors。
+- 2026-08-01 / Task 2.6：建立可重算 Gate A 与独立 matcher release evidence；Gate A 机械盘点完整 `tm_contracts.__all__`、40 成员 codec union 与 `StoreHealth` 能力不变式，各组件输入缺失/畸形只撤销自身授权；matcher 的 BASIC 与 full-only cohort 原始 fixture 字节摘要、派生 transcript 和 UTC 时间窗独立闭合，full-only 缺失、畸形、空白篡改均只降级为 BASIC，BASIC/common evidence 失效才发布 UNAVAILABLE；CLI 按请求的 full/basic 层级 fail-closed。独立复审通过；focused 22/22、全量 248/248、basedpyright 0 errors。
+- 2026-08-01 / Task 3.1：从旧会话未跟踪成果恢复并独立复审 per-resource SQLite schema 与安全连接策略；mutable stage 使用原子保留文件、严格身份/批准 schema digest/对象类型/索引/外键复核，固定 DELETE journal、FULL synchronous、foreign keys、5000 ms busy timeout，关闭 WAL 与扩展加载，并冻结 SQLite 3.51.2、FTS5、Unicode 16.0.0 运行时能力快照。独立复审通过；focused 17/17、全量 259/259（含 Qt smoke）、basedpyright error-level 0 errors。
+- 2026-08-01 / Task 3.2：实现 raw exact winner、完整变体/上下文/provenance 历史以及 migration、local_write、import 的按序事务化追加；candidate 扩展先在事务外生成封闭计划，再由 store 在 origin/record/status/revision 同一事务内写入，真实 SQL、commit 与扩展失败均整体回滚。复审反复暴露的共同根因收束为 caller-owned 值闭包：所有 scalar/nested value 在 fold/hash/compare/connection 前做 exact-type 校验并复制，长期 store handle 重建私有 identity/stage/path 快照而不保留调用方引用；该经验已并入评审集群 v1。最终独立复审与定点复验通过；focused 35/35、全量 277/277（含 Qt smoke）、basedpyright error-level 0 errors。
+- 2026-08-01 / Task 3.3：新增 per-resource `ResourceStoreCoordinator`，所有公开读写在打开线程内短连接前取得绑定 resource、generation 与私有 stage 快照的 operation lease；状态机在 DRAINING 后拒发新 lease，有界排空超时恢复 prior generation，旧连接关闭后才发布完整新 generation。SQLite busy/locked 归一为当前资源的可重试 lifecycle failure，另一资源保持可用；未提前实现 sealed activation、source binding 或 candidate retrieval。集群实现阶段机械验证通过；focused 39/39、全量 281/281（含 Qt smoke）、basedpyright error-level 0 errors，等待 Task 3.4 后执行 Cluster A 统一复审。
+- 2026-08-01 / Task 3.4：实现 leased canonical revision、completed snapshot ledger 与 `SourceBindingMonitor`；严格核对 configured JSONL、deterministic manifest、receipt、resource/canonical identity、digest、record count 和 revision ancestry。正常 local/import append 只推进 canonical revision 并把 CURRENT 变为 HISTORY，不改双文件；任一外部或 ledger 错配锁存 DIVERGED，canonical exact/append 继续权威且修回文件或重开不会隐式清除。completed-binding seam 只登记已发布且与当前 revision 闭合的 pair，不实现 issued/temp/fsync/replace/recovery/clear。集群实现阶段机械验证通过；source/store focused 47/47、全量 289/289（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster A 统一复审。
+- 2026-08-01 / Cluster A 复审：xhigh 累积复审拦截 canonical facts/revision 的 autocommit 混读、drain 窗口 next stage 篡改后误发布，以及 HISTORY 只校验上界的 ancestry 缺口。修正把当前 schema 升至 pre-release v2，以唯一 `completed_revision` 让 batch completion、record count 与 head revision 同事务闭合；所有公开 revision/binding facts 使用单一 read snapshot，divergence latch 以 canonical fingerprint 重核并在事实变化时重试；generation 只在 drain 后重新完成 schema/identity/integrity/FK/ancestry health 验证才发布。原 reviewer 定点复验最终批准；cluster focused 51/51、fresh 全量 293/293（含 Qt smoke）、basedpyright error-level 0 errors。
+- 2026-08-01 / Task 4.1：实现对已由 fold-v1 预折叠文本的 contentful FTS5 trigram 写入计划与 fast recall seam；长度至少三的查询按首次出现顺序生成唯一 code-point trigram，逐个作为转义 phrase 做 OR union，store 在 generation lease 内以参数绑定查询并返回去重稳定 identity。无 FTS 或短查询明确 unavailable，不伪造 gram fallback、budget、阶段 metadata 或最终评分；FTS 行继续通过 Task 3.2 controlled plan 与 origin/record/completed revision 同事务提交和回滚。集群实现阶段机械验证通过；candidate/store focused 47/47、全量 299/299（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.2/4.3 后执行 Cluster B 统一复审。
+- 2026-08-01 / Task 4.2：统一 candidate write plan 在 FTS 配置写入 FTS+唯一 1/2-gram、无 FTS 配置写入唯一 1/2/3-gram，继续由 store 同事务提交。1/2 字符查询只走对应 posting；无 FTS 长查询按 3→2→1 posting union 返回 matched/query overlap evidence，纯 CJK 与 SQL 行序扰动下保持 overlap 降序、record id tie 的确定顺序。caller limit 与 8192 candidate hard cap 共同限流，4096 posting cap 先形成实际执行集合，SQL 与 denominator 只使用同一集合；FTS 长查询显式留给 4.3 合并，不伪造 budget-v1 或阶段账本。集群实现阶段机械验证通过；candidate/store focused 57/57、全量 309/309（含 Qt smoke）、basedpyright error-level 0 errors，等待 4.3 后执行 Cluster B 统一复审。
+- 2026-08-01 / Task 4.3：实现唯一 `CandidateRetriever`，在单一 generation lease + SQLite read snapshot 内按 FTS_TRIGRAM、按需 GRAM_2/GRAM_1，或无 FTS 的 GRAM_3/2/1 执行召回，并从同一 canonical `source_fold_v1` 快照重算 overlap 与长度差。完整构造 frozen `CandidateRetrievalReport`：source stage、UNION、DEDUPLICATE、可选 TRUNCATE 的计数连续守恒，`candidate-budget-v1` 只在 pool 超限时截断，候选按 overlap ratio、source length delta、record id 稳定预排并绑定真实 recall stages/rank；短 query 正确报告 GRAM_FALLBACK，不提前执行 scorer、threshold 或 global limit。集群实现阶段机械验证通过；candidate/store/contract focused 85/85、全量 320/320（含 Qt smoke）、basedpyright error-level 0 errors，进入 Cluster B 统一复审。
+- 2026-08-09 / Task 5.1：实现流式 JSONL 预检，以输入摘要、资源身份、sidecar 前置条件和逐行安全诊断在写入前闭合迁移计划；损坏、摘要漂移、不可写目标与 completed batch 重试均得到确定结果，且诊断不回显正文。
+- 2026-08-09 / Task 5.2：在同目录 fresh mutable stage 中按输入顺序写入完整 records、origin batch、候选索引、receipt 与 temporary manifest；保留同 source 的全部变体，并仅在可证明身份、摘要与完成事实一致时复用既有结果。
+- 2026-08-09 / Task 5.3：以完整 schema/runtime、integrity、foreign key、record/index parity、identity、binding 与 digest 复核关闭 mutable stage；数据库、manifest 和 parent 的 durable boundary 闭合后才登记 opaque artifact 并签发单次 sealed stage，seal 后篡改、错资源或 stale generation 均 fail-closed。
+- 2026-08-09 / Task 5.4：建立可独立重算的 Gate B，把 schema/runtime、迁移完成、候选索引、sealed evidence、source binding 与 exact parity 绑定到同一待激活 artifact；Gate B 只证明 physical readiness，不提前发布 generation。
+- 2026-08-09 / Cluster C 复审：统一复审将 caller-owned mutable reference、stage 重用授权和 seal/Gate B 之间的 TOCTOU 收束为私有值闭包、registry-backed 单次能力与锁内重验；修正后 migration→seal→Gate B 流水线的 focused、fresh 全量及 basedpyright error-level 验证通过。
+- 2026-08-09 / Task 5.5：在唯一 coordinator 中把 Gate B、sealed artifact、token/nonce、prior generation 与 source binding 闭合后才排空 lease；替换前重验候选 DB/manifest 并形成恢复资产，重放、错资源、过期 generation 与 drain 失败均止于 publication 之前。
+- 2026-08-09 / Task 5.6：实现 write-once durable activation journal，PREPARED 先于任何替换落盘，随后只允许 DB_REPLACED→MANIFEST_PUBLISHED→GENERATION_PUBLISHED 单调推进；每阶段把 token、nonce、artifact、prior/new receipt 与 manifest digest 成套持久化并 fsync。
+- 2026-08-09 / Task 5.7：实现 DB→manifest→generation 的分阶段原子发布；每次 replace 后均先完成 parent fsync 和对应资产复核才推进 journal，generation 只在新 DB、receipt、manifest 与 binding 全部一致时可见，并发 operation lease 只能观察切换前或切换后的完整版本。
+- 2026-08-09 / Task 5.8：实现按同一 token 的冷启动幂等恢复矩阵；PREPARED 可安全取消，DB_REPLACED 可继续发布 manifest，MANIFEST_PUBLISHED 可发布唯一 generation，terminal replay 只确认既有完成事实，错配资产与已消费 token 均不能再推进。
+- 2026-08-09 / Task 5.9：实现不一致 activation 的成套回滚和隔离；存在 prior canonical 时恢复 prior DB、manifest/binding 并重新验证 last-known-good generation，首次激活无 prior 时隔离未发布资产并保留 JSONL 路径，任何 phase 都不允许形成跨代组合。
+- 2026-08-09 / Task 5.R1：在完整恢复矩阵闭合后，把 journal/terminal codec、durable file protocol 与逐 phase completion/rollback 从 `tm_sqlite_store.py` 提取到设计指定模块，coordinator 仅经窄 store-validation port 编排；119 个顶层定义完成等价迁移并保留原导入入口、错误码、fault injection 与单次 token 语义。
+- 2026-08-09 / Cluster D 复审：累积复审进一步闭合 lease drain、single-link handoff、PREPARED cancellation/quarantine、backup cleanup、write-once marker 与 final/temp 严格状态矩阵；native xhigh 最终批准且无 P0–P3 遗留，activation 203/203、fresh 全量 627/627（skip 1，含 Qt smoke）、basedpyright error-level 0 errors。
+- 2026-08-10 / Task 5.10：实现 `import_snapshot()` / `rebuild_from_snapshot()` 的显式消歧；每次请求以 fresh `import` origin、store id、snapshot id 和完整候选索引构建 sealed stage，由同一 coordinator 在 prior/candidate store-id 闭包下排空 lease、持久日志、切换并冷恢复。配置 JSONL 或相邻 manifest 缺失/改写只能由成功的全量激活清除 divergence；可证回滚失败在业务 API 返回前恢复 prior READY 权威，已持久 `GENERATION_PUBLISHED` 则拒绝回滚并向前恢复。同一 service 可对相同快照连续产生新 generation，canonical ledger/ancestry 破坏与外来 symlink/directory/multi-link 仍 fail-closed。集群实现阶段机械验证通过；focused 29/29、fresh 全量 656/656（skip 1，含 Qt smoke）、basedpyright error-level 0 errors，等待 Task 5.11 后执行 Cluster E 统一复审。
+- 2026-08-10 / Task 5.11：实现保持 canonical store id 的 schema v1→v2 复制切换；coordinator 在 DRAINING 下闭合 active 多 revision ancestry、source binding 与资产身份，以 `Connection.backup()` 生成并 fsync 单次恢复快照和 opaque ticket，候选只从该快照构建。seal/Gate B 后的同一激活流水线在写 journal 前重验 ticket、generation、head revision 与 prior DB digest，备份后的并发写使陈旧候选止于 publication 前且可用 fresh ticket 重试。升级按严格 record-id/origin block 证明完成顺序，保留 records、variants、context、provenance、usage、origin/receipt 与 current/history binding，重建 gram/FTS；divergence、manifest/ledger 篡改和不可证明 ancestry 均不被隐式修复。失败按既有 cancellation/rollback/terminal recovery 恢复 prior READY 或返回诚实 UNVERIFIED 证据；复审修正把 5.10/5.11 共用 recovery locator 收紧为 no-follow、regular、single-link、digest 和终态 inode 复验协议，changed/unverified 若无旧字节副本则明确 fail-stop；schema 全量备份与 locator 采用 pending→reported 持久化生命周期，cold recovery 仅提升已完成升级的 backup 并严格清理未暴露 pending，已暴露稳定证据不被后续重试删除。Task 5.10 replacement 在同一 coordinator 锁内严格清理遗留 pending 并立即转入 DRAINING，防止 import 的 completed recovery 误提升旧 upgrade backup，活跃 ticket 不被清理且既有 lease 仍按原激活语义排空。Cluster E 累积复审最终批准且无 P0–P3 遗留；复审聚焦 267/267、fresh 全量 708/708（skip 1，含 Qt smoke）、py_compile 通过、Cluster E 变更文件 basedpyright error-level 0 errors。
+- 2026-08-10 / Task 5.R2：将 schema-upgrade backup/locator pending→reported 协议、strict locator file proof 与 v1→v2 copy 数据面提取到 `tm_schema_upgrade.py`；`tm_sqlite_store.py` 减少 451 行、`tm_migration.py` 减少 373 行，新模块不反向导入两个 owner。coordinator 仍独占 ticket/locator snapshot、lease/drain/state/guard/cold-root，migration 仍独占公开成败编排；原 private patch seam 由 late-bound wrapper 保留，copy plan 每次调用重建并对 DDL/digest 做只读值快照，异常分支与 cleanup 顺序未改写。E-R `v4_flash_worker`/max 等价性复审最终批准且无 P0–P3 遗留；复审 focused/recovery 306/306、py_compile 通过、变更文件 basedpyright error-level 0 errors。其当时的 fresh 全量声明后经 Cluster F 复核发现未覆盖两项 schema-upgrade unsafe error-code 断言；相应契约已在 Cluster F correction 恢复并纳入本次 fresh 全量门。
+- 2026-08-10 / Task 5.12：在同一 lease 和 SQLite read snapshot 内捕获 canonical revision 与按 `record_id ASC` 排列的全部变体，导出固定字段顺序的 JSONL 与 adjacent manifest，并以 canonical ledger 的 issued→completed/cancelled 状态绑定 generation、revision、record count 和 receipt。发布使用排他 temp、file fsync、replace 前 digest+inode/缺席复验、atomic replace、parent fsync 与终态重验；普通写入/fsync/恢复拷贝失败只按已证明的创建 inode 清理，外来或无法证明的目标保持不删不覆盖并 fail-closed。空 provenance、完整 context/变体与 exact winner 往返保持，不改写 active binding、divergence、canonical records 或 generation。实施阶段 focused 203/203（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Task 5.13/5.14 后执行 Cluster F 统一复审。
+- 2026-08-11 / Task 5.13：实现未漂移资源的配置 JSONL 快照刷新；稳定 canonical read snapshot 经 issued receipt、JSONL replace/fsync、manifest replace/fsync、严格 digest+inode 成对复核后，在单一事务完成 receipt 与 active binding，失败按已证明所有权恢复旧 pair 或保留可恢复证据。配置 pair 观察使用资源级可重入 gate 覆盖完整发布窗口，外部 monitor 与并发 refresh 只能观察前态或 completed 后态；symlink、multi-link、same-byte foreign inode 与不稳定身份均 fail-closed 并锁存真实 divergence，canonical records、revision 与 generation 不变。实施阶段 focused 151/151（skip 1）、basedpyright error-level 0 errors、py_compile 与 diff check 通过，等待 Task 5.14 后执行 Cluster F 统一复审。
+- 2026-08-11 / Task 5.14：在资源级可重入 gate 内先恢复再观察，按 durable ledger 与严格文件身份把 issued 配置刷新确定为取消旧 pair、重建并发布 manifest、完成一致新 pair，或锁存 `SOURCE_DIVERGED`；任意路径导出的 issued receipt 独立复用同一恢复协议且不改 active binding。排他 temp/recovery copy 的 dev/inode 通过 write-once `tm_meta` handoff 跨崩溃证明所有权，正常发布与冷恢复从 root→parent 逐段绑定 no-follow directory descriptor，并在 replace 前同时复核 source/destination exact identity、digest、revision ancestry 与 authority alias；父目录 rename/ABA、symlink/hardlink、同字节外来 inode、崩溃后丢失 durable temp 均保持文件和 handoff 并 fail-closed。native xhigh Cluster F 统一复审最终批准且无 P0–P3 遗留；9 个 TM 模块 focused 314/314（skip 1）、显式 100k resource envelope 1/1、Excel adapter 3/3、fresh 全量 886/886（skip 1，含 Qt smoke）、Gate A 契约/转录/matcher build 证据根重签后 22/22，变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-11 / Task 5.R3：将 Cluster F 已批准的 deterministic artifact family、root→parent no-follow dirfd、strict identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 编解码等 81 个顶层定义提取到 `tm_snapshot_artifacts.py`；`tm_migration.py`/`tm_snapshot_recovery.py`/`tm_sqlite_store.py` 分别减少 1260/879/330 行，仍分别独占公开 export/refresh outcome、receipt reconciliation/terminal replay/divergence 与 ledger/binding SQL/transaction/generation/coordinator 权威。owner 保留 late-bound wrapper 和 fault seam，新模块不反向导入三个 owner，错误码、mutation/清理顺序、durable handoff 生命周期与磁盘效果未改；异常分支简化未混入。F-R `v4_flash_worker`/max 等价性复审批准且无 P0–P3 遗留；新边界守卫 19/19、Cluster F/owner focused 333/333（skip 1）、fresh 全量 905/905（skip 1，含 Qt smoke）、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 6.1：已激活 TMX merge import 从同一个最大 100 MiB 不可变字节快照完成 DTD/实体拒绝、解析与 source digest，按输入顺序以 `import` batch 保留同 source 变体，不修改 JSONL/manifest/binding/divergence；只有 `tm_origin_batch(kind, source_digest)` 唯一约束命中才报告同 digest 已导入，其他 transaction constraint 独立 fail-closed。同 digest 重试不增加记录，合法 head 前进后 fresh reopen 保持 canonical `VERIFIED_HISTORY`；未激活资源仍走原子 JSONL last-write-wins 路径。
+- 2026-08-12 / Task 6.2：`TMEngine` 成为 legacy/canonical 唯一 facade，Active/Lookup/Update 使用 exact-bool 门，激活后 exact/save 只经 generation lease 访问 SQLite。新 coordinator runtime-rehydration seam 把 completed activation 的 generation/lineage、store identity、exact sidecar inode、schema/integrity/FK、ledger binding 与 candidate index 闭合后再由 monitor 派生 CURRENT/HISTORY/DIVERGED，不再用激活时 JSONL parity 回滚合法 head；未闭合激活仍交给 Task 5.8/5.9 严格恢复，canonical 不可证时 fail-stop 且不回退 JSONL。Tasks 6.1–6.2 相关矩阵 292/292、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 6.3：用真实 sidecar 激活前后的同一组输入比较完整 `LogicController` payload、openpyxl 渲染与 status counts；exact `same→winner` 保持高于同名 glossary，exact miss 后仍进入 `Glossary→术语`，完全 miss 仍为 `NO_MATCH`，对外状态集严格只有 `TM_HIT / TERMS_FOUND / NO_MATCH`。Controller/Excel/facade focused 27/27、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Cluster G 复审：累积复审批准 legacy/CURRENT/HISTORY/DIVERGED/unhealthy 冷打开权威矩阵、canonical import 事务与三态兼容，无 P0–P2 遗留；唯一 P3 将非相同 digest 的 SQLite constraint 误报为重复导入，已收紧为只识别 `tm_origin_batch(kind, source_digest)` 唯一约束并完成定点复验。主 agent fresh 全量 930/930（skip 1，含 Qt smoke），累积变更文件 basedpyright error-level 0 errors，py_compile 与 range diff check 通过。
+- 2026-08-12 / Task 7.1：新增独立 retrieval domain seam；同资源 raw-exact 组只取最大有效 `record_id` 为 EXACT，其他变体仅在双方非空的 speaker/previous/next 原始完整字段出现至少一项正匹配时成为 CONTEXT，大小写/空白差异保持 mismatch，缺失事实不参与比较，无正面证据的变体只保留不返回。输入组对非 exact source、重复 identity 与非法空结果身份 fail-closed；focused 17/17、相关回归 130/130、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 7.2：在 storage-independent retrieval seam 中消费完整重建并重验的 bounded candidate/record 私有快照，以 scorer-v1 原始双 source 生成未舍入 fuzzy evidence；同 source 不进入评分，threshold 等值保留且在排序/全局 limit 前过滤，按资源与 record identity 去重，不执行写入、应用或确认。所有 query、recall stage、candidate、record/provenance 与 scorer evidence 在首个可控 callback 前完成 exact-type/nested 闭包，`score` port 只锁存一次，回调篡改 frozen alias 不会重绑结果；focused 50/50、相关回归 115/115、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 7.3：实现多资源 `TMRetrievalService` 与只读 query-view 接缝；每个 Active+Lookup 资源只取得一次 generation lease，同一 view 内闭合 health、raw exact/context、candidate recall 与 record batch，退出后失效且不暴露写端口。服务按调用方资源顺序隔离局部失败，先聚合再按 EXACT/CONTEXT/FUZZY、分数、context strength、资源顺序与 record identity 稳定排序并应用 global limit；最终 metadata 对账 scored/returned count。query/handle/view/report/record 值在可控 callback 间逐阶段重建，generation 与 health 成套复核，retriever/scorer 动态端口按需且整次 query 各锁存一次；focused 165/165、相关回归 145/145、变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过，进入 Cluster H 统一复审。
+- 2026-08-12 / Cluster H 复审：`v4_flash_worker`/max 累积复审批准 exact/context→fuzzy→多资源 query-view 流水线，无 P0–P2；两个非阻断 P3 分别由 Task 7.4 细化 unavailable code、由 7.4/7.5 增加真实 ACTIVE-store Gate C 旅程。主 agent fresh 全量 1017/1017（skip 1，含 Qt smoke），Cluster H 变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过；根目录 comparative-report 脚本仍因缺少既有 backend artifact 维持外部失败基线。
+- 2026-08-12 / Task 7.4：新增 retrieval capability evaluator/publisher，将 CONTEXT、fuzzy-core 与 fast/fallback Gate D 决定冻结为整次多资源查询唯一快照；store health 只保留 physical/canonical 权威，Retrieval 按 intended path 组合 query-effective availability，关闭路径不读取 recall/records/scorer，开放路径复核实际 index kind。稳定 unavailable code、独立降级、refresh race、真实首次激活 generation 0、只读 ACTIVE-store 旅程与依赖方向均已覆盖；focused/相关回归 236/236，变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过，等待 Task 7.5 闭合 Cluster I。
+- 2026-08-12 / Task 7.5：新增独立 `tm_retrieval_validation.py` Gate C 纯验证叶子，以固定 cohort/fixture/build/semantics/evaluator digest 重算 raw context 分类与 fuzzy-core 证据并生成一次性 manifest；fixture codec、向量执行与 observed digest 不进入 capability publisher 模块，approved roots 覆盖 artifact/evaluator/build 自身且禁止把 observed digest 回填为生产模块默认常量。最终 fuzzy-core 观察 digest 仅在全部固定观察完成后由闭合 canonical 对象 `{"fixture_digest", "scoring", "store", "service"}` 锁定，与 approved roots fuzzy-core cohort digest 相等并将 manifest fuzzy 行置为 `passed=True`；service transcript 只使用 pending digest 构造不返回、不持久化且 fuzzy/Gate D 关闭的 harness publisher，禁止用最终 digest 自授权同一次重放。新增固定 refresh/single-snapshot 场景：首个资源的真实 query-view health 步骤触发 fail-closed `refresh(None, ...)`，在途 query 对两个资源继续使用旧 CONTEXT 开放快照，query 后 publisher 快照闭合，下一 query 观察到闭合快照。修复 store 回滚 absent 判定：absent record id 成员检查改为对 `after_exported` 抽取的 record id 集合比较，并新增该场景的聚焦测试。分别汇总 candidate 阶段计数、评分排序、事务回滚、局部失败与 global limit 证据；evaluator 快照 CONTEXT 与 fuzzy-core 开放，FTS5_TRIGRAM/GRAM_FALLBACK 与 `fuzzy_available_for` 保持 benchmark 关闭，Task 8.4/8.5 发布 oracle/benchmark evidence 前 FUZZY 不开放执行路径；能力矩阵、opaque summary 与稳定 unavailable code 一致且不泄漏 source/target 正文。Cluster I 累积复审批准；唯一 P3 将额外未知 manifest cohort 忽略而非拒绝，已改为 context/fuzzy-core 分别要求 expectation 与 evidence cohort id 闭合集合精确相等并完成定点复验。最终 focused/相关回归 249/249，变更文件 basedpyright error-level 0 errors，py_compile、证据根重算与 diff check 通过；fresh 全量 1101/1101（skip 1，含 Qt smoke），Cluster I 闭合。
+- 2026-08-12 / Task 8.1：新增确定性 benchmark-v1 语料/cohort/oracle 输入 owner `tm_benchmark.py` 与机器可读 `benchmark_tm_contract.json`（strict codec 往返，corpus/composition/exact/fuzzy/oracle/scorer/path 八项 digest 均为本生成器实际值而非占位）。提供流式 100000 记录、1200 exact（逐一等于既有记录 source）、240 fuzzy（200 near-edit 单字符替换 + 40 miss 保留前缀，前缀在 100k 全量中零出现）与固定 5000 记录/200 查询 oracle 迭代器；记录 id 正数/唯一/升序，可经 `to_draft()` 构造公开 `TMRecordDraft`。corpus/composition/cohort/oracle digest 采用版本化 canonical line-framing 可独立重算，`recompute_benchmark_inputs` 与已提交 contract 全量对账、失配 fail-closed，不信任调用方布尔或 JSON digest；contract 严格解析拒绝重复键/非有限数/未知或缺失字段/bool 或错型值。语料覆盖 10 语言 multilingual、CJK、short、duplicate raw-source/multi-target、context 与 near-edit pair，类别计数与 near-edit 性质均由生成事实校验而非自报标签；无网络/遥测/输出持久化，诊断不泄漏正文，仅依赖 stdlib 与 frozen contracts，无 store/retrieval/migration/Qt/Feature3 benchmark 依赖。focused 24/24，含相关 tests.test_tm_benchmark_contract/tests.test_tm_contracts 合计 69/69；变更文件 basedpyright error-level 0 errors，py_compile、json.tool 与 diff check 通过。
+- 2026-08-12 / Task 8.2：新增 `tm_benchmark_latency.py` benchmark-v1 exact/fuzzy 逐查询延迟证据 owner：消费 Task 8.1 冻结迭代器与 strict BenchmarkContract，每个 cohort 先执行 100 次不计时 warmup，再按 frozen 顺序逐查询用 `perf_counter_ns` 单独计时（measured_repeats=1，不做整批平均），整数 nearest-rank `ceil(p*n)` 计算 p50/p95/max 且可由原始 `elapsed_ns` 独立重算。每条证据私有快照完整 contract，重验 contract/cohort/path/count/config/environment 绑定并只在构造后派生 evidence digest；单条 execution path 要求 FTS5_TRIGRAM=>`fts5_enabled=true`、GRAM_FALLBACK=>`fts5_enabled=false`，每个 fuzzy 调用冻结 `minimum_similarity=0.60`/`top_k=10` 并回显实际 path/成功/结果数，FTS 成功不得顶替 fallback。样本只保留 query_id/elapsed/cohort/path/success/result-count，不存正文；空样本、bool-as-int、子类标量、负值、重复/缺失/乱序 id、失败调用或绑定失配全部 fail-closed。仅依赖 stdlib 与 frozen owners，不构造 `BenchmarkReport`、不授予能力；Task 8.5 经 `LatencyExecutor` seam 绑定真实 store/retrieval 执行，真实 100k store 执行与强制 fallback 留待 8.5。focused 56/56，含相关 tests.test_tm_benchmark/tests.test_tm_benchmark_contract 合计 97/97；变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-12 / Task 8.3：新增 `tm_benchmark_process.py` benchmark-v1 隔离子进程迁移/reopen/query 与峰值 RSS 证据 owner：父进程以 `[sys.executable, "-m", "tm_benchmark_process", "--worker"]` 派生独立子进程，stdin 严格 JSON 请求与 stdout 单条 canonical evidence 互相回显 protocol/contract/corpus/fixture/path 摘要，stderr 只返回 code。测量覆盖 `build_mutable_stage`→seal→activate/journal/publication→fresh coordinator 重水合（COMPLETED/GENERATION_PUBLISHED）→store health/exact/candidate 证明的整段 parse/insert/索引/校验/fsync/激活/reopen 生命周期。FTS5_TRIGRAM 由实际 FTS5 能力与健康索引证明，GRAM_FALLBACK 在子进程局部强制无 FTS 并由实际 schema/index/query report 证明；Linux `ru_maxrss` 从 KiB 归一为 bytes，start/terminal/max 不做基线相减。父进程仅接受空的专用 run root，或只含唯一 regular/single-link fixture 的 root；fixture 以 exclusive create 预生成且在子进程读取前后复核 inode/size/digest，子进程保留 sidecar/manifest/journal/lineage 原始证据，不按确定性名称删除可能的外来 inode，整个专用 root 由调用方在测量外回收。正式 evidence 还必须同时绑定 contract 的 100k count 与 corpus digest，test-mode 永不能成为最终证据；strict codec、exact-type 及进程/健康证明任一漂移均 fail-closed。focused 37/37（27 subtests），含两条真实子进程集成路径；含相关 corpus/latency/contract 合计 135/135；变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过；真实 100k 执行与最终证据留待 Task 8.5 硬门。
+- 2026-08-12 / Task 8.4：新增 `tm_benchmark_oracle.py` 全扫描 oracle 与召回硬门证据 owner：对固定 oracle 查询逐条派生两类独立义务（`final_similarity >= 0.60` 阈值以上集合与真实全扫描 top-10，均按生产模糊排序取原 record id），再分别以 FTS5_TRIGRAM 与 GRAM_FALLBACK 执行真实 CandidateRetriever/SQLite 候选路径，逐查询报告缺失 candidate identity；任一缺失、index kind 漂移或 FTS 缺失都对应显式失败（FTS 缺失为 `ORACLE.FTS5_UNAVAILABLE`），任何路径的遗漏都使 recall gate 失败。`OracleRecallEvidence` 冻结自校验，私有快照完整 contract 并绑定 contract/oracle-subset/scorer/path/environment digest，`recall_passed` 只能由缺失集合与可用性/index 事实派生且必须与构造一致，strict JSON 往返拒绝重复键/非有限数/错型/缺失字段，证据不含 query/source/target 正文，fixture 与临时 store 仅位于调用方清理的专用 run root。real mode 禁止调用方注入预计算 oracle 义务；owner 内部双路径入口只计算一次权威全扫描再分别执行两条候选路径，test-mode 注入 seam 永不成为最终证据。新鲜字面 5000 记录/200 查询（threshold 0.60、top_k 10、candidate-budget-v1）得到两条路径一致的 `missing_above=0`、`missing_top10=27`、`recall_passed=False`；召回硬门如实失败，未放宽任何阈值/budget/cohort，对应 FUZZY 执行路径保持关闭。focused 50/50（含字面 5000/200 双路径证据运行），相关 benchmark/candidate/scorer/contract 回归 109/109；变更文件 basedpyright error-level 0 errors，py_compile 与 diff check 通过。
+- 2026-08-13 / Task 8.5：新增 Gate D 双路径证据组合、严格可移植 bundle codec、owner-driven 真实 runner 与 capability publication；迁移/query child 分离，query 按 artifact identity/digest 重开同一 canonical generation，保留全部 latency 原始样本且不发布临时路径或 PID。真实字面 100000 记录、1200 exact、240 fuzzy 与 5000/200 oracle 产生机器可读 `benchmark_tm_evidence.json`；FTS5_TRIGRAM 与 GRAM_FALLBACK 均通过 exact p95 和 RSS，但 recall=0.94、fuzzy p95 分别约 1498/2397 ms、迁移分别约 181/275 s，因而各自以 `CANDIDATE_RECALL/FUZZY_P95/MIGRATION` 失败并保持 FUZZY 关闭；CONTEXT/fuzzy-core 仍开放，canonical exact/save 未被撤销。真实首跑还暴露 benchmark bridge 遗漏单资源生产 global top-k，已在 scorer 稳定排序后截断并保留稳定诊断码；query/gate focused 130/130、变更文件 basedpyright error-level 0 errors，bundle strict 回读与 diff check 通过，等待 Cluster J 累积复审。
+- 2026-08-13 / Cluster J 复审：`v4_flash_worker`/max 以 corpus→migration/query→oracle→portable bundle→capability publication 整体状态机做累积对抗复审，批准且无 P0–P3 遗留；319 个 focused 测试与独立 artifact 重算确认 100k 事实、nearest-rank 原始样本、双 child artifact/RSS 绑定、oracle 100% 硬门、双路径失败隔离、原子无覆盖发布与 Gate C 事实保留均闭合。主 agent fresh 全量 1403/1403（skip 1，含 Qt smoke），字面 5000/200 oracle 继续得到双路径 `missing_top10=27`；Cluster J 变更文件 basedpyright error-level 0 errors，diff check 通过。
+- 2026-08-13 / Task 9.1：将已通过的 migration/store/seal/activation/recovery 行为断言收束为 29 行闭合故障 registry，覆盖损坏输入、record/index/commit 原子回滚、stage/journal/publication fsync 耐久边界、lease/busy timeout、token/nonce 重放、四个 journal phase 崩溃与 JSONL/last-known-good 成套保全。每行绑定精确 unittest id、生产 seam 和单一断言契约；执行工具解析并运行 54 个引用测试，以 registry 和所有相关生产/测试源文件摘要生成 `fault_matrix_evidence.json`，避免测试重命名或源码变化后继续误报 fresh。registry/evidence focused 5/5、29 行执行 29/29，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过。
+- 2026-08-13 / Task 9.2：在同一故障 registry 增加 31 行 snapshot/divergence 负空间，覆盖 export/refresh 的 issued、JSONL replace、manifest replace、completion/cleanup 崩溃，外部 JSONL 与正常 canonical write 分类，receipt/manifest/ledger/ancestry 错配，显式 import/rebuild、schema upgrade 与 refresh recovery，以及 ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节/异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失或损坏、terminal replay 幂等和外来 inode 不删不覆盖。Cluster K 复审修正把 durable handoff 改为拒绝重复/非有限/未知/缺失/错型/不完整交叉字段的严格闭集 codec，并闭合 receipt↔handoff 关系：orphan 行稳定腐败，所有缺 handoff 的 issued（包括 divergence 已锁存且四项 artifact 全缺席）及仍有 deterministic artifact 的 terminal receipt 稳定 `BLOCKED/HANDOFF_MISSING`，只有 artifact family 全部严格不存在的 terminal post-clear 状态允许 NOOP；行级 identity/path/receipt/ancestry 错误保持更具体稳定优先级，任何阻断均保留 receipt、binding、canonical、final pair 及 temp/recovery 字节与 inode。新增 15 边界 × export/refresh 的真实 `os._exit` 目录，逐一覆盖四次 file fsync、issued/handoff commit、两次 replace、三次 directory fsync、completion、两次 cleanup unlink 与 handoff clear，并显式登记 reconstructed-manifest 同/异字节 source 和 destination 末次复证置换。验证器只接受其自身 checkout、canonical evidence 输出和逐组件 no-follow regular source，交替 root、任意 emit 及 final/intermediate symlink 在执行测试或替换前拒绝。刷新机器可读 evidence 后矩阵共 60/60 行、153 个精确引用全部通过；snapshot/export/refresh/artifact-boundary/registry focused 195/195，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；因 store source identity 改变而同步从当前闭集重算 Gate C artifact/build approved roots，保持已通过的 CONTEXT/fuzzy-core cohort 与 Gate D 缺席语义不变。
+- 2026-08-13 / Cluster K 复审：原生 xhigh reviewer 以迁移/激活/snapshot 的闭合故障模型做累积复审，最终批准且无 P0–P3 遗留；复审把单行 strict handoff codec 扩展为 receipt↔handoff 闭世界关系，明确 nonterminal 一对一、missing/orphan fail-stop 与 terminal post-clear 唯一缺席例外，并保持行级错误优先级和全部资产保全。Gate C source roots 随 store 身份变化机械重算且不改变 cohort 或 Gate D 语义；主 agent fresh 全量 1423/1423（skip 1，含 Qt smoke），字面 5000/200 oracle 仍为两路径各 `missing_top10=27`，FUZZY 保持关闭。
+- 2026-08-13 / Task 9.3：新增独立于 fault taxonomy 的 `tm-acceptance-matrix-v1` 行为证据矩阵，以 18 行闭集覆盖 matcher 三态/证据降级/用途选项/single-snapshot/无正文诊断、raw context 分类、candidate union/dedupe/truncate、global limit、资源局部失败、gate-closed 与零命中区分、matcher/CONTEXT/FUZZY 不冒充以及逐阶段 metadata 守恒。每行绑定生产 seam、单一断言契约和精确 unittest id；验证器只接受当前 checkout 与 canonical evidence 输出，以逐组件 no-follow regular source 摘要拒绝改名、替代 root、symlink 或 stale 源码。18/18 行、49 个引用及 matrix 8/8 全部通过，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；Gate D 的真实性保持不变，FUZZY 未因行为证据通过而开放。
+- 2026-08-13 / Task 9.4：将 compatibility/priority/Excel/selfcheck/privacy/isolation/SQLite policy/architecture 收束为 14 行验收证据，累计 acceptance matrix 32 行、78 个精确引用。新增 disposable cwd + `-B` 子进程覆盖 TMEngine、stress runner 与 translation runner 旧自检；静态守卫以设计拥有的 28 个 Core 文件闭集和 Qt/Glossary/Legacy/Controller consumer 集合为权威，拒绝网络/账号/telemetry/凭据/外部服务依赖、Core 反向导入 Qt/Parser/TMX/Glossary，以及 consumer 通过普通 import、`__import__`、字面 `importlib.import_module`、readiness 标识符或 validation-summary 字符串取得第二权威。兼容/Excel/Legacy/selfcheck/architecture focused 35/35、matrix 8/8，变更文件 basedpyright error-level 0 errors，py_compile、strict JSON 与 diff check 通过；现有 LogicController→Glossary 合法兼容职责没有被误归为 Core 依赖违规。
+- 2026-08-13 / Task 9.5：新增独立 `tm-release-criteria-v1` 发布映射，机械解析 Requirements 的 9 项共 86 条验收标准并逐条绑定当前 acceptance/fault 矩阵、12 个补充精确 unittest 或 strict Gate D bundle；输入 evidence、requirements 与 registry 均以 no-follow regular 文件摘要和 source fingerprint 闭合，任一 stale/错型/替代 root/任意输出路径均在授予结论前拒绝。当前 86/86 均有可重算入口，其中 84 条 PASS；8.2 fuzzy p95 与 8.3 migration 因双路径真实硬门失败保持 BLOCKED，candidate recall 亦作为独立 benchmark blocker，故机器可读发布裁决诚实保持 `NO_GO`。release focused 10/10、12 个直接证据测试全部通过，变更文件 basedpyright error-level 0 errors，strict bundle 回读与 diff check 通过。
+- 2026-08-13 / Task 8.6：冻结 `scorer-bound-v1` 安全上界，并在 FTS/回退的 append、流式迁移与 v1→v2 copy-switch 中同事务维护 folded length、multiset TF 及 256-slot proof block；长度/TF/block 篡改全路径 fail-closed，穷举+固定随机上界对照与 focused 283/283（1 项环境跳过）、basedpyright 0 errors 均通过。
+- 2026-08-14 / Task 8.7：生产查询在同一 generation view 内以单一 block/record 全局上界前沿打开 256-slot exact proof facts，seed 仅保留真实路径与守恒诊断，原文/scorer 批不超过 32 且单 identity 仅评分一次；threshold 全集和 `(score, record_id DESC)` top-k 双闭合，协调篡改/世代漂移/预算耗尽资源级 fail-closed。Cluster M review correction 进一步以 `source_raw → fold-v1` 作为 health/Stage/Gate B proof-index 独立语义根，拒绝 folded/length/TF/FTS/block 成套伪造，并使 frontier/kth universe、seed→BOUND_PROOF 输入与 scored/unscored identity 在 constructor/strict codec 闭合；主 agent 新鲜 contract/store/proof/retrieval/Stage/schema/Gate B/migration/bound 363/363（1 skip）、mini oracle 3/3 及变更文件 basedpyright 0 errors 通过，本轮未重跑 5k/100k Gate D。
+- 2026-08-14 / Task 8.8：fresh build 取消刚构建 stage 的重复 reuse 扫描，existing reuse 仍完整验证；StageSealer 在同一 `BEGIN IMMEDIATE` 内闭合 parity/proof-index/schema/count/logical closure 与 `SEALED` marker，生成 registry-owned sealed attestation。sealed/active strict semantic 同时冻结全库 record/FTS 计数与历史 receipt-boundary 计数；registry 及两次 Gate B 仍以 boundary claim 对账并仅做 DB/manifest/source 的 no-follow inode+full SHA-256 复证，active 校验则必须闭合全库计数和全量 index facts。replace/reopen 后 normal/cold SEALED receipt owner 在 `BEGIN IMMEDIATE` 内先闭合 receipt/binding/meta 结构，再单次流式重建 pre-activation closure 并 exact 核对 sealed attestation，只有通过后才写 receipt/meta，并在 commit 前以最后一次读取生成独立 active closure 期望；manifest 发布不改写 DB，随后唯一 active 全语义校验重算实际 closure 并 exact 比较后才生成 active attestation；cold `DB_REPLACED` 对已完成 receipt 以同一单次流式扫描同时闭合 ACTIVE 与重建的 pre-activation closure，先核对 sealed attestation 再授权期望。未完成 publication phase 仅经 exact bytes/inode/phase 复证；completed cold rehydrate 在 canonical DB 仍是同一 inode+bytes 时复用 active attestation，合法 post-activation append 改变同 inode 字节时改走完整 runtime validator，configured JSONL/manifest 外部分歧则交由 `SourceBindingMonitor` 锁存 `SOURCE_DIVERGED`；canonical inode 替换、attestation 字段/版本/全库与 boundary 计数/闭包/阶段漂移及 v2 published phase 缺 attestation 均 fail-closed。verifier 定向 154/154、schema-upgrade/module-boundary/explicit-import 91/91、Task 8.8 矩阵 330/330（1 skip）、pre-lock P1 定点 2/2、变更文件 basedpyright 0 errors 与 diff check 通过。
+- 2026-08-15 / Tasks 8.6–8.7 v15（重开）：保留 `proof-query-v2` 双域守恒、2048 预算、Retrieval-owned exact-fold reuse 与稀疏路径；密集路径以同一 generation 的短事务生成 U1/K0/R，再由 store-owned 严格有序私有投影和 opaque receipt 重绑定 facts，提交后逐 identity 计算 exact Unicode LCS/U3 并完成 threshold+top-k 双闭合，append/tamper/injected scorer 均资源级 fail-closed且不增加持久 schema。穷举与固定 Unicode 随机向量闭合 `真实分数<=U3<=U2<=U1`；q61 以 300 次真实 scorer 覆盖 3000 identities，40 条 frozen miss 为 42–481 次调用，字面 5000/200 oracle 在 FTS/fallback 均零遗漏；q240 最终分区为 A0=10、A1=293、invocation=303，handoff 的 302 仅是非完整 U3 原型竞争类估计而非最终调用数。q1/q61/short/q226/q240 各 20 个 warm 样本的 nearest-rank p95 分别为 75.359/378.410/12.259/378.988/332.161 ms、峰值 RSS 91.203 MiB。owner 248/248、Cluster N 330/330（1 skip）、changed-file basedpyright 0 errors、diff check 通过，最终原生 xhigh 累计复审无 P0–P3 并批准。
+- 2026-08-15 / Tasks 8.6–8.7 v16：以 `proof-query-v3` 冻结 all-accounted/raw-distinct-ranking/exact-fold-invocation 三域、完整 R 的 U3 pass、最多 32 的 U3-best scorer batch 与残余逐 identity balanced-partition U4/P3；production 只以 threshold 或 threshold-qualified top-k 严格闭合，Oracle 仍要求 threshold+top-k 双闭合，v2 仅允许严格历史解码，任何直接/嵌套重编码均拒绝。穷举/固定 Unicode 向量、single-char/repeat/tie、ordered projection/receipt/binding 伪造、phase2/U4/scorer append race、2049 原子预算及 Cluster N tamper 回归全部闭合；字面 5000/200 oracle 在 FTS/fallback 均 threshold/top-10 零遗漏。以 public migration owner 新建的 100k FTS generation（artifact pre/post 相等）实测 240/240 production 闭合、最大 43 calls、40 miss 最大 0 calls；q61 `oracle_full` 以 300 calls 闭合 3000 identities，q240 以 74 calls 闭合且 top-10 等于 `50040,40046,94009,64049,40900,40498,24009,40091,40421,20040`。六条查询分别 5 次 warmup 后取 20 个只覆盖 binding→ordered reads/LCS→record fetch→真实 scorer→finish/final generation validation 的 production candidate API 样本，q1/q61/q28-short/q183/q226/q240 nearest-rank p95 分别为 23.830/317.532/12.832/390.791/98.852/83.177 ms，查询进程峰值 RSS 117,850,112 bytes。修后 query-process 69/69、M owner+Cluster N 328/328、changed-file basedpyright/py_compile 0 errors、diff check 通过，三路原生 xhigh 最终复审均无 P0–P3 并批准。本轮未运行完整 Gate D；fresh migration 244.866 s 且 per-query health 全扫约 8.3 s，故 Cluster O/Task 8.9 的 migration 与 active-attestation 复用仍诚实 NO-GO。
+- 2026-08-16 / Feature 5 Cluster M→O 最终闭合：`proof-query-v3` 的 U3/U4/P3、2048 budget、batch≤32 与三域守恒保持不变；sealed registry 收束为 StageSealer 在 post-fsync integrity/projection/closure/terminal-rehash 后铸造的 exact registry+reservation 单次 capability，对外仅有 read-only readiness view，active attestation 只在 exact inode+bytes+phase 上复用。274-file immutable epoch fingerprint `1c357b0efcf81eef8bd37498bbb2700e9c3f2fa2add3b830e2f4e3dc7f77fd98` 上 fresh Gate D bundle `071f2787f452c9f07635a85e0626e8538bdb79a1b4f46ea3a37a06d47cf5be7e` 双路径 PASS：FTS exact/fuzzy p95 `0.547/275.833 ms`、migration `65.599 s`、RSS `266.953 MiB`；fallback `0.240/279.757 ms`、`99.223 s`、`291.719 MiB`；两路 5000/200 oracle threshold/top-10 零遗漏且 recall `1.0`。fault `61/61`、acceptance `33/33`、release `86/86 GO`、strict evidence `38/38`、fresh full `1579/1579`（skip 1，含 Qt smoke）与 changed-file basedpyright 0 errors、diff check 全部通过；最终原生 xhigh 对代码、四份 current-source evidence 与 release 输入独立重算后无 P0–P3 并批准。

@@ -4,17 +4,43 @@ import json
 import traceback
 import unittest
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import cast
 
 from tm_contracts import (
+    AssetKind,
+    AssetPreservationEvidence,
+    AssetPreservationState,
     CANDIDATE_BUDGET_VERSION,
+    CANDIDATE_PROOF_BLOCK_VERSION_V1,
+    CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION,
+    CANDIDATE_PROOF_PARTITION_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION,
+    CANDIDATE_PROOF_QUERY_VERSION_V2,
+    CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+    CANDIDATE_PROOF_TRAVERSAL_VERSION,
+    CANDIDATE_PROOF_TRAVERSAL_VERSION_V2,
+    SCORER_BOUND_VERSION_V1,
+    CandidateEvidence,
+    CandidateProofMetadata,
+    CandidateProofMetadataV2,
+    CandidateProofRefinementMetadata,
     CandidateRecallMetadata,
+    CandidateRetrievalReport,
+    CandidateStage,
+    CandidateStageMetadata,
     TM_CONTRACT_CODEC_VERSION,
     ContextEvidence,
+    DiagnosticDisposition,
+    ExportDiagnostic,
+    ExportFailure,
     QueryReport,
+    RecoveryLocator,
     ResourceQueryFailure,
     ResourceQueryMetadata,
     SimilarityEvidence,
+    SourceBindingState,
+    StoreHealth,
     TMContract,
     TMMatchType,
     TMQuery,
@@ -26,6 +52,8 @@ from tm_contracts import (
     contract_from_json,
     contract_to_json,
     candidate_budget_v1,
+    export_cleanup_pending_failure,
+    export_ledger_ambiguous_failure,
     validate_resource_handles,
 )
 
@@ -44,7 +72,19 @@ class _DummyTMStore:
         return iter(())
 
     def health(self):
-        return object()
+        return StoreHealth(
+            healthy=True,
+            schema_version=1,
+            generation=0,
+            record_count=0,
+            index_kind="UNBUILT",
+            snapshot_binding_digest=None,
+            source_binding_state=None,
+            exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+            diagnostic_codes=(),
+        )
 
 
 def _context_evidence(*, matched: bool = False) -> ContextEvidence:
@@ -137,6 +177,58 @@ def _result(
 
 
 class TMContractTests(unittest.TestCase):
+    def test_store_health_is_frozen_and_keeps_gates_independent(self) -> None:
+        health = StoreHealth(
+            healthy=True,
+            schema_version=1,
+            generation=3,
+            record_count=27,
+            index_kind="GRAM_FALLBACK",
+            snapshot_binding_digest="a" * 64,
+            source_binding_state=SourceBindingState.SOURCE_DIVERGED,
+            exact_available=True,
+            context_available=True,
+            fuzzy_available=False,
+            diagnostic_codes=("SOURCE.DIVERGED",),
+        )
+
+        self.assertTrue(health.exact_available)
+        self.assertTrue(health.context_available)
+        self.assertFalse(health.fuzzy_available)
+        with self.assertRaises(FrozenInstanceError):
+            setattr(health, "healthy", False)
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires exact availability",
+        ):
+            _ = StoreHealth(
+                healthy=True,
+                schema_version=1,
+                generation=0,
+                record_count=0,
+                index_kind="UNBUILT",
+                snapshot_binding_digest=None,
+                source_binding_state=None,
+                exact_available=False,
+                context_available=False,
+                fuzzy_available=True,
+                diagnostic_codes=(),
+            )
+        with self.assertRaisesRegex(ValueError, "stable sorted order"):
+            _ = StoreHealth(
+                healthy=False,
+                schema_version=1,
+                generation=0,
+                record_count=0,
+                index_kind="UNBUILT",
+                snapshot_binding_digest=None,
+                source_binding_state=None,
+                exact_available=False,
+                context_available=False,
+                fuzzy_available=False,
+                diagnostic_codes=("STORE.Z", "STORE.A"),
+            )
+
     def test_record_preserves_raw_context_origin_and_provenance(self) -> None:
         record = TMRecord(
             record_id=7,
@@ -643,6 +735,1117 @@ class TMContractTests(unittest.TestCase):
                 context_evidence=_context_evidence(),
                 provenance=(),
                 stable_tie_key=(0, 1),
+            )
+
+
+def _proof_v3(
+    *,
+    unscored_upper: float = 0.7,
+    unscored_record_id: int = 4,
+    threshold_closed: bool = False,
+    top_k_closed: bool = True,
+    result_complete: bool = True,
+) -> CandidateProofMetadata:
+    return CandidateProofMetadata(
+        proof_version=CANDIDATE_PROOF_QUERY_VERSION,
+        bound_version=SCORER_BOUND_VERSION_V1,
+        block_version=CANDIDATE_PROOF_BLOCK_VERSION_V1,
+        traversal_version=CANDIDATE_PROOF_TRAVERSAL_VERSION,
+        ranking_domain_version=CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+        invocation_domain_version=CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION,
+        traversal_mode="SPARSE",
+        total_block_count=1,
+        total_record_count=4,
+        scanned_block_count=1,
+        opened_block_count=1,
+        inspected_record_count=4,
+        seed_unique_count=1,
+        scorer_invocation_count=2,
+        accounted_identity_count=3,
+        ranked_eligible_count=3,
+        unscored_identity_count=1,
+        unscored_max_upper_bound=unscored_upper,
+        unscored_possible_record_id=unscored_record_id,
+        minimum_similarity=0.6,
+        threshold_closed=threshold_closed,
+        top_k=2,
+        ranked_kth_score=0.8,
+        ranked_kth_record_id=2,
+        top_k_closed=top_k_closed,
+        result_complete=result_complete,
+        refinement=None,
+    )
+
+
+def _proof_v2_payload() -> dict[str, object]:
+    return {
+        "accounted_identity_count": 3,
+        "block_version": CANDIDATE_PROOF_BLOCK_VERSION_V1,
+        "bound_version": SCORER_BOUND_VERSION_V1,
+        "inspected_record_count": 3,
+        "kth_record_id": 2,
+        "kth_score": 0.8,
+        "minimum_similarity": 0.6,
+        "opened_block_count": 1,
+        "proof_version": CANDIDATE_PROOF_QUERY_VERSION_V2,
+        "refinement": None,
+        "scanned_block_count": 1,
+        "scorer_invocation_count": 2,
+        "seed_unique_count": 1,
+        "threshold_closed": True,
+        "top_k": 2,
+        "top_k_closed": True,
+        "total_block_count": 1,
+        "total_record_count": 3,
+        "traversal_mode": "SPARSE",
+        "traversal_version": CANDIDATE_PROOF_TRAVERSAL_VERSION_V2,
+        "unscored_identity_count": 0,
+        "unscored_max_upper_bound": None,
+        "unscored_possible_record_id": None,
+    }
+
+
+def _legacy_recall_payload() -> dict[str, object]:
+    stages = (
+        ("GRAM_2", 0, 1, 1, 0),
+        ("BOUND_PROOF", 1, 2, 3, 0),
+        ("UNION", 3, 0, 3, 0),
+        ("DEDUPLICATE", 3, 0, 3, 0),
+    )
+    return {
+        "candidate_budget": candidate_budget_v1(2),
+        "candidate_budget_version": CANDIDATE_BUDGET_VERSION,
+        "deduplicated_count": 3,
+        "fuzzy_available": True,
+        "fuzzy_unavailable_code": None,
+        "index_kind": "GRAM_FALLBACK",
+        "proof": _proof_v2_payload(),
+        "resource_id": "tm.primary",
+        "result_limit": 2,
+        "stages": [
+            {
+                "added_unique_count": added,
+                "dropped_count": dropped,
+                "input_count": input_count,
+                "output_unique_count": output,
+                "stage": stage,
+            }
+            for stage, input_count, added, output, dropped in stages
+        ],
+        "truncated": False,
+        "union_unique_count": 3,
+    }
+
+
+def _legacy_report_payload() -> dict[str, object]:
+    return {
+        "candidates": [
+            {
+                "matched_grams": 1,
+                "overlap_ratio": 1.0,
+                "pretruncate_rank": None,
+                "query_grams": 1,
+                "recall_stages": ["GRAM_2", "BOUND_PROOF"],
+                "record_id": record_id,
+            }
+            for record_id in range(1, 4)
+        ],
+        "metadata": _legacy_recall_payload(),
+    }
+
+
+class CandidateProofV3ContractTests(unittest.TestCase):
+    def _decode_payload(self, payload: dict[str, object]):
+        return contract_from_json(json.dumps({
+            "contract_version": TM_CONTRACT_CODEC_VERSION,
+            "contract_type": "CandidateProofMetadata",
+            "payload": payload,
+        }))
+
+    def test_v3_conditional_completion_round_trips_without_global_codec_bump(
+        self,
+    ) -> None:
+        proof = _proof_v3()
+        self.assertFalse(proof.threshold_closed)
+        self.assertTrue(proof.top_k_closed)
+        self.assertTrue(proof.result_complete)
+
+        serialized = contract_to_json(proof)
+        envelope = json.loads(serialized)
+        self.assertEqual(
+            envelope["contract_version"],
+            TM_CONTRACT_CODEC_VERSION,
+        )
+        self.assertEqual(contract_from_json(serialized), proof)
+
+        payload_keys = set(envelope["payload"])
+        self.assertTrue({
+            "invocation_domain_version",
+            "ranking_domain_version",
+            "ranked_eligible_count",
+            "ranked_kth_score",
+            "ranked_kth_record_id",
+            "result_complete",
+        }.issubset(payload_keys))
+        self.assertTrue({
+            "source_raw",
+            "target_raw",
+            "query_source",
+            "matched_source",
+            "source_fold_v1",
+            "lcs_length",
+            "gram",
+            "equivalence_key",
+        }.isdisjoint(payload_keys))
+
+    def test_v2_is_strict_historical_decode_only(self) -> None:
+        decoded = cast(
+            CandidateProofMetadataV2,
+            self._decode_payload(_proof_v2_payload()),
+        )
+        self.assertIs(type(decoded), CandidateProofMetadataV2)
+        self.assertEqual(decoded.proof_version, CANDIDATE_PROOF_QUERY_VERSION_V2)
+        with self.assertRaisesRegex(TypeError, "decode-only"):
+            contract_to_json(cast(TMContract, decoded))
+
+        payload = _proof_v2_payload()
+        payload["ranked_eligible_count"] = 3
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            self._decode_payload(payload)
+
+        dense = _proof_v2_payload()
+        dense.update({
+            "accounted_identity_count": 2,
+            "inspected_record_count": 5,
+            "opened_block_count": 0,
+            "scanned_block_count": 1,
+            "total_record_count": 5,
+            "traversal_mode": "DENSE",
+            "unscored_identity_count": 3,
+            "unscored_max_upper_bound": 0.4,
+            "unscored_possible_record_id": 2,
+            "refinement": {
+                "a0_accounted_identity_count": 1,
+                "a1_accounted_identity_count": 1,
+                "k0_record_id": 1,
+                "k0_score": 0.7,
+                "p1_max_upper_bound": 0.4,
+                "p1_possible_record_id": 2,
+                "p1_unscored_identity_count": 2,
+                "p2_max_upper_bound": 0.3,
+                "p2_possible_record_id": 3,
+                "p2_unscored_identity_count": 1,
+                "phase": "PHASE_2_COMPLETE",
+                "r_refinement_identity_count": 2,
+                "refined": True,
+                "refinement_request_count": 2,
+                "refinement_returned_count": 2,
+            },
+        })
+        dense_decoded = cast(
+            CandidateProofMetadataV2,
+            self._decode_payload(dense),
+        )
+        self.assertIsNotNone(dense_decoded.refinement)
+        dense_refinement = cast(dict[str, object], dense["refinement"])
+        dense_refinement["p3_unscored_identity_count"] = 0
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            self._decode_payload(dense)
+
+    def test_nested_v2_recall_and_report_are_strictly_decode_only(self) -> None:
+        recall_serialized = json.dumps({
+            "contract_version": TM_CONTRACT_CODEC_VERSION,
+            "contract_type": "CandidateRecallMetadata",
+            "payload": _legacy_recall_payload(),
+        })
+        recall = cast(
+            CandidateRecallMetadata,
+            contract_from_json(recall_serialized),
+        )
+        self.assertIs(type(recall), CandidateRecallMetadata)
+        self.assertIs(type(recall.proof), CandidateProofMetadataV2)
+        with self.assertRaisesRegex(TypeError, "decode-only"):
+            contract_to_json(recall)
+
+        report_serialized = json.dumps({
+            "contract_version": TM_CONTRACT_CODEC_VERSION,
+            "contract_type": "CandidateRetrievalReport",
+            "payload": _legacy_report_payload(),
+        })
+        report = cast(
+            CandidateRetrievalReport,
+            contract_from_json(report_serialized),
+        )
+        self.assertIs(type(report), CandidateRetrievalReport)
+        self.assertTrue(
+            all(type(candidate) is CandidateEvidence for candidate in report.candidates)
+        )
+        self.assertIs(type(report.metadata.proof), CandidateProofMetadataV2)
+        with self.assertRaisesRegex(TypeError, "decode-only"):
+            contract_to_json(report)
+
+    def test_nested_v2_open_truncated_or_forged_proof_fails_closed(self) -> None:
+        for field in ("threshold_closed", "top_k_closed"):
+            with self.subTest(open_field=field):
+                recall = _legacy_recall_payload()
+                proof = cast(dict[str, object], recall["proof"])
+                proof[field] = False
+                if field == "top_k_closed":
+                    proof["kth_score"] = None
+                    proof["kth_record_id"] = None
+                serialized = json.dumps({
+                    "contract_version": TM_CONTRACT_CODEC_VERSION,
+                    "contract_type": "CandidateRecallMetadata",
+                    "payload": recall,
+                })
+                with self.assertRaisesRegex(ValueError, "close threshold and top-k"):
+                    contract_from_json(serialized)
+
+        truncated = _legacy_recall_payload()
+        truncated["truncated"] = True
+        with self.assertRaisesRegex(ValueError, "must not truncate"):
+            contract_from_json(json.dumps({
+                "contract_version": TM_CONTRACT_CODEC_VERSION,
+                "contract_type": "CandidateRecallMetadata",
+                "payload": truncated,
+            }))
+
+        forged = _legacy_recall_payload()
+        forged_proof = cast(dict[str, object], forged["proof"])
+        forged_proof["ranked_eligible_count"] = 3
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            contract_from_json(json.dumps({
+                "contract_version": TM_CONTRACT_CODEC_VERSION,
+                "contract_type": "CandidateRecallMetadata",
+                "payload": forged,
+            }))
+
+    def test_cross_version_fields_and_unknown_version_fail_closed(self) -> None:
+        payload = json.loads(contract_to_json(_proof_v3()))["payload"]
+        payload["kth_score"] = payload.pop("ranked_kth_score")
+        payload["kth_record_id"] = payload.pop("ranked_kth_record_id")
+        with self.assertRaises((TypeError, ValueError)):
+            self._decode_payload(payload)
+
+        unknown = json.loads(contract_to_json(_proof_v3()))["payload"]
+        unknown["proof_version"] = "proof-query-v999"
+        with self.assertRaisesRegex(ValueError, "unsupported candidate proof version"):
+            self._decode_payload(unknown)
+
+    def test_domain_counts_and_closure_facts_are_derived(self) -> None:
+        separated = json.loads(contract_to_json(_proof_v3()))["payload"]
+        separated.update({
+            "ranked_eligible_count": 1,
+            "ranked_kth_score": None,
+            "ranked_kth_record_id": None,
+            "unscored_max_upper_bound": 0.5,
+            "threshold_closed": True,
+            "top_k_closed": False,
+            "result_complete": True,
+        })
+        separated_proof = cast(
+            CandidateProofMetadata,
+            self._decode_payload(separated),
+        )
+        self.assertGreater(
+            separated_proof.scorer_invocation_count,
+            separated_proof.ranked_eligible_count,
+        )
+
+        for field, value in (
+            ("ranking_domain_version", "raw-distinct-v999"),
+            ("invocation_domain_version", "exact-fold-v999"),
+            ("ranked_eligible_count", 4),
+            ("scorer_invocation_count", 4),
+            ("threshold_closed", True),
+            ("top_k_closed", False),
+            ("result_complete", False),
+        ):
+            with self.subTest(field=field):
+                payload = json.loads(contract_to_json(_proof_v3()))["payload"]
+                payload[field] = value
+                with self.assertRaises(ValueError):
+                    self._decode_payload(payload)
+
+    def test_ranked_kth_shape_and_tie_equality_are_strict(self) -> None:
+        payload = json.loads(contract_to_json(_proof_v3()))["payload"]
+        payload["ranked_kth_record_id"] = None
+        with self.assertRaises((TypeError, ValueError)):
+            self._decode_payload(payload)
+
+        tie_open = _proof_v3(
+            unscored_upper=0.8,
+            unscored_record_id=2,
+            top_k_closed=False,
+            result_complete=False,
+        )
+        self.assertFalse(tie_open.threshold_closed)
+        self.assertFalse(tie_open.top_k_closed)
+        self.assertFalse(tie_open.result_complete)
+        with self.assertRaisesRegex(ValueError, "result must be complete"):
+            CandidateRecallMetadata(
+                resource_id="tm.primary",
+                index_kind="GRAM_FALLBACK",
+                fuzzy_available=True,
+                fuzzy_unavailable_code=None,
+                stages=(
+                    CandidateStageMetadata(CandidateStage.GRAM_2, 0, 1, 1, 0),
+                    CandidateStageMetadata(CandidateStage.BOUND_PROOF, 1, 2, 3, 0),
+                    CandidateStageMetadata(CandidateStage.UNION, 3, 0, 3, 0),
+                    CandidateStageMetadata(CandidateStage.DEDUPLICATE, 3, 0, 3, 0),
+                ),
+                union_unique_count=3,
+                deduplicated_count=3,
+                result_limit=2,
+                candidate_budget_version=CANDIDATE_BUDGET_VERSION,
+                candidate_budget=candidate_budget_v1(2),
+                truncated=False,
+                proof=tie_open,
+            )
+
+    def test_dense_u4_partitions_and_frontier_round_trip(self) -> None:
+        refinement = CandidateProofRefinementMetadata(
+            phase="DENSE_COMPLETE",
+            refined=True,
+            partition_version=CANDIDATE_PROOF_PARTITION_VERSION,
+            a0_accounted_identity_count=1,
+            p1_unscored_identity_count=1,
+            r_refinement_identity_count=3,
+            p2_unscored_identity_count=1,
+            s_post_u3_identity_count=2,
+            u4_evaluated_identity_count=2,
+            a1_accounted_identity_count=1,
+            p3_unscored_identity_count=1,
+            refinement_request_count=3,
+            refinement_returned_count=3,
+            k0_score=0.7,
+            k0_record_id=1,
+            p1_max_upper_bound=0.1,
+            p1_possible_record_id=2,
+            p2_max_upper_bound=0.2,
+            p2_possible_record_id=3,
+            p3_max_upper_bound=0.3,
+            p3_possible_record_id=4,
+        )
+        proof = CandidateProofMetadata(
+            proof_version=CANDIDATE_PROOF_QUERY_VERSION,
+            bound_version=SCORER_BOUND_VERSION_V1,
+            block_version=CANDIDATE_PROOF_BLOCK_VERSION_V1,
+            traversal_version=CANDIDATE_PROOF_TRAVERSAL_VERSION,
+            ranking_domain_version=CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+            invocation_domain_version=CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION,
+            traversal_mode="DENSE",
+            total_block_count=1,
+            total_record_count=5,
+            scanned_block_count=1,
+            opened_block_count=0,
+            inspected_record_count=5,
+            seed_unique_count=1,
+            scorer_invocation_count=2,
+            accounted_identity_count=2,
+            ranked_eligible_count=2,
+            unscored_identity_count=3,
+            unscored_max_upper_bound=0.3,
+            unscored_possible_record_id=4,
+            minimum_similarity=0.6,
+            threshold_closed=True,
+            top_k=2,
+            ranked_kth_score=0.8,
+            ranked_kth_record_id=1,
+            top_k_closed=True,
+            result_complete=True,
+            refinement=refinement,
+        )
+        self.assertEqual(contract_from_json(contract_to_json(proof)), proof)
+
+        for field, value, error in (
+            ("refinement_request_count", 2, "request/response"),
+            ("p2_unscored_identity_count", 2, "R/P2/S"),
+            ("p3_unscored_identity_count", 0, "S/A1/P3"),
+            ("u4_evaluated_identity_count", 3, "exceeds post-U3"),
+            ("u4_evaluated_identity_count", 0, "P3 count exceeds"),
+            ("partition_version", "proof-partition-v999", "partition version"),
+            ("p3_possible_record_id", 6, "outside the proof universe"),
+        ):
+            with self.subTest(field=field):
+                payload = json.loads(contract_to_json(proof))["payload"]
+                payload["refinement"][field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    self._decode_payload(payload)
+
+        payload = json.loads(contract_to_json(proof))["payload"]
+        payload["refinement"]["p3_max_upper_bound"] = 0.4
+        with self.assertRaisesRegex(ValueError, "mixed frontier"):
+            self._decode_payload(payload)
+
+    def test_dense_lazy_u4_can_close_from_u3_without_u4_evaluation(self) -> None:
+        refinement = CandidateProofRefinementMetadata(
+            phase="DENSE_COMPLETE",
+            refined=True,
+            partition_version=CANDIDATE_PROOF_PARTITION_VERSION,
+            a0_accounted_identity_count=1,
+            p1_unscored_identity_count=1,
+            r_refinement_identity_count=3,
+            p2_unscored_identity_count=2,
+            s_post_u3_identity_count=1,
+            u4_evaluated_identity_count=0,
+            a1_accounted_identity_count=1,
+            p3_unscored_identity_count=0,
+            refinement_request_count=3,
+            refinement_returned_count=3,
+            k0_score=0.7,
+            k0_record_id=1,
+            p1_max_upper_bound=0.1,
+            p1_possible_record_id=2,
+            p2_max_upper_bound=0.3,
+            p2_possible_record_id=4,
+            p3_max_upper_bound=None,
+            p3_possible_record_id=None,
+        )
+        proof = CandidateProofMetadata(
+            proof_version=CANDIDATE_PROOF_QUERY_VERSION,
+            bound_version=SCORER_BOUND_VERSION_V1,
+            block_version=CANDIDATE_PROOF_BLOCK_VERSION_V1,
+            traversal_version=CANDIDATE_PROOF_TRAVERSAL_VERSION,
+            ranking_domain_version=CANDIDATE_PROOF_RANKING_DOMAIN_VERSION,
+            invocation_domain_version=CANDIDATE_PROOF_INVOCATION_DOMAIN_VERSION,
+            traversal_mode="DENSE",
+            total_block_count=1,
+            total_record_count=5,
+            scanned_block_count=1,
+            opened_block_count=0,
+            inspected_record_count=5,
+            seed_unique_count=1,
+            scorer_invocation_count=2,
+            accounted_identity_count=2,
+            ranked_eligible_count=2,
+            unscored_identity_count=3,
+            unscored_max_upper_bound=0.3,
+            unscored_possible_record_id=4,
+            minimum_similarity=0.6,
+            threshold_closed=True,
+            top_k=2,
+            ranked_kth_score=0.8,
+            ranked_kth_record_id=1,
+            top_k_closed=True,
+            result_complete=True,
+            refinement=refinement,
+        )
+        serialized = contract_to_json(proof)
+        self.assertEqual(contract_from_json(serialized), proof)
+        payload = json.loads(serialized)["payload"]
+        self.assertNotIn("s_u4_identity_count", payload["refinement"])
+
+        for field, value in (
+            ("phase", "PHASE_2_COMPLETE"),
+            ("s_u4_identity_count", 1),
+        ):
+            with self.subTest(field=field):
+                forged = json.loads(serialized)["payload"]
+                forged["refinement"][field] = value
+                with self.assertRaises((TypeError, ValueError)):
+                    self._decode_payload(forged)
+
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+def _export_diagnostic() -> ExportDiagnostic:
+    return ExportDiagnostic(
+        code="EXPORT.CLEANUP_PENDING",
+        record_id=None,
+        disposition=DiagnosticDisposition.WARNING,
+        safe_summary="EXPORT_ARTIFACTS_REMAIN",
+    )
+
+
+def _destination_evidence(
+    state: AssetPreservationState,
+    *,
+    before_digest: str | None,
+    observed_digest: str | None,
+) -> AssetPreservationEvidence:
+    return AssetPreservationEvidence(
+        asset_kind=AssetKind.EXPORT_DESTINATION,
+        state=state,
+        before_digest=before_digest,
+        observed_digest=observed_digest,
+    )
+
+
+class TMExportFailurePublicationCommittedTests(unittest.TestCase):
+    """ExportFailure publication_committed contract and codec tests."""
+
+    def test_default_false_preserves_original_invariant(self) -> None:
+        changed_with_locator = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(
+                RecoveryLocator(
+                    path=Path("/catalog/recovery/out.jsonl"),
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    expected_digest=_DIGEST_A,
+                ),
+            ),
+        )
+        self.assertFalse(changed_with_locator.publication_committed)
+        with self.assertRaisesRegex(ValueError, "exactly match assets"):
+            ExportFailure(
+                stage="EXPORT.PUBLISH",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+            )
+        with self.assertRaisesRegex(ValueError, "exactly match assets"):
+            ExportFailure(
+                stage="EXPORT.PUBLISH",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.UNVERIFIED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=None,
+                ),
+                recovery_locators=(),
+            )
+        with self.assertRaises(FrozenInstanceError):
+            changed_with_locator.publication_committed = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_committed_requires_fail_stop_and_forbids_rollback(self) -> None:
+        changed = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.CLEANUP_PENDING",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_committed=True,
+        )
+        self.assertTrue(changed.publication_committed)
+        with self.assertRaisesRegex(ValueError, "not retryable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=True,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot restore"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(
+                    RecoveryLocator(
+                        path=Path("/catalog/recovery/out.jsonl"),
+                        asset_kind=AssetKind.EXPORT_DESTINATION,
+                        expected_digest=_DIGEST_A,
+                    ),
+                ),
+                publication_committed=True,
+            )
+
+    def test_committed_evidence_allows_truthful_states_without_locator(
+        self,
+    ) -> None:
+        for evidence in (
+            _destination_evidence(
+                AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            _destination_evidence(
+                AssetPreservationState.UNVERIFIED,
+                before_digest=_DIGEST_A,
+                observed_digest=None,
+            ),
+        ):
+            with self.subTest(state=evidence.state):
+                failure = ExportFailure(
+                    stage="EXPORT.LEDGER",
+                    error_code="EXPORT.CLEANUP_PENDING",
+                    retryable=False,
+                    diagnostics=(),
+                    previous_destination_preservation=evidence,
+                    recovery_locators=(),
+                    publication_committed=True,
+                )
+                self.assertTrue(failure.publication_committed)
+                self.assertEqual(failure.recovery_locators, ())
+
+    def test_committed_not_applicable_requires_no_prior_destination(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "not-applicable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.CLEANUP_PENDING",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.NOT_APPLICABLE,
+                    before_digest=_DIGEST_A,
+                    observed_digest=None,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+            )
+
+    def test_cleanup_pending_builder_contract(self) -> None:
+        fresh = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=None,
+            destination_observed=_DIGEST_B,
+        )
+        self.assertEqual(fresh.error_code, "EXPORT.CLEANUP_PENDING")
+        self.assertFalse(fresh.retryable)
+        self.assertTrue(fresh.publication_committed)
+        self.assertEqual(fresh.recovery_locators, ())
+        self.assertEqual(
+            fresh.previous_destination_preservation.state,
+            AssetPreservationState.NOT_APPLICABLE,
+        )
+
+        changed = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        self.assertTrue(changed.publication_committed)
+        self.assertEqual(
+            changed.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_CHANGED,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.observed_digest,
+            _DIGEST_B,
+        )
+
+        unverified = export_cleanup_pending_failure(
+            stage="EXPORT.LEDGER",
+            destination_before=_DIGEST_A,
+            destination_observed=None,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.state,
+            AssetPreservationState.UNVERIFIED,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertIsNone(
+            unverified.previous_destination_preservation.observed_digest
+        )
+
+    def test_publication_committed_round_trips_and_old_payload_decodes(
+        self,
+    ) -> None:
+        failure = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.CLEANUP_PENDING",
+            retryable=False,
+            diagnostics=(_export_diagnostic(),),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_committed=True,
+        )
+        encoded = contract_to_json(failure)
+        self.assertTrue(
+            json.loads(encoded)["payload"]["publication_committed"]
+        )
+        self.assertEqual(contract_from_json(encoded), failure)
+        self.assertEqual(contract_to_json(contract_from_json(encoded)), encoded)
+
+        legacy_encoded = contract_to_json(
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.FAILED",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_UNCHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_A,
+                ),
+                recovery_locators=(),
+            )
+        )
+        legacy = json.loads(legacy_encoded)
+        del legacy["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(legacy, sort_keys=True))
+        self.assertIsInstance(decoded, ExportFailure)
+        assert isinstance(decoded, ExportFailure)
+        self.assertEqual(decoded.publication_committed, False)
+        self.assertEqual(decoded.error_code, "EXPORT.FAILED")
+        self.assertEqual(
+            decoded.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        default_failure = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=True,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            recovery_locators=(),
+        )
+        self.assertFalse(default_failure.publication_committed)
+        self.assertEqual(
+            contract_from_json(contract_to_json(default_failure)),
+            default_failure,
+        )
+
+
+class TMExportFailurePublicationAmbiguousTests(unittest.TestCase):
+    """ExportFailure publication_commit_ambiguous contract and codec tests."""
+
+    def _ambiguous_evidence(
+        self,
+        state: AssetPreservationState,
+        *,
+        before_digest: str | None,
+        observed_digest: str | None,
+    ) -> AssetPreservationEvidence:
+        return _destination_evidence(
+            state,
+            before_digest=before_digest,
+            observed_digest=observed_digest,
+        )
+
+    def test_default_false_preserves_original_invariant(self) -> None:
+        failure = ExportFailure(
+            stage="EXPORT.PUBLISH",
+            error_code="EXPORT.FAILED",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(
+                RecoveryLocator(
+                    path=Path("/catalog/recovery/out.jsonl"),
+                    asset_kind=AssetKind.EXPORT_DESTINATION,
+                    expected_digest=_DIGEST_A,
+                ),
+            ),
+        )
+        self.assertFalse(failure.publication_commit_ambiguous)
+        self.assertFalse(failure.publication_committed)
+        with self.assertRaises(FrozenInstanceError):
+            failure.publication_commit_ambiguous = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_ambiguous_requires_fail_stop_and_forbids_locator(self) -> None:
+        changed = ExportFailure(
+            stage="EXPORT.LEDGER",
+            error_code="EXPORT.LEDGER_AMBIGUOUS",
+            retryable=False,
+            diagnostics=(),
+            previous_destination_preservation=_destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            recovery_locators=(),
+            publication_commit_ambiguous=True,
+        )
+        self.assertTrue(changed.publication_commit_ambiguous)
+        self.assertFalse(changed.publication_committed)
+        with self.assertRaisesRegex(ValueError, "not retryable"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=True,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_commit_ambiguous=True,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot fabricate"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(
+                    RecoveryLocator(
+                        path=Path("/catalog/recovery/out.jsonl"),
+                        asset_kind=AssetKind.EXPORT_DESTINATION,
+                        expected_digest=_DIGEST_A,
+                    ),
+                ),
+                publication_commit_ambiguous=True,
+            )
+
+    def test_ambiguous_is_mutually_exclusive_with_committed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "contradictory"):
+            ExportFailure(
+                stage="EXPORT.LEDGER",
+                error_code="EXPORT.LEDGER_AMBIGUOUS",
+                retryable=False,
+                diagnostics=(),
+                previous_destination_preservation=_destination_evidence(
+                    AssetPreservationState.VERIFIED_CHANGED,
+                    before_digest=_DIGEST_A,
+                    observed_digest=_DIGEST_B,
+                ),
+                recovery_locators=(),
+                publication_committed=True,
+                publication_commit_ambiguous=True,
+            )
+
+    def test_ambiguous_allows_truthful_states_without_locator(self) -> None:
+        for evidence in (
+            _destination_evidence(
+                AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_UNCHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_A,
+            ),
+            _destination_evidence(
+                AssetPreservationState.VERIFIED_CHANGED,
+                before_digest=_DIGEST_A,
+                observed_digest=_DIGEST_B,
+            ),
+            _destination_evidence(
+                AssetPreservationState.UNVERIFIED,
+                before_digest=_DIGEST_A,
+                observed_digest=None,
+            ),
+        ):
+            with self.subTest(state=evidence.state):
+                failure = ExportFailure(
+                    stage="EXPORT.LEDGER",
+                    error_code="EXPORT.LEDGER_AMBIGUOUS",
+                    retryable=False,
+                    diagnostics=(),
+                    previous_destination_preservation=evidence,
+                    recovery_locators=(),
+                    publication_commit_ambiguous=True,
+                )
+                self.assertTrue(failure.publication_commit_ambiguous)
+                self.assertFalse(failure.publication_committed)
+                self.assertEqual(failure.recovery_locators, ())
+
+    def test_ambiguous_builder_contract(self) -> None:
+        fresh = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=None,
+            destination_observed=_DIGEST_B,
+        )
+        self.assertEqual(fresh.error_code, "STORE.PROBE_UNAVAILABLE")
+        self.assertFalse(fresh.retryable)
+        self.assertFalse(fresh.publication_committed)
+        self.assertTrue(fresh.publication_commit_ambiguous)
+        self.assertEqual(fresh.recovery_locators, ())
+        self.assertEqual(
+            fresh.previous_destination_preservation.state,
+            AssetPreservationState.NOT_APPLICABLE,
+        )
+        self.assertIsNone(fresh.previous_destination_preservation.before_digest)
+        self.assertIsNone(
+            fresh.previous_destination_preservation.observed_digest
+        )
+
+        changed = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        self.assertTrue(changed.publication_commit_ambiguous)
+        self.assertFalse(changed.publication_committed)
+        self.assertEqual(
+            changed.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_CHANGED,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertEqual(
+            changed.previous_destination_preservation.observed_digest,
+            _DIGEST_B,
+        )
+
+        unchanged = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_A,
+        )
+        self.assertEqual(
+            unchanged.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        unverified = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=None,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.state,
+            AssetPreservationState.UNVERIFIED,
+        )
+        self.assertEqual(
+            unverified.previous_destination_preservation.before_digest,
+            _DIGEST_A,
+        )
+        self.assertIsNone(
+            unverified.previous_destination_preservation.observed_digest
+        )
+
+    def test_ambiguous_round_trips_and_legacy_payloads_decode_false(
+        self,
+    ) -> None:
+        failure = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_B,
+            diagnostics=(_export_diagnostic(),),
+        )
+        encoded = contract_to_json(failure)
+        self.assertTrue(
+            json.loads(encoded)["payload"]["publication_commit_ambiguous"]
+        )
+        self.assertFalse(
+            json.loads(encoded)["payload"]["publication_committed"]
+        )
+        self.assertEqual(contract_from_json(encoded), failure)
+        self.assertEqual(contract_to_json(contract_from_json(encoded)), encoded)
+
+        legacy_candidate = export_ledger_ambiguous_failure(
+            stage="EXPORT.LEDGER",
+            error_code="STORE.PROBE_UNAVAILABLE",
+            destination_before=_DIGEST_A,
+            destination_observed=_DIGEST_A,
+        )
+        legacy_payload = json.loads(contract_to_json(legacy_candidate))
+        del legacy_payload["payload"]["publication_commit_ambiguous"]
+        decoded = contract_from_json(
+            json.dumps(legacy_payload, sort_keys=True)
+        )
+        self.assertIsInstance(decoded, ExportFailure)
+        assert isinstance(decoded, ExportFailure)
+        self.assertFalse(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+        self.assertEqual(decoded.error_code, "STORE.PROBE_UNAVAILABLE")
+        self.assertEqual(
+            decoded.previous_destination_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+
+        payload = json.loads(encoded)
+        del payload["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(payload, sort_keys=True))
+        assert isinstance(decoded, ExportFailure)
+        self.assertTrue(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+
+        payload = json.loads(contract_to_json(legacy_candidate))
+        del payload["payload"]["publication_commit_ambiguous"]
+        del payload["payload"]["publication_committed"]
+        decoded = contract_from_json(json.dumps(payload, sort_keys=True))
+        assert isinstance(decoded, ExportFailure)
+        self.assertFalse(decoded.publication_commit_ambiguous)
+        self.assertFalse(decoded.publication_committed)
+        self.assertEqual(decoded.error_code, "STORE.PROBE_UNAVAILABLE")
+
+        with self.assertRaises(ValueError):
+            contract_from_json(
+                contract_to_json(
+                    ExportFailure(
+                        stage="EXPORT.LEDGER",
+                        error_code="EXPORT.LEDGER_AMBIGUOUS",
+                        retryable=False,
+                        diagnostics=(),
+                        previous_destination_preservation=(
+                            _destination_evidence(
+                                AssetPreservationState.VERIFIED_CHANGED,
+                                before_digest=_DIGEST_A,
+                                observed_digest=_DIGEST_B,
+                            )
+                        ),
+                        recovery_locators=(),
+                        publication_committed=True,
+                        publication_commit_ambiguous=True,
+                    )
+                )
             )
 
 

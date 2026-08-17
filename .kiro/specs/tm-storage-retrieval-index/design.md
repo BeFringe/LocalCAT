@@ -71,7 +71,9 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 ```mermaid
 graph LR
     Contracts[TM contracts] --> Store[SQLite TM store]
+    Contracts --> ActivationDurability[Activation journal and recovery]
     Store --> Coordinator[Resource store coordinator]
+    ActivationDurability --> Coordinator
     Contracts --> Migration[JSONL migration]
     Contracts --> MatcherCore[Text matcher algorithm]
     MatcherEvidence[Matcher validation evidence] --> MatcherGate[Matcher capability provider]
@@ -80,16 +82,16 @@ graph LR
     Similarity[Similarity scorers] --> Retrieval[TM retrieval]
     Candidate --> Retrieval
     Coordinator --> Retrieval
+    RetrievalEvidence[Retrieval validation evidence] --> RetrievalGate[Retrieval capability publisher]
+    RetrievalGate --> Retrieval
     Migration --> Coordinator
     Retrieval --> Facade[Legacy TM facade]
     Coordinator --> Facade
-    Benchmark[TM benchmark] --> FuzzyGate[Fuzzy capability gate]
-    Retrieval --> FuzzyGate
-    FuzzyGate --> Facade
+    Benchmark[TM benchmark] --> RetrievalGate
     MatcherGate --> ProductAdapters[Qt independent product adapters]
 ```
 
-依赖方向为 Contracts → Store/Migration/Matcher/Scorers → Retrieval/Capability Gates → Compatibility Facade。候选索引没有返回 final similarity 的权力；physical canonical activation、fuzzy benchmark 和 matcher capability 是三个独立状态机，任何一项都不得替另一项宣称就绪。
+依赖方向为 Contracts → Store/Activation Durability/Migration/Matcher/Scorers → Coordinator/Retrieval/Capability Gates → Compatibility Facade。Activation Durability 通过窄 store-validation port 服务 coordinator，不反向依赖 `SQLiteTMStore` 具体实现；候选索引没有返回 final similarity 的权力。physical canonical activation、fuzzy benchmark 和 matcher capability 是三个独立状态机，任何一项都不得替另一项宣称就绪。
 
 ### 技术栈
 
@@ -110,17 +112,28 @@ graph LR
 ```text
 /
 ├── tm_contracts.py                  # Core frozen contracts、Enums、Protocols
-├── tm_sqlite_store.py               # per-resource coordinator、schema、CRUD、backup/activation
+├── tm_sqlite_store.py               # per-resource coordinator facade、schema、CRUD、source binding
+├── tm_activation_journal.py         # activation journal/terminal codec 与 durable file protocol
+├── tm_activation_recovery.py        # phase recovery、成套 publication/rollback 与窄 store-validation port
+├── tm_schema_upgrade.py             # schema upgrade copy 数据面与 pending/reported artifact 协议
+├── tm_snapshot_artifacts.py         # snapshot artifact namespace/proof/handoff primitives
 ├── tm_candidate_index.py            # FTS5/gram candidate retrievers
 ├── tm_similarity.py                 # Levenshtein、Dice、scorer-v1
 ├── tm_retrieval.py                  # exact/context/fuzzy pipeline 与聚合
+├── tm_retrieval_capability.py       # Gate C/D evidence evaluator、原子能力快照与发布
+├── tm_retrieval_validation.py       # Gate C 固定向量执行、结果重算与 manifest 生成
 ├── tm_migration.py                  # JSONL preflight/migrate/export/upgrade
 ├── text_matcher.py                  # text-v1 纯算法、fold projection 与 hit logic
 ├── matcher_capability.py             # evidence evaluator、三态发布与 gated port
 ├── unicode_word_break_data.py       # generated pinned property tables
 ├── tm_engine.py                     # 激活 gate 后的 compatibility facade
 ├── resource_importer.py             # 已激活资源调用 canonical import port
-├── tm_benchmark.py                  # 100k corpus、latency、RSS、recall
+├── tm_benchmark.py                  # benchmark-v1 确定性语料、cohort 与冻结输入契约
+├── tm_benchmark_latency.py          # exact/fuzzy 逐查询延迟样本与 nearest-rank 统计
+├── tm_benchmark_process.py          # 独立子进程迁移、reopen 与全生命周期 RSS 采样
+├── tm_benchmark_oracle.py           # 固定 subset 全扫描 oracle 与 candidate recall 对账
+├── tm_benchmark_query_process.py    # 按迁移 artifact identity 重开真实 store 的查询子进程
+├── tm_benchmark_gate.py             # TMBenchmark 组合入口、双路径报告与 Gate D 发布
 ├── benchmark_tm_contract.json       # thresholds、corpus/scorer/index config
 └── tests/
     ├── assets/
@@ -133,12 +146,20 @@ graph LR
     ├── test_tm_candidate_index.py
     ├── test_tm_similarity.py
     ├── test_tm_retrieval.py
+    ├── test_tm_retrieval_capability.py
+    ├── test_tm_retrieval_validation.py
     ├── test_tm_migration.py
     ├── test_text_matcher.py
     ├── test_matcher_capability.py
     ├── test_tm_engine_compat.py
     └── test_tm_benchmark_contract.py
 ```
+
+Activation 模块在 Task 5.9 闭合完整恢复矩阵后、Cluster D 统一复审前做行为保持型提取。`tm_sqlite_store.py` 在 Feature 5 内继续保持既有 `ResourceStoreCoordinator` 导入入口，但不再拥有 journal/terminal canonical codec、exclusive temporary/replace/fsync 原语或逐 phase 恢复/回滚实现；新模块不得反向导入 `SQLiteTMStore`，只能消费 frozen contracts 与显式窄端口。提取不得修改 journal phase、错误码、token/nonce 单次语义、fault-injection 顺序或 public lease/activation 行为；原 Cluster D characterization/failure matrix 必须在移动前后使用同一断言通过。`tm_contracts.py` 与 `tm_stage_sealer.py` 不属于本次提取范围，待 Feature 5 契约面稳定后另行评估。
+
+Cluster E 行为闭合后、Cluster F 开始前增加 schema-upgrade 行为保持型边界提取。`tm_schema_upgrade.py` 仅拥有 v1→v2 copy 数据面、backup/locator 的 pending→reported 持久化协议、strict locator file proof 与纯候选事实校验；它不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，只通过显式值、callback/窄端口消费 schema DDL 和 canonical ancestry 证明。`ResourceStoreCoordinator` 仍在 `tm_sqlite_store.py` 独占 ticket/locator snapshot 所有权、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService.upgrade_schema()` 的公开入口、成败编排和 report/failure 构造仍在 `tm_migration.py`。原模块对已有 private 导入与 fault-injection patch seam 保留 late-bound compatibility wrapper，不得藉移动改变分支顺序、异常码、cleanup 顺序或磁盘效果。`tm_contracts.py`、`tm_stage_sealer.py`、canonical ancestry 单一证明实现与通用 coordinator 状态机不纳入此次提取；`try/except/if/raise` 简化属于正交的后续治理，不与等价移动同一提交。提取前后必须用同一 Cluster E failure/interleaving matrix、公开 API 契约、import-boundary 守卫和 fresh 全量回归证明等价。
+
+Cluster F 行为、命名空间与冷恢复矩阵闭合后增加 snapshot artifact 行为保持型边界提取。`tm_snapshot_artifacts.py` 只拥有 deterministic JSONL/manifest/temp/recovery family、root→parent no-follow directory descriptor 绑定、strict regular/single-link identity+digest proof、exclusive temporary/recovery copy、replace/cleanup 原语与 durable handoff 值编解码；它不反向导入 `tm_sqlite_store.py`、`tm_migration.py` 或 `tm_snapshot_recovery.py`。`TMMigrationService` 仍独占公开 export/refresh 编排、canonical snapshot 使用和 report/failure 构造；`tm_snapshot_recovery.py` 仍独占 receipt 分类、reconciliation、terminal replay 和 divergence 决策；`tm_sqlite_store.py` 仍独占 ledger/binding SQL、transaction、generation 与 coordinator 状态。已有 owner 导入和 fault-injection seam 通过 late-bound compatibility wrapper 保留，不得改变错误码、调用/清理顺序、durable handoff 生命周期、交易边界或磁盘效果。该门不设行数指标；只用 owner 责任减少、无反向导入、Cluster F 同一断言与 fresh 全量回归判定成功。异常分支简化、错误分类重新设计、`tm_contracts.py`/`tm_stage_sealer.py` 拆分与公开 API 调整全部排除。
 
 ### Modified Files
 
@@ -237,9 +258,13 @@ sequenceDiagram
 | StageSealer | Storage workflow | 闭合索引、校验、fsync 并生成不可变 artifact | 2, 7 | staged Store | Service |
 | SourceBindingMonitor | Storage workflow | JSONL snapshot 同源性与 divergence 状态机 | 1, 2, 7 | Store metadata | State, Service |
 | TMMigrationService | Storage workflow | JSONL migration/import/rebuild/export/upgrade | 2, 7, 8 | Store, Sealer | Batch |
+| SnapshotArtifactProtocol | Storage mechanism | snapshot artifact namespace、identity proof、replace/cleanup 与 handoff codec | 2, 7 | frozen contracts, stdlib filesystem | Service |
 | CandidateRetriever | Index | recall-only candidate ids | 4, 5, 8 | Store/FTS5 | Service |
 | SimilarityScorerV1 | Domain | Levenshtein/Dice/final | 4, 5, 8 | 无 | Service |
 | TMRetrievalService | Domain | exact/context/fuzzy order | 1, 3–5, 7 | Store/Index/Scorer | Service |
+| RetrievalCapabilityEvaluator | Domain validation | Gate C correctness 与逐执行路径 Gate D evidence 的唯一判定 | 4, 5, 7, 8 | frozen contracts, validation evidence | State, Service |
+| RetrievalCapabilityPublisher | Domain runtime | 原子发布 CONTEXT 与逐路径 FUZZY 不可变快照 | 4, 7, 8 | evaluator | State, Service |
+| RetrievalValidation | Domain validation | 从固定输入重新执行 Gate C vectors 并生成 identity-closed manifest | 3–5, 7 | Retrieval pure functions, frozen contracts | Batch |
 | TextMatcherV1 | Shared domain | Unicode/CJK stable hits 纯算法 | 6, 9 | pinned data | Service |
 | MatcherCapabilityEvaluator | Shared domain | 校验证据到三态快照的唯一决策 | 9 | manifest, TextMatcherV1 | State, Service |
 | CapabilityGatedTextMatcher | Shared domain | 用途/选项门控和结果信封 | 6, 9 | evaluator, TextMatcherV1 | Service |
@@ -472,8 +497,10 @@ class ExportFailure:
     error_code: str
     retryable: bool
     diagnostics: tuple[ExportDiagnostic, ...]
-    previous_destination_unchanged: bool
-    recovery_path: Path | None
+    previous_destination_preservation: AssetPreservationEvidence
+    recovery_locators: tuple[RecoveryLocator, ...]
+    publication_committed: bool = False
+    publication_commit_ambiguous: bool = False
 
 type MigrationOutcome = MigrationReport | MigrationFailure
 type ExportOutcome = ExportReport | ExportFailure
@@ -605,7 +632,7 @@ class BenchmarkReport:
     environment: tuple[tuple[str, str], ...]
 ```
 
-所有相似度/overlap 在 `[0.0, 1.0]`，limit 为正整数，source/target/resource id 非空，handle order 唯一且非负。fuzzy 必须有 evidence；exact/context 不得伪造 scorer evidence。候选阶段计数均非负且按规定顺序出现；`UNION.output_unique_count == union_unique_count`，deduplicate/truncate 前后可对账，`scored_count <= recall.candidate_budget`，`truncated` 与 TRUNCATE dropped count 一致。fuzzy/context available 为 false 时对应 unavailable code 必须非空且不得返回该类型结果，true 时 code 必须为空。Success 必须有 digest/generation，Failure 必须有 stage/error/retryable 和资产保持标志；无法证明 unchanged 时必须给 recovery path 并 fail-stop。公开 diagnostics 只保存 code、stage、line/record id 和安全摘要，不包含正文。
+所有相似度/overlap 在 `[0.0, 1.0]`，limit 为正整数，source/target/resource id 非空，handle order 唯一且非负。fuzzy 必须有 evidence；exact/context 不得伪造 scorer evidence。候选阶段计数均非负且按规定顺序出现；`UNION.output_unique_count == union_unique_count`，deduplicate/truncate 前后可对账，`scored_count <= recall.candidate_budget`，`truncated` 与 TRUNCATE dropped count 一致。fuzzy/context available 为 false 时对应 unavailable code 必须非空且不得返回该类型结果，true 时 code 必须为空。Success 必须有 digest/generation，Failure 必须有 stage/error/retryable 和资产保持标志；普通失败无法证明 unchanged 时必须给 recovery locator 并 fail-stop。若 receipt 与新 pair 已 durable commit、禁止回滚旧 destination，但 deterministic cleanup/handoff 尚未闭合，`ExportFailure.publication_committed` 为 true：结果仍 fail-stop，保留已知 before/observed digest，且不得给出会暗示恢复旧 destination 的 locator；若 completion probe 本身失败、ledger commit 状态不可判定且自动回滚同样不安全，则互斥地设置 `publication_commit_ambiguous`，以同样的 fail-stop/no-locator 规则保留真实证据但绝不宣称已经 commit。原 destination 不存在时才可使用 `NOT_APPLICABLE`。公开 diagnostics 只保存 code、stage、line/record id 和安全摘要，不包含正文。
 
 ### SQLiteTMStore
 
@@ -621,6 +648,7 @@ class TMStore(Protocol):
 **连接配置**
 
 - 每个公开 operation 先从 per-resource coordinator 获得 generation lease，再在所属线程建立短生命周期 connection；connection 不跨线程共享，也不泄露到 Store API 外。
+- `TMRetrievalService` 的一次单资源查询是一个组合 operation：只取得一次 query lease，并在其生命周期内通过 module-private、只读的 generation view 完成 health、raw exact、candidate recall 与 candidate record 批量读取。view 不暴露 append/export/activation/update 端口，不得在内部重新取得 lease，退出后立即失效；进入 `DRAINING` 前已经签发的 view 可完成当前查询并阻塞 generation 发布，`DRAINING` 后不得签发新 view。该约束保证同一资源的查询事实来自一个完整 generation，但不要求跨多个短连接持有同一个 SQLite transaction。
 - `journal_mode=DELETE`、`synchronous=FULL`、`foreign_keys=ON`、`busy_timeout=5000`。
 - write 使用显式 transaction；失败 rollback；read cursor 尽快关闭。
 - WAL capability 默认为 false；只有 SQLite fixed version、并发 recovery suite 与 writer serialization 同时满足才允许新 semantics version。
@@ -629,11 +657,11 @@ class TMStore(Protocol):
 
 - coordinator 状态为 `READY → DRAINING → ACTIVATING → READY/FAILED`，并维护 generation、active lease count 与 bounded wait；DRAINING 后不发新 lease。
 - `StageBuilder` 只产出 mutable working stage。records、FTS/gram indexes、origin batches、snapshot receipt 与 manifest temporary file 全部构建后，`StageSealer` 才执行 integrity/FK/record-index count/exact parity/source binding/index version/receipt-manifest digest 校验，关闭全部连接并 fsync 文件和 parent，最后生成 `SealedStage`。
-- `SealedArtifactRef` 是 module-private、由 StageSealer 工厂创建并登记到 coordinator-owned sealed registry 的 opaque 引用，绑定 staged DB path、manifest temporary path 及二者 digest；调用方不能自行构造或替换其 path。`SealedStage` 携带该引用并作为不可变、单次消费的 capability object。
+- `SealedArtifactRef` 是 module-private、由 StageSealer 工厂创建并登记到 coordinator-owned sealed registry 的 opaque 引用，绑定 staged DB path、manifest temporary path 及二者 digest；调用方不能自行构造或替换其 path。`SealedStage` 携带该引用并作为不可变、单次消费的 capability object。registry 的 reservation/commit/release 与 token lifecycle 只存在于 coordinator/StageSealer 私有 adapter；公开 surface 仅可取得 exact read-only readiness view。commit 只消费 StageSealer 在 post-fsync integrity/projection/closure/terminal-rehash 全部通过后铸造、绑定 exact registry+reservation 且单次消费的私有 verified capability，不接受调用方分别提供 mutable stage/evidence/generation/attestation；任何 sealed artifact 都必须经过同一 `StageSealer` 内容↔语义 epoch 闭合链。
 - seal 后任何文件 digest 变化、registry/ref 不一致、token 重用、过期 expected generation、资源/目标路径不匹配都必须拒绝。禁止把裸 `Path`、working stage 或布尔 `validated=True` 传给 coordinator。
 - `ResourceStoreCoordinator.activate(sealed_stage)` 是唯一 sidecar replace API。它只通过 registry 解析 artifact path，从 sealed evidence 生成并单次消费绑定同一 artifact id 的 `ActivationToken`，排空旧 leases，复核 resource、target identity、prior generation、DB/manifest digests 和 snapshot binding。
 - coordinator 在 replace 前写同目录 durable activation journal，至少包含 activation nonce、artifact/sealed digest、expected generation、prior binding snapshot id、prior manifest digest/backup path、new receipt id、new manifest final digest，以及 `PREPARED / DB_REPLACED / MANIFEST_PUBLISHED / GENERATION_PUBLISHED` phase；成功发布后标记 consumed。重复 nonce、已 consumed token 或与 journal 不一致的 replay 均拒绝。
-- 替换现有 store 前创建同目录 recovery backup；`os.replace(stage, canonical)` 后 fsync parent，重新 open 并执行 schema、digest、`integrity_check`、`foreign_key_check`、record/index count。
+- 替换现有 store 前创建同目录 recovery backup；`os.replace(stage, canonical)` 后 fsync parent，重新 capture 并严格比对 post-fsync sealed attestation 的 inode+SHA，再 open 复核 schema 与 `SEALED` marker。完整 `integrity_check` / `foreign_key_check` 已绑定该精确不可变 sealed byte identity，不得在仅发生 rename 且 inode+SHA 未变时重复；后续 active receipt 仍完整重算 record/index candidate semantic 与 logical closure。任何 byte/inode/phase 漂移都不得复用 sealed 证明。
 - reopen、receipt 与 manifest 发布/复核全部成功后才一次性发布新 generation、canonical exact/save capability 和来源绑定。crash recovery 若能复核新 DB、receipt、manifest 与同一 token，便幂等完成该 token；否则同时恢复 prior DB、prior manifest/binding，fsync parent 并重新验证，不能只恢复 DB。首次激活失败则删除/隔离未发布 manifest、保留原 JSONL 为 active legacy path，并隔离失败 sidecar。进程在 DB replace 后、generation 发布前崩溃时不得暴露半发布 generation。
 - 查询/写入在 drain 超时后得到 resource-local busy failure；不得绕过 coordinator 打开 canonical path。
 - physical activation 后，context correctness gate 与 fuzzy benchmark gate 分别发布；fuzzy 未通过只关闭 FUZZY，不改变 canonical exact/save 或已验证 CONTEXT。matcher capability 由另一套 evidence state machine 控制。
@@ -650,6 +678,34 @@ Activation recovery 固定为：
 | `GENERATION_PUBLISHED` | 新 generation 健康 | 幂等标记 token consumed |
 
 每个恢复分支都 fsync 受影响文件及 parent directory；不得把新 manifest 留给旧 DB，也不得生成第二个 generation。
+
+### 激活血缘标记（activated-lineage marker）
+
+物理激活成功后的资源/目标必须留下一个最小的、确定性的、邻接的、只写一次的激活血缘标记，作为“该资源/目标已经成功跨越物理激活”的持久事实。它**不是**第二套可变的 canonical 权威，不保存任何用户正文，也不随 generation 变化；后续 generation、显式 import/rebuild、schema upgrade 都保留同一个标记事实。
+
+**身份与路径**
+
+- 标记路径确定且不可由调用方指定：`identity.canonical_sidecar_path` 同目录下的 `.{sidecar 名}.localcat-activated-lineage.json`，临时文件为 `<标记路径>.tmp`（同目录、确定性命名）。
+- 标记**只**绑定稳定血缘事实：`lineage_version`、`resource_id`、`target_identity` 与 `record_digest`。它**不**绑定 `canonical_store_id` 或任何可变 coordinator 身份：显式 import/rebuild 可以创建新的 canonical store id，后续 generation 也不改变这一只写一次的标记事实。
+
+**严格 codec（v1）**
+
+- `lineage_version="activated-lineage-v1"`、`resource_id`、`target_identity`、`record_digest` 四个字段；`record_digest` 是其余三个字段经 `_stable_digest` 计算的 SHA-256。
+- 文件必须是 canonical JSON（`sort_keys`、无重复键、禁止非有限数字、无多余字段），只读/重放时逐字节复核序列化与摘要。
+- 标记文件必须是 regular 单链接文件；symlink、hardlink、目录或其他外来条目一律 fail-closed，绝不跟随、使用或覆盖。读取用 `O_NOFOLLOW` + open-time fstat + post-read lstat 复核同一 inode；发布握手期允许 final/temp 同 inode 的两链接中间态，仅由配对 inode 证明接受。
+
+**发布与重放顺序**
+
+- 首次物理激活的发布顺序固定为：完整 active set 复核通过且视图 withheld 在 `ACTIVATING` → `GENERATION_PUBLISHED` journal 落盘 durable → 同一 active set 再次复核 → token consumed → **最后**确保（写入或严格重校验）血缘标记 → `READY`。标记失败时 view 继续 withheld 在 `ACTIVATING`，完成的 journal 是冷恢复权威，fresh recovery 幂等补写标记后收尾；rollback 与取消绝不清除标记。
+- 冷恢复发布（`MANIFEST_PUBLISHED` 推进 generation）同样先重新证明 active set、落盘 durable `GENERATION_PUBLISHED`、再次复核，之后才确保标记；失败时收回 view 停在 `ACTIVATING`。终态重放（`GENERATION_PUBLISHED`）先重放 view 并复核 active set，再确保标记，最后清理 journal-owned backups。已存在且合法的标记绝不重写。
+- 标记发布是原子 no-clobber 协议：exclusive 确定性临时文件（`O_EXCL` + 全量写入 + fsync）→ `os.link` 发布 final（final 已存在时 `FileExistsError` 即外来 final，fail-stop 且绝不覆盖，仅身份绑定清理自有临时）→ parent fsync → 仅当 final/temp 仍是同一 inode 且 `st_nlink==2` 时 unlink 临时 → 再次 parent fsync → 最终单链接逐字节重校验。崩溃重放只接受配对握手态（final/temp 同 inode 且字节等于确定性 payload）并完成 unlink；其他 symlink/hardlink/外来 final 或 temp 一律 fail-closed；字节精确的 owned 单链接临时文件恢复发布流程。
+- `DB_REPLACED → MANIFEST_PUBLISHED → GENERATION_PUBLISHED` 的恢复/终态重放路径在报告 COMPLETED 前幂等补写或严格重校验标记。
+- rollback 与 PREPARED 取消**绝不**清除标记。PREPARED 取消的 lineage 一致性：取消回退到 prior canonical generation 仅当 durable 标记存在并通过稳定身份重校验；第一次激活（无 prior）取消时标记 final 与 temp 必须**都不存在**——任何外来、篡改、hardlink 或残留标记/temp 一律 fail-closed，防止把从未激活的 legacy 资源变成声称已激活。
+- 无 journal、无 terminal 的冷发现：无论进程内是否已有 live view，都先对磁盘重新证明 canonical pair 与标记。无标记且无 canonical pair 是真正的从未激活 legacy（返回 `None`/READY，此时 live view 非空同样 fail-stop）；有标记但 pair 缺失/部分/篡改时 fail-stop 并报告恢复失败，绝不静默返回 `None`；有 pair 但无有效标记（无 transition record 的权威）绝不静默信任，同样 fail-stop。
+
+**取消候选隔离（quarantine closure）**
+
+- PREPARED 取消的候选 DB/manifest 退役进确定性隔离目录：路径缺失只在该 journal 记录的 inode 已作为 regular 单链接条目存在于该确定性隔离目录（候选或 canonical basename，扫描限定单目录）时才被接受；inode 缺失（外部删除/移动）一律 `ACTIVATION.QUARANTINE_MISSING` 非重试 fail-stop，不再有 authority-path 兜底。隔离条目必须 regular 单链接，任何外来条目 `ACTIVATION.QUARANTINE_FOREIGN` fail-stop；隔离目标绝不被覆盖。
 
 ### 物理 schema
 
@@ -705,6 +761,7 @@ CREATE TABLE tm_record (
     source_raw TEXT NOT NULL,
     target_raw TEXT NOT NULL,
     source_fold_v1 TEXT NOT NULL,
+    source_fold_length INTEGER NOT NULL CHECK(source_fold_length >= 0),
     speaker_raw TEXT,
     context_prev_raw TEXT,
     context_next_raw TEXT,
@@ -729,17 +786,40 @@ CREATE TABLE tm_gram (
     gram_size INTEGER NOT NULL,
     gram TEXT NOT NULL,
     record_id INTEGER NOT NULL,
+    term_frequency INTEGER NOT NULL CHECK(term_frequency > 0),
     PRIMARY KEY(gram_size, gram, record_id),
     FOREIGN KEY(record_id) REFERENCES tm_record(record_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_tm_gram_lookup
 ON tm_gram(gram_size, gram, record_id);
+
+CREATE TABLE tm_candidate_block (
+    block_id INTEGER PRIMARY KEY,
+    first_record_id INTEGER NOT NULL,
+    last_record_id INTEGER NOT NULL,
+    record_count INTEGER NOT NULL CHECK(record_count > 0),
+    min_source_fold_length INTEGER NOT NULL,
+    max_source_fold_length INTEGER NOT NULL
+);
+
+CREATE TABLE tm_gram_block_max (
+    gram_size INTEGER NOT NULL CHECK(gram_size IN (1, 2)),
+    gram TEXT NOT NULL,
+    block_id INTEGER NOT NULL,
+    max_term_frequency INTEGER NOT NULL CHECK(max_term_frequency > 0),
+    PRIMARY KEY(gram_size, gram, block_id),
+    FOREIGN KEY(block_id) REFERENCES tm_candidate_block(block_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_tm_gram_block_lookup
+ON tm_gram_block_max(gram_size, gram, block_id);
 ```
 
 `tm_origin_batch.kind` 是 `migration`、`local_write` 或 `import`；只有 migration/import 才需要 source digest/path，本地 append 在同一事务先建立单记录 write batch。`(kind, source_digest)` 的非空唯一约束保证同类批次幂等，`origin_ordinal` 保证批次内顺序。`tm_meta` 至少保存 schema version、resource id、canonical store id、head revision、fold/scorer/text semantics version、candidate index kind、SQLite runtime 与 activation digest；每个成功写事务推进 head revision。`tm_snapshot_receipt` 与相邻只读 manifest 保存同一规范化 ancestry receipt，证明 JSONL 快照来自 canonical 历史中的哪个 revision；ledger 额外保存本地 destination paths 以恢复任意路径 publication，这两个 path 不进入可移植 manifest 摘要。`tm_snapshot_binding` 只指向当前配置快照。issued receipt 只用于跨越 DB/JSONL/manifest 多文件崩溃窗口；completed receipt 一经发布永不修改，divergence 只作为当前 binding/file observation 派生的 `SourceBindingState`。
 
-FTS5 fast path 使用 contentful `tm_fts(source_fold_v1, record_id UNINDEXED, tokenize='trigram case_sensitive 1')`；输入已由 fold-v1 规范化，不再叠加 SQLite tokenizer 自己的大小写语义，也不使用 external-content table。即使 FTS5 可用，`tm_gram` 仍保存 1/2-gram；无 FTS5 时再保存 3-gram。
+FTS5 fast path 使用 contentful `tm_fts(source_fold_v1, record_id UNINDEXED, tokenize='trigram case_sensitive 1')`；输入已由 fold-v1 规范化，不再叠加 SQLite tokenizer 自己的大小写语义，也不使用 external-content table。即使 FTS5 可用，`tm_gram` 仍保存带 multiset term frequency 的 1/2-gram；无 FTS5 时再保存 3-gram。`candidate-proof-block-v1` 以每 256 个连续 record-id slot 形成固定 block；`tm_candidate_block` 与 `tm_gram_block_max` 必须由同一 record/index 事务精确维护并可从 canonical rows 完整重算。summary 可以因跨 record maxima 而宽松，但不得低于块内任一真实 term frequency。
 
 ### TMMigrationService
 
@@ -756,7 +836,7 @@ class TMMigrationService:
 - preflight 流式读取 UTF-8 JSONL，计算 SHA-256、有效/无效/重复/变体统计和可定位 diagnostics；valid row 明确定义为 JSON object 且 source/target 是非空字符串，last-valid 只在 accepted rows 中计算。
 - migration 在同目录 staged path 建库；accepted rows 按原 ordinal 全部保存。
 - migration/import 建立一个 origin batch；facade `save_record()`/store append 为每次本地写入建立 `local_write` batch，batch 与 record/index 必须同事务提交或回滚。
-- staged DB 只有在 records 与所有声明的 candidate indexes 完成后，才执行 `foreign_key_check`、`integrity_check`、counts、exact parity probes、source binding 和 index count；通过后 close/fsync/seal，并交给 per-resource coordinator 排空连接、备份、替换、reopen 验证与发布。
+- staged DB 只有在 records 与所有声明的 candidate indexes 完成后，才在 seal transaction 内执行 `foreign_key_check`、counts、exact parity probes、source binding、candidate semantic validator、全行 projection digest、logical closure 与 `SEALED` marker；commit、close、fsync 后在同一只读 snapshot 内对最终 sealed bytes 执行唯一完整 `integrity_check`，重算全行 projection digest 与 closure 并终端复证同一 inode+SHA 后才生成 attestation，再交给 per-resource coordinator 排空连接、备份、替换、reopen 验证与发布。
 - destination 是 deterministic sidecar；原 JSONL 不修改。
 - 同 digest completed batch 幂等；failed batch 不作为 completed activation。
 - 首次迁移激活时为原 JSONL 建立 `MIGRATION_SOURCE` receipt，把 `resource id + canonical store id + exported revision + JSONL digest + record count + format version` 同时写入 canonical ledger 与相邻 `name.jsonl.localcat-snapshot.json` manifest，再由 `SnapshotBinding` 指向这对只读资产。
@@ -786,28 +866,48 @@ class TMMigrationService:
 
 该协议不回滚或替换 canonical records。manifest 缺失、被外部改写，JSONL digest 被外部改写，或 receipt 的 resource/canonical identity、revision ancestry 不成立，都进入 `SOURCE_DIVERGED`；合法 local write 只推进 head revision，仍保持既有 receipt 为 `VERIFIED_HISTORY`。
 
+issued receipt 的 versioned artifact handoff 同时记录排他 temp/recovery copy 身份、其真实直接父目录的 device/inode，以及发布前 final pair 的 identity/digest/明确缺席事实。handoff 必须跨越 completed/cancelled 终态事务继续存在；只有先验证 terminal receipt 的 resource/canonical identity、revision ancestry、配置/任意路径分类、authority alias、完整真实父目录链与 durable parent identity，再按 exact identity+digest 清理 owned artifact、通过绑定该 parent identity 的 no-follow directory descriptor 执行 fsync、严格复核父目录未替换且四个 deterministic artifact path 均缺席后，才可清除 handoff。任何外来同字节 inode、symlink、hardlink、目录、父目录替换或 fsync 失败都保持文件与 handoff、返回 `BLOCKED`/cleanup-pending failure；不得在 cleanup 未闭合时报告成功。预先锁存的配置 divergence 只阻止 configured terminal replay，不得永久阻塞与 binding/divergence 无关的任意路径 terminal cleanup。任意路径 export replay 始终不改变 active binding 或 divergence；配置 refresh replay 仍受资源级可重入 observation gate 串行化。
+
+路径字符串和相同字节不是命名空间授权。每个 replace/rename/delete 必须遵循同一 mutation-proof 模型：从稳定 root 逐段 no-follow 绑定直接父目录，以 durable handoff/receipt 确定允许的 source、destination 和先前缺席/身份事实，在最后一个可观测 fault seam 返回后、紧邻 mutation 之前同时复证 source 与 destination，使用该 dirfd 执行变更，然后复核 final 就是已交接 source inode、fsync parent 并持久化状态转换。父目录 rename/ABA、source 或 destination 在复证窗口被替换、多链接、同字节外来 inode 或无法复核的 post-mutation 结果均不得继续完成/清理，必须保留 durable replay 证据并 fail-closed。
+
 显式 import/rebuild 与 export 不互相冒充：只有 import/rebuild 能在 divergence 后创建新 canonical generation、更新 source binding 并清除状态；export 永不把一个未知外部 JSONL 宣称为 canonical 来源。
 
 ### CandidateRetriever
 
 ```python
-class CandidateRetriever(Protocol):
+class CandidateRetriever:
     def candidates(
         self,
         resource_id: str,
+        store: SQLiteTMStore,
         folded_query: str,
-        limit: int,
+        *,
+        result_limit: int,
+    ) -> CandidateRetrievalReport: ...
+
+    def candidates_from_view(
+        self,
+        resource_id: str,
+        view: SQLiteTMQueryView,
+        folded_query: str,
+        *,
+        result_limit: int,
     ) -> CandidateRetrievalReport: ...
 ```
 
-- query 长度 ≥3 且 FTS5 capability 可用时，把 fold-v1 query 的 unique character trigrams 分别转义为 phrase，并以 OR union 召回；按 matched unique trigram ratio、长度差、record id 稳定预排。
-- FTS 结果为空、query 退化为少量重复 trigram 或 candidate pool 未达到 contract floor 时，继续 union 2-gram，再按需 union 1-gram；query 长度 1–2 直接使用对应 postings。
-- 无 FTS5 时通过 1/2/3-gram postings union + overlap count 召回；不能把完整 query 的 substring MATCH 当作 fuzzy recall。
-- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))`；pool 超限才按上述预排截断。
-- 每次查询按执行顺序记录 FTS_TRIGRAM/GRAM_3/GRAM_2/GRAM_1/UNION/DEDUPLICATE/TRUNCATE 的 input、added unique、output unique 与 dropped counts；未执行阶段不伪造零计数。候选自身记录参与的 recall stages、matched/query grams、overlap ratio 与 pretruncate rank。
-- CandidateRetriever 通过 `CandidateRetrievalReport` 同时返回候选和只属于召回阶段的 frozen `CandidateRecallMetadata`；不得提前伪造后续 scorer 或 global-limit 计数。
-- TMRetrievalService 核对 recall metadata，完成评分、threshold、稳定排序和跨资源 global limit 后，才构造最终 `ResourceQueryMetadata`，补入 context capability、`scored_count` 和每资源 `returned_count`。
-- query report 与 benchmark 复用同一 recall metadata contract；阶段计数、union unique、dedupe、truncate、scored、returned 必须可对账，任何负数、顺序错乱或 `scored_count > candidate_budget` 都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
+- query 长度 ≥3 且 FTS5 capability 可用时，把 fold-v1 query 的 unique character trigrams 分别转义为 phrase，并以 OR union 形成 fast seed；无 FTS5 时按 GRAM_3/2/1 形成 fallback seed。fallback 每阶段对全部 unique query grams 执行真实 term-major posting range read，按确定性 divmod 分配既有 4096 posting cap，并仅在该有界实际集合内按 sampled overlap/record id 生成 seed。seed 只决定实际 execution path、有界初始提示与可诊断阶段，bound-proof 的 block/record 队列和完备性不读取 seed rank/identity；全库 `GROUP BY record_id` 不是 seed 合同，seed 也不能作为 scorer-v1 完备性的证明。
+- canonical index 在 record/index 同一事务保存 `source_fold_length`、字符与 bigram 的 multiset term frequency，以及固定 record block 的长度范围和各 term 最大频次。block summary 只提供保守上界；缺行、重复、计数不守恒或 summary 低估都使该资源 fail-closed。
+- 对 fold-v1 query 与一个 record，令长度为 `m/n`、字符 multiset 交集为 `C`、bigram multiset 交集为 `I`、bigram 总数为 `Bq/Br`。编辑距离安全下界为 `max(abs(m-n), max(m,n)-C, ceil((Bq+Br-2I)/4))`；由此得到 Levenshtein ratio 上界，再与精确 bigram Dice 平均得到 scorer-v1 上界。单字符 Dice 沿用 scorer-v1 特例。实现必须以穷举/随机对照证明上界从不低估真实分数。
+- `proof-query-v3` 保留 256-slot block 作为完整性与稀疏遍历单元；CandidateRetriever 在同一 generation view 内优先按 `(score_upper_bound DESC, record_id DESC)` best-first 打开 block。若保守 block maxima 使大量 block 仍可越过阈值，则切换到 `proof-traversal-v3` 密集精化，而不是逐 block 建连或一次性计算 100k 条完整字符/bigram exact frontier。v2 只作为严格历史 codec 读取，不得在 production 授权新查询。
+- 两阶段 phase 1 在一个只读事务内复核 resource/canonical store/generation、head revision、record count、query/index maxima binding，并以既有 `tm_record` 与 `(gram_size, gram, record_id)` 索引取得全部长度 `m/n` 与精确 bigram 交集 `I`。令 `Bq=max(m-1,0)`、`Br=max(n-1,0)`、`L=max(m,n)`、`C+=min(m,n)`、`d1=max(abs(m-n), L-C+, ceil((Bq+Br-2I)/4))`，据此得到保守 `U1`；单字符特例在字符相等尚未知时必须取 Dice 上界 1.0。phase 1 提交后只按 `U1` 前沿评分足以建立真实第 k 名元组 `K0` 的前缀，禁止用 exact bigram、字符/bigram 分项最小值或其他 component heuristic 提前排除 identity。
+- session 自行定义唯一合法精化集 `R = {未计入 r | U1(r) >= threshold 或 (U1(r), record_id(r)) >= K0}`，其中 `K0` 只能来自已观察的 raw-distinct FUZZY ranking identity，raw-exact identity 不得占用 kth 槽位。phase 2 必须重新绑定同一 resource/store/generation/head/count/query/index facts，在一个短只读事务内仅为严格有序的 `R` 返回 store-owned `record_id/source_fold_v1/length` 私有投影，拒绝缺失、重复、乱序、越界或额外 identity；`request=returned=R`，事务成功提交后才可计算 folded Unicode code-point 序列的精确 LCS 长度 `ell`。令 `d3=max(abs(m-n), L-ell, ceil((Bq+Br-2I)/4))` 并为完整 `R` 形成 `U3`；任何 phase-2 后 scorer callback 都必须晚于这次完整 U3 pass。ASCII exact-LCS transition memo 每个 query 最多保留 4096 个 state；某 identity 触顶后仅对其余后缀走无状态 exact fallback，并在下一个 identity 前清空重建，既不跨 session 缓存也不授予 scorer reuse。随后 production 可按严格 `(U3 DESC, record_id DESC)` 取不超过 32 个 identity 的真实 scorer batch，并只把未评分 identity 在 `U3<threshold`，或已存在 `score>=threshold` 的真实 raw-distinct kth `Kt` 且 `(U3,record_id)<Kt` 时划入 `P2`；Oracle 的 `P2` 必须同时满足这两个条件，不能用单项闭合代替 threshold+top-k 全局义务。相等一律继续竞争。
+- 只有当前 completion policy 仍不能以剩余 U3 frontier 闭合时，才对尚未评分且未进入 P2 的残余逐 identity 惰性计算 `U4`：query 以 query-length-only 规则固定分为 balanced ordered segments，`p(1)=1`，`m>1` 时 `p(m)=min(m-1,ceil(3m/5))`，永不使用逐 code-point 全分区；对固定 query 分区 `x_i` 与 candidate 非降边界 `0=b0<=...<=bp=n`，令 `g(s,t)=max(len(s),len(t))-LCS(s,t)`、`DΠ=min Σg(x_i,y[b_(i-1):b_i])`，再令 `d4=max(d3,DΠ)` 并形成 `U4`。任意真实 edit alignment 在固定 query 边界上诱导一组 candidate 边界，故 `ED>=DΠ`；必须以穷举/随机对照证明 `真实分数<=U4<=U3<=U2<=U1`。U4 只消费已提交的 ordered fold projection，不计算 exact Levenshtein/final score、不调用 scorer、不建立等价类；它可以在后续 scorer batches 之间推进，但每次 scorer batch 仍不超过 32。两个 store 事务均不得跨 scorer callback；phase 2 前、中/后及 scorer 期间的 append/head 漂移分别由 phase binding 或最终 generation/head 复核稳定 fail-closed。
+- 密集证明以 `phase=DENSE_COMPLETE` 冻结 `A0`（精化前 all-accounted）、`P1`（U1 安全排除）、`R`、`P2`（未计算 U4、未评分且由当前 completion policy 仅凭 U3 严格排除）、`S=R-P2`、`P3`（计算 U4 后未评分且被 U4 严格排除）与 `A1`（phase 2 后实际 all-accounted，可由 U3 probe 或 U4 后评分产生），并强制 `total=A0+P1+R`、`R=P2+S`、`S=A1+P3`（等价 `R=A1+P2+P3`）、`accounted=A0+A1`、`unscored=P1+P2+P3`。`u4_evaluated_identity_count` 只计逐 identity 真正计算过 U4 的 S 成员，必须满足 `P3<=u4_evaluated<=S`；生产路径可以以 `u4_evaluated=0/P3=0` 仅凭 U3+真实 kth 闭合，Oracle 或较弱 kth 则继续 U4/scorer。全局未评分 frontier 必须精确等于 P1 最大 U1、P2 最大 U3 与 P3 最大 U4 元组中的最大值；threshold/top-k 支配均为严格比较，tie equality 仍未闭合。公开 metadata 只携带 ordered-bound/traversal/partition version、各分区计数/最大前沿、U4 实际计算计数、精化请求与返回计数及 `K0`，不得泄露 folded text、LCS、gram、等价键或正文。
+- 对固定 query，只有完整 `fold-v1(source_raw)` 完全相等的 record 才构成 scorer 等价类。TMRetrievalService 必须从 health-validated record 自行重建等价类；每类首次出现运行一次真实 scorer-v1，后续 identity 复用同一不可变 evidence，但各自的 raw source、target、provenance、record id 与稳定 tie 仍独立保留。hash、长度、gram、seed、调用方分组或自报计数均不能建立等价；任意注入 scorer 也不能冒充可复用的 scorer-v1 owner。
+- `candidate-budget-v1 = min(8192, max(2048, result_limit * 128))` 保持不变，并只限制单资源为闭合证明执行的真实 scorer-v1 调用次数。`proof-query-v3` 冻结三个不得混用的域：`accounted_identity_count` 包含全部已观察 identity，`ranked_eligible_count` 只包含由 Retrieval 从 health-validated raw snapshot 派生的 raw-distinct FUZZY identity，`scorer_invocation_count` 只计完整 exact-fold 等价类首次真实调用。`accounted+unscored=total`，同 fold fan-out 仍逐 identity 进入 ranking/tie，BOUND_PROOF/UNION/DEDUPLICATE/report candidates 仍按全部 accounted identity 对账。observe 必须先完整验证整批 ID/evidence/ranked subset 与 projected invocation budget，再一次性提交；第 2,049 次调用不得产生部分 session 变更。
+- v3 的 `threshold_closed`、`top_k_closed` 与 `result_complete` 必须由计数、frontier 和 raw-distinct ranked kth 精确派生，不是可自报的布尔值。Production 完整性精确为 `threshold_closed OR (ranked_eligible_count>=k AND ranked_kth_score>=threshold AND top_k_closed)`；Oracle 执行目标仍为 `threshold_closed AND top_k_closed`。未评分 identity 一律按可能 raw-distinct 保守处理；raw exact、fold/hash/gram、caller bool、session 自报或 injected scorer 不得授权 eligibility/completeness。Retrieval 在 finish 后必须以本地 raw snapshots、score evidence 与已验证 proof frontier 独立重算三个闭合事实，不一致即资源级 fail-closed。
+- CandidateRetriever 与 TMRetrievalService 通过私有 proof port 交替推进，公开 `CandidateRetrievalReport` 仍只暴露候选身份与 frozen `CandidateRecallMetadata`；评分 evidence 由 Retrieval 持有并直接用于 threshold、稳定排序和跨资源 global limit，不重复评分、不允许 candidate owner 授予 capability。
+- query report 与 benchmark 复用同一 proof-aware recall metadata contract；阶段计数、union unique、dedupe、truncate、scorer invocation、accounted identity、returned 必须可对账，任何负数、顺序错乱、上界低估、`scorer_invocation_count > candidate_budget`、等价类/identity 守恒错误或未闭合证明都是 validation failure。fuzzy gate 未过时 recall metadata 明确返回 unavailable code 与空阶段/候选。
 - tractable oracle corpus 上，所有高于批准 threshold 的结果与真实 top-10 必须 100% 被 candidate set 覆盖；recall gate 失败不得激活 fuzzy path。
 - 返回顺序不等于最终顺序；Retrieval 必须运行 scorer。
 
@@ -835,7 +935,7 @@ class TMRetrievalService:
     ) -> QueryReport: ...
 ```
 
-`resources` 可包含完整 ResourceConfig adapter 集合；Retrieval 只为 `active=true && lookup=true` 的 handle 获得 store lease。`TMQuery.resource_order` 必须与 handle ids 一一对应并决定跨资源 tie order。Legacy facade 的 save path 独立只写 `active=true && update=true` handles；Lookup 不授予写权限，Update 不授予查询权限。
+`resources` 可包含完整 ResourceConfig adapter 集合；Retrieval 只为 `active=true && lookup=true` 的 handle 获得 store lease。每个参与查询的资源只取得一次只读 query lease，`StoreHealth`、exact/context 分类、candidate recall 和 candidate record 批量读取全部消费同一个 generation view；任一步失败都丢弃该资源的局部结果并关闭 view，不能用新的 lease 拼接同一份资源报告。`TMQuery.resource_order` 必须与 handle ids 一一对应并决定跨资源 tie order。Legacy facade 的 save path 独立只写 `active=true && update=true` handles；Lookup 不授予写权限，Update 不授予查询权限。
 
 **分类**
 
@@ -855,6 +955,24 @@ class TMRetrievalService:
 5. record id 降序。
 
 threshold 只过滤 FUZZY；dedupe 使用 `(resource_id, record_id)`；global limit 最后应用。
+
+### Retrieval capability publication
+
+`tm_retrieval_capability.py` 是 retrieval gate 的唯一判定与发布边界。它只依赖 frozen contracts 和不可变 validation evidence，不导入 store、candidate、retrieval 或 benchmark runner；`tm_sqlite_store.py`、`tm_candidate_index.py` 和 `tm_benchmark.py` 也不得反向成为能力判定权威。`SQLiteTMStore.health()` 只报告同一 generation 的物理事实和 canonical exact 可用性，CONTEXT/FUZZY 的 query-effective availability 由 Retrieval 在内存中组合，不能写回 DB、coordinator、binding 或 migration report。
+
+Gate C 的固定输入、expected/observed canonical digest 重算和 manifest 生成由 `tm_retrieval_validation.py` 独占；它是离线 validation leaf，可以消费 `tm_retrieval.py` 的纯分类/评分入口、公开 query/store 端口和 `tm_retrieval_capability.py` 的 frozen evidence values，以临时资源重放事务回滚、局部失败和 global-limit cohorts，但任何 production runtime 模块都不得反向导入它。该模块不接触 facade 或 Qt，也不得发布能力。`tm_retrieval_capability.py` 保持 evaluator/publisher 状态机边界，不继续吸收 fixture codec、向量 runner 或测试语料；避免把“如何产生证据”和“谁有权解释/发布证据”重新耦合。
+
+批准 roots 可以覆盖 evaluator/build 文件本身，因此不得把这些文件的 observed digest 回填为被哈希生产模块中的默认常量，否则会形成自引用身份。无 evidence 的默认 publisher 始终保持 fail-closed；离线验证只返回从批准 roots 构造的不可变 expectation 与 manifest，外层 composition root 再用这两个值显式构造 `RetrievalCapabilityEvaluator`/`RetrievalCapabilityPublisher` 并注入 Retrieval。该装配不使 validation leaf 成为发布者，runtime 也不读取 roots；任何默认常量、调用方布尔值或未闭合 manifest 都不能替代批准 roots。
+
+为重放 single-snapshot、局部失败和 global-limit 固定服务 cohort，validation leaf 可以在函数内部用批准 expectation 与已独立重算通过的 CONTEXT evidence 构造不返回、不持久化的 harness-scoped evaluator/publisher；该值只为本次固定输入提供执行视图，不成为 production composition root。harness 必须让 fuzzy-core 与 Gate D 保持关闭，完整 service transcript 产生后才计算 observed fuzzy-core digest；最终 digest 或 manifest 不得反向授权生成它的同一次执行，避免 evidence 自举。
+
+`RetrievalCapabilitySnapshot` 至少冻结 retrieval semantics version、CONTEXT 子门决定、fuzzy-core correctness 决定、`FTS5_TRIGRAM` 与 `GRAM_FALLBACK` 两条 Gate D 决定，以及只含版本、digest、时间和稳定 unavailable code 的不透明 evidence summary。CONTEXT、fuzzy-core 和两条 benchmark path 可分别降级，任何一项不得替另一项宣称成功。FUZZY 对某次查询可用，当且仅当 fuzzy-core correctness 与该查询实际执行路径的 Gate D 都开放；Task 7.5 完成但 Task 8 尚未发布 benchmark evidence 时，FUZZY 必须继续关闭。
+
+`RetrievalCapabilityEvaluator` 是 evidence 到决定的唯一函数；manifest 中的自报 `passed` 不能单独授予能力。evaluator 必须重新核对批准的 cohort/fixture/build/semantics/evaluator digest、有效期和可重算结果；Gate D 还要核对 frozen benchmark contract、execution path、environment/report digest 和 hard-gate 结果。`RetrievalCapabilityPublisher` 只接受精确 evaluator/manifest 值，构造时私有克隆 expectation，refresh 时在锁内重新求值并原子替换整个 snapshot；调用方不能注入返回任意 `available=True` 的 callback。缺失、过期、版本/digest 不符或重算失败都 fail-closed，且允许从 open 降级为 closed。
+
+`TMRetrievalService.query()` 在读取任何资源前只取得一次 capability snapshot，并让同一不可变值服务整次多资源查询；发布者随后 refresh 不改变在途 query。每个资源仍只取得一次 generation view。Retrieval 先复核 physical health/exact/generation，再把 snapshot 与查询的 intended recall path 组合为 query-effective health：仅当 physical `index_kind` 是 `FTS5_TRIGRAM` 且 fold-v1 query 长度至少为 3 时选择 fast path，否则选择 `GRAM_FALLBACK`。对应 FUZZY 子门关闭时不得读取 CandidateRetriever、candidate records 或 scorer，而是返回带 intended path、空阶段和 evaluator stable unavailable code 的 recall metadata；开放后 CandidateRetriever 返回的 `index_kind` 必须与 intended path 一致，否则该资源 fail-closed。
+
+CONTEXT 关闭时仍保留 exact winner，但不返回其他 same-source variants；FUZZY 关闭时不影响 exact、已开放 CONTEXT 或 save。能力开放但零命中时 availability 为 true 且 unavailable code 为空；门关闭时 availability 为 false、结果和阶段为空且 code 非空。稳定 code 由 evaluator 按“identity/version/digest 不符 → evidence 缺失 → evidence 重算失败 → evidence 过期”的固定优先级产生，分别使用 `RETRIEVAL.CONTEXT_*`、`RETRIEVAL.FUZZY_CORRECTNESS_*` 和 `RETRIEVAL.FUZZY_BENCHMARK_*` 命名空间，不再由 store 硬编码 `STORE.*_GATE_CLOSED`。
 
 ### TextMatcherV1
 
@@ -970,12 +1088,40 @@ Core 内部的 `MatcherValidationEvidence` manifest 至少绑定 evidence schema
 - fuzzy gate 失败只使 FUZZY unavailable；已通过 Gate C 的 CONTEXT、canonical exact/save 和 Excel 三态继续运行。matcher gate 与 facade exact/save 独立。
 - Excel `LogicController` 不调用 full query，因此仍只有三态。
 
+facade 每次进程级打开都必须重建同一权威判定，不得把“本进程内已经持有 canonical handle”当作唯一成功条件：
+
+| 冷启动可观察状态 | facade 权威 | 必须保持的语义 |
+|------------------|-------------|--------------------|
+| 从未完成首次激活，或首次 `PREPARED` 已可证取消且无 canonical generation | legacy JSONL | 只有这两种状态可以使用 JSONL runtime |
+| completed binding 指向当前 head | canonical / `VERIFIED_CURRENT` | 恢复唯一 generation，exact/save 不回退 JSONL |
+| 合法 append 或 merge import 使 head 超过 completed binding | canonical / `VERIFIED_HISTORY` | 冷重开仍必须成功；历史 snapshot 不是激活损坏 |
+| 配置 JSONL/manifest 与 ledger 不再一致 | canonical / `SOURCE_DIVERGED` | 冷重开后 Lookup/Update 继续，divergence 保持锁存，不修改 JSONL |
+| activation 未闭合、canonical 资产损坏或身份歧义 | coordinator recovery 或 fail-stop | 不得因 canonical 不可用而猜测回退 JSONL |
+
+冷打开先恢复 canonical generation/lineage，再由 `SourceBindingMonitor` 对 completed binding 派生 CURRENT、HISTORY 或 DIVERGED；不得反过来要求 binding revision 必须等于 head 才允许恢复 generation。
+
 ### TMBenchmark
 
 ```python
 class TMBenchmark:
     def run(self, contract: BenchmarkContract) -> BenchmarkReport: ...
 ```
+
+`TMBenchmark` 是最终组合入口，不是要求把全部 benchmark 逻辑堆入一个文件。Task 8.1 的确定性语料与 digest 权威保留在 `tm_benchmark.py`；Task 8.2、8.3、8.4 分别由 latency、process/RSS、oracle owner 产生不可变原始证据；Task 8.5 的 `tm_benchmark_query_process.py` 只把已验证的迁移 artifact 重开为真实查询进程并产生 latency/RSS 执行证据，`tm_benchmark_gate.py` 只组合这些证据、构造两个独立路径报告并发布 Gate D。前三个执行 owner 和 query-process bridge 不得构造最终 `BenchmarkReport` 或授予 capability，gate owner 不得重新选择 cohort、丢弃原始样本或重写 oracle 结果。这些 owner seam 只分隔独立故障模型，Cluster J 仍在 8.1–8.5 全部闭合后做一次累积复审和一次 fresh full suite。
+
+Task 8.3 的迁移 child 在专用 run root 内完成激活、reopen 与健康验证后退出，不把进程内 `SQLiteTMStore` handle 伪装成可跨进程复用资产。Task 8.5 为每条路径保持该专用 root 到查询取证完成；query child 在首次查询前根据 process evidence 的 contract/corpus/fixture/resource/store/generation/path 事实重建 deterministic locator，对 canonical sidecar 执行 no-follow regular/single-link identity、digest、fresh coordinator rehydrate、health/index/count 成套复核，然后在同一子进程和同一 generation 上完成全部 warmup 与 measured query。查询前后 artifact identity/digest 必须一致；任一事实漂移都废弃该路径证据，不重新迁移、不改用另一路径。
+
+Task 8.8 的性能修正不删除迁移口径中的任何阶段。fresh mutable stage 只在新建路径执行一次完整语义校验；既有 stage 的 reuse validator 不再重复校验刚构建的同一对象。StageSealer 在一个 `BEGIN IMMEDIATE` 边界内流式完成 exact parity、schema/index/fold/count 与 logical closure 校验并写入 `SEALED` marker，随后 close/fsync，生成 registry-owned `SealedContentAttestation`。coordinator 不公开 concrete registry；registry 的 reservation/commit/release 与 token lifecycle 仅存在于私有 adapter，Gate B 只消费 exact read-only readiness view。私有 commit 只能消费唯一 StageSealer 链在 post-fsync 验证后铸造、绑定 exact registry+reservation 且单次消费的 verified capability；普通 dataclass、跨 registry/reservation、replay 或调用方分别注入 evidence/generation/attestation 均拒绝。`tm-logical-closure-v2` 逐行闭合 metadata/ancestry/receipt/binding/record/schema 权威域；gram/block/FTS 由同一事务内唯一一次完整 `validate_candidate_proof_index` 验证，并在该 transaction snapshot 中另以 SQLite-native、有界 50,000-row chunks 生成覆盖每个实际 projection row 的私有 SHA-256。post-fsync snapshot 只按同一 rowid/canonical row order 重算该 projection digest，不重复执行 fold/gram/block/FTS 语义推导，也不新增 persistent schema/index；digest、pre-activation closure 与终端 database proof 必须同时匹配，故首次 content capture 前的同 inode、同表行数 projection 篡改不能借新 bytes proof 混入 attestation。attestation 绑定 DB/manifest/source 的 SHA-256、device/inode、schema/index/fold/closure version、counts、exact-parity 与 closure digest。
+
+激活前和 lease drain 后的两次 Gate B 均保留；每次必须经 no-follow regular/single-link pre/post identity capture 重新计算完整文件 SHA-256 并与 sealed attestation 比较，但不重复展开 record/index 语义扫描。seal transaction 提交并 fsync 后，在同一只读 snapshot 中执行唯一完整 `integrity_check`、重算完整 candidate projection digest 与 pre-activation logical closure并核对事务内 facts，随后对同一 database proof 做终端完整 rehash；只有 page integrity 与 bytes↔semantic binding 全部闭合后才铸造 sealed attestation。replace 后只证明 canonical inode/digest 等于该 attestation 并 reopen 核对 schema/`SEALED` marker，不重复 integrity/FK 页级扫描。receipt owner 在获得写锁后再完整 rehash canonical DB，只有仍等于 sealed attestation 才写入封闭的 receipt/binding/meta 转换；写后执行一次 active-set 全语义校验并生成 `ActiveContentAttestation`。active 语义验证保留 exact parity、完整 candidate projection validator 和 v2 logical closure，并对刚以 exact sealed bytes 完成且仅由 owner SQL 转换的同一 inode 复用 post-fsync sealed integrity/FK 结论，不再重扫整个 page tree。之后的 manifest/generation/final closure 只可在 exact byte/inode 与 phase facts 均匹配该 attestation 时复用。active attestation 持久进入 journal/terminal，cold recovery 重新 hash、schema reopen 并核对同一 inode/bytes/phase，同字节上复用已绑定的 integrity 和 active 语义结论；缺失、损坏、过期或身份漂移继续按原恢复矩阵 rollback/fail-stop。fresh health 对 DB/manifest/source 完整 rehash 并核对小型 meta/binding/count 后可消费同一 active semantic facts；字节变化回到完整 runtime validator，inode 替换直接 fail-closed。四个 journal phase、两次 Gate B、parent fsync、replace、reopen 与 last-known-good 语义均不改变。
+
+query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → bounded real seed + bound-proof batches ↔ scorer-v1 → threshold → stable top-k` 链路，并由实际 store health/candidate/proof metadata 回显 execution path；不得以 synthetic callback、仅候选身份、oracle identity 或调用方自报 path 代替。两条路径可以共享 proof closure 算法，但必须分别执行各自 seed/index path 并发布独立报告。迁移 child 与 query child 分别采样峰值 RSS，路径报告使用两个独立进程的较大值；迁移耗时仍只取 Task 8.3 已冻结的全生命周期口径。
+
+最终 machine-readable `tm-benchmark-bundle-v2` evidence bundle 保留 latency 的全部原始样本、process/query/oracle 的不可变事实与 digest、当前 proof-query version，以及对实际迁移/query/oracle/capability 生产闭集逐文件 no-follow 稳定读取所得的 implementation fingerprint。一次 fingerprint candidate capture 必须连续读取完整 source inventory 两遍并要求逐路径 digest 完全一致；但顺序扫描不是 writer serialization，不得单独授权 final evidence。最终 Gate/matrix/release 只能在同一个 read-only、content-addressed implementation epoch 内执行和发布；活动可写 checkout 的 pre/post 重扫无法排除最后一次读取后的 late drift，不得冒充该 epoch。process child 的请求/响应、query child 对 process evidence 的重绑定以及 oracle owner 的真实 proof 观察都必须各自在自己的执行窗口前后绑定同一个 proof/source 值；oracle 的窗口从 full-scan 真值计算之前开始，贯穿两个 candidate execution path 的最终证据构造。Gate 只能从三类 nested evidence 派生顶层绑定并交叉核对两条路径，禁止为旧 evidence 重新盖上当前常量或 fingerprint。
+
+Gate runner 只有在 locked real ports 完成、bundle 原子落盘且 strict durable readback 成功后，才可为该 exact bundle object 生成 module-private、immutable、facts-bound run receipt；公开 `BenchmarkGateDRunResult` 字段、调用方 `test_mode=False` 或可重算 SHA-256 均不能自行铸造 publication authority，test seam 的 receipt 始终携带 test-mode 并被发布边界拒绝。runner 在重型运行前后以及 evidence 严格回读后复核同一 implementation fingerprint；漂移时只按 exact inode 删除自己刚发布的 final，删除或 parent fsync 无法证明时提升为 `GATE_D.CLEANUP_PENDING`，不得只报告原始 drift。capability owner 在 manifest 完整构造后、紧邻唯一一次 `publisher.refresh` 前重新取得同一 checkout 的 terminal fingerprint；不一致时 refresh 调用次数必须为零。
+
+release owner 必须从自己的 exact checkout 重算 benchmark fingerprint，另行闭合 validator/registry/全部直接 unittest module 的 source inventory，并重新执行 acceptance/fault registry 的全部 exact test IDs 与 release 独有的 12 个 direct test IDs；matrix JSON 的自报 `PASS` 和当前 source hash 组合不能单独授权 release。acceptance、fault 与 release 三个 evidence owner 都必须在测试后、临时文件 fsync 后且 replace 前、final no-follow exact-inode/bytes readback 后复核各自完整 source/input snapshot；release snapshot 包括 requirements、两份 matrix evidence 及其当前 sources、benchmark bytes/bundle/current implementation 和 release owner sources。任一窗口漂移均不得打印成功结论。旧 proof/source bytes 的 bundle 即使内部自洽也不得授权当前发布。本地 child protocol 可以使用经严格验证的绝对路径定位本次临时资产，但可移植 bundle 只发布 implementation digest、由 contract/corpus/path/artifact/evidence digest 构成的稳定 artifact key 与必要环境事实，不发布实现 source path/bytes、run-root/fixture 绝对路径、PID 或可跨机器误用的句柄。专用 root 只在 bundle 原子落盘并严格回读后由调用方在测量外整体回收；Gate D 只消费已回读的 bundle，不直接信任临时路径或运行中对象。
 
 - machine-readable `benchmark_tm_contract.json` 必须与 `BenchmarkContract` 一致；`benchmark-v1` 固定 generator/seed/digests、100,000 records、exact ≥1,000 queries、fuzzy ≥200 queries。
 - deterministic corpus 包括 multilingual/CJK/short/duplicate/multi-target/context/near-edit/miss cohorts；query cohort 由 digest 固定，不允许运行时挑选有利样本。
@@ -1024,7 +1170,7 @@ class TMBenchmark:
 | Matcher gate | unavailable/profile/options 未验证 | fail-closed outcome + 同一 capability snapshot |
 | Index | count mismatch、query error | 不使用该 index；health/report 明示 |
 | Query | 单资源失败 | partial QueryReport + failure |
-| Export | fsync/replace 失败 | `ExportFailure` 标明旧目标是否保持及 recovery path |
+| Export | fsync/replace 失败 | `ExportFailure` 报告旧目标保持证据、recovery locators 与 committed/ambiguous 状态，无法证明时 fail-stop |
 | Unicode | unsupported semantics version | 拒绝，不回退未版本化行为 |
 
 公开错误不包含完整 source/target；默认日志记录 resource id/path、stage、counts、SQLite code 和 exception category。
@@ -1041,9 +1187,10 @@ class TMBenchmark:
 ## 性能与可扩展性
 
 - exact B-tree raw index 是独立 fast path，不扫描 candidate index。
-- candidate batch fetch 避免每 record 一次 SQL。
-- migration 先 bulk insert、后建大索引；transaction 与 RSS 由 100k gate 约束。
-- FTS5/gram 只控制 recall set；默认 candidate count 写入 versioned contract。
+- candidate proof 对稀疏 frontier 以 block-level 保守上界 best-first 打开小批量 record；当保守 maxima 退化为近全量 block 或 top-k 低分前沿仍广泛竞争时，切换为确定性的两阶段 set-based refinement，禁止用每 block 一次连接/事务/count 复证实现同一密集扫描。phase 1 只取长度与精确 bigram，phase 2 只为 owner 派生的 `R` 读取 generation-bound ordered folded-source 投影并计算 LCS 上界；两个短事务之间和之后均复核同一 binding。query-view 的 candidate connection 可请求 `PRAGMA threads=1`，sealed/active 全量 proof-index validator 可请求 `PRAGMA threads=2`，分别允许 SQLite sorter 使用至多一个或两个辅助 worker；runtime 返回更低值时继续同一精确 SQL，这些设置不持久化且不得进入证明或 capability 事实。mode selector 与 sorter worker 都只影响性能路径，不能成为 completeness 事实；两种模式共享 scorer-v1、fold-equivalence、budget 与双闭合语义，上界只能多取，不能漏取。
+- migration 的私有 fresh-stage builder 先在未暴露的 `UNPUBLISHED` stage 上暂缓可重建 secondary indexes，以有界 20,000-record chunk 完成 record/gram/FTS 与 chunk-local block/max 聚合，record 与 term-major gram 均经 generator-backed `executemany` 避免二次全 chunk row-list 物化，再用冻结的原 schema SQL 批量重建并重验 schema digest 后才暴露 stage；transaction 与 RSS 由 100k gate 约束。
+- FTS5/gram seed 只控制 execution path 与有界路径诊断；gram seed 沿用 4096 条真实 postings 的确定性 cap，不要求全库 record-major 聚合。proof 队列与完备性由共同的 versioned bound proof 独立决定，默认 scorer budget 写入 versioned contract。
+- sealed/active attestation 只消除同一 immutable byte identity 上的重复语义扫描；seal 事务内闭合 schema/FK/parity/proof-index、完整 projection digest、logical closure 与 `SEALED` marker，commit+fsync 后对最终 sealed bytes 执行唯一完整 `integrity_check`，并在同一 snapshot 重算 projection digest/closure 后写入 inode+SHA attestation。后续 DB rename/reopen 只在 exact sealed inode+SHA 不变时复用该 post-fsync integrity 事实，active receipt 写入后仍完整重算 candidate semantic/logical closure；任何字节、inode、phase 或 durable evidence 漂移都重新进入完整验证或 fail-stop，不能以 stat/mtime/size 或缓存布尔值代替。
 - read connection 不长时间持有 transaction；rollback journal 下 write transaction 保持短小。
 - WAL 不作为首版性能优化；升级前必须先解决当前 3.51.2 advisory。
 
@@ -1067,6 +1214,7 @@ class TMBenchmark:
 - QueryReport 分别区分“CONTEXT/FUZZY 可用但本次无命中”与“对应 gate 未开放”，并在 global limit 后对账每资源 returned count。
 - canonical 正常写入不触发/清除 divergence；外部 JSONL 变化触发，显式 import/rebuild 失败保持三方资产，成功才换 generation 并清除。
 - 配置快照 refresh 的 issued receipt 在 crash 后按 digest 完成、取消或进入 divergence，不回滚 canonical。
+- snapshot publication/recovery 的 mutation-proof 矩阵覆盖 ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节或异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失或损坏、terminal replay 幂等和外来 inode 不删不覆盖。
 - same-source variants：winner EXACT、positive context CONTEXT、no evidence retained-only。
 - multi-resource query：stable global order、partial failure、resource provenance。
 - facade 激活前后 `query_exact/save_record` 一致。

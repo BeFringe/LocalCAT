@@ -45,7 +45,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
   - `LocalCAT-logo-silver.png` 与竖版“…”宽度维护。
 - **Now — Feature 5**:
   - SQLite TM、版本化记录、多译文/context/provenance；
-  - JSONL 安全迁移与兼容导出；
+  - JSONL 安全迁移、兼容导出与可崩溃恢复的快照发布；
   - Levenshtein 和 Dice scorer；
   - exact → context → fuzzy 的确定性排序；
   - 供 TM、项目搜索和术语搜索消费的 Match Case / Whole Word 兼容内核。
@@ -85,6 +85,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 ## Boundary Strategy
 
 - **Feature 5 shared seam**: `SearchOptions(match_case, whole_word)`、文本规范化/词界判断和稳定 hit offsets；UI/Glossary/TM 只消费，不复制实现。
+- **Durable snapshot seam**: export/refresh/recovery 以 durable receipt/handoff 为状态权威，文件变更必须绑定完整 parent chain 与 exact inode identity，在最后一次 mutation 前复证 source/destination，并以 post-mutation fsync/身份复核和冷恢复共同闭合；任何调用方不得以相同字节代替该命名空间证明。
 - **CJK Whole Word**: 对纯 CJK 查询不施加额外词界过滤，结果与未勾选 Whole Word 的连续文本匹配相同；该退化必须是明示、版本化且有 golden cases 的兼容语义。
 - **Qt Stage A**: 搜索 UI、结果模型和导航可以先实施，但基础搜索只有在 Feature 5 legacy matcher 达到 `BASIC_VALIDATED` 后才能完成验收；两个高级选项保持 disabled，且不得写入持久记录。
 - **Qt Stage B**: 合并 Feature 5 后启用 Match Case / Whole Word，并用跨 source/target/speaker/术语 fixture 验证一致结果。
@@ -125,7 +126,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 ## Merge Contract
 
 1. **Spec gate**：`feature5-ui-integration` 的 Requirements、Design、Tasks 三阶段均批准前，不得 merge Feature 5 或修改业务代码。
-2. **Feature 5 gate**：Levenshtein/Dice、exact parity、SQLite migration、Match Case / Whole Word Unicode/CJK fixtures、无 Qt import 全部通过。
+2. **Feature 5 gate**：Levenshtein/Dice、exact parity、SQLite migration、snapshot namespace/crash-recovery 故障矩阵、激活后 CURRENT/HISTORY/DIVERGED 冷重开的 canonical authority 且不回退 JSONL、Match Case / Whole Word Unicode/CJK fixtures、无 Qt import 全部通过。
 3. **Merge direction**：只从精确 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 形成可追踪 merge；不得 squash 或 cherry-pick 重建等价历史。
 4. **Integration gate**：merge 后由 integration Spec 完成 composition root、Controller adapter、canonical activation、mixed resource 与 TM suggestion 验收；原 Qt 的正交功能继续按自身 Spec 完成。
 5. **Integration anchor**：legacy source-LWW 与当前 100% 卡片只证明 legacy exact compatibility；多候选、非 100%、阈值、fuzzy 与全局 top-10 必须由真实 canonical SQLite + production `TMRetrievalService` 证明。

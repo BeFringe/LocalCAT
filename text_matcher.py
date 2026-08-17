@@ -215,6 +215,20 @@ def fold_text_v1(text: str) -> FoldProjection:
     )
 
 
+def fold_text_value_v1(text: str) -> str:
+    """Return the exact fold-v1 value without building source spans.
+
+    Storage and sealing paths only need the authoritative whole-string value.
+    Keeping that calculation here prevents those paths from constructing the
+    matcher-only decomposition/composition projection while preserving the
+    pinned runtime check and the exact ``NFC(raw).casefold()`` definition.
+    """
+
+    _require_pinned_runtime()
+    raw = _require_text(text, "text")
+    return unicodedata.normalize("NFC", raw).casefold()
+
+
 def project_folded_span_v1(
     projection: FoldProjection,
     folded_start: int,
@@ -560,6 +574,7 @@ __all__ = [
     "UNICODE_VERSION",
     "FoldProjection",
     "TextMatcherV1",
+    "fold_text_value_v1",
     "fold_text_v1",
     "is_pure_cjk_v1",
     "is_word_boundary_v1",

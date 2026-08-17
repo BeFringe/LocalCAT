@@ -1,0 +1,2968 @@
+"""Task 5.10 explicit import/rebuild disambiguation tests.
+
+The suite drives the two public entry points
+``TMMigrationService.import_snapshot`` and
+``TMMigrationService.rebuild_from_snapshot`` over an already-active
+resource whose configured JSONL has diverged.  A successful call must
+replace the active canonical with one exact snapshot under a fresh
+collision-resistant ``store.import.<uuid>`` store id and the next
+generation, clearing ``SOURCE_DIVERGED``; the same bytes imported twice
+succeed again with a new store id and snapshot id.  Public failures
+auto-restore the READY prior service (cancel before any durable
+journal, rollback for durable pending phases, recovery completion for
+a durable ``GENERATION_PUBLISHED`` journal whose candidate set is
+provable) without any caller-side ``rollback_durable_activation``, and
+a rollback that cannot be proven fails stop with honest UNVERIFIED
+preservation evidence.  The replacement journals are proven across the
+Task 5.8/5.9 seams: pending phases accept the exact prior store id,
+``GENERATION_PUBLISHED`` accepts prior (crash window) or candidate
+(idempotent replay), and any third id is rejected.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import sqlite3
+import tempfile
+import threading
+from typing import Any, Callable, cast
+import unittest
+from unittest.mock import patch
+
+import tm_activation_recovery
+import tm_contracts as contract_module
+import tm_gate_b
+import tm_migration
+import tm_sqlite_store
+from tm_activation_journal import (
+    _ActivationFileIdentity,
+    _ActivationJournalHandle,
+    _ActivationJournalRecord,
+    _ActivationPreparation,
+    _ensure_activation_lineage_marker,
+)
+from tm_contracts import (
+    AssetPreservationState,
+    CanonicalResourceIdentity,
+    MigrationFailure,
+    MigrationReport,
+    MutableStageRef,
+    SealedStage,
+    SourceBindingState,
+    snapshot_receipt_digest,
+)
+from tm_migration import (
+    MigrationPreflightError,
+    TMMigrationService,
+    _scan_jsonl,
+)
+from tm_sqlite_store import (
+    ActivationPreparationError,
+    ActivationRecoveryReport,
+    ResourceStoreCoordinator,
+    SQLiteTMStore,
+    _ActivationJournalPhase,
+    _activation_journal_path,
+    _parse_activation_journal_bytes,
+    initialize_stage_schema,
+)
+from tm_stage_sealer import StageSealer
+from tests.test_tm_activation import (
+    SOURCE_BYTES,
+    _draft,
+    _existing_fixture,
+    _identity,
+    _publish_prior_binding,
+    _prior_stage,
+)
+from tests.test_tm_schema_upgrade import _legacy_fixture
+
+_STORE_IMPORT_RE = re.compile(r"^store\.import\.[0-9a-f]{32}$")
+_BATCH_IMPORT_RE = re.compile(r"^import\.[0-9a-f]{32}$")
+_SNAPSHOT_IMPORT_RE = re.compile(r"^snapshot\.import\.[0-9a-f]{24}$")
+
+
+def _schema_upgrade_pending_family(root: Path) -> list[Path]:
+    return list(
+        root.glob("..prior.sqlite3.localcat-schema-upgrade.*.pending")
+    )
+
+
+def _schema_upgrade_stable_bak(root: Path) -> list[Path]:
+    return list(root.glob("..prior.sqlite3.localcat-schema-upgrade.*.bak"))
+
+
+def _schema_upgrade_stable_locator(root: Path) -> list[Path]:
+    return list(
+        root.glob("..prior.sqlite3.localcat-schema-upgrade.*.locator")
+    )
+
+
+def _diverged_fixture(
+    root: Path,
+    *,
+    fts5_available: bool,
+) -> tuple[
+    CanonicalResourceIdentity,
+    MutableStageRef,
+    SQLiteTMStore,
+    ResourceStoreCoordinator,
+]:
+    """One active prior canonical whose configured JSONL has diverged."""
+
+    identity = _identity(root)
+    identity.configured_jsonl_path.write_bytes(SOURCE_BYTES)
+    prior = _prior_stage(root, identity)
+    with patch("tm_sqlite_store._probe_fts5", return_value=fts5_available):
+        initialize_stage_schema(prior, canonical_store_id="store.primary")
+        store = SQLiteTMStore(
+            prior,
+            canonical_store_id="store.primary",
+        )
+    coordinator = store.coordinator
+    _ = store.append_batch(
+        batch_id="migration.prior",
+        kind="migration",
+        drafts=(_draft("prior", "canonical"),),
+        source_digest=hashlib.sha256(SOURCE_BYTES).hexdigest(),
+        source_path=identity.configured_jsonl_path,
+    )
+    _publish_prior_binding(store, identity)
+    _ensure_activation_lineage_marker(identity)
+    identity.configured_jsonl_path.write_bytes(
+        SOURCE_BYTES + b'{"source":"new","target":"ext"}\n'
+    )
+    observation = store.source_binding_monitor.observe()
+    if observation.state is not SourceBindingState.SOURCE_DIVERGED:
+        raise AssertionError("fixture must start in SOURCE_DIVERGED")
+    return identity, prior, store, coordinator
+
+
+def _service(
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+) -> TMMigrationService:
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=coordinator.canonical_store_id,
+        coordinator=coordinator,
+    )
+
+
+def _explicit_preflight(
+    service: TMMigrationService,
+    identity: CanonicalResourceIdentity,
+) -> contract_module.MigrationPreflight:
+    """Explicit scan/build seam without the initial-migration sidecar preflight.
+
+    Task 5.10 candidate helpers must not call the public initial-migration
+    ``preflight`` (whose fail-closed ``MIGRATION.MANIFEST_WITHOUT_SIDECAR``
+    rejection applies to manifest-without-sidecar claims regardless of
+    coordinator authority); they use the same explicit scan/build seam as
+    ``TMMigrationService.import_snapshot``.
+    """
+
+    source = identity.configured_jsonl_path
+    service._validate_source_preconditions(source)
+    return _scan_jsonl(source)
+
+
+def _read_manifest(
+    identity: CanonicalResourceIdentity,
+) -> contract_module.SnapshotManifest:
+    manifest = contract_module.contract_from_json(
+        identity.snapshot_manifest_path.read_text(encoding="utf-8")
+    )
+    if not isinstance(manifest, contract_module.SnapshotManifest):
+        raise AssertionError("expected a SnapshotManifest")
+    return manifest
+
+
+def _journal_phase(
+    identity: CanonicalResourceIdentity,
+) -> _ActivationJournalPhase:
+    journal_path = _activation_journal_path(identity)
+    return _parse_activation_journal_bytes(
+        journal_path.read_bytes(),
+        expected_journal_path=journal_path,
+    ).phase
+
+
+def _import_batch_row(
+    identity: CanonicalResourceIdentity,
+) -> tuple[str, str]:
+    connection = sqlite3.connect(identity.canonical_sidecar_path)
+    try:
+        rows = connection.execute(
+            "SELECT batch_id, kind FROM tm_origin_batch"
+        ).fetchall()
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        raise AssertionError("expected exactly one origin batch")
+    return str(rows[0][0]), str(rows[0][1])
+
+
+def _assert_success_report(
+    testcase: unittest.TestCase,
+    report: MigrationReport,
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+    *,
+    jsonl_before: bytes,
+    expected_generation: int,
+) -> None:
+    testcase.assertIsInstance(report, MigrationReport)
+    new_store_id = report.canonical_store_id
+    testcase.assertRegex(new_store_id, _STORE_IMPORT_RE)
+    testcase.assertNotEqual(
+        new_store_id,
+        f"store.import.{hashlib.sha256(jsonl_before).hexdigest()[:16]}",
+    )
+    testcase.assertEqual(report.resource_id, identity.resource_id)
+    testcase.assertEqual(
+        report.source_digest,
+        hashlib.sha256(jsonl_before).hexdigest(),
+    )
+    testcase.assertEqual(report.activated_generation, expected_generation)
+    testcase.assertEqual(report.migrated_count, 4)
+    testcase.assertEqual(report.variant_count, 1)
+    testcase.assertEqual(report.skipped_count, 0)
+    testcase.assertEqual(len(report.diagnostics), 1)
+    testcase.assertRegex(
+        report.snapshot_receipt.snapshot_id,
+        _SNAPSHOT_IMPORT_RE,
+    )
+    testcase.assertEqual(
+        report.snapshot_receipt.canonical_store_id,
+        new_store_id,
+    )
+    testcase.assertEqual(
+        report.snapshot_receipt.jsonl_digest,
+        hashlib.sha256(jsonl_before).hexdigest(),
+    )
+    testcase.assertEqual(report.snapshot_receipt.record_count, 4)
+    testcase.assertTrue(report.canonical_exact_available)
+    testcase.assertFalse(report.context_available)
+    testcase.assertFalse(report.fuzzy_available)
+
+    testcase.assertEqual(coordinator.state, "READY")
+    testcase.assertEqual(coordinator.canonical_store_id, new_store_id)
+    testcase.assertEqual(coordinator.current_generation, expected_generation)
+    testcase.assertEqual(
+        coordinator.active_store_path,
+        identity.canonical_sidecar_path,
+    )
+    batch_id, batch_kind = _import_batch_row(identity)
+    testcase.assertEqual(batch_kind, "import")
+    testcase.assertRegex(batch_id, _BATCH_IMPORT_RE)
+    manifest = _read_manifest(identity)
+    testcase.assertEqual(manifest.receipt.canonical_store_id, new_store_id)
+    testcase.assertEqual(
+        manifest.receipt.snapshot_id,
+        report.snapshot_receipt.snapshot_id,
+    )
+    testcase.assertEqual(
+        manifest.receipt_digest,
+        snapshot_receipt_digest(manifest.receipt),
+    )
+
+
+def _assert_failure_preserves_prior(
+    testcase: unittest.TestCase,
+    failure: MigrationFailure,
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+    prior: MutableStageRef,
+    *,
+    jsonl_before: bytes,
+    manifest_before: bytes | None,
+    store_before: bytes,
+    expected_code: str,
+    expected_stage: str,
+    expected_retryable: bool,
+    expected_state: str = "READY",
+    expected_sidecar_present: bool = False,
+    expected_store_state: AssetPreservationState = (
+        AssetPreservationState.VERIFIED_UNCHANGED
+    ),
+    expected_journal_present: bool = False,
+) -> None:
+    testcase.assertIsInstance(failure, MigrationFailure)
+    testcase.assertEqual(failure.error_code, expected_code)
+    testcase.assertEqual(failure.stage, expected_stage)
+    testcase.assertEqual(failure.retryable, expected_retryable)
+    testcase.assertEqual(failure.active_generation, 0)
+    testcase.assertEqual(
+        failure.original_source_preservation.state,
+        AssetPreservationState.VERIFIED_UNCHANGED,
+    )
+    testcase.assertEqual(
+        failure.original_source_preservation.before_digest,
+        hashlib.sha256(jsonl_before).hexdigest(),
+    )
+    testcase.assertEqual(
+        failure.active_store_preservation.state,
+        expected_store_state,
+    )
+    testcase.assertEqual(
+        failure.active_store_preservation.before_digest,
+        hashlib.sha256(store_before).hexdigest(),
+    )
+    testcase.assertEqual(coordinator.state, expected_state)
+    testcase.assertEqual(coordinator.canonical_store_id, "store.primary")
+    testcase.assertEqual(coordinator.current_generation, 0)
+    testcase.assertEqual(
+        identity.configured_jsonl_path.read_bytes(),
+        jsonl_before,
+    )
+    if manifest_before is None:
+        testcase.assertFalse(identity.snapshot_manifest_path.exists())
+    else:
+        testcase.assertEqual(
+            identity.snapshot_manifest_path.read_bytes(),
+            manifest_before,
+        )
+    testcase.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+    testcase.assertEqual(
+        identity.canonical_sidecar_path.exists(),
+        expected_sidecar_present,
+    )
+    testcase.assertEqual(
+        _activation_journal_path(identity).exists(),
+        expected_journal_present,
+    )
+
+
+def _drive_to_prepared(
+    service: TMMigrationService,
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+    *,
+    fts5_available: bool = False,
+) -> tuple[_ActivationPreparation, _ActivationJournalHandle, str]:
+    """Drive one replacement activation to a durable PREPARED journal.
+
+    Coordinator-level seam for the recovery authority matrix: the service
+    auto-reconciles public failures, so these tests build the journal
+    phases directly through the coordinator public API.
+    """
+
+    import uuid
+
+    with patch("tm_sqlite_store._probe_fts5", return_value=fts5_available):
+        preflight = _explicit_preflight(service, identity)
+        origin_token = uuid.uuid4().hex
+        new_store_id = f"store.import.{origin_token}"
+        stage, _stage_identity, _manifest_identity = service._build_stage(
+            identity.configured_jsonl_path,
+            preflight=preflight,
+            canonical_store_id=new_store_id,
+            batch_kind="import",
+            batch_prefix="import",
+            snapshot_prefix="snapshot.import",
+            stage_prefix="import",
+            path_salt=uuid.uuid4().hex,
+            batch_id=f"import.{origin_token}",
+        )
+        sealed = StageSealer(
+            registry=coordinator._sealed_registry,
+            canonical_store_id=new_store_id,
+        ).seal(
+            stage,
+            expected_prior_generation=coordinator.current_generation,
+        )
+        prepared = coordinator.activate_replacement(sealed)
+        handle = coordinator.publish_prepared_activation(prepared)
+    return prepared, handle, new_store_id
+
+
+class ExplicitImportRebuildSuccessTests(unittest.TestCase):
+    def test_import_and_rebuild_replace_the_active_canonical(self) -> None:
+        for fts5_available in (True, False):
+            for operation in ("import_snapshot", "rebuild_from_snapshot"):
+                with self.subTest(
+                    fts5_available=fts5_available,
+                    operation=operation,
+                ):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        (
+                            identity,
+                            _prior,
+                            store,
+                            coordinator,
+                        ) = _diverged_fixture(
+                            root,
+                            fts5_available=fts5_available,
+                        )
+                        jsonl_before = (
+                            identity.configured_jsonl_path.read_bytes()
+                        )
+                        self.assertEqual(coordinator.current_generation, 0)
+                        self.assertEqual(
+                            store.source_binding_monitor.observe().state,
+                            SourceBindingState.SOURCE_DIVERGED,
+                        )
+                        service = _service(coordinator, identity)
+                        with patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=fts5_available,
+                        ):
+                            outcome = getattr(service, operation)(
+                                identity.configured_jsonl_path,
+                                identity.resource_id,
+                            )
+                        self.assertIsInstance(outcome, MigrationReport)
+                        _assert_success_report(
+                            self,
+                            cast(MigrationReport, outcome),
+                            coordinator,
+                            identity,
+                            jsonl_before=jsonl_before,
+                            expected_generation=1,
+                        )
+                        self.assertEqual(
+                            _journal_phase(identity),
+                            _ActivationJournalPhase.GENERATION_PUBLISHED,
+                        )
+                        # a fresh candidate-id coordinator replays the
+                        # completed journal idempotently without a second
+                        # generation
+                        fresh = ResourceStoreCoordinator(
+                            resource_identity=identity,
+                            canonical_store_id=cast(
+                                MigrationReport, outcome
+                            ).canonical_store_id,
+                        )
+                        with patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=fts5_available,
+                        ):
+                            replay = fresh.recover_durable_activation()
+                        self.assertEqual(
+                            replay,
+                            ActivationRecoveryReport(
+                                phase="GENERATION_PUBLISHED",
+                                action="COMPLETED",
+                                generation=1,
+                            ),
+                        )
+                        self.assertEqual(fresh.current_generation, 1)
+
+    def test_identical_snapshot_import_twice_succeeds_with_new_ids(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            service = _service(coordinator, identity)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                first = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(first, MigrationReport)
+            first_report = cast(MigrationReport, first)
+            _assert_success_report(
+                self,
+                first_report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+            first_store_id = first_report.canonical_store_id
+            first_snapshot_id = first_report.snapshot_receipt.snapshot_id
+            first_batch_id, _ = _import_batch_row(identity)
+
+            # the exact same bytes again succeed as generation N+1 with a
+            # distinct fresh store id and snapshot id (never a digest
+            # collision and never IMPORT.COORDINATOR_MISMATCH); the exact
+            # same service instance adopts the published authority and
+            # needs no caller-side renewal
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                second = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(second, MigrationReport)
+            second_report = cast(MigrationReport, second)
+            _assert_success_report(
+                self,
+                second_report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=2,
+            )
+            self.assertNotEqual(
+                second_report.canonical_store_id,
+                first_store_id,
+            )
+            self.assertNotEqual(
+                second_report.snapshot_receipt.snapshot_id,
+                first_snapshot_id,
+            )
+            second_batch_id, _ = _import_batch_row(identity)
+            self.assertNotEqual(second_batch_id, first_batch_id)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+
+
+class ExplicitImportValidationTests(unittest.TestCase):
+    def test_validation_failures_never_mutate(self) -> None:
+        def run_case(
+            case_name: str,
+            invoke: Callable[
+                [TMMigrationService, Path],
+                contract_module.MigrationOutcome,
+            ],
+            *,
+            expected_code: str,
+        ) -> None:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        store,
+                        coordinator,
+                    ) = _diverged_fixture(
+                        root,
+                        fts5_available=False,
+                    )
+                    jsonl_before = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    manifest_before = (
+                        identity.snapshot_manifest_path.read_bytes()
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = invoke(service, root)
+                    self.assertIsInstance(outcome, MigrationFailure)
+                    failure = cast(MigrationFailure, outcome)
+                    _assert_failure_preserves_prior(
+                        self,
+                        failure,
+                        coordinator,
+                        identity,
+                        prior,
+                        jsonl_before=jsonl_before,
+                        manifest_before=manifest_before,
+                        store_before=store_before,
+                        expected_code=expected_code,
+                        expected_stage="PREFLIGHT",
+                        expected_retryable=False,
+                    )
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+
+        run_case(
+            "wrong_source_path",
+            lambda service, root: service.import_snapshot(
+                root / "other.jsonl",
+                "tm.primary",
+            ),
+            expected_code="MIGRATION.RESOURCE_IDENTITY_MISMATCH",
+        )
+        run_case(
+            "wrong_resource_id",
+            lambda service, root: service.import_snapshot(
+                _identity(root).configured_jsonl_path,
+                "tm.other",
+            ),
+            expected_code="MIGRATION.RESOURCE_IDENTITY_MISMATCH",
+        )
+        for invalid in ("", "   ", 7):
+            run_case(
+                f"invalid_resource_id_{invalid!r}",
+                lambda service, root, value=invalid: service.import_snapshot(
+                    _identity(root).configured_jsonl_path,
+                    cast(str, value),
+                ),
+                expected_code="IMPORT.RESOURCE_ID_INVALID",
+            )
+        run_case(
+            "non_native_source_path",
+            lambda service, root: service.import_snapshot(
+                cast(
+                    Path,
+                    cast(object, str(_identity(root).configured_jsonl_path)),
+                ),
+                "tm.primary",
+            ),
+            expected_code="IMPORT.FAILED",
+        )
+
+    def test_empty_configured_source_fails_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            identity.configured_jsonl_path.write_bytes(b"")
+            service = _service(coordinator, identity)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=b"",
+                manifest_before=(
+                    identity.snapshot_manifest_path.read_bytes()
+                ),
+                store_before=prior.staged_db_path.read_bytes(),
+                expected_code="MIGRATION.SOURCE_EMPTY",
+                expected_stage="PREFLIGHT",
+                expected_retryable=False,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_coordinator_authority_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            mismatched = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.other",
+                coordinator=coordinator,
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = mismatched.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="IMPORT.COORDINATOR_MISMATCH",
+                expected_stage="PREFLIGHT",
+                expected_retryable=False,
+            )
+
+            without_coordinator = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with self.assertRaises(MigrationPreflightError) as raised:
+                without_coordinator.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertEqual(
+                raised.exception.error_code,
+                "IMPORT.COORDINATOR_UNAVAILABLE",
+            )
+            with self.assertRaises(TypeError):
+                TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=cast(Any, "not-a-coordinator"),
+                )
+
+    def test_gate_b_rejection_restores_ready_without_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_gate_b.GateBEvaluator.evaluate",
+                    side_effect=ActivationPreparationError(
+                        "ACTIVATION.GATE_B_REJECTED",
+                        retryable=False,
+                    ),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="ACTIVATION.GATE_B_REJECTED",
+                expected_stage="ACTIVATION",
+                expected_retryable=False,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+
+    def test_seal_failure_removes_exactly_the_fresh_stage_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=MigrationPreflightError(
+                        "IMPORT.SEAL_FAILED"
+                    ),
+                ),
+            ):
+                first = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(first, MigrationFailure)
+            failure = cast(MigrationFailure, first)
+            self.assertEqual(failure.error_code, "IMPORT.SEAL_FAILED")
+            self.assertEqual(failure.stage, "ACTIVATION")
+            self.assertFalse(failure.retryable)
+            self.assertEqual(
+                failure.active_store_preservation.state,
+                AssetPreservationState.VERIFIED_UNCHANGED,
+            )
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+            self.assertEqual(coordinator.state, "READY")
+            # the fresh stage DB and manifest temp are removed by identity
+            self.assertEqual(list(root.glob(".localcat-import.*")), [])
+            # a repeated fresh-salt failure must not grow stage/temp pairs
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=MigrationPreflightError(
+                        "IMPORT.SEAL_FAILED"
+                    ),
+                ),
+            ):
+                second = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(second, MigrationFailure)
+            self.assertEqual(list(root.glob(".localcat-import.*")), [])
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_seal_failure_hostile_stage_swap_never_unlinks_foreign_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            decoy = root / "decoy.sqlite3"
+            decoy.write_bytes(b"foreign-bytes")
+            swapped_stage_path: Path | None = None
+
+            def seal_then_swap(
+                stage: MutableStageRef,
+                *args: Any,
+                **kwargs: Any,
+            ) -> SealedStage:
+                nonlocal swapped_stage_path
+                swapped_stage_path = stage.staged_db_path
+                stage.staged_db_path.unlink()
+                os.symlink(decoy, stage.staged_db_path)
+                raise MigrationPreflightError("IMPORT.SEAL_FAILED")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_migration.StageSealer.seal",
+                    side_effect=seal_then_swap,
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            self.assertEqual(failure.error_code, "IMPORT.SEAL_FAILED")
+            self.assertEqual(
+                failure.active_store_preservation.state,
+                AssetPreservationState.VERIFIED_UNCHANGED,
+            )
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(coordinator.state, "READY")
+            # the foreign symlink and decoy are never disturbed; only the
+            # owned manifest temporary is removed by identity
+            self.assertIsNotNone(swapped_stage_path)
+            assert swapped_stage_path is not None
+            self.assertTrue(swapped_stage_path.is_symlink())
+            self.assertTrue(decoy.is_file())
+            self.assertFalse(
+                swapped_stage_path.with_name(
+                    swapped_stage_path.name.replace(
+                        ".sqlite3.stage",
+                        ".manifest.tmp",
+                    )
+                ).exists()
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+
+class ExplicitImportCanonicalCorruptionTests(unittest.TestCase):
+    def test_canonical_ledger_and_ancestry_tamper_fails_before_publication(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "ancestry",
+                "UPDATE tm_origin_batch SET status = 'staged', "
+                "completed_revision = NULL",
+            ),
+            (
+                "ledger status",
+                "UPDATE tm_snapshot_receipt SET status = 'issued'",
+            ),
+            (
+                "ledger path",
+                "UPDATE tm_snapshot_receipt SET destination_jsonl_path = "
+                "'/other/tm.jsonl'",
+            ),
+        )
+        for name, statement in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    jsonl_before = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    manifest_before = (
+                        identity.snapshot_manifest_path.read_bytes()
+                    )
+                    connection = sqlite3.connect(prior.staged_db_path)
+                    try:
+                        connection.execute(statement)
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    # the service observes the tampered DB as the prior
+                    # authority: the exact tampered bytes are what the
+                    # import must preserve byte-for-byte
+                    store_before = prior.staged_db_path.read_bytes()
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    # canonical ledger/ancestry corruption is never
+                    # repaired by an explicit import: the operation fails
+                    # before any durable publication, preserves the exact
+                    # three assets, and leaves the prior canonical in
+                    # place with its divergence intact
+                    self.assertIsInstance(outcome, MigrationFailure)
+                    failure = cast(MigrationFailure, outcome)
+                    _assert_failure_preserves_prior(
+                        self,
+                        failure,
+                        coordinator,
+                        identity,
+                        prior,
+                        jsonl_before=jsonl_before,
+                        manifest_before=manifest_before,
+                        store_before=store_before,
+                        expected_code="ACTIVATION.PRIOR_BINDING_INVALID",
+                        expected_stage="ACTIVATION",
+                        expected_retryable=False,
+                    )
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                    self.assertFalse(
+                        _activation_journal_path(identity).exists()
+                    )
+
+
+class ExplicitImportPublicationFailureTests(unittest.TestCase):
+    def test_publish_prepared_failure_cancels_and_restores_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="ACTIVATION.JOURNAL_WRITE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                retry = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(retry, MigrationReport)
+            _assert_success_report(
+                self,
+                cast(MigrationReport, retry),
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+
+    def test_db_replace_failure_auto_restores_ready_old_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._replace_activation_file",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="ACTIVATION.DB_REPLACE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            # a fresh prior-id coordinator replays the retained CANCELLED
+            # terminal without any caller-side rollback call
+            fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                replay = fresh.recover_durable_activation()
+            self.assertEqual(
+                replay,
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="CANCELLED",
+                    generation=0,
+                ),
+            )
+            self.assertEqual(fresh.current_generation, 0)
+            # a retry after the auto-restored failure succeeds with a fresh
+            # store id and the next generation
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                retry = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(retry, MigrationReport)
+            retry_report = cast(MigrationReport, retry)
+            _assert_success_report(
+                self,
+                retry_report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+    def test_manifest_publish_failure_auto_restores_ready_old_service(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._publish_activation_manifest",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="IMPORT.FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=False,
+                expected_sidecar_present=False,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                retry = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(retry, MigrationReport)
+            _assert_success_report(
+                self,
+                cast(MigrationReport, retry),
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+
+    def test_generation_journal_write_failure_auto_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            calls = {"count": 0}
+            original_write = tm_sqlite_store._write_activation_journal
+
+            def fail_generation_journal(
+                record: _ActivationJournalRecord,
+                journal_path: Path,
+                *,
+                expected_final_identity: _ActivationFileIdentity | None,
+            ) -> _ActivationJournalHandle:
+                calls["count"] += 1
+                if calls["count"] == 4:
+                    raise OSError("injected")
+                return original_write(
+                    record,
+                    journal_path,
+                    expected_final_identity=expected_final_identity,
+                )
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=fail_generation_journal,
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            _assert_failure_preserves_prior(
+                self,
+                failure,
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="ACTIVATION.JOURNAL_WRITE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+
+    def test_unprovable_rollback_fails_stop_with_unverified_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._replace_activation_file",
+                    side_effect=OSError("injected"),
+                ),
+                patch(
+                    "tm_activation_recovery._revalidate_recovered_prior_set",
+                    side_effect=ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
+                        retryable=False,
+                    ),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            # rollback could not prove the restored prior set, so the
+            # service fails stop with UNVERIFIED evidence and never claims
+            # VERIFIED_UNCHANGED
+            self.assertEqual(
+                failure.active_store_preservation.state,
+                AssetPreservationState.UNVERIFIED,
+            )
+            self.assertFalse(failure.retryable)
+            self.assertEqual(len(failure.recovery_locators), 1)
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            self.assertEqual(
+                _journal_phase(identity),
+                _ActivationJournalPhase.PREPARED,
+            )
+            self.assertEqual(prior.staged_db_path.read_bytes(), store_before)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                manifest_before,
+            )
+
+    def test_crash_window_token_consume_failure_completes_via_recovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            service = _service(coordinator, identity)
+            def fail_consume(
+                token: contract_module._ActivationToken,
+            ) -> None:
+                _ = token
+                raise __import__(
+                    "tm_stage_sealer"
+                ).StageSealError("SEALER.TOKEN_CONSUME_FAILED")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                    patch.object(
+                        coordinator._sealed_registry,
+                        "consume",
+                        side_effect=fail_consume,
+                    ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            # the GENERATION_PUBLISHED journal is durable and the candidate
+            # active set is provable: the service completes the candidate
+            # and reports success with the new generation
+            self.assertIsInstance(outcome, MigrationReport)
+            report = cast(MigrationReport, outcome)
+            _assert_success_report(
+                self,
+                report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+
+    def test_crash_window_marker_failure_high_level_op_returns_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            service = _service(coordinator, identity)
+            calls = {"count": 0}
+
+            def fail_marker_once(value: CanonicalResourceIdentity) -> None:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.LINEAGE_MARKER_FAILED",
+                        retryable=True,
+                    )
+                _ensure_activation_lineage_marker(value)
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._ensure_activation_lineage_marker",
+                    side_effect=fail_marker_once,
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationReport)
+            report = cast(MigrationReport, outcome)
+            _assert_success_report(
+                self,
+                report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+            # the completed journal is retained: a fresh prior-id
+            # coordinator recovers the candidate (crash-window authority)
+            fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                recovered = fresh.recover_durable_activation()
+            self.assertEqual(
+                recovered,
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="COMPLETED",
+                    generation=1,
+                ),
+            )
+            self.assertEqual(
+                fresh.canonical_store_id,
+                report.canonical_store_id,
+            )
+            self.assertEqual(fresh.current_generation, 1)
+            # the recovered authority was adopted by the original
+            # coordinator and service: the exact same service instance
+            # performs a second byte-identical import as generation 2
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                second = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(second, MigrationReport)
+            second_report = cast(MigrationReport, second)
+            _assert_success_report(
+                self,
+                second_report,
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=2,
+            )
+            self.assertNotEqual(
+                second_report.canonical_store_id,
+                report.canonical_store_id,
+            )
+
+
+class ExplicitImportManifestDivergenceTests(unittest.TestCase):
+    def test_missing_prior_manifest_import_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            identity.snapshot_manifest_path.unlink()
+            service = _service(coordinator, identity)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationReport)
+            _assert_success_report(
+                self,
+                cast(MigrationReport, outcome),
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+            self.assertTrue(identity.snapshot_manifest_path.is_file())
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+    def test_missing_prior_manifest_failure_preserves_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            identity.snapshot_manifest_path.unlink()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._replace_activation_file",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            _assert_failure_preserves_prior(
+                self,
+                cast(MigrationFailure, outcome),
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=None,
+                store_before=store_before,
+                expected_code="ACTIVATION.DB_REPLACE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_externally_altered_manifest_import_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            altered = b'{"external":"tampered"}\n'
+            identity.snapshot_manifest_path.write_bytes(altered)
+            service = _service(coordinator, identity)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationReport)
+            _assert_success_report(
+                self,
+                cast(MigrationReport, outcome),
+                coordinator,
+                identity,
+                jsonl_before=jsonl_before,
+                expected_generation=1,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+    def test_externally_altered_manifest_failure_preserves_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            altered = b'{"external":"tampered"}\n'
+            identity.snapshot_manifest_path.write_bytes(altered)
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._replace_activation_file",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            _assert_failure_preserves_prior(
+                self,
+                cast(MigrationFailure, outcome),
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=altered,
+                store_before=store_before,
+                expected_code="ACTIVATION.DB_REPLACE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+            self.assertEqual(
+                identity.snapshot_manifest_path.read_bytes(),
+                altered,
+            )
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_foreign_manifest_entries_fail_closed(self) -> None:
+        for entry_kind in ("symlink", "directory"):
+            with self.subTest(entry_kind=entry_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    jsonl_before = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    manifest_path = identity.snapshot_manifest_path
+                    original_bytes = manifest_path.read_bytes()
+                    manifest_path.unlink()
+                    if entry_kind == "symlink":
+                        manifest_path.symlink_to(identity.configured_jsonl_path)
+                    else:
+                        manifest_path.mkdir()
+                    service = _service(coordinator, identity)
+                    with (
+                        patch(
+                            "tm_sqlite_store._probe_fts5",
+                            return_value=False,
+                        ),
+                        patch(
+                            "tm_activation_recovery._replace_activation_file",
+                            side_effect=OSError("injected"),
+                        ),
+                    ):
+                        outcome = service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    self.assertIsInstance(outcome, MigrationFailure)
+                    failure = cast(MigrationFailure, outcome)
+                    # the foreign entry is never touched or followed
+                    if entry_kind == "symlink":
+                        self.assertTrue(manifest_path.is_symlink())
+                    else:
+                        self.assertTrue(manifest_path.is_dir())
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        jsonl_before,
+                    )
+                    self.assertEqual(
+                        prior.staged_db_path.read_bytes(),
+                        store_before,
+                    )
+                    self.assertEqual(coordinator.state, "READY")
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                    self.assertFalse(
+                        identity.canonical_sidecar_path.exists()
+                    )
+                    self.assertIsNotNone(failure.error_code)
+                    # restore for the next subtest iteration is unnecessary
+                    # (fresh tempdir), but keep the fixture tidy
+                    if entry_kind == "symlink":
+                        manifest_path.unlink()
+                    else:
+                        manifest_path.rmdir()
+                    manifest_path.write_bytes(original_bytes)
+
+
+class ExplicitImportRecoveryTests(unittest.TestCase):
+    def test_prepared_replacement_cancels_on_prior_id_coordinator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            manifest_before = identity.snapshot_manifest_path.read_bytes()
+            store_before = prior.staged_db_path.read_bytes()
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            _assert_failure_preserves_prior(
+                self,
+                cast(MigrationFailure, outcome),
+                coordinator,
+                identity,
+                prior,
+                jsonl_before=jsonl_before,
+                manifest_before=manifest_before,
+                store_before=store_before,
+                expected_code="ACTIVATION.JOURNAL_WRITE_FAILED",
+                expected_stage="ACTIVATION",
+                expected_retryable=True,
+            )
+            # a fresh prior-id coordinator replays the CANCELLED terminal
+            fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                replay = fresh.recover_durable_activation()
+            self.assertEqual(
+                replay,
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="CANCELLED",
+                    generation=0,
+                ),
+            )
+            self.assertEqual(fresh.current_generation, 0)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                rehydrated = SQLiteTMStore(
+                    prior,
+                    canonical_store_id="store.primary",
+                )
+            self.assertEqual(
+                rehydrated.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+    def test_pending_phase_recovery_authority_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+
+            # PREPARED accepts the exact prior id (cancelled)
+            _drive_to_prepared(service, coordinator, identity)
+            prior_fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                report = prior_fresh.recover_durable_activation()
+            self.assertEqual(
+                report,
+                ActivationRecoveryReport(
+                    phase="PREPARED",
+                    action="CANCELLED",
+                    generation=0,
+                ),
+            )
+            self.assertEqual(prior_fresh.current_generation, 0)
+            # the live coordinator still holds the retired preparation;
+            # the no-journal rollback replays the CANCELLED terminal and
+            # returns the same coordinator to READY for the next drive
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                coordinator.rollback_durable_activation()
+
+            # PREPARED rejects the candidate id (still pending)
+            _drive_to_prepared(service, coordinator, identity)
+            candidate_fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.import.candidate",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    candidate_fresh.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_MISMATCH",
+            )
+            # retire the still-pending journal before the next drive
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                coordinator.rollback_durable_activation()
+
+            # PREPARED rejects an arbitrary third id
+            _drive_to_prepared(service, coordinator, identity)
+            third_fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.other",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    third_fresh.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_MISMATCH",
+            )
+
+    def test_db_replaced_replacement_completes_on_prior_id_coordinator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            service = _service(coordinator, identity)
+            prepared, handle, new_store_id = _drive_to_prepared(
+                service,
+                coordinator,
+                identity,
+            )
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._publish_activation_manifest",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                with self.assertRaises(OSError):
+                    coordinator.publish_activation(prepared, handle)
+            self.assertEqual(
+                _journal_phase(identity),
+                _ActivationJournalPhase.DB_REPLACED,
+            )
+            # a fresh prior-id coordinator completes the DB_REPLACED
+            # replacement and adopts the candidate store id
+            fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                report = fresh.recover_durable_activation()
+            self.assertEqual(
+                report,
+                ActivationRecoveryReport(
+                    phase="DB_REPLACED",
+                    action="COMPLETED",
+                    generation=1,
+                ),
+            )
+            self.assertEqual(fresh.state, "READY")
+            self.assertEqual(fresh.current_generation, 1)
+            self.assertEqual(fresh.canonical_store_id, new_store_id)
+            self.assertRegex(fresh.canonical_store_id, _STORE_IMPORT_RE)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+            self.assertEqual(
+                fresh.active_store_path,
+                identity.canonical_sidecar_path,
+            )
+            manifest = _read_manifest(identity)
+            self.assertEqual(
+                manifest.receipt.canonical_store_id,
+                fresh.canonical_store_id,
+            )
+
+    def test_completed_replacement_prior_id_recovers_and_rollback_refused(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            jsonl_before = identity.configured_jsonl_path.read_bytes()
+            service = _service(coordinator, identity)
+            prepared, handle, new_store_id = _drive_to_prepared(
+                service,
+                coordinator,
+                identity,
+            )
+            calls = {"count": 0}
+
+            def fail_marker_once(value: CanonicalResourceIdentity) -> None:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.LINEAGE_MARKER_FAILED",
+                        retryable=True,
+                    )
+                _ensure_activation_lineage_marker(value)
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._ensure_activation_lineage_marker",
+                    side_effect=fail_marker_once,
+                ),
+            ):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    coordinator.publish_activation(prepared, handle)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.LINEAGE_MARKER_FAILED",
+            )
+            self.assertEqual(
+                _journal_phase(identity),
+                _ActivationJournalPhase.GENERATION_PUBLISHED,
+            )
+            # a prior-id coordinator refuses rollback of the valid completed
+            # candidate and completes it via recovery instead
+            prior_fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    prior_fresh.rollback_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.ROLLBACK_COMPLETED_INVALID",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                recovered = prior_fresh.recover_durable_activation()
+            self.assertEqual(
+                recovered,
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="COMPLETED",
+                    generation=1,
+                ),
+            )
+            self.assertEqual(prior_fresh.state, "READY")
+            self.assertEqual(prior_fresh.canonical_store_id, new_store_id)
+            self.assertEqual(prior_fresh.current_generation, 1)
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                jsonl_before,
+            )
+            # a candidate-id coordinator replays idempotently without a
+            # second generation
+            candidate_fresh = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id=new_store_id,
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                replay = candidate_fresh.recover_durable_activation()
+            self.assertEqual(
+                replay,
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="COMPLETED",
+                    generation=1,
+                ),
+            )
+            self.assertEqual(candidate_fresh.current_generation, 1)
+            # an arbitrary third store id is rejected for the completed
+            # journal (still retained after the idempotent replays)
+            third = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.other",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    third.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_MISMATCH",
+            )
+
+class ExplicitImportRecoveryAuthorityAdoptionTests(unittest.TestCase):
+    def test_adopt_recovered_authority_guards_and_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+            prepared, handle, new_store_id = _drive_to_prepared(
+                service,
+                coordinator,
+                identity,
+            )
+            calls = {"count": 0}
+
+            def fail_marker_once(value: CanonicalResourceIdentity) -> None:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.LINEAGE_MARKER_FAILED",
+                        retryable=True,
+                    )
+                _ensure_activation_lineage_marker(cast(Any, value))
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._ensure_activation_lineage_marker",
+                    side_effect=fail_marker_once,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ActivationPreparationError,
+                    "ACTIVATION.LINEAGE_MARKER_FAILED",
+                ):
+                    coordinator.publish_activation(
+                        cast(Any, prepared),
+                        cast(Any, handle),
+                    )
+            # the original coordinator is fail-stopped with a durable
+            # GENERATION_PUBLISHED journal (crash-window authority)
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            self.assertEqual(
+                _journal_phase(identity),
+                _ActivationJournalPhase.GENERATION_PUBLISHED,
+            )
+            recovered = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                recovery_report = recovered.recover_durable_activation()
+            self.assertEqual(
+                recovery_report,
+                ActivationRecoveryReport(
+                    phase="GENERATION_PUBLISHED",
+                    action="COMPLETED",
+                    generation=1,
+                ),
+            )
+            self.assertEqual(recovered.state, "READY")
+            self.assertEqual(recovered.canonical_store_id, new_store_id)
+            self.assertEqual(recovered.current_generation, 1)
+
+            # wrong type is rejected before any state is inspected
+            with self.assertRaises(TypeError):
+                coordinator.adopt_recovered_authority(
+                    cast(Any, "not-a-coordinator")
+                )
+
+            # different immutable resource identity is rejected
+            foreign = ResourceStoreCoordinator(
+                resource_identity=_identity(root, "tm.other"),
+                canonical_store_id="store.primary",
+            )
+            with self.assertRaisesRegex(
+                ActivationPreparationError,
+                "ACTIVATION.RECOVERY_IDENTITY_MISMATCH",
+            ):
+                coordinator.adopt_recovered_authority(foreign)
+
+            # a non-READY recovered authority is rejected
+            not_ready = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            not_ready._state = "ACTIVATING"
+            with self.assertRaisesRegex(
+                ActivationPreparationError,
+                "ACTIVATION.RECOVERY_STATE_INVALID",
+            ):
+                coordinator.adopt_recovered_authority(not_ready)
+
+            # an arbitrary unactivated authority (no recovered view) is
+            # rejected even with the same resource identity
+            arbitrary = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with self.assertRaisesRegex(
+                ActivationPreparationError,
+                "ACTIVATION.RECOVERY_VIEW_INVALID",
+            ):
+                coordinator.adopt_recovered_authority(arbitrary)
+
+            # a view whose canonical paths do not match the resource's
+            # canonical sidecar pair is rejected
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                wrong_path = ResourceStoreCoordinator(
+                    stage=prior,
+                    canonical_store_id="store.primary",
+                )
+            with self.assertRaisesRegex(
+                ActivationPreparationError,
+                "ACTIVATION.RECOVERY_PATH_MISMATCH",
+            ):
+                coordinator.adopt_recovered_authority(wrong_path)
+
+            # the proven recovered authority is adopted by the
+            # coordinator-owned transition and returns READY
+            self.assertEqual(
+                coordinator.adopt_recovered_authority(recovered),
+                "READY",
+            )
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(
+                coordinator.canonical_store_id,
+                recovered.canonical_store_id,
+            )
+            self.assertEqual(coordinator.current_generation, 1)
+            self.assertEqual(
+                coordinator.active_store_path,
+                identity.canonical_sidecar_path,
+            )
+
+            # adoption is not a generic setter: a second adoption on an
+            # already-READY coordinator is rejected without mutation
+            with self.assertRaisesRegex(
+                ActivationPreparationError,
+                "ACTIVATION.RECOVERY_ADOPTION_INVALID",
+            ):
+                coordinator.adopt_recovered_authority(recovered)
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(
+                coordinator.canonical_store_id,
+                recovered.canonical_store_id,
+            )
+
+
+class ExplicitImportLocalWriteTests(unittest.TestCase):
+    def test_success_discards_writes_made_while_diverged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            store.append(_draft("local", "write-while-diverged"))
+            service = _service(coordinator, identity)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationReport)
+            _assert_success_report(
+                self,
+                cast(MigrationReport, outcome),
+                coordinator,
+                identity,
+                jsonl_before=identity.configured_jsonl_path.read_bytes(),
+                expected_generation=1,
+            )
+            self.assertEqual(store.exact_records("local"), ())
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+    def test_failure_retains_writes_made_while_diverged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            store.append(_draft("local", "write-while-diverged"))
+            service = _service(coordinator, identity)
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_activation_recovery._publish_activation_manifest",
+                    side_effect=OSError("injected"),
+                ),
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            # the service auto-restored the READY prior authority; no
+            # caller-side rollback was needed
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(coordinator.canonical_store_id, "store.primary")
+            self.assertEqual(coordinator.current_generation, 0)
+            local = store.exact_records("local")
+            self.assertEqual(len(local), 1)
+            self.assertEqual(local[0].target_raw, "write-while-diverged")
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.SOURCE_DIVERGED,
+            )
+
+
+class ExplicitImportOriginBindingTests(unittest.TestCase):
+    def test_gate_b_binds_the_actual_import_batch_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            identity.configured_jsonl_path.write_bytes(SOURCE_BYTES)
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                preflight = _explicit_preflight(service, identity)
+                stage, _stage_identity, _manifest_identity = service._build_stage(
+                    identity.configured_jsonl_path,
+                    preflight=preflight,
+                    canonical_store_id="store.import.new",
+                    batch_kind="import",
+                    batch_prefix="import",
+                    snapshot_prefix="snapshot.import",
+                    stage_prefix="import",
+                    path_salt="f" * 32,
+                    batch_id="import." + "e" * 32,
+                )
+            registry = __import__(
+                "tm_stage_sealer"
+            )._SealedArtifactRegistry(
+                registry_namespace="coordinator.primary"
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                sealed = StageSealer(
+                    registry=registry,
+                    canonical_store_id="store.import.new",
+                ).seal(
+                    stage,
+                    expected_prior_generation=0,
+                )
+                report = tm_gate_b.GateBEvaluator(
+                    registry=registry._readiness_view()
+                ).evaluate(sealed)
+            self.assertTrue(report.granted)
+            facts = report.facts
+            self.assertIsInstance(facts, tm_gate_b.GateBPhysicalFacts)
+            assert facts is not None
+            self.assertEqual(
+                facts.migration_batch_id,
+                "import." + "e" * 32,
+            )
+            self.assertEqual(facts.origin_batch_count, 1)
+            self.assertRegex(facts.migration_batch_id, _BATCH_IMPORT_RE)
+            self.assertRegex(
+                sealed.evidence.source_binding.receipt.snapshot_id,
+                _SNAPSHOT_IMPORT_RE,
+            )
+
+
+class ExplicitImportIdentityGuardTests(unittest.TestCase):
+    def test_ordinary_activate_cannot_smuggle_a_different_store_id(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                store,
+                coordinator,
+                _stage,
+                sealed,
+            ) = _existing_fixture(
+                root,
+                fts5_available=False,
+                candidate_store_id="store.other",
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    coordinator.activate(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.IDENTITY_MISMATCH",
+            )
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(coordinator.canonical_store_id, "store.primary")
+            self.assertEqual(coordinator.current_generation, 0)
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+    def test_activate_replacement_rejects_the_current_store_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                store,
+                coordinator,
+                _stage,
+                sealed,
+            ) = _existing_fixture(
+                root,
+                fts5_available=False,
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    coordinator.activate_replacement(sealed)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.IDENTITY_MISMATCH",
+            )
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(coordinator.canonical_store_id, "store.primary")
+            self.assertEqual(coordinator.current_generation, 0)
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertEqual(
+                store.source_binding_monitor.observe().state,
+                SourceBindingState.VERIFIED_CURRENT,
+            )
+
+
+class ExplicitImportRecoveryLocatorStrictnessTests(unittest.TestCase):
+    """Cluster E re-review: strict prove-or-fail-stop locator protocol.
+
+    Task 5.10 failure builders never fabricate live-path locators: a
+    recovery locator is accepted only through the shared strict proof
+    (O_NOFOLLOW regular single-link file whose bytes equal the preserved
+    digest with a stable terminal identity), searched as activation
+    byte-exact recovery backups first and the live path only when the
+    same strict proof passes.  A DB_REPLACED failure whose rollback
+    cannot be proven and whose byte-exact backup is missing stops
+    explicitly with ``IMPORT.PRIOR_STATE_UNRECOVERABLE`` instead of
+    exposing a false locator, symlink/multi-link candidates are never
+    accepted, and a swap between selection and return fails stop without
+    deleting or exposing the swapped path.
+    """
+
+    def _drive_db_replaced_unprovable_rollback(
+        self,
+        root: Path,
+        *,
+        manifest_failure: Callable[[], None],
+    ) -> tuple[
+        CanonicalResourceIdentity,
+        ResourceStoreCoordinator,
+        bytes,
+        MigrationPreflightError,
+    ]:
+        """One import driven to durable DB_REPLACED with an injected rollback.
+
+        The manifest publish side effect first mutates the recovery
+        backup/live assets as requested, then raises so the journal stays
+        durably at DB_REPLACED; the rollback is injected to fail so the
+        failure builder runs with ``force_unverified``.
+        """
+
+        identity, _prior, _store, coordinator = _diverged_fixture(
+            root,
+            fts5_available=False,
+        )
+        store_before = _prior.staged_db_path.read_bytes()
+        service = _service(coordinator, identity)
+
+        def fail_manifest(*args: object, **kwargs: object) -> None:
+            manifest_failure()
+            raise OSError("injected manifest publish")
+
+        with (
+            patch("tm_sqlite_store._probe_fts5", return_value=False),
+            patch(
+                "tm_activation_recovery._publish_activation_manifest",
+                side_effect=fail_manifest,
+            ),
+            patch.object(
+                tm_sqlite_store.ResourceStoreCoordinator,
+                "rollback_durable_activation",
+                side_effect=OSError("injected rollback"),
+            ),
+        ):
+            with self.assertRaises(MigrationPreflightError) as raised:
+                service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+        return identity, coordinator, store_before, raised.exception
+
+    def _recovery_backups(self, root: Path) -> list[Path]:
+        return list(
+            root.glob(".*.localcat-recovery.*.database.bak")
+        )
+
+    def test_db_replaced_failed_rollback_with_deleted_backup_fails_stop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def delete_backup_and_live_prior() -> None:
+                for candidate in self._recovery_backups(root):
+                    candidate.unlink()
+                # the live store path no longer carries the prior bytes
+                # (production: DB_REPLACED moved the candidate there)
+                (root / ".prior.sqlite3").unlink()
+
+            identity, coordinator, store_before, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=delete_backup_and_live_prior,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            # the durable DB_REPLACED candidate is the live canonical and
+            # is never fabricated into a locator
+            self.assertTrue(identity.canonical_sidecar_path.is_file())
+            self.assertNotEqual(
+                hashlib.sha256(
+                    identity.canonical_sidecar_path.read_bytes()
+                ).hexdigest(),
+                hashlib.sha256(store_before).hexdigest(),
+            )
+            self.assertEqual(self._recovery_backups(root), [])
+
+    def test_symlink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_symlink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                target = root / "byte-exact-prior.copy"
+                target.write_bytes(
+                    (root / ".prior.sqlite3").read_bytes()
+                )
+                candidates[0].unlink()
+                os.symlink(target, candidates[0])
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_symlink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the symlink candidate is never unlinked and never exposed
+            symlinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.path.islink(candidate)
+            ]
+            self.assertEqual(len(symlinks), 1)
+
+    def test_multilink_recovery_backup_candidate_is_rejected_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def swap_backup_to_multilink() -> None:
+                candidates = self._recovery_backups(root)
+                self.assertEqual(len(candidates), 1)
+                hard = root / "byte-exact-prior.hard"
+                os.link(candidates[0], hard)
+                (root / ".prior.sqlite3").unlink()
+
+            _identity_value, _coordinator, _digest, error = (
+                self._drive_db_replaced_unprovable_rollback(
+                    root,
+                    manifest_failure=swap_backup_to_multilink,
+                )
+            )
+            self.assertEqual(
+                error.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            # the multi-link candidate is never unlinked and never exposed
+            multilinks = [
+                candidate
+                for candidate in self._recovery_backups(root)
+                if os.lstat(candidate).st_nlink != 1
+            ]
+            self.assertEqual(len(multilinks), 1)
+
+    def test_swap_between_selection_and_return_fails_stop(self) -> None:
+        swap_kinds = ("symlink", "directory", "multilink", "foreign")
+        for kind in swap_kinds:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        _prior,
+                        _store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    store_before = _prior.staged_db_path.read_bytes()
+                    byte_exact = root / "byte-exact-prior.copy"
+                    byte_exact.write_bytes(store_before)
+                    service = _service(coordinator, identity)
+                    original_proof = (
+                        tm_migration._require_locator_return_proof
+                    )
+
+                    def swap_then_prove(
+                        selection: Any,
+                        expected_digest: str,
+                        fail_stop_code: str,
+                    ) -> None:
+                        path = selection.path
+                        if kind == "symlink":
+                            path.unlink()
+                            os.symlink(byte_exact, path)
+                        elif kind == "directory":
+                            path.unlink()
+                            path.mkdir()
+                        elif kind == "multilink":
+                            os.link(path, path.with_name(path.name + ".x"))
+                        else:
+                            path.unlink()
+                            path.write_bytes(b"foreign inode bytes")
+                        original_proof(selection, expected_digest, fail_stop_code)
+
+                    with (
+                        patch("tm_sqlite_store._probe_fts5", return_value=False),
+                        patch(
+                            "tm_sqlite_store._write_activation_journal",
+                            side_effect=OSError("injected"),
+                        ),
+                        patch(
+                            "tm_sqlite_store.ResourceStoreCoordinator."
+                            "cancel_prepared_activation",
+                            side_effect=OSError("injected"),
+                        ),
+                        patch(
+                            "tm_migration._require_locator_return_proof",
+                            side_effect=swap_then_prove,
+                        ),
+                    ):
+                        with self.assertRaises(
+                            MigrationPreflightError
+                        ) as raised:
+                            service.import_snapshot(
+                                identity.configured_jsonl_path,
+                                identity.resource_id,
+                            )
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+                    )
+                    # the swapped path is never deleted and never exposed:
+                    # the fail-stop propagates instead of a MigrationFailure
+                    backups = self._recovery_backups(root)
+                    self.assertEqual(len(backups), 1)
+                    if kind == "symlink":
+                        self.assertTrue(os.path.islink(backups[0]))
+                    elif kind == "directory":
+                        self.assertTrue(backups[0].is_dir())
+                    elif kind == "multilink":
+                        self.assertEqual(
+                            os.lstat(backups[0]).st_nlink,
+                            2,
+                        )
+                    else:
+                        self.assertEqual(
+                            backups[0].read_bytes(),
+                            b"foreign inode bytes",
+                        )
+
+    def test_unreadable_source_at_failure_time_fails_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+
+            def delete_source_and_fail(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                identity.configured_jsonl_path.unlink()
+                raise OSError("injected journal write")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=delete_source_and_fail,
+                ),
+                patch(
+                    "tm_sqlite_store.ResourceStoreCoordinator."
+                    "cancel_prepared_activation",
+                    side_effect=OSError("injected cancel"),
+                ),
+            ):
+                with self.assertRaises(MigrationPreflightError) as raised:
+                    service.import_snapshot(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+            # the unreadable source has no honest locator: the live path
+            # cannot be proven byte-exact, so the failure stops instead of
+            # fabricating a source locator
+            self.assertEqual(
+                raised.exception.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertFalse(identity.configured_jsonl_path.exists())
+
+    def test_changed_source_without_prior_copy_fails_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+
+            def change_source_and_fail(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                identity.configured_jsonl_path.write_bytes(
+                    b'{"changed":true}\n'
+                )
+                raise OSError("injected journal write")
+
+            with (
+                patch("tm_sqlite_store._probe_fts5", return_value=False),
+                patch(
+                    "tm_sqlite_store._write_activation_journal",
+                    side_effect=change_source_and_fail,
+                ),
+                patch(
+                    "tm_sqlite_store.ResourceStoreCoordinator."
+                    "cancel_prepared_activation",
+                    side_effect=OSError("injected cancel"),
+                ),
+            ):
+                with self.assertRaises(MigrationPreflightError) as raised:
+                    service.import_snapshot(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+            self.assertEqual(
+                raised.exception.error_code,
+                "IMPORT.PRIOR_STATE_UNRECOVERABLE",
+            )
+            self.assertEqual(
+                identity.configured_jsonl_path.read_bytes(),
+                b'{"changed":true}\n',
+            )
+
+
+class ExplicitImportUpgradePendingInterleavingTests(unittest.TestCase):
+    """Cluster E P3: abandoned schema-upgrade pending artifacts vs 5.10.
+
+    A schema upgrade that crashes after minting its snapshot ticket but
+    before any activation journal leaves an owned ``.bak.pending`` and
+    ``.locator.pending`` beside the active store.  The explicit
+    replacement import/rebuild must resolve that abandoned unexposed
+    family before its own activation begins, so a later completed cold
+    recovery of the import can never promote a stale upgrade backup to an
+    unreported stable ``.bak``; a hostile abandoned entry fails closed
+    without deletion and without publishing a generation; and a live
+    Task 5.11 ticket is never swept.
+    """
+
+    def test_crash_after_upgrade_ticket_mint_import_resolves_before_publish(
+        self,
+    ) -> None:
+        for operation in ("import_snapshot", "rebuild_from_snapshot"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        coordinator,
+                        activation_digest,
+                    ) = _legacy_fixture(root, fts5_available=False)
+                    # crash/abandon after ticket mint before any journal:
+                    # a separate coordinator mints the ticket and dies
+                    # with its "process", leaving the pending family
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        crashed = ResourceStoreCoordinator(
+                            prior,
+                            canonical_store_id="store.primary",
+                            _allow_legacy_schema=True,
+                            _allow_active=True,
+                            _expected_active_generation=3,
+                            _expected_activation_digest=activation_digest,
+                        )
+                        crashed.prepare_schema_upgrade_ticket()
+                    pending = _schema_upgrade_pending_family(root)
+                    self.assertEqual(len(pending), 2)
+                    self.assertTrue(
+                        any(
+                            candidate.name.endswith(".bak.pending")
+                            for candidate in pending
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            candidate.name.endswith(".locator.pending")
+                            for candidate in pending
+                        )
+                    )
+                    self.assertEqual(
+                        _schema_upgrade_stable_bak(root),
+                        [],
+                    )
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+                    # the completed explicit import/rebuild resolves the
+                    # abandoned family before its own activation begins
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = getattr(service, operation)(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    self.assertIsInstance(outcome, MigrationReport)
+                    report = cast(MigrationReport, outcome)
+                    self.assertEqual(report.activated_generation, 4)
+                    self.assertEqual(coordinator.state, "READY")
+                    self.assertEqual(
+                        coordinator.active_store_path,
+                        identity.canonical_sidecar_path,
+                    )
+                    self.assertEqual(_schema_upgrade_pending_family(root), [])
+                    self.assertEqual(_schema_upgrade_stable_bak(root), [])
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+                    # a later cold recovery of the completed import
+                    # promotes nothing: no stale upgrade backup becomes
+                    # an unreported stable .bak and no hidden full-copy
+                    # artifacts remain
+                    fresh = ResourceStoreCoordinator(
+                        resource_identity=identity,
+                        canonical_store_id=report.canonical_store_id,
+                    )
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        recovered = fresh.recover_durable_activation()
+                    self.assertIsNotNone(recovered)
+                    recovery = cast(ActivationRecoveryReport, recovered)
+                    self.assertEqual(recovery.action, "COMPLETED")
+                    self.assertEqual(recovery.generation, 4)
+                    self.assertEqual(fresh.state, "READY")
+                    self.assertEqual(fresh.current_generation, 4)
+                    self.assertEqual(_schema_upgrade_pending_family(root), [])
+                    self.assertEqual(_schema_upgrade_stable_bak(root), [])
+                    self.assertEqual(
+                        _schema_upgrade_stable_locator(root),
+                        [],
+                    )
+
+    def test_hostile_abandoned_pending_entry_fails_closed_without_deletion(
+        self,
+    ) -> None:
+        for kind in ("symlink", "directory", "multilink", "malformed"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (
+                        identity,
+                        prior,
+                        store,
+                        coordinator,
+                    ) = _diverged_fixture(root, fts5_available=False)
+                    jsonl_before = (
+                        identity.configured_jsonl_path.read_bytes()
+                    )
+                    store_before = prior.staged_db_path.read_bytes()
+                    token = "a" * 32
+                    pending_path = root / (
+                        f"..prior.sqlite3.localcat-schema-upgrade."
+                        f"{token}.bak.pending"
+                    )
+                    if kind == "symlink":
+                        os.symlink(identity.canonical_sidecar_path, pending_path)
+                    elif kind == "directory":
+                        pending_path.mkdir()
+                    elif kind == "multilink":
+                        pending_path.write_bytes(b"pending bytes")
+                        os.link(
+                            pending_path,
+                            root / "hostile-hardlink-extra",
+                        )
+                    else:
+                        pending_path = root / (
+                            "..prior.sqlite3.localcat-schema-upgrade."
+                            "nothex.bak.pending"
+                        )
+                        pending_path.write_bytes(b"malformed pending bytes")
+                    self.assertTrue(os.path.lexists(pending_path))
+                    service = _service(coordinator, identity)
+                    with patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=False,
+                    ):
+                        outcome = service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    self.assertIsInstance(outcome, MigrationFailure)
+                    failure = cast(MigrationFailure, outcome)
+                    self.assertEqual(
+                        failure.error_code,
+                        "ACTIVATION.UPGRADE_PENDING_UNSAFE",
+                    )
+                    self.assertFalse(failure.retryable)
+                    self.assertEqual(failure.stage, "ACTIVATION")
+                    # the hostile entry is never deleted and no activation
+                    # ever began: no journal, no generation, no recovery
+                    # backup, and the prior authority is byte-identical
+                    self.assertTrue(os.path.lexists(pending_path))
+                    self.assertEqual(
+                        coordinator.state,
+                        "READY",
+                    )
+                    self.assertEqual(
+                        coordinator.canonical_store_id,
+                        "store.primary",
+                    )
+                    self.assertEqual(coordinator.current_generation, 0)
+                    self.assertFalse(
+                        _activation_journal_path(identity).exists()
+                    )
+                    self.assertEqual(
+                        prior.staged_db_path.read_bytes(),
+                        store_before,
+                    )
+                    self.assertEqual(
+                        identity.configured_jsonl_path.read_bytes(),
+                        jsonl_before,
+                    )
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                    self.assertEqual(
+                        list(
+                            root.glob(
+                                "..prior.sqlite3."
+                                "localcat-recovery.*.database.bak"
+                            )
+                        ),
+                        [],
+                    )
+
+    def test_live_upgrade_ticket_is_never_swept_by_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                prior,
+                coordinator,
+                activation_digest,
+            ) = _legacy_fixture(root, fts5_available=False)
+            store_before = prior.staged_db_path.read_bytes()
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                coordinator.prepare_schema_upgrade_ticket()
+            self.assertEqual(len(_schema_upgrade_pending_family(root)), 2)
+            # a concurrent explicit import while the Task 5.11 ticket is
+            # live fails closed before activation and never sweeps the
+            # live ticket's pending family
+            service = _service(coordinator, identity)
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ):
+                outcome = service.import_snapshot(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+            self.assertIsInstance(outcome, MigrationFailure)
+            failure = cast(MigrationFailure, outcome)
+            self.assertEqual(
+                failure.error_code,
+                "ACTIVATION.UPGRADE_BUSY",
+            )
+            self.assertTrue(failure.retryable)
+            self.assertEqual(len(_schema_upgrade_pending_family(root)), 2)
+            self.assertEqual(_schema_upgrade_stable_bak(root), [])
+            self.assertEqual(_schema_upgrade_stable_locator(root), [])
+            self.assertEqual(coordinator.state, "READY")
+            self.assertEqual(coordinator.canonical_store_id, "store.primary")
+            self.assertEqual(coordinator.current_generation, 3)
+            self.assertFalse(_activation_journal_path(identity).exists())
+            self.assertEqual(
+                prior.staged_db_path.read_bytes(),
+                store_before,
+            )
+
+    def test_import_still_drains_an_existing_operation_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                identity,
+                _prior,
+                _store,
+                coordinator,
+            ) = _diverged_fixture(root, fts5_available=False)
+            service = _service(coordinator, identity)
+            entered = threading.Event()
+            release = threading.Event()
+            outcomes: list[Any] = []
+
+            def hold_lease() -> None:
+                with coordinator._operation_lease():
+                    entered.set()
+                    release.wait(timeout=3)
+
+            def run_import() -> None:
+                with patch(
+                    "tm_sqlite_store._probe_fts5",
+                    return_value=False,
+                ):
+                    outcomes.append(
+                        service.import_snapshot(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                    )
+
+            holder = threading.Thread(target=hold_lease)
+            holder.start()
+            self.assertTrue(entered.wait(timeout=2))
+            worker = threading.Thread(target=run_import)
+            worker.start()
+            self.assertTrue(
+                coordinator.wait_for_state(
+                    "DRAINING",
+                    timeout_seconds=2,
+                )
+            )
+            release.set()
+            holder.join(timeout=3)
+            worker.join(timeout=5)
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], MigrationReport)
+            self.assertEqual(
+                cast(MigrationReport, outcomes[0]).activated_generation,
+                1,
+            )
+            self.assertEqual(coordinator.state, "READY")
+
+
+if __name__ == "__main__":
+    unittest.main()
