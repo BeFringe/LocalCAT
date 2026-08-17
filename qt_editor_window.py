@@ -7,7 +7,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRect, QSignalBlocker, QSize, Qt, QTimer
+from PySide6.QtCore import QObject, QEvent, QRect, QSignalBlocker, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QLineEdit,
     QScrollArea,
+    QStyledItemDelegate,
 )
 
 from editor_contracts import (
@@ -66,6 +67,32 @@ from editor_contracts import (
 from editor_controller import EditorController, EditorControllerError
 from editor_project import ProjectError
 from qt_settings_dialog import QtSettingsDialog
+
+
+_WORKSPACE_MODE_POPUP_STYLE = """
+QAbstractItemView#workspaceModePopup {
+    color: #1f3850;
+    background-color: #ffffff;
+    selection-color: #0b304c;
+    selection-background-color: #c4e8f2;
+    border: 1px solid #9fb5c8;
+    outline: 0;
+}
+QAbstractItemView#workspaceModePopup::item {
+    color: #1f3850;
+    background-color: #ffffff;
+    min-height: 30px;
+    padding: 2px 8px;
+}
+QAbstractItemView#workspaceModePopup::item:hover {
+    color: #16344e;
+    background-color: #e7f4f8;
+}
+QAbstractItemView#workspaceModePopup::item:selected {
+    color: #0b304c;
+    background-color: #c4e8f2;
+}
+"""
 
 
 class ResponsiveSplitter(QSplitter):
@@ -125,11 +152,52 @@ def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> s
 class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
-    shortcuts: dict[str, QShortcut]
-    target_editor_shortcuts: dict[str, QShortcut]
-
     def __init__(self, controller: EditorController) -> None:
         super().__init__()
+        # The UI is assembled by small builder methods.  Keep the resulting
+        # widget contract explicit here so static analysis sees the same
+        # always-initialized surface that callers receive after construction.
+        self.shortcuts: dict[str, QShortcut]
+        self.target_editor_shortcuts: dict[str, QShortcut]
+        self.project_name_label: QLabel
+        self.language_label: QLabel
+        self.progress_bar: QProgressBar
+        self.workspace_mode_combo: QComboBox
+        self.open_button: QToolButton
+        self.project_menu: QMenu
+        self.open_project_action: QAction
+        self.recent_projects_menu: QMenu
+        self.close_project_action: QAction
+        self.quit_action: QAction
+        self.save_button: QToolButton
+        self.settings_button: QToolButton
+        self.empty_open_button: QPushButton
+        self.sample_button: QPushButton
+        self.main_splitter: ResponsiveSplitter
+        self.workspace_pages: QStackedWidget
+        self.segment_count_label: QLabel
+        self.segment_density_combo: QComboBox
+        self.unconfirmed_filter: QCheckBox
+        self.segment_list: QListWidget
+        self.browse_table: QTableWidget
+        self.segment_position_label: QLabel
+        self.speaker_display: QLabel
+        self.source_display: QTextBrowser
+        self.confirmation_label: QLabel
+        self.target_editor: QTextEdit
+        self.previous_button: QPushButton
+        self.next_button: QPushButton
+        self.confirm_button: QPushButton
+        self.suggestion_tabs: QTabWidget
+        self.translation_matches_page: QWidget
+        self.tm_scroll: QScrollArea
+        self.tm_container: QWidget
+        self.tm_cards_layout: QVBoxLayout
+        self.termbase_page: QWidget
+        self.add_term_button: QPushButton
+        self.term_scroll: QScrollArea
+        self.term_container: QWidget
+        self.term_cards_layout: QVBoxLayout
         self.controller = controller
         self._refreshing = False
         self._display_preferences: DisplayPreferences = controller.display_preferences()
@@ -227,6 +295,13 @@ class QtEditorWindow(QMainWindow):
         self.workspace_mode_combo.setToolTip("切换编辑或双语浏览校对模式")
         self.workspace_mode_combo.addItem("编辑", WorkspaceMode.EDIT.value)
         self.workspace_mode_combo.addItem("浏览 / 校对", WorkspaceMode.BROWSE.value)
+        workspace_mode_popup = self.workspace_mode_combo.view()
+        workspace_mode_popup.setObjectName("workspaceModePopup")
+        workspace_mode_popup.setAccessibleName("工作区模式选项")
+        workspace_mode_popup.setStyleSheet(_WORKSPACE_MODE_POPUP_STYLE)
+        workspace_mode_popup.setItemDelegate(
+            QStyledItemDelegate(workspace_mode_popup)
+        )
         self.workspace_mode_combo.setCurrentIndex(
             0 if self.workspace_mode is WorkspaceMode.EDIT else 1
         )
@@ -663,7 +738,7 @@ class QtEditorWindow(QMainWindow):
                 )
                 self.target_editor_shortcuts[object_name] = shortcut
 
-    def eventFilter(self, watched: object, event: QEvent) -> bool:
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         """Handle Ctrl+wheel only for the two editor viewports."""
 
         editor_viewports = (
@@ -1315,6 +1390,8 @@ class QtEditorWindow(QMainWindow):
     def _clear_layout(layout: QVBoxLayout) -> None:
         while layout.count():
             item = layout.takeAt(0)
+            if item is None:
+                continue
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()

@@ -64,8 +64,12 @@ class QtSettingsDialogTest(unittest.TestCase):
 
             self.assertEqual(dialog.active_table.rowCount(), 1)
             self.assertEqual(dialog.inactive_table.rowCount(), 1)
-            self.assertEqual(dialog.active_table.item(0, 3).text(), "Primary TM")
-            self.assertEqual(dialog.inactive_table.item(0, 3).text(), "Archive terms")
+            active_name = dialog.active_table.item(0, 3)
+            inactive_name = dialog.inactive_table.item(0, 3)
+            assert active_name is not None
+            assert inactive_name is not None
+            self.assertEqual(active_name.text(), "Primary TM")
+            self.assertEqual(inactive_name.text(), "Archive terms")
             dialog.close()
 
     def test_create_and_checkbox_updates_use_controller_and_persist(self) -> None:
@@ -79,6 +83,7 @@ class QtSettingsDialogTest(unittest.TestCase):
             created = dialog.create_resource("Client terms", ResourceKind.TERMBASE)
             lookup = dialog.findChild(QCheckBox, f"lookup_{created.id}")
             self.assertIsNotNone(lookup)
+            assert lookup is not None
             lookup.setChecked(False)
             self.app.processEvents()
             dialog.refresh_resources()
@@ -101,6 +106,8 @@ class QtSettingsDialogTest(unittest.TestCase):
                 configured for configured in controller.list_resources() if configured.name == "Primary TM"
             )
             active = dialog.findChild(QCheckBox, f"active_{resource.id}")
+            self.assertIsNotNone(active)
+            assert active is not None
 
             active.setChecked(False)
             self.app.processEvents()
@@ -424,6 +431,7 @@ class QtSettingsDialogTest(unittest.TestCase):
             table = dialog.active_table
             button = dialog.findChild(QToolButton, f"more_{resource.id}")
             self.assertIsNotNone(button)
+            assert button is not None
             expected_button_width = min(
                 40,
                 max(32, button.sizeHint().width() + 8),
@@ -476,6 +484,8 @@ class QtSettingsDialogTest(unittest.TestCase):
             )
             table = dialog.active_table
             button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            self.assertIsNotNone(button)
+            assert button is not None
 
             dialog.show()
             for width in (860, 1320):
@@ -628,7 +638,11 @@ class QtSettingsDialogTest(unittest.TestCase):
                 if configured.name == "Primary TM"
             )
             button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            self.assertIsNotNone(button)
+            assert button is not None
             menu = button.menu()
+            self.assertIsNotNone(menu)
+            assert menu is not None
             opened: list[bool] = []
             menu.aboutToShow.connect(lambda: opened.append(True))
             dialog.show()
@@ -664,8 +678,12 @@ class QtSettingsDialogTest(unittest.TestCase):
             more_button = dialog.findChild(QToolButton, f"more_{resource.id}")
 
             self.assertIsNotNone(more_button)
+            assert more_button is not None
+            menu = more_button.menu()
+            self.assertIsNotNone(menu)
+            assert menu is not None
             delete_action = next(
-                action for action in more_button.menu().actions() if action.text() == "删除资源"
+                action for action in menu.actions() if action.text() == "删除资源"
             )
             with patch.object(
                 QMessageBox,
@@ -687,8 +705,13 @@ class QtSettingsDialogTest(unittest.TestCase):
             resource = controller.create_resource("Keep me", ResourceKind.TERMBASE)
             dialog = QtSettingsDialog(controller)
             more_button = dialog.findChild(QToolButton, f"more_{resource.id}")
+            self.assertIsNotNone(more_button)
+            assert more_button is not None
+            menu = more_button.menu()
+            self.assertIsNotNone(menu)
+            assert menu is not None
             delete_action = next(
-                action for action in more_button.menu().actions() if action.text() == "删除资源"
+                action for action in menu.actions() if action.text() == "删除资源"
             )
 
             with patch.object(

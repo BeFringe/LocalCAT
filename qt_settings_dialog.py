@@ -152,6 +152,7 @@ class QtSettingsDialog(QDialog):
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.new_resource_button: QPushButton
         self.controller = controller
         self.setObjectName("settingsDialog")
         self.setWindowTitle("LocalCAT · 语言资源设置")
@@ -214,6 +215,7 @@ class QtSettingsDialog(QDialog):
         new_button = QPushButton("＋ 新建资源")
         new_button.setObjectName("newResourceButton")
         new_button.clicked.connect(self._prompt_create_resource)
+        self.new_resource_button = new_button
         intro_row.addWidget(new_button)
         content_layout.addLayout(intro_row)
 
@@ -564,7 +566,7 @@ class QtSettingsDialog(QDialog):
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
         self.active_table.setEnabled(not busy)
         self.inactive_table.setEnabled(not busy)
-        self.findChild(QPushButton, "newResourceButton").setEnabled(not busy)
+        self.new_resource_button.setEnabled(not busy)
         self.close_button.setEnabled(not busy)
         self.import_progress.setVisible(busy)
         if message:
