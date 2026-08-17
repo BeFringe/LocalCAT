@@ -1,25 +1,33 @@
 from __future__ import annotations
 
+from collections import Counter
 import os
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QEvent, QModelIndex, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QPainter, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QHeaderView,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionComboBox,
+    QStyleOptionViewItem,
     QToolButton,
 )
 
@@ -32,7 +40,10 @@ from resource_repository import ResourceRepository
 class QtSettingsDialogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        application = QApplication.instance()
+        cls.app = (
+            application if isinstance(application, QApplication) else QApplication([])
+        )
 
     def _controller(self, root: Path) -> EditorController:
         repository = ResourceRepository(root / "app-data")
@@ -123,6 +134,261 @@ class QtSettingsDialogTest(unittest.TestCase):
             self.assertIs(terms.kind, ResourceKind.TERMBASE)
             self.assertEqual(terms.path.suffix, ".csv")
             dialog.close()
+
+    def test_new_resource_kind_combo_renders_readable_popup_states(self) -> None:
+        hostile_palette = QPalette(self.app.palette())
+        for role, color in (
+            (QPalette.ColorRole.Text, QColor("#ffffff")),
+            (QPalette.ColorRole.ButtonText, QColor("#ffffff")),
+            (QPalette.ColorRole.Base, QColor("#ffffff")),
+            (QPalette.ColorRole.Button, QColor("#ffffff")),
+            (QPalette.ColorRole.Highlight, QColor("#f4f6f8")),
+            (QPalette.ColorRole.HighlightedText, QColor("#ffffff")),
+        ):
+            hostile_palette.setColor(role, color)
+
+        original_palette = QPalette(self.app.palette())
+        rendered: dict[str, object] = {}
+        try:
+            self.app.setPalette(hostile_palette)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                controller = self._controller(Path(temp_dir))
+                dialog = QtSettingsDialog(controller)
+
+                def capture_prompt(prompt: QDialog) -> QDialog.DialogCode:
+                    kind_input = prompt.findChild(QComboBox)
+                    self.assertIsNotNone(kind_input)
+                    assert kind_input is not None
+                    prompt.show()
+                    kind_input.resize(240, 36)
+                    closed_image = kind_input.grab().toImage()
+                    closed_option = QStyleOptionComboBox()
+                    closed_option.initFrom(kind_input)
+                    closed_option.currentText = kind_input.currentText()
+                    closed_option.rect = kind_input.rect()
+                    closed_text_rect = kind_input.style().subControlRect(
+                        QStyle.ComplexControl.CC_ComboBox,
+                        closed_option,
+                        QStyle.SubControl.SC_ComboBoxEditField,
+                        kind_input,
+                    )
+                    rendered["closed"] = (
+                        closed_image,
+                        self._to_device_rect(closed_image, closed_text_rect),
+                    )
+                    kind_input.showPopup()
+                    self.app.processEvents()
+                    popup = kind_input.view()
+
+                    rendered["combo"] = kind_input
+                    rendered["popup"] = popup
+                    rendered["data"] = tuple(
+                        kind_input.itemData(index) for index in range(kind_input.count())
+                    )
+                    states = (
+                        QStyle.StateFlag.State_Enabled,
+                        QStyle.StateFlag.State_Enabled
+                        | QStyle.StateFlag.State_MouseOver,
+                        QStyle.StateFlag.State_Enabled
+                        | QStyle.StateFlag.State_Selected,
+                    )
+                    rendered["states"] = tuple(
+                        self._render_popup_item(
+                            popup,
+                            kind_input.model().index(row, 0),
+                            state,
+                        )
+                        for row in range(kind_input.count())
+                        for state in states
+                    )
+                    kind_input.hidePopup()
+                    prompt.close()
+                    return QDialog.DialogCode.Rejected
+
+                with patch.object(QDialog, "exec", new=capture_prompt):
+                    dialog._prompt_create_resource()
+
+                kind_input = rendered["combo"]
+                popup = rendered["popup"]
+                assert isinstance(kind_input, QComboBox)
+                assert isinstance(popup, QAbstractItemView)
+                self.assertEqual(kind_input.objectName(), "newResourceKind")
+                self.assertEqual(kind_input.accessibleName(), "资源类型")
+                self.assertEqual(popup.objectName(), "newResourceKindPopup")
+                self.assertEqual(
+                    rendered["data"],
+                    (
+                        ResourceKind.TRANSLATION_MEMORY.value,
+                        ResourceKind.TERMBASE.value,
+                    ),
+                )
+                self.assertGreaterEqual(
+                    self._contrast_ratio(
+                        kind_input.palette().color(QPalette.ColorRole.Text),
+                        kind_input.palette().color(QPalette.ColorRole.Base),
+                    ),
+                    4.5,
+                )
+                closed_image, closed_text_rect = cast(
+                    tuple[QImage, QRect], rendered["closed"]
+                )
+                closed_background = self._dominant_background_outside(
+                    closed_image,
+                    closed_text_rect,
+                )
+                self.assertTrue(
+                    self._has_readable_glyph_population(
+                        closed_image,
+                        closed_text_rect,
+                        closed_background,
+                    )
+                )
+                self.assertGreaterEqual(
+                    self._contrast_ratio(
+                        popup.palette().color(QPalette.ColorRole.Text),
+                        popup.palette().color(QPalette.ColorRole.Base),
+                    ),
+                    4.5,
+                )
+                self.assertGreaterEqual(
+                    self._contrast_ratio(
+                        popup.palette().color(QPalette.ColorRole.HighlightedText),
+                        popup.palette().color(QPalette.ColorRole.Highlight),
+                    ),
+                    4.5,
+                )
+
+                state_images = rendered["states"]
+                assert isinstance(state_images, tuple)
+                self.assertTrue(
+                    all(
+                        isinstance(image, QImage) and isinstance(text_rect, QRect)
+                        for image, text_rect in state_images
+                    )
+                )
+                backgrounds = tuple(
+                    self._dominant_background_outside(image, text_rect)
+                    for image, text_rect in state_images
+                )
+                self.assertEqual(len(backgrounds), 6)
+                self.assertEqual(
+                    len({color.name() for color in backgrounds[:3]}),
+                    3,
+                )
+                self.assertEqual(
+                    len({color.name() for color in backgrounds[3:]}),
+                    3,
+                )
+                for (image, text_rect), background in zip(state_images, backgrounds):
+                    self.assertTrue(
+                        self._has_readable_glyph_population(
+                            image,
+                            text_rect,
+                            background,
+                        )
+                    )
+                dialog.close()
+        finally:
+            self.app.setPalette(original_palette)
+
+    def test_contrast_oracle_rejects_one_dark_artifact(self) -> None:
+        image = QImage(120, 32, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor("#ffffff"))
+        text_rect = QRect(8, 4, 84, 24)
+        image.setPixelColor(text_rect.center(), QColor("#10243b"))
+        background = self._dominant_background_outside(image, text_rect)
+
+        self.assertFalse(
+            self._has_readable_glyph_population(image, text_rect, background)
+        )
+
+    @staticmethod
+    def _render_popup_item(
+        popup: QAbstractItemView,
+        index: QModelIndex,
+        state: QStyle.StateFlag,
+    ) -> tuple[QImage, QRect]:
+        image = QImage(240, 36, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(popup.palette().color(QPalette.ColorRole.Base))
+        option = QStyleOptionViewItem()
+        option.initFrom(popup)
+        delegate = popup.itemDelegateForIndex(index)
+        if not isinstance(delegate, QStyledItemDelegate):
+            raise AssertionError("resource kind popup must use QStyledItemDelegate")
+        delegate.initStyleOption(option, index)
+        option.rect = QRect(0, 0, image.width(), image.height())
+        option.state = state
+        option.widget = popup
+        text_rect = popup.style().subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText,
+            option,
+            popup,
+        ).intersected(image.rect())
+        painter = QPainter(image)
+        try:
+            delegate.paint(painter, option, index)
+        finally:
+            painter.end()
+        return image, text_rect
+
+    @staticmethod
+    def _to_device_rect(image: QImage, logical_rect: QRect) -> QRect:
+        ratio = image.devicePixelRatio()
+        return QRect(
+            round(logical_rect.x() * ratio),
+            round(logical_rect.y() * ratio),
+            round(logical_rect.width() * ratio),
+            round(logical_rect.height() * ratio),
+        ).intersected(image.rect())
+
+    @staticmethod
+    def _dominant_background_outside(image: QImage, text_rect: QRect) -> QColor:
+        protected_text = text_rect.adjusted(-1, -1, 1, 1)
+        rgba_values = (
+            image.pixelColor(x, y).rgba()
+            for y in range(3, image.height() - 3)
+            for x in range(3, image.width() - 3)
+            if not protected_text.contains(x, y)
+        )
+        counts = Counter(rgba_values)
+        if not counts:
+            raise AssertionError("no rendered background exists outside the text rect")
+        return QColor.fromRgba(counts.most_common(1)[0][0])
+
+    @classmethod
+    def _has_readable_glyph_population(
+        cls,
+        image: QImage,
+        text_rect: QRect,
+        background: QColor,
+    ) -> bool:
+        sample_rect = text_rect.intersected(image.rect()).adjusted(1, 1, -1, -1)
+        glyph_pixels = tuple(
+            (x, y)
+            for y in range(sample_rect.top(), sample_rect.bottom() + 1)
+            for x in range(sample_rect.left(), sample_rect.right() + 1)
+            if cls._contrast_ratio(image.pixelColor(x, y), background) >= 4.5
+        )
+        if len(glyph_pixels) < 10:
+            return False
+        x_values = tuple(x for x, _y in glyph_pixels)
+        y_values = tuple(y for _x, y in glyph_pixels)
+        return max(x_values) - min(x_values) >= 6 and max(y_values) - min(y_values) >= 4
+
+    @staticmethod
+    def _contrast_ratio(first: QColor, second: QColor) -> float:
+        def luminance(color: QColor) -> float:
+            channels = (color.redF(), color.greenF(), color.blueF())
+            linear = tuple(
+                channel / 12.92
+                if channel <= 0.04045
+                else ((channel + 0.055) / 1.055) ** 2.4
+                for channel in channels
+            )
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+        lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+        return (lighter + 0.05) / (darker + 0.05)
 
     def test_resource_columns_preserve_chinese_actions_and_share_extra_width(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

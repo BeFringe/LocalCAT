@@ -286,7 +286,7 @@
   - _Requirements: 3.3, 3.4, 8.6_
   - _Boundary: QtEditorWindow Editing Workflow_
 
-- [ ] 11.2 修复新建资源类型选择框的正常与悬停对比度
+- [x] 11.2 修复新建资源类型选择框的正常与悬停对比度
   - 为新建资源 `QComboBox` 的关闭状态、popup 普通项、悬停项和选中项定义明确且相互可辨的前景与背景
   - 保持翻译记忆库、术语表的 `currentData()` 及创建语义不变，不把视觉修复扩展为资源类型或持久化改造
   - 使用真实 popup view 的 palette/render 结果验证两种资源文字在普通、悬停和选中状态均可读，不只断言 stylesheet 字符串
@@ -315,3 +315,4 @@
 
 - Cluster base：`2df687055c43839a726d2a98f0ed73b72c4a7129`。
 - Task 11.1：macOS 主 Return、keypad Enter、物理 Control + Return 与 Option 导航均以真实 Qt 键事件通过；Qt editor 定向套件 35/35 通过。`qt_editor_window.py` 的 changed-file basedpyright 在 base/当前均有 42 个既存诊断，本任务未增加；最终零诊断门由 Task 11.4 闭合。
+- Task 11.2：新建资源类型的 closed/popup normal/hover/selected 六态在 offscreen 与 macOS Cocoa 通过真实渲染对比度验收；单深色像素对抗图被 oracle 拒绝。`qt_settings_dialog.py` 的 basedpyright 在 base/当前均有 31 个既存诊断，最终零诊断门由 Task 11.4 闭合。

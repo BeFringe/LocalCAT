@@ -66,6 +66,36 @@ QToolButton::menu-indicator {
     height: 0;
 }
 """
+_RESOURCE_KIND_COMBO_STYLE = """
+QComboBox#newResourceKind {
+    color: #1f3850;
+    background-color: #ffffff;
+}
+"""
+_RESOURCE_KIND_POPUP_STYLE = """
+QAbstractItemView#newResourceKindPopup {
+    color: #1f3850;
+    background-color: #ffffff;
+    selection-color: #0b304c;
+    selection-background-color: #c4e8f2;
+    border: 1px solid #9fb5c8;
+    outline: 0;
+}
+QAbstractItemView#newResourceKindPopup::item {
+    color: #1f3850;
+    background-color: #ffffff;
+    min-height: 30px;
+    padding: 2px 8px;
+}
+QAbstractItemView#newResourceKindPopup::item:hover {
+    color: #16344e;
+    background-color: #e7f4f8;
+}
+QAbstractItemView#newResourceKindPopup::item:selected {
+    color: #0b304c;
+    background-color: #c4e8f2;
+}
+"""
 
 
 class _ResourceMoreButton(QToolButton):
@@ -410,8 +440,15 @@ class QtSettingsDialog(QDialog):
         layout.addWidget(name_input)
         layout.addWidget(QLabel("资源类型"))
         kind_input = QComboBox()
+        kind_input.setObjectName("newResourceKind")
+        kind_input.setAccessibleName("资源类型")
         kind_input.addItem("翻译记忆库", ResourceKind.TRANSLATION_MEMORY)
         kind_input.addItem("术语表", ResourceKind.TERMBASE)
+        kind_input.setStyleSheet(_RESOURCE_KIND_COMBO_STYLE)
+        kind_input.view().setObjectName("newResourceKindPopup")
+        kind_input.view().setAccessibleName("资源类型选项")
+        kind_input.view().setStyleSheet(_RESOURCE_KIND_POPUP_STYLE)
+        kind_input.view().setItemDelegate(QStyledItemDelegate(kind_input.view()))
         layout.addWidget(kind_input)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
