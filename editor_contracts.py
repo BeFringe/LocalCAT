@@ -4,13 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
+import math
 from pathlib import Path
+import re
+from typing import Any, Mapping
+
+from tm_contracts import TMMatchType, TextMatcherState, TextMatchProfile
 
 
 DEFAULT_EDITOR_FONT_SIZE = 15
 MIN_EDITOR_FONT_SIZE = 10
 MAX_EDITOR_FONT_SIZE = 28
 EDITOR_FONT_SIZE_STEP = 1
+EDITOR_TM_CONTRACT_CODEC_VERSION = 1
+
+_SAFE_DIAGNOSTIC_CODE = re.compile(
+    r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\Z"
+)
+_LOWER_SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_CANONICAL_RECORD_ID = re.compile(r"canonical:[1-9][0-9]*\Z")
+_LEGACY_RECORD_ID = re.compile(r"legacy:[0-9a-f]{64}\Z")
 
 
 class ResourceKind(str, Enum):
@@ -57,11 +71,71 @@ class TermCommitState(str, Enum):
     INDETERMINATE = "indeterminate"
 
 
+class TMResourceDisplayMode(str, Enum):
+    """Non-authoritative UI projection of one TM resource lifecycle."""
+
+    LEGACY_EXACT_ONLY = "LEGACY_EXACT_ONLY"
+    ACTIVATING = "ACTIVATING"
+    CANONICAL_ACTIVE = "CANONICAL_ACTIVE"
+    SOURCE_DIVERGED = "SOURCE_DIVERGED"
+    DEGRADED = "DEGRADED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 def _validate_non_empty_string(value: object, field_name: str) -> None:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
     if not value.strip():
         raise ValueError(f"{field_name} must not be empty")
+
+
+def _validate_exact_non_empty_string(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be an exact string")
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be empty")
+
+
+def _validate_exact_raw_text(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be an exact string")
+    if value == "":
+        raise ValueError(f"{field_name} must not be empty")
+
+
+def _validate_lower_sha256_digest(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be an exact string")
+    if _LOWER_SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+
+
+def _validate_exact_nonnegative_int(value: object, field_name: str) -> None:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an exact integer")
+    if value < 0:
+        raise ValueError(f"{field_name} must not be negative")
+
+
+def _validate_exact_bool(value: object, field_name: str) -> None:
+    if type(value) is not bool:
+        raise TypeError(f"{field_name} must be an exact boolean")
+
+
+def _validate_safe_code(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be an exact string")
+    if len(value) > 96 or _SAFE_DIAGNOSTIC_CODE.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a safe diagnostic code")
+
+
+def _validate_safe_codes(value: object, field_name: str) -> None:
+    if type(value) is not tuple:
+        raise TypeError(f"{field_name} must be an exact tuple")
+    for code in value:
+        _validate_safe_code(code, f"{field_name} item")
+    if len(value) != len(set(value)):
+        raise ValueError(f"{field_name} must not contain duplicates")
 
 
 def _validate_sha256_digest(value: object, field_name: str) -> None:
@@ -636,9 +710,293 @@ class ResourceConfig:
             raise ValueError("resource path must be absolute")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class SuggestionQueryIdentity:
+    """Current-segment identity captured when a TM query is issued.
+
+    ``query_epoch`` is the Controller-owned aggregate epoch.  A resource,
+    capability, threshold, project, segment, or source change advances that
+    one value; the underlying runtime generations remain application-private.
+    """
+
+    project_session_id: str
+    segment_id: str
+    source_digest: str
+    query_epoch: int
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.project_session_id,
+            "suggestion project session id",
+        )
+        _validate_exact_non_empty_string(
+            self.segment_id,
+            "suggestion segment id",
+        )
+        _validate_lower_sha256_digest(
+            self.source_digest,
+            "suggestion source digest",
+        )
+        _validate_exact_nonnegative_int(
+            self.query_epoch,
+            "suggestion query epoch",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TMSuggestionProvenance:
+    """Body-free resource display facts attached to one TM suggestion."""
+
+    resource_name: str
+    resource_mode: TMResourceDisplayMode
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.resource_name,
+            "TM suggestion resource name",
+        )
+        if type(self.resource_mode) is not TMResourceDisplayMode:
+            raise TypeError(
+                "TM suggestion resource mode must be TMResourceDisplayMode"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class TMSuggestion:
-    """An exact translation-memory suggestion with resource provenance."""
+    """Safe UI projection of one Core or legacy TM result.
+
+    Match category and score remain owned by Feature 5 Core.  This projection
+    deliberately omits evidence, folds, candidate proof, intermediate scorer
+    values, paths, and mutable collections.
+    """
+
+    resource_id: str
+    record_id: str
+    query_source: str
+    matched_source: str
+    target: str
+    match_type: TMMatchType
+    final_similarity: float
+    provenance: TMSuggestionProvenance
+    query_identity: SuggestionQueryIdentity
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.resource_id,
+            "TM suggestion resource id",
+        )
+        if type(self.record_id) is not str:
+            raise TypeError("TM suggestion record id must be an exact string")
+        canonical_record = _CANONICAL_RECORD_ID.fullmatch(self.record_id) is not None
+        legacy_record = _LEGACY_RECORD_ID.fullmatch(self.record_id) is not None
+        if not canonical_record and not legacy_record:
+            raise ValueError("TM suggestion record id has an unsupported shape")
+        for field_name, value in (
+            ("query source", self.query_source),
+            ("matched source", self.matched_source),
+            ("target", self.target),
+        ):
+            _validate_exact_raw_text(
+                value,
+                f"TM suggestion {field_name}",
+            )
+        if type(self.match_type) is not TMMatchType:
+            raise TypeError("TM suggestion match type must be TMMatchType")
+        if type(self.final_similarity) is not float:
+            raise TypeError("TM suggestion final similarity must be an exact float")
+        if not math.isfinite(self.final_similarity) or not (
+            0.0 <= self.final_similarity <= 1.0
+        ):
+            raise ValueError(
+                "TM suggestion final similarity must be finite and between 0 and 1"
+            )
+        if type(self.provenance) is not TMSuggestionProvenance:
+            raise TypeError(
+                "TM suggestion provenance must be TMSuggestionProvenance"
+            )
+        if type(self.query_identity) is not SuggestionQueryIdentity:
+            raise TypeError(
+                "TM suggestion query identity must be SuggestionQueryIdentity"
+            )
+
+        if self.match_type is TMMatchType.FUZZY:
+            if self.query_source == self.matched_source:
+                raise ValueError(
+                    "fuzzy TM suggestion must expose a distinct matched source"
+                )
+            if not canonical_record:
+                raise ValueError("fuzzy TM suggestion must use a canonical record id")
+            if self.provenance.resource_mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+                raise ValueError("legacy exact-only resources cannot produce fuzzy")
+        else:
+            if self.final_similarity != 1.0:
+                raise ValueError(
+                    f"{self.match_type.value} TM suggestion similarity must be 1.0"
+                )
+            if self.query_source != self.matched_source:
+                raise ValueError(
+                    f"{self.match_type.value} TM suggestion sources must be identical"
+                )
+        if self.provenance.resource_mode is TMResourceDisplayMode.UNAVAILABLE:
+            raise ValueError("unavailable resources cannot produce suggestions")
+        if legacy_record:
+            if self.match_type is not TMMatchType.EXACT:
+                raise ValueError("legacy TM records can only produce exact suggestions")
+            if self.provenance.resource_mode not in (
+                TMResourceDisplayMode.LEGACY_EXACT_ONLY,
+                TMResourceDisplayMode.ACTIVATING,
+            ):
+                raise ValueError(
+                    "legacy TM record id requires legacy or activating provenance"
+                )
+        if self.provenance.resource_mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            if not legacy_record or self.match_type is not TMMatchType.EXACT:
+                raise ValueError(
+                    "legacy exact-only provenance requires a legacy exact record"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class TMResourceStatus:
+    """Safe display projection for one configured TM resource."""
+
+    resource_id: str
+    resource_name: str
+    mode: TMResourceDisplayMode
+    exact_available: bool
+    context_available: bool
+    fuzzy_available: bool
+    safe_codes: tuple[str, ...]
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.resource_id,
+            "TM resource status id",
+        )
+        _validate_exact_non_empty_string(
+            self.resource_name,
+            "TM resource status name",
+        )
+        if type(self.mode) is not TMResourceDisplayMode:
+            raise TypeError("TM resource status mode must be TMResourceDisplayMode")
+        for field_name, value in (
+            ("exact available", self.exact_available),
+            ("context available", self.context_available),
+            ("fuzzy available", self.fuzzy_available),
+            ("retryable", self.retryable),
+        ):
+            _validate_exact_bool(value, f"TM resource status {field_name}")
+        _validate_safe_codes(self.safe_codes, "TM resource status safe codes")
+        if self.retryable and not self.safe_codes:
+            raise ValueError("retryable TM resource status requires a safe code")
+        if (self.context_available or self.fuzzy_available) and not self.exact_available:
+            raise ValueError(
+                "advanced TM availability requires canonical exact availability"
+            )
+        if self.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            if not self.exact_available or self.context_available or self.fuzzy_available:
+                raise ValueError(
+                    "legacy exact-only status must expose exact and close advanced matches"
+                )
+        if self.mode is TMResourceDisplayMode.UNAVAILABLE:
+            if self.exact_available or self.context_available or self.fuzzy_available:
+                raise ValueError("unavailable TM resource cannot expose match capability")
+            if not self.safe_codes:
+                raise ValueError("unavailable TM resource requires a safe code")
+        if self.mode in (
+            TMResourceDisplayMode.DEGRADED,
+            TMResourceDisplayMode.SOURCE_DIVERGED,
+        ) and not self.safe_codes:
+            raise ValueError("degraded or diverged TM resource requires a safe code")
+        if self.mode in (
+            TMResourceDisplayMode.CANONICAL_ACTIVE,
+            TMResourceDisplayMode.SOURCE_DIVERGED,
+        ) and not self.exact_available:
+            raise ValueError("canonical TM resource must retain exact availability")
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalDisplayState:
+    """Non-authoritative safe projection of Core retrieval availability."""
+
+    context_available: bool
+    fuzzy_available: bool
+    safe_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _validate_exact_bool(
+            self.context_available,
+            "retrieval context available",
+        )
+        _validate_exact_bool(
+            self.fuzzy_available,
+            "retrieval fuzzy available",
+        )
+        _validate_safe_codes(self.safe_codes, "retrieval safe codes")
+        if (
+            not self.context_available or not self.fuzzy_available
+        ) and not self.safe_codes:
+            raise ValueError(
+                "closed retrieval availability requires at least one safe code"
+            )
+
+
+_BASIC_DISPLAY_PROFILES = (
+    TextMatchProfile.LEGACY_COMPAT,
+    TextMatchProfile.BASIC_CONTIGUOUS,
+)
+_TEXT_V1_DISPLAY_PROFILES = (
+    TextMatchProfile.LEGACY_COMPAT,
+    TextMatchProfile.BASIC_CONTIGUOUS,
+    TextMatchProfile.CONFIGURABLE_TEXT_V1,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TextMatcherDisplayState:
+    """One-way display projection of the Core matcher authority."""
+
+    state: TextMatcherState
+    supported_profiles: tuple[TextMatchProfile, ...]
+    safe_reason: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not TextMatcherState:
+            raise TypeError("matcher display state must be TextMatcherState")
+        if type(self.supported_profiles) is not tuple:
+            raise TypeError("matcher display supported profiles must be an exact tuple")
+        if any(type(profile) is not TextMatchProfile for profile in self.supported_profiles):
+            raise TypeError(
+                "matcher display profiles must contain TextMatchProfile values"
+            )
+        if self.state is TextMatcherState.UNAVAILABLE:
+            expected_profiles: tuple[TextMatchProfile, ...] = ()
+            if self.safe_reason is None:
+                raise ValueError("unavailable matcher display requires a safe reason")
+            _validate_safe_code(self.safe_reason, "matcher display safe reason")
+        elif self.state is TextMatcherState.BASIC_VALIDATED:
+            expected_profiles = _BASIC_DISPLAY_PROFILES
+            if self.safe_reason is not None:
+                raise ValueError("available matcher display must omit safe reason")
+        else:
+            expected_profiles = _TEXT_V1_DISPLAY_PROFILES
+            if self.safe_reason is not None:
+                raise ValueError("available matcher display must omit safe reason")
+        if self.supported_profiles != expected_profiles:
+            raise ValueError(
+                "matcher display profiles must exactly match the Core state"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyExactTMSuggestion:
+    """Temporary explicit bridge for the pre-integration exact-only UI.
+
+    This type is not accepted by the new strict UI contract codec.  It keeps
+    existing consumers honest until the Controller adapter starts issuing the
+    double-source ``TMSuggestion`` contract.
+    """
 
     source: str
     target: str
@@ -648,12 +1006,29 @@ class TMSuggestion:
     match_type: str = "EXACT"
 
     def __post_init__(self) -> None:
-        if not self.source or not self.target:
-            raise ValueError("TM suggestion source and target must not be empty")
-        if not self.resource_id or not self.resource_name:
-            raise ValueError("TM suggestion resource provenance must not be empty")
-        if not 0.0 <= self.similarity <= 1.0:
-            raise ValueError("TM suggestion similarity must be between 0 and 1")
+        for field_name, value in (
+            ("source", self.source),
+            ("target", self.target),
+            ("resource id", self.resource_id),
+            ("resource name", self.resource_name),
+        ):
+            validator = (
+                _validate_exact_raw_text
+                if field_name in ("source", "target")
+                else _validate_exact_non_empty_string
+            )
+            validator(
+                value,
+                f"legacy TM suggestion {field_name}",
+            )
+        if type(self.similarity) is not float:
+            raise TypeError("legacy TM suggestion similarity must be an exact float")
+        if not math.isfinite(self.similarity) or self.similarity != 1.0:
+            raise ValueError("legacy TM suggestion similarity must be 1.0")
+        if type(self.match_type) is not str:
+            raise TypeError("legacy TM suggestion match type must be an exact string")
+        if self.match_type != "EXACT":
+            raise ValueError("legacy TM suggestion match type must be EXACT")
 
 
 @dataclass(frozen=True)
@@ -681,12 +1056,321 @@ class TermSuggestion:
 class SuggestionBundle:
     """TM and termbase results for the same active segment."""
 
-    tm_matches: tuple[TMSuggestion, ...] = ()
+    tm_matches: tuple[LegacyExactTMSuggestion, ...] = ()
     terms: tuple[TermSuggestion, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.tm_matches, tuple) or not isinstance(self.terms, tuple):
             raise TypeError("suggestion collections must be tuples")
+        if not all(
+            type(suggestion) is LegacyExactTMSuggestion
+            for suggestion in self.tm_matches
+        ):
+            raise TypeError(
+                "legacy suggestion bundle must contain LegacyExactTMSuggestion values"
+            )
+
+
+type EditorTMContract = (
+    SuggestionQueryIdentity
+    | TMSuggestionProvenance
+    | TMSuggestion
+    | TMResourceStatus
+    | RetrievalDisplayState
+    | TextMatcherDisplayState
+)
+
+
+def _editor_tm_contract_payload(
+    contract: EditorTMContract,
+) -> tuple[str, dict[str, Any]]:
+    if type(contract) is SuggestionQueryIdentity:
+        contract.__post_init__()
+        return "SuggestionQueryIdentity", {
+            "project_session_id": contract.project_session_id,
+            "query_epoch": contract.query_epoch,
+            "segment_id": contract.segment_id,
+            "source_digest": contract.source_digest,
+        }
+    if type(contract) is TMSuggestionProvenance:
+        contract.__post_init__()
+        return "TMSuggestionProvenance", {
+            "resource_mode": contract.resource_mode.value,
+            "resource_name": contract.resource_name,
+        }
+    if type(contract) is TMSuggestion:
+        contract.__post_init__()
+        _, identity_payload = _editor_tm_contract_payload(
+            contract.query_identity
+        )
+        _, provenance_payload = _editor_tm_contract_payload(
+            contract.provenance
+        )
+        return "TMSuggestion", {
+            "final_similarity": contract.final_similarity,
+            "match_type": contract.match_type.value,
+            "matched_source": contract.matched_source,
+            "provenance": provenance_payload,
+            "query_identity": identity_payload,
+            "query_source": contract.query_source,
+            "record_id": contract.record_id,
+            "resource_id": contract.resource_id,
+            "target": contract.target,
+        }
+    if type(contract) is TMResourceStatus:
+        contract.__post_init__()
+        return "TMResourceStatus", {
+            "context_available": contract.context_available,
+            "exact_available": contract.exact_available,
+            "fuzzy_available": contract.fuzzy_available,
+            "mode": contract.mode.value,
+            "resource_id": contract.resource_id,
+            "resource_name": contract.resource_name,
+            "retryable": contract.retryable,
+            "safe_codes": list(contract.safe_codes),
+        }
+    if type(contract) is RetrievalDisplayState:
+        contract.__post_init__()
+        return "RetrievalDisplayState", {
+            "context_available": contract.context_available,
+            "fuzzy_available": contract.fuzzy_available,
+            "safe_codes": list(contract.safe_codes),
+        }
+    if type(contract) is TextMatcherDisplayState:
+        contract.__post_init__()
+        return "TextMatcherDisplayState", {
+            "safe_reason": contract.safe_reason,
+            "state": contract.state.value,
+            "supported_profiles": [
+                profile.value for profile in contract.supported_profiles
+            ],
+        }
+    raise TypeError(
+        f"unsupported editor TM contract type: {type(contract).__name__}"
+    )
+
+
+def editor_tm_contract_to_json(contract: EditorTMContract) -> str:
+    """Encode one safe UI contract into deterministic versioned JSON."""
+
+    contract_type, payload = _editor_tm_contract_payload(contract)
+    return json.dumps(
+        {
+            "contract_type": contract_type,
+            "contract_version": EDITOR_TM_CONTRACT_CODEC_VERSION,
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _editor_tm_mapping(value: object) -> Mapping[str, Any]:
+    if type(value) is not dict:
+        raise ValueError("editor TM contract value must be a JSON object")
+    if any(type(key) is not str for key in value):
+        raise ValueError("editor TM contract object keys must be strings")
+    return value
+
+
+def _editor_tm_strict_fields(
+    value: object,
+    expected_fields: tuple[str, ...],
+) -> Mapping[str, Any]:
+    mapping = _editor_tm_mapping(value)
+    if set(mapping) != set(expected_fields):
+        raise ValueError("editor TM contract fields do not match the schema")
+    return mapping
+
+
+def _editor_tm_string_tuple(value: object) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise ValueError("editor TM contract tuple must be a JSON array")
+    if any(type(item) is not str for item in value):
+        raise ValueError("editor TM contract tuple values must be strings")
+    return tuple(value)
+
+
+def _decode_suggestion_query_identity(value: object) -> SuggestionQueryIdentity:
+    payload = _editor_tm_strict_fields(
+        value,
+        (
+            "project_session_id",
+            "query_epoch",
+            "segment_id",
+            "source_digest",
+        ),
+    )
+    return SuggestionQueryIdentity(
+        project_session_id=payload["project_session_id"],
+        segment_id=payload["segment_id"],
+        source_digest=payload["source_digest"],
+        query_epoch=payload["query_epoch"],
+    )
+
+
+def _decode_tm_suggestion_provenance(value: object) -> TMSuggestionProvenance:
+    payload = _editor_tm_strict_fields(
+        value,
+        ("resource_mode", "resource_name"),
+    )
+    return TMSuggestionProvenance(
+        resource_name=payload["resource_name"],
+        resource_mode=TMResourceDisplayMode(payload["resource_mode"]),
+    )
+
+
+def _decode_tm_suggestion(value: object) -> TMSuggestion:
+    payload = _editor_tm_strict_fields(
+        value,
+        (
+            "final_similarity",
+            "match_type",
+            "matched_source",
+            "provenance",
+            "query_identity",
+            "query_source",
+            "record_id",
+            "resource_id",
+            "target",
+        ),
+    )
+    return TMSuggestion(
+        resource_id=payload["resource_id"],
+        record_id=payload["record_id"],
+        query_source=payload["query_source"],
+        matched_source=payload["matched_source"],
+        target=payload["target"],
+        match_type=TMMatchType(payload["match_type"]),
+        final_similarity=payload["final_similarity"],
+        provenance=_decode_tm_suggestion_provenance(payload["provenance"]),
+        query_identity=_decode_suggestion_query_identity(
+            payload["query_identity"]
+        ),
+    )
+
+
+def _decode_tm_resource_status(value: object) -> TMResourceStatus:
+    payload = _editor_tm_strict_fields(
+        value,
+        (
+            "context_available",
+            "exact_available",
+            "fuzzy_available",
+            "mode",
+            "resource_id",
+            "resource_name",
+            "retryable",
+            "safe_codes",
+        ),
+    )
+    return TMResourceStatus(
+        resource_id=payload["resource_id"],
+        resource_name=payload["resource_name"],
+        mode=TMResourceDisplayMode(payload["mode"]),
+        exact_available=payload["exact_available"],
+        context_available=payload["context_available"],
+        fuzzy_available=payload["fuzzy_available"],
+        safe_codes=_editor_tm_string_tuple(payload["safe_codes"]),
+        retryable=payload["retryable"],
+    )
+
+
+def _decode_retrieval_display_state(value: object) -> RetrievalDisplayState:
+    payload = _editor_tm_strict_fields(
+        value,
+        ("context_available", "fuzzy_available", "safe_codes"),
+    )
+    return RetrievalDisplayState(
+        context_available=payload["context_available"],
+        fuzzy_available=payload["fuzzy_available"],
+        safe_codes=_editor_tm_string_tuple(payload["safe_codes"]),
+    )
+
+
+def _decode_text_matcher_display_state(value: object) -> TextMatcherDisplayState:
+    payload = _editor_tm_strict_fields(
+        value,
+        ("safe_reason", "state", "supported_profiles"),
+    )
+    profiles = _editor_tm_string_tuple(payload["supported_profiles"])
+    return TextMatcherDisplayState(
+        state=TextMatcherState(payload["state"]),
+        supported_profiles=tuple(TextMatchProfile(profile) for profile in profiles),
+        safe_reason=payload["safe_reason"],
+    )
+
+
+def _decode_editor_tm_contract(
+    contract_type: object,
+    payload: object,
+) -> EditorTMContract:
+    if type(contract_type) is not str:
+        raise ValueError("editor TM contract type must be a string")
+    decoders = {
+        "SuggestionQueryIdentity": _decode_suggestion_query_identity,
+        "TMSuggestionProvenance": _decode_tm_suggestion_provenance,
+        "TMSuggestion": _decode_tm_suggestion,
+        "TMResourceStatus": _decode_tm_resource_status,
+        "RetrievalDisplayState": _decode_retrieval_display_state,
+        "TextMatcherDisplayState": _decode_text_matcher_display_state,
+    }
+    decoder = decoders.get(contract_type)
+    if decoder is None:
+        raise ValueError("unsupported editor TM contract type")
+    return decoder(payload)
+
+
+def editor_tm_contract_from_json(serialized: str) -> EditorTMContract:
+    """Decode a strict UI contract without accepting body-bearing internals."""
+
+    if type(serialized) is not str:
+        raise TypeError("serialized editor TM contract must be an exact string")
+
+    class _DuplicateEditorTMKey(ValueError):
+        pass
+
+    def reject_duplicate_object(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        decoded: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in decoded:
+                raise _DuplicateEditorTMKey
+            decoded[key] = item
+        return decoded
+
+    def reject_non_finite(_value: str) -> None:
+        raise ValueError("non-finite editor TM contract number is not allowed")
+
+    try:
+        value = json.loads(
+            serialized,
+            parse_constant=reject_non_finite,
+            object_pairs_hook=reject_duplicate_object,
+        )
+        envelope = _editor_tm_strict_fields(
+            value,
+            ("contract_type", "contract_version", "payload"),
+        )
+        version = envelope["contract_version"]
+        if type(version) is not int:
+            raise ValueError("editor TM contract version must be an integer")
+        if version != EDITOR_TM_CONTRACT_CODEC_VERSION:
+            raise ValueError("unsupported editor TM contract version")
+        return _decode_editor_tm_contract(
+            envelope["contract_type"],
+            envelope["payload"],
+        )
+    except (
+        json.JSONDecodeError,
+        _DuplicateEditorTMKey,
+        TypeError,
+        ValueError,
+    ):
+        raise ValueError("serialized editor TM contract is invalid") from None
 
 
 @dataclass(frozen=True)

@@ -18,8 +18,8 @@ from editor_contracts import (
     ResourceConfig,
     ResourceKind,
     RecentProject,
+    LegacyExactTMSuggestion,
     SuggestionBundle,
-    TMSuggestion,
     TermSuggestion,
     WriteReport,
 )
@@ -223,7 +223,7 @@ class EditorController:
 
         segment = self.current_segment
         source = segment.source
-        tm_matches: list[TMSuggestion] = []
+        tm_matches: list[LegacyExactTMSuggestion] = []
         terms: list[TermSuggestion] = []
         for resource in self.repository.list_resources():
             if not resource.active or not resource.lookup:
@@ -233,7 +233,7 @@ class EditorController:
                 match = engine.query_exact(source) if engine is not None else None
                 if match is not None:
                     tm_matches.append(
-                        TMSuggestion(
+                        LegacyExactTMSuggestion(
                             source=match.source,
                             target=match.target,
                             resource_id=resource.id,
@@ -256,7 +256,7 @@ class EditorController:
                 )
                 if wrapped is not None and target is not None:
                     tm_matches.append(
-                        TMSuggestion(
+                        LegacyExactTMSuggestion(
                             source=source,
                             target=target,
                             resource_id=resource.id,
@@ -354,10 +354,13 @@ class EditorController:
         except WorkspaceStateError as exc:
             LOGGER.warning("Unable to remember project position: %s", exc)
 
-    def apply_tm_suggestion(self, suggestion: TMSuggestion) -> EditorProject:
+    def apply_tm_suggestion(
+        self,
+        suggestion: LegacyExactTMSuggestion,
+    ) -> EditorProject:
         """Apply one typed TM suggestion without confirming the segment."""
 
-        if not isinstance(suggestion, TMSuggestion):
+        if not isinstance(suggestion, LegacyExactTMSuggestion):
             raise EditorControllerError("a TM suggestion contract is required")
         if suggestion.source != self.current_segment.source:
             raise EditorControllerError("TM suggestion does not belong to the current segment")

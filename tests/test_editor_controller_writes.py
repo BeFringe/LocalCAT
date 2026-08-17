@@ -10,8 +10,8 @@ from pathlib import Path
 from editor_contracts import (
     EditorProject,
     EditorSegment,
+    LegacyExactTMSuggestion,
     ResourceKind,
-    TMSuggestion,
     TermSuggestion,
 )
 from editor_controller import EditorController, EditorControllerError
@@ -100,7 +100,7 @@ class EditorControllerWritesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller, _ = self._session(Path(temp_dir))
             controller.update_target("")
-            tm = TMSuggestion(
+            tm = LegacyExactTMSuggestion(
                 source="The office is ready.",
                 target="办公室准备就绪。",
                 resource_id="tm",

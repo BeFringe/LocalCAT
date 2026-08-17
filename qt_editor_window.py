@@ -58,9 +58,9 @@ from editor_contracts import (
     MIN_EDITOR_FONT_SIZE,
     DisplayPreferences,
     EditorSegment,
+    LegacyExactTMSuggestion,
     SegmentDensity,
     SuggestionBundle,
-    TMSuggestion,
     TermSuggestion,
     WorkspaceMode,
 )
@@ -1405,7 +1405,11 @@ class QtEditorWindow(QMainWindow):
             label.setObjectName(object_name)
         return label
 
-    def _tm_card(self, index: int, suggestion: TMSuggestion) -> QWidget:
+    def _tm_card(
+        self,
+        index: int,
+        suggestion: LegacyExactTMSuggestion,
+    ) -> QWidget:
         card = QFrame()
         card.setObjectName(f"tmCard_{index}")
         card.setProperty("suggestionCard", True)
@@ -1465,7 +1469,7 @@ class QtEditorWindow(QMainWindow):
     def _empty_suggestion(self, message: str) -> QLabel:
         return self._plain_label(message, "emptySuggestion")
 
-    def apply_tm_suggestion(self, suggestion: TMSuggestion) -> bool:
+    def apply_tm_suggestion(self, suggestion: LegacyExactTMSuggestion) -> bool:
         try:
             self.controller.apply_tm_suggestion(suggestion)
         except EditorControllerError as exc:

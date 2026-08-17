@@ -17,6 +17,7 @@ from editor_contracts import (
     EditorSegment,
     ImportReport,
     ImportRequest,
+    LegacyExactTMSuggestion,
     LegacyTermRow,
     PreprocessChange,
     PreprocessPreview,
@@ -24,7 +25,6 @@ from editor_contracts import (
     ResourceConfig,
     ResourceKind,
     SuggestionBundle,
-    TMSuggestion,
     TermCleanupReport,
     TermCommitOutcome,
     TermCommitState,
@@ -59,7 +59,7 @@ class EditorContractsTest(unittest.TestCase):
             kind=ResourceKind.TRANSLATION_MEMORY,
             path=Path("/tmp/main.jsonl"),
         )
-        tm = TMSuggestion(
+        tm = LegacyExactTMSuggestion(
             source="Hello",
             target="你好",
             resource_id=resource.id,
@@ -115,7 +115,7 @@ class EditorContractsTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             EditorProject(name="Demo", segments=[])  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
-            TMSuggestion(
+            LegacyExactTMSuggestion(
                 source="Hello",
                 target="你好",
                 resource_id="tm",
