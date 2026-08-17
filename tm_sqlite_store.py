@@ -58,6 +58,7 @@ from tm_contracts import (
 from tm_content_attestation import (
     ActiveContentAttestation,
     ContentAttestationError,
+    ContentFileProof,
     _capture_content_file,
 )
 
@@ -144,6 +145,7 @@ from tm_activation_journal import (
     _quarantine_owned_activation_artifact,
     _read_activation_file_bytes,
     _read_activation_journal_file,
+    _read_activation_lineage_marker,
     _remove_journal_proven_backups,
     _remove_orphaned_activation_temp,
     _remove_orphaned_rollback_temp,
@@ -1753,11 +1755,187 @@ def _rehydrate_runtime_authority(
         raise
 
 
-def _rehydrate_completed_activation(
+@contextmanager
+def _open_completed_authority_read_connection(
+    database_path: Path,
+) -> Iterator[sqlite3.Connection]:
+    """Open one target DB without locking or SQLite journal recovery.
+
+    ``immutable=1`` is safe only in this completion-only proof: exact SQLite
+    sidecars are rejected before the open and again before in-memory
+    publication, while the canonical DB inode+bytes are captured around all
+    semantic validation.  A sidecar or DB change in either TOCTOU window
+    therefore rejects the proof; SQLite itself is never allowed to recover,
+    delete, or otherwise act on transient rollback/WAL state.
+    """
+
+    _require_absolute_path(database_path, "database_path")
+    if _completed_authority_sqlite_sidecar_present(database_path):
+        raise SQLiteStoreSchemaError("STORE.SQLITE_SIDECAR_PRESENT")
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro&immutable=1",
+        timeout=BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+        uri=True,
+    )
+    try:
+        connection.enable_load_extension(False)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        if _pragma_int(connection, "query_only") != 1:
+            raise SQLiteStoreSchemaError("STORE.QUERY_ONLY_DISABLED")
+        if _pragma_text(connection, "journal_mode").lower() == "wal":
+            raise SQLiteStoreSchemaError("STORE.WAL_FORBIDDEN")
+        yield connection
+    finally:
+        connection.close()
+
+
+def _completed_authority_sqlite_sidecar_present(
+    database_path: Path,
+) -> bool:
+    """Detect exact SQLite rollback/WAL sidecars without opening the DB."""
+
+    return any(
+        _lstat_any_entry(Path(f"{database_path}{suffix}"))
+        for suffix in ("-journal", "-wal", "-shm")
+    )
+
+
+def _inspect_completed_active_schema_read_only(
+    stage: _StoreRuntimeRef,
+    *,
+    canonical_store_id: str,
+    expected_generation: int,
+    expected_activation_digest: str,
+) -> SQLiteSchemaSnapshot:
+    """Validate the active schema without opening the target writable."""
+
+    validated_stage = _require_inspectable_store_ref(stage)
+    _require_identity(canonical_store_id, "canonical_store_id")
+    if not validated_stage.staged_db_path.is_file():
+        raise SQLiteStoreSchemaError("STORE.DATABASE_MISSING")
+    with _open_completed_authority_read_connection(
+        validated_stage.staged_db_path
+    ) as connection:
+        connection.execute("BEGIN")
+        try:
+            meta = _read_meta(connection)
+            schema_version = _meta_int(meta, "schema_version")
+            if schema_version > TM_SCHEMA_VERSION:
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_TOO_NEW")
+            if schema_version != TM_SCHEMA_VERSION:
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_UNSUPPORTED")
+            identity = validated_stage.resource_identity
+            if (
+                meta["resource_id"] != identity.resource_id
+                or meta["canonical_store_id"] != canonical_store_id
+                or meta["target_identity"] != identity.target_identity
+            ):
+                raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+            runtime = detect_sqlite_runtime()
+            _validate_stage_meta(
+                meta,
+                runtime=runtime,
+                allow_diverged_runtime=True,
+                allow_active=True,
+                expected_active_generation=expected_generation,
+                expected_activation_digest=expected_activation_digest,
+            )
+            table_names = _schema_object_names(connection, "table")
+            index_names = _schema_object_names(connection, "index")
+            expected_tables = set(_BASE_TABLES)
+            fts5_available = _meta_bool(meta, "fts5_available")
+            if fts5_available:
+                expected_tables.add("tm_fts")
+            expected_physical_tables = set(expected_tables)
+            if fts5_available:
+                expected_physical_tables.update(_FTS5_SHADOW_TABLES)
+            if not expected_physical_tables.issubset(table_names):
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
+            if table_names != expected_physical_tables:
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
+            if not _BASE_INDEXES.issubset(index_names):
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
+            if index_names != _BASE_INDEXES:
+                raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
+            _validate_schema_object_types(connection)
+            approved_schema_digest = _APPROVED_SCHEMA_DIGESTS[
+                fts5_available
+            ]
+            if (
+                meta["schema_digest"] != approved_schema_digest
+                or _schema_digest(
+                    connection,
+                    fts5_available=fts5_available,
+                    legacy_schema=False,
+                )
+                != approved_schema_digest
+            ):
+                raise SQLiteStoreSchemaError(
+                    "STORE.TABLE_SCHEMA_MISMATCH"
+                )
+            _validate_index_schema(connection, legacy_schema=False)
+            _validate_foreign_key_schema(connection, legacy_schema=False)
+            if fts5_available != runtime.fts5_available:
+                raise SQLiteStoreSchemaError(
+                    "STORE.RUNTIME_CAPABILITY_CHANGED"
+                )
+            if meta["sqlite_runtime_version"] != runtime.sqlite_version:
+                raise SQLiteStoreSchemaError("STORE.SQLITE_RUNTIME_CHANGED")
+            if meta["unicode_runtime_version"] != runtime.unicode_version:
+                raise SQLiteStoreSchemaError(
+                    "STORE.UNICODE_RUNTIME_MISMATCH"
+                )
+            journal_mode = _pragma_text(
+                connection,
+                "journal_mode",
+            ).lower()
+            synchronous_value = _pragma_int(connection, "synchronous")
+            synchronous = {
+                0: "OFF",
+                1: "NORMAL",
+                2: "FULL",
+                3: "EXTRA",
+            }.get(synchronous_value, f"UNKNOWN_{synchronous_value}")
+            snapshot = SQLiteSchemaSnapshot(
+                schema_version=schema_version,
+                resource_id=meta["resource_id"],
+                canonical_store_id=meta["canonical_store_id"],
+                target_identity=meta["target_identity"],
+                generation=_meta_int(meta, "generation"),
+                head_revision=_meta_int(meta, "head_revision"),
+                fold_version=meta["fold_version"],
+                scorer_version=meta["scorer_version"],
+                text_semantics_version=meta["text_semantics_version"],
+                candidate_index_kind=meta["candidate_index_kind"],
+                candidate_index_version=meta["candidate_index_version"],
+                sqlite_runtime_version=meta["sqlite_runtime_version"],
+                unicode_runtime_version=meta["unicode_runtime_version"],
+                fts5_available=fts5_available,
+                journal_mode=journal_mode,
+                synchronous=synchronous,
+                foreign_keys=_pragma_int(connection, "foreign_keys") == 1,
+                busy_timeout_ms=_pragma_int(connection, "busy_timeout"),
+                wal_enabled=journal_mode == "wal",
+                extension_loading_enabled=False,
+                activation_status=meta["activation_status"],
+                activation_digest=meta.get("activation_digest"),
+                fuzzy_available=False,
+                table_names=tuple(sorted(expected_tables)),
+                index_names=tuple(sorted(_BASE_INDEXES)),
+            )
+        finally:
+            connection.rollback()
+    return snapshot
+
+
+def _prove_and_hydrate_completed_activation(
     port: _StoreValidationPort,
     record: _ActivationJournalRecord,
-) -> ActivationRecoveryReport:
-    """Re-prove and hydrate exactly one completed canonical generation.
+) -> tuple[ActivationRecoveryReport, _SQLiteGenerationView]:
+    """Re-prove and stage one completed generation for general recovery.
 
     Proves the canonical generation and lineage from the authenticated
     record plus disk: the ACTIVE sidecar schema with the record-derived
@@ -1908,21 +2086,332 @@ def _rehydrate_completed_activation(
         except BaseException:
             connection.rollback()
             raise
-    port.view = _SQLiteGenerationView(
+    view = _SQLiteGenerationView(
         stage=active_ref,
         canonical_store_id=record.canonical_store_id,
         generation=next_generation,
         fts5_available=snapshot.fts5_available,
         active_content_attestation=record.active_content_attestation,
     )
+    return (
+        ActivationRecoveryReport(
+            phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
+            action="COMPLETED",
+            generation=next_generation,
+        ),
+        view,
+    )
+
+
+def _prove_completed_initial_authority_read_only(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> tuple[
+    ActivationRecoveryReport,
+    _SQLiteGenerationView,
+    ContentFileProof,
+]:
+    """Stage one completed gen0 view through read-only SQLite validation."""
+
+    identity = port.resource_identity
+    if record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+            retryable=False,
+        )
+    if (
+        _lstat_any_entry(record.candidate_stage_db_path)
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            retryable=False,
+        )
+    activation_digest = _activation_publication_digest(
+        record,
+        next_generation=0,
+    )
+    active_attestation = _require_bound_active_content_attestation(
+        record,
+        canonical_store_id=record.canonical_store_id,
+        next_generation=0,
+        activation_digest=activation_digest,
+    )
+    try:
+        database_before = _capture_content_file(
+            identity.canonical_sidecar_path
+        )
+    except ContentAttestationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        ) from error
+    if (database_before.device, database_before.inode) != (
+        active_attestation.database.device,
+        active_attestation.database.inode,
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        )
+    active_ref = _canonical_activation_ref(
+        identity,
+        journal_id=record.journal_id,
+    )
+    snapshot = _inspect_completed_active_schema_read_only(
+        active_ref,
+        canonical_store_id=record.canonical_store_id,
+        expected_generation=0,
+        expected_activation_digest=activation_digest,
+    )
+    with _open_completed_authority_read_connection(
+        identity.canonical_sidecar_path
+    ) as connection:
+        connection.execute("BEGIN")
+        try:
+            port.validate_store_identity(
+                connection,
+                resource_id=identity.resource_id,
+                canonical_store_id=record.canonical_store_id,
+                target_identity=identity.target_identity,
+            )
+            if connection.execute(
+                "PRAGMA integrity_check"
+            ).fetchall() != [("ok",)]:
+                raise port.store_schema_error(
+                    "STORE.INTEGRITY_CHECK_FAILED"
+                )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise port.store_schema_error(
+                    "STORE.FOREIGN_KEY_CHECK_FAILED"
+                )
+            staged_view = _SQLiteGenerationView(
+                stage=active_ref,
+                canonical_store_id=record.canonical_store_id,
+                generation=0,
+                fts5_available=snapshot.fts5_available,
+            )
+            facts = port.read_source_binding_facts_in_transaction(
+                connection,
+                staged_view,
+            )
+            binding = facts.binding
+            if binding is None or facts.diagnostic_codes:
+                raise port.store_schema_error(
+                    "STORE.ACTIVE_BINDING_INVALID"
+                )
+            if (
+                binding.receipt.snapshot_id != record.new_receipt_id
+                or snapshot_receipt_digest(binding.receipt)
+                != record.snapshot_receipt_digest
+                or binding.receipt.jsonl_digest
+                != record.source_jsonl_digest
+            ):
+                raise port.store_schema_error(
+                    "STORE.ACTIVE_BINDING_INVALID"
+                )
+            port.validate_candidate_proof_index(
+                connection,
+                required_sizes=(
+                    (1, 2)
+                    if snapshot.fts5_available
+                    else (1, 2, 3)
+                ),
+                fts5_available=snapshot.fts5_available,
+            )
+        finally:
+            connection.rollback()
+    try:
+        database_after = _capture_content_file(
+            identity.canonical_sidecar_path
+        )
+    except ContentAttestationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        ) from error
+    if database_after != database_before:
+        raise ActivationPreparationError(
+            "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
+            retryable=False,
+        )
+    view = _SQLiteGenerationView(
+        stage=active_ref,
+        canonical_store_id=record.canonical_store_id,
+        generation=0,
+        fts5_available=snapshot.fts5_available,
+        active_content_attestation=record.active_content_attestation,
+    )
+    return (
+        ActivationRecoveryReport(
+            phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
+            action="COMPLETED",
+            generation=0,
+        ),
+        view,
+        database_after,
+    )
+
+
+def _rehydrate_completed_activation(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> ActivationRecoveryReport:
+    """Complete cleanup after proving one published canonical generation."""
+
+    report, view = _prove_and_hydrate_completed_activation(port, record)
+    port.view = view
+    identity = port.resource_identity
     _ensure_activation_lineage_marker(identity)
     port._activate_candidate_store_id(record.canonical_store_id)
     _remove_journal_proven_backups(record)
-    return ActivationRecoveryReport(
-        phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
-        action="COMPLETED",
-        generation=next_generation,
+    return report
+
+
+def _rehydrate_completed_initial_authority_only(
+    port: _StoreValidationPort,
+) -> ActivationRecoveryReport | None:
+    """Read-only proof and in-memory hydration of completed generation zero.
+
+    This narrow seam exists only for the case where the persistent initial-
+    activation reservation cannot be acquired.  It never delegates to the
+    general recovery engine: pending phases, temp artifacts, journal/terminal
+    coexistence, a missing/unfinished lineage marker, and every non-initial
+    generation return ``None`` without advancing, cancelling, cleaning, or
+    rolling back durable facts.  Only one already-complete, exactly re-proven
+    ``GENERATION_PUBLISHED`` initial record may hydrate the fresh in-memory
+    coordinator.
+    """
+
+    if (
+        port.state != "READY"
+        or port.preparation is not None
+        or port.cleanup_reservation is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_STATE_INVALID",
+            retryable=True,
+        )
+    identity = port.resource_identity
+    journal_path = _activation_journal_path(identity)
+    terminal_path = _activation_terminal_path(identity)
+    marker_path = _activation_lineage_marker_path(identity)
+    marker_temp_path = _activation_lineage_marker_temp_path(marker_path)
+    journal_identity = _lstat_activation_journal_identity(journal_path)
+    terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+    if (
+        _lstat_any_entry(_activation_journal_temp_path(journal_path))
+        or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+        or _lstat_any_entry(marker_temp_path)
+        or _completed_authority_sqlite_sidecar_present(
+            identity.canonical_sidecar_path
+        )
+        or (journal_identity is not None and terminal_identity is not None)
+    ):
+        return None
+    selected_path: Path
+    selected_identity: _ActivationFileIdentity
+    if journal_identity is not None:
+        selected_path = journal_path
+        selected_identity = journal_identity
+        record = _load_recovery_journal(
+            port,
+            selected_path,
+            selected_identity,
+        )
+    elif terminal_identity is not None:
+        selected_path = terminal_path
+        selected_identity = terminal_identity
+        record = _load_recovery_terminal(
+            port,
+            selected_path,
+            selected_identity,
+        )
+    else:
+        return None
+    _revalidate_recovery_authority(port, record)
+    if (
+        record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED
+        or record.expected_prior_generation is not None
+        or record.had_prior_canonical
+    ):
+        return None
+    marker_identity = _lstat_activation_lineage_marker_identity(marker_path)
+    if marker_identity is None:
+        return None
+    _read_activation_lineage_marker(marker_path, identity=identity)
+    report, staged_view, database_proof = (
+        _prove_completed_initial_authority_read_only(
+            port,
+            record,
+        )
     )
+    # Re-prove every selected authority path after the potentially long DB
+    # validation before exposing the in-memory view.  No cleanup is attempted
+    # if any identity, phase, or closed-marker fact changed underneath us.
+    if (
+        _lstat_any_entry(_activation_journal_temp_path(journal_path))
+        or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+        or _lstat_any_entry(marker_temp_path)
+        or _completed_authority_sqlite_sidecar_present(
+            identity.canonical_sidecar_path
+        )
+    ):
+        return None
+    if selected_path == journal_path:
+        if (
+            _lstat_activation_journal_identity(journal_path)
+            != selected_identity
+            or _lstat_activation_terminal_identity(terminal_path) is not None
+        ):
+            return None
+        reproved_record = _load_recovery_journal(
+            port,
+            selected_path,
+            selected_identity,
+        )
+    else:
+        if (
+            _lstat_activation_terminal_identity(terminal_path)
+            != selected_identity
+            or _lstat_activation_journal_identity(journal_path) is not None
+        ):
+            return None
+        reproved_record = _load_recovery_terminal(
+            port,
+            selected_path,
+            selected_identity,
+        )
+    _revalidate_recovery_authority(port, reproved_record)
+    if reproved_record != record:
+        return None
+    if (
+        _lstat_activation_lineage_marker_identity(marker_path)
+        != marker_identity
+    ):
+        return None
+    _read_activation_lineage_marker(marker_path, identity=identity)
+    if _completed_authority_sqlite_sidecar_present(
+        identity.canonical_sidecar_path
+    ):
+        return None
+    try:
+        if (
+            _capture_content_file(identity.canonical_sidecar_path)
+            != database_proof
+        ):
+            return None
+    except ContentAttestationError:
+        return None
+    # Publish the fully staged in-memory authority only after every durable
+    # record, marker, and database proof has closed.  The coordinator method
+    # owns its condition lock, so the store-id/view pair becomes observable
+    # as one transition and no failure path above can leak a partial gen0.
+    port._activate_candidate_store_id(record.canonical_store_id)
+    port.view = staged_view
+    port.state = "READY"
+    port.notify_all()
+    return report
 
 
 class ResourceStoreCoordinator:
@@ -2011,6 +2500,13 @@ class ResourceStoreCoordinator:
         self._preparation: _ActivationPreparation | None = None
         self._cleanup_reservation: _ActivationCleanupReservation | None = None
         self._cleanup_in_progress = False
+        # Process-local fail-stop for an initial activation whose unpublished
+        # authority could not be proved clean or published.  Absence from the
+        # canonical paths is not sufficient to clear it: a same-byte foreign
+        # inode may still occupy a salted stage path outside those locators.
+        # Only this coordinator's formal durable recovery paths clear the
+        # latch after returning a proven recovery report.
+        self._initial_activation_authority_unavailable = False
         self._owner_nonce = uuid.uuid4().hex
         self._schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None
         self._schema_upgrade_locator_snapshot: (
@@ -2045,6 +2541,28 @@ class ResourceStoreCoordinator:
     def current_generation(self) -> int | None:
         with self._condition:
             return None if self._view is None else self._view.generation
+
+    def _mark_initial_activation_authority_unavailable(self) -> None:
+        """Fail-stop later first-activation attempts on this coordinator."""
+
+        with self._condition:
+            self._initial_activation_authority_unavailable = True
+
+    def _initial_activation_authority_is_unavailable(self) -> bool:
+        """Return the coordinator-owned first-activation fail-stop state."""
+
+        with self._condition:
+            return self._initial_activation_authority_unavailable
+
+    def _clear_initial_activation_fail_stop_after_recovery(
+        self,
+        report: ActivationRecoveryReport | None,
+    ) -> None:
+        """Clear only after a Core recovery path returned proven authority."""
+
+        with self._condition:
+            if report is not None:
+                self._initial_activation_authority_unavailable = False
 
     def _seal_stage(
         self,
@@ -3373,6 +3891,7 @@ class ResourceStoreCoordinator:
                     _recovered_schema_upgrade_pending_root(port, view),
                     completed=(report.action == "COMPLETED"),
                 )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
 
     def rehydrate_runtime_authority(
@@ -3404,6 +3923,26 @@ class ResourceStoreCoordinator:
                     _recovered_schema_upgrade_pending_root(port, view),
                     completed=(report.action == "COMPLETED"),
                 )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
+            return report
+
+    def rehydrate_completed_initial_authority(
+        self,
+    ) -> ActivationRecoveryReport | None:
+        """Hydrate only an already-complete generation zero without recovery.
+
+        This Core-owned fail-safe seam is intentionally narrower than
+        :meth:`rehydrate_runtime_authority`: it never advances, cancels,
+        rolls back, or cleans durable activation facts.  It is therefore the
+        only authority probe permitted when the physical initial-activation
+        reservation itself could not be acquired.
+        """
+
+        with self._condition:
+            report = _rehydrate_completed_initial_authority_only(
+                _CoordinatorStorePort(self)
+            )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
 
     def rollback_durable_activation(
@@ -3439,6 +3978,7 @@ class ResourceStoreCoordinator:
                     _recovered_schema_upgrade_pending_root(port, view),
                     completed=False,
                 )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
 
     def adopt_recovered_authority(
@@ -3527,6 +4067,7 @@ class ResourceStoreCoordinator:
             self._canonical_store_id = recovered._canonical_store_id
             self._preparation = None
             self._cleanup_reservation = None
+            self._initial_activation_authority_unavailable = False
             self._state = "READY"
             self._condition.notify_all()
         if stale_preparation is not None:

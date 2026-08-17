@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 import ctypes
 import errno
 import hashlib
+import importlib
 import json
 import os
 from dataclasses import dataclass
@@ -286,6 +287,18 @@ class MigrationPreflightError(RuntimeError):
     def __init__(self, error_code: str) -> None:
         if type(error_code) is not str:
             raise TypeError("error_code must be a built-in string")
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+class _InitialActivationReservationError(RuntimeError):
+    """Code-only failure of the physical first-activation reservation."""
+
+    def __init__(self, error_code: str) -> None:
+        if type(error_code) is not str or not error_code.startswith(
+            "MIGRATION.INITIAL_RESOURCE_LOCK_"
+        ):
+            raise TypeError("initial resource lock error code is invalid")
         self.error_code = error_code
         super().__init__(error_code)
 
@@ -1026,17 +1039,176 @@ class TMMigrationService:
         if source_before is None:
             raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
 
-        # A fresh application facade may be constructed over durable facts
-        # left by a prior process after the publication linearization point.
-        # Reconcile those facts before preflight's intentional sidecar-reuse
-        # rejection and, critically, before allocating another stage/token.
+        # Separate application facades may own distinct in-memory
+        # coordinators for the same physical resource.  The persistent
+        # Core-private reservation serializes those coordinators/processes.
+        # All recovery capable of advancing or cancelling durable facts runs
+        # only after acquiring it, then the same descriptor-bound lock spans
+        # residue proof and the whole
+        # build -> seal -> publish -> reconcile transaction.
+        try:
+            reservation = _InitialActivationResourceReservation.acquire(
+                self._resource_identity
+            )
+        except _InitialActivationReservationError:
+            return self._initial_resource_reservation_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+            )
+        with reservation:
+            try:
+                return self._activate_initial_with_resource_reservation(
+                    coordinator=coordinator,
+                    source=source,
+                    source_before=source_before,
+                    reservation=reservation,
+                )
+            except _InitialActivationReservationError:
+                return self._initial_resource_reservation_failure(
+                    coordinator=coordinator,
+                    source_before=source_before,
+                )
+
+    def _initial_resource_reservation_failure(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+    ) -> MigrationOutcome:
+        """Prefer only read-only-proven completed authority after lock failure."""
+
+        recovered = self._recover_completed_initial_activation_only(
+            coordinator=coordinator,
+            source_before=source_before,
+        )
+        if recovered is not None:
+            return recovered
+        return self._initial_authority_unavailable_failure(
+            coordinator=coordinator,
+            source_before=source_before,
+            preflight=None,
+            published_generation=None,
+        )
+
+    def _recover_completed_initial_activation_only(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+    ) -> MigrationFailure | None:
+        """Distinguish completed gen0 without handing off runtime authority.
+
+        This is the reservation-failure counterpart to the general recovery
+        path below.  A fresh disposable Core coordinator may prove a completed
+        initial generation, but an invalid/unacquirable physical reservation
+        forbids live hydration and every standard store/health/query report
+        projection.  The caller receives only a frozen unavailable outcome
+        that truthfully distinguishes published gen0 from ambiguous facts.
+        """
+
+        try:
+            recovery_probe = ResourceStoreCoordinator(
+                canonical_store_id=self._canonical_store_id,
+                resource_identity=self._resource_identity,
+            )
+            recovered = (
+                recovery_probe.rehydrate_completed_initial_authority()
+            )
+            if recovered is None:
+                return None
+            if recovered.action != "COMPLETED" or recovered.generation != 0:
+                return None
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=None,
+                published_generation=0,
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=None,
+                published_generation=None,
+            )
+
+    def _activate_initial_with_resource_reservation(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source: Path,
+        source_before: str,
+        reservation: _InitialActivationResourceReservation,
+    ) -> MigrationOutcome:
+        """Recheck and transact while one physical resource lock is held."""
+
+        reservation.reprove()
         recovered_initial = self._recover_existing_initial_activation(
             coordinator=coordinator,
             source=source,
             source_before=source_before,
         )
+        reservation.reprove()
         if recovered_initial is not None:
             return recovered_initial
+
+        with coordinator._condition:
+            reservation.reprove()
+            if coordinator._initial_activation_authority_is_unavailable():
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    preflight=None,
+                    published_generation=None,
+                )
+            try:
+                initial_residue = _has_initial_stage_residue(
+                    self._resource_identity
+                )
+            except Exception as error:
+                if not _is_initial_activation_operational_error(error):
+                    raise
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    preflight=None,
+                    published_generation=None,
+                )
+            if initial_residue:
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    preflight=None,
+                    published_generation=None,
+                )
+            reservation.reprove()
+            if (
+                coordinator.current_generation is not None
+                or coordinator.active_store_path is not None
+            ):
+                raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
+            if coordinator.state != "READY":
+                raise MigrationPreflightError(
+                    "MIGRATION.ACTIVATION_NOT_READY"
+                )
+            return self._activate_initial_authority_transaction(
+                coordinator=coordinator,
+                source=source,
+                source_before=source_before,
+                reservation=reservation,
+            )
+
+    def _activate_initial_authority_transaction(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source: Path,
+        source_before: str,
+        reservation: _InitialActivationResourceReservation,
+    ) -> MigrationOutcome:
+        """Run one serialized unpublished first-activation transaction."""
 
         preflight: MigrationPreflight | None = None
         build: MigrationStageBuild | None = None
@@ -1046,6 +1218,7 @@ class TMMigrationService:
         prepared: _ActivationPreparation | None = None
         stage_label = "BUILD"
         try:
+            reservation.reprove()
             # A first-activation attempt gets its own unpublished namespace.
             # Cancelled/sealed registry entries are intentionally immutable;
             # reusing their deterministic path would make a later safe retry
@@ -1076,6 +1249,7 @@ class TMMigrationService:
                     initial_attempt=attempt,
                 )
             )
+            reservation.reprove()
             if initial_stage != attempt.stage:
                 raise MigrationPreflightError(
                     "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
@@ -1101,24 +1275,30 @@ class TMMigrationService:
                     "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
                 )
             stage_label = "SEAL"
+            reservation.reprove()
             sealed = coordinator._seal_stage(
                 mutable_stage,
                 canonical_store_id=self._canonical_store_id,
                 expected_prior_generation=None,
             )
             stage_label = "PREPARE"
+            reservation.reprove()
             prepared = coordinator.activate(sealed)
             stage_label = "JOURNAL"
+            reservation.reprove()
             handle = coordinator.publish_prepared_activation(prepared)
             stage_label = "PUBLISH"
+            reservation.reprove()
             generation = coordinator.publish_activation(prepared, handle)
             stage_label = "VERIFY"
+            reservation.reprove()
             self._verify_initial_activation_runtime(
                 coordinator=coordinator,
                 preflight=build.preflight,
                 sealed=sealed,
                 generation=generation,
             )
+            reservation.reprove()
             return self._success_report(
                 preflight=build.preflight,
                 sealed=sealed,
@@ -1143,19 +1323,25 @@ class TMMigrationService:
                     reconciliation_error
                 ):
                     raise
-                return self._initial_authority_unavailable_failure(
+                unavailable = self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
                     source_before=source_before,
                     preflight=preflight,
                     published_generation=None,
                 )
+                reservation.reprove()
+                return unavailable
             if failure is not None:
+                reservation.reprove()
                 return failure
-            return self._recover_published_initial_tail(
+            outcome = self._recover_published_initial_tail(
                 coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 sealed=sealed,
             )
+            reservation.reprove()
+            return outcome
 
     def _recover_existing_initial_activation(
         self,
@@ -1183,6 +1369,7 @@ class TMMigrationService:
             if not _is_initial_activation_operational_error(error):
                 raise
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=None,
                 published_generation=None,
@@ -1195,6 +1382,7 @@ class TMMigrationService:
             if not _is_initial_activation_operational_error(error):
                 raise
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=None,
                 published_generation=(
@@ -1205,6 +1393,7 @@ class TMMigrationService:
             )
         if preflight.source_digest != source_before:
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=(
@@ -1246,6 +1435,7 @@ class TMMigrationService:
                 if not _is_initial_activation_operational_error(error):
                     raise
                 return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
                     source_before=source_before,
                     preflight=preflight,
                     published_generation=generation,
@@ -1255,6 +1445,7 @@ class TMMigrationService:
             or recovered.generation is not None
         ):
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=None,
@@ -1270,6 +1461,7 @@ class TMMigrationService:
             if not _is_initial_activation_operational_error(error):
                 raise
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=None,
@@ -1309,6 +1501,7 @@ class TMMigrationService:
 
         if preflight is None or sealed is None:
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=None,
@@ -1323,6 +1516,7 @@ class TMMigrationService:
             if not _is_initial_activation_operational_error(error):
                 raise
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=None,
@@ -1333,6 +1527,7 @@ class TMMigrationService:
             or recovered.generation != 0
         ):
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=None,
@@ -1368,6 +1563,7 @@ class TMMigrationService:
             if not _is_initial_activation_operational_error(error):
                 raise
             return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=generation,
@@ -1459,11 +1655,15 @@ class TMMigrationService:
     def _initial_authority_unavailable_failure(
         self,
         *,
+        coordinator: ResourceStoreCoordinator,
         source_before: str,
         preflight: MigrationPreflight | None,
         published_generation: int | None,
     ) -> MigrationFailure:
         """Build one code-only outcome that explicitly forbids legacy use."""
+
+        if published_generation is None:
+            coordinator._mark_initial_activation_authority_unavailable()
 
         observed = _try_file_digest(
             self._resource_identity.configured_jsonl_path
@@ -4527,6 +4727,386 @@ def _deterministic_stage_ref(
     )
 
 
+class _InitialActivationResourceReservation:
+    """Persistent per-sidecar advisory lock held across initial activation.
+
+    The lock pathname is deterministic and is never unlinked or replaced.
+    Its descriptor and parent directory are retained no-follow for the full
+    scan/build/reconcile transaction.  ``flock`` ownership is released by
+    the kernel on process death; the persistent file remains reusable, while
+    any stage residue created before the crash stays independently
+    discoverable by ``_has_initial_stage_residue``.
+    """
+
+    __slots__ = (
+        "_descriptor",
+        "_fcntl",
+        "_identity",
+        "_lock_name",
+        "_parent",
+        "_released",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: CanonicalResourceIdentity,
+        parent: _ExportParentHandle,
+        descriptor: int,
+        lock_name: str,
+        fcntl_module: Any,
+    ) -> None:
+        self._identity = identity
+        self._parent = parent
+        self._descriptor = descriptor
+        self._lock_name = lock_name
+        self._fcntl = fcntl_module
+        self._released = False
+
+    @classmethod
+    def acquire(
+        cls,
+        identity: CanonicalResourceIdentity,
+    ) -> _InitialActivationResourceReservation:
+        """Acquire one macOS/Linux resource lock without pathname reuse."""
+
+        if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        if not (
+            hasattr(os, "O_NOFOLLOW")
+            and hasattr(os, "O_CLOEXEC")
+            and hasattr(os, "pread")
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        try:
+            fcntl_module = importlib.import_module("fcntl")
+        except ImportError as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        if not all(
+            hasattr(fcntl_module, name)
+            for name in ("flock", "LOCK_EX", "LOCK_UN")
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+
+        lock_path = identity.canonical_sidecar_path.with_name(
+            f".{identity.canonical_sidecar_path.name}."
+            "localcat-initial-activation.lock"
+        )
+        lock_name = lock_path.name
+        parent: _ExportParentHandle | None = None
+        descriptor = -1
+        resource_locked = False
+        bootstrap_locked = False
+        created = False
+        try:
+            parent = _ExportParentHandle.bind(lock_path)
+            parent.reprove()
+            # Serialize only the deterministic lock-file bootstrap.  A
+            # creator must finish the exact payload and its directory fsync
+            # before any compliant peer can open the inode.  The directory
+            # lock is released before waiting on the long-lived per-resource
+            # lock so an active resource never blocks initialization of a
+            # different resource in the same directory.
+            fcntl_module.flock(parent.descriptor, fcntl_module.LOCK_EX)
+            bootstrap_locked = True
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                descriptor = parent.open(
+                    lock_name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = parent.open(lock_name, flags)
+            cls._require_descriptor_shape(descriptor)
+            if created:
+                cls._write_new_payload(
+                    descriptor,
+                    cls._payload(identity),
+                )
+                parent.fsync()
+            parent.reprove()
+            try:
+                fcntl_module.flock(
+                    parent.descriptor,
+                    fcntl_module.LOCK_UN,
+                )
+            finally:
+                # Closing the retained dirfd below is the fail-safe release
+                # if the explicit unlock itself failed or was defective.
+                bootstrap_locked = False
+            fcntl_module.flock(descriptor, fcntl_module.LOCK_EX)
+            resource_locked = True
+            reservation = cls(
+                identity=identity,
+                parent=parent,
+                descriptor=descriptor,
+                lock_name=lock_name,
+                fcntl_module=fcntl_module,
+            )
+            reservation.reprove()
+            return reservation
+        except BaseException as error:
+            cls._close_failed_acquisition(
+                parent=parent,
+                descriptor=descriptor,
+                resource_locked=resource_locked,
+                bootstrap_locked=bootstrap_locked,
+                fcntl_module=fcntl_module,
+            )
+            if isinstance(error, _InitialActivationReservationError):
+                raise
+            if isinstance(
+                error,
+                (
+                    OSError,
+                    snapshot_artifacts_module.ExportPreflightError,
+                ),
+            ):
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                ) from error
+            raise
+
+    @staticmethod
+    def _close_failed_acquisition(
+        *,
+        parent: _ExportParentHandle | None,
+        descriptor: int,
+        resource_locked: bool,
+        bootstrap_locked: bool,
+        fcntl_module: Any,
+    ) -> None:
+        """Close every acquired handle even when unlock itself is defective."""
+
+        deferred: BaseException | None = None
+        try:
+            if resource_locked:
+                try:
+                    fcntl_module.flock(
+                        descriptor,
+                        fcntl_module.LOCK_UN,
+                    )
+                except OSError:
+                    pass
+                except BaseException as error:
+                    deferred = error
+            if bootstrap_locked and parent is not None:
+                try:
+                    fcntl_module.flock(
+                        parent.descriptor,
+                        fcntl_module.LOCK_UN,
+                    )
+                except OSError:
+                    pass
+                except BaseException as error:
+                    if deferred is None:
+                        deferred = error
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                except BaseException as error:
+                    if deferred is None:
+                        deferred = error
+            if parent is not None:
+                try:
+                    parent.close()
+                except BaseException as error:
+                    if deferred is None:
+                        deferred = error
+        if deferred is not None:
+            raise deferred
+
+    @staticmethod
+    def _payload(identity: CanonicalResourceIdentity) -> bytes:
+        return (
+            "localcat-initial-activation-lock-v1\0"
+            f"{identity.target_identity}\n"
+        ).encode("ascii")
+
+    @staticmethod
+    def _require_descriptor_shape(descriptor: int) -> os.stat_result:
+        try:
+            observed = os.fstat(descriptor)
+        except OSError as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        return observed
+
+    @staticmethod
+    def _write_new_payload(descriptor: int, payload: bytes) -> None:
+        offset = 0
+        try:
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, "resource lock write stalled")
+                offset += written
+            os.fsync(descriptor)
+        except OSError as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+
+    def reprove(self) -> None:
+        """Reprove exact inode, single-link shape, bytes, and parent."""
+
+        if self._released:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        try:
+            self._parent.reprove()
+            descriptor_state = self._require_descriptor_shape(
+                self._descriptor
+            )
+            path_state = self._parent.lstat(self._lock_name)
+            if (
+                not stat.S_ISREG(path_state.st_mode)
+                or path_state.st_nlink != 1
+                or (path_state.st_dev, path_state.st_ino)
+                != (descriptor_state.st_dev, descriptor_state.st_ino)
+                or os.pread(
+                    self._descriptor,
+                    len(self._payload(self._identity)) + 1,
+                    0,
+                )
+                != self._payload(self._identity)
+            ):
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                )
+            self._parent.reprove()
+        except _InitialActivationReservationError:
+            raise
+        except (
+            OSError,
+            snapshot_artifacts_module.ExportPreflightError,
+        ) as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+
+    def release(self) -> None:
+        """Release advisory ownership; never unlink the persistent file."""
+
+        if self._released:
+            return
+        self._released = True
+        deferred: BaseException | None = None
+        try:
+            try:
+                self._fcntl.flock(
+                    self._descriptor,
+                    self._fcntl.LOCK_UN,
+                )
+            except OSError:
+                pass
+            except BaseException as error:
+                deferred = error
+        finally:
+            try:
+                os.close(self._descriptor)
+            except OSError:
+                pass
+            except BaseException as error:
+                if deferred is None:
+                    deferred = error
+            try:
+                self._parent.close()
+            except BaseException as error:
+                if deferred is None:
+                    deferred = error
+        if deferred is not None:
+            raise deferred
+
+    def __enter__(self) -> _InitialActivationResourceReservation:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
+    ) -> None:
+        self.release()
+
+
+def _has_initial_stage_residue(
+    identity: CanonicalResourceIdentity,
+) -> bool:
+    """Discover this resource's exact salted first-activation family.
+
+    The scan is directory-descriptor relative and compares only the closed
+    basename grammar emitted by ``_deterministic_stage_ref`` for an
+    ``initial-<uuid>`` migration attempt.  A matching name is sufficient to
+    fail stop regardless of whether it currently denotes a regular file,
+    hardlink, symlink, or another foreign entry; discovery never follows,
+    opens, or removes it.  Other resources in the same parent differ in the
+    target-identity field and remain outside this resource's family.
+    """
+
+    target_fragment = identity.target_identity[:16]
+    prefix = ".localcat-migration.initial-"
+    suffixes = (".sqlite3.stage", ".manifest.tmp")
+    try:
+        with _ExportParentHandle.bind(
+            identity.canonical_sidecar_path
+        ) as parent:
+            parent.reprove()
+            names = os.listdir(parent.descriptor)
+            parent.reprove()
+    except Exception as error:
+        if not _is_initial_activation_operational_error(error):
+            raise
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_DISCOVERY_UNAVAILABLE"
+        ) from error
+
+    for name in names:
+        if type(name) is not str or not name.startswith(prefix):
+            continue
+        suffix = next(
+            (candidate for candidate in suffixes if name.endswith(candidate)),
+            None,
+        )
+        if suffix is None:
+            continue
+        fields = name[len(prefix) : -len(suffix)].split(".")
+        if len(fields) != 3:
+            continue
+        attempt_nonce, observed_target, source_fragment = fields
+        if (
+            len(attempt_nonce) == 32
+            and all(character in "0123456789abcdef" for character in attempt_nonce)
+            and observed_target == target_fragment
+            and len(source_fragment) == 16
+            and all(
+                character in "0123456789abcdef"
+                for character in source_fragment
+            )
+        ):
+            return True
+    return False
+
+
 def _snapshot_id_for_origin(
     *,
     batch_id: str,
@@ -5201,6 +5781,7 @@ def _require_proven_initial_legacy_state(
         or coordinator.active_store_path is not None
         or coordinator.durable_activation_phase is not None
         or any(_lstat_any_entry(path) for path in prohibited)
+        or _has_initial_stage_residue(identity)
     ):
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
