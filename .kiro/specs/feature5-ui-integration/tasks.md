@@ -11,7 +11,7 @@
   - _Requirements: 5.3, 7.2, 9.7_
   - _Boundary: Governance Steering and Spec Ownership_
 
-- [ ] 1.2 执行合并前精确身份与用户 WIP 门
+- [x] 1.2 执行合并前精确身份与用户 WIP 门
   - 由 UI owner fail-closed 核对两个授权根、`ui-mvp`、full HEAD、来源 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 对象、可达性和工作树状态
   - 确认 UI 本地旧迁移线只保留为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得作为本次 merge 来源或补齐到 `b90de57…`
   - 对 `Demo.xlsx`、`spec.md`、`terms.csv`、`tm.jsonl` 记录 merge 前 SHA-256，并只允许显式路径暂存，不吸收、覆盖或清理其他 untracked/WIP
@@ -348,7 +348,7 @@
 ## Implementation Notes
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
-- 身份基线：UI `ui-mvp@8c0e623af6d224312c995c3f5714d0b451b3e164`；来源 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 已改名为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge。
+- 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
 - canonical 红线：legacy importer 的 source-LWW 与当前 100% 卡片只验 exact compatibility；多译文、非 100%、阈值、排序和 fuzzy 必须使用真实 activated SQLite 与 production retrieval API。
 - 每个实现子任务经独立 review 与 fresh completion evidence 后，使用显式路径暂存该任务文件和本 `tasks.md` checkbox；不得 `git add -A`、`git add .`、stash 或吸收用户 WIP。
 - cluster review 是逐任务门后的额外退出证据：按 `.kiro/steering/feature5-ui-integration-review-clustering.md` 记录 full base/tip、累计 diff 与共享故障矩阵；Checkpoint M/Q 仍只更新 owning Spec，不得在本文件代勾。
