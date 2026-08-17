@@ -294,7 +294,7 @@
   - _Requirements: 1.4, 6.3, 6.7, 6.8_
   - _Boundary: QtSettingsDialog New Resource Presentation_
 
-- [ ] 11.3 为无可写术语表提供明确且零写入的操作指引
+- [x] 11.3 为无可写术语表提供明确且零写入的操作指引
   - 继续只把术语写入 active 且 `Update=true` 的术语表，不自动启用资源、不改 Lookup，也不创建或实现术语管理页
   - 当不存在可写术语表时，明确说明应在语言资源设置中激活至少一个术语表并开启 Update；空输入继续给出独立原因
   - 覆盖所有术语表 `Update=false`、无术语表、恢复一个 `Update=true` 后重试成功，并验证失败路径不改变任何术语资源字节
@@ -316,3 +316,4 @@
 - Cluster base：`2df687055c43839a726d2a98f0ed73b72c4a7129`。
 - Task 11.1：macOS 主 Return、keypad Enter、物理 Control + Return 与 Option 导航均以真实 Qt 键事件通过；Qt editor 定向套件 35/35 通过。`qt_editor_window.py` 的 changed-file basedpyright 在 base/当前均有 42 个既存诊断，本任务未增加；最终零诊断门由 Task 11.4 闭合。
 - Task 11.2：新建资源类型的 closed/popup normal/hover/selected 六态在 offscreen 与 macOS Cocoa 通过真实渲染对比度验收；单深色像素对抗图被 oracle 拒绝。`qt_settings_dialog.py` 的 basedpyright 在 base/当前均有 31 个既存诊断，最终零诊断门由 Task 11.4 闭合。
+- Task 11.3：所有术语表 `Update=false`、无术语表、inactive+Update 对抗与恢复可写资源均已闭合；失败保持 registry、资源字节和项目零变化，成功路径仍确定性选择第一个 active+Update 术语表。Controller/Qt 定向套件及 changed-file basedpyright 均通过。

@@ -383,7 +383,7 @@ class EditorController:
         """Persist a term in the first active Update termbase and reload it."""
 
         if not source.strip() or not target.strip():
-            raise EditorControllerError("source and target terms must not be empty")
+            raise EditorControllerError("源术语和目标术语均不能为空。")
         resource = next(
             (
                 configured
@@ -395,7 +395,10 @@ class EditorController:
             None,
         )
         if resource is None:
-            raise EditorControllerError("no active writable termbase is available")
+            raise EditorControllerError(
+                "没有可写术语表。请打开“语言资源设置”，"
+                "将至少一个术语表设为 Active，并开启 Update。"
+            )
         report = upsert_term(resource.path, source, target)
         if not report.succeeded:
             raise EditorControllerError("; ".join(report.errors))

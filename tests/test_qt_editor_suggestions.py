@@ -101,10 +101,20 @@ class QtEditorSuggestionsTest(unittest.TestCase):
             window.close()
 
             blocked = self._window(root / "blocked", writable_terms=False)
-            errors: list[str] = []
-            blocked._show_error = lambda _title, message: errors.append(message)
+            errors: list[tuple[str, str]] = []
+            blocked._show_error = lambda title, message: errors.append((title, message))
             self.assertFalse(blocked.add_term("The", "该"))
-            self.assertTrue(errors)
+            self.assertEqual(errors[0][0], "无法添加术语")
+            self.assertRegex(
+                errors[0][1],
+                r"语言资源设置.*术语表.*Active.*Update",
+            )
+
+            errors.clear()
+            self.assertFalse(blocked.add_term("", "该"))
+            self.assertEqual(errors[0][0], "无法添加术语")
+            self.assertIn("不能为空", errors[0][1])
+            self.assertNotIn("语言资源设置", errors[0][1])
             blocked.close()
 
     def test_longest_non_overlapping_term_highlight_is_deterministic(self) -> None:
