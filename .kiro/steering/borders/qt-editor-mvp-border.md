@@ -19,10 +19,11 @@
 | Step 7 | 最近项目、段落断点、退出项目与桌面启动 | 完成后应能从应用菜单启动，在 GUI 内切换/退出项目并恢复上次段落 | 已验证 |
 | Step 8 | 左栏紧凑/换行密度和独立浏览校对页 | 完成后应能保持同一会话切换密度与工作区，并从双语浏览行返回同段编辑 | 已验证 |
 | Step 9 | `卷一_引.json + OWNattempt.tmx` 真实增量闭环 | 完成后应看到真实 TM 导入统计、项目精确命中、恢复与浏览旅程和全量回归均通过 | 已验证 |
+| Step 10 | Checkpoint M 修复平台确认/导航快捷键、资源类型下拉对比度与无可写术语表指引 | 完成后应以真实 Qt 键事件、popup 各状态与 Update=false 零写入/恢复旅程闭合三类缺陷，且不扩张到 Req7 CRUD 或 Feature 5 合同 | 待实施 |
 
 ## 依赖
 
-**Critical Path:** Step 1 → Step 2 → Step 3/4 → Step 5 → Step 6 → Step 7/8 → Step 9
+**Critical Path:** Step 1 → Step 2 → Step 3/4 → Step 5 → Step 6 → Step 7/8 → Step 9 → Step 10 → Feature 5 UI Integration Task 2
 
 **隐性依赖：**
 

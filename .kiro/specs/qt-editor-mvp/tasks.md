@@ -275,3 +275,38 @@
   - _Requirements: 8.4, 8.5, 8.7, 11.1–11.9_
   - _Boundary: Verification, Documentation_
   - _Depends: 10.1, 10.2, 10.3_
+
+- [ ] 11. 完成 Checkpoint M：修复 Qt 跨平台编辑交互回归
+
+- [ ] 11.1 修正现有确认与段落导航快捷键
+  - 让确认动作响应平台主修饰键与主 Return，并保留需要支持的数字键盘 Enter 等价入口；macOS 物理 Control + Return 继续由译文编辑器处理换行
+  - 上一段、下一段使用不劫持译文编辑的可发现绑定，按钮提示从实际 `QKeySequence` 的 NativeText 生成，不再硬编码 Ctrl、Alt 或 macOS 键名
+  - 使用真实 Qt 按键事件覆盖主 Return、数字键盘 Enter、macOS Control + Return 和上一段/下一段，禁止以 `activated.emit()` 代替行为验收
+  - 完成后，Command + Return 在 macOS 与确认按钮执行同一动作，Control + Return 不确认段落，段落导航不修改目标文本且提示与实际绑定一致
+  - _Requirements: 3.3, 3.4, 8.6_
+  - _Boundary: QtEditorWindow Editing Workflow_
+
+- [ ] 11.2 修复新建资源类型选择框的正常与悬停对比度
+  - 为新建资源 `QComboBox` 的关闭状态、popup 普通项、悬停项和选中项定义明确且相互可辨的前景与背景
+  - 保持翻译记忆库、术语表的 `currentData()` 及创建语义不变，不把视觉修复扩展为资源类型或持久化改造
+  - 使用真实 popup view 的 palette/render 结果验证两种资源文字在普通、悬停和选中状态均可读，不只断言 stylesheet 字符串
+  - 完成后，两种资源类型在 macOS 原生窗口与 offscreen 测试环境下均无白字白底或浅字浅底
+  - _Requirements: 1.4, 6.3, 6.7, 6.8_
+  - _Boundary: QtSettingsDialog New Resource Presentation_
+
+- [ ] 11.3 为无可写术语表提供明确且零写入的操作指引
+  - 继续只把术语写入 active 且 `Update=true` 的术语表，不自动启用资源、不改 Lookup，也不创建或实现术语管理页
+  - 当不存在可写术语表时，明确说明应在语言资源设置中激活至少一个术语表并开启 Update；空输入继续给出独立原因
+  - 覆盖所有术语表 `Update=false`、无术语表、恢复一个 `Update=true` 后重试成功，并验证失败路径不改变任何术语资源字节
+  - 完成后，“添加术语”失败不再只显示英文内部错误，用户可据提示完成配置且当前项目/资源保持不变
+  - _Requirements: 5.4, 5.5, 6.4_
+  - _Boundary: EditorController Error Semantics, QtEditorWindow Term Add Feedback_
+
+- [ ] 11.4 完成 Checkpoint M 的累计交互回归
+  - 用同一 offscreen 旅程覆盖真实快捷键、资源类型 popup 各状态、`Update=false` 添加术语指引及重新开启后的成功写入
+  - 运行 Qt 定向套件、完整 unittest、offscreen smoke、changed-file `basedpyright --level error`，并仅对 M-owned 显式 changed/staged paths 运行 `git diff --check`；受保护用户 WIP 以独立 SHA-256 复核
+  - 复核 Layer 4 仍只调用 `EditorController`，新快捷键候选、Req7 CRUD、Feature 5 capability 与 Integration checkbox 均未进入本簇
+  - 完成后，三类缺陷的正向、失败和恢复路径全绿，四个用户 WIP SHA-256 不变，可进入独立 M cluster review
+  - _Depends: 11.1, 11.2, 11.3_
+  - _Requirements: 1.4, 3.3, 3.4, 5.4, 5.5, 6.3, 6.4, 6.7, 6.8, 8.4, 8.5, 8.6_
+  - _Boundary: Qt Maintenance Verification_

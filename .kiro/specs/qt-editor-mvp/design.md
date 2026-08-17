@@ -390,7 +390,7 @@ class EditorController:
 - 右栏：Translation Matches 与 Termbase 页签；双击或按钮应用建议。
 - 浏览校对页：源文/译文双栏只读表、长文本自动换行、确认状态；双击回到同段编辑。
 - 源文 HTML 使用转义后再注入高亮 span，避免项目文本形成 HTML。
-- 快捷键：`Ctrl+O`、`Ctrl+S`、`Ctrl+Enter`、`Alt+Up`、`Alt+Down`、`Ctrl+,`。
+- 快捷键以 Qt PortableText 定义行为、以 NativeText 生成用户可见提示；平台主修饰键 + 主 Return 执行确认，macOS 显示为 Command + Return，其他平台使用对应的 Ctrl 组合。上一段/下一段使用实际绑定的平台本机名称（macOS 为 Option + Up/Down）；按钮 tooltip 不得硬编码 `Ctrl`/`Alt` 文案。
 
 ### QtBootstrap
 
@@ -487,7 +487,7 @@ erDiagram
 ### E2E / UI 测试
 
 - offscreen 创建主窗口，空状态和示例项目可用。
-- 模拟 `Ctrl+Enter`，确认当前段并移动到下一段。
+- 向译文编辑器发送平台主修饰键 + 主 Return 的真实 Qt 键事件，确认当前段并移动到下一段；macOS 物理 Control + Return 仍属于译文编辑换行。
 - 点击齿轮打开设置；创建资源；验证设置刷新信号。
 - 应用 TM/术语建议并检查译文编辑器。
 - 缩小与放大主窗口，验证主要 splitter 面板仍可见且具有最小可读尺寸。
@@ -503,6 +503,13 @@ QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
 ```
 
 输出首个可用状态、窗口标题、段落数并以 0 退出。
+
+## Checkpoint M 维护设计修订
+
+- 确认快捷键以主 Return 键为主入口，可保留数字键盘 Enter 等价别名；不得劫持 macOS 物理 Control + Return 的译文换行。上一段/下一段的绑定和提示必须来自同一个 resolved `QKeySequence`。
+- 新建资源类型 `QComboBox` 对 closed field 与 popup 的普通、悬停、选中状态分别定义可区分的前景/背景；修复不得改变 `currentData()` 或资源创建语义。
+- 添加术语仍只能写入 `active && update` 的术语表。若不存在可写术语表，Controller/Qt 失败路径必须零写入，并明确引导用户在语言资源设置中为至少一个术语表开启 Active 与 Update。
+- 本修订只闭合已有 Requirements 的跨平台可用性回归；不实现术语 CRUD/管理页，不增加 TM/Termbase 页签或编辑/校对模式的新快捷键，不改变 Feature 5 合同。
 
 ## 任务治理例外
 
