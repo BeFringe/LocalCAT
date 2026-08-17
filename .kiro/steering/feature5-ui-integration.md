@@ -64,6 +64,8 @@ owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 
 
 Gate A～D 与 Matcher Gate 只使用 Feature 5 Core 定义；跨 Spec 等待点只称 Checkpoint M/Q。Gate C 证明 context/fuzzy-core correctness，Gate D 按 FTS5/fallback intended path 证明 fuzzy benchmark；二者及 Matcher Gate 均不迁移资源，也不从 physical canonical state 推断能力。详细进入/退出条件由 Integration Design 自包含定义。
 
+实施与复审按 [`feature5-ui-integration-review-clustering.md`](feature5-ui-integration-review-clustering.md) 执行：每个子任务仍经 fresh implementer、独立 task reviewer、fresh completion evidence 和小步提交；共享不变量闭合后再由原生 cluster reviewer 读取累计 `base..tip`。评审集群不改变本表顺序，也不转移 Spec ownership 或 Feature 5 Core Gate authority。
+
 ## 禁止的兼容捷径
 
 - Qt、Glossary 或 TM 各自复制 scorer、case-fold、Whole Word、CJK、capability evaluator 或候选证明；
@@ -96,3 +98,4 @@ Gate A～D 与 Matcher Gate 只使用 Feature 5 Core 定义；跨 Spec 等待点
 - 2026-08-17：ADR-007～011 已采纳，ADR-002/006 的 canonical 范围部分被 ADR-007 取代。
 - 2026-08-17：新增 `feature5-ui-integration` 独立 Spec；本文件同步为三方 ownership 与验收边界。
 - 2026-08-17：跨 Spec 顺序冻结为八步 Critical Path；外部等待点改称 Checkpoint M/Q，避免与 Feature 5 Gate A～D 冲突。
+- 2026-08-17：新增跨 Spec 累计评审集群；它作为逐任务原生 implementer/reviewer 门后的额外退出证据，不改变 Critical Path、checkbox ownership 或 Core Gate authority。

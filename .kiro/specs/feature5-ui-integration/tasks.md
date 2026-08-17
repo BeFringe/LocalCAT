@@ -4,7 +4,7 @@
 
 - [ ] 1. 闭合治理、精确身份与 Feature 5 合并基线
 
-- [ ] 1.1 闭合获批治理顺序与三方所有权
+- [x] 1.1 闭合获批治理顺序与三方所有权
   - 由 Governance owner 同步已批准的八步实施顺序、Feature 5 Requirement 2 public-contract completion 和 Feature 5 Core / Integration / 原 Qt increment 三方职责
   - 保持 ADR-007～011 的既有处置与 ADR-002/006 的部分取代关系，不新增产品 scope amendment 或把实现事实冒充治理批准
   - 完成时，Steering、Spec ownership 与本 Design 对 Controller/current-segment TM UI、原 Qt Req3/Req7 和 macOS 的归属表述一致且可复查
@@ -351,3 +351,4 @@
 - 身份基线：UI `ui-mvp@8c0e623af6d224312c995c3f5714d0b451b3e164`；来源 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 已改名为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge。
 - canonical 红线：legacy importer 的 source-LWW 与当前 100% 卡片只验 exact compatibility；多译文、非 100%、阈值、排序和 fuzzy 必须使用真实 activated SQLite 与 production retrieval API。
 - 每个实现子任务经独立 review 与 fresh completion evidence 后，使用显式路径暂存该任务文件和本 `tasks.md` checkbox；不得 `git add -A`、`git add .`、stash 或吸收用户 WIP。
+- cluster review 是逐任务门后的额外退出证据：按 `.kiro/steering/feature5-ui-integration-review-clustering.md` 记录 full base/tip、累计 diff 与共享故障矩阵；Checkpoint M/Q 仍只更新 owning Spec，不得在本文件代勾。
