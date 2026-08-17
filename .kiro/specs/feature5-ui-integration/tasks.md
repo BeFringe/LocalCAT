@@ -353,3 +353,4 @@
 - 每个实现子任务经独立 review 与 fresh completion evidence 后，使用显式路径暂存该任务文件和本 `tasks.md` checkbox；不得 `git add -A`、`git add .`、stash 或吸收用户 WIP。
 - cluster review 是逐任务门后的额外退出证据：按 `.kiro/steering/feature5-ui-integration-review-clustering.md` 记录 full base/tip、累计 diff 与共享故障矩阵；Checkpoint M/Q 仍只更新 owning Spec，不得在本文件代勾。
 - 2026-08-17 / Task 1.3：以 merge commit `482dd5b` 保留精确 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 为第二父；唯一 roadmap 冲突保留 Integration contract 与 Core gate 事实，acceptance/release evidence 由官方工具绑定 merged UI source（33/33、86/86 GO），canonical suite 1629 tests 全绿并保留 1 个明确 opt-in 100k envelope skip；四个用户 WIP SHA-256 未变化。
+- 2026-08-17 / G0 cluster：native reviewer 对 `105449a5838763e0a08a05a600a45a457d589edf..9479c4f33d2c540fb300b0773d335dec3ffc7f24` 累计补丁复审通过；fresh cluster suite 在 reviewed tip 运行 1629 tests / 413.467s，Qt smoke、FTS5/fallback 5k/200 oracle 与 release 86/86 GO 全绿，唯一 skip 仍是明确 opt-in 100k migration envelope；WIP hashes 未变化。
