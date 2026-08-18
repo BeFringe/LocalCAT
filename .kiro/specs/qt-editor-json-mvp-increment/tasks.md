@@ -2,13 +2,20 @@
 
 > Feature 5 `TextMatcher` 是基础搜索的硬依赖；本计划不提供本地 casefold/Whole Word 替代实现。历史 Close-without-Saving 缺陷不属于本规格；这里只实现需求 5.5 明确要求的批量撤销点跨项目清理。
 
+> **Q1 tasks-only amendment（2026-08-19）**：按 `feature5-ui-integration-review-clustering` 的 Checkpoint Q，将原 1.1、3.1、3.2 中混合的 Requirement 3 搜索切片与 speaker inventory、preprocessing/batch baseline 切片拆开，并新增 4.3a fresh acceptance 子任务。Q1 只可勾选 1.1a、2.6、3.1a、3.2a、4.3、4.3a；不得借搜索实施完成相邻产品范围。
+
 - [ ] 1. 建立冻结契约与能力边界
 
-- [ ] 1.1 建立单 JSON 工具、speaker inventory 与搜索能力契约
-  - 覆盖项目工具可用性、speaker inventory、搜索字段、命中、报告和三态 matcher readiness
-  - 约束基础能力、高级选项、configured terms 和 validation digest 的合法组合
+- [ ] 1.1a 建立单 JSON 搜索与 matcher 能力契约
+  - 覆盖项目工具可用性、搜索字段、命中、报告和三态 matcher readiness
+  - 约束基础能力、高级选项与 validation digest 的合法组合
   - 完成时，合法契约可稳定构造，非法 capability、tuple 或 offset 组合会在边界测试中失败
-  - _Requirements: 1.1, 1.3, 3.1, 3.3, 3.7, 3.9, 9.1, 9.7_
+  - _Requirements: 3.1, 3.3, 3.7, 3.9, 9.1, 9.7_
+
+- [ ] 1.1b 建立 speaker inventory 能力契约
+  - 覆盖项目工具可用性、speaker inventory item、空 speaker 计数和稳定顺序
+  - 完成时，合法 inventory 可稳定构造，非法计数、重复身份或顺序组合会在边界测试中失败
+  - _Requirements: 1.1, 1.3, 9.1, 9.7_
 
 - [x] 1.2 建立预处理、批次报告与撤销会话契约
   - 覆盖有序 literal rule、段落前后差异、项目 session、revision、dirty 和 saved baseline
@@ -30,7 +37,7 @@
   - 完成时，重复扫描结果一致，扫描前后项目全部字段、顺序和身份保持不变
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7_
   - _Boundary: SpeakerInventoryService_
-  - _Depends: 1.1_
+  - _Depends: 1.1b_
 
 - [x] 2.2 (P) 实现 target-only 有序 literal 预处理预览
   - 按用户可见顺序执行区分大小写、从左到右、非重叠的普通字符串替换
@@ -74,7 +81,7 @@
   - 完成时，false/false golden cases 证明默认不区分大小写连续子串搜索，移除 matcher 后测试会失败而不是切换本地实现
   - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.6, 3.8, 3.9, 3.10_
   - _Boundary: ProjectSearchService_
-  - _Depends: 1.1_
+  - _Depends: 1.1a_
 
 - [ ] 2.7 (P) 集成 legacy Trie 与 configured term matcher
   - legacy 行始终保持区分大小写、连续子串和既有长词优先语义
@@ -84,24 +91,34 @@
   - 完成时，同一 fixture 在 pre-gate、post-gate、legacy 与 CJK 场景得到设计规定的结果
   - _Requirements: 7.2, 7.8, 7.9, 7.10, 7.11, 7.12, 9.6_
   - _Boundary: ConfiguredTermAdapter, GlossaryEngine_
-  - _Depends: 1.1, 1.3, 2.3_
+  - _Depends: 1.1a, 1.3, 2.3_
 
 - [ ] 3. 在 EditorController 中闭合会话与事务
 
-- [ ] 3.1 建立项目 session、revision、baseline 与单 JSON capability
-  - 在成功安装、打开、切换或关闭项目时维护 session identity，并在项目内容变化时递增 revision
-  - 成功打开/保存时更新 canonical saved baseline；只有扩展名不区分大小写为 JSON 的项目启用本规格项目工具
-  - TXT 与无路径 sample 保持可打开但工具明确不可用；项目 codec 错误统一转换为 Controller 错误
-  - 关闭或切换项目时只清除本规格的 batch undo/preview 状态，不扩展到历史 Close-without-Saving 修复
+- [ ] 3.1a 建立项目 session 与单 JSON capability
+  - 在成功安装、打开、切换或关闭项目时维护 session identity
+  - 只有扩展名不区分大小写为 JSON 的项目启用本规格项目工具；TXT 与无路径 sample 保持可打开但工具明确不可用
+  - 项目 codec 错误统一转换为 Controller 错误
   - 完成时，JSON、大小写变体 JSON、TXT、sample、失败打开和 session 切换测试均返回正确 capability 且不破坏现有会话
-  - _Requirements: 5.5, 9.1, 9.4, 9.7_
+  - _Requirements: 9.1, 9.7_
 
-- [ ] 3.2 接入 speaker inventory 与项目搜索导航
-  - 所有入口先通过单 JSON gate，再调用纯 inventory/search 能力
+- [ ] 3.1b 建立 revision、saved baseline 与 batch 状态生命周期
+  - 项目内容变化时递增 revision，成功打开/保存时更新 canonical saved baseline
+  - 关闭或切换项目时只清除本规格的 batch undo/preview 状态，不扩展到历史 Close-without-Saving 修复
+  - 完成时，编辑、保存、关闭和 session 切换测试得到一致 revision/baseline，且不破坏现有会话
+  - _Requirements: 5.5, 9.4_
+
+- [ ] 3.2a 接入项目搜索与稳定导航
+  - 所有入口先通过单 JSON gate，再调用纯搜索能力
   - 基础搜索只有在 `BASIC_VALIDATED` 时可执行；高级 options 只有在 `TEXT_V1_VALIDATED` 时接受
   - 使用稳定 segment identity 导航命中，保留当前未保存 target；空 query、无结果和 stale hit 不改变当前段
-  - 完成时，Controller 测试可从搜索结果前后导航，同时 inventory/search 失败保持原项目和当前位置
-  - _Requirements: 1.1, 1.5, 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 9.1, 9.4_
+  - 完成时，Controller 测试可从搜索结果前后导航，同时搜索失败保持原项目和当前位置
+  - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 9.1, 9.4_
+
+- [ ] 3.2b 接入 speaker inventory
+  - 入口先通过单 JSON gate，再调用纯 inventory 能力
+  - 完成时，Controller 重复读取 inventory 一致，失败保持原项目和当前位置
+  - _Requirements: 1.1, 1.5, 9.1, 9.4_
 
 - [ ] 3.3 闭合预处理 preview、apply 与最近批次 undo
   - preview 绑定 session/revision；apply 复核 revision、segment identity 和 before target，stale 时整体拒绝
@@ -148,6 +165,15 @@
   - 基础搜索完成验收的前提是 Feature 5 `BASIC_VALIDATED` matcher 已连接，不得以 disabled 搜索框代替完成
   - 完成时，QtTest 可在真实项目中搜索、导航并保留未保存 target，disabled 控件状态不会改变 false/false 结果
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10_
+
+- [ ] 4.3a 完成 Requirement 3 fresh acceptance evidence
+  - 使用真实单 JSON project、production Controller 与 Feature 5 matcher handoff 验证 source/target/raw-speaker、offset、结果顺序和前后导航
+  - 分别验证 BASIC 与 TEXT_V1 gate、Match Case / Whole Word、纯 CJK Whole Word、空 query、无结果、stale hit 与未保存 target 保留
+  - 移除 matcher 或换入 foreign handoff 时必须 fail closed，不得切换 Qt/Controller 本地 matcher
+  - 完成时，Q1 累计评审与 current-source acceptance evidence 对 Requirement 3 给出 fresh PASS
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 9.1, 9.2, 9.4, 9.5_
+  - _Boundary: Requirement 3 Acceptance_
+  - _Depends: 1.1a, 2.6, 3.1a, 3.2a, 4.3_
 
 - [ ] 4.4 增加预处理规则、preview、apply 与 batch undo 对话框
   - 支持规则增删、启停和可见顺序；只呈现普通 literal 能力
