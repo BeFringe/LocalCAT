@@ -4,6 +4,8 @@
 
 > **Q1 tasks-only amendment（2026-08-19）**：按 `feature5-ui-integration-review-clustering` 的 Checkpoint Q，将原 1.1、3.1、3.2 中混合的 Requirement 3 搜索切片与 speaker inventory、preprocessing/batch baseline 切片拆开，并新增 4.3a fresh acceptance 子任务。Q1 只可勾选 1.1a、2.6、3.1a、3.2a、4.3、4.3a；不得借搜索实施完成相邻产品范围。
 
+> **Q2 tasks-only amendment（2026-08-19）**：按同一 Checkpoint Q，将原 4.7 中混合的 term mutation 与 preprocessing 四视图刷新拆为 4.7a/4.7b，并新增 4.5a fresh acceptance 子任务。Q2 只可勾选 2.7、3.4、3.5、4.5、4.5a、4.7a；不得借术语实施完成 preprocessing 或其他 Requirement。
+
 - [ ] 1. 建立冻结契约与能力边界
 
 - [x] 1.1a 建立单 JSON 搜索与 matcher 能力契约
@@ -193,6 +195,15 @@
   - _Boundary: QtTermbaseDialog, QtSettingsDialog Integration_
   - _Depends: 3.4, 3.5_
 
+- [ ] 4.5a 完成 Requirement 7 fresh acceptance evidence
+  - 使用真实 mixed legacy/v1 termbase、production Controller 与 Qt 对话框验证列表、新增、修改、删除与重启恢复
+  - 分别验证 pre-gate legacy preset 与 `TEXT_V1_VALIDATED` configured matcher，包含纯 CJK Whole Word 与 legacy 两列行不被静默改写
+  - 覆盖 committed、not committed、rolled back、indeterminate、recovery/quarantine 及 import metadata 保留；只有 committed outcome 可刷新当前建议
+  - 完成时，Q2 累计评审与 current-source acceptance evidence 对 Requirement 7 给出 fresh PASS
+  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 9.2, 9.4, 9.5, 9.6_
+  - _Boundary: Requirement 7 Acceptance_
+  - _Depends: 1.3, 2.3, 2.4, 2.5, 2.7, 3.4, 3.5, 4.5, 4.7a_
+
 - [x] 4.6 实现译文框原生 undo/redo 与 edit blocks
   - 在 target editor 聚焦时绑定 `Ctrl+Z`、`Ctrl+Y` 和 `Ctrl+Shift+Z`
   - 继续通过文本变化同步 Controller；首次改变已确认 target 时恢复待确认
@@ -201,12 +212,21 @@
   - 完成时，三个快捷键、普通输入、suggestion 单步撤销、确认状态和空栈行为全部通过 QtTest
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
 
-- [ ] 4.7 建立主窗口四视图刷新协调
+- [ ] 4.7a 建立术语变更的主窗口刷新协调
+  - committed term mutation 从同一 Controller 会话刷新资源状态与当前 suggestions；非 committed outcome 只显示错误/recovery/quarantine
+  - 对话框不维护项目、术语或 Engine 副本，失败操作不得渲染部分新状态
+  - 完成时，创建、修改、删除只在 committed 后立即改变当前 term suggestions，切段或重开不会恢复旧 Engine
+  - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 7.13, 9.4, 9.5_
+  - _Boundary: QtTermbaseDialog, QtEditorWindow Refresh_
+  - _Depends: 3.4, 3.5, 4.5_
+
+- [ ] 4.7b 建立预处理的主窗口四视图刷新协调
   - preprocess apply/undo 成功后从同一 Controller snapshot 刷新 edit、browse、progress/dirty 和 suggestions
-  - committed term mutation 至少刷新资源状态与 suggestions；非 committed outcome 只显示错误/recovery/quarantine
-  - dialogs 不直接维护项目或资源副本，失败操作不得渲染部分状态
-  - 完成时，每种 mutation 后四个视图一致，切换编辑/浏览不会显示旧 target、confirmed 或 term suggestions
-  - _Requirements: 7.2, 7.3, 7.4, 9.4, 9.5_
+  - 对话框不直接维护项目副本，失败操作不得渲染部分状态
+  - 完成时，apply/undo 后四个视图一致，切换编辑/浏览不会显示旧 target 或 confirmed
+  - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.2, 5.3, 5.4, 5.5, 5.6, 9.4, 9.5_
+  - _Boundary: QtPreprocessDialog, QtEditorWindow Refresh_
+  - _Depends: 3.3, 4.4_
 
 - [x] 4.8 (P) 统一 desktop、application、window 与 dialog 的 silver logo
   - launcher 默认图标和 Qt application icon 使用 `LocalCAT-logo-silver.png`
@@ -240,7 +260,7 @@
   - 完成时，offscreen Qt journeys 覆盖所有新增入口和关键失败路径并稳定通过
   - _Requirements: 1.1, 1.7, 2.1, 2.2, 2.3, 3.1, 3.4, 3.7, 4.2, 4.4, 4.8, 5.1, 5.5, 6.1, 6.2, 6.3, 6.4, 7.1, 7.2, 7.3, 7.4, 7.8, 7.13, 9.5_
   - _Boundary: Qt Project Tool Tests_
-  - _Depends: 4.7_
+  - _Depends: 4.7a, 4.7b_
 
 - [ ] 5.3 (P) 验证 UI polish、可访问性与导入边界
   - 验证 silver logo、ellipsis 尺寸、resize、tooltip、accessible name 和键盘菜单
