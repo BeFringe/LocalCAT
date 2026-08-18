@@ -80,6 +80,7 @@ def configure_tm_threshold_entry(
     button.setProperty("fuzzyAvailable", retrieval_status.fuzzy_available)
     state_label.setText(state_text)
     state_label.setToolTip(tooltip)
+    state_label.setAccessibleName(state_text)
     state_label.setProperty("fuzzyAvailable", retrieval_status.fuzzy_available)
     for widget in (button, state_label):
         widget.style().unpolish(widget)

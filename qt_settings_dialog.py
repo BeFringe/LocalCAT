@@ -410,12 +410,32 @@ class QtSettingsDialog(QDialog):
             status_by_resource_id=status_by_resource_id,
             operation=operation,
         )
+        self._refresh_tm_lifecycle_tab_order(resources)
         if operation is not None and not operation.completed:
             self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
         else:
             self.status_label.setText(
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
             )
+
+    def _refresh_tm_lifecycle_tab_order(
+        self,
+        resources: tuple[ResourceConfig, ...],
+    ) -> None:
+        """Keep enabled lifecycle actions reachable outside table cell navigation."""
+
+        actions: list[QPushButton] = []
+        for resource in resources:
+            action = self.findChild(QPushButton, f"tmLifecycle_{resource.id}")
+            if action is not None and action.isEnabled():
+                actions.append(action)
+        if not actions:
+            return
+        previous: QWidget = self.tm_threshold_chip
+        for action in actions:
+            self.setTabOrder(previous, action)
+            previous = action
+        self.setTabOrder(previous, self.active_table)
 
     def _refresh_tm_threshold_entry(self) -> None:
         """Render the settings entry from fresh defensive Controller values."""
@@ -620,8 +640,9 @@ class QtSettingsDialog(QDialog):
         status_label.setText(text)
         status_label.setProperty("tm_mode", mode.value)
         status_label.setProperty("tmMode", mode.value)
-        if safe_codes:
-            status_label.setToolTip(" · ".join(safe_codes))
+        status_accessible_name = f"{resource.name}：{text.replace(chr(10), '；')}"
+        status_label.setAccessibleName(status_accessible_name)
+        status_label.setToolTip(status_accessible_name)
 
         if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
             action.setText("激活 canonical")

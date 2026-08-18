@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QFontMetrics,
+    QKeyEvent,
     QKeySequence,
     QResizeEvent,
     QShortcut,
@@ -102,6 +103,17 @@ QAbstractItemView#workspaceModePopup::item:selected {
     background-color: #c4e8f2;
 }
 """
+
+
+class _TMApplyButton(QPushButton):
+    """Keep TM apply reachable through both standard activation keys."""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            event.accept()
+            self.click()
+            return
+        super().keyPressEvent(event)
 
 
 class ResponsiveSplitter(QSplitter):
@@ -1609,8 +1621,17 @@ class QtEditorWindow(QMainWindow):
                 f"tmResource_{index}",
             )
             resource.setProperty("suggestionProvenance", True)
-            apply_button = QPushButton("应用译文")
+            apply_button = _TMApplyButton("应用译文")
             apply_button.setObjectName(f"applyTm_{index}")
+            apply_accessible_name = (
+                f"应用来自 {suggestion.provenance.resource_name} 的 "
+                f"{suggestion.match_type.value} 译文"
+            )
+            apply_button.setAccessibleName(apply_accessible_name)
+            apply_button.setToolTip(
+                f"{apply_accessible_name}；不会自动确认或跳转段落"
+            )
+            apply_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             apply_button.clicked.connect(
                 lambda _checked=False, current=suggestion: self.apply_tm_suggestion(
                     current
@@ -1636,8 +1657,16 @@ class QtEditorWindow(QMainWindow):
             f"{suggestion.resource_name} · {suggestion.match_type}",
             "suggestionProvenance",
         )
-        apply_button = QPushButton("应用译文")
+        apply_button = _TMApplyButton("应用译文")
         apply_button.setObjectName(f"applyTm_{index}")
+        apply_accessible_name = (
+            f"应用来自 {suggestion.resource_name} 的 {suggestion.match_type} 译文"
+        )
+        apply_button.setAccessibleName(apply_accessible_name)
+        apply_button.setToolTip(
+            f"{apply_accessible_name}；不会自动确认或跳转段落"
+        )
+        apply_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         apply_button.clicked.connect(
             lambda _checked=False, current=suggestion: self.apply_tm_suggestion(current)
         )
@@ -1683,6 +1712,8 @@ class QtEditorWindow(QMainWindow):
     ) -> QLabel:
         label = self._plain_label(message, object_name)
         label.setProperty("emptySuggestion", True)
+        label.setAccessibleName(message)
+        label.setToolTip(message)
         return label
 
     def apply_tm_suggestion(
