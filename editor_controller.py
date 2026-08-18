@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
+from uuid import uuid4
 
 from editor_contracts import (
     ConfirmResult,
@@ -20,9 +23,13 @@ from editor_contracts import (
     RecentProject,
     LegacyExactTMSuggestion,
     SuggestionBundle,
+    TMPreferences,
+    TMSuggestion,
+    TMSuggestionReport,
     TermSuggestion,
     WriteReport,
 )
+from editor_tm_adapter import EditorTMAdapter
 from editor_project import load_project, sample_project, save_project as save_project_file
 from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
@@ -39,6 +46,34 @@ class EditorControllerError(RuntimeError):
     """Raised when an editor operation cannot be completed."""
 
 
+def _clone_tm_suggestion_report(
+    report: TMSuggestionReport,
+) -> TMSuggestionReport:
+    """Create a defensive UI-contract graph with one private query identity."""
+
+    if type(report) is not TMSuggestionReport:
+        raise TypeError("TM suggestion report must be TMSuggestionReport")
+    report.__post_init__()
+    identity = replace(report.query_identity)
+    cloned = TMSuggestionReport(
+        suggestions=tuple(
+            replace(
+                suggestion,
+                provenance=replace(suggestion.provenance),
+                query_identity=identity,
+            )
+            for suggestion in report.suggestions
+        ),
+        resource_statuses=tuple(
+            replace(status) for status in report.resource_statuses
+        ),
+        retrieval_status=replace(report.retrieval_status),
+        query_identity=identity,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 class EditorController:
     """Own one immutable editor session while engines remain UI-state free."""
 
@@ -46,11 +81,29 @@ class EditorController:
         self,
         repository: ResourceRepository,
         workspace_state: WorkspaceStateRepository | None = None,
+        tm_adapter: EditorTMAdapter | None = None,
     ) -> None:
+        if tm_adapter is not None and type(tm_adapter) is not EditorTMAdapter:
+            raise TypeError("TM adapter must be EditorTMAdapter")
         self.repository = repository
         self.workspace_state = workspace_state or WorkspaceStateRepository(
             repository.config_dir
         )
+        self._tm_adapter = tm_adapter
+        self._tm_query_lock = RLock()
+        self._project_session_id = uuid4().hex
+        self._tm_query_epoch = 0
+        self._issued_tm_suggestions: tuple[TMSuggestion, ...] = ()
+        self._current_tm_report: TMSuggestionReport | None = None
+        self._observed_tm_signature: tuple[
+            str,
+            str,
+            str,
+            int,
+            int,
+            float,
+            int,
+        ] | None = None
         self._project: EditorProject | None = None
         self._current_index = 0
         self._dirty = False
@@ -77,6 +130,31 @@ class EditorController:
         return self._dirty
 
     @property
+    def project_session_id(self) -> str:
+        """Return the opaque identity of the current project session."""
+
+        return self._project_session_id
+
+    @property
+    def query_epoch(self) -> int:
+        """Return the aggregate query epoch after observing external drift."""
+
+        with self._tm_query_lock:
+            self._synchronize_tm_query_state()
+            return self._tm_query_epoch
+
+    @property
+    def issued_tm_suggestions(self) -> tuple[TMSuggestion, ...]:
+        """Return only the complete tuple issued for the current epoch."""
+
+        with self._tm_query_lock:
+            self._synchronize_tm_query_state()
+            report = self._current_tm_report
+            if report is None:
+                return ()
+            return _clone_tm_suggestion_report(report).suggestions
+
+    @property
     def has_project(self) -> bool:
         return self._project is not None
 
@@ -93,22 +171,24 @@ class EditorController:
         """Load a local JSON/TXT project and reset navigation only after success."""
 
         project = load_project(path)
-        self.set_project(project)
-        remembered = self.workspace_state.find_project(project.path or path)
-        if remembered is not None:
-            restored_index = next(
-                (
-                    index
-                    for index, segment in enumerate(project.segments)
-                    if segment.id == remembered.segment_id
-                ),
-                remembered.index
-                if remembered.index < len(project.segments)
-                else 0,
-            )
-            self._current_index = restored_index
-        self._remember_current_position()
-        return self.project
+        with self._tm_query_lock:
+            self.set_project(project)
+            remembered = self.workspace_state.find_project(project.path or path)
+            if remembered is not None:
+                restored_index = next(
+                    (
+                        index
+                        for index, segment in enumerate(project.segments)
+                        if segment.id == remembered.segment_id
+                    ),
+                    remembered.index
+                    if remembered.index < len(project.segments)
+                    else 0,
+                )
+                self._current_index = restored_index
+                self._record_current_tm_baseline()
+            self._remember_current_position()
+            return self.project
 
     def load_sample(self) -> EditorProject:
         """Open the bundled original sample project."""
@@ -120,10 +200,14 @@ class EditorController:
 
         if not project.segments:
             raise EditorControllerError("project contains no segments")
-        self._project = project
-        self._current_index = 0
-        self._dirty = False
-        return project
+        with self._tm_query_lock:
+            self._project = project
+            self._current_index = 0
+            self._dirty = False
+            self._project_session_id = uuid4().hex
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+            return project
 
     def update_target(self, target: str) -> EditorProject:
         """Persist the current edit in the immutable session and reopen confirmation."""
@@ -144,32 +228,43 @@ class EditorController:
 
         if direction == 0:
             raise EditorControllerError("navigation direction must not be zero")
-        segments = self.project.segments
-        step = 1 if direction > 0 else -1
-        if unconfirmed_only:
-            candidates = range(
-                self._current_index + step,
-                len(segments) if step > 0 else -1,
-                step,
-            )
-            destination = next(
-                (index for index in candidates if not segments[index].confirmed),
-                self._current_index,
-            )
-        else:
-            destination = min(max(self._current_index + step, 0), len(segments) - 1)
-        self._current_index = destination
-        self._remember_current_position()
-        return self.project
+        with self._tm_query_lock:
+            segments = self.project.segments
+            step = 1 if direction > 0 else -1
+            if unconfirmed_only:
+                candidates = range(
+                    self._current_index + step,
+                    len(segments) if step > 0 else -1,
+                    step,
+                )
+                destination = next(
+                    (index for index in candidates if not segments[index].confirmed),
+                    self._current_index,
+                )
+            else:
+                destination = min(
+                    max(self._current_index + step, 0),
+                    len(segments) - 1,
+                )
+            if destination != self._current_index:
+                self._current_index = destination
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+            self._remember_current_position()
+            return self.project
 
     def go_to(self, index: int) -> EditorProject:
         """Select one segment by index while preserving all current edits."""
 
         if index < 0 or index >= len(self.project.segments):
             raise EditorControllerError(f"segment index is out of range: {index}")
-        self._current_index = index
-        self._remember_current_position()
-        return self.project
+        with self._tm_query_lock:
+            if index != self._current_index:
+                self._current_index = index
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+            self._remember_current_position()
+            return self.project
 
     def save_project(self, path: Path) -> EditorProject:
         """Atomically save the current project and clear the session dirty flag."""
@@ -183,11 +278,15 @@ class EditorController:
     def close_project(self) -> None:
         """Leave the current project after the frontend has handled unsaved changes."""
 
-        if self._project is not None:
-            self._remember_current_position()
-        self._project = None
-        self._current_index = 0
-        self._dirty = False
+        with self._tm_query_lock:
+            if self._project is not None:
+                self._remember_current_position()
+            self._project = None
+            self._current_index = 0
+            self._dirty = False
+            self._project_session_id = uuid4().hex
+            self._advance_tm_query_epoch()
+            self._observed_tm_signature = None
 
     def recent_projects(self) -> tuple[RecentProject, ...]:
         """Return locally remembered projects in most-recent-first order."""
@@ -217,6 +316,70 @@ class EditorController:
             return self.workspace_state.update_display_preferences(preferences)
         except WorkspaceStateError as exc:
             raise EditorControllerError(str(exc)) from exc
+
+    def tm_suggestion_report(self) -> TMSuggestionReport:
+        """Query and atomically issue the current frozen TM suggestion tuple."""
+
+        adapter = self._tm_adapter
+        if adapter is None:
+            raise EditorControllerError("TM query adapter is not configured")
+        with self._tm_query_lock:
+            self._synchronize_tm_query_state()
+            for _attempt in range(4):
+                segment = self.current_segment
+                preferences = self.workspace_state.tm_preferences()
+                operation = adapter._query_current_operation(
+                    segment=segment,
+                    project_session_id=self._project_session_id,
+                    query_epoch=self._tm_query_epoch,
+                    preferences=preferences,
+                )
+                operation.__post_init__()
+                operation_signature = self._tm_signature(
+                    segment=segment,
+                    preferences=preferences,
+                    runtime_generation=operation.runtime_generation,
+                    retrieval_generation=operation.retrieval_generation,
+                )
+                try:
+                    current_signature = self._capture_current_tm_signature()
+                except ValueError:
+                    self._advance_tm_query_epoch()
+                    self._observed_tm_signature = None
+                    continue
+                if current_signature != operation_signature:
+                    self._advance_tm_query_epoch()
+                    self._observed_tm_signature = current_signature
+                    continue
+                if (
+                    self._observed_tm_signature is not None
+                    and operation_signature != self._observed_tm_signature
+                ):
+                    self._advance_tm_query_epoch()
+                    self._observed_tm_signature = operation_signature
+                    continue
+
+                report = operation.report
+                report.__post_init__()
+                identity = report.query_identity
+                expected_digest = hashlib.sha256(
+                    segment.source.encode("utf-8")
+                ).hexdigest()
+                if (
+                    identity.project_session_id != self._project_session_id
+                    or identity.segment_id != segment.id
+                    or identity.source_digest != expected_digest
+                    or identity.query_epoch != self._tm_query_epoch
+                ):
+                    raise EditorControllerError(
+                        "TM query report identity does not match the current session"
+                    )
+                private_report = _clone_tm_suggestion_report(report)
+                self._observed_tm_signature = operation_signature
+                self._current_tm_report = private_report
+                self._issued_tm_suggestions = private_report.suggestions
+                return report
+        raise EditorControllerError("unable to capture a stable TM query snapshot")
 
     def suggestions(self) -> SuggestionBundle:
         """Query every currently active Lookup resource for the current source."""
@@ -340,6 +503,77 @@ class EditorController:
             current_index=next_index,
             write_report=report,
         )
+
+    def _advance_tm_query_epoch(self) -> None:
+        """Invalidate every issued suggestion before advancing one epoch."""
+
+        self._issued_tm_suggestions = ()
+        self._current_tm_report = None
+        self._tm_query_epoch += 1
+
+    def _tm_signature(
+        self,
+        *,
+        segment: EditorSegment,
+        preferences: TMPreferences,
+        runtime_generation: int,
+        retrieval_generation: int,
+    ) -> tuple[str, str, str, int, int, float, int]:
+        return (
+            self._project_session_id,
+            segment.id,
+            hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+            runtime_generation,
+            retrieval_generation,
+            preferences.minimum_similarity,
+            preferences.result_limit,
+        )
+
+    def _capture_current_tm_signature(
+        self,
+    ) -> tuple[str, str, str, int, int, float, int]:
+        adapter = self._tm_adapter
+        if adapter is None:
+            raise ValueError("TM query adapter is not configured")
+        segment = self.current_segment
+        preferences = self.workspace_state.tm_preferences()
+        runtime_generation, retrieval_generation = (
+            adapter._current_query_generations()
+        )
+        return self._tm_signature(
+            segment=segment,
+            preferences=preferences,
+            runtime_generation=runtime_generation,
+            retrieval_generation=retrieval_generation,
+        )
+
+    def _record_current_tm_baseline(self) -> None:
+        if self._tm_adapter is None or self._project is None:
+            self._observed_tm_signature = None
+            return
+        try:
+            self._observed_tm_signature = self._capture_current_tm_signature()
+        except ValueError:
+            self._observed_tm_signature = None
+
+    def _synchronize_tm_query_state(self) -> None:
+        """Observe resource, capability, source, and preference changes."""
+
+        if self._tm_adapter is None or self._project is None:
+            return
+        try:
+            current = self._capture_current_tm_signature()
+        except ValueError:
+            if self._observed_tm_signature is not None:
+                self._advance_tm_query_epoch()
+                self._observed_tm_signature = None
+            return
+        if self._observed_tm_signature is None:
+            self._observed_tm_signature = current
+            return
+        if current != self._observed_tm_signature:
+            self._advance_tm_query_epoch()
+            self._observed_tm_signature = current
 
     def _remember_current_position(self) -> None:
         if self._project is None or self._project.path is None:
@@ -498,6 +732,10 @@ class EditorController:
             raise EditorControllerError(f"unable to reload language resources: {exc}") from exc
         self._tm_engines = tm_engines
         self._glossary_engines = glossary_engines
+        if self._project is not None:
+            with self._tm_query_lock:
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
 
     @staticmethod
     def _load_tm_engine(path: Path) -> TMEngine:

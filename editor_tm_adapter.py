@@ -2,8 +2,8 @@
 
 Tasks 4.1/4.2 own the canonical and legacy query lanes. Task 4.3 composes
 those lanes into the frozen, body-safe public report. Task 4.4 dispatches
-confirmed writes through one captured runtime cohort. Issued-suggestion
-membership remains in a later task.
+confirmed writes through one captured runtime cohort. EditorController Task
+5.1 owns the aggregate epoch and issued-suggestion membership.
 """
 
 from __future__ import annotations
@@ -176,6 +176,29 @@ class _LegacyQueryBatch:
         _validate_legacy_batch(self)
 
 
+@dataclass(frozen=True, slots=True)
+class _TMQueryOperation:
+    """Controller-private report plus its exact application generations."""
+
+    report: TMSuggestionReport
+    runtime_generation: int
+    retrieval_generation: int
+
+    def __post_init__(self) -> None:
+        if type(self.report) is not TMSuggestionReport:
+            raise TypeError("TM query operation report must be TMSuggestionReport")
+        self.report.__post_init__()
+        for field_name, value in (
+            ("runtime", self.runtime_generation),
+            ("retrieval", self.retrieval_generation),
+        ):
+            if type(value) is not int or value < 0:
+                raise TypeError(
+                    f"TM query operation {field_name} generation must be "
+                    "a non-negative exact int"
+                )
+
+
 class EditorTMAdapter:
     """Consume current runtime/capability snapshots without owning authority."""
 
@@ -205,6 +228,23 @@ class EditorTMAdapter:
         preferences: TMPreferences,
     ) -> TMSuggestionReport:
         """Query one current segment and return one immutable mixed report."""
+
+        return self._query_current_operation(
+            segment=segment,
+            project_session_id=project_session_id,
+            query_epoch=query_epoch,
+            preferences=preferences,
+        ).report
+
+    def _query_current_operation(
+        self,
+        *,
+        segment: EditorSegment,
+        project_session_id: str,
+        query_epoch: int,
+        preferences: TMPreferences,
+    ) -> _TMQueryOperation:
+        """Return one report with the generations captured by that query."""
 
         _validate_query_inputs(
             segment=segment,
@@ -250,12 +290,35 @@ class EditorTMAdapter:
             query_identity=query_identity,
         )
         retrieval_status = _project_retrieval_display(canonical_batch.retrieval)
-        return TMSuggestionReport(
+        report = TMSuggestionReport(
             suggestions=projected,
             resource_statuses=statuses,
             retrieval_status=retrieval_status,
             query_identity=query_identity,
         )
+        return _TMQueryOperation(
+            report=report,
+            runtime_generation=canonical_batch.runtime.generation,
+            retrieval_generation=canonical_batch.retrieval.generation,
+        )
+
+    def _current_query_generations(self) -> tuple[int, int]:
+        """Read current host generations without capturing another operation."""
+
+        runtime_generation = self._runtime_host._current_generation()
+        retrieval_generation = (
+            self._capability_host
+            .retrieval_generation_notifications()
+            .current()
+        )
+        if (
+            type(runtime_generation) is not int
+            or runtime_generation < 0
+            or type(retrieval_generation) is not int
+            or retrieval_generation < 0
+        ):
+            raise ValueError("TM query host generation drift")
+        return runtime_generation, retrieval_generation
 
     def append_confirmed(
         self,

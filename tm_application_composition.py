@@ -533,6 +533,21 @@ class TMRuntimeHost:
                 generation=self._operation_template.generation,
             )
 
+    def _current_generation(self) -> int:
+        """Return the validated current generation without cloning a snapshot."""
+
+        with self._lock:
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            generation = self._operation_template.generation
+            if type(generation) is not int or generation < 0:
+                raise ValueError("runtime generation drift")
+            return generation
+
     def refresh(
         self,
         configs: tuple[ResourceConfig, ...],
