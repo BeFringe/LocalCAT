@@ -12,9 +12,9 @@ import re
 from typing import Any, Mapping
 
 from tm_contracts import (
-    SearchOptions,
+    SearchOptions as SearchOptions,
     TMMatchType,
-    TextMatcherState,
+    TextMatcherState as TextMatcherState,
     TextMatchProfile,
 )
 

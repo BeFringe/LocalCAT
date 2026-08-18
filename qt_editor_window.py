@@ -77,6 +77,10 @@ from editor_contracts import (
     DisplayPreferences,
     EditorSegment,
     LegacyExactTMSuggestion,
+    ProjectSearchReport,
+    ProjectSearchRequest,
+    SearchField,
+    SearchOptions,
     SegmentDensity,
     SuggestionBundle,
     TermSuggestion,
@@ -84,10 +88,10 @@ from editor_contracts import (
     TMThresholdUpdateOutcome,
     TMSuggestion,
     TMSuggestionReport,
+    TextMatcherState,
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
-from editor_project import ProjectError
 from qt_settings_dialog import QtSettingsDialog
 from qt_tm_threshold import (
     TMThresholdButton,
@@ -274,6 +278,7 @@ class QtEditorWindow(QMainWindow):
         # always-initialized surface that callers receive after construction.
         self.shortcuts: dict[str, QShortcut]
         self.target_editor_shortcuts: dict[str, QShortcut]
+        self.project_search_shortcut: QShortcut
         self.project_name_label: QLabel
         self.language_label: QLabel
         self.progress_bar: QProgressBar
@@ -294,6 +299,18 @@ class QtEditorWindow(QMainWindow):
         self.segment_density_combo: QComboBox
         self.unconfirmed_filter: QCheckBox
         self.segment_list: QListWidget
+        self.project_search_input: QLineEdit
+        self.project_search_source: QCheckBox
+        self.project_search_target: QCheckBox
+        self.project_search_speaker: QCheckBox
+        self.project_search_match_case: QCheckBox
+        self.project_search_whole_word: QCheckBox
+        self.project_search_button: QPushButton
+        self.project_search_previous: QPushButton
+        self.project_search_next: QPushButton
+        self.project_search_capability: QLabel
+        self.project_search_result: QLabel
+        self.project_search_preview: QLabel
         self.browse_table: QTableWidget
         self.segment_position_label: QLabel
         self.speaker_display: QLabel
@@ -324,11 +341,32 @@ class QtEditorWindow(QMainWindow):
         self.settings_dialog: QtSettingsDialog | None = None
         self.current_suggestions = SuggestionBundle()
         self.current_tm_report: TMSuggestionReport | None = None
+        self.current_project_search_report: ProjectSearchReport | None = None
+        self._project_search_ordinal: int | None = None
         self.setObjectName("editorWindow")
         self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
+        self.setTabOrder(self.settings_button, self.project_search_input)
+        self.setTabOrder(self.project_search_input, self.project_search_source)
+        self.setTabOrder(self.project_search_source, self.project_search_target)
+        self.setTabOrder(self.project_search_target, self.project_search_speaker)
+        self.setTabOrder(
+            self.project_search_speaker,
+            self.project_search_match_case,
+        )
+        self.setTabOrder(
+            self.project_search_match_case,
+            self.project_search_whole_word,
+        )
+        self.setTabOrder(
+            self.project_search_whole_word,
+            self.project_search_button,
+        )
+        self.setTabOrder(self.project_search_button, self.project_search_previous)
+        self.setTabOrder(self.project_search_previous, self.project_search_next)
+        self.setTabOrder(self.project_search_next, self.segment_list)
         self.setTabOrder(self.confirm_button, self.tm_threshold_chip)
         self.apply_editor_font_size(self.editor_font_size)
         self.source_display.viewport().installEventFilter(self)
@@ -513,6 +551,8 @@ class QtEditorWindow(QMainWindow):
         page.setObjectName("editorPage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(self._build_project_search_bar())
 
         self.main_splitter = ResponsiveSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setObjectName("mainWorkspaceSplitter")
@@ -535,6 +575,139 @@ class QtEditorWindow(QMainWindow):
         self.workspace_pages.addWidget(self._build_browse_panel())
         layout.addWidget(self.workspace_pages)
         return page
+
+    def _build_project_search_bar(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("projectSearchPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(6)
+
+        query_row = QHBoxLayout()
+        query_row.setSpacing(8)
+        title = QLabel("项目搜索")
+        title.setObjectName("projectSearchTitle")
+        self.project_search_input = QLineEdit()
+        self.project_search_input.setObjectName("projectSearchQuery")
+        self.project_search_input.setPlaceholderText("在当前 JSON 项目中搜索…")
+        self.project_search_input.setClearButtonEnabled(True)
+        self.project_search_input.setAccessibleName("项目搜索关键词")
+        self.project_search_input.setToolTip(
+            "输入非空关键词并按 Enter 搜索当前 JSON 项目"
+        )
+        self.project_search_button = QPushButton("搜索")
+        self.project_search_button.setObjectName("projectSearchSubmit")
+        self.project_search_button.setAccessibleName("执行项目搜索")
+        self.project_search_button.setToolTip("执行当前项目搜索")
+        query_row.addWidget(title)
+        query_row.addWidget(self.project_search_input, 1)
+        query_row.addWidget(self.project_search_button)
+        layout.addLayout(query_row)
+
+        options_row = QHBoxLayout()
+        options_row.setSpacing(10)
+        scope = QLabel("范围")
+        scope.setObjectName("projectSearchScopeLabel")
+        self.project_search_source = self._project_search_checkbox(
+            "Source",
+            "projectSearchSource",
+            "搜索 source 字段",
+            checked=True,
+        )
+        self.project_search_target = self._project_search_checkbox(
+            "Target",
+            "projectSearchTarget",
+            "搜索 target 字段",
+            checked=True,
+        )
+        self.project_search_speaker = self._project_search_checkbox(
+            "Speaker",
+            "projectSearchSpeaker",
+            "搜索 raw speaker 字段",
+            checked=True,
+        )
+        self.project_search_match_case = self._project_search_checkbox(
+            "Match Case",
+            "projectSearchMatchCase",
+            "区分大小写；仅在 TEXT_V1 已验证时参与搜索",
+        )
+        self.project_search_whole_word = self._project_search_checkbox(
+            "Whole Word",
+            "projectSearchWholeWord",
+            "全词匹配；纯 CJK 语义由 Core 决定",
+        )
+        self.project_search_previous = QPushButton("←")
+        self.project_search_previous.setObjectName("projectSearchPrevious")
+        self.project_search_previous.setAccessibleName("上一个搜索结果")
+        self.project_search_previous.setToolTip(
+            "上一个搜索结果；位于第一个结果时停用"
+        )
+        self.project_search_next = QPushButton("→")
+        self.project_search_next.setObjectName("projectSearchNext")
+        self.project_search_next.setAccessibleName("下一个搜索结果")
+        self.project_search_next.setToolTip(
+            "下一个搜索结果；位于最后一个结果时停用"
+        )
+        options_row.addWidget(scope)
+        options_row.addWidget(self.project_search_source)
+        options_row.addWidget(self.project_search_target)
+        options_row.addWidget(self.project_search_speaker)
+        options_row.addSpacing(8)
+        options_row.addWidget(self.project_search_match_case)
+        options_row.addWidget(self.project_search_whole_word)
+        options_row.addStretch()
+        options_row.addWidget(self.project_search_previous)
+        options_row.addWidget(self.project_search_next)
+        layout.addLayout(options_row)
+
+        feedback_row = QHBoxLayout()
+        feedback_row.setSpacing(12)
+        self.project_search_capability = QLabel("搜索能力尚未读取。")
+        self.project_search_capability.setObjectName("projectSearchCapability")
+        self.project_search_capability.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_search_capability.setAccessibleName("项目搜索能力状态")
+        self.project_search_capability.setToolTip(
+            "显示当前项目与 Core TextMatcher 的真实可用状态"
+        )
+        self.project_search_result = QLabel("尚未搜索。")
+        self.project_search_result.setObjectName("projectSearchResult")
+        self.project_search_result.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_search_result.setAccessibleName("项目搜索结果状态：尚未搜索")
+        self.project_search_result.setToolTip(
+            "显示结果总数、当前序号、命中字段和段落"
+        )
+        feedback_row.addWidget(self.project_search_capability, 1)
+        feedback_row.addWidget(self.project_search_result)
+        layout.addLayout(feedback_row)
+
+        self.project_search_preview = QLabel("预览：—")
+        self.project_search_preview.setObjectName("projectSearchPreview")
+        self.project_search_preview.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_search_preview.setWordWrap(True)
+        self.project_search_preview.setMaximumHeight(42)
+        self.project_search_preview.setAccessibleName("当前搜索结果预览：无")
+        self.project_search_preview.setToolTip(
+            "当前命中字段的原始纯文本预览"
+        )
+        layout.addWidget(self.project_search_preview)
+        self.project_search_previous.setEnabled(False)
+        self.project_search_next.setEnabled(False)
+        return panel
+
+    @staticmethod
+    def _project_search_checkbox(
+        text: str,
+        object_name: str,
+        description: str,
+        *,
+        checked: bool = False,
+    ) -> QCheckBox:
+        checkbox = QCheckBox(text)
+        checkbox.setObjectName(object_name)
+        checkbox.setChecked(checked)
+        checkbox.setAccessibleName(description)
+        checkbox.setToolTip(description)
+        return checkbox
 
     def _build_segment_panel(self) -> QWidget:
         panel = QFrame()
@@ -775,6 +948,18 @@ class QtEditorWindow(QMainWindow):
             self._workspace_mode_changed
         )
         self.browse_table.cellDoubleClicked.connect(self._activate_browse_row)
+        self.project_search_input.returnPressed.connect(
+            self._submit_project_search
+        )
+        self.project_search_button.clicked.connect(
+            self._submit_project_search
+        )
+        self.project_search_previous.clicked.connect(
+            lambda: self._navigate_project_search(-1)
+        )
+        self.project_search_next.clicked.connect(
+            lambda: self._navigate_project_search(1)
+        )
 
     def _install_shortcuts(self) -> None:
         bindings = (
@@ -820,6 +1005,14 @@ class QtEditorWindow(QMainWindow):
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(callback)
             self.shortcuts[name] = shortcut
+        self.project_search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.project_search_shortcut.setObjectName("projectSearchFocusShortcut")
+        self.project_search_shortcut.setContext(
+            Qt.ShortcutContext.WindowShortcut
+        )
+        self.project_search_shortcut.activated.connect(
+            self._focus_project_search
+        )
         self._install_target_editor_shortcuts()
         self._update_shortcut_tooltips()
 
@@ -883,6 +1076,19 @@ class QtEditorWindow(QMainWindow):
             f"(编辑 {self._native_shortcut_text(self.shortcuts['workspace_edit'])} / "
             f"校对 {self._native_shortcut_text(self.shortcuts['workspace_browse'])})"
         )
+        project_search_shortcut = self._native_shortcut_text(
+            self.project_search_shortcut
+        )
+        self.project_search_input.setToolTip(
+            f"输入非空关键词并按 Enter 搜索当前 JSON 项目 ({project_search_shortcut})"
+        )
+        self.project_search_button.setToolTip(
+            f"执行当前项目搜索；{project_search_shortcut} 聚焦关键词"
+        )
+
+    def _focus_project_search(self) -> None:
+        self.project_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.project_search_input.selectAll()
 
     def _install_target_editor_shortcuts(self) -> None:
         bindings = (
@@ -1010,6 +1216,8 @@ class QtEditorWindow(QMainWindow):
         self.close_project_action.setEnabled(False)
         self.workspace_mode_combo.setEnabled(False)
         self.segment_density_combo.setEnabled(False)
+        self._clear_project_search_results("打开 JSON 项目后可搜索。")
+        self._refresh_project_search_controls()
         self.statusBar().showMessage("打开本地项目或载入示例以开始。")
 
     def load_sample(self) -> bool:
@@ -1025,7 +1233,7 @@ class QtEditorWindow(QMainWindow):
             return False
         try:
             self.controller.open_project(path)
-        except (ProjectError, EditorControllerError, OSError, ValueError) as exc:
+        except (EditorControllerError, OSError, ValueError) as exc:
             self._show_error("无法打开项目", str(exc))
             self.statusBar().showMessage("项目打开失败；当前会话保持不变。", 7000)
             return False
@@ -1037,7 +1245,7 @@ class QtEditorWindow(QMainWindow):
     def save_project_path(self, path: Path) -> bool:
         try:
             self.controller.save_project(path)
-        except (ProjectError, EditorControllerError, OSError, ValueError) as exc:
+        except (EditorControllerError, OSError, ValueError) as exc:
             self._show_error("无法保存项目", str(exc))
             self.statusBar().showMessage("保存失败。", 7000)
             return False
@@ -1136,6 +1344,7 @@ class QtEditorWindow(QMainWindow):
         self.close_project_action.setEnabled(True)
         self.workspace_mode_combo.setEnabled(True)
         self.segment_density_combo.setEnabled(True)
+        self._clear_project_search_results()
         self._refreshing = True
         try:
             project = self.controller.project
@@ -1178,6 +1387,10 @@ class QtEditorWindow(QMainWindow):
         if self._refreshing or not self.controller.has_project:
             return
         self.controller.update_target(self.target_editor.toPlainText())
+        if self.current_project_search_report is not None:
+            self._clear_project_search_results(
+                "搜索结果已过期；请按当前项目内容重新搜索。"
+            )
         if self.unconfirmed_filter.isChecked():
             self._refreshing = True
             try:
@@ -1499,6 +1712,228 @@ class QtEditorWindow(QMainWindow):
         finally:
             self._refreshing = False
 
+    def _refresh_project_search_controls(self) -> None:
+        """Project the current JSON and matcher gates without executing search."""
+
+        project_capability = self.controller.project_tool_capability()
+        display = None
+        search_available = False
+        advanced_available = False
+        if not project_capability.single_json_tools_available:
+            code = project_capability.unavailable_reason or (
+                "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+            )
+            detail = (
+                "请打开一个本地 JSON 项目"
+                if code == "PROJECT_TOOLS.NO_PROJECT"
+                else "当前项目不是本规格支持的单 JSON 项目"
+            )
+            message = f"搜索不可用：{code}（{detail}）。"
+        else:
+            try:
+                handoff = self.controller.text_matcher_handoff()
+            except EditorControllerError as exc:
+                message = f"搜索不可用：{exc}。"
+            else:
+                display = handoff.display
+                if display.state is TextMatcherState.BASIC_VALIDATED:
+                    search_available = True
+                    message = (
+                        "BASIC 搜索可用；Match Case / Whole Word 属于第二阶段，"
+                        "当前不参与搜索。"
+                    )
+                elif display.state is TextMatcherState.TEXT_V1_VALIDATED:
+                    search_available = True
+                    advanced_available = True
+                    message = (
+                        "TEXT_V1 搜索可用；Match Case / Whole Word 已使用 Core 语义。"
+                    )
+                else:
+                    code = display.safe_reason or "MATCHER.UNAVAILABLE"
+                    message = f"搜索不可用：{code}。"
+
+        self.project_search_button.setEnabled(search_available)
+        for checkbox in (
+            self.project_search_source,
+            self.project_search_target,
+            self.project_search_speaker,
+        ):
+            checkbox.setEnabled(search_available)
+        self.project_search_match_case.setEnabled(advanced_available)
+        self.project_search_whole_word.setEnabled(advanced_available)
+        self.project_search_capability.setText(message)
+        self.project_search_capability.setAccessibleName(
+            f"项目搜索能力状态：{message}"
+        )
+        self.project_search_capability.setToolTip(message)
+
+        report = self.current_project_search_report
+        if report is not None and (
+            not search_available
+            or display is None
+            or report.capability != display
+        ):
+            self._clear_project_search_results(
+                "搜索能力已变化；请重新搜索。"
+            )
+
+    def _selected_project_search_fields(self) -> tuple[SearchField, ...]:
+        return tuple(
+            field
+            for field, checkbox in (
+                (SearchField.SOURCE, self.project_search_source),
+                (SearchField.TARGET, self.project_search_target),
+                (SearchField.SPEAKER, self.project_search_speaker),
+            )
+            if checkbox.isChecked()
+        )
+
+    def _project_search_options(self) -> SearchOptions:
+        """Ignore disabled visual state and preserve BASIC false/false."""
+
+        return SearchOptions(
+            match_case=(
+                self.project_search_match_case.isEnabled()
+                and self.project_search_match_case.isChecked()
+            ),
+            whole_word=(
+                self.project_search_whole_word.isEnabled()
+                and self.project_search_whole_word.isChecked()
+            ),
+        )
+
+    def _submit_project_search(self) -> None:
+        """Issue one Controller search and activate its first issued hit."""
+
+        if not self.project_search_button.isEnabled():
+            self._clear_project_search_results(
+                "搜索当前不可用；请查看能力说明。"
+            )
+            return
+        query = self.project_search_input.text()
+        if not query.strip():
+            self._clear_project_search_results("请输入有效关键词。")
+            self.statusBar().showMessage("请输入有效搜索关键词。", 5000)
+            return
+        fields = self._selected_project_search_fields()
+        if not fields:
+            self._clear_project_search_results("请至少选择一个搜索字段。")
+            self.statusBar().showMessage("请至少选择一个搜索字段。", 5000)
+            return
+        request = ProjectSearchRequest(
+            query=query,
+            fields=fields,
+            options=self._project_search_options(),
+        )
+        try:
+            report = self.controller.search_project(request)
+        except EditorControllerError as exc:
+            self._clear_project_search_results(f"搜索失败：{exc}。")
+            self.statusBar().showMessage(f"项目搜索失败：{exc}", 7000)
+            return
+
+        self.current_project_search_report = report
+        if not report.hits:
+            self._project_search_ordinal = None
+            self.project_search_result.setText("没有找到匹配结果。")
+            self.project_search_result.setAccessibleName(
+                "项目搜索结果状态：没有找到匹配结果"
+            )
+            self.project_search_preview.setText("预览：—")
+            self.project_search_preview.setAccessibleName(
+                "当前搜索结果预览：无"
+            )
+            self.project_search_previous.setEnabled(False)
+            self.project_search_next.setEnabled(False)
+            self.statusBar().showMessage("项目搜索没有找到匹配结果。", 5000)
+            return
+
+        if self._activate_project_search_ordinal(0):
+            self.statusBar().showMessage(
+                f"项目搜索找到 {report.total} 个结果。",
+                5000,
+            )
+
+    def _navigate_project_search(self, direction: int) -> None:
+        report = self.current_project_search_report
+        ordinal = self._project_search_ordinal
+        if report is None or ordinal is None or direction not in (-1, 1):
+            return
+        candidate = ordinal + direction
+        if 0 <= candidate < report.total:
+            _ = self._activate_project_search_ordinal(candidate)
+
+    def _activate_project_search_ordinal(self, ordinal: int) -> bool:
+        report = self.current_project_search_report
+        if report is None or not 0 <= ordinal < report.total:
+            return False
+        previous_index = self.controller.current_index
+        try:
+            _ = self.controller.go_to_search_hit(report.hits[ordinal])
+        except EditorControllerError as exc:
+            self._clear_project_search_results(
+                f"搜索结果已过期：{exc}；请重新搜索。"
+            )
+            self.statusBar().showMessage(
+                "搜索结果已过期，请重新搜索。",
+                7000,
+            )
+            return False
+
+        self._project_search_ordinal = ordinal
+        self._refreshing = True
+        try:
+            self._select_project_index(self.controller.current_index)
+            self._render_current_segment(
+                reset_target_history=(
+                    self.controller.current_index != previous_index
+                )
+            )
+            if self.workspace_mode is WorkspaceMode.BROWSE:
+                self._refresh_browse_table()
+        finally:
+            self._refreshing = False
+        self._render_project_search_hit()
+        return True
+
+    def _render_project_search_hit(self) -> None:
+        report = self.current_project_search_report
+        ordinal = self._project_search_ordinal
+        if report is None or ordinal is None or not 0 <= ordinal < report.total:
+            return
+        hit = report.hits[ordinal]
+        field = hit.field.value.upper()
+        result = (
+            f"共 {report.total} 个结果 · 第 {ordinal + 1} 个 · "
+            f"{field} · 段落 {hit.segment_index + 1}"
+        )
+        preview = f"预览（{field}）：{hit.preview}"
+        self.project_search_result.setText(result)
+        self.project_search_result.setAccessibleName(
+            f"项目搜索结果状态：{result}"
+        )
+        self.project_search_result.setToolTip(result)
+        self.project_search_preview.setText(preview)
+        self.project_search_preview.setAccessibleName(
+            f"当前搜索结果预览：{preview}"
+        )
+        self.project_search_preview.setToolTip(hit.preview)
+        self.project_search_previous.setEnabled(ordinal > 0)
+        self.project_search_next.setEnabled(ordinal + 1 < report.total)
+
+    def _clear_project_search_results(self, message: str = "尚未搜索。") -> None:
+        self.current_project_search_report = None
+        self._project_search_ordinal = None
+        self.project_search_result.setText(message)
+        self.project_search_result.setAccessibleName(
+            f"项目搜索结果状态：{message}"
+        )
+        self.project_search_preview.setText("预览：—")
+        self.project_search_preview.setAccessibleName("当前搜索结果预览：无")
+        self.project_search_preview.setToolTip("当前命中字段的原始纯文本预览")
+        self.project_search_previous.setEnabled(False)
+        self.project_search_next.setEnabled(False)
+
     def confirm_current(self) -> bool:
         if not self.controller.has_project:
             return False
@@ -1551,6 +1986,7 @@ class QtEditorWindow(QMainWindow):
     def refresh_suggestions(self) -> SuggestionBundle:
         """Render the current controller bundle as safe, actionable cards."""
 
+        self._refresh_project_search_controls()
         if not self.controller.has_project:
             self.current_suggestions = SuggestionBundle()
             self.current_tm_report = None
@@ -2140,6 +2576,76 @@ QFrame#segmentPanel, QFrame#editPanel, QFrame#suggestionPanel {
     border: 1px solid #d6e0ea;
     border-radius: 8px;
     padding: 12px;
+}
+QFrame#projectSearchPanel {
+    background: #ffffff;
+    border: 1px solid #d6e0ea;
+    border-radius: 8px;
+}
+QLabel#projectSearchTitle {
+    color: #17314b;
+    font-size: 13px;
+    font-weight: 750;
+}
+QLabel#projectSearchScopeLabel {
+    color: #64778b;
+    font-size: 10px;
+    font-weight: 700;
+}
+QLineEdit#projectSearchQuery {
+    min-height: 30px;
+    color: #1c2b3a;
+    background: #fbfcfe;
+    border: 1px solid #cbd7e2;
+    border-radius: 5px;
+    padding: 0 9px;
+    selection-background-color: #87d8eb;
+}
+QLineEdit#projectSearchQuery:focus {
+    border: 2px solid #0a9ec7;
+    background: #ffffff;
+}
+QCheckBox#projectSearchSource,
+QCheckBox#projectSearchTarget,
+QCheckBox#projectSearchSpeaker,
+QCheckBox#projectSearchMatchCase,
+QCheckBox#projectSearchWholeWord {
+    color: #405367;
+    font-size: 11px;
+}
+QCheckBox#projectSearchMatchCase:disabled,
+QCheckBox#projectSearchWholeWord:disabled {
+    color: #8897a5;
+}
+QPushButton#projectSearchSubmit {
+    color: white;
+    background: #079fc9;
+    border-color: #079fc9;
+}
+QPushButton#projectSearchSubmit:hover {
+    background: #078bb2;
+}
+QPushButton#projectSearchPrevious,
+QPushButton#projectSearchNext {
+    min-width: 32px;
+    max-width: 36px;
+    padding: 0;
+}
+QLabel#projectSearchCapability {
+    color: #66798d;
+    font-size: 10px;
+}
+QLabel#projectSearchResult {
+    color: #24455f;
+    font-size: 10px;
+    font-weight: 650;
+}
+QLabel#projectSearchPreview {
+    color: #405367;
+    background: #f5f8fb;
+    border-radius: 4px;
+    padding: 4px 7px;
+    font-size: 10px;
 }
 QFrame#browsePanel {
     background: #ffffff;
