@@ -11,7 +11,12 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
-from tm_contracts import TMMatchType, TextMatcherState, TextMatchProfile
+from tm_contracts import (
+    SearchOptions,
+    TMMatchType,
+    TextMatcherState,
+    TextMatchProfile,
+)
 
 
 DEFAULT_EDITOR_FONT_SIZE = 15
@@ -49,6 +54,14 @@ class WorkspaceMode(str, Enum):
 
     EDIT = "edit"
     BROWSE = "browse"
+
+
+class SearchField(str, Enum):
+    """Searchable raw fields in one JSON project segment."""
+
+    SOURCE = "source"
+    TARGET = "target"
+    SPEAKER = "speaker"
 
 
 class TermMatchPolicy(str, Enum):
@@ -1229,6 +1242,213 @@ class TextMatcherDisplayState:
             raise ValueError(
                 "matcher display profiles must exactly match the Core state"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectToolCapability:
+    """Single-JSON project-tool availability for one editor session."""
+
+    project_session_id: str | None
+    single_json_tools_available: bool
+    project_kind: str
+    unavailable_reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.project_session_id is not None:
+            _validate_exact_non_empty_string(
+                self.project_session_id,
+                "project tool session id",
+            )
+        _validate_exact_bool(
+            self.single_json_tools_available,
+            "single JSON tools available state",
+        )
+        _validate_exact_non_empty_string(
+            self.project_kind,
+            "project tool project kind",
+        )
+
+        if self.single_json_tools_available:
+            if self.project_session_id is None:
+                raise ValueError(
+                    "available project tools require a project session"
+                )
+            if self.project_kind != "json":
+                raise ValueError(
+                    "single JSON tools require the json project kind"
+                )
+            if self.unavailable_reason is not None:
+                raise ValueError(
+                    "available project tools must omit unavailable reason"
+                )
+            return
+
+        if self.unavailable_reason is None:
+            raise ValueError(
+                "unavailable project tools require an unavailable reason"
+            )
+        _validate_safe_code(
+            self.unavailable_reason,
+            "project tools unavailable reason",
+        )
+
+
+_SEARCH_FIELD_ORDER = {
+    SearchField.SOURCE: 0,
+    SearchField.TARGET: 1,
+    SearchField.SPEAKER: 2,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectSearchRequest:
+    """One field selection and Core-owned option set for project search."""
+
+    query: str
+    fields: tuple[SearchField, ...]
+    options: SearchOptions
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(self.query, "project search query")
+        if type(self.fields) is not tuple:
+            raise TypeError("project search fields must be an exact tuple")
+        if not self.fields:
+            raise ValueError("project search fields must not be empty")
+        if any(type(field) is not SearchField for field in self.fields):
+            raise TypeError(
+                "project search fields must contain SearchField values"
+            )
+        if len(self.fields) != len(set(self.fields)):
+            raise ValueError("project search fields must not contain duplicates")
+        field_order = tuple(_SEARCH_FIELD_ORDER[field] for field in self.fields)
+        if field_order != tuple(sorted(field_order)):
+            raise ValueError(
+                "project search fields must use source-target-speaker order"
+            )
+        if type(self.options) is not SearchOptions:
+            raise TypeError(
+                "project search options must be exact Core SearchOptions"
+            )
+        self.options.__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectSearchHit:
+    """One half-open match range bound to stable project navigation identity."""
+
+    segment_id: str
+    segment_index: int
+    field: SearchField
+    start_index: int
+    end_index: int
+    preview: str
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.segment_id,
+            "project search hit segment id",
+        )
+        _validate_exact_nonnegative_int(
+            self.segment_index,
+            "project search hit segment index",
+        )
+        if type(self.field) is not SearchField:
+            raise TypeError("project search hit field must be SearchField")
+        _validate_exact_nonnegative_int(
+            self.start_index,
+            "project search hit start index",
+        )
+        _validate_exact_nonnegative_int(
+            self.end_index,
+            "project search hit end index",
+        )
+        if self.end_index <= self.start_index:
+            raise ValueError(
+                "project search hit end index must be greater than start index"
+            )
+        _validate_exact_raw_text(self.preview, "project search hit preview")
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectSearchReport:
+    """Stable ordered hits plus the exact Integration matcher projection."""
+
+    hits: tuple[ProjectSearchHit, ...]
+    capability: TextMatcherDisplayState
+
+    def __post_init__(self) -> None:
+        if type(self.hits) is not tuple:
+            raise TypeError("project search report hits must be an exact tuple")
+        if any(type(hit) is not ProjectSearchHit for hit in self.hits):
+            raise TypeError(
+                "project search report hits must contain ProjectSearchHit values"
+            )
+        for hit in self.hits:
+            hit.__post_init__()
+        if type(self.capability) is not TextMatcherDisplayState:
+            raise TypeError(
+                "project search report capability must be TextMatcherDisplayState"
+            )
+        self.capability.__post_init__()
+        if (
+            self.capability.state is TextMatcherState.UNAVAILABLE
+            and self.hits
+        ):
+            raise ValueError(
+                "unavailable project search report cannot contain hits"
+            )
+
+        identities_by_index: dict[int, str] = {}
+        indexes_by_identity: dict[str, int] = {}
+        hit_identities: list[tuple[str, SearchField, int, int]] = []
+        sort_keys: list[tuple[int, int, int, int]] = []
+        for hit in self.hits:
+            known_identity = identities_by_index.setdefault(
+                hit.segment_index,
+                hit.segment_id,
+            )
+            if known_identity != hit.segment_id:
+                raise ValueError(
+                    "project search segment index must have one stable identity"
+                )
+            known_index = indexes_by_identity.setdefault(
+                hit.segment_id,
+                hit.segment_index,
+            )
+            if known_index != hit.segment_index:
+                raise ValueError(
+                    "project search segment identity must have one stable index"
+                )
+            hit_identities.append(
+                (
+                    hit.segment_id,
+                    hit.field,
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+            sort_keys.append(
+                (
+                    hit.segment_index,
+                    _SEARCH_FIELD_ORDER[hit.field],
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+        if len(hit_identities) != len(set(hit_identities)):
+            raise ValueError(
+                "project search report must not contain duplicate hits"
+            )
+        if sort_keys != sorted(sort_keys):
+            raise ValueError(
+                "project search report hits must use stable project order"
+            )
+
+    @property
+    def total(self) -> int:
+        """Return the derived result count without duplicating report state."""
+
+        return len(self.hits)
 
 
 @dataclass(frozen=True, slots=True)

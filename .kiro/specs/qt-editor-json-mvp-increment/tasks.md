@@ -6,7 +6,7 @@
 
 - [ ] 1. 建立冻结契约与能力边界
 
-- [ ] 1.1a 建立单 JSON 搜索与 matcher 能力契约
+- [x] 1.1a 建立单 JSON 搜索与 matcher 能力契约
   - 覆盖项目工具可用性、搜索字段、命中、报告和三态 matcher readiness
   - 约束基础能力、高级选项与 Integration `TextMatcherDisplayState` 的合法组合，不定义第二份 readiness/digest authority
   - 完成时，合法契约可稳定构造，非法 capability、tuple 或 offset 组合会在边界测试中失败
