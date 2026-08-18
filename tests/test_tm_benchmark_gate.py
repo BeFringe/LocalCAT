@@ -344,7 +344,7 @@ def _capability_publisher(
         RetrievalCapabilityEvaluator(
             expectation if expectation is not None else _capability_expectation()
         ),
-        initial_manifest=None,
+        initial_manifest=_base_capability_manifest(),
         evaluated_at_utc=_EVALUATED_AT,
     )
 
@@ -2035,6 +2035,7 @@ class GateDPublicationTests(unittest.TestCase):
             evaluator_digest=hashlib.sha256(b"other-evaluator").hexdigest()
         )
         publisher = _capability_publisher(mismatched)
+        initial = publisher.snapshot()
         bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
         with self.assertRaises(BenchmarkGateDError) as ctx:
             self._publish(_base_capability_manifest(), bundle, publisher)
@@ -2042,12 +2043,186 @@ class GateDPublicationTests(unittest.TestCase):
             ctx.exception.error_code,
             "GATE_D.PUBLICATION_DECISION_MISMATCH",
         )
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_expired_gate_c_base_never_commits_gate_d_candidate(self) -> None:
+        base = _base_capability_manifest()
+        publisher = RetrievalCapabilityPublisher(
+            RetrievalCapabilityEvaluator(_capability_expectation()),
+            initial_manifest=base,
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        initial = publisher.snapshot()
+        self.assertTrue(initial.context.available)
+        self.assertTrue(initial.fuzzy_core.available)
+        expired = datetime(2026, 8, 15, tzinfo=timezone.utc)
+
+        with self.assertRaises(BenchmarkGateDError):
+            publish_retrieval_capability_gate_d(
+                base,
+                self._run_result(_combined_bundle()),
+                publisher,
+                generated_at_utc=_GENERATED_AT,
+                valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=expired,
+            )
+
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_concurrent_publisher_change_aborts_before_gate_d_commit(
+        self,
+    ) -> None:
+        base = _base_capability_manifest()
+        publisher = _capability_publisher()
+        fingerprint = benchmark_implementation_fingerprint()
+        concurrent: list[RetrievalCapabilitySnapshot] = []
+        calls: list[None] = []
+
+        def observed_fingerprint() -> str:
+            if concurrent:
+                raise AssertionError("fingerprint called more than twice")
+            if not calls:
+                calls.append(None)
+                return fingerprint
+            concurrent.append(
+                publisher.refresh(base, evaluated_at_utc=_EVALUATED_AT)
+            )
+            return fingerprint
+
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_implementation_fingerprint",
+            side_effect=observed_fingerprint,
+        ):
+            with self.assertRaises(BenchmarkGateDError):
+                self._publish(
+                    base,
+                    _combined_bundle(fts5_missing=0, fallback_missing=0),
+                    publisher,
+                )
+
+        self.assertEqual(len(concurrent), 1)
+        self.assertIs(publisher.snapshot(), concurrent[0])
+
+    def test_publication_validator_failure_never_mutates_publisher(self) -> None:
+        publisher = _capability_publisher()
+        initial = publisher.snapshot()
+        failure = BenchmarkGateDError(
+            "GATE_D.PUBLICATION_DECISION_MISMATCH"
+        )
+
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "_verify_path_decisions_match_reports",
+            side_effect=failure,
+        ):
+            with self.assertRaises(BenchmarkGateDError) as ctx:
+                self._publish(
+                    _base_capability_manifest(),
+                    _combined_bundle(fts5_missing=0, fallback_missing=0),
+                    publisher,
+                )
+
+        self.assertIs(ctx.exception, failure)
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_publication_result_constructor_failure_never_mutates_publisher(
+        self,
+    ) -> None:
+        publisher = _capability_publisher()
+        initial = publisher.snapshot()
+        failure = AssertionError("publication result constructor failed")
+
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "RetrievalCapabilityPublicationResult",
+            side_effect=failure,
+        ):
+            with self.assertRaises(AssertionError) as ctx:
+                self._publish(
+                    _base_capability_manifest(),
+                    _combined_bundle(fts5_missing=0, fallback_missing=0),
+                    publisher,
+                )
+
+        self.assertIs(ctx.exception, failure)
+        self.assertIs(publisher.snapshot(), initial)
+
+    def test_prepared_publication_commits_through_captured_slot_descriptor(
+        self,
+    ) -> None:
+        base = _base_capability_manifest()
+        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        publisher = _capability_publisher()
+        initial = publisher.snapshot()
+        publisher_type = type(publisher)
+        slot_name = "_RetrievalCapabilityPublisher__snapshot"
+        original_descriptor = publisher_type.__dict__[slot_name]
+        foreign_sets: list[object] = []
+
+        class FailingSnapshotDescriptor:
+            def __get__(self, instance: object, owner: object) -> object:
+                return original_descriptor.__get__(instance, owner)
+
+            def __set__(self, instance: object, value: object) -> None:
+                del instance
+                foreign_sets.append(value)
+                raise AssertionError(
+                    "late snapshot descriptor ran after Core prepare"
+                )
+
+        def prepare_publication(
+            result: RetrievalCapabilityPublicationResult,
+        ) -> RetrievalCapabilityPublicationResult:
+            setattr(
+                publisher_type,
+                slot_name,
+                FailingSnapshotDescriptor(),
+            )
+            return result
+
+        try:
+            result = (
+                tm_benchmark_gate
+                ._publish_retrieval_capability_gate_d_prepared(
+                    base,
+                    self._run_result(bundle),
+                    publisher,
+                    generated_at_utc=_GENERATED_AT,
+                    valid_until_utc=_VALID_UNTIL,
+                    evaluated_at_utc=_EVALUATED_AT,
+                    prepare_publication=prepare_publication,
+                    _publication_bindings=(
+                        tm_benchmark_gate
+                        ._publication_bindings_from_current_globals()
+                    ),
+                )
+            )
+        finally:
+            setattr(publisher_type, slot_name, original_descriptor)
+
+        self.assertEqual(foreign_sets, [])
+        self.assertIs(result.snapshot, publisher.snapshot())
+        self.assertIsNot(result.snapshot, initial)
+        self.assertTrue(result.snapshot.fts5_trigram.available)
+        self.assertTrue(result.snapshot.gram_fallback.available)
 
     def test_publication_refreshes_exactly_once_and_returns_immutable_result(
         self,
     ) -> None:
         source = (_ROOT / "tm_benchmark_gate.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count("publisher.refresh("), 1)
+        publication_source = inspect.getsource(
+            tm_benchmark_gate._publish_retrieval_capability_gate_d_prepared
+        )
+        self.assertEqual(
+            publication_source.count("publication_result = validated_transition("),
+            1,
+        )
+        self.assertNotIn(
+            "_validated_refresh_retrieval_capability(",
+            publication_source,
+        )
+        self.assertNotIn("publisher.refresh(", publication_source)
         bundle = _combined_bundle()
         publisher = _capability_publisher()
         result = self._publish(_base_capability_manifest(), bundle, publisher)
@@ -2269,12 +2444,17 @@ class PortabilityAndBoundaryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         # Task 8.5 publication requires the owner to import and use the
         # exact Manifest/Publisher/Snapshot types and to compose exactly one
-        # new manifest through exactly one publisher refresh.
+        # new manifest through exactly one validated Core transition.
         self.assertIn("RetrievalCapabilityManifest", source)
         self.assertIn("RetrievalCapabilityPublisher", source)
         self.assertIn("RetrievalCapabilitySnapshot", source)
-        self.assertIn("RetrievalCapabilityManifest(", source)
-        self.assertEqual(source.count("publisher.refresh("), 1)
+        self.assertIn("RetrievalCapabilityManifest,", source)
+        self.assertIn("new_manifest = manifest_type(", source)
+        self.assertEqual(
+            source.count("publication_result = validated_transition("),
+            1,
+        )
+        self.assertNotIn("publisher.refresh(", source)
         # The owner must never import or construct the evaluator, create a
         # publisher/evaluator expectation or snapshot itself, or bypass the
         # publisher to grant availability.

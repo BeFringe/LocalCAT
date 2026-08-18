@@ -32,11 +32,12 @@ runner result, an exact ``RetrievalCapabilityPublisher`` and explicit UTC
 instants;
 it composes one new manifest preserving every envelope and Gate C fact
 byte-for-byte/value-for-value and replacing only the two fuzzy benchmark
-fields from ``retrieval_benchmark_evidence_pair``, calls
-``publisher.refresh`` exactly once, verifies the returned per-path decisions
-match each report truth, and returns an immutable publication result.  The
-owner never constructs a publisher or evaluator, never imports the
-evaluator, and never bypasses the publisher to grant availability.
+fields from ``retrieval_benchmark_evidence_pair``.  A Core-private publisher
+transition verifies the candidate's retained Gate C decisions and per-path
+report truth, prepares the immutable publication result, and only then makes
+that exact snapshot query-visible.  The owner never constructs a publisher
+or evaluator, never imports the evaluator, and never bypasses the publisher
+to grant availability.
 
 This module is Gate D combination only.  ``tm_benchmark.py``, latency,
 process, query-process and oracle owners remain authoritative for their
@@ -122,7 +123,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-from typing import cast
+from typing import Any, Callable, TypeVar, cast
 
 from tm_benchmark import (
     BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION,
@@ -178,6 +179,8 @@ from tm_retrieval_capability import (
     RetrievalCapabilityManifest,
     RetrievalCapabilityPublisher,
     RetrievalCapabilitySnapshot,
+    _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR,
+    _validated_refresh_retrieval_capability,
 )
 
 BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v2"
@@ -3468,7 +3471,67 @@ def _verify_path_decisions_match_reports(
             )
 
 
-def publish_retrieval_capability_gate_d(
+_PreparedPublicationT = TypeVar("_PreparedPublicationT")
+
+
+_GATE_D_PUBLICATION_BINDINGS_MINT = object()
+
+
+_GateDPublicationBindings = tuple[
+    object,
+    type[BenchmarkGateDError],
+    Callable[
+        [
+            RetrievalCapabilitySnapshot,
+            RetrievalBenchmarkEvidence,
+            RetrievalBenchmarkEvidence,
+        ],
+        None,
+    ],
+    Callable[
+        ...,
+        tuple[RetrievalBenchmarkEvidence, RetrievalBenchmarkEvidence],
+    ],
+    Callable[..., str],
+    type[RetrievalCapabilityManifest],
+    str,
+    type[RetrievalCapabilityPublicationResult],
+    type[RetrievalCapabilityPublisher],
+    Callable[[object], datetime],
+    type[_GateDRunReceipt],
+    type[BenchmarkGateDRunResult],
+    Callable[[object, str], str],
+    object,
+    Callable[..., Any],
+]
+
+
+def _publication_bindings_from_current_globals() -> _GateDPublicationBindings:
+    """Mint one private binding set for the public compatibility facade."""
+
+    return (
+        _GATE_D_PUBLICATION_BINDINGS_MINT,
+        BenchmarkGateDError,
+        _verify_path_decisions_match_reports,
+        retrieval_benchmark_evidence_pair,
+        benchmark_implementation_fingerprint,
+        RetrievalCapabilityManifest,
+        CANDIDATE_PROOF_QUERY_VERSION,
+        RetrievalCapabilityPublicationResult,
+        RetrievalCapabilityPublisher,
+        _require_utc_datetime,
+        _GateDRunReceipt,
+        BenchmarkGateDRunResult,
+        _validate_evidence_utc_string,
+        _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR,
+        _validated_refresh_retrieval_capability,
+    )
+
+
+_GATE_D_PUBLICATION_BINDINGS = _publication_bindings_from_current_globals()
+
+
+def _publish_retrieval_capability_gate_d_prepared(
     base_manifest: RetrievalCapabilityManifest,
     run_result: BenchmarkGateDRunResult,
     publisher: RetrievalCapabilityPublisher,
@@ -3476,68 +3539,99 @@ def publish_retrieval_capability_gate_d(
     generated_at_utc: str,
     valid_until_utc: str,
     evaluated_at_utc: datetime,
-) -> RetrievalCapabilityPublicationResult:
+    prepare_publication: Callable[
+        [RetrievalCapabilityPublicationResult],
+        _PreparedPublicationT,
+    ],
+    _publication_bindings: _GateDPublicationBindings,
+) -> _PreparedPublicationT:
     """Compose and publish one Gate D manifest through the exact publisher.
 
     Preserves every envelope and Gate C fact of the base manifest
     byte-for-byte/value-for-value and replaces only the two fuzzy benchmark
     fields with the pair derived from the durable runner readback at the
     explicit validity
-    window.  Calls ``publisher.refresh`` exactly once at the explicit
-    evaluated instant, verifies the returned per-path decisions match each
-    report truth (a failed report must stay closed; a passed report must be
-    open), and returns an immutable manifest+snapshot result.  The owner
-    never constructs a publisher/evaluator and never grants availability
-    itself.
+    window.  Performs exactly one Core-owned validated publisher transition
+    at the explicit evaluated instant: per-path decisions are checked against
+    report truth before the candidate can become query-visible.  A failed
+    report must stay closed and a passed report must be open.  The owner never
+    constructs a publisher/evaluator and never grants availability itself.
     """
 
+    if (
+        type(_publication_bindings) is not tuple
+        or len(_publication_bindings) != 15
+        or _publication_bindings[0]
+        is not _GATE_D_PUBLICATION_BINDINGS_MINT
+    ):
+        raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_INVALID")
+    (
+        _bindings_mint,
+        benchmark_error_type,
+        decision_verifier,
+        evidence_pair,
+        implementation_fingerprint,
+        manifest_type,
+        proof_query_version,
+        publication_result_type,
+        publisher_type,
+        require_utc_datetime,
+        run_receipt_type,
+        run_result_type,
+        validate_utc_string,
+        snapshot_descriptor,
+        validated_transition_raw,
+    ) = _publication_bindings
+    validated_transition = validated_transition_raw
+
     try:
-        if type(base_manifest) is not RetrievalCapabilityManifest:
-            raise BenchmarkGateDError("GATE_D.MANIFEST_INVALID")
-        if type(run_result) is not BenchmarkGateDRunResult:
-            raise BenchmarkGateDError("GATE_D.RUN_RESULT_INVALID")
+        if type(base_manifest) is not manifest_type:
+            raise benchmark_error_type("GATE_D.MANIFEST_INVALID")
+        if type(run_result) is not run_result_type:
+            raise benchmark_error_type("GATE_D.RUN_RESULT_INVALID")
         receipt = run_result._receipt
-        if type(receipt) is not _GateDRunReceipt or (
+        if type(receipt) is not run_receipt_type or (
             receipt.bundle is not run_result.bundle
             or receipt.bundle_digest != run_result.bundle_digest
             or receipt.artifact_size != run_result.artifact_size
             or receipt.artifact_digest != run_result.artifact_digest
             or receipt.test_mode is not run_result.test_mode
         ):
-            raise BenchmarkGateDError("GATE_D.RUN_RESULT_INVALID")
+            raise benchmark_error_type("GATE_D.RUN_RESULT_INVALID")
         if run_result.test_mode:
-            raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+            raise benchmark_error_type("GATE_D.TEST_EVIDENCE_FORBIDDEN")
         bundle = run_result.bundle
         try:
-            current_fingerprint = benchmark_implementation_fingerprint()
+            current_fingerprint = implementation_fingerprint()
         except (TypeError, ValueError) as error:
-            raise BenchmarkGateDError(
+            raise benchmark_error_type(
                 "GATE_D.IMPLEMENTATION_INVALID"
             ) from error
         if (
-            bundle.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION
+            bundle.proof_query_version != proof_query_version
             or bundle.implementation_fingerprint != current_fingerprint
         ):
-            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
-        if type(publisher) is not RetrievalCapabilityPublisher:
-            raise BenchmarkGateDError("GATE_D.PUBLISHER_INVALID")
-        generated = _validate_evidence_utc_string(
+            raise benchmark_error_type("GATE_D.IMPLEMENTATION_CHANGED")
+        if type(publisher) is not publisher_type:
+            raise benchmark_error_type("GATE_D.PUBLISHER_INVALID")
+        expected_current = publisher.snapshot()
+        generated = validate_utc_string(
             generated_at_utc,
             "generated_at_utc",
         )
-        valid_until = _validate_evidence_utc_string(
+        valid_until = validate_utc_string(
             valid_until_utc,
             "valid_until_utc",
         )
         if not generated < valid_until:
-            raise BenchmarkGateDError("GATE_D.INSTANTS_INVALID")
-        evaluated = _require_utc_datetime(evaluated_at_utc)
-        fts5_evidence, fallback_evidence = retrieval_benchmark_evidence_pair(
+            raise benchmark_error_type("GATE_D.INSTANTS_INVALID")
+        evaluated = require_utc_datetime(evaluated_at_utc)
+        fts5_evidence, fallback_evidence = evidence_pair(
             bundle,
             generated_at_utc=generated_at_utc,
             valid_until_utc=valid_until_utc,
         )
-        new_manifest = RetrievalCapabilityManifest(
+        new_manifest = manifest_type(
             evidence_schema_version=base_manifest.evidence_schema_version,
             retrieval_artifact_digest=base_manifest.retrieval_artifact_digest,
             retrieval_build_digest=base_manifest.retrieval_build_digest,
@@ -3552,29 +3646,75 @@ def publish_retrieval_capability_gate_d(
             gram_fallback_benchmark=fallback_evidence,
         )
         try:
-            terminal_fingerprint = benchmark_implementation_fingerprint()
+            terminal_fingerprint = implementation_fingerprint()
         except (TypeError, ValueError) as error:
-            raise BenchmarkGateDError(
+            raise benchmark_error_type(
                 "GATE_D.IMPLEMENTATION_INVALID"
             ) from error
         if terminal_fingerprint != current_fingerprint:
-            raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
-        snapshot = publisher.refresh(
+            raise benchmark_error_type("GATE_D.IMPLEMENTATION_CHANGED")
+
+        def validate_candidate(
+            candidate: RetrievalCapabilitySnapshot,
+        ) -> RetrievalCapabilityPublicationResult:
+            if (
+                candidate.context != expected_current.context
+                or candidate.fuzzy_core != expected_current.fuzzy_core
+            ):
+                raise benchmark_error_type(
+                    "GATE_D.PUBLICATION_DECISION_MISMATCH"
+                )
+            decision_verifier(
+                candidate,
+                fts5_evidence,
+                fallback_evidence,
+            )
+            return publication_result_type(
+                manifest=new_manifest,
+                snapshot=candidate,
+            )
+
+        def prepare_candidate(
+            candidate: RetrievalCapabilitySnapshot,
+        ) -> _PreparedPublicationT:
+            core_result = validate_candidate(candidate)
+            return prepare_publication(core_result)
+
+        publication_result = validated_transition(
+            publisher,
             new_manifest,
             evaluated_at_utc=evaluated,
+            expected_current=expected_current,
+            validator=prepare_candidate,
+            _snapshot_descriptor=snapshot_descriptor,
         )
-        _verify_path_decisions_match_reports(
-            snapshot,
-            fts5_evidence,
-            fallback_evidence,
-        )
-    except BenchmarkGateDError:
+    except benchmark_error_type:
         raise
     except (TypeError, ValueError) as error:
-        raise BenchmarkGateDError("GATE_D.PUBLICATION_FAILED") from error
-    return RetrievalCapabilityPublicationResult(
-        manifest=new_manifest,
-        snapshot=snapshot,
+        raise benchmark_error_type("GATE_D.PUBLICATION_FAILED") from error
+    return publication_result
+
+
+def publish_retrieval_capability_gate_d(
+    base_manifest: RetrievalCapabilityManifest,
+    run_result: BenchmarkGateDRunResult,
+    publisher: RetrievalCapabilityPublisher,
+    *,
+    generated_at_utc: str,
+    valid_until_utc: str,
+    evaluated_at_utc: datetime,
+) -> RetrievalCapabilityPublicationResult:
+    """Publish one immutable Core result through the prepared private seam."""
+
+    return _publish_retrieval_capability_gate_d_prepared(
+        base_manifest,
+        run_result,
+        publisher,
+        generated_at_utc=generated_at_utc,
+        valid_until_utc=valid_until_utc,
+        evaluated_at_utc=evaluated_at_utc,
+        prepare_publication=lambda result: result,
+        _publication_bindings=_publication_bindings_from_current_globals(),
     )
 
 

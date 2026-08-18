@@ -34,7 +34,7 @@ import tempfile
 import time
 from threading import Condition, Lock, RLock, Thread
 from types import CodeType, FunctionType, ModuleType
-from typing import Any, Protocol, cast, final, runtime_checkable
+from typing import Any, Callable, Protocol, cast, final, runtime_checkable
 
 from capability_gated_text_matcher import CapabilityGatedTextMatcherV1
 from editor_contracts import RetrievalDisplayState, TextMatcherDisplayState
@@ -72,6 +72,7 @@ _GATE_D_MODULE_NAMES = (
     "tm_benchmark_oracle",
     "tm_benchmark_process",
     "tm_benchmark_query_process",
+    "tm_retrieval_capability",
     "tm_benchmark_gate",
 )
 
@@ -2074,13 +2075,21 @@ def _load_retrieval_validation_binding(
 
 @dataclass(frozen=True, slots=True)
 class _GateDExecutionResult:
-    """Composition-private result after Core has refreshed the publisher."""
+    """Host publication plan fully constructed before Core commit."""
 
     snapshot: RetrievalCapabilitySnapshot
+    handoff: RetrievalHandoffSnapshot
+    status: CapabilityDisplaySnapshot
 
     def __post_init__(self) -> None:
         if type(self.snapshot) is not RetrievalCapabilitySnapshot:
             raise TypeError("Gate D result must carry a Core snapshot")
+        if type(self.handoff) is not RetrievalHandoffSnapshot:
+            raise TypeError("Gate D result must carry a host handoff")
+        if type(self.status) is not CapabilityDisplaySnapshot:
+            raise TypeError("Gate D result must carry a host status")
+        if self.status.retrieval is not self.handoff.display:
+            raise ValueError("Gate D status must retain the handoff display")
 
 
 class _GateDOperationalError(RuntimeError):
@@ -2096,16 +2105,59 @@ class _GateDOperationalError(RuntimeError):
 
 
 class _GateDExecutionPort(Protocol):
-    def run_and_publish(
+    def run(
         self,
         *,
-        base_manifest: RetrievalCapabilityManifest,
-        publisher: RetrievalCapabilityPublisher,
         contract_path: Path,
         work_root: Path,
         evidence_path: Path,
-        evaluated_at_utc: datetime,
-    ) -> _GateDExecutionResult: ...
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> _CoreGateDPublication: ...
+
+
+_GATE_D_PUBLICATION_MINT = object()
+
+
+def _gate_d_publication_bindings_are_canonical(
+    *,
+    gate_module: ModuleType,
+    retrieval_module: ModuleType,
+    bindings: object,
+) -> bool:
+    """Bind every authority-bearing publication primitive by identity."""
+
+    if type(bindings) is not tuple or len(bindings) != 15:
+        return False
+    expected = (
+        gate_module.__dict__.get("_GATE_D_PUBLICATION_BINDINGS_MINT"),
+        gate_module.__dict__.get("BenchmarkGateDError"),
+        gate_module.__dict__.get("_verify_path_decisions_match_reports"),
+        gate_module.__dict__.get("retrieval_benchmark_evidence_pair"),
+        gate_module.__dict__.get("benchmark_implementation_fingerprint"),
+        gate_module.__dict__.get("RetrievalCapabilityManifest"),
+        gate_module.__dict__.get("CANDIDATE_PROOF_QUERY_VERSION"),
+        gate_module.__dict__.get("RetrievalCapabilityPublicationResult"),
+        gate_module.__dict__.get("RetrievalCapabilityPublisher"),
+        gate_module.__dict__.get("_require_utc_datetime"),
+        gate_module.__dict__.get("_GateDRunReceipt"),
+        gate_module.__dict__.get("BenchmarkGateDRunResult"),
+        gate_module.__dict__.get("_validate_evidence_utc_string"),
+        retrieval_module.__dict__.get(
+            "_RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR"
+        ),
+        retrieval_module.__dict__.get(
+            "_validated_refresh_retrieval_capability"
+        ),
+    )
+    return all(
+        actual is canonical
+        for actual, canonical in zip(bindings, expected, strict=True)
+    ) and gate_module.__dict__.get(
+        "_validated_refresh_retrieval_capability"
+    ) is retrieval_module.__dict__.get(
+        "_validated_refresh_retrieval_capability"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2119,6 +2171,7 @@ class _CoreGateDBinding:
     error_type: type[BaseException]
     run_result_type: type[object]
     publication_result_type: type[object]
+    publication_bindings: tuple[object, ...]
 
     @classmethod
     def capture(cls) -> _CoreGateDBinding:
@@ -2140,9 +2193,10 @@ class _CoreGateDBinding:
             )
         )
         gate_module = cast(ModuleType, modules[-1])
+        retrieval_module = cast(ModuleType, modules[-2])
         run_function = gate_module.__dict__.get("run_benchmark_gate_d")
         publish_function = gate_module.__dict__.get(
-            "publish_retrieval_capability_gate_d"
+            "_publish_retrieval_capability_gate_d_prepared"
         )
         error_type = gate_module.__dict__.get("BenchmarkGateDError")
         run_result_type = gate_module.__dict__.get(
@@ -2151,6 +2205,9 @@ class _CoreGateDBinding:
         publication_result_type = gate_module.__dict__.get(
             "RetrievalCapabilityPublicationResult"
         )
+        publication_bindings = gate_module.__dict__.get(
+            "_GATE_D_PUBLICATION_BINDINGS"
+        )
         if (
             type(run_function) is not FunctionType
             or type(publish_function) is not FunctionType
@@ -2158,6 +2215,11 @@ class _CoreGateDBinding:
             or not issubclass(cast(type[object], error_type), BaseException)
             or type(run_result_type) is not type
             or type(publication_result_type) is not type
+            or not _gate_d_publication_bindings_are_canonical(
+                gate_module=gate_module,
+                retrieval_module=retrieval_module,
+                bindings=publication_bindings,
+            )
         ):
             raise RuntimeError("Gate D Core owner exports are invalid")
         binding = cls(
@@ -2169,6 +2231,9 @@ class _CoreGateDBinding:
             run_result_type=cast(type[object], run_result_type),
             publication_result_type=cast(
                 type[object], publication_result_type
+            ),
+            publication_bindings=cast(
+                tuple[object, ...], publication_bindings
             ),
         )
         if not binding.is_current():
@@ -2182,7 +2247,7 @@ class _CoreGateDBinding:
             and self.gate_module.__dict__.get("run_benchmark_gate_d")
             is self.run_function
             and self.gate_module.__dict__.get(
-                "publish_retrieval_capability_gate_d"
+                "_publish_retrieval_capability_gate_d_prepared"
             )
             is self.publish_function
             and self.gate_module.__dict__.get("BenchmarkGateDError")
@@ -2193,18 +2258,26 @@ class _CoreGateDBinding:
                 "RetrievalCapabilityPublicationResult"
             )
             is self.publication_result_type
+            and self.gate_module.__dict__.get(
+                "_GATE_D_PUBLICATION_BINDINGS"
+            )
+            is self.publication_bindings
+            and _gate_d_publication_bindings_are_canonical(
+                gate_module=self.gate_module,
+                retrieval_module=self.graphs[-2].module,
+                bindings=self.publication_bindings,
+            )
         )
 
-    def run_and_publish(
+    def run(
         self,
         *,
-        base_manifest: RetrievalCapabilityManifest,
-        publisher: RetrievalCapabilityPublisher,
         contract_path: Path,
         work_root: Path,
         evidence_path: Path,
-        evaluated_at_utc: datetime,
-    ) -> _GateDExecutionResult:
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> _CoreGateDPublication:
         if (
             not self.is_current()
             or contract_path != _GATE_D_CONTRACT_ANCHOR.path
@@ -2225,6 +2298,44 @@ class _CoreGateDBinding:
             or not self.is_current()
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        return _CoreGateDPublication(
+            _mint=_GATE_D_PUBLICATION_MINT,
+            binding=self,
+            run_result=run_result,
+            publication_owner_identity=publication_owner_identity,
+            publication_graph_nonce=publication_graph_nonce,
+        )
+
+    def publish(
+        self,
+        *,
+        run_result: object,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        evaluated_at_utc: datetime,
+        prepare_publication: Callable[
+            [RetrievalCapabilitySnapshot],
+            _GateDExecutionResult,
+        ],
+    ) -> _GateDExecutionResult:
+        if (
+            type(run_result) is not self.run_result_type
+            or not self.is_current()
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        def prepare_core_result(publication: object) -> _GateDExecutionResult:
+            if type(publication) is not self.publication_result_type:
+                raise _GateDOperationalError(
+                    "GATE_D.IMPLEMENTATION_CHANGED"
+                )
+            validated_publication: Any = publication
+            snapshot = validated_publication.snapshot
+            if type(snapshot) is not RetrievalCapabilitySnapshot:
+                raise TypeError(
+                    "Core Gate D publication returned invalid snapshot"
+                )
+            return prepare_publication(snapshot)
+
         try:
             publication = self.publish_function(
                 base_manifest,
@@ -2233,17 +2344,91 @@ class _CoreGateDBinding:
                 generated_at_utc=base_manifest.generated_at_utc,
                 valid_until_utc=base_manifest.valid_until_utc,
                 evaluated_at_utc=evaluated_at_utc,
+                prepare_publication=prepare_core_result,
+                _publication_bindings=self.publication_bindings,
             )
         except self.error_type as error:
+            validated_error: Any = error
             raise _GateDOperationalError(
-                cast(Any, error).error_code
+                validated_error.error_code
             ) from error
-        if type(publication) is not self.publication_result_type:
-            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
-        snapshot = cast(Any, publication).snapshot
-        if type(snapshot) is not RetrievalCapabilitySnapshot:
-            raise TypeError("Core Gate D publication returned invalid snapshot")
-        return _GateDExecutionResult(snapshot=snapshot)
+        validated_result: Any = publication
+        return validated_result
+
+
+@final
+class _CoreGateDPublication:
+    """Pinned Core run receipt whose only mutation is formal publication."""
+
+    __slots__ = (
+        "__binding",
+        "__consume_lock",
+        "__consumed",
+        "__publication_graph_nonce",
+        "__publication_owner_identity",
+        "__run_result",
+    )
+
+    def __init__(
+        self,
+        *,
+        _mint: object,
+        binding: _CoreGateDBinding,
+        run_result: object,
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> None:
+        if _mint is not _GATE_D_PUBLICATION_MINT:
+            raise PermissionError("Gate D publication mint is private")
+        if type(binding) is not _CoreGateDBinding:
+            raise TypeError("Gate D publication requires the Core binding")
+        if type(run_result) is not binding.run_result_type:
+            raise TypeError("Gate D publication requires a Core run result")
+        if type(publication_owner_identity) is not object:
+            raise TypeError("Gate D publication owner identity is invalid")
+        if type(publication_graph_nonce) is not object:
+            raise TypeError("Gate D publication graph nonce is invalid")
+        self.__binding = binding
+        self.__run_result = run_result
+        self.__publication_owner_identity = publication_owner_identity
+        self.__publication_graph_nonce = publication_graph_nonce
+        self.__consume_lock = Lock()
+        self.__consumed = False
+
+    def publish(
+        self,
+        *,
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        evaluated_at_utc: datetime,
+        prepare_publication: Callable[
+            [RetrievalCapabilitySnapshot],
+            _GateDExecutionResult,
+        ],
+    ) -> _GateDExecutionResult:
+        if (
+            publication_owner_identity
+            is not self.__publication_owner_identity
+            or publication_graph_nonce is not self.__publication_graph_nonce
+        ):
+            raise PermissionError(
+                "Gate D publication receipt belongs to another graph"
+            )
+        with self.__consume_lock:
+            if self.__consumed:
+                raise RuntimeError(
+                    "Gate D publication receipt was already consumed"
+                )
+            self.__consumed = True
+            return self.__binding.publish(
+                run_result=self.__run_result,
+                base_manifest=base_manifest,
+                publisher=publisher,
+                evaluated_at_utc=evaluated_at_utc,
+                prepare_publication=prepare_publication,
+            )
 
 
 @final
@@ -2252,34 +2437,32 @@ class _RealGateDExecution:
 
     __slots__ = ()
 
-    def run_and_publish(
+    def run(
         self,
         *,
-        base_manifest: RetrievalCapabilityManifest,
-        publisher: RetrievalCapabilityPublisher,
         contract_path: Path,
         work_root: Path,
         evidence_path: Path,
-        evaluated_at_utc: datetime,
-    ) -> _GateDExecutionResult:
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> _CoreGateDPublication:
         try:
             binding = _CoreGateDBinding.capture()
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             raise _GateDOperationalError(
                 "GATE_D.IMPLEMENTATION_CHANGED"
             ) from error
-        return binding.run_and_publish(
-            base_manifest=base_manifest,
-            publisher=publisher,
+        return binding.run(
             contract_path=contract_path,
             work_root=work_root,
             evidence_path=evidence_path,
-            evaluated_at_utc=evaluated_at_utc,
+            publication_owner_identity=publication_owner_identity,
+            publication_graph_nonce=publication_graph_nonce,
         )
 
 
 _REAL_GATE_D_EXECUTION = _RealGateDExecution()
-_REAL_GATE_D_EXECUTE = _REAL_GATE_D_EXECUTION.run_and_publish
+_REAL_GATE_D_EXECUTE = _REAL_GATE_D_EXECUTION.run
 
 
 class GateDRunState(Enum):
@@ -2319,6 +2502,7 @@ class _GateDGraphSnapshot:
     base_manifest: RetrievalCapabilityManifest
     handoff: RetrievalHandoffSnapshot
     capability: RetrievalCapabilitySnapshot
+    publication_nonce: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -2583,6 +2767,14 @@ class _RetrievalGenerationNotifications:
         owner_identity: object,
         generation: int,
     ) -> None:
+        self._validate_publish_locked(owner_identity, generation)
+        self._publish_prevalidated_locked(generation)
+
+    def _validate_publish_locked(
+        self,
+        owner_identity: object,
+        generation: int,
+    ) -> None:
         if owner_identity is not self.__owner_identity:
             raise PermissionError(
                 "retrieval generation publication requires composition owner"
@@ -2590,8 +2782,22 @@ class _RetrievalGenerationNotifications:
         _require_generation(generation)
         if generation <= self.__generation:
             raise ValueError("retrieval generation must increase")
+
+    def _publish_prevalidated_locked(self, generation: int) -> None:
+        """Commit a generation already validated under the same host lock."""
+
         self.__generation = generation
         self.__condition.notify_all()
+
+    def _precommit_snapshot_locked(self) -> int:
+        """Capture rollback state while the host owns the condition lock."""
+
+        return self.__generation
+
+    def _restore_precommit_locked(self, generation: int) -> None:
+        """Restore captured state directly after a provisional failure."""
+
+        self.__generation = generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -2653,6 +2859,7 @@ class CapabilityHost:
         "__retrieval_owner_identity",
         "__retrieval_checkout_identity",
         "__retrieval_base_manifest",
+        "__retrieval_lifecycle_lock",
         "__retrieval_publisher",
         "__retrieval_service",
         "__retrieval_handoff",
@@ -2681,6 +2888,7 @@ class CapabilityHost:
         )
 
         self.__lock = RLock()
+        self.__retrieval_lifecycle_lock = Lock()
         self.__matcher_handoff = matcher
         self.__matcher_owner_identity = object()
         self.__matcher_notifications = _MatcherGenerationNotifications(
@@ -2913,33 +3121,34 @@ class CapabilityHost:
         if not (capability.context.available or capability.fuzzy_core.available):
             raise ValueError("Gate C did not validate a correctness cohort")
 
-        with self.__lock:
-            if (
-                not checkout_identity.is_current()
-                or not validation_binding.is_current()
-                or publisher.snapshot() is not capability
-            ):
-                return self.__retrieval_handoff
-            generation = self.__retrieval_handoff.generation + 1
-            handoff = RetrievalHandoffSnapshot(
-                generation=generation,
-                query_port=_CoreRetrievalQueryPort(service),
-                display=display,
-            )
-            status = CapabilityDisplaySnapshot(
-                matcher=self.__matcher_handoff.display,
-                retrieval=handoff.display,
-            )
-            self.__retrieval_publisher = publisher
-            self.__retrieval_service = service
-            self.__retrieval_base_manifest = base_manifest
-            self.__retrieval_handoff = handoff
-            self.__status = status
-            self.__retrieval_notifications._publish_locked(
-                self.__retrieval_owner_identity,
-                generation,
-            )
-            return handoff
+        with self.__retrieval_lifecycle_lock:
+            with self.__lock:
+                if (
+                    not checkout_identity.is_current()
+                    or not validation_binding.is_current()
+                    or publisher.snapshot() is not capability
+                ):
+                    return self.__retrieval_handoff
+                generation = self.__retrieval_handoff.generation + 1
+                handoff = RetrievalHandoffSnapshot(
+                    generation=generation,
+                    query_port=_CoreRetrievalQueryPort(service),
+                    display=display,
+                )
+                status = CapabilityDisplaySnapshot(
+                    matcher=self.__matcher_handoff.display,
+                    retrieval=handoff.display,
+                )
+                self.__retrieval_publisher = publisher
+                self.__retrieval_service = service
+                self.__retrieval_base_manifest = base_manifest
+                self.__retrieval_handoff = handoff
+                self.__status = status
+                self.__retrieval_notifications._publish_locked(
+                    self.__retrieval_owner_identity,
+                    generation,
+                )
+                return handoff
 
     def _capture_gate_d_graph(
         self,
@@ -2968,16 +3177,20 @@ class CapabilityHost:
                 base_manifest=manifest,
                 handoff=self.__retrieval_handoff,
                 capability=capability,
+                publication_nonce=object(),
             )
 
-    def _install_gate_d_capability(
+    def _publish_gate_d_capability(
         self,
         *,
         owner_identity: object,
         graph: _GateDGraphSnapshot,
-        capability: RetrievalCapabilitySnapshot,
+        publication: _CoreGateDPublication,
+        evaluated_at_utc: datetime,
+        prepare_owner_success: Callable[[], None] | None = None,
+        rollback_owner_success: Callable[[], None] | None = None,
     ) -> RetrievalHandoffSnapshot | None:
-        """Publish one query-effective Gate D generation atomically."""
+        """Publish and install one still-current Gate D graph generation."""
 
         if owner_identity is not self.__retrieval_owner_identity:
             raise PermissionError(
@@ -2985,36 +3198,91 @@ class CapabilityHost:
             )
         if type(graph) is not _GateDGraphSnapshot:
             raise TypeError("Gate D graph capture is invalid")
-        if type(capability) is not RetrievalCapabilitySnapshot:
-            raise TypeError("Gate D capability must be a Core snapshot")
-        display = _retrieval_display(capability)
-        with self.__lock:
-            if (
-                self.__retrieval_publisher is not graph.publisher
-                or self.__retrieval_service is not graph.service
-                or self.__retrieval_base_manifest is not graph.base_manifest
-                or self.__retrieval_handoff is not graph.handoff
-                or graph.publisher.snapshot() is not capability
-                or capability.context != graph.capability.context
-                or capability.fuzzy_core != graph.capability.fuzzy_core
-            ):
-                return None
-            generation = graph.handoff.generation + 1
-            handoff = RetrievalHandoffSnapshot(
-                generation=generation,
-                query_port=graph.handoff.query_port,
-                display=display,
+        if type(publication) is not _CoreGateDPublication:
+            raise TypeError("Gate D publication receipt is invalid")
+        if (prepare_owner_success is None) != (rollback_owner_success is None):
+            raise TypeError(
+                "Gate D owner lifecycle callbacks must be provided together"
             )
-            self.__retrieval_handoff = handoff
-            self.__status = CapabilityDisplaySnapshot(
-                matcher=self.__matcher_handoff.display,
-                retrieval=display,
-            )
-            self.__retrieval_notifications._publish_locked(
-                self.__retrieval_owner_identity,
-                generation,
-            )
-            return handoff
+        with self.__retrieval_lifecycle_lock:
+            with self.__lock:
+                if (
+                    self.__retrieval_publisher is not graph.publisher
+                    or self.__retrieval_service is not graph.service
+                    or self.__retrieval_base_manifest is not graph.base_manifest
+                    or self.__retrieval_handoff is not graph.handoff
+                    or graph.publisher.snapshot() is not graph.capability
+                ):
+                    return None
+                generation = graph.handoff.generation + 1
+                self.__retrieval_notifications._validate_publish_locked(
+                    self.__retrieval_owner_identity,
+                    generation,
+                )
+                old_handoff = self.__retrieval_handoff
+                old_status = self.__status
+                old_notification_generation = (
+                    self.__retrieval_notifications
+                    ._precommit_snapshot_locked()
+                )
+                prepared_handoff = graph.handoff
+
+                def prepare_publication(
+                    capability: RetrievalCapabilitySnapshot,
+                ) -> _GateDExecutionResult:
+                    nonlocal prepared_handoff
+                    if (
+                        capability.context != graph.capability.context
+                        or capability.fuzzy_core
+                        != graph.capability.fuzzy_core
+                    ):
+                        raise RuntimeError(
+                            "Gate D candidate changed Gate C authority"
+                        )
+                    display = _retrieval_display(capability)
+                    handoff = RetrievalHandoffSnapshot(
+                        generation=generation,
+                        query_port=graph.handoff.query_port,
+                        display=display,
+                    )
+                    status = CapabilityDisplaySnapshot(
+                        matcher=self.__matcher_handoff.display,
+                        retrieval=display,
+                    )
+                    prepared = _GateDExecutionResult(
+                        snapshot=capability,
+                        handoff=handoff,
+                        status=status,
+                    )
+                    try:
+                        self.__retrieval_handoff = handoff
+                        self.__status = status
+                        self.__retrieval_notifications._publish_prevalidated_locked(
+                            generation
+                        )
+                        if prepare_owner_success is not None:
+                            prepare_owner_success()
+                    except BaseException:
+                        self.__retrieval_handoff = old_handoff
+                        self.__status = old_status
+                        self.__retrieval_notifications._restore_precommit_locked(
+                            old_notification_generation
+                        )
+                        if rollback_owner_success is not None:
+                            rollback_owner_success()
+                        raise
+                    prepared_handoff = handoff
+                    return prepared
+
+                publication.publish(
+                    publication_owner_identity=owner_identity,
+                    publication_graph_nonce=graph.publication_nonce,
+                    base_manifest=graph.base_manifest,
+                    publisher=graph.publisher,
+                    evaluated_at_utc=evaluated_at_utc,
+                    prepare_publication=prepare_publication,
+                )
+                return prepared_handoff
 
 
 @final
@@ -3360,23 +3628,43 @@ class _RetrievalGateDOwner:
                     "GATE_D.EVIDENCE_PATH_EXISTS"
                 )
             self.__retained_roots.append(work_root)
-            result = self.__execute(
-                base_manifest=graph.base_manifest,
-                publisher=graph.publisher,
+            publication = self.__execute(
                 contract_path=_GATE_D_CONTRACT_ANCHOR.path,
                 work_root=work_root,
                 evidence_path=evidence_path,
-                evaluated_at_utc=evaluated_at_utc,
+                publication_owner_identity=self.__owner_identity,
+                publication_graph_nonce=graph.publication_nonce,
             )
-            if type(result) is not _GateDExecutionResult:
+            if type(publication) is not _CoreGateDPublication:
                 raise TypeError("Gate D execution returned an invalid result")
-            installed = self.__host._install_gate_d_capability(
-                owner_identity=self.__owner_identity,
-                graph=graph,
-                capability=result.snapshot,
+            succeeded = GateDRunStatus(
+                epoch=epoch,
+                state=GateDRunState.SUCCEEDED,
+                safe_code=None,
             )
-            if installed is None:
-                raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
+            with self.__condition:
+                old_status = self.__status
+                old_programmer_error = self.__programmer_error
+
+                def prepare_owner_success() -> None:
+                    self.__status = succeeded
+                    self.__programmer_error = None
+                    self.__condition.notify_all()
+
+                def rollback_owner_success() -> None:
+                    self.__status = old_status
+                    self.__programmer_error = old_programmer_error
+
+                installed = self.__host._publish_gate_d_capability(
+                    owner_identity=self.__owner_identity,
+                    graph=graph,
+                    publication=publication,
+                    evaluated_at_utc=evaluated_at_utc,
+                    prepare_owner_success=prepare_owner_success,
+                    rollback_owner_success=rollback_owner_success,
+                )
+                if installed is None:
+                    raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
         except _GateDOperationalError as error:
             self.__finish(
                 GateDRunStatus(
@@ -3405,13 +3693,7 @@ class _RetrievalGateDOwner:
                 programmer_error=error,
             )
             return
-        self.__finish(
-            GateDRunStatus(
-                epoch=epoch,
-                state=GateDRunState.SUCCEEDED,
-                safe_code=None,
-            )
-        )
+        return
 
     def __finish(
         self,

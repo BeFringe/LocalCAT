@@ -22,7 +22,8 @@ import hashlib
 import json
 import re
 from threading import Lock
-from typing import cast, final
+from types import MemberDescriptorType
+from typing import Callable, TypeVar, cast, final
 
 from tm_contracts import (
     BenchmarkExecutionPath,
@@ -1355,6 +1356,9 @@ def _require_evaluator(
 # --- publisher --------------------------------------------------------------
 
 
+_ValidatedPublicationT = TypeVar("_ValidatedPublicationT")
+
+
 @final
 class RetrievalCapabilityPublisher:
     """Atomically refresh and expose evaluator-produced snapshots only."""
@@ -1431,6 +1435,40 @@ class RetrievalCapabilityPublisher:
     ) -> RetrievalCapabilitySnapshot:
         """Evaluate a manifest, then atomically publish that exact result."""
 
+        return self._validated_transition(
+            manifest,
+            evaluated_at_utc=evaluated_at_utc,
+            expected_current=None,
+            prepare=lambda candidate: candidate,
+            _snapshot_descriptor=(
+                _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR
+            ),
+        )
+
+    def _validated_transition(
+        self,
+        manifest: RetrievalCapabilityManifest | None,
+        *,
+        evaluated_at_utc: datetime,
+        expected_current: RetrievalCapabilitySnapshot | None,
+        prepare: Callable[
+            [RetrievalCapabilitySnapshot],
+            _ValidatedPublicationT,
+        ],
+        _snapshot_descriptor: object,
+    ) -> _ValidatedPublicationT:
+        """Commit only after an owner prepares its final return value."""
+
+        if (
+            type(_snapshot_descriptor) is not MemberDescriptorType
+            or _snapshot_descriptor.__objclass__
+            is not RetrievalCapabilityPublisher
+            or _snapshot_descriptor.__name__
+            != "_RetrievalCapabilityPublisher__snapshot"
+        ):
+            raise TypeError("publisher snapshot descriptor is invalid")
+        snapshot_get = _snapshot_descriptor.__get__
+        snapshot_set = _snapshot_descriptor.__set__
         instant = _require_utc_instant(evaluated_at_utc)
         evaluator = self.__trusted_evaluator()
         if evaluator is None:
@@ -1451,6 +1489,17 @@ class RetrievalCapabilityPublisher:
                 evaluated_at_utc=instant,
             )
         with self.__lock:
+            if (
+                expected_current is not None
+                and snapshot_get(
+                    self,
+                    RetrievalCapabilityPublisher,
+                )
+                is not expected_current
+            ):
+                raise ValueError(
+                    "publisher current snapshot changed before commit"
+                )
             trusted_at_publish = self.__trusted_evaluator()
             semantics_match = (
                 next_snapshot.semantics_version
@@ -1472,8 +1521,51 @@ class RetrievalCapabilityPublisher:
                     ),
                     manifest=None,
                 )
-            self.__snapshot = next_snapshot
-            return self.__snapshot
+            prepared = prepare(next_snapshot)
+            snapshot_set(self, next_snapshot)
+            return prepared
+
+
+_RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR = (
+    RetrievalCapabilityPublisher.__dict__[
+        "_RetrievalCapabilityPublisher__snapshot"
+    ]
+)
+if type(_RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR) is not MemberDescriptorType:
+    raise RuntimeError("publisher snapshot descriptor is unavailable")
+
+
+def _validated_refresh_retrieval_capability(
+    publisher: RetrievalCapabilityPublisher,
+    manifest: RetrievalCapabilityManifest,
+    *,
+    evaluated_at_utc: datetime,
+    expected_current: RetrievalCapabilitySnapshot,
+    validator: Callable[
+        [RetrievalCapabilitySnapshot],
+        _ValidatedPublicationT,
+    ],
+    _snapshot_descriptor: object,
+) -> _ValidatedPublicationT:
+    """Gate-owner-only validate-before-commit publisher transition."""
+
+    if type(publisher) is not RetrievalCapabilityPublisher:
+        raise TypeError("publisher must be RetrievalCapabilityPublisher")
+    if type(manifest) is not RetrievalCapabilityManifest:
+        raise TypeError("manifest must be RetrievalCapabilityManifest")
+    if type(expected_current) is not RetrievalCapabilitySnapshot:
+        raise TypeError(
+            "expected_current must be RetrievalCapabilitySnapshot"
+        )
+    if not callable(validator):
+        raise TypeError("publisher validator must be callable")
+    return publisher._validated_transition(
+        manifest,
+        evaluated_at_utc=evaluated_at_utc,
+        expected_current=expected_current,
+        prepare=validator,
+        _snapshot_descriptor=_snapshot_descriptor,
+    )
 
 
 # --- production default -----------------------------------------------------
