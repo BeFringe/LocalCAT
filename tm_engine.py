@@ -324,6 +324,18 @@ class TMEngine:
 
         return self._store is not None
 
+    @property
+    def canonical_store(self) -> SQLiteTMStore | None:
+        """Return the store selected by this facade's one open-time decision.
+
+        This read-only projection exists only so the application composition
+        root can turn the already-completed ``TMEngine`` classification into
+        a canonical or legacy runtime binding.  It never accepts a caller
+        claim, never reopens the resource, and cannot force legacy fallback.
+        """
+
+        return self._store
+
     def _load_tm(self):
         """Loads TM from JSONL file into memory index."""
 
