@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -961,6 +962,94 @@ class RetrievalDisplayState:
         ) and not self.safe_codes:
             raise ValueError(
                 "closed retrieval availability requires at least one safe code"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class TMSuggestionReport:
+    """One immutable, body-safe current-segment TM query projection."""
+
+    suggestions: tuple[TMSuggestion, ...]
+    resource_statuses: tuple[TMResourceStatus, ...]
+    retrieval_status: RetrievalDisplayState
+    query_identity: SuggestionQueryIdentity
+
+    def __post_init__(self) -> None:
+        if type(self.suggestions) is not tuple or any(
+            type(suggestion) is not TMSuggestion
+            for suggestion in self.suggestions
+        ):
+            raise TypeError(
+                "TM suggestion report suggestions must be an exact tuple"
+            )
+        if len(self.suggestions) > 10:
+            raise ValueError("TM suggestion report may contain at most ten items")
+        if type(self.resource_statuses) is not tuple or any(
+            type(status) is not TMResourceStatus
+            for status in self.resource_statuses
+        ):
+            raise TypeError(
+                "TM suggestion report statuses must be an exact tuple"
+            )
+        if type(self.retrieval_status) is not RetrievalDisplayState:
+            raise TypeError(
+                "TM suggestion report retrieval status must be RetrievalDisplayState"
+            )
+        if type(self.query_identity) is not SuggestionQueryIdentity:
+            raise TypeError(
+                "TM suggestion report query identity must be SuggestionQueryIdentity"
+            )
+
+        self.query_identity.__post_init__()
+        self.retrieval_status.__post_init__()
+        status_by_resource_id: dict[str, TMResourceStatus] = {}
+        for status in self.resource_statuses:
+            status.__post_init__()
+            if status.resource_id in status_by_resource_id:
+                raise ValueError(
+                    "TM suggestion report resource statuses must be unique"
+                )
+            status_by_resource_id[status.resource_id] = status
+
+        result_identities: set[tuple[str, str]] = set()
+        query_source: str | None = None
+        for suggestion in self.suggestions:
+            suggestion.__post_init__()
+            if suggestion.query_identity is not self.query_identity:
+                raise ValueError(
+                    "TM suggestions must share the report query identity"
+                )
+            result_identity = (suggestion.resource_id, suggestion.record_id)
+            if result_identity in result_identities:
+                raise ValueError(
+                    "TM suggestion report must not contain duplicate records"
+                )
+            result_identities.add(result_identity)
+            if query_source is None:
+                query_source = suggestion.query_source
+            elif suggestion.query_source != query_source:
+                raise ValueError(
+                    "TM suggestions must share one raw query source"
+                )
+            status = status_by_resource_id.get(suggestion.resource_id)
+            if status is None:
+                raise ValueError(
+                    "TM suggestion resource must have a projected status"
+                )
+            if (
+                suggestion.provenance.resource_name != status.resource_name
+                or suggestion.provenance.resource_mode is not status.mode
+            ):
+                raise ValueError(
+                    "TM suggestion provenance must match its resource status"
+                )
+        if (
+            query_source is not None
+            and hashlib.sha256(query_source.encode("utf-8")).hexdigest()
+            != self.query_identity.source_digest
+        ):
+            raise ValueError(
+                "TM suggestion query source must match the identity digest"
             )
 
 

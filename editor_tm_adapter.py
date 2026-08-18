@@ -1,18 +1,28 @@
 """Qt-free current-segment translation-memory adapter.
 
-Tasks 4.1/4.2 own the canonical and legacy query lanes. Mixed aggregation,
-safe UI projection, issued-suggestion membership, and append remain in later
-tasks. The private batches below therefore never cross the Controller/Qt
-boundary.
+Tasks 4.1/4.2 own the canonical and legacy query lanes. Task 4.3 composes
+those lanes into the frozen, body-safe public report. Issued-suggestion
+membership and append remain in later tasks.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 
 from capability_host import CapabilityHost, RetrievalHandoffSnapshot
-from editor_contracts import EditorSegment, TMPreferences
+from editor_contracts import (
+    EditorSegment,
+    RetrievalDisplayState,
+    SuggestionQueryIdentity,
+    TMPreferences,
+    TMResourceDisplayMode,
+    TMResourceStatus,
+    TMSuggestion,
+    TMSuggestionProvenance,
+    TMSuggestionReport,
+)
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from tm_application_composition import (
     LegacyExactPort,
@@ -171,6 +181,67 @@ class EditorTMAdapter:
         self._runtime_host = runtime_host
         self._capability_host = capability_host
 
+    def query_current(
+        self,
+        *,
+        segment: EditorSegment,
+        project_session_id: str,
+        query_epoch: int,
+        preferences: TMPreferences,
+    ) -> TMSuggestionReport:
+        """Query one current segment and return one immutable mixed report."""
+
+        _validate_query_inputs(
+            segment=segment,
+            project_session_id=project_session_id,
+            query_epoch=query_epoch,
+            preferences=preferences,
+        )
+        canonical_batch = self._query_canonical(
+            segment=segment,
+            project_session_id=project_session_id,
+            query_epoch=query_epoch,
+            preferences=preferences,
+        )
+        _validate_canonical_batch_for_legacy(canonical_batch)
+        _validate_current_query_binding(
+            canonical_batch=canonical_batch,
+            segment=segment,
+            preferences=preferences,
+        )
+        legacy_batch = self._query_legacy_exact(
+            canonical_batch=canonical_batch,
+        )
+        if legacy_batch.canonical_batch is not canonical_batch:
+            raise ValueError("legacy query must retain the issued canonical batch")
+        legacy_batch.__post_init__()
+        _validate_canonical_batch_for_legacy(canonical_batch)
+
+        query_identity = SuggestionQueryIdentity(
+            project_session_id=project_session_id,
+            segment_id=segment.id,
+            source_digest=hashlib.sha256(
+                segment.source.encode("utf-8")
+            ).hexdigest(),
+            query_epoch=query_epoch,
+        )
+        statuses = _project_resource_statuses(legacy_batch)
+        status_by_resource_id = {
+            status.resource_id: status for status in statuses
+        }
+        projected = _project_mixed_suggestions(
+            legacy_batch=legacy_batch,
+            status_by_resource_id=status_by_resource_id,
+            query_identity=query_identity,
+        )
+        retrieval_status = _project_retrieval_display(canonical_batch.retrieval)
+        return TMSuggestionReport(
+            suggestions=projected,
+            resource_statuses=statuses,
+            retrieval_status=retrieval_status,
+            query_identity=query_identity,
+        )
+
     def _query_canonical(
         self,
         *,
@@ -324,6 +395,269 @@ def _validate_canonical_batch_for_legacy(
     _validate_canonical_report(
         query=canonical_batch.query,
         report=canonical_batch.report,
+    )
+
+
+def _validate_current_query_binding(
+    *,
+    canonical_batch: _CanonicalQueryBatch,
+    segment: EditorSegment,
+    preferences: TMPreferences,
+) -> None:
+    query = canonical_batch.query
+    expected_resource_order = tuple(
+        handle.resource_id
+        for handle in canonical_batch.runtime.canonical_handles
+        if handle.active and handle.lookup
+    )
+    if (
+        query.query_source != segment.source
+        or query.speaker_raw != (segment.speaker or None)
+        or query.context_prev_raw is not None
+        or query.context_next_raw is not None
+        or query.minimum_similarity != preferences.minimum_similarity
+        or query.limit != preferences.result_limit
+        or query.resource_order != expected_resource_order
+    ):
+        raise ValueError("canonical batch drifted from the public query inputs")
+
+
+def _project_mixed_suggestions(
+    *,
+    legacy_batch: _LegacyQueryBatch,
+    status_by_resource_id: dict[str, TMResourceStatus],
+    query_identity: SuggestionQueryIdentity,
+) -> tuple[TMSuggestion, ...]:
+    canonical_batch = legacy_batch.canonical_batch
+    order_by_resource_id = dict(
+        canonical_batch.runtime.global_order_by_resource_id
+    )
+    canonical_exact_by_resource_id: dict[str, list[TMResult]] = {}
+    trailing_canonical: list[TMResult] = []
+    for result in canonical_batch.report.results:
+        if result.match_type is TMMatchType.EXACT:
+            canonical_exact_by_resource_id.setdefault(
+                result.resource_id,
+                [],
+            ).append(result)
+        else:
+            trailing_canonical.append(result)
+    legacy_exact_by_resource_id = {
+        result.resource_id: result for result in legacy_batch.results
+    }
+
+    projected: list[TMSuggestion] = []
+    for resource_id, _global_order in canonical_batch.runtime.global_order_by_resource_id:
+        legacy_result = legacy_exact_by_resource_id.get(resource_id)
+        if legacy_result is not None:
+            projected.append(
+                _project_legacy_result(
+                    legacy_result,
+                    status=status_by_resource_id[resource_id],
+                    query_identity=query_identity,
+                )
+            )
+        for result in canonical_exact_by_resource_id.get(resource_id, ()):
+            projected.append(
+                _project_canonical_result(
+                    result,
+                    status=status_by_resource_id[resource_id],
+                    query_identity=query_identity,
+                )
+            )
+    for result in trailing_canonical:
+        if result.resource_id not in order_by_resource_id:
+            raise ValueError("canonical result is outside declarative order")
+        projected.append(
+            _project_canonical_result(
+                result,
+                status=status_by_resource_id[result.resource_id],
+                query_identity=query_identity,
+            )
+        )
+
+    unique: list[TMSuggestion] = []
+    seen: set[tuple[str, str]] = set()
+    for suggestion in projected:
+        key = (suggestion.resource_id, suggestion.record_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(suggestion)
+    return tuple(unique[:10])
+
+
+def _project_canonical_result(
+    result: TMResult,
+    *,
+    status: TMResourceStatus,
+    query_identity: SuggestionQueryIdentity,
+) -> TMSuggestion:
+    return TMSuggestion(
+        resource_id=result.resource_id,
+        record_id=f"canonical:{result.record_id}",
+        query_source=result.query_source,
+        matched_source=result.matched_source,
+        target=result.target,
+        match_type=result.match_type,
+        final_similarity=result.similarity,
+        provenance=TMSuggestionProvenance(
+            resource_name=status.resource_name,
+            resource_mode=status.mode,
+        ),
+        query_identity=query_identity,
+    )
+
+
+def _project_legacy_result(
+    result: _LegacyExactResult,
+    *,
+    status: TMResourceStatus,
+    query_identity: SuggestionQueryIdentity,
+) -> TMSuggestion:
+    return TMSuggestion(
+        resource_id=result.resource_id,
+        record_id=_legacy_record_id(result),
+        query_source=result.query_source,
+        matched_source=result.matched_source,
+        target=result.target,
+        match_type=result.match_type,
+        final_similarity=result.similarity,
+        provenance=TMSuggestionProvenance(
+            resource_name=status.resource_name,
+            resource_mode=status.mode,
+        ),
+        query_identity=query_identity,
+    )
+
+
+def _legacy_record_id(result: _LegacyExactResult) -> str:
+    source = result.record_source.encode("utf-8")
+    target = result.record_target.encode("utf-8")
+    digest = hashlib.sha256(
+        b"localcat-legacy-record-v1\x00"
+        + len(source).to_bytes(8, "big")
+        + source
+        + len(target).to_bytes(8, "big")
+        + target
+    ).hexdigest()
+    return f"legacy:{digest}"
+
+
+def _project_resource_statuses(
+    legacy_batch: _LegacyQueryBatch,
+) -> tuple[TMResourceStatus, ...]:
+    canonical_batch = legacy_batch.canonical_batch
+    runtime = canonical_batch.runtime
+    metadata_by_resource_id = {
+        metadata.resource_id: metadata
+        for metadata in canonical_batch.report.resource_metadata
+    }
+    canonical_failure_by_resource_id = {
+        failure.resource_id: failure
+        for failure in canonical_batch.report.resource_failures
+    }
+    legacy_failure_by_resource_id = {
+        failure.resource_id: failure for failure in legacy_batch.failures
+    }
+    retrieval_display = canonical_batch.retrieval.display
+    for result in canonical_batch.report.results:
+        metadata = metadata_by_resource_id[result.resource_id]
+        if (
+            result.match_type is TMMatchType.CONTEXT
+            and not metadata.context_available
+        ):
+            raise ValueError(
+                "context result exceeds captured resource authority"
+            )
+        if (
+            result.match_type is TMMatchType.FUZZY
+            and not metadata.recall.fuzzy_available
+        ):
+            raise ValueError(
+                "fuzzy result exceeds captured resource authority"
+            )
+    statuses: list[TMResourceStatus] = []
+    for base in runtime.statuses:
+        metadata = metadata_by_resource_id.get(base.resource_id)
+        canonical_failure = canonical_failure_by_resource_id.get(base.resource_id)
+        legacy_failure = legacy_failure_by_resource_id.get(base.resource_id)
+        if canonical_failure is not None and legacy_failure is not None:
+            raise ValueError("one resource cannot fail in both runtime lanes")
+        failure = canonical_failure or legacy_failure
+        if metadata is not None:
+            if (
+                metadata.context_available
+                and not retrieval_display.context_available
+            ):
+                raise ValueError(
+                    "resource context availability exceeds captured Core authority"
+                )
+            if (
+                metadata.recall.fuzzy_available
+                and not retrieval_display.fuzzy_available
+            ):
+                raise ValueError(
+                    "resource fuzzy availability exceeds captured Core authority"
+                )
+
+        safe_codes = list(base.safe_codes)
+        if failure is not None:
+            safe_codes.extend((failure.stage, failure.error_code))
+        if metadata is not None:
+            if metadata.context_unavailable_code is not None:
+                safe_codes.append(metadata.context_unavailable_code)
+            if metadata.recall.fuzzy_unavailable_code is not None:
+                safe_codes.append(metadata.recall.fuzzy_unavailable_code)
+
+        mode = base.mode
+        exact_available = base.exact_available
+        context_available = False
+        fuzzy_available = False
+        retryable = base.retryable
+        if metadata is not None:
+            context_available = metadata.context_available
+            fuzzy_available = metadata.recall.fuzzy_available
+        if failure is not None:
+            mode = TMResourceDisplayMode.DEGRADED
+            exact_available = metadata is not None and base.exact_available
+            retryable = retryable or failure.retryable
+        statuses.append(
+            TMResourceStatus(
+                resource_id=base.resource_id,
+                resource_name=base.resource_name,
+                mode=mode,
+                exact_available=exact_available,
+                context_available=context_available,
+                fuzzy_available=fuzzy_available,
+                safe_codes=_stable_unique_codes(safe_codes),
+                retryable=retryable,
+            )
+        )
+    return tuple(statuses)
+
+
+def _stable_unique_codes(codes: list[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        if code in seen:
+            continue
+        seen.add(code)
+        result.append(code)
+    return tuple(result)
+
+
+def _project_retrieval_display(
+    retrieval: RetrievalHandoffSnapshot,
+) -> RetrievalDisplayState:
+    retrieval.__post_init__()
+    display = retrieval.display
+    display.__post_init__()
+    return RetrievalDisplayState(
+        context_available=display.context_available,
+        fuzzy_available=display.fuzzy_available,
+        safe_codes=tuple(display.safe_codes),
     )
 
 
