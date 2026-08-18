@@ -1505,15 +1505,90 @@ class ImportReport:
 
 
 @dataclass(frozen=True)
+class TMResourceWriteOutcome:
+    """Body-free result of one confirmed-translation TM append attempt."""
+
+    resource_id: str
+    resource_name: str
+    global_order: int
+    written: bool
+    error_code: str | None
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.resource_id,
+            "TM write outcome resource id",
+        )
+        _validate_exact_non_empty_string(
+            self.resource_name,
+            "TM write outcome resource name",
+        )
+        _validate_exact_nonnegative_int(
+            self.global_order,
+            "TM write outcome global order",
+        )
+        _validate_exact_bool(self.written, "TM write outcome written state")
+        _validate_exact_bool(
+            self.retryable,
+            "TM write outcome retryable state",
+        )
+        if self.written:
+            if self.error_code is not None or self.retryable:
+                raise ValueError(
+                    "successful TM write outcome cannot retain failure facts"
+                )
+            return
+        _validate_safe_code(self.error_code, "TM write outcome error code")
+
+
+@dataclass(frozen=True)
 class WriteReport:
     """Structured result of writing a confirmed translation."""
 
     written_resource_ids: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    outcomes: tuple[TMResourceWriteOutcome, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.written_resource_ids, tuple) or not isinstance(self.errors, tuple):
             raise TypeError("write report collections must be tuples")
+        if type(self.outcomes) is not tuple or any(
+            type(outcome) is not TMResourceWriteOutcome
+            for outcome in self.outcomes
+        ):
+            raise TypeError(
+                "write report outcomes must be exact TMResourceWriteOutcome values"
+            )
+        for outcome in self.outcomes:
+            outcome.__post_init__()
+        if not self.outcomes:
+            return
+        resource_ids = tuple(outcome.resource_id for outcome in self.outcomes)
+        global_orders = tuple(outcome.global_order for outcome in self.outcomes)
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("write report outcome resources must be unique")
+        if any(
+            left >= right
+            for left, right in zip(global_orders, global_orders[1:])
+        ):
+            raise ValueError(
+                "write report outcomes must preserve declarative resource order"
+            )
+        expected_written = tuple(
+            outcome.resource_id for outcome in self.outcomes if outcome.written
+        )
+        expected_errors = tuple(
+            outcome.error_code
+            for outcome in self.outcomes
+            if not outcome.written
+        )
+        if self.written_resource_ids != expected_written:
+            raise ValueError(
+                "write report written resources must close over outcomes"
+            )
+        if self.errors != expected_errors:
+            raise ValueError("write report errors must close over outcomes")
 
     @property
     def succeeded(self) -> bool:

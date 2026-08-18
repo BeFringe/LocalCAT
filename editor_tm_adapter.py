@@ -1,8 +1,9 @@
 """Qt-free current-segment translation-memory adapter.
 
 Tasks 4.1/4.2 own the canonical and legacy query lanes. Task 4.3 composes
-those lanes into the frozen, body-safe public report. Issued-suggestion
-membership and append remain in later tasks.
+those lanes into the frozen, body-safe public report. Task 4.4 dispatches
+confirmed writes through one captured runtime cohort. Issued-suggestion
+membership remains in a later task.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import sqlite3
 
 from capability_host import CapabilityHost, RetrievalHandoffSnapshot
 from editor_contracts import (
@@ -17,14 +19,18 @@ from editor_contracts import (
     RetrievalDisplayState,
     SuggestionQueryIdentity,
     TMPreferences,
+    TMResourceWriteOutcome,
     TMResourceDisplayMode,
     TMResourceStatus,
     TMSuggestion,
     TMSuggestionProvenance,
     TMSuggestionReport,
+    WriteReport,
 )
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from tm_application_composition import (
+    CanonicalResourcePort,
+    LegacyAppendOperationError,
     LegacyExactPort,
     TMRuntimeHost,
     TMRuntimeSnapshot,
@@ -36,15 +42,24 @@ from tm_contracts import (
     ResourceQueryMetadata,
     TMMatchType,
     TMQuery,
+    TMRecordDraft,
     TMResourceHandle,
     TMResult,
 )
 from tm_engine import TMMatch
+from tm_sqlite_store import SQLiteStoreSchemaError
 
 
 _LEGACY_QUERY_FAILED_CODE = "TM.LEGACY.QUERY_FAILED"
 _LEGACY_FAILURE_STAGES = frozenset(("DIRECT", "ALIAS"))
 _LEGACY_OPERATION_ERRORS = (OSError, UnicodeError, json.JSONDecodeError)
+_WRITE_OPERATION_ERRORS = (
+    SQLiteStoreSchemaError,
+    OSError,
+    UnicodeError,
+)
+_LEGACY_APPEND_FAILED_CODE = "TM.WRITE.LEGACY_APPEND_FAILED"
+_CANONICAL_APPEND_FAILED_CODE = "TM.WRITE.CANONICAL_APPEND_FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +255,58 @@ class EditorTMAdapter:
             resource_statuses=statuses,
             retrieval_status=retrieval_status,
             query_identity=query_identity,
+        )
+
+    def append_confirmed(
+        self,
+        *,
+        segment: EditorSegment,
+        target: str,
+        file_source: str,
+    ) -> WriteReport:
+        """Append one confirmed translation to the captured writable cohort."""
+
+        draft = _confirmed_translation_draft(
+            segment=segment,
+            target=target,
+            file_source=file_source,
+        )
+        runtime = self._runtime_host.capture_operation_snapshot()
+        runtime.__post_init__()
+        outcomes: list[TMResourceWriteOutcome] = []
+        for port in _writable_ports(runtime):
+            try:
+                port.append(draft)
+            except Exception as error:
+                failure = _write_failure_outcome(port=port, error=error)
+                if failure is None:
+                    raise
+                outcomes.append(failure)
+                continue
+            outcomes.append(
+                TMResourceWriteOutcome(
+                    resource_id=port.resource_id,
+                    resource_name=port.resource_name,
+                    global_order=port.global_order,
+                    written=True,
+                    error_code=None,
+                    retryable=False,
+                )
+            )
+
+        frozen_outcomes = tuple(outcomes)
+        return WriteReport(
+            written_resource_ids=tuple(
+                outcome.resource_id
+                for outcome in frozen_outcomes
+                if outcome.written
+            ),
+            errors=tuple(
+                outcome.error_code
+                for outcome in frozen_outcomes
+                if not outcome.written and outcome.error_code is not None
+            ),
+            outcomes=frozen_outcomes,
         )
 
     def _query_canonical(
@@ -949,6 +1016,115 @@ def _validate_captured_snapshots(
         raise TypeError("runtime host must return TMRuntimeSnapshot")
     if type(retrieval) is not RetrievalHandoffSnapshot:
         raise TypeError("capability host must return RetrievalHandoffSnapshot")
+
+
+type _WritableTMPort = LegacyExactPort | CanonicalResourcePort
+
+
+def _confirmed_translation_draft(
+    *,
+    segment: EditorSegment,
+    target: str,
+    file_source: str,
+) -> TMRecordDraft:
+    if type(segment) is not EditorSegment:
+        raise TypeError("TM append segment must be EditorSegment")
+    segment.__post_init__()
+    if type(target) is not str:
+        raise TypeError("TM append target must be exact str")
+    if not target.strip():
+        raise ValueError("TM append target must not be empty")
+    if type(file_source) is not str:
+        raise TypeError("TM append file source must be exact str")
+    if not file_source.strip():
+        raise ValueError("TM append file source must not be empty")
+    return TMRecordDraft(
+        source_raw=segment.source,
+        target_raw=target,
+        speaker_raw=segment.speaker or None,
+        context_prev_raw=None,
+        context_next_raw=None,
+        file_source=file_source,
+        provenance=(("source", "local-write"),),
+    )
+
+
+def _writable_ports(runtime: TMRuntimeSnapshot) -> tuple[_WritableTMPort, ...]:
+    ports: dict[str, _WritableTMPort] = {}
+    for port in (*runtime.legacy_ports, *runtime.canonical_ports):
+        if port.resource_id in ports:
+            raise ValueError("runtime resource cannot have two append ports")
+        ports[port.resource_id] = port
+
+    selected: list[_WritableTMPort] = []
+    for resource_id, global_order in runtime.global_order_by_resource_id:
+        port = ports.get(resource_id)
+        if port is None:
+            continue
+        if port.global_order != global_order:
+            raise ValueError("TM append port drifted from declarative order")
+        if port.active and port.update:
+            selected.append(port)
+    return tuple(selected)
+
+
+def _write_failure_outcome(
+    *,
+    port: _WritableTMPort,
+    error: Exception,
+) -> TMResourceWriteOutcome | None:
+    known_operation_error = _is_write_operation_error(error)
+    formal_legacy_failure = (
+        error
+        if (
+            type(port) is LegacyExactPort
+            and type(error) is LegacyAppendOperationError
+        )
+        else None
+    )
+    if formal_legacy_failure is not None and (
+        formal_legacy_failure.error_code != _LEGACY_APPEND_FAILED_CODE
+        or formal_legacy_failure.retryable is not True
+    ):
+        raise ValueError("formal legacy append failure contract drift")
+    known_formal_legacy_failure = (
+        type(port) is LegacyExactPort
+        and formal_legacy_failure is not None
+    )
+    if not known_operation_error and not known_formal_legacy_failure:
+        return None
+    retryable_fact = getattr(error, "retryable", None)
+    retryable = (
+        retryable_fact
+        if type(retryable_fact) is bool
+        else isinstance(error, (OSError, sqlite3.OperationalError))
+        or known_formal_legacy_failure
+    )
+    error_code = (
+        _LEGACY_APPEND_FAILED_CODE
+        if type(port) is LegacyExactPort
+        else _CANONICAL_APPEND_FAILED_CODE
+    )
+    return TMResourceWriteOutcome(
+        resource_id=port.resource_id,
+        resource_name=port.resource_name,
+        global_order=port.global_order,
+        written=False,
+        error_code=error_code,
+        retryable=retryable,
+    )
+
+
+def _is_write_operation_error(error: Exception) -> bool:
+    if isinstance(
+        error,
+        (sqlite3.ProgrammingError, sqlite3.NotSupportedError),
+    ):
+        return False
+    return isinstance(error, _WRITE_OPERATION_ERRORS) or isinstance(
+        error,
+        sqlite3.DatabaseError,
+    )
 
 
 __all__ = ["EditorTMAdapter"]

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Callable, Protocol, TypeGuard, cast
+from typing import Callable, Protocol, TypeGuard, cast, final
 
 from editor_contracts import (
     ResourceConfig,
@@ -58,6 +58,18 @@ class LegacyPortBackend(Protocol):
     ) -> TMMatch | None: ...
 
     def append(self, draft: TMRecordDraft) -> None: ...
+
+
+@final
+class LegacyAppendOperationError(RuntimeError):
+    """Body-free formal failure emitted by the existing legacy owner."""
+
+    __slots__ = ("error_code", "retryable")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.error_code = "TM.WRITE.LEGACY_APPEND_FAILED"
+        self.retryable = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -758,7 +770,7 @@ class _TMEngineLegacyBackend:
             file_source=draft.file_source or "",
         )
         if not self._engine.save_record(unit, draft.target_raw):
-            raise RuntimeError("legacy TM append failed")
+            raise LegacyAppendOperationError()
 
 
 def _open_runtime_binding(path: Path) -> RuntimeOpenBinding:
