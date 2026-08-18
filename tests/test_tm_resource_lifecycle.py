@@ -9,6 +9,9 @@ import tempfile
 import threading
 import unittest
 from typing import Iterator, NoReturn, Protocol, cast
+from unittest.mock import patch
+
+import tm_application_composition as tm_app
 
 from editor_contracts import (
     ResourceConfig,
@@ -1036,6 +1039,249 @@ class TMResourceLifecycleTests(unittest.TestCase):
             self.assertIsNotNone(old_result)
             assert old_result is not None
             self.assertEqual(old_result.target, old_config.path.stem)
+
+    def test_operation_capture_is_defensive_and_rejects_published_handle_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = _config(root, "canonical.operation")
+            digest = "a" * 64
+            store = _LifecycleProbeStore(
+                monitor=_SequenceMonitor(
+                    (
+                        _observation(
+                            canonical_store_id="store-operation",
+                            binding_digest=digest,
+                            resource_id=canonical.id,
+                        ),
+                        _observation(
+                            canonical_store_id="store-operation",
+                            binding_digest=digest,
+                            resource_id=canonical.id,
+                        ),
+                    )
+                ),
+                health_binding_digest=digest,
+                resource_id=canonical.id,
+            )
+            resolved = TMResourceResolver(
+                runtime_open=lambda _path: CanonicalOpenBinding(
+                    resource_id=canonical.id,
+                    store=cast(TMStore, store),
+                )
+            ).resolve((canonical,))
+            host = TMRuntimeHost(
+                resolver=_StaticResolver(resolved),
+                configs=(canonical,),
+            )
+            public = host.snapshot()
+
+            first = host.capture_operation_snapshot()
+            second = host.capture_operation_snapshot()
+            self.assertIsNot(first, public)
+            self.assertIsNot(second, first)
+            self.assertIsNot(
+                first.canonical_handles[0],
+                second.canonical_handles[0],
+            )
+            self.assertIs(
+                first.canonical_handles[0].store,
+                public.canonical_handles[0].store,
+            )
+
+            object.__setattr__(public.canonical_handles[0], "update", False)
+            public.__post_init__()
+            with self.assertRaisesRegex(ValueError, "runtime snapshot drift"):
+                host.capture_operation_snapshot()
+
+    def test_operation_capture_rejects_valid_foreign_store_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_config = _config(root, "canonical.first")
+            second_config = _config(root, "canonical.second")
+            digest = "b" * 64
+
+            def store_for(resource_id: str, canonical_store_id: str) -> TMStore:
+                return cast(
+                    TMStore,
+                    _LifecycleProbeStore(
+                        monitor=_SequenceMonitor(
+                            (
+                                _observation(
+                                    canonical_store_id=canonical_store_id,
+                                    binding_digest=digest,
+                                    resource_id=resource_id,
+                                ),
+                                _observation(
+                                    canonical_store_id=canonical_store_id,
+                                    binding_digest=digest,
+                                    resource_id=resource_id,
+                                ),
+                            )
+                        ),
+                        health_binding_digest=digest,
+                        resource_id=resource_id,
+                    ),
+                )
+
+            stores = {
+                first_config.path: store_for(first_config.id, "store-first"),
+                second_config.path: store_for(second_config.id, "store-second"),
+            }
+            resolved = TMResourceResolver(
+                runtime_open=lambda path: CanonicalOpenBinding(
+                    resource_id=(
+                        first_config.id
+                        if path == first_config.path
+                        else second_config.id
+                    ),
+                    store=stores[path],
+                )
+            ).resolve((first_config, second_config))
+            host = TMRuntimeHost(
+                resolver=_StaticResolver(resolved),
+                configs=(first_config, second_config),
+            )
+            public = host.snapshot()
+            foreign_store = public.canonical_handles[1].store
+            object.__setattr__(
+                public.canonical_handles[0],
+                "store",
+                foreign_store,
+            )
+            public.__post_init__()
+
+            with self.assertRaisesRegex(ValueError, "runtime snapshot drift"):
+                host.capture_operation_snapshot()
+
+    def test_operation_capture_propagates_programmer_assertion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.programmer-error")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+
+            with (
+                patch.object(
+                    TMRuntimeSnapshot,
+                    "__post_init__",
+                    side_effect=AssertionError("programmer invariant"),
+                ),
+                self.assertRaisesRegex(AssertionError, "programmer invariant"),
+            ):
+                host.capture_operation_snapshot()
+
+    def test_operation_capture_propagates_programmer_type_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.programmer-type-error")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+
+            with (
+                patch.object(
+                    TMRuntimeSnapshot,
+                    "__post_init__",
+                    side_effect=TypeError("programmer type invariant"),
+                ),
+                self.assertRaisesRegex(TypeError, "programmer type invariant"),
+            ):
+                host.capture_operation_snapshot()
+
+    def test_refresh_derives_both_snapshots_from_one_closed_candidate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.clone-lineage")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+            original_clone = tm_app._clone_runtime_snapshot
+            clone_calls = 0
+
+            def mutate_external_candidate_after_first_clone(
+                snapshot: TMRuntimeSnapshot,
+                *,
+                generation: int,
+            ) -> TMRuntimeSnapshot:
+                nonlocal clone_calls
+                clone_calls += 1
+                cloned = original_clone(snapshot, generation=generation)
+                if clone_calls == 1:
+                    object.__setattr__(snapshot.legacy_ports[0], "update", False)
+                    snapshot.__post_init__()
+                return cloned
+
+            with patch.object(
+                tm_app,
+                "_clone_runtime_snapshot",
+                mutate_external_candidate_after_first_clone,
+            ):
+                published = host.refresh((config,))
+
+            operation = host.capture_operation_snapshot()
+            self.assertEqual(clone_calls, 2)
+            self.assertTrue(published.legacy_ports[0].update)
+            self.assertTrue(operation.legacy_ports[0].update)
+            self.assertEqual(published.generation, 1)
+            self.assertEqual(operation.generation, 1)
+
+    def test_refresh_pair_drift_preserves_old_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.clone-pair")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+            old = host.snapshot()
+            original_clone = tm_app._clone_runtime_snapshot
+            first_clone: list[TMRuntimeSnapshot] = []
+
+            def drift_first_clone_after_second_clone(
+                snapshot: TMRuntimeSnapshot,
+                *,
+                generation: int,
+            ) -> TMRuntimeSnapshot:
+                cloned = original_clone(snapshot, generation=generation)
+                if not first_clone:
+                    first_clone.append(cloned)
+                else:
+                    object.__setattr__(
+                        first_clone[0].legacy_ports[0],
+                        "update",
+                        False,
+                    )
+                    first_clone[0].__post_init__()
+                return cloned
+
+            with (
+                patch.object(
+                    tm_app,
+                    "_clone_runtime_snapshot",
+                    drift_first_clone_after_second_clone,
+                ),
+                self.assertRaisesRegex(ValueError, "runtime refresh candidate drift"),
+            ):
+                host.refresh((config,))
+
+            self.assertIs(host.snapshot(), old)
+            self.assertEqual(host.snapshot().generation, 0)
 
     def test_failed_refresh_preserves_old_snapshot_and_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

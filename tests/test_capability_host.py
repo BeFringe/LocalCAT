@@ -151,6 +151,55 @@ class ExactOnlyCapabilityHostTests(unittest.TestCase):
         self.assertIs(self.host.retrieval_snapshot(), retrieval)
         self.assertIs(self.host.status_snapshot(), status)
 
+    def test_retrieval_operation_snapshot_is_defensive_and_host_bound(self) -> None:
+        public = self.host.retrieval_snapshot()
+        first = self.host.retrieval_operation_snapshot()
+        second = self.host.retrieval_operation_snapshot()
+
+        self.assertIsNot(first, public)
+        self.assertIsNot(second, first)
+        self.assertIsNot(first.query_port, public.query_port)
+        self.assertIsNot(first.display, public.display)
+        self.assertEqual(first.display, public.display)
+        self.assertEqual(first.generation, public.generation)
+
+    def test_retrieval_operation_snapshot_rejects_foreign_host_query_port(
+        self,
+    ) -> None:
+        public = self.host.retrieval_snapshot()
+        other = CapabilityHost(evaluated_at_utc=_EVALUATED_AT)
+        foreign_port = other.retrieval_snapshot().query_port
+        object.__setattr__(public, "query_port", foreign_port)
+        public.__post_init__()
+
+        with self.assertRaisesRegex(ValueError, "retrieval handoff drift"):
+            self.host.retrieval_operation_snapshot()
+
+    def test_retrieval_operation_snapshot_rejects_display_field_drift(
+        self,
+    ) -> None:
+        public = self.host.retrieval_snapshot()
+        object.__setattr__(public.display, "fuzzy_available", True)
+        public.display.__post_init__()
+        public.__post_init__()
+
+        with self.assertRaisesRegex(ValueError, "retrieval handoff drift"):
+            self.host.retrieval_operation_snapshot()
+
+    def test_retrieval_operation_snapshot_rejects_service_publisher_drift(
+        self,
+    ) -> None:
+        public = self.host.retrieval_snapshot()
+        service_field = dataclasses.fields(cast(Any, public.query_port))[0].name
+        service = getattr(public.query_port, service_field)
+        foreign_publisher = default_retrieval_capability_publisher(
+            _EVALUATED_AT
+        )
+        setattr(service, "_capability_publisher", foreign_publisher)
+
+        with self.assertRaisesRegex(ValueError, "retrieval handoff drift"):
+            self.host.retrieval_operation_snapshot()
+
     def test_retrieval_query_uses_core_default_and_captures_once(self) -> None:
         original_snapshot = RetrievalCapabilityPublisher.snapshot
         captured: list[object] = []

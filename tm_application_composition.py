@@ -324,6 +324,144 @@ class RuntimeResolverPort(Protocol):
     ) -> TMRuntimeSnapshot: ...
 
 
+def _clone_resource_configs(
+    configs: tuple[ResourceConfig, ...],
+) -> tuple[ResourceConfig, ...]:
+    return tuple(
+        ResourceConfig(
+            id=config.id,
+            name=config.name,
+            kind=config.kind,
+            path=config.path,
+            active=config.active,
+            lookup=config.lookup,
+            update=config.update,
+        )
+        for config in configs
+    )
+
+
+def _clone_runtime_snapshot(
+    snapshot: TMRuntimeSnapshot,
+    *,
+    generation: int,
+) -> TMRuntimeSnapshot:
+    """Build a defensive port graph while retaining Core-owned backends."""
+
+    legacy_ports = tuple(
+        LegacyExactPort(
+            resource_id=port.resource_id,
+            resource_name=port.resource_name,
+            path=port.path,
+            global_order=port.global_order,
+            active=port.active,
+            lookup=port.lookup,
+            update=port.update,
+            backend=port.backend,
+        )
+        for port in snapshot.legacy_ports
+    )
+    canonical_handles: list[TMResourceHandle] = []
+    canonical_ports: list[CanonicalResourcePort] = []
+    for port, handle in zip(
+        snapshot.canonical_ports,
+        snapshot.canonical_handles,
+        strict=True,
+    ):
+        cloned_handle = TMResourceHandle(
+            resource_id=handle.resource_id,
+            store=handle.store,
+            active=handle.active,
+            lookup=handle.lookup,
+            update=handle.update,
+            order=handle.order,
+        )
+        canonical_handles.append(cloned_handle)
+        canonical_ports.append(
+            CanonicalResourcePort(
+                resource_name=port.resource_name,
+                path=port.path,
+                global_order=port.global_order,
+                handle=cloned_handle,
+            )
+        )
+    return TMRuntimeSnapshot(
+        generation=generation,
+        legacy_ports=legacy_ports,
+        canonical_ports=tuple(canonical_ports),
+        canonical_handles=tuple(canonical_handles),
+        global_order_by_resource_id=tuple(
+            (resource_id, order)
+            for resource_id, order in snapshot.global_order_by_resource_id
+        ),
+        statuses=tuple(replace(status) for status in snapshot.statuses),
+    )
+
+
+def _runtime_snapshot_matches_private_binding(
+    published: TMRuntimeSnapshot,
+    private: TMRuntimeSnapshot,
+    configs: tuple[ResourceConfig, ...],
+) -> bool:
+    """Check values plus backend/store identities without trusting equality."""
+
+    try:
+        if type(published) is not TMRuntimeSnapshot:
+            return False
+        _validate_snapshot_against_configs(published, configs)
+        if (
+            published.generation != private.generation
+            or published.global_order_by_resource_id
+            != private.global_order_by_resource_id
+            or published.statuses != private.statuses
+            or len(published.legacy_ports) != len(private.legacy_ports)
+            or len(published.canonical_ports) != len(private.canonical_ports)
+            or len(published.canonical_handles)
+            != len(private.canonical_handles)
+        ):
+            return False
+        for observed, expected in zip(
+            published.legacy_ports,
+            private.legacy_ports,
+            strict=True,
+        ):
+            if (
+                observed.resource_id != expected.resource_id
+                or observed.resource_name != expected.resource_name
+                or observed.path != expected.path
+                or observed.global_order != expected.global_order
+                or observed.active is not expected.active
+                or observed.lookup is not expected.lookup
+                or observed.update is not expected.update
+                or observed.backend is not expected.backend
+            ):
+                return False
+        for observed_port, observed_handle, expected_port, expected_handle in zip(
+            published.canonical_ports,
+            published.canonical_handles,
+            private.canonical_ports,
+            private.canonical_handles,
+            strict=True,
+        ):
+            if (
+                observed_port.handle is not observed_handle
+                or expected_port.handle is not expected_handle
+                or observed_port.resource_name != expected_port.resource_name
+                or observed_port.path != expected_port.path
+                or observed_port.global_order != expected_port.global_order
+                or observed_handle.resource_id != expected_handle.resource_id
+                or observed_handle.store is not expected_handle.store
+                or observed_handle.active is not expected_handle.active
+                or observed_handle.lookup is not expected_handle.lookup
+                or observed_handle.update is not expected_handle.update
+                or observed_handle.order != expected_handle.order
+            ):
+                return False
+    except ValueError:
+        return False
+    return True
+
+
 class TMRuntimeHost:
     """Own one atomically replaceable immutable resource snapshot.
 
@@ -343,19 +481,45 @@ class TMRuntimeHost:
         if not callable(resolve):
             raise TypeError("runtime host resolver must provide resolve")
         _validate_configs(configs)
-        initial = resolve(configs)
+        private_configs = _clone_resource_configs(configs)
+        initial = resolve(private_configs)
         if type(initial) is not TMRuntimeSnapshot:
             raise TypeError("runtime resolver must return TMRuntimeSnapshot")
-        _validate_snapshot_against_configs(initial, configs)
+        private = _clone_runtime_snapshot(initial, generation=0)
+        _validate_snapshot_against_configs(private, private_configs)
+        published = _clone_runtime_snapshot(private, generation=0)
+        if not _runtime_snapshot_matches_private_binding(
+            published,
+            private,
+            private_configs,
+        ):
+            raise ValueError("runtime initial candidate drift")
         self._resolver = resolver
         self._lock = threading.Lock()
-        self._snapshot = replace(initial, generation=0)
+        self._configs = private_configs
+        self._snapshot = published
+        self._operation_template = private
 
     def snapshot(self) -> TMRuntimeSnapshot:
         """Capture one complete snapshot for an operation."""
 
         with self._lock:
             return self._snapshot
+
+    def capture_operation_snapshot(self) -> TMRuntimeSnapshot:
+        """Return a defensive snapshot bound to the current published graph."""
+
+        with self._lock:
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            return _clone_runtime_snapshot(
+                self._operation_template,
+                generation=self._operation_template.generation,
+            )
 
     def refresh(
         self,
@@ -364,15 +528,45 @@ class TMRuntimeHost:
         """Resolve completely, then publish exactly one new generation."""
 
         _validate_configs(configs)
-        candidate = self._resolver.resolve(configs)
+        private_configs = _clone_resource_configs(configs)
+        candidate = self._resolver.resolve(private_configs)
         if type(candidate) is not TMRuntimeSnapshot:
             raise TypeError("runtime resolver must return TMRuntimeSnapshot")
-        _validate_snapshot_against_configs(candidate, configs)
+        private_candidate = _clone_runtime_snapshot(candidate, generation=0)
+        _validate_snapshot_against_configs(private_candidate, private_configs)
+        published_candidate = _clone_runtime_snapshot(
+            private_candidate,
+            generation=0,
+        )
         with self._lock:
-            published = replace(
-                candidate,
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            if not _runtime_snapshot_matches_private_binding(
+                published_candidate,
+                private_candidate,
+                private_configs,
+            ):
+                raise ValueError("runtime refresh candidate drift")
+            private = replace(
+                private_candidate,
                 generation=self._snapshot.generation + 1,
             )
+            published = replace(
+                published_candidate,
+                generation=private.generation,
+            )
+            if not _runtime_snapshot_matches_private_binding(
+                published,
+                private,
+                private_configs,
+            ):
+                raise ValueError("runtime refresh candidate drift")
+            self._configs = private_configs
+            self._operation_template = private
             self._snapshot = published
             return published
 

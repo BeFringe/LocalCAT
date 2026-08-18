@@ -1,5 +1,5 @@
 {
-  "artifact_digest": "8a7d82a6c40589d6de83840a5ddff2fa61ba2a7fb33bb136c0cb6426a0eb13e0",
+  "artifact_digest": "df1bcd4c13aaacfbe637b85d9b1e6c8b7042fc5b3cc38043d6144bc95e02ed67",
  "artifact_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",
@@ -9,7 +9,7 @@
   "tm_similarity.py",
   "tm_sqlite_store.py"
  ],
-  "build_digest": "b5932d52adb120c3b164a63badbd118a6c9da8922aea5cd3d279b0ddb0ccf5e2",
+  "build_digest": "bdfc7d5db0289bfe13bdbb86aabf2c9c3bc5ea6343ac40baae33e7372939ede6",
  "build_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",
@@ -23,7 +23,7 @@
  "context_cohorts": {
   "context.correctness.cohort.v1": "5ac24d770613883b8698caeec140fbf7bd3233bea8f62f7bca4c8cead8f209f0"
  },
-  "evaluator_digest": "0c31f548bd2deb27b5b3909e4877c36bf6e31eea082dd2470cfe6c2902c75c1d",
+  "evaluator_digest": "2e29194f65934001a161a1798d0144e7d1574b53ca9683bce070c0ab19b87da6",
  "evaluator_path": "tm_retrieval_capability.py",
  "fixture_digest": "177b7b7a6088578e6c5c4bd7e0a474d8fc4ecf95fcc5342cc7d952a0651239b9",
  "fixture_paths": [

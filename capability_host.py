@@ -2554,6 +2554,20 @@ class RetrievalHandoffSnapshot:
             raise TypeError("retrieval display must be RetrievalDisplayState")
 
 
+@dataclass(frozen=True, slots=True)
+class _RetrievalOperationResult:
+    """Host-private pairing of one exact handoff and its Core report."""
+
+    handoff: RetrievalHandoffSnapshot
+    report: QueryReport
+
+    def __post_init__(self) -> None:
+        if type(self.handoff) is not RetrievalHandoffSnapshot:
+            raise TypeError("retrieval operation handoff must be host-owned")
+        if type(self.report) is not QueryReport:
+            raise TypeError("retrieval operation report must be QueryReport")
+
+
 class RetrievalQueryPort(Protocol):
     """Read-only Core retrieval execution port exposed to application code."""
 
@@ -2660,6 +2674,11 @@ class _CoreRetrievalQueryPort:
         """Delegate one query to the Core service's single-snapshot port."""
 
         return self.__service.query(resources, query)
+
+    def _is_bound_to(self, service: TMRetrievalService) -> bool:
+        """Verify host-private service identity without exposing the service."""
+
+        return self.__service is service
 
 
 @final
@@ -2862,6 +2881,16 @@ def _retrieval_display(
     )
 
 
+def _clone_retrieval_display(
+    display: RetrievalDisplayState,
+) -> RetrievalDisplayState:
+    return RetrievalDisplayState(
+        context_available=display.context_available,
+        fuzzy_available=display.fuzzy_available,
+        safe_codes=tuple(display.safe_codes),
+    )
+
+
 @final
 class CapabilityHost:
     """Hold immutable process handoffs for independent matcher/retrieval gates.
@@ -2878,6 +2907,7 @@ class CapabilityHost:
         "__matcher_notifications",
         "__matcher_owner_identity",
         "__retrieval_notifications",
+        "__retrieval_operation_display",
         "__retrieval_owner_identity",
         "__retrieval_checkout_identity",
         "__retrieval_base_manifest",
@@ -2934,6 +2964,9 @@ class CapabilityHost:
         self.__retrieval_publisher = publisher
         self.__retrieval_service = service
         self.__retrieval_handoff = retrieval
+        self.__retrieval_operation_display = _clone_retrieval_display(
+            retrieval.display
+        )
         self.__status = CapabilityDisplaySnapshot(
             matcher=matcher.display,
             retrieval=retrieval.display,
@@ -2957,6 +2990,96 @@ class CapabilityHost:
 
         with self.__lock:
             return self.__retrieval_handoff
+
+    def retrieval_operation_snapshot(self) -> RetrievalHandoffSnapshot:
+        """Return a defensive handoff bound to the current private graph."""
+
+        with self.__lock:
+            handoff, _capability = self.__capture_retrieval_operation_locked()
+            return handoff
+
+    def query_retrieval_operation(
+        self,
+        resources: tuple[TMResourceHandle, ...],
+        query: TMQuery,
+    ) -> _RetrievalOperationResult:
+        """Execute one query under the exact host publication reservation."""
+
+        with self.__retrieval_lifecycle_lock:
+            with self.__lock:
+                handoff, _publisher, service = (
+                    self.__validate_retrieval_graph_locked()
+                )
+                reservation = service._reserve_query_operation()
+                capability = reservation.capability_snapshot
+                if (
+                    _retrieval_display(capability)
+                    != self.__retrieval_operation_display
+                ):
+                    raise ValueError("retrieval capability drift")
+                operation_handoff = RetrievalHandoffSnapshot(
+                    generation=handoff.generation,
+                    query_port=_CoreRetrievalQueryPort(service),
+                    display=_clone_retrieval_display(
+                        self.__retrieval_operation_display
+                    ),
+                )
+            report = service._query_reserved(resources, query, reservation)
+            return _RetrievalOperationResult(
+                handoff=operation_handoff,
+                report=report,
+            )
+
+    def __capture_retrieval_operation_locked(
+        self,
+    ) -> tuple[RetrievalHandoffSnapshot, RetrievalCapabilitySnapshot]:
+        """Validate and defensively copy the current private retrieval pair."""
+
+        handoff, publisher, service = self.__validate_retrieval_graph_locked()
+        capability = publisher.snapshot()
+        if (
+            type(capability) is not RetrievalCapabilitySnapshot
+            or _retrieval_display(capability)
+            != self.__retrieval_operation_display
+        ):
+            raise ValueError("retrieval capability drift")
+        return (
+            RetrievalHandoffSnapshot(
+                generation=handoff.generation,
+                query_port=_CoreRetrievalQueryPort(service),
+                display=_clone_retrieval_display(
+                    self.__retrieval_operation_display
+                ),
+            ),
+            capability,
+        )
+
+    def __validate_retrieval_graph_locked(
+        self,
+    ) -> tuple[
+        RetrievalHandoffSnapshot,
+        RetrievalCapabilityPublisher,
+        TMRetrievalService,
+    ]:
+        """Validate the host-private graph without capturing capability."""
+
+        handoff = self.__retrieval_handoff
+        publisher = self.__retrieval_publisher
+        service = self.__retrieval_service
+        if (
+            type(handoff) is not RetrievalHandoffSnapshot
+            or type(handoff.query_port) is not _CoreRetrievalQueryPort
+            or not handoff.query_port._is_bound_to(service)
+            or handoff.display is not self.__status.retrieval
+            or handoff.display != self.__retrieval_operation_display
+            or handoff.generation
+            != self.__retrieval_notifications.current()
+            or type(publisher) is not RetrievalCapabilityPublisher
+            or type(service) is not TMRetrievalService
+            or cast(Any, service)._capability_publisher is not publisher
+        ):
+            raise ValueError("retrieval handoff drift")
+        return handoff, publisher, service
 
     def retrieval_generation_notifications(
         self,
@@ -3185,6 +3308,7 @@ class CapabilityHost:
                 old_service = self.__retrieval_service
                 old_base_manifest = self.__retrieval_base_manifest
                 old_handoff = self.__retrieval_handoff
+                old_operation_display = self.__retrieval_operation_display
                 old_status = self.__status
                 old_notification_generation = (
                     self.__retrieval_notifications
@@ -3195,6 +3319,9 @@ class CapabilityHost:
                     self.__retrieval_service = service
                     self.__retrieval_base_manifest = base_manifest
                     self.__retrieval_handoff = handoff
+                    self.__retrieval_operation_display = (
+                        _clone_retrieval_display(display)
+                    )
                     self.__status = status
                     self.__retrieval_notifications._publish_prevalidated_locked(
                         generation
@@ -3204,6 +3331,7 @@ class CapabilityHost:
                     self.__retrieval_service = old_service
                     self.__retrieval_base_manifest = old_base_manifest
                     self.__retrieval_handoff = old_handoff
+                    self.__retrieval_operation_display = old_operation_display
                     self.__status = old_status
                     self.__retrieval_notifications._restore_precommit_locked(
                         old_notification_generation
@@ -3281,6 +3409,7 @@ class CapabilityHost:
                     generation,
                 )
                 old_handoff = self.__retrieval_handoff
+                old_operation_display = self.__retrieval_operation_display
                 old_status = self.__status
                 old_notification_generation = (
                     self.__retrieval_notifications
@@ -3317,6 +3446,9 @@ class CapabilityHost:
                     )
                     try:
                         self.__retrieval_handoff = handoff
+                        self.__retrieval_operation_display = (
+                            _clone_retrieval_display(display)
+                        )
                         self.__status = status
                         self.__retrieval_notifications._publish_prevalidated_locked(
                             generation
@@ -3325,6 +3457,9 @@ class CapabilityHost:
                             prepare_owner_success()
                     except BaseException:
                         self.__retrieval_handoff = old_handoff
+                        self.__retrieval_operation_display = (
+                            old_operation_display
+                        )
                         self.__status = old_status
                         self.__retrieval_notifications._restore_precommit_locked(
                             old_notification_generation

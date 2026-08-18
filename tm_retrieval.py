@@ -1403,6 +1403,24 @@ class _LazyScorerPort:
         return self._score
 
 
+@dataclass(frozen=True, slots=True)
+class _ReservedRetrievalQueryOperation:
+    """Service-private binding for one Core-issued capability receipt."""
+
+    _service_identity: object
+    _receipt: object
+    capability_snapshot: RetrievalCapabilitySnapshot
+
+    def __post_init__(self) -> None:
+        if self._service_identity is None:
+            raise TypeError("reserved query service identity is required")
+        _require_exact_type(
+            self.capability_snapshot,
+            RetrievalCapabilitySnapshot,
+            "reserved query capability snapshot",
+        )
+
+
 class TMRetrievalService:
     """Deterministic multi-resource exact/context/fuzzy retrieval service.
 
@@ -1461,6 +1479,70 @@ class TMRetrievalService:
         capability_snapshot = _snapshot_capability_snapshot(
             self._capability_publisher.snapshot()
         )
+        return self._query_with_capability_snapshot(
+            resources,
+            query,
+            capability_snapshot,
+        )
+
+    def _reserve_query_operation(self) -> _ReservedRetrievalQueryOperation:
+        """Capture one service-bound publisher receipt for the host."""
+
+        receipt = self._capability_publisher._mint_query_operation_receipt(
+            self
+        )
+        captured = (
+            self._capability_publisher._inspect_query_operation_receipt(
+                receipt,
+                self,
+            )
+        )
+        return _ReservedRetrievalQueryOperation(
+            _service_identity=self,
+            _receipt=receipt,
+            capability_snapshot=_snapshot_capability_snapshot(captured),
+        )
+
+    def _query_reserved(
+        self,
+        resources: tuple[TMResourceHandle, ...],
+        query: TMQuery,
+        reservation: _ReservedRetrievalQueryOperation,
+    ) -> QueryReport:
+        """Consume one exact receipt without recapturing publisher state."""
+
+        if type(reservation) is not _ReservedRetrievalQueryOperation:
+            raise TypeError("reserved query operation must be service-issued")
+        if reservation._service_identity is not self:
+            raise ValueError(
+                "reserved query operation belongs to a foreign retrieval service"
+            )
+        reserved_snapshot = _snapshot_capability_snapshot(
+            reservation.capability_snapshot
+        )
+        captured = (
+            self._capability_publisher._consume_query_operation_receipt(
+                reservation._receipt,
+                self,
+            )
+        )
+        consumed_snapshot = _snapshot_capability_snapshot(captured)
+        if consumed_snapshot != reserved_snapshot:
+            raise ValueError("reserved query capability snapshot drift")
+        return self._query_with_capability_snapshot(
+            resources,
+            query,
+            reserved_snapshot,
+        )
+
+    def _query_with_capability_snapshot(
+        self,
+        resources: tuple[TMResourceHandle, ...],
+        query: TMQuery,
+        capability_snapshot: RetrievalCapabilitySnapshot,
+    ) -> QueryReport:
+        """Run the shared pipeline with one already-defensive snapshot."""
+
         snapshots = _snapshot_handles(resources)
         query_snapshot = _snapshot_service_query(query)
         _validate_service_mapping(snapshots, query_snapshot)

@@ -5282,6 +5282,143 @@ class TMRetrievalCapabilityIntegrationTests(unittest.TestCase):
             {"tm.first", "tm.second"},
         )
 
+    def test_reserved_query_receipt_is_service_bound_and_single_use(
+        self,
+    ) -> None:
+        publisher = _retrieval_capability_publisher()
+        owner = TMRetrievalService(capability_publisher=publisher)
+        foreign = TMRetrievalService(capability_publisher=publisher)
+        query = _service_query(resource_order=())
+        reservation = owner._reserve_query_operation()
+
+        with self.assertRaisesRegex(ValueError, "foreign retrieval service"):
+            foreign._query_reserved((), query, reservation)
+
+        report = owner._query_reserved((), query, reservation)
+        self.assertEqual(report, QueryReport((), (), ()))
+        with self.assertRaisesRegex(ValueError, "already consumed"):
+            owner._query_reserved((), query, reservation)
+
+    def test_reserved_query_mints_exactly_one_publisher_snapshot(self) -> None:
+        publisher = _retrieval_capability_publisher()
+        service = TMRetrievalService(capability_publisher=publisher)
+        original_snapshot = RetrievalCapabilityPublisher.snapshot
+        captures: list[object] = []
+
+        def count_snapshot(
+            current: RetrievalCapabilityPublisher,
+        ) -> object:
+            captured = original_snapshot(current)
+            captures.append(captured)
+            return captured
+
+        with patch.object(
+            RetrievalCapabilityPublisher,
+            "snapshot",
+            count_snapshot,
+        ):
+            reservation = service._reserve_query_operation()
+            report = service._query_reserved(
+                (),
+                _service_query(resource_order=()),
+                reservation,
+            )
+
+        self.assertEqual(report, QueryReport((), (), ()))
+        self.assertEqual(len(captures), 1)
+
+    def test_reserved_query_rejects_receipt_and_snapshot_tamper(self) -> None:
+        publisher = _retrieval_capability_publisher()
+        service = TMRetrievalService(capability_publisher=publisher)
+        query = _service_query(resource_order=())
+        receipt_tampered = service._reserve_query_operation()
+        foreign_snapshot = _retrieval_capability_publisher(
+            context_open=False,
+            fuzzy_core_open=False,
+            fts5_open=False,
+            gram_open=False,
+        ).snapshot()
+        object.__setattr__(
+            receipt_tampered._receipt,
+            "_RetrievalCapabilityOperationReceipt__snapshot",
+            foreign_snapshot,
+        )
+        with self.assertRaisesRegex(ValueError, "receipt snapshot drift"):
+            service._query_reserved((), query, receipt_tampered)
+
+        snapshot_tampered = service._reserve_query_operation()
+        object.__setattr__(
+            snapshot_tampered.capability_snapshot.context,
+            "available",
+            False,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "closed context requires an unavailable code",
+        ):
+            service._query_reserved((), query, snapshot_tampered)
+
+    def test_reserved_query_refresh_callback_uses_old_snapshot_without_locking(
+        self,
+    ) -> None:
+        publisher = _retrieval_capability_publisher()
+        events: list[str] = []
+
+        def refresh_to_closed() -> None:
+            events.append("refresh")
+            publisher.refresh(
+                None,
+                evaluated_at_utc=_CAPABILITY_EVALUATED_AT,
+            )
+
+        store = self._fuzzy_store(
+            "tm.primary",
+            batch_records=(
+                _record(501, source_raw="Open the door quickly."),
+            ),
+            on_health=refresh_to_closed,
+        )
+        retriever = _ServiceRetriever(
+            report_by_resource={
+                "tm.primary": _candidate_report(
+                    (501,),
+                    resource_id="tm.primary",
+                    result_limit=10,
+                ),
+            }
+        )
+        service = TMRetrievalService(
+            retriever=cast(Any, retriever),
+            scorer=cast(
+                Any,
+                _FixedEvidenceScorer(
+                    {"Open the door quickly.": _evidence(0.9)}
+                ),
+            ),
+            capability_publisher=publisher,
+        )
+        reservation = service._reserve_query_operation()
+        report = service._query_reserved(
+            (
+                _service_handle(
+                    store,
+                    resource_id="tm.primary",
+                    order=0,
+                ),
+            ),
+            _service_query(resource_order=("tm.primary",)),
+            reservation,
+        )
+
+        self.assertEqual(events, ["refresh"])
+        self.assertFalse(publisher.snapshot().context.available)
+        self.assertTrue(report.resource_metadata[0].context_available)
+        self.assertTrue(report.resource_metadata[0].recall.fuzzy_available)
+        self.assertEqual(
+            {result.resource_id for result in report.results},
+            {"tm.primary"},
+        )
+
     def test_tampered_published_snapshot_cannot_corrupt_in_flight_query(
         self,
     ) -> None:

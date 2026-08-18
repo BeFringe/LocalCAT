@@ -1357,6 +1357,105 @@ def _require_evaluator(
 
 
 _ValidatedPublicationT = TypeVar("_ValidatedPublicationT")
+_QUERY_OPERATION_RECEIPT_MINT = object()
+
+
+@final
+class _RetrievalCapabilityOperationReceipt:
+    """One publisher-issued, service-bound, single-use snapshot receipt."""
+
+    __slots__ = (
+        "__consumed",
+        "__lock",
+        "__mint_identity",
+        "__publisher",
+        "__publisher_identity",
+        "__service_identity",
+        "__snapshot",
+        "__snapshot_identity",
+    )
+
+    def __init__(
+        self,
+        *,
+        publisher: RetrievalCapabilityPublisher,
+        service_identity: object,
+        snapshot: RetrievalCapabilitySnapshot,
+        mint_identity: object,
+    ) -> None:
+        if mint_identity is not _QUERY_OPERATION_RECEIPT_MINT:
+            raise PermissionError("query receipt mint is private")
+        if type(publisher) is not RetrievalCapabilityPublisher:
+            raise TypeError("query receipt publisher must be exact")
+        if service_identity is None:
+            raise TypeError("query receipt service identity is required")
+        if type(snapshot) is not RetrievalCapabilitySnapshot:
+            raise TypeError("query receipt snapshot must be exact")
+        self.__consumed = False
+        self.__lock = Lock()
+        self.__mint_identity = mint_identity
+        self.__publisher = publisher
+        self.__publisher_identity = publisher
+        self.__service_identity = service_identity
+        self.__snapshot = snapshot
+        self.__snapshot_identity = snapshot
+
+    def _inspect(
+        self,
+        *,
+        publisher: RetrievalCapabilityPublisher,
+        service_identity: object,
+        mint_identity: object,
+    ) -> RetrievalCapabilitySnapshot:
+        with self.__lock:
+            self.__validate_binding(
+                publisher=publisher,
+                service_identity=service_identity,
+                mint_identity=mint_identity,
+            )
+            if self.__consumed:
+                raise ValueError("query operation receipt is already consumed")
+            return self.__snapshot
+
+    def _consume(
+        self,
+        *,
+        publisher: RetrievalCapabilityPublisher,
+        service_identity: object,
+        mint_identity: object,
+    ) -> RetrievalCapabilitySnapshot:
+        with self.__lock:
+            self.__validate_binding(
+                publisher=publisher,
+                service_identity=service_identity,
+                mint_identity=mint_identity,
+            )
+            if self.__consumed:
+                raise ValueError("query operation receipt is already consumed")
+            self.__consumed = True
+            return self.__snapshot
+
+    def __validate_binding(
+        self,
+        *,
+        publisher: RetrievalCapabilityPublisher,
+        service_identity: object,
+        mint_identity: object,
+    ) -> None:
+        if (
+            mint_identity is not _QUERY_OPERATION_RECEIPT_MINT
+            or self.__mint_identity is not _QUERY_OPERATION_RECEIPT_MINT
+            or self.__publisher is not self.__publisher_identity
+            or self.__publisher is not publisher
+        ):
+            raise ValueError("query operation receipt publisher drift")
+        if self.__service_identity is not service_identity:
+            raise ValueError("query operation receipt belongs to a foreign retrieval service")
+        if (
+            self.__snapshot is not self.__snapshot_identity
+            or type(self.__snapshot) is not RetrievalCapabilitySnapshot
+        ):
+            raise ValueError("query operation receipt snapshot drift")
 
 
 @final
@@ -1401,6 +1500,46 @@ class RetrievalCapabilityPublisher:
 
         with self.__lock:
             return self.__snapshot
+
+    def _mint_query_operation_receipt(
+        self,
+        service_identity: object,
+    ) -> object:
+        """Mint one opaque receipt from exactly one atomic snapshot capture."""
+
+        snapshot = self.snapshot()
+        return _RetrievalCapabilityOperationReceipt(
+            publisher=self,
+            service_identity=service_identity,
+            snapshot=snapshot,
+            mint_identity=_QUERY_OPERATION_RECEIPT_MINT,
+        )
+
+    def _inspect_query_operation_receipt(
+        self,
+        receipt: object,
+        service_identity: object,
+    ) -> RetrievalCapabilitySnapshot:
+        if type(receipt) is not _RetrievalCapabilityOperationReceipt:
+            raise TypeError("query operation receipt must be publisher-issued")
+        return receipt._inspect(
+            publisher=self,
+            service_identity=service_identity,
+            mint_identity=_QUERY_OPERATION_RECEIPT_MINT,
+        )
+
+    def _consume_query_operation_receipt(
+        self,
+        receipt: object,
+        service_identity: object,
+    ) -> RetrievalCapabilitySnapshot:
+        if type(receipt) is not _RetrievalCapabilityOperationReceipt:
+            raise TypeError("query operation receipt must be publisher-issued")
+        return receipt._consume(
+            publisher=self,
+            service_identity=service_identity,
+            mint_identity=_QUERY_OPERATION_RECEIPT_MINT,
+        )
 
     @property
     def semantics_version(self) -> str:
