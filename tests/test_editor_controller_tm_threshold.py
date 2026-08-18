@@ -210,6 +210,62 @@ class EditorControllerTMThresholdTests(unittest.TestCase):
                 before_bytes,
             )
 
+    def test_new_controller_restores_threshold_and_queries_with_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _adapter = _fixture(root)
+            self.assertTrue(
+                controller.update_tm_minimum_similarity(0.83).succeeded
+            )
+
+            repository = ResourceRepository(root / "app-data")
+            adapter = EditorTMAdapter(
+                runtime_host=TMRuntimeHost(
+                    resolver=TMResourceResolver(),
+                    configs=repository.list_resources(),
+                ),
+                capability_host=CapabilityHost(
+                    evaluated_at_utc=_EVALUATED_AT
+                ),
+            )
+            restarted = EditorController(repository, tm_adapter=adapter)
+            restarted.set_project(
+                EditorProject(
+                    name="Restarted threshold",
+                    segments=(EditorSegment(id="restart", source="Hello"),),
+                )
+            )
+            observed: list[TMPreferences] = []
+            original_query = EditorTMAdapter._query_current_operation
+
+            def record_query(
+                current: EditorTMAdapter,
+                *,
+                segment: EditorSegment,
+                project_session_id: str,
+                query_epoch: int,
+                preferences: TMPreferences,
+            ):
+                observed.append(preferences)
+                return original_query(
+                    current,
+                    segment=segment,
+                    project_session_id=project_session_id,
+                    query_epoch=query_epoch,
+                    preferences=preferences,
+                )
+
+            with patch.object(
+                EditorTMAdapter,
+                "_query_current_operation",
+                autospec=True,
+                side_effect=record_query,
+            ):
+                _ = restarted.tm_suggestion_report()
+
+            self.assertEqual(restarted.tm_preferences(), TMPreferences(0.83))
+            self.assertEqual(observed, [TMPreferences(0.83)])
+
 
 if __name__ == "__main__":
     unittest.main()

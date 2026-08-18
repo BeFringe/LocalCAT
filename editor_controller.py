@@ -45,6 +45,7 @@ from tm_contracts import (
     MigrationFailure,
     MigrationPreflight,
     MigrationReport,
+    StoreHealth,
 )
 from tm_engine import SourceUnit, TMEngine
 from tm_migration import MigrationPreflightError, TMMigrationService
@@ -100,6 +101,32 @@ def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService
     return TMMigrationService(
         resource_identity=identity,
         canonical_store_id=canonical_store_id,
+        coordinator=coordinator,
+    )
+
+
+def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
+    """Reopen the resource's proven LKG coordinator for explicit rebuild."""
+
+    if type(config) is not ResourceConfig:
+        raise TypeError("TM rebuild config must be ResourceConfig")
+    config.__post_init__()
+    engine = TMEngine(str(config.path))
+    store = engine.canonical_store
+    if store is None:
+        raise EditorControllerError(
+            "TM rebuild requires an active canonical resource"
+        )
+    coordinator = store.coordinator
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        config.id,
+        config.path,
+    )
+    if coordinator.resource_id != config.id:
+        raise EditorControllerError("TM rebuild canonical identity changed")
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=coordinator.canonical_store_id,
         coordinator=coordinator,
     )
 
@@ -163,6 +190,24 @@ def _validate_activation_runtime_candidate(
     canonical_ids = tuple(
         port.handle.resource_id for port in snapshot.canonical_ports
     )
+    canonical_port = next(
+        (
+            port
+            for port in snapshot.canonical_ports
+            if port.handle.resource_id == resource_id
+        ),
+        None,
+    )
+
+    def canonical_health() -> StoreHealth:
+        if canonical_port is None:
+            raise ValueError("activation runtime canonical port is missing")
+        health = canonical_port.handle.store.health()
+        if type(health) is not StoreHealth:
+            raise TypeError("activation runtime health contract is invalid")
+        health.__post_init__()
+        return health
+
     if isinstance(outcome, MigrationReport):
         outcome.__post_init__()
         if outcome.resource_id != resource_id:
@@ -174,8 +219,23 @@ def _validate_activation_runtime_candidate(
             or status.fuzzy_available
             or resource_id in legacy_ids
             or canonical_ids.count(resource_id) != 1
+            or outcome.context_available
+            or outcome.fuzzy_available
         ):
             raise ValueError("activation success runtime is not canonical")
+        health = canonical_health()
+        if health.generation != outcome.activated_generation:
+            raise ValueError("activation success runtime generation changed")
+        port = canonical_port
+        if port is None:
+            raise ValueError("activation runtime canonical port is missing")
+        coordinator = getattr(port.handle.store, "coordinator", None)
+        if (
+            coordinator is None
+            or getattr(coordinator, "canonical_store_id", None)
+            != outcome.canonical_store_id
+        ):
+            raise ValueError("activation success canonical store changed")
         return
 
     outcome.__post_init__()
@@ -203,6 +263,8 @@ def _validate_activation_runtime_candidate(
             and resource_id not in legacy_ids
             and canonical_ids.count(resource_id) == 1
         ):
+            if canonical_health().generation != outcome.active_generation:
+                raise ValueError("published activation generation changed")
             return
         raise ValueError("published activation runtime is not fail-closed")
     if outcome.active_generation is not None:
@@ -219,6 +281,8 @@ def _validate_activation_runtime_candidate(
             or canonical_ids.count(resource_id) != 1
         ):
             raise ValueError("canonical update failure did not preserve LKG")
+        if canonical_health().generation != outcome.active_generation:
+            raise ValueError("canonical LKG generation changed")
         return
     if (
         status.mode is not TMResourceDisplayMode.LEGACY_EXACT_ONLY
@@ -242,6 +306,41 @@ def _activation_outcome_requires_query_block(
         outcome.canonical_authority_published
         or outcome.canonical_authority_ambiguous
     )
+
+
+def _validate_activation_compatibility_engine(
+    engine: TMEngine,
+    outcome: MigrationReport | MigrationFailure,
+) -> None:
+    """Re-prove one no-adapter Controller engine against the Core outcome."""
+
+    if type(engine) is not TMEngine:
+        raise TypeError("activation compatibility engine must be TMEngine")
+    store = engine.canonical_store
+    if isinstance(outcome, MigrationReport):
+        if store is None:
+            raise ValueError("activation success compatibility engine is legacy")
+        health = store.health()
+        health.__post_init__()
+        if (
+            health.generation != outcome.activated_generation
+            or store.coordinator.canonical_store_id
+            != outcome.canonical_store_id
+        ):
+            raise ValueError("activation success compatibility authority changed")
+        return
+    if outcome.canonical_authority_ambiguous:
+        raise ValueError("ambiguous activation has no safe compatibility engine")
+    if outcome.canonical_authority_published or outcome.active_generation is not None:
+        if store is None:
+            raise ValueError("canonical failure compatibility engine is legacy")
+        health = store.health()
+        health.__post_init__()
+        if health.generation != outcome.active_generation:
+            raise ValueError("canonical failure compatibility generation changed")
+        return
+    if store is not None:
+        raise ValueError("proven first failure compatibility engine is canonical")
 
 
 def _clone_tm_suggestion_report(
@@ -341,7 +440,13 @@ class EditorController:
             LegacyExactTMSuggestion,
             ...,
         ] = ()
-        self._legacy_issued_context: tuple[str, str, str, int] | None = None
+        self._legacy_issued_context: tuple[
+            str,
+            str,
+            str,
+            str,
+            int,
+        ] | None = None
         self._current_tm_report: TMSuggestionReport | None = None
         self._observed_tm_signature: tuple[
             str,
@@ -351,6 +456,7 @@ class EditorController:
             int,
             float,
             int,
+            str,
         ] | None = None
         self._tm_activation_condition = Condition(RLock())
         self._prepared_tm_activation: _PreparedTMActivation | None = None
@@ -365,7 +471,7 @@ class EditorController:
         self._dirty = False
         self._tm_engines: dict[str, TMEngine] = {}
         self._glossary_engines: dict[str, GlossaryEngine] = {}
-        self.reload_resources()
+        self.reload_resources(_refresh_runtime=False)
 
     @property
     def project(self) -> EditorProject:
@@ -726,6 +832,9 @@ class EditorController:
                 self._project_session_id,
                 segment.id,
                 hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+                hashlib.sha256(
+                    (segment.speaker or "").encode("utf-8")
+                ).hexdigest(),
                 self._tm_query_epoch,
             )
             return bundle
@@ -889,6 +998,14 @@ class EditorController:
     ) -> TMActivationPreflightView:
         """Return read-only activation counts and retain Core authority privately."""
 
+        return self._prepare_initial_tm_activation(resource_id)
+
+    def _prepare_initial_tm_activation(
+        self,
+        resource_id: str,
+    ) -> TMActivationPreflightView:
+        """Issue one initial-activation preflight without exposing Core authority."""
+
         if type(resource_id) is not str or not resource_id.strip():
             raise EditorControllerError("TM activation resource id is required")
         with self._tm_activation_condition:
@@ -965,6 +1082,81 @@ class EditorController:
     ) -> TMActivationOperationView:
         """Start the Core-owned first activation in one background worker."""
 
+        return self._start_initial_tm_activation(preflight)
+
+    def rebuild_tm_resource(
+        self,
+        resource_id: str,
+    ) -> TMActivationOperationView:
+        """Start one explicitly confirmed Core-owned canonical rebuild."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise EditorControllerError("TM rebuild resource id is required")
+        with self._tm_activation_condition:
+            current_operation = self._tm_activation_operation
+            if current_operation is not None:
+                if not current_operation.completed:
+                    raise EditorControllerError(
+                        "a TM activation is already in progress"
+                    )
+                self._tm_activation_operation = None
+                self._tm_activation_outcome = None
+                self._tm_activation_worker_error = None
+            try:
+                config = self.repository.get(resource_id)
+            except ResourceError as error:
+                raise EditorControllerError(
+                    "TM rebuild resource is unavailable"
+                ) from error
+            if config.kind is not ResourceKind.TRANSLATION_MEMORY:
+                raise EditorControllerError(
+                    "TM rebuild requires a translation memory resource"
+                )
+            try:
+                service = _tm_rebuild_service(config)
+            except (OSError, UnicodeError, ValueError) as error:
+                raise EditorControllerError(
+                    "TM rebuild canonical resource is unavailable"
+                ) from error
+            operation = TMActivationOperationView(
+                operation_id=uuid4().hex,
+                resource_id=config.id,
+                phase="ACTIVATING",
+                completed=False,
+                succeeded=False,
+                safe_code=None,
+                retryable=False,
+            )
+            private_operation = replace(operation)
+            self._tm_activation_operation = private_operation
+            self._tm_activation_outcome = None
+            self._tm_activation_worker_error = None
+            self._prepared_tm_activation = None
+            worker = Thread(
+                target=self._run_tm_activation,
+                kwargs={
+                    "operation_id": private_operation.operation_id,
+                    "service": service,
+                    "source": config.path,
+                    "resource_id": config.id,
+                    "action": "REBUILD",
+                },
+                name=f"localcat-tm-rebuild-{operation.operation_id[:8]}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                self._tm_activation_operation = None
+                raise
+            return replace(operation)
+
+    def _start_initial_tm_activation(
+        self,
+        preflight: TMActivationPreflightView,
+    ) -> TMActivationOperationView:
+        """Start one initial activation bound by Controller preflight."""
+
         if type(preflight) is not TMActivationPreflightView:
             raise EditorControllerError("TM activation preflight is required")
         candidate = replace(preflight)
@@ -1039,6 +1231,7 @@ class EditorController:
                     "service": prepared.service,
                     "source": current_config.path,
                     "resource_id": current_config.id,
+                    "action": "INITIAL",
                 },
                 name=f"localcat-tm-activation-{operation.operation_id[:8]}",
                 daemon=True,
@@ -1058,6 +1251,7 @@ class EditorController:
         service: TMMigrationService,
         source: Path,
         resource_id: str,
+        action: str,
     ) -> None:
         """Execute Core activation and publish only a body-free completion."""
 
@@ -1067,7 +1261,12 @@ class EditorController:
         safe_code: str | None = None
         retryable = False
         try:
-            candidate = service.activate_initial(source, resource_id)
+            if action == "INITIAL":
+                candidate = service.activate_initial(source, resource_id)
+            elif action == "REBUILD":
+                candidate = service.rebuild_from_snapshot(source, resource_id)
+            else:
+                raise ValueError("TM operation action is unsupported")
             if type(candidate) is MigrationReport:
                 candidate.__post_init__()
                 outcome = candidate
@@ -1090,7 +1289,7 @@ class EditorController:
             worker_error = error
             safe_code = "TM.ACTIVATION.PROGRAMMER_ERROR"
 
-        if outcome is not None and self._tm_adapter is not None:
+        if outcome is not None:
             try:
                 self._refresh_runtime_for_activation_outcome(
                     resource_id=resource_id,
@@ -1138,18 +1337,94 @@ class EditorController:
             raise TypeError("activation completion outcome is unsupported")
         outcome.__post_init__()
         adapter = self._tm_adapter
-        if adapter is None:
-            raise ValueError("TM runtime adapter is unavailable")
         with self._tm_query_lock:
             try:
-                _ = adapter._refresh_runtime_after_activation(
-                    self.repository.list_resources(),
-                    lambda snapshot: _validate_activation_runtime_candidate(
+                configs = self.repository.list_resources()
+                tm_engines: dict[str, TMEngine] | None = None
+
+                def validate_candidate(snapshot: object) -> None:
+                    from tm_application_composition import TMRuntimeSnapshot
+
+                    nonlocal tm_engines
+                    if type(snapshot) is not TMRuntimeSnapshot:
+                        raise TypeError(
+                            "activation runtime candidate must be TMRuntimeSnapshot"
+                        )
+                    _validate_activation_runtime_candidate(
                         snapshot,
                         resource_id=resource_id,
                         outcome=outcome,
-                    ),
-                )
+                    )
+                    tm_engines = self._build_tm_engine_set_for_runtime_snapshot(
+                        configs,
+                        snapshot,
+                    )
+                    target_status = next(
+                        status
+                        for status in snapshot.statuses
+                        if status.resource_id == resource_id
+                    )
+                    target_engine = tm_engines.get(resource_id)
+                    if target_status.mode is TMResourceDisplayMode.UNAVAILABLE:
+                        if target_engine is not None:
+                            raise ValueError(
+                                "unavailable activation retained compatibility authority"
+                            )
+                    else:
+                        if target_engine is None:
+                            raise ValueError(
+                                "activation compatibility engine is missing"
+                            )
+                        _validate_activation_compatibility_engine(
+                            target_engine,
+                            outcome,
+                        )
+
+                if adapter is None:
+                    target_config = next(
+                        (
+                            config
+                            for config in configs
+                            if config.id == resource_id
+                            and config.kind
+                            is ResourceKind.TRANSLATION_MEMORY
+                            and config.active
+                        ),
+                        None,
+                    )
+                    if target_config is None:
+                        raise ValueError(
+                            "activation completion resource is unavailable"
+                        )
+                    target_engine = self._load_tm_engine(target_config.path)
+                    _validate_activation_compatibility_engine(
+                        target_engine,
+                        outcome,
+                    )
+                    tm_engines = {
+                        config.id: (
+                            target_engine
+                            if config.id == resource_id
+                            else self._load_tm_engine(config.path)
+                        )
+                        for config in configs
+                        if config.active
+                        and config.kind
+                        is ResourceKind.TRANSLATION_MEMORY
+                    }
+                else:
+                    _ = adapter._refresh_runtime_after_activation(
+                        configs,
+                        validate_candidate,
+                    )
+                if tm_engines is None:
+                    raise ValueError("TM runtime compatibility candidate is missing")
+                self._tm_engines = tm_engines
+                self._tm_runtime_blocked_safe_code = None
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+                if adapter is not None and self._project is not None:
+                    _ = self.tm_suggestion_report()
             except BaseException:
                 if _activation_outcome_requires_query_block(outcome):
                     self._tm_runtime_blocked_safe_code = (
@@ -1158,10 +1433,6 @@ class EditorController:
                     self._advance_tm_query_epoch()
                     self._observed_tm_signature = None
                 raise
-            else:
-                self._tm_runtime_blocked_safe_code = None
-                self._advance_tm_query_epoch()
-                self._record_current_tm_baseline()
 
     def tm_activation_operation(self) -> TMActivationOperationView | None:
         """Return the current body-free activation lifecycle snapshot."""
@@ -1228,7 +1499,7 @@ class EditorController:
         preferences: TMPreferences,
         runtime_generation: int,
         retrieval_generation: int,
-    ) -> tuple[str, str, str, int, int, float, int]:
+    ) -> tuple[str, str, str, int, int, float, int, str]:
         return (
             self._project_session_id,
             segment.id,
@@ -1237,11 +1508,14 @@ class EditorController:
             retrieval_generation,
             preferences.minimum_similarity,
             preferences.result_limit,
+            hashlib.sha256(
+                (segment.speaker or "").encode("utf-8")
+            ).hexdigest(),
         )
 
     def _capture_current_tm_signature(
         self,
-    ) -> tuple[str, str, str, int, int, float, int]:
+    ) -> tuple[str, str, str, int, int, float, int, str]:
         adapter = self._tm_adapter
         if adapter is None:
             raise ValueError("TM query adapter is not configured")
@@ -1362,6 +1636,9 @@ class EditorController:
                     self._project_session_id,
                     segment.id,
                     hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+                    hashlib.sha256(
+                        (segment.speaker or "").encode("utf-8")
+                    ).hexdigest(),
                     self._tm_query_epoch,
                 )
                 if self._legacy_issued_context != current_context:
@@ -1479,42 +1756,45 @@ class EditorController:
     def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create a managed resource and make it available immediately."""
 
-        try:
-            resource = self.repository.create_resource(name, kind)
-            self.reload_resources()
-            return resource
-        except ResourceError as exc:
-            raise EditorControllerError(str(exc)) from exc
+        with self._tm_query_lock:
+            try:
+                resource = self.repository.create_resource(name, kind)
+                self.reload_resources()
+                return resource
+            except ResourceError as exc:
+                raise EditorControllerError(str(exc)) from exc
 
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig:
         """Persist resource state through the repository and rebuild engine sets."""
 
-        try:
-            updated = self.repository.update_resource(resource)
-            self.reload_resources()
-            return updated
-        except ResourceError as exc:
-            raise EditorControllerError(str(exc)) from exc
+        with self._tm_query_lock:
+            try:
+                updated = self.repository.update_resource(resource)
+                self.reload_resources()
+                return updated
+            except ResourceError as exc:
+                raise EditorControllerError(str(exc)) from exc
 
     def delete_resource(self, resource_id: str) -> ResourceConfig:
         """Delete one configured resource and remove it from live engine sets."""
 
-        try:
-            deleted = self.repository.delete_resource(resource_id)
-        except ResourceError as exc:
-            raise EditorControllerError(str(exc)) from exc
-        self._tm_engines.pop(resource_id, None)
-        self._glossary_engines.pop(resource_id, None)
-        try:
-            self.reload_resources()
-        except EditorControllerError as exc:
-            LOGGER.warning(
-                "Resource %s was deleted; remaining resources kept their last "
-                "known-good engines because reload failed: %s",
-                resource_id,
-                exc,
-            )
-        return deleted
+        with self._tm_query_lock:
+            try:
+                deleted = self.repository.delete_resource(resource_id)
+            except ResourceError as exc:
+                raise EditorControllerError(str(exc)) from exc
+            self._tm_engines.pop(resource_id, None)
+            self._glossary_engines.pop(resource_id, None)
+            try:
+                self.reload_resources()
+            except EditorControllerError as exc:
+                LOGGER.warning(
+                    "Resource %s was deleted; remaining resources kept their last "
+                    "known-good engines because reload failed: %s",
+                    resource_id,
+                    exc,
+                )
+            return deleted
 
     def import_resource(self, request: ImportRequest) -> ImportReport:
         """Import into one configured resource and hot reload on any written result."""
@@ -1544,27 +1824,134 @@ class EditorController:
                 )
         return report
 
-    def reload_resources(self) -> None:
+    def reload_resources(self, *, _refresh_runtime: bool = True) -> None:
         """Build a complete active engine set before replacing the last known-good set."""
 
-        tm_engines: dict[str, TMEngine] = {}
-        glossary_engines: dict[str, GlossaryEngine] = {}
+        if type(_refresh_runtime) is not bool:
+            raise TypeError("resource runtime refresh flag must be exact bool")
+        configs = self.repository.list_resources()
         try:
-            for resource in self.repository.list_resources():
-                if not resource.active:
-                    continue
-                if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-                    tm_engines[resource.id] = self._load_tm_engine(resource.path)
+            with self._tm_query_lock:
+                adapter = self._tm_adapter
+                if adapter is None:
+                    tm_engines, glossary_engines = self._build_resource_engine_sets(
+                        configs
+                    )
+                elif not _refresh_runtime:
+                    if configs:
+                        initial_runtime = adapter._capture_runtime_for_controller(
+                            configs
+                        )
+                        tm_engines, glossary_engines = (
+                            self._build_resource_engine_sets(
+                                configs,
+                                runtime_snapshot=initial_runtime,
+                            )
+                        )
+                    else:
+                        tm_engines, glossary_engines = (
+                            self._build_resource_engine_sets(configs)
+                        )
                 else:
-                    glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
+                    engine_candidate: tuple[
+                        dict[str, TMEngine],
+                        dict[str, GlossaryEngine],
+                    ] | None = None
+
+                    def validate_candidate(snapshot: object) -> None:
+                        nonlocal engine_candidate
+                        engine_candidate = self._build_resource_engine_sets(
+                            configs,
+                            runtime_snapshot=snapshot,
+                        )
+
+                    _ = adapter._refresh_runtime(configs, validate_candidate)
+                    if engine_candidate is None:
+                        raise ValueError(
+                            "resource engine refresh candidate is missing"
+                        )
+                    tm_engines, glossary_engines = engine_candidate
+
+                self._tm_engines = tm_engines
+                self._glossary_engines = glossary_engines
+                self._tm_runtime_blocked_safe_code = None
+                if self._project is not None:
+                    self._advance_tm_query_epoch()
+                    self._record_current_tm_baseline()
+                    if adapter is not None:
+                        _ = self.tm_suggestion_report()
         except (OSError, UnicodeError, ValueError, csv.Error, json.JSONDecodeError) as exc:
             raise EditorControllerError(f"unable to reload language resources: {exc}") from exc
-        self._tm_engines = tm_engines
-        self._glossary_engines = glossary_engines
-        if self._project is not None:
-            with self._tm_query_lock:
-                self._advance_tm_query_epoch()
-                self._record_current_tm_baseline()
+
+    def _build_resource_engine_sets(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        *,
+        runtime_snapshot: object | None = None,
+    ) -> tuple[dict[str, TMEngine], dict[str, GlossaryEngine]]:
+        """Build compatibility engines against one validated runtime cohort."""
+
+        tm_engines = (
+            {}
+            if runtime_snapshot is None
+            else self._build_tm_engine_set_for_runtime_snapshot(
+                configs,
+                runtime_snapshot,
+            )
+        )
+        glossary_engines: dict[str, GlossaryEngine] = {}
+        for resource in configs:
+            if not resource.active:
+                continue
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                if runtime_snapshot is None:
+                    tm_engines[resource.id] = self._load_tm_engine(
+                        resource.path
+                    )
+            else:
+                glossary_engines[resource.id] = self._load_glossary_engine(
+                    resource.path
+                )
+        return tm_engines, glossary_engines
+
+    def _build_tm_engine_set_for_runtime_snapshot(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        runtime_snapshot: object,
+    ) -> dict[str, TMEngine]:
+        """Build only TM compatibility engines before activation publication."""
+
+        from tm_application_composition import TMRuntimeSnapshot
+
+        if type(runtime_snapshot) is not TMRuntimeSnapshot:
+            raise TypeError("resource runtime candidate must be TMRuntimeSnapshot")
+        runtime_snapshot.__post_init__()
+        legacy_ids = {
+            port.resource_id for port in runtime_snapshot.legacy_ports
+        }
+        canonical_ids = {
+            port.resource_id for port in runtime_snapshot.canonical_ports
+        }
+        tm_engines: dict[str, TMEngine] = {}
+        for resource in configs:
+            if (
+                resource.kind is not ResourceKind.TRANSLATION_MEMORY
+                or not resource.active
+                or resource.id not in legacy_ids | canonical_ids
+            ):
+                continue
+            engine = self._load_tm_engine(resource.path)
+            if resource.id in legacy_ids:
+                if engine.canonical_store is not None:
+                    raise ValueError(
+                        "legacy compatibility engine became canonical"
+                    )
+            elif engine.canonical_store is None:
+                raise ValueError(
+                    "canonical compatibility engine lost canonical authority"
+                )
+            tm_engines[resource.id] = engine
+        return tm_engines
 
     @staticmethod
     def _load_tm_engine(path: Path) -> TMEngine:

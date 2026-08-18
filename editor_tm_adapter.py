@@ -374,9 +374,31 @@ class EditorTMAdapter:
     ) -> TMRuntimeSnapshot:
         """Atomically publish one activation-proven runtime candidate."""
 
+        return self._refresh_runtime(
+            configs,
+            validate_candidate,
+        )
+
+    def _refresh_runtime(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        validate_candidate: Callable[[TMRuntimeSnapshot], None],
+    ) -> TMRuntimeSnapshot:
+        """Publish one fully validated resource-config runtime candidate."""
+
         return self._runtime_host._refresh_validated(
             configs,
             validate_candidate,
+        )
+
+    def _capture_runtime_for_controller(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> TMRuntimeSnapshot:
+        """Return the defensive runtime cohort injected at Controller startup."""
+
+        return self._runtime_host._capture_operation_snapshot_for_configs(
+            configs
         )
 
     def append_confirmed(

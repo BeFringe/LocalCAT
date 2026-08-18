@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ from editor_contracts import (
     TMPreferences,
     TMSuggestion,
 )
-from editor_controller import EditorController
+from editor_controller import EditorController, EditorControllerError
 from editor_tm_adapter import EditorTMAdapter
 from resource_repository import ResourceRepository
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
@@ -162,6 +163,94 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             self.assertEqual(controller.query_epoch, epoch + 3)
             controller.close_project()
             self.assertEqual(controller.query_epoch, epoch + 4)
+
+    def test_raw_speaker_change_advances_epoch_and_invalidates_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, _repository = self._controller(
+                Path(temporary)
+            )
+            _ = controller.tm_suggestion_report()
+            epoch = controller.query_epoch
+
+            object.__setattr__(controller.current_segment, "speaker", "Narrator")
+
+            self.assertEqual(controller.query_epoch, epoch + 1)
+            self.assertEqual(controller.issued_tm_suggestions, ())
+
+    def test_raw_speaker_change_invalidates_legacy_membership_without_adapter(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = ResourceRepository(root / "app-data")
+            resource = repository.create_resource(
+                "Legacy TM",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            resource.path.write_text(
+                json.dumps({"source": "Hello.", "target": "你好。"}) + "\n",
+                encoding="utf-8",
+            )
+            controller = EditorController(repository)
+            controller.set_project(
+                EditorProject(
+                    name="Legacy membership",
+                    segments=(EditorSegment(id="segment-1", source="Hello."),),
+                )
+            )
+            suggestion = controller.suggestions().tm_matches[0]
+
+            object.__setattr__(
+                controller.current_segment,
+                "speaker",
+                "Narrator",
+            )
+
+            with self.assertRaisesRegex(EditorControllerError, "stale"):
+                controller.apply_tm_suggestion(suggestion)
+            self.assertEqual(controller.current_segment.target, "")
+
+    def test_controller_resource_update_refreshes_runtime_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, adapter, runtime, repository = self._controller(
+                Path(temporary)
+            )
+            initial = controller.tm_suggestion_report()
+            initial_epoch = initial.query_identity.query_epoch
+            initial_generation = runtime.capture_operation_snapshot().generation
+            resource = repository.list_resources()[0]
+
+            query_calls = 0
+            original_query = EditorTMAdapter._query_current_operation
+
+            def counted_query(current, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal query_calls
+                if current is adapter:
+                    query_calls += 1
+                return original_query(current, **kwargs)
+
+            with patch.object(
+                EditorTMAdapter,
+                "_query_current_operation",
+                new=counted_query,
+            ):
+                updated = controller.update_resource(
+                    replace(resource, lookup=False, update=False)
+                )
+
+            self.assertFalse(updated.lookup)
+            self.assertFalse(updated.update)
+            refreshed_runtime = runtime.capture_operation_snapshot()
+            self.assertEqual(
+                refreshed_runtime.generation,
+                initial_generation + 1,
+            )
+            self.assertFalse(refreshed_runtime.legacy_ports[0].lookup)
+            self.assertFalse(refreshed_runtime.legacy_ports[0].update)
+            self.assertEqual(controller.query_epoch, initial_epoch + 1)
+            self.assertEqual(query_calls, 1)
+            self.assertEqual(controller.issued_tm_suggestions, ())
+            self.assertEqual(controller.tm_suggestion_report().suggestions, ())
 
     def test_runtime_refresh_invalidates_and_inflight_query_retries_new_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -541,6 +541,28 @@ class TMRuntimeHost:
                 generation=self._operation_template.generation,
             )
 
+    def _capture_operation_snapshot_for_configs(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> TMRuntimeSnapshot:
+        """Capture startup state only when it matches current repository facts."""
+
+        _validate_configs(configs)
+        private_configs = _clone_resource_configs(configs)
+        with self._lock:
+            if self._configs != private_configs:
+                raise ValueError("runtime startup configs do not match repository")
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                private_configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            return _clone_runtime_snapshot(
+                self._operation_template,
+                generation=self._operation_template.generation,
+            )
+
     def _current_generation(self) -> int:
         """Return the validated current generation without cloning a snapshot."""
 

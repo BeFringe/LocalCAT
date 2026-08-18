@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -30,9 +31,8 @@ from tm_application_composition import (
     TMRuntimeHost,
     TMRuntimeSnapshot,
 )
-from tm_contracts import CanonicalResourceIdentity, MigrationFailure
+from tm_contracts import MigrationReport
 from tm_migration import TMMigrationService
-from tm_sqlite_store import SQLiteTMStore
 from tests.test_tm_initial_activation_recovery import (
     _ambiguous_failure,
     _legacy_failure,
@@ -194,6 +194,16 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             self.assertFalse(status.context_available)
             self.assertFalse(status.fuzzy_available)
 
+            issued_after_completion = controller.issued_tm_suggestions
+            self.assertEqual(len(issued_after_completion), 1)
+            self.assertEqual(
+                issued_after_completion[0].provenance.resource_mode,
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+            )
+            self.assertIsNotNone(
+                controller._tm_engines[resource_id].canonical_store
+            )
+
             after_report = controller.tm_suggestion_report()
             self.assertGreater(
                 after_report.query_identity.query_epoch,
@@ -321,7 +331,43 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             ):
                 controller.tm_suggestion_report()
 
-    def test_real_canonical_rebuild_failure_keeps_last_known_good_runtime(
+    def test_success_outcome_generation_mismatch_is_not_published(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, runtime, _repository, resource_id = _fixture(root)
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            self.assertTrue(
+                controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
+                ).succeeded
+            )
+            outcome = controller._tm_activation_outcome
+            self.assertIs(type(outcome), MigrationReport)
+            assert isinstance(outcome, MigrationReport)
+            before = runtime.snapshot()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "generation changed",
+            ):
+                controller._refresh_runtime_for_activation_outcome(
+                    resource_id=resource_id,
+                    outcome=replace(
+                        outcome,
+                        activated_generation=outcome.activated_generation + 1,
+                    ),
+                )
+
+            self.assertIs(runtime.snapshot(), before)
+            with self.assertRaisesRegex(
+                EditorControllerError,
+                "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
+            ):
+                controller.tm_suggestion_report()
+
+    def test_public_canonical_rebuild_failure_keeps_last_known_good_runtime(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -336,20 +382,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 ).succeeded
             )
             active = runtime.capture_operation_snapshot()
-            store = active.canonical_handles[0].store
-            self.assertIs(type(store), SQLiteTMStore)
-            assert isinstance(store, SQLiteTMStore)
             config = repository.get(resource_id)
-            identity = CanonicalResourceIdentity.from_configured_jsonl(
-                resource_id,
-                config.path,
-            )
-            coordinator = store.coordinator
-            service = TMMigrationService(
-                resource_identity=identity,
-                canonical_store_id=coordinator.canonical_store_id,
-                coordinator=coordinator,
-            )
             config.path.write_text(
                 json.dumps(
                     {"source": "Hello", "target": "已变更的 legacy 译文"},
@@ -358,25 +391,20 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-
             with patch.object(
                 TMMigrationService,
                 "_build_stage",
                 autospec=True,
                 side_effect=OSError("forced rebuild failure"),
             ):
-                outcome = service.rebuild_from_snapshot(
-                    config.path,
-                    resource_id,
+                started = controller.rebuild_tm_resource(resource_id)
+                completed = controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
                 )
 
-            self.assertIs(type(outcome), MigrationFailure)
-            assert isinstance(outcome, MigrationFailure)
-            self.assertEqual(outcome.active_generation, 0)
-            controller._refresh_runtime_for_activation_outcome(
-                resource_id=resource_id,
-                outcome=outcome,
-            )
+            self.assertFalse(completed.succeeded)
+            self.assertEqual(completed.safe_code, "IMPORT.FAILED")
             refreshed = runtime.capture_operation_snapshot()
             self.assertEqual(refreshed.generation, active.generation + 1)
             self.assertEqual(refreshed.legacy_ports, ())
@@ -388,6 +416,48 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             self.assertEqual(
                 controller.tm_suggestion_report().suggestions[0].target,
                 "你好",
+            )
+
+    def test_public_canonical_rebuild_success_refreshes_current_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, runtime, repository, resource_id = _fixture(root)
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            self.assertTrue(
+                controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
+                ).succeeded
+            )
+            before = runtime.capture_operation_snapshot()
+            config = repository.get(resource_id)
+            config.path.write_text(
+                json.dumps(
+                    {"source": "Hello", "target": "重建后译文"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rebuild = controller.rebuild_tm_resource(resource_id)
+            completed = controller.wait_tm_activation(
+                rebuild.operation_id,
+                timeout=20.0,
+            )
+
+            self.assertTrue(completed.succeeded)
+            self.assertIsNone(completed.safe_code)
+            after = runtime.capture_operation_snapshot()
+            self.assertEqual(after.generation, before.generation + 1)
+            self.assertEqual(
+                after.statuses[0].mode,
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+            )
+            self.assertEqual(
+                controller.issued_tm_suggestions[0].target,
+                "重建后译文",
             )
 
 
