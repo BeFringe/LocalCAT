@@ -26,6 +26,8 @@ _SAFE_DIAGNOSTIC_CODE = re.compile(
 _LOWER_SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CANONICAL_RECORD_ID = re.compile(r"canonical:[1-9][0-9]*\Z")
 _LEGACY_RECORD_ID = re.compile(r"legacy:[0-9a-f]{64}\Z")
+_OPAQUE_OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_TM_ACTIVATION_PHASES = frozenset(("ACTIVATING", "COMPLETED"))
 
 
 class ResourceKind(str, Enum):
@@ -223,6 +225,108 @@ class TMPreferences:
             raise TypeError("TM result limit must be an exact integer")
         if self.result_limit != 10:
             raise ValueError("TM result limit must be fixed at 10")
+
+
+@dataclass(frozen=True, slots=True)
+class TMActivationPreflightView:
+    """Body-free counts shown before one explicit TM activation."""
+
+    resource_id: str
+    resource_name: str
+    valid_count: int
+    invalid_count: int
+    variant_count: int
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(
+            self.resource_id,
+            "TM activation resource id",
+        )
+        _validate_exact_non_empty_string(
+            self.resource_name,
+            "TM activation resource name",
+        )
+        _validate_exact_nonnegative_int(
+            self.valid_count,
+            "TM activation valid count",
+        )
+        _validate_exact_nonnegative_int(
+            self.invalid_count,
+            "TM activation invalid count",
+        )
+        _validate_exact_nonnegative_int(
+            self.variant_count,
+            "TM activation variant count",
+        )
+        if self.valid_count + self.invalid_count == 0:
+            raise ValueError("TM activation preflight must describe source rows")
+        if self.variant_count > self.valid_count:
+            raise ValueError(
+                "TM activation variants cannot exceed valid rows"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class TMActivationOperationView:
+    """Opaque, body-free lifecycle projection for one activation worker."""
+
+    operation_id: str
+    resource_id: str
+    phase: str
+    completed: bool
+    succeeded: bool
+    safe_code: str | None
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.operation_id) is not str
+            or _OPAQUE_OPERATION_ID.fullmatch(self.operation_id) is None
+        ):
+            raise ValueError(
+                "TM activation operation id must be opaque lowercase hex"
+            )
+        _validate_exact_non_empty_string(
+            self.resource_id,
+            "TM activation operation resource id",
+        )
+        if type(self.phase) is not str or self.phase not in _TM_ACTIVATION_PHASES:
+            raise ValueError("TM activation operation phase is unsupported")
+        _validate_exact_bool(
+            self.completed,
+            "TM activation operation completed state",
+        )
+        _validate_exact_bool(
+            self.succeeded,
+            "TM activation operation succeeded state",
+        )
+        _validate_exact_bool(
+            self.retryable,
+            "TM activation operation retryable state",
+        )
+        if not self.completed:
+            if (
+                self.phase != "ACTIVATING"
+                or self.succeeded
+                or self.safe_code is not None
+                or self.retryable
+            ):
+                raise ValueError(
+                    "running TM activation state is contradictory"
+                )
+            return
+        if self.phase != "COMPLETED":
+            raise ValueError("completed TM activation must use COMPLETED phase")
+        if self.succeeded:
+            if self.safe_code is not None or self.retryable:
+                raise ValueError(
+                    "successful TM activation cannot retain failure facts"
+                )
+            return
+        _validate_safe_code(
+            self.safe_code,
+            "TM activation operation safe code",
+        )
 
 
 @dataclass(frozen=True)

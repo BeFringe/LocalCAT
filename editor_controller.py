@@ -6,9 +6,10 @@ import csv
 import hashlib
 import json
 import logging
-from dataclasses import replace
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import RLock
+from threading import Condition, RLock, Thread
 from uuid import uuid4
 
 from editor_contracts import (
@@ -24,6 +25,8 @@ from editor_contracts import (
     LegacyExactTMSuggestion,
     SuggestionBundle,
     TMPreferences,
+    TMActivationOperationView,
+    TMActivationPreflightView,
     TMSuggestion,
     TMSuggestionReport,
     TermSuggestion,
@@ -35,7 +38,15 @@ from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
+from tm_contracts import (
+    CanonicalResourceIdentity,
+    MigrationFailure,
+    MigrationPreflight,
+    MigrationReport,
+)
 from tm_engine import SourceUnit, TMEngine
+from tm_migration import MigrationPreflightError, TMMigrationService
+from tm_sqlite_store import ResourceStoreCoordinator
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
 
 
@@ -44,6 +55,86 @@ LOGGER = logging.getLogger(__name__)
 
 class EditorControllerError(RuntimeError):
     """Raised when an editor operation cannot be completed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTMActivation:
+    """Controller-private Core authority retained after read-only preflight."""
+
+    config: ResourceConfig
+    service: TMMigrationService
+    preflight: MigrationPreflight
+    view: TMActivationPreflightView
+
+    def __post_init__(self) -> None:
+        if type(self.config) is not ResourceConfig:
+            raise TypeError("prepared activation config must be ResourceConfig")
+        self.config.__post_init__()
+        if type(self.service) is not TMMigrationService:
+            raise TypeError("prepared activation service must be TMMigrationService")
+        if type(self.preflight) is not MigrationPreflight:
+            raise TypeError("prepared activation preflight must be MigrationPreflight")
+        self.preflight.__post_init__()
+        if type(self.view) is not TMActivationPreflightView:
+            raise TypeError("prepared activation view must be exact contract")
+        self.view.__post_init__()
+
+
+def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService:
+    """Construct the sole Core public first-activation owner for a resource."""
+
+    if type(config) is not ResourceConfig:
+        raise TypeError("TM activation config must be ResourceConfig")
+    config.__post_init__()
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        config.id,
+        config.path,
+    )
+    canonical_store_id = f"store.{config.id}"
+    coordinator = ResourceStoreCoordinator(
+        canonical_store_id=canonical_store_id,
+        resource_identity=identity,
+    )
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=canonical_store_id,
+        coordinator=coordinator,
+    )
+
+
+def _activation_preflight_equal(
+    left: MigrationPreflight,
+    right: MigrationPreflight,
+) -> bool:
+    """Compare every source/count fact needed to bind user confirmation."""
+
+    left.__post_init__()
+    right.__post_init__()
+    return (
+        left.source_digest == right.source_digest
+        and left.valid_count == right.valid_count
+        and left.invalid_count == right.invalid_count
+        and left.duplicate_source_count == right.duplicate_source_count
+        and left.variant_count == right.variant_count
+        and left.diagnostics == right.diagnostics
+    )
+
+
+def _activation_view_equal(
+    left: TMActivationPreflightView,
+    right: TMActivationPreflightView,
+) -> bool:
+    """Compare the complete body-free preflight membership projection."""
+
+    left.__post_init__()
+    right.__post_init__()
+    return (
+        left.resource_id == right.resource_id
+        and left.resource_name == right.resource_name
+        and left.valid_count == right.valid_count
+        and left.invalid_count == right.invalid_count
+        and left.variant_count == right.variant_count
+    )
 
 
 def _clone_tm_suggestion_report(
@@ -154,6 +245,13 @@ class EditorController:
             float,
             int,
         ] | None = None
+        self._tm_activation_condition = Condition(RLock())
+        self._prepared_tm_activation: _PreparedTMActivation | None = None
+        self._tm_activation_operation: TMActivationOperationView | None = None
+        self._tm_activation_outcome: MigrationReport | MigrationFailure | None = (
+            None
+        )
+        self._tm_activation_worker_error: BaseException | None = None
         self._project: EditorProject | None = None
         self._current_index = 0
         self._dirty = False
@@ -606,6 +704,274 @@ class EditorController:
                 current_index=next_index,
                 write_report=report,
             )
+
+    def prepare_tm_activation(
+        self,
+        resource_id: str,
+    ) -> TMActivationPreflightView:
+        """Return read-only activation counts and retain Core authority privately."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise EditorControllerError("TM activation resource id is required")
+        with self._tm_activation_condition:
+            if self._tm_activation_operation is not None:
+                raise EditorControllerError("a TM activation is already in progress")
+            try:
+                config = self.repository.get(resource_id)
+            except ResourceError as error:
+                raise EditorControllerError(
+                    "TM activation resource is unavailable"
+                ) from error
+            if config.kind is not ResourceKind.TRANSLATION_MEMORY:
+                raise EditorControllerError(
+                    "TM activation requires a translation memory resource"
+                )
+            service = _initial_tm_activation_service(config)
+            try:
+                preflight = service.preflight(config.path)
+            except MigrationPreflightError as error:
+                raise EditorControllerError(error.error_code) from error
+            preflight.__post_init__()
+            view = TMActivationPreflightView(
+                resource_id=config.id,
+                resource_name=config.name,
+                valid_count=preflight.valid_count,
+                invalid_count=preflight.invalid_count,
+                variant_count=preflight.variant_count,
+            )
+            private_view = replace(view)
+            prepared = _PreparedTMActivation(
+                config=replace(config),
+                service=service,
+                preflight=preflight,
+                view=private_view,
+            )
+            prepared.__post_init__()
+            self._prepared_tm_activation = prepared
+            return replace(view)
+
+    def cancel_tm_activation(
+        self,
+        preflight: TMActivationPreflightView,
+    ) -> None:
+        """Revoke one issued preflight before the Core transaction starts."""
+
+        if type(preflight) is not TMActivationPreflightView:
+            raise EditorControllerError("TM activation preflight is required")
+        candidate = replace(preflight)
+        candidate.__post_init__()
+        with self._tm_activation_condition:
+            if self._tm_activation_operation is not None:
+                raise EditorControllerError(
+                    "TM activation cannot be cancelled after it starts"
+                )
+            prepared = self._prepared_tm_activation
+            if prepared is None or not _activation_view_equal(
+                candidate,
+                prepared.view,
+            ):
+                raise EditorControllerError(
+                    "TM activation preflight is stale or was not issued"
+                )
+            self._prepared_tm_activation = None
+
+    def activate_tm_resource(
+        self,
+        preflight: TMActivationPreflightView,
+    ) -> TMActivationOperationView:
+        """Start the Core-owned first activation in one background worker."""
+
+        if type(preflight) is not TMActivationPreflightView:
+            raise EditorControllerError("TM activation preflight is required")
+        candidate = replace(preflight)
+        candidate.__post_init__()
+        with self._tm_activation_condition:
+            if self._tm_activation_operation is not None:
+                raise EditorControllerError("a TM activation is already in progress")
+            prepared = self._prepared_tm_activation
+            if prepared is None or not _activation_view_equal(
+                candidate,
+                prepared.view,
+            ):
+                raise EditorControllerError(
+                    "TM activation preflight is stale or was not issued"
+                )
+            try:
+                current_config = self.repository.get(candidate.resource_id)
+            except ResourceError as error:
+                self._prepared_tm_activation = None
+                raise EditorControllerError(
+                    "TM activation resource is unavailable"
+                ) from error
+            current_config.__post_init__()
+            expected_config = prepared.config
+            if not (
+                current_config.id == expected_config.id
+                and current_config.name == expected_config.name
+                and current_config.kind is expected_config.kind
+                and current_config.path == expected_config.path
+                and current_config.active is expected_config.active
+                and current_config.lookup is expected_config.lookup
+                and current_config.update is expected_config.update
+            ):
+                self._prepared_tm_activation = None
+                raise EditorControllerError(
+                    "TM activation resource changed after preflight"
+                )
+            try:
+                current_preflight = prepared.service.preflight(
+                    current_config.path
+                )
+            except MigrationPreflightError as error:
+                self._prepared_tm_activation = None
+                raise EditorControllerError(error.error_code) from error
+            if not _activation_preflight_equal(
+                current_preflight,
+                prepared.preflight,
+            ):
+                self._prepared_tm_activation = None
+                raise EditorControllerError(
+                    "TM activation source changed after preflight"
+                )
+
+            operation = TMActivationOperationView(
+                operation_id=uuid4().hex,
+                resource_id=current_config.id,
+                phase="ACTIVATING",
+                completed=False,
+                succeeded=False,
+                safe_code=None,
+                retryable=False,
+            )
+            private_operation = replace(operation)
+            self._tm_activation_operation = private_operation
+            self._tm_activation_outcome = None
+            self._tm_activation_worker_error = None
+            self._prepared_tm_activation = None
+            worker = Thread(
+                target=self._run_tm_activation,
+                kwargs={
+                    "operation_id": private_operation.operation_id,
+                    "service": prepared.service,
+                    "source": current_config.path,
+                    "resource_id": current_config.id,
+                },
+                name=f"localcat-tm-activation-{operation.operation_id[:8]}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                self._tm_activation_operation = None
+                self._prepared_tm_activation = prepared
+                raise
+            return replace(operation)
+
+    def _run_tm_activation(
+        self,
+        *,
+        operation_id: str,
+        service: TMMigrationService,
+        source: Path,
+        resource_id: str,
+    ) -> None:
+        """Execute Core activation and publish only a body-free completion."""
+
+        outcome: MigrationReport | MigrationFailure | None = None
+        worker_error: BaseException | None = None
+        succeeded = False
+        safe_code: str | None = None
+        retryable = False
+        try:
+            candidate = service.activate_initial(source, resource_id)
+            if type(candidate) is MigrationReport:
+                candidate.__post_init__()
+                outcome = candidate
+                succeeded = True
+            elif type(candidate) is MigrationFailure:
+                candidate.__post_init__()
+                outcome = candidate
+                safe_code = candidate.error_code
+                retryable = candidate.retryable
+            else:
+                raise TypeError(
+                    "TM activation service returned an unsupported outcome"
+                )
+        except MigrationPreflightError as error:
+            safe_code = error.error_code
+        except (OSError, UnicodeError):
+            safe_code = "TM.ACTIVATION.IO_FAILED"
+            retryable = True
+        except BaseException as error:
+            worker_error = error
+            safe_code = "TM.ACTIVATION.PROGRAMMER_ERROR"
+
+        completed = TMActivationOperationView(
+            operation_id=operation_id,
+            resource_id=resource_id,
+            phase="COMPLETED",
+            completed=True,
+            succeeded=succeeded,
+            safe_code=(None if succeeded else safe_code),
+            retryable=(False if succeeded else retryable),
+        )
+        with self._tm_activation_condition:
+            current = self._tm_activation_operation
+            if current is None or current.operation_id != operation_id:
+                return
+            self._tm_activation_outcome = outcome
+            self._tm_activation_worker_error = worker_error
+            self._tm_activation_operation = completed
+            self._tm_activation_condition.notify_all()
+
+    def tm_activation_operation(self) -> TMActivationOperationView | None:
+        """Return the current body-free activation lifecycle snapshot."""
+
+        with self._tm_activation_condition:
+            operation = self._tm_activation_operation
+            if operation is None:
+                return None
+            operation.__post_init__()
+            return replace(operation)
+
+    def wait_tm_activation(
+        self,
+        operation_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> TMActivationOperationView:
+        """Wait for one known activation and surface programmer failures."""
+
+        if type(operation_id) is not str or not operation_id:
+            raise EditorControllerError("TM activation operation id is required")
+        if timeout is not None and (
+            type(timeout) is not float
+            or not math.isfinite(timeout)
+            or timeout < 0.0
+        ):
+            raise TypeError("TM activation timeout must be finite non-negative float")
+        with self._tm_activation_condition:
+            current = self._tm_activation_operation
+            if current is None or current.operation_id != operation_id:
+                raise EditorControllerError("TM activation operation is unknown")
+            _ = self._tm_activation_condition.wait_for(
+                lambda: (
+                    self._tm_activation_operation is not None
+                    and self._tm_activation_operation.operation_id == operation_id
+                    and self._tm_activation_operation.completed
+                ),
+                timeout=timeout,
+            )
+            current = self._tm_activation_operation
+            if current is None or current.operation_id != operation_id:
+                raise EditorControllerError("TM activation operation is unknown")
+            result = replace(current)
+            worker_error = (
+                self._tm_activation_worker_error if result.completed else None
+            )
+        if worker_error is not None:
+            raise worker_error
+        return result
 
     def _advance_tm_query_epoch(self) -> None:
         """Invalidate every issued suggestion before advancing one epoch."""
