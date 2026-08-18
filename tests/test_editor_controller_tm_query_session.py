@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from capability_host import CapabilityHost, CapabilityHostComposition, compose_capability_host
+import editor_controller as controller_module
 from editor_contracts import (
     EditorProject,
     EditorSegment,
@@ -579,6 +580,76 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
                 refreshed[0].query_identity.query_epoch,
                 initial_epoch + 2,
             )
+
+    def test_gate_c_change_after_final_check_retries_before_report_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            composition = compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
+            controller, adapter, _runtime, _repository = self._controller(
+                Path(temporary),
+                composition=composition,
+            )
+            initial_epoch = controller.query_epoch
+            gate_c = composition.retrieval_gate_c_validation_owner
+            assert gate_c is not None
+            original_clone = controller_module._clone_tm_suggestion_report
+            original_query = EditorTMAdapter._query_current_operation
+            clone_calls = 0
+            query_calls = 0
+
+            def clone_after_gate_c_change(report):  # type: ignore[no-untyped-def]
+                nonlocal clone_calls
+                clone_calls += 1
+                cloned = original_clone(report)
+                if clone_calls == 1:
+                    _ = gate_c.validate_gate_c(
+                        generated_at_utc=datetime(
+                            2030,
+                            1,
+                            1,
+                            10,
+                            tzinfo=timezone.utc,
+                        ),
+                        valid_until_utc=datetime(
+                            2030,
+                            1,
+                            2,
+                            10,
+                            tzinfo=timezone.utc,
+                        ),
+                        evaluated_at_utc=_EVALUATED_AT,
+                    )
+                return cloned
+
+            def counted_query(current, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal query_calls
+                if current is adapter:
+                    query_calls += 1
+                return original_query(current, **kwargs)
+
+            with (
+                patch.object(
+                    controller_module,
+                    "_clone_tm_suggestion_report",
+                    new=clone_after_gate_c_change,
+                ),
+                patch.object(
+                    EditorTMAdapter,
+                    "_query_current_operation",
+                    new=counted_query,
+                ),
+            ):
+                report = controller.tm_suggestion_report()
+
+            self.assertEqual(clone_calls, 2)
+            self.assertEqual(query_calls, 2)
+            self.assertEqual(
+                report.query_identity.query_epoch,
+                initial_epoch + 1,
+            )
+            self.assertEqual(controller.query_epoch, initial_epoch + 1)
+            self.assertEqual(controller.issued_tm_suggestions, report.suggestions)
 
     def test_capability_and_threshold_generation_changes_auto_requery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

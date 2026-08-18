@@ -839,10 +839,23 @@ class EditorController:
                     "TM query report identity does not match the current session"
                 )
             private_report = _clone_tm_suggestion_report(report)
-            self._observed_tm_signature = operation_signature
-            self._current_tm_report = private_report
-            self._issued_tm_suggestions = private_report.suggestions
-            return report
+
+            def commit_current_report() -> TMSuggestionReport:
+                self._observed_tm_signature = operation_signature
+                self._current_tm_report = private_report
+                self._issued_tm_suggestions = private_report.suggestions
+                return report
+
+            try:
+                return adapter._run_if_query_generations_current(
+                    runtime_generation=operation.runtime_generation,
+                    retrieval_generation=operation.retrieval_generation,
+                    operation=commit_current_report,
+                )
+            except _TMQueryGenerationChanged:
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+                continue
         raise EditorControllerError("unable to capture a stable TM query snapshot")
 
     def suggestions(self) -> SuggestionBundle:
