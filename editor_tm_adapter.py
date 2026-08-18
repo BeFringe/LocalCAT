@@ -1,18 +1,24 @@
 """Qt-free current-segment translation-memory adapter.
 
-Task 4.1 owns only the canonical query lane.  Legacy compatibility, mixed
-aggregation, safe UI projection, issued-suggestion membership, and append
-remain in later tasks.  The private batch below therefore never crosses the
-Controller/Qt boundary.
+Tasks 4.1/4.2 own the canonical and legacy query lanes. Mixed aggregation,
+safe UI projection, issued-suggestion membership, and append remain in later
+tasks. The private batches below therefore never cross the Controller/Qt
+boundary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from capability_host import CapabilityHost, RetrievalHandoffSnapshot
 from editor_contracts import EditorSegment, TMPreferences
-from tm_application_composition import TMRuntimeHost, TMRuntimeSnapshot
+from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
+from tm_application_composition import (
+    LegacyExactPort,
+    TMRuntimeHost,
+    TMRuntimeSnapshot,
+)
 from tm_contracts import (
     CandidateRecallMetadata,
     QueryReport,
@@ -23,6 +29,12 @@ from tm_contracts import (
     TMResourceHandle,
     TMResult,
 )
+from tm_engine import TMMatch
+
+
+_LEGACY_QUERY_FAILED_CODE = "TM.LEGACY.QUERY_FAILED"
+_LEGACY_FAILURE_STAGES = frozenset(("DIRECT", "ALIAS"))
+_LEGACY_OPERATION_ERRORS = (OSError, UnicodeError, json.JSONDecodeError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +57,98 @@ class _CanonicalQueryBatch:
             raise TypeError(
                 "canonical batch retrieval must be RetrievalHandoffSnapshot"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyExactResult:
+    """Application-private exact result retaining its legacy record body."""
+
+    resource_id: str
+    resource_name: str
+    global_order: int
+    query_source: str
+    matched_source: str
+    target: str
+    record_source: str
+    record_target: str
+    match_type: TMMatchType
+    similarity: float
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("resource id", self.resource_id),
+            ("resource name", self.resource_name),
+            ("query source", self.query_source),
+            ("matched source", self.matched_source),
+            ("target", self.target),
+            ("record source", self.record_source),
+            ("record target", self.record_target),
+        ):
+            if type(value) is not str:
+                raise TypeError(f"legacy exact {field_name} must be exact str")
+            if not value:
+                raise ValueError(f"legacy exact {field_name} must not be empty")
+        if type(self.global_order) is not int or self.global_order < 0:
+            raise TypeError("legacy exact global order must be non-negative int")
+        if self.query_source != self.matched_source:
+            raise ValueError("legacy exact query and matched source must be equal")
+        if self.match_type is not TMMatchType.EXACT:
+            raise ValueError("legacy exact result must remain EXACT")
+        if type(self.similarity) is not float or self.similarity != 1.0:
+            raise ValueError("legacy exact similarity must remain 1.0")
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyQueryFailure:
+    """Body-free resource-local failure for later safe status projection."""
+
+    resource_id: str
+    global_order: int
+    stage: str
+    error_code: str
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        if type(self.resource_id) is not str or not self.resource_id.strip():
+            raise TypeError("legacy failure resource id must be non-empty str")
+        if type(self.global_order) is not int or self.global_order < 0:
+            raise TypeError("legacy failure global order must be non-negative int")
+        if type(self.stage) is not str or self.stage not in _LEGACY_FAILURE_STAGES:
+            raise ValueError("legacy failure stage must be DIRECT or ALIAS")
+        if (
+            type(self.error_code) is not str
+            or self.error_code != _LEGACY_QUERY_FAILED_CODE
+        ):
+            raise ValueError("legacy failure code must be the closed safe code")
+        if type(self.retryable) is not bool:
+            raise TypeError("legacy failure retryable must be exact bool")
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyQueryBatch:
+    """Legacy outcomes bound to one already-captured canonical operation."""
+
+    canonical_batch: _CanonicalQueryBatch
+    results: tuple[_LegacyExactResult, ...]
+    failures: tuple[_LegacyQueryFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.canonical_batch) is not _CanonicalQueryBatch:
+            raise TypeError("legacy batch must retain a canonical query batch")
+        if type(self.results) is not tuple or any(
+            type(result) is not _LegacyExactResult for result in self.results
+        ):
+            raise TypeError("legacy batch results must be exact private contracts")
+        if type(self.failures) is not tuple or any(
+            type(failure) is not _LegacyQueryFailure
+            for failure in self.failures
+        ):
+            raise TypeError("legacy batch failures must be exact private contracts")
+        for result in self.results:
+            result.__post_init__()
+        for failure in self.failures:
+            failure.__post_init__()
+        _validate_legacy_batch(self)
 
 
 class EditorTMAdapter:
@@ -115,6 +219,221 @@ class EditorTMAdapter:
             runtime=runtime,
             retrieval=retrieval,
         )
+
+    def _query_legacy_exact(
+        self,
+        *,
+        canonical_batch: _CanonicalQueryBatch,
+    ) -> _LegacyQueryBatch:
+        """Query legacy exact ports within one captured 4.1 operation.
+
+        The method accepts the already-issued canonical batch so it cannot
+        recapture a newer runtime or capability generation. It produces only
+        application-private exact results and body-free local failures; mixed
+        ordering, identity projection, and the global limit remain Task 4.3.
+        """
+
+        _validate_canonical_batch_for_legacy(canonical_batch)
+        query_source = canonical_batch.query.query_source
+        speaker_raw = canonical_batch.query.speaker_raw
+        results: list[_LegacyExactResult] = []
+        failures: list[_LegacyQueryFailure] = []
+        for port in canonical_batch.runtime.legacy_ports:
+            if not (port.active and port.lookup):
+                continue
+            try:
+                direct = port.query_exact(query_source, speaker_raw)
+            except _LEGACY_OPERATION_ERRORS as error:
+                failures.append(
+                    _legacy_query_failure(
+                        port=port,
+                        stage="DIRECT",
+                        error=error,
+                    )
+                )
+                continue
+            if direct is not None:
+                record_source, record_target = _snapshot_legacy_exact_match(
+                    direct,
+                    expected_source=query_source,
+                )
+                results.append(
+                    _legacy_exact_result(
+                        port=port,
+                        query_source=query_source,
+                        target=record_target,
+                        record_source=record_source,
+                        record_target=record_target,
+                    )
+                )
+                continue
+
+            if speaker_raw is None:
+                continue
+            alias = build_dialogue_alias(speaker_raw, query_source)
+            if alias is None:
+                continue
+            try:
+                wrapped = port.query_exact(alias, speaker_raw)
+            except _LEGACY_OPERATION_ERRORS as error:
+                failures.append(
+                    _legacy_query_failure(
+                        port=port,
+                        stage="ALIAS",
+                        error=error,
+                    )
+                )
+                continue
+            if wrapped is None:
+                continue
+            record_source, record_target = _snapshot_legacy_exact_match(
+                wrapped,
+                expected_source=alias,
+            )
+            target = unwrap_dialogue_target(record_target, speaker_raw)
+            if target is None:
+                continue
+            results.append(
+                _legacy_exact_result(
+                    port=port,
+                    query_source=query_source,
+                    target=target,
+                    record_source=record_source,
+                    record_target=record_target,
+                )
+            )
+
+        return _LegacyQueryBatch(
+            canonical_batch=canonical_batch,
+            results=tuple(results),
+            failures=tuple(failures),
+        )
+
+
+def _validate_canonical_batch_for_legacy(
+    canonical_batch: _CanonicalQueryBatch,
+) -> None:
+    if type(canonical_batch) is not _CanonicalQueryBatch:
+        raise TypeError("legacy query requires an exact canonical query batch")
+    canonical_batch.__post_init__()
+    canonical_batch.runtime.__post_init__()
+    _validate_captured_snapshots(
+        runtime=canonical_batch.runtime,
+        retrieval=canonical_batch.retrieval,
+    )
+    _validate_canonical_report(
+        query=canonical_batch.query,
+        report=canonical_batch.report,
+    )
+
+
+def _snapshot_legacy_exact_match(
+    match: TMMatch,
+    *,
+    expected_source: str,
+) -> tuple[str, str]:
+    """Copy only the legacy record body after exact-contract validation."""
+
+    if type(match) is not TMMatch:
+        raise TypeError("legacy exact port must return TMMatch or None")
+    if type(match.source) is not str or match.source != expected_source:
+        raise ValueError("legacy exact source must equal the requested source")
+    if type(match.target) is not str or not match.target:
+        raise ValueError("legacy exact target must be a non-empty exact string")
+    if type(match.match_type) is not str or match.match_type != "EXACT":
+        raise ValueError("legacy exact port must not return another match type")
+    if type(match.similarity) is not float or match.similarity != 1.0:
+        raise ValueError("legacy exact port must return similarity 1.0")
+    return str(match.source), str(match.target)
+
+
+def _legacy_exact_result(
+    *,
+    port: LegacyExactPort,
+    query_source: str,
+    target: str,
+    record_source: str,
+    record_target: str,
+) -> _LegacyExactResult:
+    return _LegacyExactResult(
+        resource_id=port.resource_id,
+        resource_name=port.resource_name,
+        global_order=port.global_order,
+        query_source=query_source,
+        matched_source=query_source,
+        target=target,
+        record_source=record_source,
+        record_target=record_target,
+        match_type=TMMatchType.EXACT,
+        similarity=1.0,
+    )
+
+
+def _legacy_query_failure(
+    *,
+    port: LegacyExactPort,
+    stage: str,
+    error: Exception,
+) -> _LegacyQueryFailure:
+    """Discard exception text/path and retain only closed local facts."""
+
+    if not isinstance(error, _LEGACY_OPERATION_ERRORS):
+        raise TypeError("legacy local failure requires a read operation error")
+    return _LegacyQueryFailure(
+        resource_id=port.resource_id,
+        global_order=port.global_order,
+        stage=stage,
+        error_code=_LEGACY_QUERY_FAILED_CODE,
+        retryable=isinstance(error, OSError),
+    )
+
+
+def _validate_legacy_batch(batch: _LegacyQueryBatch) -> None:
+    runtime = batch.canonical_batch.runtime
+    query_source = batch.canonical_batch.query.query_source
+    selected = {
+        port.resource_id: port
+        for port in runtime.legacy_ports
+        if port.active and port.lookup
+    }
+    result_ids = tuple(result.resource_id for result in batch.results)
+    failure_ids = tuple(failure.resource_id for failure in batch.failures)
+    observed_ids = (*result_ids, *failure_ids)
+    if len(observed_ids) != len(set(observed_ids)):
+        raise ValueError("legacy resources may produce at most one outcome")
+    if any(resource_id not in selected for resource_id in observed_ids):
+        raise ValueError("legacy outcome is outside the Active+Lookup cohort")
+    result_orders: list[int] = []
+    for result in batch.results:
+        port = selected[result.resource_id]
+        if (
+            result.resource_name != port.resource_name
+            or result.global_order != port.global_order
+            or result.query_source != query_source
+        ):
+            raise ValueError("legacy exact result drifted from runtime snapshot")
+        result_orders.append(result.global_order)
+    failure_orders: list[int] = []
+    for failure in batch.failures:
+        port = selected[failure.resource_id]
+        if failure.global_order != port.global_order:
+            raise ValueError("legacy failure drifted from runtime snapshot")
+        failure_orders.append(failure.global_order)
+    for orders in (result_orders, failure_orders):
+        if any(left >= right for left, right in zip(orders, orders[1:])):
+            raise ValueError("legacy outcomes must preserve global resource order")
+    expected_result_order = tuple(
+        port.resource_id
+        for port in runtime.legacy_ports
+        if port.active and port.lookup and port.resource_id in result_ids
+    )
+    expected_failure_order = tuple(
+        port.resource_id
+        for port in runtime.legacy_ports
+        if port.active and port.lookup and port.resource_id in failure_ids
+    )
+    if result_ids != expected_result_order or failure_ids != expected_failure_order:
+        raise ValueError("legacy outcome lanes must preserve global resource order")
 
 
 def _canonical_lookup_handles(
