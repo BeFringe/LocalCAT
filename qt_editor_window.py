@@ -7,13 +7,27 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QEvent, QRect, QSignalBlocker, QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QObject,
+    QEvent,
+    QPointF,
+    QRect,
+    QSignalBlocker,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QCloseEvent,
     QFontMetrics,
     QKeyEvent,
     QKeySequence,
+    QPaintEvent,
+    QPainter,
+    QPen,
+    QPolygonF,
     QResizeEvent,
     QShortcut,
     QTextCursor,
@@ -50,6 +64,9 @@ from PySide6.QtWidgets import (
     QWidget,
     QLineEdit,
     QScrollArea,
+    QStyle,
+    QStyleOptionComboBox,
+    QStyleOptionToolButton,
     QStyledItemDelegate,
 )
 
@@ -113,6 +130,98 @@ class _TMApplyButton(QPushButton):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             event.accept()
             self.click()
+            return
+        super().keyPressEvent(event)
+
+
+def _paint_top_bar_chevron(
+    widget: QWidget,
+    rect: QRect,
+    *,
+    enabled: bool,
+) -> None:
+    """Paint one platform-independent, high-contrast downward chevron."""
+
+    if rect.width() <= 0 or rect.height() <= 0:
+        return
+    center = rect.center()
+    painter = QPainter(widget)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor("#d6e7f4" if enabled else "#8facc2"))
+        pen.setWidthF(1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(
+            QPolygonF(
+                (
+                    QPointF(center.x() - 4.0, center.y() - 2.0),
+                    QPointF(center.x(), center.y() + 2.0),
+                    QPointF(center.x() + 4.0, center.y() - 2.0),
+                )
+            )
+        )
+    finally:
+        painter.end()
+
+
+class _TopBarModeCombo(QComboBox):
+    """Workspace mode combo with an application-owned visible arrow."""
+
+    def _arrow_rect(self) -> QRect:
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxArrow,
+            self,
+        )
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        _paint_top_bar_chevron(
+            self,
+            self._arrow_rect(),
+            enabled=self.isEnabled(),
+        )
+
+
+class _TopBarProjectButton(QToolButton):
+    """Split project button with explicit main/menu keyboard semantics."""
+
+    def _menu_rect(self) -> QRect:
+        option = QStyleOptionToolButton()
+        self.initStyleOption(option)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ToolButton,
+            option,
+            QStyle.SubControl.SC_ToolButtonMenu,
+            self,
+        )
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        _paint_top_bar_chevron(
+            self,
+            self._menu_rect(),
+            enabled=self.isEnabled(),
+        )
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            event.accept()
+            self.click()
+            return
+        if (
+            event.key() == Qt.Key.Key_Down
+            and event.modifiers() & Qt.KeyboardModifier.AltModifier
+            and self.menu() is not None
+        ):
+            event.accept()
+            self.showMenu()
             return
         super().keyPressEvent(event)
 
@@ -316,8 +425,9 @@ class QtEditorWindow(QMainWindow):
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
 
-        self.workspace_mode_combo = QComboBox()
+        self.workspace_mode_combo = _TopBarModeCombo()
         self.workspace_mode_combo.setObjectName("workspaceModeCombo")
+        self.workspace_mode_combo.setAccessibleName("工作区模式")
         self.workspace_mode_combo.setToolTip("切换编辑或双语浏览校对模式")
         self.workspace_mode_combo.addItem("编辑", WorkspaceMode.EDIT.value)
         self.workspace_mode_combo.addItem("浏览 / 校对", WorkspaceMode.BROWSE.value)
@@ -333,9 +443,12 @@ class QtEditorWindow(QMainWindow):
         )
         layout.addWidget(self.workspace_mode_combo)
 
-        self.open_button = QToolButton()
+        self.open_button = _TopBarProjectButton()
         self.open_button.setObjectName("openProjectButton")
         self.open_button.setText("项目")
+        self.open_button.setAccessibleName(
+            "项目：主按钮打开项目，箭头显示更多项目操作"
+        )
         self.open_button.setToolTip("打开或切换项目")
         self.open_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.open_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
@@ -1912,6 +2025,20 @@ QToolButton:disabled {
     color: #6686a1;
     border-color: #244c70;
 }
+QToolButton#openProjectButton {
+    padding-left: 8px;
+    padding-right: 25px;
+}
+QToolButton#openProjectButton::menu-button {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border: none;
+    border-left: 1px solid #31577d;
+}
+QToolButton#openProjectButton::menu-arrow {
+    image: none;
+}
 QComboBox#workspaceModeCombo {
     min-height: 30px;
     min-width: 104px;
@@ -1923,7 +2050,10 @@ QComboBox#workspaceModeCombo {
 }
 QComboBox#workspaceModeCombo::drop-down {
     border: none;
-    width: 22px;
+    width: 26px;
+}
+QComboBox#workspaceModeCombo::down-arrow {
+    image: none;
 }
 QProgressBar#projectProgress {
     min-height: 17px;

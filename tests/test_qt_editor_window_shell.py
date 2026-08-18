@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 import tempfile
@@ -8,8 +9,19 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from unittest.mock import patch
+
+from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QImage
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QMessageBox,
+    QStyle,
+    QStyleOptionComboBox,
+    QStyleOptionToolButton,
+)
 
 from editor_contracts import ResourceKind
 from editor_controller import EditorController
@@ -30,6 +42,91 @@ class QtEditorWindowShellTest(unittest.TestCase):
 
     def _events(self) -> None:
         QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
+
+    @staticmethod
+    def _contrast_ratio(first: QColor, second: QColor) -> float:
+        def luminance(color: QColor) -> float:
+            channels = (color.redF(), color.greenF(), color.blueF())
+            linear = tuple(
+                channel / 12.92
+                if channel <= 0.04045
+                else ((channel + 0.055) / 1.055) ** 2.4
+                for channel in channels
+            )
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+        lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+        return (lighter + 0.05) / (darker + 0.05)
+
+    @staticmethod
+    def _to_device_rect(image: QImage, logical_rect: QRect) -> QRect:
+        ratio = image.devicePixelRatio()
+        return QRect(
+            round(logical_rect.x() * ratio),
+            round(logical_rect.y() * ratio),
+            round(logical_rect.width() * ratio),
+            round(logical_rect.height() * ratio),
+        ).intersected(image.rect())
+
+    @classmethod
+    def _assert_chevron_visible(cls, image: QImage, logical_rect: QRect) -> None:
+        rect = cls._to_device_rect(image, logical_rect).adjusted(4, 5, -4, -5)
+        colors = Counter(
+            image.pixelColor(x, y).rgba()
+            for y in range(rect.top(), rect.bottom() + 1)
+            for x in range(rect.left(), rect.right() + 1)
+        )
+        background = QColor.fromRgba(colors.most_common(1)[0][0])
+        glyph = tuple(
+            (x, y)
+            for y in range(rect.top(), rect.bottom() + 1)
+            for x in range(rect.left(), rect.right() + 1)
+            if cls._contrast_ratio(image.pixelColor(x, y), background) >= 3.0
+        )
+        glyph_width = max((x for x, _y in glyph), default=0) - min(
+            (x for x, _y in glyph),
+            default=0,
+        )
+        glyph_height = max((y for _x, y in glyph), default=0) - min(
+            (y for _x, y in glyph),
+            default=0,
+        )
+        if len(glyph) < 8 or glyph_width < 6 or glyph_height < 3:
+            raise AssertionError(
+                "top-bar arrow has no readable chevron glyph "
+                f"(pixels={len(glyph)}, span={glyph_width}x{glyph_height})"
+            )
+
+    @staticmethod
+    def _mode_arrow_rect(window: QtEditorWindow) -> QRect:
+        combo = window.workspace_mode_combo
+        option = QStyleOptionComboBox()
+        option.initFrom(combo)
+        option.rect = combo.rect()
+        option.currentText = combo.currentText()
+        return combo.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxArrow,
+            combo,
+        )
+
+    @staticmethod
+    def _project_menu_rect(window: QtEditorWindow) -> QRect:
+        button = window.open_button
+        option = QStyleOptionToolButton()
+        option.initFrom(button)
+        option.rect = button.rect()
+        option.features = (
+            QStyleOptionToolButton.ToolButtonFeature.MenuButtonPopup
+            | QStyleOptionToolButton.ToolButtonFeature.HasMenu
+        )
+        return button.style().subControlRect(
+            QStyle.ComplexControl.CC_ToolButton,
+            option,
+            QStyle.SubControl.SC_ToolButtonMenu,
+            button,
+        )
 
     def _schedule_message_box_click(
         self,
@@ -65,6 +162,84 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertEqual(window.segment_list.count(), 3)
             self.assertEqual(window.project_name_label.text(), "LocalCAT Welcome")
             self.assertEqual(window.language_label.text(), "en-US  →  zh-CN")
+            window.close()
+
+    def test_top_bar_arrows_render_and_keep_compact_hit_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.resize(1180, 680)
+            window.show()
+            self._events()
+
+            mode = window.workspace_mode_combo
+            disabled_rect = self._mode_arrow_rect(window)
+            disabled_image = mode.grab().toImage()
+            self.assertFalse(mode.isEnabled())
+            self._assert_chevron_visible(disabled_image, disabled_rect)
+
+            window.load_sample()
+            self._events()
+            enabled_rect = self._mode_arrow_rect(window)
+            enabled_image = mode.grab().toImage()
+            self.assertTrue(mode.isEnabled())
+            self._assert_chevron_visible(enabled_image, enabled_rect)
+            self.assertGreaterEqual(enabled_rect.width(), 24)
+            self.assertTrue(mode.accessibleName())
+
+            project_rect = self._project_menu_rect(window)
+            project_image = window.open_button.grab().toImage()
+            self.assertGreaterEqual(project_rect.width(), 24)
+            self._assert_chevron_visible(project_image, project_rect)
+            self.assertLessEqual(window.open_button.width(), 96)
+            self.assertTrue(window.open_button.accessibleName())
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    def test_project_button_preserves_main_action_and_opens_existing_menu(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.show()
+            self._events()
+            button = window.open_button
+            menu_rect = self._project_menu_rect(window)
+            main_rect = button.rect().adjusted(0, 0, -menu_rect.width(), 0)
+
+            with patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                return_value=("", ""),
+            ) as choose:
+                QTest.mouseClick(
+                    button,
+                    Qt.MouseButton.LeftButton,
+                    pos=main_rect.center(),
+                )
+                button.setFocus()
+                QTest.keyClick(button, Qt.Key.Key_Space)
+                QTest.keyClick(button, Qt.Key.Key_Return)
+                QTest.keyClick(button, Qt.Key.Key_Enter)
+            self.assertEqual(choose.call_count, 4)
+
+            opened: list[bool] = []
+
+            def close_existing_menu() -> None:
+                opened.append(True)
+                QTimer.singleShot(0, window.project_menu.close)
+
+            window.project_menu.aboutToShow.connect(close_existing_menu)
+            QTest.mouseClick(
+                button,
+                Qt.MouseButton.LeftButton,
+                pos=menu_rect.center(),
+            )
+            button.setFocus()
+            QTest.keyClick(
+                button,
+                Qt.Key.Key_Down,
+                Qt.KeyboardModifier.AltModifier,
+            )
+            self._events()
+            self.assertEqual(opened, [True, True])
             window.close()
 
     def test_open_edit_and_save_json_project(self) -> None:
@@ -112,7 +287,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
             invalid.write_text("{not-json", encoding="utf-8")
             window = self._window(root)
             errors: list[str] = []
-            window._show_error = lambda _title, message: errors.append(message)
+            window._show_error = lambda title, message: errors.append(message)
 
             self.assertTrue(window.open_project_path(first))
             self.assertFalse(window.open_project_path(invalid))
@@ -224,7 +399,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertTrue(window.close_current_project())
             project_path.unlink()
             errors: list[str] = []
-            window._show_error = lambda _title, message: errors.append(message)
+            window._show_error = lambda title, message: errors.append(message)
 
             self.assertFalse(window.open_recent_project(project_path))
 
