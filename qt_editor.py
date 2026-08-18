@@ -175,21 +175,53 @@ def install_desktop_launcher(
     return launcher_path
 
 
-def _start_capability_validation(composition: object) -> object:
-    """Start one fail-closed validation lifecycle for this application run."""
+def _start_capability_validation(
+    composition: object,
+    on_capability_changed: object | None = None,
+) -> object:
+    """Start validation and queue generation changes to one Qt receiver."""
 
     from datetime import datetime, timedelta, timezone
     from threading import Thread
 
     from capability_host import CapabilityHostComposition
+    from PySide6.QtCore import QObject, Qt, Signal
 
     if type(composition) is not CapabilityHostComposition:
         raise TypeError(
             "editor capability validation requires one host composition"
         )
 
-    generated_at_utc = datetime.now(timezone.utc)
+    class CapabilityCompletionBridge(QObject):
+        changed = Signal()
+
+    bridge: CapabilityCompletionBridge | None = None
+    if on_capability_changed is not None:
+        if isinstance(on_capability_changed, QObject):
+            receiver = on_capability_changed
+            callback = getattr(receiver, "refresh_suggestions", None)
+        else:
+            callback = on_capability_changed
+            receiver = getattr(callback, "__self__", None)
+        if not callable(callback) or not isinstance(
+            receiver,
+            QObject,
+        ):
+            raise TypeError(
+                "capability completion requires one bound Qt receiver"
+            )
+        bridge = CapabilityCompletionBridge()
+        _ = bridge.changed.connect(
+            callback,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+    generated_at_utc = datetime.now(timezone.utc).replace(microsecond=0)
     valid_until_utc = generated_at_utc + timedelta(days=1)
+
+    def notify_capability_change() -> None:
+        if bridge is not None:
+            bridge.changed.emit()
 
     def validate() -> None:
         _ = composition.matcher_validation_owner.validate_text_v1(
@@ -200,21 +232,36 @@ def _start_capability_validation(composition: object) -> object:
         gate_c = composition.retrieval_gate_c_validation_owner
         if gate_c is None:
             return
+        gate_c_generation = (
+            composition.host.retrieval_operation_snapshot().generation
+        )
         _ = gate_c.validate_gate_c(
             generated_at_utc=generated_at_utc,
             valid_until_utc=valid_until_utc,
             evaluated_at_utc=generated_at_utc,
         )
+        current_generation = (
+            composition.host.retrieval_operation_snapshot().generation
+        )
+        if current_generation != gate_c_generation:
+            notify_capability_change()
         gate_d = composition.retrieval_gate_d_owner
         if gate_d is None:
             return
         _ = gate_d.start_gate_d(evaluated_at_utc=generated_at_utc)
+        _ = gate_d.wait()
+        gate_d_generation = (
+            composition.host.retrieval_operation_snapshot().generation
+        )
+        if gate_d_generation != current_generation:
+            notify_capability_change()
 
     worker = Thread(
         target=validate,
         name="LocalCAT-capability-validation",
         daemon=True,
     )
+    setattr(worker, "_localcat_capability_completion_bridge", bridge)
     worker.start()
     return worker
 
@@ -246,7 +293,6 @@ def _compose_editor_controller(repository: object):
             capability_host=capability_composition.host,
         ),
     )
-    _ = _start_capability_validation(capability_composition)
     return controller, capability_composition
 
 
@@ -311,6 +357,13 @@ def main(argv: list[str] | None = None) -> int:
             app.setWindowIcon(QIcon(str(logo_path)))
         window = QtEditorWindow(controller)
         window.show()
+        validation_worker = _start_capability_validation(
+            capability_composition,
+            window,
+        )
+        # Retain both the daemon and its Qt signal bridge for the application
+        # lifetime. The worker only emits; Qt invokes the window on its thread.
+        _ = validation_worker
         app.processEvents()
 
         if args.smoke_test:

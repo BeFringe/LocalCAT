@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 from datetime import datetime, timezone
+import io
 import os
 from pathlib import Path
 import sys
 import tempfile
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
+import time
 import types
 from typing import cast
 import unittest
@@ -16,15 +19,17 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, Qt
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 import capability_host as capability_host_module
+from capability_host import CapabilityHostComposition
 from editor_contracts import (
     EditorProject,
     EditorSegment,
     ResourceKind,
     RetrievalDisplayState,
+    SuggestionBundle,
 )
 from editor_controller import EditorController, EditorControllerError
 from editor_tm_adapter import EditorTMAdapter
@@ -47,6 +52,61 @@ from tests.test_editor_controller_tm_apply import (
 )
 from tests.test_editor_tm_adapter_canonical import _activate
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
+from tm_retrieval_capability import (
+    RetrievalCapabilityManifest,
+    RetrievalCapabilityPublisher,
+)
+
+
+def _live_gate_d_composition(
+    test_case: unittest.TestCase,
+    execution: _FakeGateDExecution,
+) -> CapabilityHostComposition:
+    """Attach the fake Gate D runner to a composition evaluated at now."""
+
+    composition = capability_host_module.compose_capability_host(
+        evaluated_at_utc=datetime.now(timezone.utc),
+    )
+    owner = composition.retrieval_gate_d_owner
+    self_owner = owner
+    assert self_owner is not None
+    object.__setattr__(
+        self_owner,
+        "_RetrievalGateDOwner__execute",
+        execution.run,
+    )
+
+    def publish_from_authentic_binding(
+        binding: object,
+        *,
+        run_result: object,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        evaluated_at_utc: datetime,
+        prepare_publication: object,
+    ) -> object:
+        del run_result
+        if not any(binding is current for current in execution.bindings):
+            raise AssertionError("unexpected Gate D binding")
+        return execution.publish(
+            base_manifest=base_manifest,
+            publisher=publisher,
+            evaluated_at_utc=evaluated_at_utc,
+            prepare_publication=prepare_publication,
+        )
+
+    binding_type = getattr(
+        capability_host_module,
+        "_CoreGateDBinding",
+    )
+    binding_patch = patch.object(
+        binding_type,
+        "publish",
+        publish_from_authentic_binding,
+    )
+    binding_patch.start()
+    test_case.addCleanup(binding_patch.stop)
+    return composition
 
 
 class ClusterERemediationTests(unittest.TestCase):
@@ -57,6 +117,17 @@ class ClusterERemediationTests(unittest.TestCase):
     @staticmethod
     def _events() -> None:
         QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
+
+    def _wait_for(self, predicate: object, *, timeout: float = 10.0) -> None:
+        if not callable(predicate):
+            raise TypeError("wait predicate must be callable")
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            self._events()
+            if time.monotonic() >= deadline:
+                self.fail("timed out waiting for asynchronous Qt state")
+            time.sleep(0.01)
+        self._events()
 
     def test_real_bootstrap_composes_one_tm_runtime_and_keeps_refresh_live(
         self,
@@ -469,6 +540,189 @@ class ClusterERemediationTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(order, ["matcher", "gate_c", "gate_d"])
+
+    def test_capability_completion_refreshes_window_at_gate_c_and_gate_d(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _activate(
+                root,
+                resource_id="local-tm",
+                rows=(
+                    '{"source":"aabba","target":"exact"}',
+                    '{"source":"bbaab","target":"fuzzy"}',
+                ),
+            )
+            repository = ResourceRepository(
+                root / "app-data",
+                default_tm_path=source,
+            )
+            runtime = TMRuntimeHost(
+                resolver=TMResourceResolver(),
+                configs=repository.list_resources(),
+            )
+            gate_d_release = Event()
+            execution = _FakeGateDExecution(release=gate_d_release)
+            composition = _live_gate_d_composition(self, execution)
+            controller = EditorController(
+                repository,
+                tm_adapter=EditorTMAdapter(
+                    runtime_host=runtime,
+                    capability_host=composition.host,
+                ),
+            )
+            controller.set_project(
+                EditorProject(
+                    name="Capability completion",
+                    segments=(EditorSegment(id="one", source="aabba"),),
+                )
+            )
+            refresh_threads: list[Thread] = []
+
+            class TrackingWindow(QtEditorWindow):
+                def refresh_suggestions(self) -> SuggestionBundle:
+                    refresh_threads.append(current_thread())
+                    return super().refresh_suggestions()
+
+            window = TrackingWindow(controller)
+            initial_report = window.current_tm_report
+            self.assertIsNotNone(initial_report)
+            assert initial_report is not None
+            self.assertFalse(initial_report.retrieval_status.context_available)
+            self.assertFalse(initial_report.retrieval_status.fuzzy_available)
+            self.assertIs(
+                window.tm_threshold_chip.property("fuzzyAvailable"),
+                False,
+            )
+            initial_epoch = initial_report.query_identity.query_epoch
+            refresh_threads.clear()
+
+            worker = cast(
+                Thread,
+                qt_editor._start_capability_validation(
+                    composition,
+                    window.refresh_suggestions,
+                ),
+            )
+            self.assertTrue(worker.daemon)
+            self.assertTrue(execution.started.wait(10.0))
+            self.assertTrue(worker.is_alive())
+            self._wait_for(lambda: len(refresh_threads) == 1)
+
+            gate_c_report = window.current_tm_report
+            self.assertIsNotNone(gate_c_report)
+            assert gate_c_report is not None
+            self.assertTrue(gate_c_report.retrieval_status.context_available)
+            self.assertFalse(gate_c_report.retrieval_status.fuzzy_available)
+            self.assertIs(
+                window.tm_threshold_chip.property("fuzzyAvailable"),
+                False,
+            )
+            self.assertEqual(
+                gate_c_report.query_identity.query_epoch,
+                initial_epoch + 1,
+            )
+
+            gate_d_release.set()
+            self._wait_for(lambda: len(refresh_threads) == 2)
+            worker.join(10.0)
+            self.assertFalse(worker.is_alive())
+            gate_d_report = window.current_tm_report
+            self.assertIsNotNone(gate_d_report)
+            assert gate_d_report is not None
+            self.assertTrue(gate_d_report.retrieval_status.context_available)
+            self.assertTrue(gate_d_report.retrieval_status.fuzzy_available)
+            self.assertIs(
+                window.tm_threshold_chip.property("fuzzyAvailable"),
+                True,
+            )
+            self.assertEqual(
+                gate_d_report.query_identity.query_epoch,
+                initial_epoch + 2,
+            )
+            self.assertTrue(
+                all(thread is current_thread() for thread in refresh_threads)
+            )
+            window.close()
+
+    def test_capability_completion_ignores_destroyed_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _activate(
+                root,
+                resource_id="local-tm",
+                rows=(
+                    '{"source":"aabba","target":"exact"}',
+                    '{"source":"bbaab","target":"fuzzy"}',
+                ),
+            )
+            repository = ResourceRepository(
+                root / "app-data",
+                default_tm_path=source,
+            )
+            runtime = TMRuntimeHost(
+                resolver=TMResourceResolver(),
+                configs=repository.list_resources(),
+            )
+            gate_d_release = Event()
+            execution = _FakeGateDExecution(release=gate_d_release)
+            composition = _live_gate_d_composition(self, execution)
+            controller = EditorController(
+                repository,
+                tm_adapter=EditorTMAdapter(
+                    runtime_host=runtime,
+                    capability_host=composition.host,
+                ),
+            )
+            controller.set_project(
+                EditorProject(
+                    name="Destroyed completion receiver",
+                    segments=(EditorSegment(id="one", source="aabba"),),
+                )
+            )
+            refresh_threads: list[Thread] = []
+
+            class TrackingWindow(QtEditorWindow):
+                def refresh_suggestions(self) -> SuggestionBundle:
+                    refresh_threads.append(current_thread())
+                    return super().refresh_suggestions()
+
+            window = TrackingWindow(controller)
+            refresh_threads.clear()
+            worker = cast(
+                Thread,
+                qt_editor._start_capability_validation(
+                    composition,
+                    window.refresh_suggestions,
+                ),
+            )
+            self.assertTrue(execution.started.wait(10.0))
+            self._wait_for(lambda: len(refresh_threads) == 1)
+            destroyed = Event()
+            window.destroyed.connect(lambda: destroyed.set())
+            window.setAttribute(
+                Qt.WidgetAttribute.WA_DeleteOnClose,
+                True,
+            )
+            window.close()
+            QCoreApplication.sendPostedEvents(
+                None,
+                QEvent.Type.DeferredDelete,
+            )
+            self._events()
+            self.assertTrue(destroyed.is_set())
+            calls_before_gate_d = len(refresh_threads)
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                gate_d_release.set()
+                worker.join(10.0)
+                self.assertFalse(worker.is_alive())
+                self._events()
+            self.assertEqual(len(refresh_threads), calls_before_gate_d)
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertNotIn("Exception in thread", stderr.getvalue())
 
     def test_global_runtime_block_closes_both_tm_resources_not_last_operation(
         self,
