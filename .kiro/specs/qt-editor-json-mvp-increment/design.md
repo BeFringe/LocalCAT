@@ -226,8 +226,8 @@ flowchart LR
 
 | 验收标准 | 可执行绑定 | 证明 |
 |----------|------------|------|
-| 3.1–3.2 | `ProjectSearchService` + `basic_search_available` | false/false golden + Qt navigation test |
-| 3.7–3.10 | `MatcherCapability` + Feature 5 `text-v1` | disabled-state QtTest + CJK shared vectors |
+| 3.1–3.2 | `ProjectSearchService` + handoff `BASIC_VALIDATED` state | false/false golden + Qt navigation test |
+| 3.7–3.10 | `TextMatcherDisplayState` + `CONFIGURABLE_TEXT_V1` profile | disabled-state QtTest + CJK shared vectors |
 | 5.2, 5.5 | project session id + before/after batch snapshot | stale/cross-project undo tests |
 | 7.2–7.6 | prepare/build/commit/swap transaction | failure injection before/at commit |
 | 7.7–7.12 | legacy Trie/configured adapter capability cohorts | legacy/new flags/CJK matrix |
@@ -294,22 +294,7 @@ class ProjectSearchHit:
 @dataclass(frozen=True)
 class ProjectSearchReport:
     hits: tuple[ProjectSearchHit, ...]
-    capability: MatcherCapability
-
-class MatcherReadiness(str, Enum):
-    UNAVAILABLE = "unavailable"
-    BASIC_VALIDATED = "basic_validated"
-    TEXT_V1_VALIDATED = "text_v1_validated"
-
-@dataclass(frozen=True)
-class MatcherCapability:
-    readiness: MatcherReadiness
-    basic_search_available: bool
-    advanced_options_available: bool
-    configured_terms_available: bool
-    semantics_version: str | None
-    validation_digest: str | None
-    unavailable_reason: str | None
+    capability: TextMatcherDisplayState
 
 @dataclass(frozen=True)
 class LiteralReplaceRule:
@@ -431,7 +416,7 @@ class TermCleanupReport:
     warning_code: str | None
 ```
 
-`BASIC_VALIDATED` 只允许 `basic_search_available=true`；`TEXT_V1_VALIDATED` 必须来自 Feature 5 完整 golden gate，且三个 available flag 全为 true。Qt MVP 完成验收时 basic search 必须可用。未批准的 available flag 必须为 false，Qt 不能自行降级匹配。v1 locator 必须有 record id，legacy locator 不得有；file/row digest 使用 SHA-256，ordinal 非负。Prepared paths 必须同目录且不等于 resource path；candidate records 必须已完整验证。COMMITTED 必须有 report，其他 state 不得有；只有 INDETERMINATE 可 quarantined。所有 tuple 在 `__post_init__` 中校验，字符范围必须引用原字段文本，legacy flags 必须同时为 `None`；Batch report 的 changed ids 不重复，term mutation counts 非负。
+`TextMatcherDisplayState` 直接复用 Integration frozen contract，不在 Qt Spec 重定义 readiness、availability boolean、semantics version 或 validation digest。`BASIC_VALIDATED` 的 supported profiles 必须精确为 handoff 的 BASIC 集合；`TEXT_V1_VALIDATED` 必须精确包含 `CONFIGURABLE_TEXT_V1`。Qt MVP 完成验收时 basic search 必须可用；未批准状态只能 fail closed，Qt 不能自行降级匹配。v1 locator 必须有 record id，legacy locator 不得有；file/row digest 使用 SHA-256，ordinal 非负。Prepared paths 必须同目录且不等于 resource path；candidate records 必须已完整验证。COMMITTED 必须有 report，其他 state 不得有；只有 INDETERMINATE 可 quarantined。所有 tuple 在 `__post_init__` 中校验，字符范围必须引用原字段文本，legacy flags 必须同时为 `None`；Batch report 的 changed ids 不重复，term mutation counts 非负。
 
 ### SpeakerInventoryService
 
@@ -458,7 +443,7 @@ class ProjectSearchService:
 
 - 空 query 在边界拒绝；字段按 segment order 与固定 SOURCE/TARGET/SPEAKER 顺序扫描。
 - 每个字段调用唯一 Core matcher，hit offsets 原样传递。
-- basic request 固定使用 `false/false`，要求 `basic_search_available`；advanced capability 未批准时 Controller 拒绝其他 options。
+- basic request 固定使用 `false/false`，要求 handoff state 至少为 `BASIC_VALIDATED`；只有 `TEXT_V1_VALIDATED` 才允许 Controller 接受其他 options。
 - service 不导航，Controller 用 hit 的 stable segment id/index 调用 `go_to()`。
 - UI 可先渲染稳定搜索入口，但 Qt MVP 不得在 basic capability 缺失时宣称基础搜索完成。
 
@@ -518,8 +503,8 @@ class TermbaseStore:
 ### ConfiguredTermAdapter
 
 - legacy rows 始终进入现有 `GlossaryEngine` Trie，保持区分大小写、连续子串、重叠候选与长词优先。
-- v1 rows 在 `configured_terms_available=false` 时也以 legacy preset 进入同一 Trie，使新增/修改立即可见，但两个 flags 不改变结果。
-- `configured_terms_available=true` 时，v1 rows 从 legacy Trie cohort 移出；adapter 对每条记录调用唯一 `TextMatcher.find_all(source_text, term.source, row_options)`，不在 Qt 线复制 case-fold、词界或 CJK 规则。
+- handoff 尚未包含 `CONFIGURABLE_TEXT_V1` profile 时，v1 rows 也以 legacy preset 进入同一 Trie，使新增/修改立即可见，但两个 flags 不改变结果。
+- handoff 包含 `CONFIGURABLE_TEXT_V1` profile 时，v1 rows 从 legacy Trie cohort 移出；adapter 对每条记录调用唯一 Core matcher port，不在 Qt 线复制 case-fold、词界或 CJK 规则。
 - configured hits 与 legacy Trie hits 合并后按原文 start、匹配长度降序、资源顺序、记录顺序稳定排序，并使用既有长词优先/非重叠选择规则生成建议。
 - capability 切换或 term mutation 必须重建完整 candidate engine set；只有成功构建才允许原子提交术语文件。
 
