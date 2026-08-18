@@ -995,6 +995,11 @@ class EditorController:
                 supported_profiles=tuple(handoff.display.supported_profiles),
             )
 
+    def term_matcher_display(self) -> TextMatcherDisplayState:
+        """Return the same sole current-host matcher projection for term UI."""
+
+        return self.project_search_matcher_display()
+
     def search_project(
         self,
         request: ProjectSearchRequest,

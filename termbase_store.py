@@ -392,8 +392,8 @@ class TermbaseStore:
                 record_id,
                 draft.source,
                 draft.target,
-                "false",
-                "true",
+                _format_bool(draft.match_case),
+                _format_bool(draft.whole_word),
             ]
         )
         prepared = self._prepare_artifacts(

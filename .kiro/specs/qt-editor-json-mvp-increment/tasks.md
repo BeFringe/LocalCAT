@@ -185,7 +185,7 @@
   - 完成时，QtTest 覆盖 preview→cancel、preview→apply、apply→undo、新批次覆盖和跨项目隔离
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
 
-- [ ] 4.5 (P) 增加集中式术语管理对话框
+- [x] 4.5 (P) 增加集中式术语管理对话框
   - 从设置入口列出 resource、source、target、policy 和匹配选项状态
   - 新记录显示 false/true 默认值；gate 前禁用 options 并说明 flags 尚不参与匹配
   - 支持 source/target 编辑、legacy locator、删除确认、冲突反馈和 committed/recovery/quarantine outcome

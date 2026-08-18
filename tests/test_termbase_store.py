@@ -259,8 +259,8 @@ class TermbaseStoreTests(unittest.TestCase):
         created = prepared.candidate_records[-1]
         self.assertIs(created.locator.row_kind, TermRowKind.V1)
         self.assertEqual(uuid.UUID(created.record_id).version, 4)
-        self.assertIs(created.match_case, False)
-        self.assertIs(created.whole_word, True)
+        self.assertIs(created.match_case, True)
+        self.assertIs(created.whole_word, False)
         self.assertEqual(
             self.staged_rows(prepared)[-1],
             [
@@ -268,8 +268,8 @@ class TermbaseStoreTests(unittest.TestCase):
                 created.record_id,
                 "New source",
                 "新译",
-                "false",
                 "true",
+                "false",
             ],
         )
 

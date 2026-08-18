@@ -63,6 +63,7 @@ from editor_contracts import (
     TMResourceStatus,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_termbase_dialog import QtTermbaseDialog
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -724,7 +725,9 @@ class QtSettingsDialog(QDialog):
                     widget.setEnabled(False)
                 widget.setObjectName("")
         for action in table.findChildren(QAction):
-            if action.objectName().startswith("tmLifecycleAction_"):
+            if action.objectName().startswith(
+                ("tmLifecycleAction_", "manageTerms_")
+            ):
                 action.setEnabled(False)
                 action.setObjectName("")
         table.clearContents()
@@ -819,6 +822,20 @@ class QtSettingsDialog(QDialog):
                     )
                 )
                 menu.addSeparator()
+            else:
+                manage_action = menu.addAction("管理术语")
+                manage_action.setObjectName(f"manageTerms_{resource.id}")
+                manage_action.setToolTip(
+                    f"打开 {resource.name} 的术语管理"
+                )
+                manage_action.setStatusTip(manage_action.toolTip())
+                manage_action.setEnabled(resource.active and resource.update)
+                manage_action.triggered.connect(
+                    lambda _checked=False, configured=resource: self._open_termbase_dialog(
+                        configured
+                    )
+                )
+                menu.addSeparator()
             delete_action = menu.addAction("删除资源")
             delete_action.setObjectName(f"delete_{resource.id}")
             delete_action.triggered.connect(
@@ -841,6 +858,21 @@ class QtSettingsDialog(QDialog):
             more_button.setFixedWidth(compact_width)
             table.setCellWidget(row, 7, more_button)
         table.resizeRowsToContents()
+
+    def _open_termbase_dialog(self, resource: ResourceConfig) -> None:
+        """Open one Controller-only termbase management surface."""
+
+        if type(resource) is not ResourceConfig:
+            raise TypeError("term management resource must be ResourceConfig")
+        if resource.kind is not ResourceKind.TERMBASE:
+            raise ValueError("term management requires a termbase resource")
+        dialog = QtTermbaseDialog(
+            self.controller,
+            resource.id,
+            resource.name,
+            self,
+        )
+        dialog.exec()
 
     @staticmethod
     def _tm_kind_projection(
