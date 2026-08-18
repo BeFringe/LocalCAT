@@ -88,6 +88,7 @@ from editor_contracts import (
     TMThresholdUpdateOutcome,
     TMSuggestion,
     TMSuggestionReport,
+    TextMatcherDisplayState,
     TextMatcherState,
     WorkspaceMode,
 )
@@ -1735,22 +1736,35 @@ class QtEditorWindow(QMainWindow):
             except EditorControllerError as exc:
                 message = f"搜索不可用：{exc}。"
             else:
-                display = handoff.display
-                if display.state is TextMatcherState.BASIC_VALIDATED:
-                    search_available = True
-                    message = (
-                        "BASIC 搜索可用；Match Case / Whole Word 属于第二阶段，"
-                        "当前不参与搜索。"
-                    )
-                elif display.state is TextMatcherState.TEXT_V1_VALIDATED:
-                    search_available = True
-                    advanced_available = True
-                    message = (
-                        "TEXT_V1 搜索可用；Match Case / Whole Word 已使用 Core 语义。"
-                    )
+                try:
+                    candidate_display = handoff.display
+                except AttributeError:
+                    message = "搜索不可用：PROJECT_SEARCH.HANDOFF_INVALID。"
                 else:
-                    code = display.safe_reason or "MATCHER.UNAVAILABLE"
-                    message = f"搜索不可用：{code}。"
+                    if type(candidate_display) is not TextMatcherDisplayState:
+                        message = "搜索不可用：PROJECT_SEARCH.HANDOFF_INVALID。"
+                    else:
+                        try:
+                            candidate_display.__post_init__()
+                        except ValueError:
+                            message = "搜索不可用：PROJECT_SEARCH.HANDOFF_INVALID。"
+                        else:
+                            display = candidate_display
+                            if display.state is TextMatcherState.BASIC_VALIDATED:
+                                search_available = True
+                                message = (
+                                    "BASIC 搜索可用；Match Case / Whole Word 属于第二阶段，"
+                                    "当前不参与搜索。"
+                                )
+                            elif display.state is TextMatcherState.TEXT_V1_VALIDATED:
+                                search_available = True
+                                advanced_available = True
+                                message = (
+                                    "TEXT_V1 搜索可用；Match Case / Whole Word 已使用 Core 语义。"
+                                )
+                            else:
+                                code = display.safe_reason or "MATCHER.UNAVAILABLE"
+                                message = f"搜索不可用：{code}。"
 
         self.project_search_button.setEnabled(search_available)
         for checkbox in (

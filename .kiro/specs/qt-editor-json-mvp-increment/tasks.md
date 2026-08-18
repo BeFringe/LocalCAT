@@ -166,7 +166,7 @@
   - 完成时，QtTest 可在真实项目中搜索、导航并保留未保存 target，disabled 控件状态不会改变 false/false 结果
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10_
 
-- [ ] 4.3a 完成 Requirement 3 fresh acceptance evidence
+- [x] 4.3a 完成 Requirement 3 fresh acceptance evidence
   - 使用真实单 JSON project、production Controller 与 Feature 5 matcher handoff 验证 source/target/raw-speaker、offset、结果顺序和前后导航
   - 分别验证 BASIC 与 TEXT_V1 gate、Match Case / Whole Word、纯 CJK Whole Word、空 query、无结果、stale hit 与未保存 target 保留
   - 移除 matcher 或换入 foreign handoff 时必须 fail closed，不得切换 Qt/Controller 本地 matcher
