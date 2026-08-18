@@ -22,6 +22,7 @@ from editor_contracts import (
     ResourceConfig,
     ResourceKind,
     RecentProject,
+    RetrievalDisplayState,
     LegacyExactTMSuggestion,
     SuggestionBundle,
     TMPreferences,
@@ -731,6 +732,23 @@ class EditorController:
                 minimum_similarity=preferences.minimum_similarity,
                 result_limit=preferences.result_limit,
             )
+
+    def tm_retrieval_status(self) -> RetrievalDisplayState:
+        """Return current frozen retrieval availability without querying a segment."""
+
+        with self._tm_query_lock:
+            adapter = self._tm_adapter
+            if adapter is None:
+                return RetrievalDisplayState(
+                    context_available=False,
+                    fuzzy_available=False,
+                    safe_codes=("TM.RETRIEVAL.UNAVAILABLE",),
+                )
+            status = adapter._inspect_retrieval_status_for_controller()
+            if type(status) is not RetrievalDisplayState:
+                raise TypeError("TM retrieval display contract is invalid")
+            status.__post_init__()
+            return replace(status)
 
     def update_tm_minimum_similarity(
         self,

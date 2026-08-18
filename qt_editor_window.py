@@ -70,6 +70,12 @@ from editor_contracts import (
 from editor_controller import EditorController, EditorControllerError
 from editor_project import ProjectError
 from qt_settings_dialog import QtSettingsDialog
+from qt_tm_threshold import (
+    TMThresholdButton,
+    configure_tm_threshold_entry,
+    prompt_tm_threshold,
+    tm_threshold_feedback,
+)
 
 
 _WORKSPACE_MODE_POPUP_STYLE = """
@@ -196,6 +202,8 @@ class QtEditorWindow(QMainWindow):
         self.tm_scroll: QScrollArea
         self.tm_container: QWidget
         self.tm_cards_layout: QVBoxLayout
+        self.tm_threshold_chip: QPushButton
+        self.tm_threshold_state: QLabel
         self.termbase_page: QWidget
         self.add_term_button: QPushButton
         self.term_scroll: QScrollArea
@@ -215,6 +223,7 @@ class QtEditorWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
+        self.setTabOrder(self.confirm_button, self.tm_threshold_chip)
         self.apply_editor_font_size(self.editor_font_size)
         self.source_display.viewport().installEventFilter(self)
         self.target_editor.viewport().installEventFilter(self)
@@ -585,6 +594,19 @@ class QtEditorWindow(QMainWindow):
         self.translation_matches_page.setObjectName("translationMatchesPage")
         matches_layout = QVBoxLayout(self.translation_matches_page)
         matches_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_row = QHBoxLayout()
+        threshold_row.setContentsMargins(10, 8, 10, 4)
+        threshold_row.setSpacing(8)
+        self.tm_threshold_state = QLabel()
+        self.tm_threshold_state.setObjectName("tmThresholdState")
+        self.tm_threshold_state.setWordWrap(True)
+        threshold_row.addWidget(self.tm_threshold_state, 1)
+        self.tm_threshold_chip = TMThresholdButton()
+        self.tm_threshold_chip.setObjectName("tmThresholdChip")
+        self.tm_threshold_chip.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.tm_threshold_chip.clicked.connect(self._request_tm_threshold_update)
+        threshold_row.addWidget(self.tm_threshold_chip)
+        matches_layout.addLayout(threshold_row)
         self.tm_scroll = QScrollArea()
         self.tm_scroll.setObjectName("tmSuggestionsScroll")
         self.tm_scroll.setWidgetResizable(True)
@@ -617,6 +639,7 @@ class QtEditorWindow(QMainWindow):
         self.suggestion_tabs.addTab(self.translation_matches_page, "Translation Matches")
         self.suggestion_tabs.addTab(self.termbase_page, "Termbase")
         layout.addWidget(self.suggestion_tabs, 1)
+        self._refresh_tm_threshold_entry()
         return panel
 
     def _wire_actions(self) -> None:
@@ -1353,6 +1376,7 @@ class QtEditorWindow(QMainWindow):
 
         dialog = QtSettingsDialog(self.controller, self)
         dialog.resources_changed.connect(self._resources_changed)
+        dialog.tm_threshold_changed.connect(self._settings_tm_threshold_changed)
         self.settings_dialog = dialog
         return dialog
 
@@ -1367,6 +1391,7 @@ class QtEditorWindow(QMainWindow):
         if not self.controller.has_project:
             self.current_suggestions = SuggestionBundle()
             self.current_tm_report = None
+            self._refresh_tm_threshold_entry()
             return self.current_suggestions
         report: TMSuggestionReport | None = None
         tm_query_failed = False
@@ -1386,6 +1411,7 @@ class QtEditorWindow(QMainWindow):
             bundle = self.controller.suggestions()
         self.current_suggestions = bundle
         self.current_tm_report = report
+        self._refresh_tm_threshold_entry()
         self.source_display.setHtml(
             render_highlighted_source(self.controller.current_segment.source, bundle.terms)
         )
@@ -1421,6 +1447,60 @@ class QtEditorWindow(QMainWindow):
             self.term_cards_layout.addWidget(self._empty_suggestion("当前段暂无术语建议。"))
         self.term_cards_layout.addStretch()
         return bundle
+
+    def _refresh_tm_threshold_entry(self) -> None:
+        """Render the compact entry from fresh defensive Controller values."""
+
+        configure_tm_threshold_entry(
+            self.tm_threshold_chip,
+            self.tm_threshold_state,
+            preferences=self.controller.tm_preferences(),
+            retrieval_status=self.controller.tm_retrieval_status(),
+        )
+
+    def _request_tm_threshold_update(self) -> None:
+        """Submit one chip edit through the Controller and refresh visible cards."""
+
+        if self.tm_threshold_chip.property("fuzzyAvailable") is not True:
+            return
+        try:
+            requested = prompt_tm_threshold(self, self.controller.tm_preferences())
+            if requested is None:
+                return
+            outcome = self.controller.update_tm_minimum_similarity(requested)
+        except (EditorControllerError, TypeError, ValueError):
+            self._refresh_tm_threshold_entry()
+            self.statusBar().showMessage(
+                "Fuzzy 阈值未更新；当前值保持不变。",
+                7000,
+            )
+            return
+        if outcome.succeeded and self.controller.has_project:
+            self.refresh_suggestions()
+        else:
+            self._refresh_tm_threshold_entry()
+        if outcome.succeeded and self.settings_dialog is not None:
+            self.settings_dialog.refresh_resources()
+        self.statusBar().showMessage(tm_threshold_feedback(outcome), 7000)
+
+    def _settings_tm_threshold_changed(self, _minimum_similarity: float) -> None:
+        """Refresh cards when the settings entry updates the shared preference."""
+
+        if self.controller.has_project:
+            self.refresh_suggestions()
+        else:
+            self._refresh_tm_threshold_entry()
+        preferences = self.controller.tm_preferences()
+        percentage = preferences.minimum_similarity * 100.0
+        rendered = (
+            str(int(percentage))
+            if percentage.is_integer()
+            else f"{percentage:.6f}".rstrip("0").rstrip(".")
+        )
+        self.statusBar().showMessage(
+            f"Fuzzy 阈值 {rendered}% 已保存；当前段建议已刷新。",
+            7000,
+        )
 
     @staticmethod
     def _tm_state_message(
@@ -2020,6 +2100,32 @@ QTabWidget#suggestionTabs::pane {
     background: #fbfcfe;
     border: 1px solid #d2dce6;
     border-radius: 6px;
+}
+QLabel#tmThresholdState {
+    color: #52677b;
+    font-size: 10px;
+}
+QLabel#tmThresholdState[fuzzyAvailable="false"] {
+    color: #9b5a24;
+}
+QPushButton#tmThresholdChip {
+    min-height: 24px;
+    max-height: 26px;
+    padding: 0 9px;
+    color: #087f9f;
+    background: #e6f5f9;
+    border: 1px solid #99cfdb;
+    border-radius: 12px;
+    font-size: 10px;
+    font-weight: 750;
+}
+QPushButton#tmThresholdChip:focus {
+    border: 2px solid #087f9f;
+}
+QPushButton#tmThresholdChip[fuzzyAvailable="false"] {
+    color: #6f7d8a;
+    background: #edf0f3;
+    border-color: #cbd3da;
 }
 QScrollArea#tmSuggestionsScroll, QScrollArea#termSuggestionsScroll {
     border: none;

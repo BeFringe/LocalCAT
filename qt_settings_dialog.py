@@ -46,6 +46,12 @@ from editor_contracts import (
     TMResourceStatus,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_tm_threshold import (
+    TMThresholdButton,
+    configure_tm_threshold_entry,
+    prompt_tm_threshold,
+    tm_threshold_feedback,
+)
 
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
@@ -195,10 +201,13 @@ class QtSettingsDialog(QDialog):
 
     resources_changed = Signal()
     import_completed = Signal(object)
+    tm_threshold_changed = Signal(float)
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.new_resource_button: QPushButton
+        self.tm_threshold_chip: QPushButton
+        self.tm_threshold_state: QLabel
         self.controller = controller
         self.setObjectName("settingsDialog")
         self.setWindowTitle("LocalCAT · 语言资源设置")
@@ -215,6 +224,7 @@ class QtSettingsDialog(QDialog):
         self._tm_operation_timer.setInterval(75)
         self._tm_operation_timer.timeout.connect(self._poll_tm_operation)
         self._build_ui()
+        self.setTabOrder(self.new_resource_button, self.tm_threshold_chip)
         self.refresh_resources()
 
     def _build_ui(self) -> None:
@@ -269,6 +279,25 @@ class QtSettingsDialog(QDialog):
         self.new_resource_button = new_button
         intro_row.addWidget(new_button)
         content_layout.addLayout(intro_row)
+
+        threshold_panel = QFrame()
+        threshold_panel.setObjectName("settingsTmThresholdPanel")
+        threshold_layout = QHBoxLayout(threshold_panel)
+        threshold_layout.setContentsMargins(12, 8, 12, 8)
+        threshold_layout.setSpacing(10)
+        threshold_title = QLabel("Fuzzy 建议阈值")
+        threshold_title.setObjectName("settingsTmThresholdTitle")
+        threshold_layout.addWidget(threshold_title)
+        self.tm_threshold_state = QLabel()
+        self.tm_threshold_state.setObjectName("settingsTmThresholdState")
+        self.tm_threshold_state.setWordWrap(True)
+        threshold_layout.addWidget(self.tm_threshold_state, 1)
+        self.tm_threshold_chip = TMThresholdButton()
+        self.tm_threshold_chip.setObjectName("settingsTmThresholdChip")
+        self.tm_threshold_chip.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.tm_threshold_chip.clicked.connect(self._request_tm_threshold_update)
+        threshold_layout.addWidget(self.tm_threshold_chip)
+        content_layout.addWidget(threshold_panel)
 
         active_group = QGroupBox("活动资源")
         active_group.setObjectName("activeResourcesGroup")
@@ -356,6 +385,7 @@ class QtSettingsDialog(QDialog):
             for status in statuses
             if type(status) is TMResourceStatus
         }
+        self._refresh_tm_threshold_entry()
         try:
             operation = self.controller.tm_activation_operation()
         except Exception:
@@ -385,6 +415,39 @@ class QtSettingsDialog(QDialog):
         else:
             self.status_label.setText(
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
+            )
+
+    def _refresh_tm_threshold_entry(self) -> None:
+        """Render the settings entry from fresh defensive Controller values."""
+
+        configure_tm_threshold_entry(
+            self.tm_threshold_chip,
+            self.tm_threshold_state,
+            preferences=self.controller.tm_preferences(),
+            retrieval_status=self.controller.tm_retrieval_status(),
+        )
+
+    def _request_tm_threshold_update(self) -> None:
+        """Submit one constrained value through the sole Controller update seam."""
+
+        if self.tm_threshold_chip.property("fuzzyAvailable") is not True:
+            return
+        try:
+            requested = prompt_tm_threshold(self, self.controller.tm_preferences())
+            if requested is None:
+                return
+            outcome = self.controller.update_tm_minimum_similarity(requested)
+        except (EditorControllerError, TypeError, ValueError):
+            self._refresh_tm_threshold_entry()
+            self.status_label.setText(
+                "Fuzzy 阈值未更新；当前值保持不变。"
+            )
+            return
+        self.refresh_resources()
+        self.status_label.setText(tm_threshold_feedback(outcome))
+        if outcome.succeeded:
+            self.tm_threshold_changed.emit(
+                outcome.preferences.minimum_similarity
             )
 
     def _populate_table(
@@ -985,6 +1048,39 @@ QLabel#resourceSectionTitle {
 }
 QLabel#resourceSectionHint, QLabel#settingsStatus {
     color: #66758a;
+}
+QFrame#settingsTmThresholdPanel {
+    background: #ffffff;
+    border: 1px solid #d7e0ea;
+    border-radius: 7px;
+}
+QLabel#settingsTmThresholdTitle {
+    color: #2a4058;
+    font-weight: 700;
+}
+QLabel#settingsTmThresholdState {
+    color: #52677b;
+    font-size: 11px;
+}
+QLabel#settingsTmThresholdState[fuzzyAvailable="false"] {
+    color: #9b5a24;
+}
+QPushButton#settingsTmThresholdChip {
+    min-height: 26px;
+    padding: 1px 10px;
+    color: #087f9f;
+    background: #e6f5f9;
+    border: 1px solid #99cfdb;
+    border-radius: 13px;
+    font-weight: 750;
+}
+QPushButton#settingsTmThresholdChip:focus {
+    border: 2px solid #087f9f;
+}
+QPushButton#settingsTmThresholdChip[fuzzyAvailable="false"] {
+    color: #6f7d8a;
+    background: #edf0f3;
+    border-color: #cbd3da;
 }
 QLabel[tmMode="LEGACY_EXACT_ONLY"] {
     color: #40566d;

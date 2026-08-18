@@ -409,6 +409,12 @@ class EditorTMAdapter:
 
         return self._runtime_host._inspect_resource_statuses(configs)
 
+    def _inspect_retrieval_status_for_controller(self) -> RetrievalDisplayState:
+        """Return the current frozen retrieval display without running a query."""
+
+        handoff = self._capability_host.retrieval_operation_snapshot()
+        return _project_retrieval_display(handoff)
+
     def append_confirmed(
         self,
         *,
