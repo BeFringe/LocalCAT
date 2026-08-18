@@ -297,7 +297,7 @@
   - _Boundary: Capability Resource and Activation Failure Validation_
   - _Depends: 3.5, 3.6_
 
-- [ ] 7.5 验证 stale/tamper/apply 与写回权限矩阵
+- [x] 7.5 验证 stale/tamper/apply 与写回权限矩阵
   - 对 project/segment/source/resource/capability/threshold epoch 变化和逐字段 suggestion substitution 执行 zero-mutation tests
   - 覆盖三种 match type 的显式 apply，以及 Active+Lookup 与 Active+Update 的 canonical/legacy 组合
   - 对 Update=false 资源比较操作前后 SHA-256，并验证 partial write failure 不确认、不导航
@@ -391,6 +391,7 @@
 - Task 7.2：新增由 tracked JSONL 经 production `activate_initial()` 构建、再由 fresh resolver 冷重开的 canonical fixture；同源 variants、两资源 tie、非 100%、0.60 边界、低于阈值与 raw-distinct 1.00 候选均在正式 query lease 上可重复验证，不以 legacy 卡片或手写 store 作为依据。
 - Task 7.3：同一次 production retrieval operation 的 Core report 与 adapter projection 逐字段闭合；真实 canonical 与交错 legacy 资源验证 exact/context/fuzzy、双 source、0.60 inclusive、跨资源 tie、确定性重查和唯一 global top-10，未引入 UI scorer、重排或后过滤权威。
 - Task 7.4：跨 Gate owner、runtime/query、Controller activation 与 Qt 状态投影闭合 capability/resource/activation failure matrix；closed/expired/foreign、局部 path/query/reopen、proven/ambiguous、source-diverged/LKG 均保留安全可见失败与健康结果，activated authority 不回落 JSONL。
+- Task 7.5：真实 canonical/legacy Controller journey 对六类 epoch、suggestion 全字段 substitution、三种 match type apply 与 Active/Lookup/Update 写入矩阵执行零修改证明；partial write 保留已成功资源事实，但不确认、不导航，Update=false、inactive 与失败资源字节不变。
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
 - 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
