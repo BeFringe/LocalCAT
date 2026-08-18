@@ -189,6 +189,79 @@ class CapabilityHostGateCPublicBoundaryTests(unittest.TestCase):
 
 
 class CapabilityHostGateCCompositionTests(unittest.TestCase):
+    def _assert_notification_failure_is_atomic(
+        self,
+        *,
+        fail_after_generation_assignment: bool,
+    ) -> None:
+        composition = _composition()
+        host = composition.host
+        owner = _gate_c_owner(composition)
+        old_handoff = host.retrieval_snapshot()
+        old_status = host.status_snapshot()
+        host_private = cast(Any, host)
+        old_publisher = host_private._CapabilityHost__retrieval_publisher
+        old_service = host_private._CapabilityHost__retrieval_service
+        old_manifest = host_private._CapabilityHost__retrieval_base_manifest
+        notification = host.retrieval_generation_notifications()
+        notification_type = cast(Any, type(notification))
+        original_publish = cast(
+            Any,
+            notification_type._publish_prevalidated_locked,
+        )
+        failure = RuntimeError("Gate C notification publication failed")
+
+        def failing_publish(
+            observed: object,
+            generation: int,
+        ) -> None:
+            if fail_after_generation_assignment:
+                original_publish(observed, generation)
+            raise failure
+
+        with patch.object(
+            notification_type,
+            "_publish_prevalidated_locked",
+            failing_publish,
+        ):
+            returned = owner.validate_gate_c(
+                generated_at_utc=_GENERATED_AT,
+                valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=_EVALUATED_AT,
+            )
+
+        self.assertIs(returned, old_handoff)
+        self.assertIs(host.retrieval_snapshot(), old_handoff)
+        self.assertIs(host.status_snapshot(), old_status)
+        self.assertIs(host.status_snapshot().retrieval, old_handoff.display)
+        self.assertIs(
+            host_private._CapabilityHost__retrieval_publisher,
+            old_publisher,
+        )
+        self.assertIs(
+            host_private._CapabilityHost__retrieval_service,
+            old_service,
+        )
+        self.assertIs(
+            host_private._CapabilityHost__retrieval_base_manifest,
+            old_manifest,
+        )
+        self.assertEqual(notification.current(), old_handoff.generation)
+
+    def test_notification_failure_before_generation_assignment_is_atomic(
+        self,
+    ) -> None:
+        self._assert_notification_failure_is_atomic(
+            fail_after_generation_assignment=False
+        )
+
+    def test_notification_failure_after_generation_assignment_is_atomic(
+        self,
+    ) -> None:
+        self._assert_notification_failure_is_atomic(
+            fail_after_generation_assignment=True
+        )
+
     def test_loaded_authority_class_member_replacement_blocks_gate_c(
         self,
     ) -> None:

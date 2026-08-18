@@ -2710,6 +2710,14 @@ class _MatcherGenerationNotifications:
     ) -> None:
         """Publish while CapabilityHost holds the shared re-entrant lock."""
 
+        self._validate_publish_locked(owner_identity, generation)
+        self._publish_prevalidated_locked(generation)
+
+    def _validate_publish_locked(
+        self,
+        owner_identity: object,
+        generation: int,
+    ) -> None:
         if owner_identity is not self.__owner_identity:
             raise PermissionError(
                 "matcher generation publication requires composition owner"
@@ -2717,8 +2725,22 @@ class _MatcherGenerationNotifications:
         _require_generation(generation)
         if generation <= self.__generation:
             raise ValueError("matcher generation must increase")
+
+    def _publish_prevalidated_locked(self, generation: int) -> None:
+        """Commit a generation already validated under the same host lock."""
+
         self.__generation = generation
         self.__condition.notify_all()
+
+    def _precommit_snapshot_locked(self) -> int:
+        """Capture rollback state while the host owns the condition lock."""
+
+        return self.__generation
+
+    def _restore_precommit_locked(self, generation: int) -> None:
+        """Restore captured state directly after a provisional failure."""
+
+        self.__generation = generation
 
 
 @final
@@ -3066,6 +3088,10 @@ class CapabilityHost:
 
         with self.__lock:
             generation = self.__matcher_handoff.generation + 1
+            self.__matcher_notifications._validate_publish_locked(
+                self.__matcher_owner_identity,
+                generation,
+            )
             handoff = MatcherHandoffSnapshot(
                 generation=generation,
                 matcher=exposed_matcher,
@@ -3075,12 +3101,24 @@ class CapabilityHost:
                 matcher=handoff.display,
                 retrieval=self.__retrieval_handoff.display,
             )
-            self.__matcher_handoff = handoff
-            self.__status = status
-            self.__matcher_notifications._publish_locked(
-                self.__matcher_owner_identity,
-                generation,
+            old_handoff = self.__matcher_handoff
+            old_status = self.__status
+            old_notification_generation = (
+                self.__matcher_notifications._precommit_snapshot_locked()
             )
+            try:
+                self.__matcher_handoff = handoff
+                self.__status = status
+                self.__matcher_notifications._publish_prevalidated_locked(
+                    generation
+                )
+            except BaseException:
+                self.__matcher_handoff = old_handoff
+                self.__status = old_status
+                self.__matcher_notifications._restore_precommit_locked(
+                    old_notification_generation
+                )
+                raise
             return handoff
 
     def _install_gate_c_service(
@@ -3139,15 +3177,38 @@ class CapabilityHost:
                     matcher=self.__matcher_handoff.display,
                     retrieval=handoff.display,
                 )
-                self.__retrieval_publisher = publisher
-                self.__retrieval_service = service
-                self.__retrieval_base_manifest = base_manifest
-                self.__retrieval_handoff = handoff
-                self.__status = status
-                self.__retrieval_notifications._publish_locked(
+                self.__retrieval_notifications._validate_publish_locked(
                     self.__retrieval_owner_identity,
                     generation,
                 )
+                old_publisher = self.__retrieval_publisher
+                old_service = self.__retrieval_service
+                old_base_manifest = self.__retrieval_base_manifest
+                old_handoff = self.__retrieval_handoff
+                old_status = self.__status
+                old_notification_generation = (
+                    self.__retrieval_notifications
+                    ._precommit_snapshot_locked()
+                )
+                try:
+                    self.__retrieval_publisher = publisher
+                    self.__retrieval_service = service
+                    self.__retrieval_base_manifest = base_manifest
+                    self.__retrieval_handoff = handoff
+                    self.__status = status
+                    self.__retrieval_notifications._publish_prevalidated_locked(
+                        generation
+                    )
+                except BaseException:
+                    self.__retrieval_publisher = old_publisher
+                    self.__retrieval_service = old_service
+                    self.__retrieval_base_manifest = old_base_manifest
+                    self.__retrieval_handoff = old_handoff
+                    self.__status = old_status
+                    self.__retrieval_notifications._restore_precommit_locked(
+                        old_notification_generation
+                    )
+                    raise
                 return handoff
 
     def _capture_gate_d_graph(

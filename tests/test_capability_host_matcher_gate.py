@@ -727,6 +727,64 @@ class CapabilityHostMatcherGateStateTests(unittest.TestCase):
 
 
 class CapabilityHostMatcherGateRefreshTests(unittest.TestCase):
+    def _assert_notification_failure_is_atomic(
+        self,
+        *,
+        fail_after_generation_assignment: bool,
+    ) -> None:
+        composition = _composition()
+        host = composition.host
+        owner = composition.matcher_validation_owner
+        old_handoff = host.matcher_snapshot()
+        old_status = host.status_snapshot()
+        notification = host.matcher_generation_notifications()
+        notification_type = cast(Any, type(notification))
+        original_publish = cast(
+            Any,
+            notification_type._publish_prevalidated_locked,
+        )
+        failure = RuntimeError("matcher notification publication failed")
+
+        def failing_publish(
+            observed: object,
+            generation: int,
+        ) -> None:
+            if fail_after_generation_assignment:
+                original_publish(observed, generation)
+            raise failure
+
+        with patch.object(
+            notification_type,
+            "_publish_prevalidated_locked",
+            failing_publish,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                owner.validate_basic(
+                    generated_at_utc=_GENERATED_AT,
+                    valid_until_utc=_VALID_UNTIL,
+                    evaluated_at_utc=_EVALUATED_AT,
+                )
+
+        self.assertIs(raised.exception, failure)
+        self.assertIs(host.matcher_snapshot(), old_handoff)
+        self.assertIs(host.status_snapshot(), old_status)
+        self.assertIs(host.status_snapshot().matcher, old_handoff.display)
+        self.assertEqual(notification.current(), old_handoff.generation)
+
+    def test_notification_failure_before_generation_assignment_is_atomic(
+        self,
+    ) -> None:
+        self._assert_notification_failure_is_atomic(
+            fail_after_generation_assignment=False
+        )
+
+    def test_notification_failure_after_generation_assignment_is_atomic(
+        self,
+    ) -> None:
+        self._assert_notification_failure_is_atomic(
+            fail_after_generation_assignment=True
+        )
+
     def test_refresh_atomically_increments_generation_and_notifies(self) -> None:
         composition = _composition()
         host = composition.host
