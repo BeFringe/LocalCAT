@@ -17,6 +17,7 @@ from PySide6.QtCore import QCoreApplication, QEventLoop
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -123,6 +124,12 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         assert state is not None
         return state
 
+    def _capabilities(self, dialog: QtSettingsDialog, resource_id: str) -> QLabel:
+        capabilities = dialog.findChild(QLabel, f"tmCapabilities_{resource_id}")
+        self.assertIsNotNone(capabilities)
+        assert capabilities is not None
+        return capabilities
+
     def _complete_operation(
         self,
         dialog: QtSettingsDialog,
@@ -179,6 +186,10 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             kind_state = self._kind_state(dialog, resource_id)
             self.assertEqual(kind_state.property("tm_semantics"), "legacy")
             self.assertIn("Legacy exact-only", kind_state.accessibleName())
+            self.assertEqual(
+                self._capabilities(dialog, resource_id).text(),
+                "Exact 可用 · Context 不可用 · Fuzzy 不可用",
+            )
             dialog.close()
 
     def test_1180_render_has_one_tm_name_nonoverlapping_status_and_yellow_legacy_dot(
@@ -207,7 +218,27 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self.assertIsNone(table.item(row, 3))
             self.assertEqual(name.text(), resource.name)
             self.assertFalse(name.geometry().intersects(status.geometry()))
+            self.assertGreaterEqual(status.height(), status.minimumSizeHint().height())
+            self.assertNotIn("\n", status.text())
+            capabilities = self._capabilities(dialog, resource_id)
             self.assertFalse(table.cellWidget(row, 3).grab().toImage().isNull())
+            kind_cell = table.cellWidget(row, 4)
+            self.assertIsNotNone(kind_cell)
+            assert kind_cell is not None
+            self.assertEqual(kind_cell.findChildren(QCheckBox), [])
+            self.assertGreaterEqual(
+                capabilities.width(),
+                capabilities.sizeHint().width(),
+            )
+            self.assertGreaterEqual(
+                capabilities.height(),
+                capabilities.minimumSizeHint().height(),
+            )
+            for phrase in ("Exact 可用", "Context 不可用", "Fuzzy 不可用"):
+                self.assertIn(phrase, name.toolTip())
+                self.assertIn(phrase, name.accessibleName())
+                self.assertIn(phrase, capabilities.toolTip())
+                self.assertIn(phrase, kind_cell.accessibleName())
             state_image = state.grab().toImage()
             self.assertFalse(state_image.isNull())
             self.assertEqual(
@@ -334,6 +365,14 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 )
                 canonical_state = self._kind_state(dialog, resource_id)
                 self.assertEqual(canonical_state.property("tm_semantics"), "canonical")
+                canonical_capabilities = self._capabilities(dialog, resource_id)
+                self.assertEqual(
+                    canonical_capabilities.text(),
+                    "Exact 可用 · Context 不可用 · Fuzzy 不可用",
+                )
+                for phrase in ("Exact 可用", "Context 不可用", "Fuzzy 不可用"):
+                    self.assertIn(phrase, canonical_capabilities.accessibleName())
+                    self.assertIn(phrase, canonical_capabilities.toolTip())
                 canonical_image = canonical_state.grab().toImage()
                 self.assertEqual(
                     canonical_image.pixelColor(canonical_image.rect().center()),
@@ -414,6 +453,9 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 {first_id},
             )
             dialog = QtSettingsDialog(controller)
+            dialog.resize(1180, 680)
+            dialog.show()
+            self._events()
 
             first = self._status(dialog, first_id)
             unavailable = self._status(dialog, missing_id)
@@ -424,6 +466,18 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self.assertFalse(self._action(dialog, missing_id).isEnabled())
             unavailable_state = self._kind_state(dialog, missing_id)
             self.assertEqual(unavailable_state.property("tm_semantics"), "unavailable")
+            unavailable_capabilities = self._capabilities(dialog, missing_id)
+            self.assertEqual(
+                unavailable_capabilities.text(),
+                "Exact 不可用 · Context 不可用 · Fuzzy 不可用",
+            )
+            self.assertGreaterEqual(
+                unavailable_capabilities.width(),
+                unavailable_capabilities.sizeHint().width(),
+            )
+            for phrase in ("Exact 不可用", "Context 不可用", "Fuzzy 不可用"):
+                self.assertIn(phrase, unavailable_capabilities.accessibleName())
+                self.assertIn(phrase, unavailable_capabilities.toolTip())
             dialog.close()
 
     def test_unknown_preflight_exception_is_sanitized(self) -> None:

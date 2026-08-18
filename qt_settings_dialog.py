@@ -371,13 +371,15 @@ class QtSettingsDialog(QDialog):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        table.setColumnWidth(4, 128)
+        table.setColumnWidth(4, 234)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(6, 128)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(7, 32)
         full_cell_delegate = _FullCellWidgetDelegate(table)
+        table.setItemDelegateForColumn(3, full_cell_delegate)
+        table.setItemDelegateForColumn(4, full_cell_delegate)
         table.setItemDelegateForColumn(6, full_cell_delegate)
         table.setItemDelegateForColumn(7, full_cell_delegate)
         return table
@@ -495,6 +497,7 @@ class QtSettingsDialog(QDialog):
                     "tmStatus_",
                     "tmKindCell_",
                     "tmKindState_",
+                    "tmCapabilities_",
                     "resourceKind_",
                     "more_",
                 )
@@ -668,12 +671,22 @@ class QtSettingsDialog(QDialog):
         status: TMResourceStatus | None,
     ) -> QWidget:
         semantics, color, description = self._tm_kind_projection(status)
+        capabilities_text = self._tm_capability_text(status)
+        accessible_text = (
+            f"翻译记忆库：{description}；"
+            f"{capabilities_text.replace(' · ', '；')}"
+        )
         holder = QWidget()
         holder.setObjectName(f"tmKindCell_{resource.id}")
-        holder.setAccessibleName(f"翻译记忆库：{description}")
-        layout = QHBoxLayout(holder)
-        layout.setContentsMargins(8, 0, 6, 0)
-        layout.setSpacing(7)
+        holder.setAccessibleName(accessible_text)
+        holder.setToolTip(accessible_text)
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(8, 3, 6, 3)
+        layout.setSpacing(1)
+
+        heading = QHBoxLayout()
+        heading.setContentsMargins(0, 0, 0, 0)
+        heading.setSpacing(7)
 
         state = QLabel()
         state.setObjectName(f"tmKindState_{resource.id}")
@@ -682,15 +695,37 @@ class QtSettingsDialog(QDialog):
         state.setStyleSheet(
             f"background-color: {color}; border: none; border-radius: 5px;"
         )
-        state.setAccessibleName(f"翻译记忆库：{description} 状态点")
-        state.setToolTip(state.accessibleName())
-        layout.addWidget(state)
+        state.setAccessibleName(f"{accessible_text}；状态点")
+        state.setToolTip(accessible_text)
+        heading.addWidget(state)
 
         kind = QLabel("翻译记忆库")
         kind.setObjectName(f"resourceKind_{resource.id}")
-        kind.setToolTip(description)
-        layout.addWidget(kind, 1)
+        kind.setAccessibleName(accessible_text)
+        kind.setToolTip(accessible_text)
+        heading.addWidget(kind, 1)
+        layout.addLayout(heading)
+
+        capabilities = QLabel(capabilities_text)
+        capabilities.setObjectName(f"tmCapabilities_{resource.id}")
+        capabilities.setAccessibleName(accessible_text)
+        capabilities.setToolTip(accessible_text)
+        capabilities.setWordWrap(False)
+        capabilities.setStyleSheet("color: #52677b; font-size: 10px;")
+        capabilities.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout.addWidget(capabilities)
         return holder
+
+    @staticmethod
+    def _tm_capability_text(status: TMResourceStatus | None) -> str:
+        return (
+            f"Exact {'可用' if status is not None and status.exact_available else '不可用'} · "
+            f"Context {'可用' if status is not None and status.context_available else '不可用'} · "
+            f"Fuzzy {'可用' if status is not None and status.fuzzy_available else '不可用'}"
+        )
 
     @staticmethod
     def _tm_lifecycle_action_spec(
@@ -747,7 +782,7 @@ class QtSettingsDialog(QDialog):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        status_label.setWordWrap(True)
+        status_label.setWordWrap(False)
         layout.addWidget(status_label)
 
         target_running = (
@@ -770,16 +805,18 @@ class QtSettingsDialog(QDialog):
             text = _TM_MODE_LABELS[mode]
             if safe_codes:
                 text += f" · {_tm_safe_reason(safe_codes[0])}"
-            text += (
-                "\n"
-                f"Exact {'可用' if status.exact_available else '不可用'} · "
-                f"Context {'可用' if status.context_available else '不可用'} · "
-                f"Fuzzy {'可用' if status.fuzzy_available else '不可用'}"
-            )
         status_label.setText(text)
         status_label.setProperty("tm_mode", mode.value)
         status_label.setProperty("tmMode", mode.value)
-        status_accessible_name = f"{resource.name}：{text.replace(chr(10), '；')}"
+        capabilities_text = self._tm_capability_text(status)
+        status_accessible_name = (
+            f"{resource.name}：{text}；"
+            f"{capabilities_text.replace(' · ', '；')}"
+        )
+        holder.setAccessibleName(status_accessible_name)
+        holder.setToolTip(status_accessible_name)
+        name.setAccessibleName(status_accessible_name)
+        name.setToolTip(status_accessible_name)
         status_label.setAccessibleName(status_accessible_name)
         status_label.setToolTip(status_accessible_name)
 
