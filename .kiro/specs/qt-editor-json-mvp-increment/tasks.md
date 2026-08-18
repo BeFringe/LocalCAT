@@ -137,7 +137,7 @@
   - 完成时，新增、修改、删除以及每个故障点都不会产生“磁盘新版本、运行时旧版本”的普通成功状态
   - _Requirements: 7.2, 7.3, 7.4, 7.5, 7.6, 7.13, 9.4_
 
-- [ ] 3.5 接入术语导入、configured adapter 与资源热重载
+- [x] 3.5 接入术语导入、configured adapter 与资源热重载
   - 让 termbase import 经统一 mixed store merge，保留 v1 ID、flags、row kind 和既有 overwrite 计数
   - 按 matcher capability 构建 legacy/configured cohorts，并在成功 mutation 或 capability 切换后一次交换
   - 保持精确 TM 优先级、raw speaker TM identity、既有术语建议和资源状态行为

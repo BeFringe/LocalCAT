@@ -18,6 +18,7 @@ from capability_host import (
     CapabilityHost,
     MatcherHandoffSnapshot,
     RetrievalHandoffSnapshot,
+    _MatcherGenerationChanged,
     _RetrievalGenerationChanged,
 )
 from editor_contracts import (
@@ -75,6 +76,10 @@ _OperationResultT = TypeVar("_OperationResultT")
 
 class _TMQueryGenerationChanged(RuntimeError):
     """Controller-facing private signal for a stale TM query operation."""
+
+
+class _TMMatcherGenerationChanged(RuntimeError):
+    """Controller-facing signal for a stale matcher cohort operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +253,21 @@ class EditorTMAdapter:
         """Prove candidate identity against this adapter's current Host issue."""
 
         return candidate is self._capability_host.matcher_snapshot()
+
+    def _run_if_text_matcher_handoff_current_for_controller(
+        self,
+        candidate: MatcherHandoffSnapshot,
+        operation: Callable[[], _OperationResultT],
+    ) -> _OperationResultT:
+        """Run one short term commit/publication under the Host reservation."""
+
+        try:
+            return self._capability_host._run_if_matcher_handoff_current(
+                candidate,
+                operation,
+            )
+        except _MatcherGenerationChanged as error:
+            raise _TMMatcherGenerationChanged from error
 
     def query_current(
         self,

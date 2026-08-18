@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, cast
 from uuid import uuid4
 
-from editor_contracts import ImportReport
+from editor_contracts import ImportReport, LegacyTermRow
 from tm_contracts import TMRecordDraft
 from tm_engine import open_canonical_tm_store
 from tm_sqlite_store import (
@@ -34,6 +34,46 @@ TARGET_HEADERS = frozenset({"target", "target term", "target text", "translation
 
 class ImportFailure(RuntimeError):
     """Internal all-or-nothing import failure."""
+
+
+def read_legacy_termbase_import(
+    input_path: Path,
+) -> tuple[tuple[LegacyTermRow, ...], int]:
+    """Read one CSV/XLSX import without touching the managed resource.
+
+    The Controller passes the validated rows to ``TermbaseStore`` so the
+    mixed legacy/v1 target remains under its single transaction boundary.
+    Duplicate rows deliberately remain present: the Store owns source-LWW
+    ordering and overwrite counts.
+    """
+
+    source = _validate_input(input_path, {".csv", ".xlsx"})
+    rows = _read_termbase_rows(source)
+    accepted: list[LegacyTermRow] = []
+    skipped = 0
+    for input_ordinal, row in enumerate(rows):
+        if len(row) < 2:
+            skipped += 1
+            continue
+        source_text = "" if row[0] is None else str(row[0]).strip()
+        target_text = "" if row[1] is None else str(row[1]).strip()
+        if (
+            _is_header(source_text, target_text)
+            or not source_text
+            or not target_text
+        ):
+            skipped += 1
+            continue
+        accepted.append(
+            LegacyTermRow(
+                source=source_text,
+                target=target_text,
+                input_ordinal=input_ordinal,
+            )
+        )
+    if not accepted:
+        raise ImportFailure("termbase contains no valid source/target rows")
+    return tuple(accepted), skipped
 
 
 def import_tmx(

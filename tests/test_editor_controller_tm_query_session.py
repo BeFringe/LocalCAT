@@ -361,59 +361,72 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             self.assertEqual(controller.issued_tm_suggestions, ())
             self.assertFalse(tm.path.exists())
 
-    def test_create_and_import_refresh_failures_latch_persisted_state(self) -> None:
-        for action in ("create", "import"):
-            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                controller, _adapter, _runtime, repository = self._controller(root)
-                _ = controller.tm_suggestion_report()
-                imported_resource = None
-                source: Path | None = None
-                if action == "import":
-                    imported_resource = controller.create_resource(
-                        "Imported terms",
-                        ResourceKind.TERMBASE,
+    def test_create_refresh_failure_latches_persisted_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, repository = self._controller(
+                Path(temporary)
+            )
+            _ = controller.tm_suggestion_report()
+
+            with patch.object(
+                EditorTMAdapter,
+                "_refresh_runtime",
+                autospec=True,
+                side_effect=ValueError("/secret/runtime-refresh"),
+            ):
+                with self.assertRaises(EditorControllerError):
+                    controller.create_resource(
+                        "Persisted TM",
+                        ResourceKind.TRANSLATION_MEMORY,
                     )
-                    source = root / "import.csv"
-                    source.write_text(
-                        "Source,Target\nHello,你好\n",
-                        encoding="utf-8-sig",
+
+            self.assertGreaterEqual(len(repository.list_resources()), 2)
+            self.assertEqual(controller.issued_tm_suggestions, ())
+            with self.assertRaisesRegex(
+                EditorControllerError,
+                "TM.RUNTIME.REFRESH_FAILED",
+            ):
+                controller.tm_suggestion_report()
+
+            controller.reload_resources()
+            self.assertTrue(controller.issued_tm_suggestions)
+
+    def test_term_import_does_not_refresh_or_latch_unchanged_tm_runtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _adapter, _runtime, _repository = self._controller(root)
+            imported_resource = controller.create_resource(
+                "Imported terms",
+                ResourceKind.TERMBASE,
+            )
+            before = controller.tm_suggestion_report()
+            source = root / "import.csv"
+            source.write_text(
+                "Source,Target\nHello,你好\n",
+                encoding="utf-8-sig",
+            )
+
+            with patch.object(
+                EditorTMAdapter,
+                "_refresh_runtime",
+                autospec=True,
+                side_effect=ValueError("/secret/runtime-refresh"),
+            ) as refresh:
+                report = controller.import_resource(
+                    ImportRequest(
+                        resource_id=imported_resource.id,
+                        input_path=source.resolve(),
                     )
+                )
 
-                with patch.object(
-                    EditorTMAdapter,
-                    "_refresh_runtime",
-                    autospec=True,
-                    side_effect=ValueError("/secret/runtime-refresh"),
-                ):
-                    if action == "create":
-                        with self.assertRaises(EditorControllerError):
-                            controller.create_resource(
-                                "Persisted TM",
-                                ResourceKind.TRANSLATION_MEMORY,
-                            )
-                    else:
-                        assert imported_resource is not None
-                        assert source is not None
-                        report = controller.import_resource(
-                            ImportRequest(
-                                resource_id=imported_resource.id,
-                                input_path=source.resolve(),
-                            )
-                        )
-                        self.assertEqual(report.imported, 1)
-                        self.assertTrue(report.errors)
+            after = controller.tm_suggestion_report()
 
-                self.assertGreaterEqual(len(repository.list_resources()), 2)
-                self.assertEqual(controller.issued_tm_suggestions, ())
-                with self.assertRaisesRegex(
-                    EditorControllerError,
-                    "TM.RUNTIME.REFRESH_FAILED",
-                ):
-                    controller.tm_suggestion_report()
-
-                controller.reload_resources()
-                self.assertTrue(controller.issued_tm_suggestions)
+        self.assertEqual(report.imported, 1)
+        self.assertEqual(report.errors, ())
+        refresh.assert_not_called()
+        self.assertEqual(after.suggestions, before.suggestions)
 
     def test_refresh_programmer_error_propagates_but_latch_stays_body_free(
         self,

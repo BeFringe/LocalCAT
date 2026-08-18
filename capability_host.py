@@ -91,6 +91,11 @@ class _RetrievalGenerationChanged(RuntimeError):
     """Application-private signal for a stale retrieval commit reservation."""
 
 
+@final
+class _MatcherGenerationChanged(RuntimeError):
+    """Application-private signal for a stale matcher commit reservation."""
+
+
 def _require_generation(value: object) -> None:
     if type(value) is not int:
         raise TypeError("capability generation must be an exact integer")
@@ -2991,6 +2996,34 @@ class CapabilityHost:
 
         with self.__lock:
             return self.__matcher_handoff
+
+    def _run_if_matcher_handoff_current(
+        self,
+        candidate: MatcherHandoffSnapshot,
+        operation: Callable[[], _OperationResultT],
+    ) -> _OperationResultT:
+        """Linearize one short application commit against one handoff.
+
+        The exact host-owned snapshot, rather than a caller-supplied
+        generation integer, is the reservation token.  Matcher publication
+        uses the same lock, so it cannot interleave with the operation.
+        """
+
+        if type(candidate) is not MatcherHandoffSnapshot:
+            raise TypeError(
+                "matcher generation reservation requires a host handoff"
+            )
+        if not callable(operation):
+            raise TypeError("matcher generation operation must be callable")
+        with self.__lock:
+            candidate.__post_init__()
+            if (
+                self.__matcher_handoff is not candidate
+                or self.__matcher_notifications.current()
+                != candidate.generation
+            ):
+                raise _MatcherGenerationChanged
+            return operation()
 
     def matcher_generation_notifications(
         self,

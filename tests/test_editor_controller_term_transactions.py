@@ -434,7 +434,8 @@ class EditorControllerTermTransactionTests(unittest.TestCase):
             ),
             (("Legacy", "old"),),
         )
-        self.assertIs(repeated, outcome)
+        self.assertIsNot(repeated, outcome)
+        self.assertEqual(repeated, outcome)
         self.assertIs(
             self._term_engines(controller)[resource.id],
             before_engine,

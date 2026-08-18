@@ -50,7 +50,11 @@ from editor_contracts import (
     TextMatcherDisplayState,
     WriteReport,
 )
-from editor_tm_adapter import EditorTMAdapter, _TMQueryGenerationChanged
+from editor_tm_adapter import (
+    EditorTMAdapter,
+    _TMMatcherGenerationChanged,
+    _TMQueryGenerationChanged,
+)
 from editor_project import (
     ProjectError,
     load_project,
@@ -58,7 +62,11 @@ from editor_project import (
     save_project as save_project_file,
 )
 from glossary_engine import GlossaryEngine
-from resource_importer import import_termbase, import_tmx
+from resource_importer import (
+    ImportFailure,
+    import_tmx,
+    read_legacy_termbase_import,
+)
 from resource_repository import ResourceError, ResourceRepository
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from project_search import ProjectSearchError, ProjectSearchService
@@ -531,6 +539,42 @@ def _clone_term_records(
     return tuple(cloned)
 
 
+_TERM_QUARANTINE_ERROR_CODES = frozenset(
+    {"ROLLBACK_FAILED", "ROLLBACK_VERIFICATION_FAILED"}
+)
+_TERM_QUARANTINE_SAFE_DETAIL = (
+    "Quarantine the resource and restore it from the recovery file "
+    "before retrying."
+)
+
+
+def _clone_indeterminate_term_outcome(
+    outcome: TermCommitOutcome,
+) -> TermCommitOutcome:
+    """Validate and detach one private quarantine recovery envelope."""
+
+    if type(outcome) is not TermCommitOutcome:
+        raise TypeError("private term quarantine must be TermCommitOutcome")
+    outcome.__post_init__()
+    if outcome.state is not TermCommitState.INDETERMINATE:
+        raise ValueError("private term quarantine state drifted")
+    if outcome.error_code not in _TERM_QUARANTINE_ERROR_CODES:
+        raise ValueError("private term quarantine error code drifted")
+    if outcome.safe_detail != _TERM_QUARANTINE_SAFE_DETAIL:
+        raise ValueError("private term quarantine guidance drifted")
+    cloned = TermCommitOutcome(
+        state=outcome.state,
+        report=None,
+        error_code=outcome.error_code,
+        retryable=outcome.retryable,
+        recovery_path=outcome.recovery_path,
+        quarantined=outcome.quarantined,
+        safe_detail=outcome.safe_detail,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 def _project_search_hit_fields_equal(
     candidate: ProjectSearchHit,
     issued: ProjectSearchHit,
@@ -795,6 +839,7 @@ class EditorController:
         self._glossary_engines: dict[str, _TermEngine] = {}
         self._term_record_snapshots: dict[str, tuple[TermRecord, ...]] = {}
         self._term_quarantines: dict[str, TermCommitOutcome] = {}
+        self._term_matcher_handoff: MatcherHandoffSnapshot | None = None
         self._term_store = TermbaseStore()
         self.reload_resources(_refresh_runtime=False)
 
@@ -1628,6 +1673,32 @@ class EditorController:
         )
 
     def _term_suggestions(self, source: str) -> tuple[TermSuggestion, ...]:
+        adapter = self._tm_adapter
+        if adapter is None:
+            return self._extract_term_suggestions(source)
+
+        for _attempt in range(2):
+            self._synchronize_term_matcher_cohort()
+            handoff = self._term_matcher_handoff
+            if handoff is None:
+                raise AssertionError(
+                    "configured term cohort lost its matcher handoff"
+                )
+            try:
+                return adapter._run_if_text_matcher_handoff_current_for_controller(
+                    handoff,
+                    lambda: self._extract_term_suggestions(source),
+                )
+            except _TMMatcherGenerationChanged:
+                continue
+        raise EditorControllerError("TERM.MATCHER_GENERATION_CHANGED")
+
+    def _extract_term_suggestions(
+        self,
+        source: str,
+    ) -> tuple[TermSuggestion, ...]:
+        """Extract from one already-published immutable term cohort."""
+
         terms: list[TermSuggestion] = []
         for resource in self.repository.list_resources():
             if (
@@ -1652,6 +1723,47 @@ class EditorController:
                     )
                 )
         return tuple(terms)
+
+    def _synchronize_term_matcher_cohort(self) -> None:
+        """Lazily replace the complete term graph after capability drift."""
+
+        adapter = self._tm_adapter
+        if adapter is None:
+            return
+        current = adapter._text_matcher_handoff_for_controller()
+        if self._term_matcher_handoff is current:
+            return
+        configs = self.repository.list_resources()
+        try:
+            engines, records, handoff = self._build_term_engine_sets(configs)
+        except (OSError, UnicodeError, ValueError) as error:
+            raise EditorControllerError("TERM.COHORT_REBUILD_FAILED") from error
+        if handoff is None:
+            raise AssertionError("term candidate did not retain a host handoff")
+
+        try:
+            adapter._run_if_text_matcher_handoff_current_for_controller(
+                handoff,
+                lambda: self._publish_term_engine_graph(
+                    engines,
+                    records,
+                    handoff,
+                ),
+            )
+        except _TMMatcherGenerationChanged:
+            return
+
+    def _publish_term_engine_graph(
+        self,
+        engines: dict[str, _TermEngine],
+        records: dict[str, tuple[TermRecord, ...]],
+        handoff: MatcherHandoffSnapshot | None,
+    ) -> None:
+        """Swap one fully built engine/record graph without later allocation."""
+
+        self._glossary_engines = engines
+        self._term_record_snapshots = records
+        self._term_matcher_handoff = handoff
 
     def confirm_current(self) -> ConfirmResult:
         """Write the current translation to every writable TM before confirmation."""
@@ -2745,7 +2857,12 @@ class EditorController:
             resource = self._require_writable_termbase(resource_id)
             quarantined = self._term_quarantines.get(resource.id)
             if quarantined is not None:
-                return quarantined
+                try:
+                    return _clone_indeterminate_term_outcome(quarantined)
+                except ValueError as error:
+                    raise EditorControllerError(
+                        "TERM.QUARANTINE_INVALID"
+                    ) from error
 
             try:
                 prepared = prepare(resource.path)
@@ -2760,7 +2877,7 @@ class EditorController:
             prepared.__post_init__()
 
             try:
-                candidate_engines, candidate_records = (
+                candidate_engines, candidate_records, candidate_handoff = (
                     self._build_term_engine_sets(
                         self.repository.list_resources(),
                         candidate_records={
@@ -2783,27 +2900,63 @@ class EditorController:
                     ) from error
                 raise
 
-            outcome = self._term_store.commit(prepared)
-            if type(outcome) is not TermCommitOutcome:
-                raise TypeError("term commit must return TermCommitOutcome")
-            outcome.__post_init__()
-            if outcome.state is TermCommitState.COMMITTED:
-                report = outcome.report
-                if report is None:
-                    raise AssertionError(
-                        "committed term mutation must contain its report"
+            def commit_and_publish() -> TermCommitOutcome:
+                outcome = self._term_store.commit(prepared)
+                if type(outcome) is not TermCommitOutcome:
+                    raise TypeError("term commit must return TermCommitOutcome")
+                outcome.__post_init__()
+                if outcome.state is TermCommitState.COMMITTED:
+                    report = outcome.report
+                    if report is None:
+                        raise AssertionError(
+                            "committed term mutation must contain its report"
+                        )
+                    if (
+                        report.resource_path != resource.path
+                        or report.records != prepared.candidate_records
+                    ):
+                        raise AssertionError(
+                            "committed term report changed its prepared candidate"
+                        )
+                    self._publish_term_engine_graph(
+                        candidate_engines,
+                        candidate_records,
+                        candidate_handoff,
                     )
-                if (
-                    report.resource_path != resource.path
-                    or report.records != prepared.candidate_records
-                ):
-                    raise AssertionError(
-                        "committed term report changed its prepared candidate"
+                    _ = self._term_quarantines.pop(resource.id, None)
+                elif outcome.state is TermCommitState.INDETERMINATE:
+                    self._term_quarantines[resource.id] = (
+                        _clone_indeterminate_term_outcome(outcome)
                     )
+                return outcome
 
-                self._glossary_engines = candidate_engines
-                self._term_record_snapshots = candidate_records
-                _ = self._term_quarantines.pop(resource.id, None)
+            adapter = self._tm_adapter
+            try:
+                if adapter is None:
+                    outcome = commit_and_publish()
+                elif candidate_handoff is None:
+                    raise AssertionError(
+                        "configured term mutation lost its matcher handoff"
+                    )
+                else:
+                    outcome = adapter._run_if_text_matcher_handoff_current_for_controller(
+                        candidate_handoff,
+                        commit_and_publish,
+                    )
+            except _TMMatcherGenerationChanged as error:
+                try:
+                    self._term_store.discard(prepared)
+                except (OSError, ValueError) as cleanup_error:
+                    LOGGER.warning(
+                        "Unable to discard stale term candidate for %s: %s",
+                        resource.id,
+                        type(cleanup_error).__name__,
+                    )
+                raise EditorControllerError(
+                    "TERM.MATCHER_GENERATION_CHANGED"
+                ) from error
+
+            if outcome.state is TermCommitState.COMMITTED:
                 cleanup = self._term_store.finalize(prepared, outcome)
                 if not cleanup.cleaned:
                     LOGGER.warning(
@@ -2814,8 +2967,19 @@ class EditorController:
                 return outcome
 
             if outcome.state is TermCommitState.INDETERMINATE:
-                self._term_quarantines[resource.id] = outcome
-                return outcome
+                private_quarantine = self._term_quarantines.get(resource.id)
+                if private_quarantine is None:
+                    raise AssertionError(
+                        "indeterminate term mutation lost quarantine state"
+                    )
+                try:
+                    return _clone_indeterminate_term_outcome(
+                        private_quarantine
+                    )
+                except ValueError as error:
+                    raise EditorControllerError(
+                        "TERM.QUARANTINE_INVALID"
+                    ) from error
 
             try:
                 self._term_store.discard(prepared)
@@ -2858,6 +3022,8 @@ class EditorController:
         """Delete one configured resource and remove it from live engine sets."""
 
         with self._tm_query_lock:
+            if resource_id in self._term_quarantines:
+                raise EditorControllerError("TERM.RESOURCE_QUARANTINED")
             try:
                 deleted = self.repository.delete_resource(resource_id)
             except ResourceError as exc:
@@ -2880,6 +3046,9 @@ class EditorController:
     def import_resource(self, request: ImportRequest) -> ImportReport:
         """Import into one configured resource and hot reload on any written result."""
 
+        if type(request) is not ImportRequest:
+            raise TypeError("resource import request must be ImportRequest")
+        request.__post_init__()
         with self._tm_query_lock:
             try:
                 resource = self.repository.get(request.resource_id)
@@ -2892,22 +3061,74 @@ class EditorController:
                     request.source_locale,
                     request.target_locale,
                 )
-            else:
-                report = import_termbase(request.input_path, resource.path)
-            if report.imported:
-                try:
-                    self._reload_resources_after_persisted_mutation()
-                except EditorControllerError as exc:
+                if report.imported:
+                    try:
+                        self._reload_resources_after_persisted_mutation()
+                    except EditorControllerError as exc:
+                        return ImportReport(
+                            imported=report.imported,
+                            skipped=report.skipped,
+                            overwritten=report.overwritten,
+                            errors=(
+                                *report.errors,
+                                f"resource reload failed: {exc}",
+                            ),
+                        )
+                return report
+
+            try:
+                rows, skipped = read_legacy_termbase_import(
+                    request.input_path
+                )
+            except (
+                ImportFailure,
+                OSError,
+                UnicodeError,
+            ) as error:
+                return ImportReport(errors=(str(error),))
+            try:
+                outcome = self._mutate_term_resource(
+                    resource.id,
+                    lambda path: self._term_store.prepare_merge_legacy(
+                        path,
+                        rows,
+                    ),
+                )
+            except EditorControllerError as error:
+                return ImportReport(
+                    skipped=skipped,
+                    errors=(str(error),),
+                )
+            if outcome.state is not TermCommitState.COMMITTED:
+                if outcome.state is TermCommitState.INDETERMINATE:
+                    recovery_path = outcome.recovery_path
+                    safe_detail = outcome.safe_detail
+                    if recovery_path is None or safe_detail is None:
+                        raise AssertionError(
+                            "indeterminate term import lost recovery guidance"
+                        )
                     return ImportReport(
-                        imported=report.imported,
-                        skipped=report.skipped,
-                        overwritten=report.overwritten,
+                        skipped=skipped,
                         errors=(
-                            *report.errors,
-                            f"resource reload failed: {exc}",
+                            outcome.error_code or "TERM.COMMIT_INDETERMINATE",
+                            f"Recovery file: {recovery_path}",
+                            safe_detail,
                         ),
                     )
-            return report
+                return ImportReport(
+                    skipped=skipped,
+                    errors=(outcome.error_code or "TERM.COMMIT_FAILED",),
+                )
+            mutation = outcome.report
+            if mutation is None:
+                raise AssertionError(
+                    "committed term import lost its mutation report"
+                )
+            return ImportReport(
+                imported=mutation.imported,
+                skipped=skipped,
+                overwritten=mutation.overwritten,
+            )
 
     def reload_resources(self, *, _refresh_runtime: bool = True) -> None:
         """Build a complete active engine set before replacing the last known-good set."""
@@ -2923,6 +3144,7 @@ class EditorController:
                         tm_engines,
                         glossary_engines,
                         term_records,
+                        term_handoff,
                     ) = self._build_resource_engine_sets(configs)
                 elif not _refresh_runtime:
                     if configs:
@@ -2933,6 +3155,7 @@ class EditorController:
                             tm_engines,
                             glossary_engines,
                             term_records,
+                            term_handoff,
                         ) = self._build_resource_engine_sets(
                             configs,
                             runtime_snapshot=initial_runtime,
@@ -2942,12 +3165,14 @@ class EditorController:
                             tm_engines,
                             glossary_engines,
                             term_records,
+                            term_handoff,
                         ) = self._build_resource_engine_sets(configs)
                 else:
                     engine_candidate: tuple[
                         dict[str, TMEngine],
                         dict[str, _TermEngine],
                         dict[str, tuple[TermRecord, ...]],
+                        MatcherHandoffSnapshot | None,
                     ] | None = None
 
                     def validate_candidate(snapshot: object) -> None:
@@ -2962,11 +3187,45 @@ class EditorController:
                         raise ValueError(
                             "resource engine refresh candidate is missing"
                         )
-                    tm_engines, glossary_engines, term_records = engine_candidate
+                    (
+                        tm_engines,
+                        glossary_engines,
+                        term_records,
+                        term_handoff,
+                    ) = engine_candidate
 
-                self._tm_engines = tm_engines
-                self._glossary_engines = glossary_engines
-                self._term_record_snapshots = term_records
+                def publish_resource_graph() -> None:
+                    self._tm_engines = tm_engines
+                    self._publish_term_engine_graph(
+                        glossary_engines,
+                        term_records,
+                        term_handoff,
+                    )
+
+                if adapter is None:
+                    publish_resource_graph()
+                else:
+                    for attempt in range(2):
+                        if term_handoff is None:
+                            raise AssertionError(
+                                "configured resource graph lost its handoff"
+                            )
+                        try:
+                            adapter._run_if_text_matcher_handoff_current_for_controller(
+                                term_handoff,
+                                publish_resource_graph,
+                            )
+                            break
+                        except _TMMatcherGenerationChanged:
+                            if attempt == 1:
+                                raise ValueError(
+                                    "matcher generation changed during resource reload"
+                                ) from None
+                            (
+                                glossary_engines,
+                                term_records,
+                                term_handoff,
+                            ) = self._build_term_engine_sets(configs)
                 if self._project is not None:
                     self._advance_tm_query_epoch()
                     self._record_current_tm_baseline()
@@ -2985,6 +3244,7 @@ class EditorController:
         dict[str, TMEngine],
         dict[str, _TermEngine],
         dict[str, tuple[TermRecord, ...]],
+        MatcherHandoffSnapshot | None,
     ]:
         """Build compatibility engines against one validated runtime cohort."""
 
@@ -2996,7 +3256,11 @@ class EditorController:
                 runtime_snapshot,
             )
         )
-        glossary_engines, term_records = self._build_term_engine_sets(configs)
+        (
+            glossary_engines,
+            term_records,
+            term_handoff,
+        ) = self._build_term_engine_sets(configs)
         for resource in configs:
             if not resource.active:
                 continue
@@ -3005,7 +3269,7 @@ class EditorController:
                     tm_engines[resource.id] = self._load_tm_engine(
                         resource.path
                     )
-        return tm_engines, glossary_engines, term_records
+        return tm_engines, glossary_engines, term_records, term_handoff
 
     def _build_term_engine_sets(
         self,
@@ -3015,6 +3279,7 @@ class EditorController:
     ) -> tuple[
         dict[str, _TermEngine],
         dict[str, tuple[TermRecord, ...]],
+        MatcherHandoffSnapshot | None,
     ]:
         """Build one complete active term cohort from a single Host issue."""
 
@@ -3033,12 +3298,11 @@ class EditorController:
             if resource.kind is not ResourceKind.TERMBASE:
                 continue
             if resource.id in self._term_quarantines and resource.id not in overrides:
-                lkg_engine = self._glossary_engines.get(resource.id)
                 lkg_records = self._term_record_snapshots.get(resource.id)
-                if lkg_engine is None or lkg_records is None:
+                if lkg_records is None:
                     raise ValueError("quarantined termbase lost its in-memory LKG")
-                engines[resource.id] = lkg_engine
-                snapshots[resource.id] = lkg_records
+                if resource.active:
+                    pending.append((resource, lkg_records))
                 continue
             if not resource.active:
                 continue
@@ -3056,8 +3320,8 @@ class EditorController:
 
         adapter = self._tm_adapter
         handoff: MatcherHandoffSnapshot | None = None
-        if adapter is not None and pending:
-            handoff = self.text_matcher_handoff()
+        if adapter is not None:
+            handoff = adapter._text_matcher_handoff_for_controller()
             if not adapter._is_current_text_matcher_handoff_for_controller(
                 handoff
             ):
@@ -3085,7 +3349,7 @@ class EditorController:
             )
         ):
             raise ValueError("term matcher handoff changed during candidate build")
-        return engines, snapshots
+        return engines, snapshots, handoff
 
     @staticmethod
     def _build_legacy_term_engine(
