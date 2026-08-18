@@ -238,22 +238,31 @@ class _ResourceTable(QTableWidget):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         pixel_delta = event.pixelDelta().y()
-        vertical_delta = pixel_delta or event.angleDelta().y()
         scrollbar = self.verticalScrollBar()
+        target = self._wheel_handoff_target
+        if pixel_delta:
+            requested = -pixel_delta
+            inner_before = scrollbar.value()
+            inner_after = min(
+                scrollbar.maximum(),
+                max(scrollbar.minimum(), inner_before + requested),
+            )
+            scrollbar.setValue(inner_after)
+            remaining = requested - (inner_after - inner_before)
+            if remaining and target is not None:
+                target_scrollbar = target.verticalScrollBar()
+                target_scrollbar.setValue(target_scrollbar.value() + remaining)
+            event.accept()
+            return
+
+        vertical_delta = event.angleDelta().y()
         at_boundary = (
             vertical_delta < 0 and scrollbar.value() >= scrollbar.maximum()
         ) or (
             vertical_delta > 0 and scrollbar.value() <= scrollbar.minimum()
         )
-        target = self._wheel_handoff_target
         if vertical_delta == 0 or not at_boundary or target is None:
             super().wheelEvent(event)
-            return
-
-        if pixel_delta:
-            target_scrollbar = target.verticalScrollBar()
-            target_scrollbar.setValue(target_scrollbar.value() - pixel_delta)
-            event.accept()
             return
 
         target_position = target.viewport().mapFromGlobal(

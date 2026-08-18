@@ -216,6 +216,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         *,
         angle_y: int = 0,
         pixel_y: int = 0,
+        phase: Qt.ScrollPhase = Qt.ScrollPhase.ScrollUpdate,
     ) -> QWheelEvent:
         event = QWheelEvent(
             QPointF(10, 10),
@@ -224,7 +225,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             QPoint(0, angle_y),
             Qt.MouseButton.NoButton,
             Qt.KeyboardModifier.NoModifier,
-            Qt.ScrollPhase.ScrollUpdate,
+            phase,
             False,
         )
         QApplication.sendEvent(receiver, event)
@@ -290,6 +291,105 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self.assertEqual(
                 self._capabilities(dialog, resource_id).text(),
                 "Exact 可用 · Context 不可用 · Fuzzy 不可用",
+            )
+            dialog.close()
+
+    def test_pixel_only_trackpad_partially_consumes_inner_then_outer_scroll(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, resource_ids = _controller(Path(temporary), resources=6)
+            for resource_id in resource_ids[4:]:
+                resource = next(
+                    configured
+                    for configured in controller.list_resources()
+                    if configured.id == resource_id
+                )
+                controller.update_resource(replace(resource, active=False))
+
+            dialog = QtSettingsDialog(controller)
+            dialog.resize(860, 560)
+            dialog.show()
+            self._events()
+            inner = dialog.active_table.verticalScrollBar()
+            outer = dialog.resource_tables_scroll.verticalScrollBar()
+            self.assertEqual(inner.maximum(), 56)
+            self.assertEqual(outer.maximum(), 308)
+
+            phases = (
+                Qt.ScrollPhase.NoScrollPhase,
+                Qt.ScrollPhase.ScrollBegin,
+                Qt.ScrollPhase.ScrollUpdate,
+                Qt.ScrollPhase.ScrollEnd,
+            )
+            for phase in phases:
+                with self.subTest(phase=phase):
+                    inner.setValue(inner.minimum())
+                    outer.setValue(outer.minimum())
+                    first = self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=-17,
+                        phase=phase,
+                    )
+                    self.assertTrue(first.isAccepted())
+                    self.assertEqual(inner.value(), 17)
+                    self.assertEqual(outer.value(), 0)
+
+                    second = self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=-31,
+                        phase=phase,
+                    )
+                    self.assertTrue(second.isAccepted())
+                    self.assertEqual(inner.value(), 48)
+                    self.assertEqual(outer.value(), 0)
+
+                    third = self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=-31,
+                        phase=phase,
+                    )
+                    self.assertTrue(third.isAccepted())
+                    self.assertEqual(inner.value(), inner.maximum())
+                    self.assertEqual(outer.value(), 23)
+
+                    self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=31,
+                        phase=phase,
+                    )
+                    self.assertEqual(inner.value(), 25)
+                    self.assertEqual(outer.value(), 23)
+                    self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=64,
+                        phase=phase,
+                    )
+                    self.assertEqual(inner.value(), inner.minimum())
+                    self.assertEqual(outer.value(), outer.minimum())
+
+                    inner.setValue(inner.maximum())
+                    outer.setValue(outer.maximum())
+                    self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=-31,
+                        phase=phase,
+                    )
+                    self.assertEqual(inner.value(), inner.maximum())
+                    self.assertEqual(outer.value(), outer.maximum())
+                    inner.setValue(inner.minimum())
+                    outer.setValue(outer.minimum())
+                    self._wheel(
+                        dialog.active_table.viewport(),
+                        pixel_y=31,
+                        phase=phase,
+                    )
+                    self.assertEqual(inner.value(), inner.minimum())
+                    self.assertEqual(outer.value(), outer.minimum())
+
+            self.assertEqual(
+                dialog.close_button.visibleRegion().boundingRect(),
+                dialog.close_button.rect(),
             )
             dialog.close()
 
