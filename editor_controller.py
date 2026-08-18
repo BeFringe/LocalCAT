@@ -30,6 +30,7 @@ from editor_contracts import (
     TMResourceDisplayMode,
     TMSuggestion,
     TMSuggestionReport,
+    TMThresholdUpdateOutcome,
     TermSuggestion,
     WriteReport,
 )
@@ -576,6 +577,73 @@ class EditorController:
             return self.workspace_state.update_display_preferences(preferences)
         except WorkspaceStateError as exc:
             raise EditorControllerError(str(exc)) from exc
+
+    def tm_preferences(self) -> TMPreferences:
+        """Return one defensive copy of the shared device-local TM preference."""
+
+        with self._tm_query_lock:
+            preferences = self.workspace_state.tm_preferences()
+            if type(preferences) is not TMPreferences:
+                raise TypeError("workspace TM preferences contract is invalid")
+            preferences.__post_init__()
+            return TMPreferences(
+                minimum_similarity=preferences.minimum_similarity,
+                result_limit=preferences.result_limit,
+            )
+
+    def update_tm_minimum_similarity(
+        self,
+        minimum_similarity: float,
+    ) -> TMThresholdUpdateOutcome:
+        """Persist one threshold and refresh the current query as one UI action."""
+
+        with self._tm_query_lock:
+            previous = self.tm_preferences()
+            try:
+                requested = TMPreferences(
+                    minimum_similarity=minimum_similarity,
+                    result_limit=previous.result_limit,
+                )
+            except (TypeError, ValueError):
+                return TMThresholdUpdateOutcome(
+                    succeeded=False,
+                    preferences=previous,
+                    safe_code="TM.THRESHOLD.INVALID",
+                )
+
+            if requested == previous:
+                return TMThresholdUpdateOutcome(
+                    succeeded=True,
+                    preferences=previous,
+                    safe_code=None,
+                )
+
+            try:
+                persisted = self.workspace_state.update_tm_preferences(requested)
+            except WorkspaceStateError:
+                return TMThresholdUpdateOutcome(
+                    succeeded=False,
+                    preferences=previous,
+                    safe_code="TM.THRESHOLD.PERSISTENCE_FAILED",
+                )
+            if type(persisted) is not TMPreferences:
+                raise TypeError("workspace TM preference update returned invalid type")
+            persisted.__post_init__()
+            if persisted != requested:
+                raise ValueError("workspace TM preference update changed the request")
+
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+            if self._tm_adapter is not None and self._project is not None:
+                _ = self.tm_suggestion_report()
+            return TMThresholdUpdateOutcome(
+                succeeded=True,
+                preferences=TMPreferences(
+                    minimum_similarity=persisted.minimum_similarity,
+                    result_limit=persisted.result_limit,
+                ),
+                safe_code=None,
+            )
 
     def tm_suggestion_report(self) -> TMSuggestionReport:
         """Query and atomically issue the current frozen TM suggestion tuple."""

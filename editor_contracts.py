@@ -1157,6 +1157,33 @@ class TMSuggestionReport:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class TMThresholdUpdateOutcome:
+    """Body-free result of one Controller-owned threshold update."""
+
+    succeeded: bool
+    preferences: TMPreferences
+    safe_code: str | None
+
+    def __post_init__(self) -> None:
+        _validate_exact_bool(self.succeeded, "TM threshold update succeeded")
+        if type(self.preferences) is not TMPreferences:
+            raise TypeError(
+                "TM threshold update preferences must be exact TMPreferences"
+            )
+        self.preferences.__post_init__()
+        if self.succeeded:
+            if self.safe_code is not None:
+                raise ValueError(
+                    "successful TM threshold update cannot contain a safe code"
+                )
+            return
+        _validate_safe_code(
+            self.safe_code,
+            "failed TM threshold update safe code",
+        )
+
+
 _BASIC_DISPLAY_PROFILES = (
     TextMatchProfile.LEGACY_COMPAT,
     TextMatchProfile.BASIC_CONTIGUOUS,
