@@ -12,6 +12,7 @@ from pathlib import Path
 from threading import Condition, RLock, Thread
 from uuid import uuid4
 
+from capability_host import MatcherHandoffSnapshot
 from editor_contracts import (
     ConfirmResult,
     DisplayPreferences,
@@ -644,6 +645,14 @@ class EditorController:
         """
 
         return self._tm_adapter is not None
+
+    def text_matcher_handoff(self) -> MatcherHandoffSnapshot:
+        """Expose the sole Core matcher handoff assembled for this app run."""
+
+        adapter = self._tm_adapter
+        if adapter is None:
+            raise EditorControllerError("MATCHER.HANDOFF_UNAVAILABLE")
+        return adapter._text_matcher_handoff_for_controller()
 
     @property
     def query_epoch(self) -> int:

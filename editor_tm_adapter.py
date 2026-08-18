@@ -16,6 +16,7 @@ from typing import Callable, TypeVar
 
 from capability_host import (
     CapabilityHost,
+    MatcherHandoffSnapshot,
     RetrievalHandoffSnapshot,
     _RetrievalGenerationChanged,
 )
@@ -232,6 +233,13 @@ class EditorTMAdapter:
             )
         self._runtime_host = runtime_host
         self._capability_host = capability_host
+
+    def _text_matcher_handoff_for_controller(
+        self,
+    ) -> MatcherHandoffSnapshot:
+        """Return the one host-owned matcher port and safe projection."""
+
+        return self._capability_host.matcher_snapshot()
 
     def query_current(
         self,
