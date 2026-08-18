@@ -279,7 +279,7 @@
   - _Requirements: 9.6, 9.7, 9.8_
   - _Boundary: Canonical TM Integration Fixtures_
 
-- [ ] 7.3 验证 canonical 阈值、排序与 mixed global top-10
+- [x] 7.3 验证 canonical 阈值、排序与 mixed global top-10
   - 使用 production retrieval 覆盖 exact/context/fuzzy、双 source、最终分数和 0.60 inclusive / 1.00 fuzzy
   - 交错 legacy/canonical 资源，验证 exact-first、相似度降序、Core ties、去重和全资源一次 top-10
   - 相同 snapshot 重复查询返回相同集合与顺序，阈值降低会通过新查询补回候选
@@ -389,6 +389,7 @@
 - 2026-08-19 / Cluster E 出口：同一 native cumulative reviewer 对固定范围 `4f56645881214e181b839b65ab1f329e806f513a..3595ac9006971d20c419eef45181f7ebee5bb70b` 最终 APPROVED，merge-base 精确等于 base，Critical/Important findings 均为 0；真实 composition、同 generation capability/resource 投影、body-safe exception、全 cohort runtime block、threshold partial-success 与 Gate C/Gate D queued UI recovery 全部重放闭合。parent 按 reviewed tip 重签 fault `61/61`（source `701ccae34a7962c5f45ca067fff104c8436a9fb997ec6c5264f29f10ef0e3fae`）、acceptance `33/33`（source `3eb8027b36fcb1bf3c5423e6e97525d6f2a9e4213409cb088bccaf2521a05484`）和 release `86/86 GO`（source `58ddb1ae66bd655d133bf8eb6459397dbc991d2d27b8947da0139d1c7d5d0b2f`）；Gate D implementation 未变，release owner继续接受 Cluster C 已验证的 bundle `4f22bfe70d3abd7d22f96398dfeacf98676c98498e08f6ef0d452b34ea33c88a`，未机械重跑 100k。fresh offscreen full suite `1990/1990` / `452.069 s`（1 个明确 skip），Qt smoke 通过，literal 5000/200 FTS5/fallback 双路 `missing_above=0` / `missing_top10=0`，evidence integrity `38/38`、strict JSON、scoped diff-check 与四个 WIP SHA-256 全部通过。本簇只落实批准 R/D/T、ADR-009/011 与 Layer 4 边界，未跨越五类语义门，不新增 ADR 或 Steering disposition；可进入 Cluster F Task 7.1～7.3。
 - Task 7.1：`EditorController.text_matcher_handoff()` 只读返回本次 composition 的同一 frozen matcher snapshot；BASIC/TEXT_V1 均只经 Core gated port 执行，未装配或验证失效时 fail closed，原 Qt Q1/Q2 不获得本地 matcher fallback，legacy Trie 语义保持原 owner。
 - Task 7.2：新增由 tracked JSONL 经 production `activate_initial()` 构建、再由 fresh resolver 冷重开的 canonical fixture；同源 variants、两资源 tie、非 100%、0.60 边界、低于阈值与 raw-distinct 1.00 候选均在正式 query lease 上可重复验证，不以 legacy 卡片或手写 store 作为依据。
+- Task 7.3：同一次 production retrieval operation 的 Core report 与 adapter projection 逐字段闭合；真实 canonical 与交错 legacy 资源验证 exact/context/fuzzy、双 source、0.60 inclusive、跨资源 tie、确定性重查和唯一 global top-10，未引入 UI scorer、重排或后过滤权威。
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
 - 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
