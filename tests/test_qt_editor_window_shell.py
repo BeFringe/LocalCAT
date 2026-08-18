@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from unittest.mock import patch
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QKeySequence, QShortcut
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QStyleOptionToolButton,
 )
 
-from editor_contracts import ResourceKind
+from editor_contracts import ResourceKind, WorkspaceMode
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
@@ -216,9 +216,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 )
                 button.setFocus()
                 QTest.keyClick(button, Qt.Key.Key_Space)
-                QTest.keyClick(button, Qt.Key.Key_Return)
-                QTest.keyClick(button, Qt.Key.Key_Enter)
-            self.assertEqual(choose.call_count, 4)
+            self.assertEqual(choose.call_count, 2)
 
             opened: list[bool] = []
 
@@ -232,14 +230,130 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 Qt.MouseButton.LeftButton,
                 pos=menu_rect.center(),
             )
-            button.setFocus()
+            self._events()
+            self.assertEqual(opened, [True])
+            window.close()
+
+    def test_resource_and_workspace_shortcuts_are_scoped_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.resize(1180, 680)
+            window.show()
+            self._events()
+
+            expected = {
+                "suggestion_tab_next": "Ctrl+Tab",
+                "suggestion_tab_previous": "Ctrl+Shift+Tab",
+                "workspace_edit": "Ctrl+1",
+                "workspace_browse": "Ctrl+2",
+            }
+            for name, sequence in expected.items():
+                shortcut = window.shortcuts[name]
+                self.assertEqual(
+                    shortcut.key().toString(
+                        QKeySequence.SequenceFormat.PortableText
+                    ),
+                    sequence,
+                )
+                self.assertEqual(
+                    shortcut.context(),
+                    Qt.ShortcutContext.WindowShortcut,
+                )
+
+            window.shortcuts["suggestion_tab_next"].activated.emit()
+            window.shortcuts["workspace_browse"].activated.emit()
+            self.assertEqual(window.suggestion_tabs.currentIndex(), 0)
+            self.assertIs(window.workspace_mode, WorkspaceMode.EDIT)
+
+            window.load_sample()
+            self._events()
+            window.target_editor.setFocus()
+            self.assertEqual(window.suggestion_tabs.currentIndex(), 0)
             QTest.keyClick(
-                button,
+                window.target_editor,
+                Qt.Key.Key_Tab,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+            self.assertEqual(window.suggestion_tabs.currentIndex(), 1)
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_Tab,
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.ShiftModifier,
+            )
+            self.assertEqual(window.suggestion_tabs.currentIndex(), 0)
+
+            QTest.keyClick(
+                window.target_editor,
+                Qt.Key.Key_2,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+            self.assertIs(window.workspace_mode, WorkspaceMode.BROWSE)
+            self.assertEqual(window.workspace_pages.currentIndex(), 1)
+            QTest.keyClick(
+                window.browse_table,
+                Qt.Key.Key_1,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+            self.assertIs(window.workspace_mode, WorkspaceMode.EDIT)
+            self.assertEqual(window.workspace_pages.currentIndex(), 0)
+
+            native_tab = window._native_shortcut_text(
+                window.shortcuts["suggestion_tab_next"]
+            )
+            native_reverse_tab = window._native_shortcut_text(
+                window.shortcuts["suggestion_tab_previous"]
+            )
+            self.assertIn(native_tab, window.suggestion_tabs.accessibleName())
+            self.assertIn(native_reverse_tab, window.suggestion_tabs.accessibleName())
+            self.assertIn(
+                window._native_shortcut_text(window.shortcuts["workspace_edit"]),
+                window.workspace_mode_combo.toolTip(),
+            )
+            self.assertIn(
+                window._native_shortcut_text(window.shortcuts["workspace_browse"]),
+                window.workspace_mode_combo.toolTip(),
+            )
+
+            registered = {
+                key.toString(QKeySequence.SequenceFormat.PortableText)
+                for shortcut in window.findChildren(QShortcut)
+                for key in shortcut.keys()
+            }
+            for forbidden in (
+                "Ctrl+Left",
+                "Ctrl+Right",
+                "Meta+Left",
+                "Meta+Right",
+            ):
+                self.assertNotIn(forbidden, registered)
+
+            window.target_editor.setPlainText("alpha beta gamma")
+            for key, modifiers in (
+                (Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier),
+                (Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier),
+                (Qt.Key.Key_Left, Qt.KeyboardModifier.MetaModifier),
+                (Qt.Key.Key_Right, Qt.KeyboardModifier.MetaModifier),
+            ):
+                cursor = window.target_editor.textCursor()
+                cursor.setPosition(6)
+                window.target_editor.setTextCursor(cursor)
+                before_mode = window.workspace_mode
+                before_tab = window.suggestion_tabs.currentIndex()
+                before_text = window.target_editor.toPlainText()
+                QTest.keyClick(window.target_editor, key, modifiers)
+                self.assertIs(window.workspace_mode, before_mode)
+                self.assertEqual(window.suggestion_tabs.currentIndex(), before_tab)
+                self.assertEqual(window.target_editor.toPlainText(), before_text)
+
+            current_index = window.controller.current_index
+            QTest.keyClick(
+                window.target_editor,
                 Qt.Key.Key_Down,
                 Qt.KeyboardModifier.AltModifier,
             )
-            self._events()
-            self.assertEqual(opened, [True, True])
+            self.assertEqual(window.controller.current_index, current_index + 1)
+            window._confirm_unsaved = lambda: True
             window.close()
 
     def test_open_edit_and_save_json_project(self) -> None:

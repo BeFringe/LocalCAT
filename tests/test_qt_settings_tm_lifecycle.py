@@ -14,7 +14,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEventLoop
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QColor, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -129,6 +129,55 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(capabilities)
         assert capabilities is not None
         return capabilities
+
+    def _assert_app_owned_more_indicator(self, button: QToolButton) -> None:
+        image = button.grab().toImage()
+        self.assertFalse(image.isNull())
+        self.assertEqual(button.text(), "")
+        opaque = {
+            (x, y)
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        }
+        components: list[set[tuple[int, int]]] = []
+        while opaque:
+            pending = [opaque.pop()]
+            component = set(pending)
+            while pending:
+                x, y = pending.pop()
+                for adjacent_x in range(x - 1, x + 2):
+                    for adjacent_y in range(y - 1, y + 2):
+                        adjacent = (adjacent_x, adjacent_y)
+                        if adjacent in opaque:
+                            opaque.remove(adjacent)
+                            component.add(adjacent)
+                            pending.append(adjacent)
+            components.append(component)
+        self.assertEqual(len(components), 3)
+        boxes = sorted(
+            (
+                min(x for x, _y in component),
+                min(y for _x, y in component),
+                max(x for x, _y in component),
+                max(y for _x, y in component),
+            )
+            for component in components
+        )
+        component_sizes = {
+            (right - left + 1, bottom - top + 1)
+            for left, top, right, bottom in boxes
+        }
+        self.assertEqual(len(component_sizes), 1)
+        left = min(box[0] for box in boxes)
+        top = min(box[1] for box in boxes)
+        right = max(box[2] for box in boxes)
+        bottom = max(box[3] for box in boxes)
+        ratio = image.devicePixelRatio()
+        x_delta = abs((left + right + 1) / 2 - image.width() / 2) / ratio
+        y_delta = abs((top + bottom + 1) / 2 - image.height() / 2) / ratio
+        self.assertLessEqual(x_delta, 1.0)
+        self.assertLessEqual(y_delta, 1.0)
 
     def _complete_operation(
         self,
@@ -478,6 +527,62 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             for phrase in ("Exact 不可用", "Context 不可用", "Fuzzy 不可用"):
                 self.assertIn(phrase, unavailable_capabilities.accessibleName())
                 self.assertIn(phrase, unavailable_capabilities.toolTip())
+            dialog.close()
+
+    def test_more_indicator_is_centered_for_canonical_legacy_and_unavailable_rows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, resource_ids = _controller(Path(temporary), resources=3)
+            canonical_id, legacy_id, missing_id = resource_ids
+            activation_dialog = QtSettingsDialog(controller)
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                self._action(activation_dialog, canonical_id).trigger()
+                self._complete_operation(activation_dialog, controller)
+            activation_dialog.close()
+
+            missing = next(
+                resource
+                for resource in controller.list_resources()
+                if resource.id == missing_id
+            )
+            missing.path.unlink()
+            controller.reload_resources()
+            controller.tm_suggestion_report()
+
+            dialog = QtSettingsDialog(controller)
+            dialog.show()
+            self._events()
+            expected_modes = {
+                canonical_id: "CANONICAL_ACTIVE",
+                legacy_id: "LEGACY_EXACT_ONLY",
+                missing_id: "UNAVAILABLE",
+            }
+            observed_row_heights: set[int] = set()
+            for width in (860, 1180, 1320):
+                dialog.resize(width, 680)
+                self._events()
+                for resource_id, expected_mode in expected_modes.items():
+                    self.assertEqual(
+                        self._status(dialog, resource_id).property("tm_mode"),
+                        expected_mode,
+                    )
+                    button = self._more(dialog, resource_id)
+                    row = next(
+                        row
+                        for row in range(dialog.active_table.rowCount())
+                        if dialog.active_table.cellWidget(row, 7) is button
+                    )
+                    observed_row_heights.add(dialog.active_table.rowHeight(row))
+                    self.assertEqual(button.width(), 32)
+                    self.assertEqual(button.toolTip(), button.accessibleName())
+                    self.assertTrue(button.menu())
+                    self._assert_app_owned_more_indicator(button)
+            self.assertGreaterEqual(len(observed_row_heights), 2)
             dialog.close()
 
     def test_unknown_preflight_exception_is_sanitized(self) -> None:

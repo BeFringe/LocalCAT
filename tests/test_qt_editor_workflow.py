@@ -241,6 +241,10 @@ class QtEditorWorkflowTest(unittest.TestCase):
                     "settings": "Ctrl+,",
                     "close_project": "Ctrl+Shift+W",
                     "quit": "Ctrl+Q",
+                    "suggestion_tab_next": "Ctrl+Tab",
+                    "suggestion_tab_previous": "Ctrl+Shift+Tab",
+                    "workspace_edit": "Ctrl+1",
+                    "workspace_browse": "Ctrl+2",
                 },
             )
             native = {

@@ -190,7 +190,7 @@ class _TopBarModeCombo(QComboBox):
 
 
 class _TopBarProjectButton(QToolButton):
-    """Split project button with explicit main/menu keyboard semantics."""
+    """Split project button with an application-owned visible menu arrow."""
 
     def _menu_rect(self) -> QRect:
         option = QStyleOptionToolButton()
@@ -209,22 +209,6 @@ class _TopBarProjectButton(QToolButton):
             self._menu_rect(),
             enabled=self.isEnabled(),
         )
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            event.accept()
-            self.click()
-            return
-        if (
-            event.key() == Qt.Key.Key_Down
-            and event.modifiers() & Qt.KeyboardModifier.AltModifier
-            and self.menu() is not None
-        ):
-            event.accept()
-            self.showMenu()
-            return
-        super().keyPressEvent(event)
-
 
 class ResponsiveSplitter(QSplitter):
     """QSplitter with inspectable stretch metadata for layout verification."""
@@ -806,6 +790,26 @@ class QtEditorWindow(QMainWindow):
             ("settings", ("Ctrl+,",), self._open_settings),
             ("close_project", ("Ctrl+Shift+W",), self.close_current_project),
             ("quit", ("Ctrl+Q",), self.close),
+            (
+                "suggestion_tab_next",
+                ("Ctrl+Tab",),
+                lambda: self._cycle_suggestion_tab(1),
+            ),
+            (
+                "suggestion_tab_previous",
+                ("Ctrl+Shift+Tab",),
+                lambda: self._cycle_suggestion_tab(-1),
+            ),
+            (
+                "workspace_edit",
+                ("Ctrl+1",),
+                lambda: self._set_workspace_mode_from_shortcut(WorkspaceMode.EDIT),
+            ),
+            (
+                "workspace_browse",
+                ("Ctrl+2",),
+                lambda: self._set_workspace_mode_from_shortcut(WorkspaceMode.BROWSE),
+            ),
         )
         self.shortcuts: dict[str, QShortcut] = {}
         for name, sequences, callback in bindings:
@@ -818,6 +822,20 @@ class QtEditorWindow(QMainWindow):
             self.shortcuts[name] = shortcut
         self._install_target_editor_shortcuts()
         self._update_shortcut_tooltips()
+
+    def _cycle_suggestion_tab(self, direction: int) -> None:
+        if not self.controller.has_project or not self.suggestion_tabs.isEnabled():
+            return
+        count = self.suggestion_tabs.count()
+        if count > 1:
+            self.suggestion_tabs.setCurrentIndex(
+                (self.suggestion_tabs.currentIndex() + direction) % count
+            )
+
+    def _set_workspace_mode_from_shortcut(self, mode: WorkspaceMode) -> None:
+        if not self.controller.has_project or not self.workspace_mode_combo.isEnabled():
+            return
+        self.set_workspace_mode(mode)
 
     @staticmethod
     def _native_shortcut_text(shortcut: QShortcut) -> str:
@@ -845,6 +863,25 @@ class QtEditorWindow(QMainWindow):
         )
         self.next_button.setToolTip(
             f"下一段 ({self._native_shortcut_text(self.shortcuts['next'])})"
+        )
+        next_tab = self._native_shortcut_text(
+            self.shortcuts["suggestion_tab_next"]
+        )
+        previous_tab = self._native_shortcut_text(
+            self.shortcuts["suggestion_tab_previous"]
+        )
+        self.suggestion_tabs.setAccessibleName(
+            f"语言资源：{next_tab} / {previous_tab} 切换 Translation Matches 与 Termbase"
+        )
+        for index in range(self.suggestion_tabs.count()):
+            self.suggestion_tabs.setTabToolTip(
+                index,
+                f"{self.suggestion_tabs.tabText(index)} ({next_tab} / {previous_tab})",
+            )
+        self.workspace_mode_combo.setToolTip(
+            "切换编辑或双语浏览校对模式 "
+            f"(编辑 {self._native_shortcut_text(self.shortcuts['workspace_edit'])} / "
+            f"校对 {self._native_shortcut_text(self.shortcuts['workspace_browse'])})"
         )
 
     def _install_target_editor_shortcuts(self) -> None:

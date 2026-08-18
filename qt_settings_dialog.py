@@ -6,8 +6,16 @@ from dataclasses import replace
 
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QPersistentModelIndex, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QKeyEvent
+from PySide6.QtCore import (
+    QModelIndex,
+    QPointF,
+    QPersistentModelIndex,
+    QThread,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QAction, QColor, QKeyEvent, QPaintEvent, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -162,6 +170,29 @@ def _tm_safe_reason(code: str | None) -> str:
 
 class _ResourceMoreButton(QToolButton):
     """Keep the resource menu reachable with standard keyboard activation."""
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        color = QColor("#26435e")
+        if self.isDown():
+            color = QColor("#047fa8")
+        elif self.underMouse() or self.hasFocus():
+            color = QColor("#0798c6")
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            center_x = self.width() / 2.0
+            center_y = self.height() / 2.0
+            for offset in (-5.0, 0.0, 5.0):
+                painter.drawEllipse(
+                    QPointF(center_x, center_y + offset),
+                    1.5,
+                    1.5,
+                )
+        finally:
+            painter.end()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.menu() is not None:
@@ -577,7 +608,7 @@ class QtSettingsDialog(QDialog):
             table.setCellWidget(row, 6, import_button)
             more_button = _ResourceMoreButton()
             more_button.setObjectName(f"more_{resource.id}")
-            more_button.setText("⋮")
+            more_button.setText("")
             more_button.setToolTip(f"{resource.name} 的更多操作")
             more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             menu = QMenu(more_button)
