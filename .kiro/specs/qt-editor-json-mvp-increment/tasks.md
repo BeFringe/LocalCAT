@@ -73,7 +73,7 @@
   - 完成时，所有可恢复失败保持旧字节，indeterminate 不伪装成功，committed 文件重启后可完整读取
   - _Requirements: 7.5, 7.6, 7.13, 9.4_
 
-- [ ] 2.6 (P) 通过唯一 TextMatcher 实现项目搜索编排
+- [x] 2.6 (P) 通过唯一 TextMatcher 实现项目搜索编排
   - 开始条件是 Feature 5 已提供 `SearchOptions`、稳定 offsets 和 `BASIC_VALIDATED` 的 `TextMatcher` port
   - 按项目段落顺序遍历 source、target、speaker，并把每个字段交给同一个 matcher
   - 基础请求固定使用 `match_case=false`、`whole_word=false`，不得实现本地 casefold 或词界 fallback
