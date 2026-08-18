@@ -401,6 +401,14 @@ class EditorTMAdapter:
             configs
         )
 
+    def _inspect_resource_statuses_for_controller(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> tuple[TMResourceStatus, ...]:
+        """Return fresh read-only lifecycle facts from the injected resolver."""
+
+        return self._runtime_host._inspect_resource_statuses(configs)
+
     def append_confirmed(
         self,
         *,

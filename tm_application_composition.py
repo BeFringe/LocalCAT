@@ -541,6 +541,21 @@ class TMRuntimeHost:
                 generation=self._operation_template.generation,
             )
 
+    def _inspect_resource_statuses(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> tuple[TMResourceStatus, ...]:
+        """Re-observe lifecycle facts without publishing a runtime generation."""
+
+        _validate_configs(configs)
+        private_configs = _clone_resource_configs(configs)
+        candidate = self._resolver.resolve(private_configs)
+        if type(candidate) is not TMRuntimeSnapshot:
+            raise TypeError("runtime resolver must return TMRuntimeSnapshot")
+        private_candidate = _clone_runtime_snapshot(candidate, generation=0)
+        _validate_snapshot_against_configs(private_candidate, private_configs)
+        return tuple(replace(status) for status in private_candidate.statuses)
+
     def _capture_operation_snapshot_for_configs(
         self,
         configs: tuple[ResourceConfig, ...],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 
 from pathlib import Path
 
@@ -35,7 +36,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from editor_contracts import ImportReport, ImportRequest, ResourceConfig, ResourceKind
+from editor_contracts import (
+    ImportReport,
+    ImportRequest,
+    ResourceConfig,
+    ResourceKind,
+    TMActivationOperationView,
+    TMResourceDisplayMode,
+    TMResourceStatus,
+)
 from editor_controller import EditorController, EditorControllerError
 
 
@@ -96,6 +105,43 @@ QAbstractItemView#newResourceKindPopup::item:selected {
     background-color: #c4e8f2;
 }
 """
+_SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)+")
+_TM_MODE_LABELS = {
+    TMResourceDisplayMode.LEGACY_EXACT_ONLY: "Legacy exact-only",
+    TMResourceDisplayMode.ACTIVATING: "激活中",
+    TMResourceDisplayMode.CANONICAL_ACTIVE: "Canonical active",
+    TMResourceDisplayMode.SOURCE_DIVERGED: "Source diverged",
+    TMResourceDisplayMode.DEGRADED: "Degraded",
+    TMResourceDisplayMode.UNAVAILABLE: "Unavailable",
+}
+_TM_SAFE_REASON_LABELS = {
+    "TM.RUNTIME.PATH_UNAVAILABLE": "本地资源路径不可用",
+    "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE": "Canonical 权威无法验证",
+    "TM.RUNTIME.OPEN_UNAVAILABLE": "资源无法安全打开",
+    "TM.RUNTIME.SOURCE_BINDING_UNAVAILABLE": "来源绑定无法验证",
+    "TM.RUNTIME.QUERY_LEASE_UNAVAILABLE": "Canonical 查询不可用",
+    "TM.RUNTIME.CANONICAL_HEALTH_UNAVAILABLE": "Canonical 健康状态不可用",
+    "TM.RUNTIME.SOURCE_DIVERGED": "外部来源已变更",
+    "TM.RUNTIME.REFRESH_FAILED": "运行时刷新失败",
+    "TM.ACTIVATION.RUNTIME_REFRESH_FAILED": "激活后运行时验证失败",
+    "TM.LEGACY.QUERY_FAILED": "Legacy 查询失败",
+    "TM.ACTIVATION.IO_FAILED": "本地读写失败",
+    "TM.ACTIVATION.PROGRAMMER_ERROR": "Canonical 操作未能安全完成",
+    "MIGRATION.INITIAL_IO_FAILED": "首次激活未完成",
+    "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE": "Canonical 权威无法确定",
+    "RETRIEVAL.CONTEXT_EVIDENCE_MISSING": "Context 尚未开放",
+    "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_MISSING": "Fuzzy 正确性尚未开放",
+    "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING": "Fuzzy 性能尚未开放",
+}
+
+
+def _tm_safe_reason(code: str | None) -> str:
+    if code is None:
+        return "内部状态无法安全确认"
+    return _TM_SAFE_REASON_LABELS.get(
+        code,
+        f"状态信息不可用（{code}）",
+    )
 
 
 class _ResourceMoreButton(QToolButton):
@@ -163,6 +209,11 @@ class QtSettingsDialog(QDialog):
         self._import_busy = False
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
+        self._tm_operation_id: str | None = None
+        self._tm_operation_action: str | None = None
+        self._tm_operation_timer = QTimer(self)
+        self._tm_operation_timer.setInterval(75)
+        self._tm_operation_timer.timeout.connect(self._poll_tm_operation)
         self._build_ui()
         self.refresh_resources()
 
@@ -296,19 +347,61 @@ class QtSettingsDialog(QDialog):
         """Render persistent controller state into active and inactive groups."""
 
         resources = self.controller.list_resources()
+        try:
+            statuses = self.controller.tm_resource_statuses()
+        except Exception:
+            statuses = ()
+        status_by_resource_id = {
+            status.resource_id: status
+            for status in statuses
+            if type(status) is TMResourceStatus
+        }
+        try:
+            operation = self.controller.tm_activation_operation()
+        except Exception:
+            operation = None
+        if operation is not None and not operation.completed:
+            self._tm_operation_id = operation.operation_id
+            if self._tm_operation_action is None:
+                self._tm_operation_action = "Canonical 操作"
+            if not self._tm_operation_timer.isActive():
+                self._tm_operation_timer.start()
         active = tuple(resource for resource in resources if resource.active)
         inactive = tuple(resource for resource in resources if not resource.active)
-        self._populate_table(self.active_table, active)
-        self._populate_table(self.inactive_table, inactive)
-        self.status_label.setText(
-            f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
+        self._populate_table(
+            self.active_table,
+            active,
+            status_by_resource_id=status_by_resource_id,
+            operation=operation,
         )
+        self._populate_table(
+            self.inactive_table,
+            inactive,
+            status_by_resource_id=status_by_resource_id,
+            operation=operation,
+        )
+        if operation is not None and not operation.completed:
+            self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
+        else:
+            self.status_label.setText(
+                f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
+            )
 
     def _populate_table(
         self,
         table: QTableWidget,
         resources: tuple[ResourceConfig, ...],
+        *,
+        status_by_resource_id: dict[str, TMResourceStatus],
+        operation: TMActivationOperationView | None,
     ) -> None:
+        for widget in table.findChildren(QWidget):
+            if widget.objectName().startswith(
+                ("tmResource_", "resourceName_", "tmStatus_", "tmLifecycle_")
+            ):
+                if isinstance(widget, QPushButton):
+                    widget.setEnabled(False)
+                widget.setObjectName("")
         table.clearContents()
         table.setRowCount(len(resources))
         for row, resource in enumerate(resources):
@@ -333,6 +426,16 @@ class QtSettingsDialog(QDialog):
                 holder_layout.addWidget(checkbox)
                 table.setCellWidget(row, column, holder)
             table.setItem(row, 3, QTableWidgetItem(resource.name))
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                table.setCellWidget(
+                    row,
+                    3,
+                    self._make_tm_resource_cell(
+                        resource,
+                        status_by_resource_id.get(resource.id),
+                        operation=operation,
+                    ),
+                )
             kind_label = (
                 "翻译记忆库"
                 if resource.kind is ResourceKind.TRANSLATION_MEMORY
@@ -382,6 +485,232 @@ class QtSettingsDialog(QDialog):
             more_button.setFixedWidth(compact_width)
             table.setCellWidget(row, 7, more_button)
         table.resizeRowsToContents()
+
+    def _make_tm_resource_cell(
+        self,
+        resource: ResourceConfig,
+        status: TMResourceStatus | None,
+        *,
+        operation: TMActivationOperationView | None,
+    ) -> QWidget:
+        holder = QWidget()
+        holder.setObjectName(f"tmResource_{resource.id}")
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(3)
+
+        name = QLabel(resource.name)
+        name.setObjectName(f"resourceName_{resource.id}")
+        layout.addWidget(name)
+
+        lifecycle = QHBoxLayout()
+        lifecycle.setContentsMargins(0, 0, 0, 0)
+        lifecycle.setSpacing(8)
+        status_label = QLabel()
+        status_label.setObjectName(f"tmStatus_{resource.id}")
+        status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        status_label.setWordWrap(True)
+        lifecycle.addWidget(status_label, 1)
+
+        action = QPushButton()
+        action.setObjectName(f"tmLifecycle_{resource.id}")
+        action.setProperty("resource_id", resource.id)
+        action.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        action.clicked.connect(
+            lambda _checked=False, resource_id=resource.id: self._request_tm_lifecycle(
+                resource_id
+            )
+        )
+        lifecycle.addWidget(action)
+        layout.addLayout(lifecycle)
+
+        running = operation is not None and not operation.completed
+        target_running = (
+            operation is not None
+            and not operation.completed
+            and operation.resource_id == resource.id
+        )
+        if target_running:
+            mode = TMResourceDisplayMode.ACTIVATING
+            text = "激活中 · 原状态保持可见"
+            safe_codes: tuple[str, ...] = ()
+        elif status is None:
+            mode = TMResourceDisplayMode.UNAVAILABLE
+            text = "Unavailable · 状态暂不可用"
+            safe_codes = ()
+        else:
+            status.__post_init__()
+            mode = status.mode
+            safe_codes = status.safe_codes
+            text = _TM_MODE_LABELS[mode]
+            if safe_codes:
+                text += f" · {_tm_safe_reason(safe_codes[0])}"
+            text += (
+                "\n"
+                f"Exact {'可用' if status.exact_available else '不可用'} · "
+                f"Context {'可用' if status.context_available else '不可用'} · "
+                f"Fuzzy {'可用' if status.fuzzy_available else '不可用'}"
+            )
+        status_label.setText(text)
+        status_label.setProperty("tm_mode", mode.value)
+        status_label.setProperty("tmMode", mode.value)
+        if safe_codes:
+            status_label.setToolTip(" · ".join(safe_codes))
+
+        if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            action.setText("激活 canonical")
+            action.setToolTip("显式检查并激活 canonical TM")
+            can_start = True
+        elif status is not None and (
+            status.mode
+            in (
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+            )
+            or (
+                status.mode is TMResourceDisplayMode.DEGRADED
+                and status.exact_available
+            )
+        ):
+            action.setText("重建 canonical")
+            action.setToolTip("显式重建 canonical TM，失败时保留 last-known-good")
+            can_start = True
+        else:
+            action.setText("Canonical 不可用")
+            action.setToolTip("当前状态不允许启动 canonical 操作")
+            can_start = False
+        action.setAccessibleName(f"{resource.name}：{action.text()}")
+        action.setEnabled(can_start and not running)
+        return holder
+
+    def _request_tm_lifecycle(self, resource_id: str) -> None:
+        """Run one explicit Controller-owned activation or rebuild request."""
+
+        try:
+            operation = self.controller.tm_activation_operation()
+            if operation is not None and not operation.completed:
+                self.status_label.setText("Canonical 操作已在进行。")
+                self.refresh_resources()
+                return
+            resource = next(
+                configured
+                for configured in self.controller.list_resources()
+                if configured.id == resource_id
+                and configured.kind is ResourceKind.TRANSLATION_MEMORY
+            )
+            status = next(
+                item
+                for item in self.controller.tm_resource_statuses()
+                if item.resource_id == resource_id
+            )
+            if status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+                preflight = self.controller.prepare_tm_activation(resource_id)
+                prompt = (
+                    f"资源：{preflight.resource_name}\n"
+                    f"有效 {preflight.valid_count} · 无效 {preflight.invalid_count} "
+                    f"· 变体 {preflight.variant_count}\n\n"
+                    "预期变化：Legacy exact-only → Canonical active。\n"
+                    "Context / fuzzy 仍只按当前已验证能力开放。"
+                )
+                answer = QMessageBox.question(
+                    self,
+                    "激活 canonical TM",
+                    prompt,
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.controller.cancel_tm_activation(preflight)
+                    self.status_label.setText(
+                        f"已取消 {preflight.resource_name} 的 canonical 激活。"
+                    )
+                    return
+                started = self.controller.activate_tm_resource(preflight)
+                action_name = "Canonical 激活"
+            elif status.mode in (
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+                TMResourceDisplayMode.DEGRADED,
+            ) and status.exact_available:
+                answer = QMessageBox.question(
+                    self,
+                    "重建 canonical TM",
+                    (
+                        f"资源：{resource.name}\n\n"
+                        "将从当前本地来源显式重建 canonical TM；"
+                        "失败时保留 last-known-good canonical 状态。"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.status_label.setText(
+                        f"已取消 {resource.name} 的 canonical 重建。"
+                    )
+                    return
+                started = self.controller.rebuild_tm_resource(resource_id)
+                action_name = "Canonical 重建"
+            else:
+                self.status_label.setText("当前资源状态不允许启动 canonical 操作。")
+                return
+        except Exception as error:
+            self._show_tm_action_error(error)
+            return
+
+        self._tm_operation_id = started.operation_id
+        self._tm_operation_action = action_name
+        self.refresh_resources()
+        self.status_label.setText(f"{action_name}已开始；重复操作已禁用。")
+        if not self._tm_operation_timer.isActive():
+            self._tm_operation_timer.start()
+
+    def _poll_tm_operation(self) -> None:
+        """Refresh one body-free Controller operation without blocking Qt."""
+
+        operation_id = self._tm_operation_id
+        if operation_id is None:
+            self._tm_operation_timer.stop()
+            return
+        try:
+            operation = self.controller.tm_activation_operation()
+        except Exception as error:
+            self._tm_operation_timer.stop()
+            self._show_tm_action_error(error)
+            return
+        if operation is None or operation.operation_id != operation_id:
+            self._tm_operation_timer.stop()
+            self._tm_operation_id = None
+            self._tm_operation_action = None
+            self.status_label.setText("Canonical 操作状态无法确认。")
+            return
+        if not operation.completed:
+            return
+
+        self._tm_operation_timer.stop()
+        action_name = self._tm_operation_action or "Canonical 操作"
+        self._tm_operation_id = None
+        self._tm_operation_action = None
+        self.refresh_resources()
+        if operation.succeeded:
+            self.status_label.setText(f"{action_name}已完成。")
+        else:
+            reason = _tm_safe_reason(operation.safe_code)
+            self.status_label.setText(f"{action_name}失败：{reason}。")
+        self.resources_changed.emit()
+
+    def _show_tm_action_error(self, error: Exception) -> None:
+        raw = str(error)
+        reason = (
+            _tm_safe_reason(raw)
+            if _SAFE_CODE.fullmatch(raw) is not None
+            else "内部状态无法安全确认"
+        )
+        self.status_label.setText(f"Canonical 操作无法开始：{reason}。")
 
     def _set_state(self, resource_id: str, field: str, checked: bool) -> None:
         try:
@@ -656,6 +985,20 @@ QLabel#resourceSectionTitle {
 }
 QLabel#resourceSectionHint, QLabel#settingsStatus {
     color: #66758a;
+}
+QLabel[tmMode="LEGACY_EXACT_ONLY"] {
+    color: #40566d;
+}
+QLabel[tmMode="CANONICAL_ACTIVE"] {
+    color: #216746;
+}
+QLabel[tmMode="SOURCE_DIVERGED"],
+QLabel[tmMode="DEGRADED"],
+QLabel[tmMode="ACTIVATING"] {
+    color: #8a5414;
+}
+QLabel[tmMode="UNAVAILABLE"] {
+    color: #a13434;
 }
 QLabel#importFeedback {
     color: #2f6b50;

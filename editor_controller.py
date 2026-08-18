@@ -28,6 +28,7 @@ from editor_contracts import (
     TMActivationOperationView,
     TMActivationPreflightView,
     TMResourceDisplayMode,
+    TMResourceStatus,
     TMSuggestion,
     TMSuggestionReport,
     TMThresholdUpdateOutcome,
@@ -1540,6 +1541,94 @@ class EditorController:
                 return None
             operation.__post_init__()
             return replace(operation)
+
+    def tm_resource_statuses(self) -> tuple[TMResourceStatus, ...]:
+        """Return current body-free lifecycle facts without querying or migrating."""
+
+        with self._tm_query_lock:
+            configs = self.repository.list_resources()
+            adapter = self._tm_adapter
+            if adapter is None:
+                from tm_application_composition import TMResourceResolver
+
+                runtime = TMResourceResolver().resolve(configs)
+                runtime.__post_init__()
+                statuses = tuple(replace(status) for status in runtime.statuses)
+            else:
+                statuses = adapter._inspect_resource_statuses_for_controller(
+                    configs
+                )
+            for status in statuses:
+                status.__post_init__()
+
+            current_report = self._current_tm_report
+            if current_report is not None:
+                current_report.__post_init__()
+                projected = tuple(
+                    replace(status)
+                    for status in current_report.resource_statuses
+                )
+                base_identity = tuple(
+                    (status.resource_id, status.resource_name)
+                    for status in statuses
+                )
+                projected_identity = tuple(
+                    (status.resource_id, status.resource_name)
+                    for status in projected
+                )
+                if projected_identity != base_identity:
+                    raise ValueError(
+                        "current TM resource statuses drifted from runtime"
+                    )
+                projected_by_resource_id = {
+                    status.resource_id: status for status in projected
+                }
+                statuses = tuple(
+                    (
+                        projected_by_resource_id[status.resource_id]
+                        if (
+                            projected_by_resource_id[status.resource_id].mode
+                            is TMResourceDisplayMode.DEGRADED
+                            and status.mode
+                            not in (
+                                TMResourceDisplayMode.SOURCE_DIVERGED,
+                                TMResourceDisplayMode.UNAVAILABLE,
+                            )
+                        )
+                        or projected_by_resource_id[status.resource_id].mode
+                        is status.mode
+                        else status
+                    )
+                    for status in statuses
+                )
+
+            blocked_code = self._tm_runtime_blocked_safe_code
+            if blocked_code is not None:
+                with self._tm_activation_condition:
+                    operation = self._tm_activation_operation
+                    blocked_resource_id = (
+                        None if operation is None else operation.resource_id
+                    )
+                statuses = tuple(
+                    TMResourceStatus(
+                        resource_id=status.resource_id,
+                        resource_name=status.resource_name,
+                        mode=TMResourceDisplayMode.UNAVAILABLE,
+                        exact_available=False,
+                        context_available=False,
+                        fuzzy_available=False,
+                        safe_codes=(blocked_code,),
+                        retryable=True,
+                    )
+                    if blocked_resource_id is None
+                    or status.resource_id == blocked_resource_id
+                    else status
+                    for status in statuses
+                )
+
+            for status in statuses:
+                status.__post_init__()
+            return tuple(replace(status) for status in statuses)
 
     def wait_tm_activation(
         self,
