@@ -24,6 +24,7 @@ from editor_contracts import (
     ProjectSearchReport,
     ProjectSearchRequest,
     ProjectToolCapability,
+    SearchField,
     ResourceConfig,
     ResourceKind,
     RecentProject,
@@ -39,6 +40,7 @@ from editor_contracts import (
     TMSuggestionReport,
     TMThresholdUpdateOutcome,
     TermSuggestion,
+    TextMatcherDisplayState,
     WriteReport,
 )
 from editor_tm_adapter import EditorTMAdapter, _TMQueryGenerationChanged
@@ -514,6 +516,64 @@ def _project_search_fields_digest(project: EditorProject) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_exact_project_search_handoff(
+    candidate: object,
+) -> MatcherHandoffSnapshot:
+    """Validate one raw handoff without converting its availability state."""
+
+    if type(candidate) is not MatcherHandoffSnapshot:
+        raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+    handoff = candidate
+    handoff.display.__post_init__()
+    handoff.__post_init__()
+    return handoff
+
+
+def _fresh_project_search_unavailable_display(
+    safe_reason: str,
+) -> TextMatcherDisplayState:
+    """Mint a fresh closed projection even when a validator is failing."""
+
+    if safe_reason not in (
+        "MATCHER.HANDOFF_UNAVAILABLE",
+        "PROJECT_SEARCH.HANDOFF_INVALID",
+    ):
+        raise AssertionError("project-search display reason must be closed")
+    return TextMatcherDisplayState(
+        state=TextMatcherState.UNAVAILABLE,
+        supported_profiles=(),
+        safe_reason=safe_reason,
+    )
+
+
+def _validate_project_search_report_against_project(
+    report: ProjectSearchReport,
+    project: EditorProject,
+) -> None:
+    """Bind issued hit identities and previews to the current project graph."""
+
+    if type(report) is not ProjectSearchReport:
+        raise TypeError("project search binding requires ProjectSearchReport")
+    if type(project) is not EditorProject:
+        raise TypeError("project search binding requires EditorProject")
+    report.__post_init__()
+    project.__post_init__()
+    for hit in report.hits:
+        if hit.segment_index >= len(project.segments):
+            raise ValueError("project search hit index is outside the project")
+        segment = project.segments[hit.segment_index]
+        if segment.id != hit.segment_id:
+            raise ValueError("project search hit identity does not match the project")
+        if hit.field is SearchField.SOURCE:
+            field_text = segment.source
+        elif hit.field is SearchField.TARGET:
+            field_text = segment.target
+        else:
+            field_text = segment.speaker
+        if hit.preview != field_text:
+            raise ValueError("project search hit preview does not match the field")
+
+
 def _stable_tm_safe_codes(
     *groups: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -801,6 +861,43 @@ class EditorController:
                 ),
             )
 
+    def project_search_matcher_display(self) -> TextMatcherDisplayState:
+        """Return a safe read-only matcher projection for project-search UI."""
+
+        with self._tm_query_lock:
+            try:
+                candidate = self.text_matcher_handoff()
+            except EditorControllerError as error:
+                if (
+                    type(error) is EditorControllerError
+                    and error.args == ("MATCHER.HANDOFF_UNAVAILABLE",)
+                ):
+                    return _fresh_project_search_unavailable_display(
+                        "MATCHER.HANDOFF_UNAVAILABLE"
+                    )
+                return _fresh_project_search_unavailable_display(
+                    "PROJECT_SEARCH.HANDOFF_INVALID"
+                )
+            adapter = self._tm_adapter
+            if adapter is None or not (
+                adapter._is_current_text_matcher_handoff_for_controller(
+                    candidate
+                )
+            ):
+                return _fresh_project_search_unavailable_display(
+                    "PROJECT_SEARCH.HANDOFF_INVALID"
+                )
+            try:
+                handoff = _validate_exact_project_search_handoff(candidate)
+            except EditorControllerError:
+                return _fresh_project_search_unavailable_display(
+                    "PROJECT_SEARCH.HANDOFF_INVALID"
+                )
+            return replace(
+                handoff.display,
+                supported_profiles=tuple(handoff.display.supported_profiles),
+            )
+
     def search_project(
         self,
         request: ProjectSearchRequest,
@@ -831,6 +928,10 @@ class EditorController:
                 raise EditorControllerError(error.code) from error
             try:
                 private_report = _clone_project_search_report(report)
+                _validate_project_search_report_against_project(
+                    private_report,
+                    self.project,
+                )
             except ValueError as error:
                 raise EditorControllerError(
                     "PROJECT_SEARCH.REPORT_INVALID"
@@ -962,17 +1063,22 @@ class EditorController:
         """Capture and validate exactly one Core matcher handoff."""
 
         try:
-            handoff = self.text_matcher_handoff()
-        except EditorControllerError:
-            raise
-        if type(handoff) is not MatcherHandoffSnapshot:
-            raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
-        try:
-            handoff.__post_init__()
-        except ValueError as error:
+            candidate = self.text_matcher_handoff()
+        except EditorControllerError as error:
+            if (
+                type(error) is EditorControllerError
+                and error.args == ("MATCHER.HANDOFF_UNAVAILABLE",)
+            ):
+                raise
             raise EditorControllerError(
                 "PROJECT_SEARCH.HANDOFF_INVALID"
             ) from error
+        adapter = self._tm_adapter
+        if adapter is None or not (
+            adapter._is_current_text_matcher_handoff_for_controller(candidate)
+        ):
+            raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+        handoff = _validate_exact_project_search_handoff(candidate)
         if handoff.display.state is TextMatcherState.UNAVAILABLE:
             reason = handoff.display.safe_reason
             if reason is None:

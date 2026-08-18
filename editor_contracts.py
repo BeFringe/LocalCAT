@@ -1367,6 +1367,10 @@ class ProjectSearchHit:
                 "project search hit end index must be greater than start index"
             )
         _validate_exact_raw_text(self.preview, "project search hit preview")
+        if self.end_index > len(self.preview):
+            raise ValueError(
+                "project search hit end index must not exceed preview length"
+            )
 
 
 @dataclass(frozen=True, slots=True)

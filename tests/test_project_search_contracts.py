@@ -250,6 +250,7 @@ class ProjectSearchContractTests(unittest.TestCase):
             lambda: _hit(start_index=-1),
             lambda: _hit(start_index=3, end_index=3),
             lambda: _hit(start_index=4, end_index=3),
+            lambda: _hit(start_index=1, end_index=16, preview="too short"),
             lambda: _hit(preview=""),
             lambda: _hit(preview=1),  # pyright: ignore[reportArgumentType]
         )

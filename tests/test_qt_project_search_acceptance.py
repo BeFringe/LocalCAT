@@ -442,23 +442,30 @@ class QtProjectSearchAcceptanceTests(unittest.TestCase):
         ):
             window.refresh_suggestions()
 
-    def test_exact_display_semantic_value_error_fails_closed(self) -> None:
+    def test_exact_current_validator_value_error_is_not_laundered(self) -> None:
         self._validate_basic()
-        window = self._open_window()
+        _ = self._open_window()
+        request = ProjectSearchRequest(
+            query="cat",
+            fields=(SearchField.SOURCE,),
+            options=SearchOptions(match_case=False, whole_word=False),
+        )
 
         with patch.object(
             TextMatcherDisplayState,
             "__post_init__",
-            side_effect=ValueError("invalid display semantics"),
+            side_effect=ValueError("display programmer fault"),
         ):
-            window.refresh_suggestions()
-            self._events()
-
-        self.assertFalse(window.project_search_button.isEnabled())
-        self.assertIn(
-            "PROJECT_SEARCH.HANDOFF_INVALID",
-            window.project_search_capability.text(),
-        )
+            with self.assertRaisesRegex(
+                ValueError,
+                "^display programmer fault$",
+            ):
+                self.controller.project_search_matcher_display()
+            with self.assertRaisesRegex(
+                ValueError,
+                "^display programmer fault$",
+            ):
+                self.controller.search_project(request)
 
 
 if __name__ == "__main__":

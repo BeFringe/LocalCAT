@@ -12,6 +12,7 @@ from unittest.mock import patch
 import editor_controller as editor_controller_module
 from capability_host import CapabilityHostComposition, MatcherHandoffSnapshot
 from editor_contracts import (
+    ProjectSearchHit,
     ProjectSearchReport,
     ProjectSearchRequest,
     ProjectToolCapability,
@@ -290,7 +291,7 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
         object.__setattr__(missing_matcher, "matcher", None)
         object.__setattr__(missing_matcher, "display", valid.display)
         cases = (
-            (unavailable, "MATCHER.VALIDATION_UNAVAILABLE"),
+            (unavailable, "PROJECT_SEARCH.HANDOFF_INVALID"),
             (object(), "PROJECT_SEARCH.HANDOFF_INVALID"),
             (malformed, "PROJECT_SEARCH.HANDOFF_INVALID"),
             (missing_matcher, "PROJECT_SEARCH.HANDOFF_INVALID"),
@@ -309,6 +310,58 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
             self.assertIs(self.controller.project, before_project)
             self.assertEqual(self.controller.current_index, before_index)
             self.assertIsNone(self.controller.current_project_search_report)
+
+    def test_exact_handoff_with_foreign_matcher_identity_fails_closed(self) -> None:
+        valid = self._validate_basic()
+        self.controller.open_project(self.project_path)
+        foreign_copy = MatcherHandoffSnapshot(
+            generation=valid.generation,
+            matcher=valid.matcher,
+            display=valid.display,
+        )
+        tampered = object.__new__(MatcherHandoffSnapshot)
+        object.__setattr__(tampered, "generation", valid.generation)
+        object.__setattr__(tampered, "matcher", object())
+        object.__setattr__(tampered, "display", valid.display)
+
+        for candidate in (foreign_copy, tampered):
+            with self.subTest(candidate=candidate), patch.object(
+                self.controller,
+                "text_matcher_handoff",
+                return_value=candidate,
+            ), self.assertRaisesRegex(
+                EditorControllerError,
+                "^PROJECT_SEARCH\\.HANDOFF_INVALID$",
+            ):
+                self.controller.search_project(_request())
+
+            self.assertIsNone(self.controller.current_project_search_report)
+
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            side_effect=EditorControllerError("PRIVATE.PROOF.TOKEN"),
+        ), self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.HANDOFF_INVALID$",
+        ) as raised:
+            self.controller.search_project(_request())
+
+        self.assertNotIn("PRIVATE.PROOF.TOKEN", str(raised.exception))
+        self.assertIsNone(self.controller.current_project_search_report)
+
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            side_effect=EditorControllerError("MATCHER.HANDOFF_UNAVAILABLE"),
+        ), self.assertRaisesRegex(
+            EditorControllerError,
+            "^MATCHER\\.HANDOFF_UNAVAILABLE$",
+        ):
+            self.controller.search_project(_request())
+
+        ordinary = self.controller.search_project(_request())
+        self.assertEqual(ordinary.capability, valid.display)
 
     def test_report_is_defensive_and_tampered_hit_is_not_membership(self) -> None:
         self._validate_basic()
@@ -447,6 +500,53 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
         self.assertEqual(self.controller.current_index, 0)
         self.assertIsNone(self.controller.current_project_search_report)
 
+    def test_replaced_service_hits_must_bind_to_current_project_fields(self) -> None:
+        handoff = self._validate_basic()
+        self.controller.open_project(self.project_path)
+        source = self.controller.project.segments[0].source
+        cases = (
+            ProjectSearchHit(
+                segment_id="foreign-segment",
+                segment_index=0,
+                field=SearchField.SOURCE,
+                start_index=2,
+                end_index=8,
+                preview=source,
+            ),
+            ProjectSearchHit(
+                segment_id="seg-a",
+                segment_index=99,
+                field=SearchField.SOURCE,
+                start_index=2,
+                end_index=8,
+                preview=source,
+            ),
+            ProjectSearchHit(
+                segment_id="seg-a",
+                segment_index=0,
+                field=SearchField.TARGET,
+                start_index=2,
+                end_index=8,
+                preview=source,
+            ),
+        )
+
+        for hit in cases:
+            report = ProjectSearchReport(
+                hits=(hit,),
+                capability=handoff.display,
+            )
+            with self.subTest(hit=hit), patch.object(
+                ProjectSearchService,
+                "search",
+                return_value=report,
+            ), self.assertRaisesRegex(
+                EditorControllerError,
+                "^PROJECT_SEARCH\\.REPORT_INVALID$",
+            ):
+                self.controller.search_project(_request())
+            self.assertIsNone(self.controller.current_project_search_report)
+
     def test_internal_programmer_type_errors_propagate_before_publication(
         self,
     ) -> None:
@@ -492,6 +592,17 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
             self.assertIs(self.controller.project, before_project)
             self.assertEqual(self.controller.current_index, before_index)
             self.assertIsNone(self.controller.current_project_search_report)
+
+        with patch.object(
+            ProjectSearchService,
+            "search",
+            side_effect=AssertionError("service programmer assertion"),
+        ), self.assertRaisesRegex(
+            AssertionError,
+            "^service programmer assertion$",
+        ):
+            self.controller.search_project(_request())
+        self.assertIsNone(self.controller.current_project_search_report)
 
         report = self.controller.search_project(_request())
         with patch.object(

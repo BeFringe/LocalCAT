@@ -25,7 +25,7 @@ from editor_contracts import (
     SearchOptions as EditorSearchOptions,
     TextMatcherState as EditorTextMatcherState,
 )
-from editor_controller import EditorController
+from editor_controller import EditorController, EditorControllerError
 from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
@@ -335,6 +335,84 @@ class QtProjectSearchTests(unittest.TestCase):
         self.assertIn(
             "PROJECT_TOOLS.JSON_REQUIRED",
             window.project_search_capability.text(),
+        )
+
+    def test_foreign_display_wrapper_cannot_enable_qt_search(self) -> None:
+        self._validate_basic()
+        display = self.controller.text_matcher_handoff().display
+
+        class ForeignDisplayWrapper:
+            display: object
+
+            def __init__(self) -> None:
+                self.display = display
+
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            return_value=ForeignDisplayWrapper(),
+        ):
+            window = self._open_window()
+
+        self.assertFalse(window.project_search_button.isEnabled())
+        self.assertIn(
+            "PROJECT_SEARCH.HANDOFF_INVALID",
+            window.project_search_capability.text(),
+        )
+
+        window_source = (ROOT / "qt_editor_window.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("controller.text_matcher_handoff", window_source)
+
+    def test_private_handoff_error_body_is_not_exposed_by_qt(self) -> None:
+        self.controller.open_project(self.project_path)
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            side_effect=EditorControllerError("PRIVATE.PROOF.TOKEN"),
+        ):
+            polluted = self.controller.project_search_matcher_display()
+            object.__setattr__(
+                polluted,
+                "state",
+                TextMatcherState.BASIC_VALIDATED,
+            )
+            display = self.controller.project_search_matcher_display()
+            self.window = QtEditorWindow(self.controller)
+            self.window.show()
+            self._events()
+
+        message = self.window.project_search_capability.text()
+        self.assertIsNot(display, polluted)
+        self.assertIs(display.state, TextMatcherState.UNAVAILABLE)
+        self.assertEqual(
+            display.safe_reason,
+            "PROJECT_SEARCH.HANDOFF_INVALID",
+        )
+        self.assertNotIn("PRIVATE.PROOF.TOKEN", display.safe_reason or "")
+        self.assertFalse(self.window.project_search_button.isEnabled())
+        self.assertIn("PROJECT_SEARCH.HANDOFF_INVALID", message)
+        self.assertNotIn("PRIVATE.PROOF.TOKEN", message)
+
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            side_effect=EditorControllerError("MATCHER.HANDOFF_UNAVAILABLE"),
+        ):
+            missing_first = self.controller.project_search_matcher_display()
+            object.__setattr__(
+                missing_first,
+                "state",
+                TextMatcherState.TEXT_V1_VALIDATED,
+            )
+            missing_second = self.controller.project_search_matcher_display()
+
+        self.assertIsNot(missing_first, missing_second)
+        self.assertIs(missing_second.state, TextMatcherState.UNAVAILABLE)
+        self.assertEqual(
+            missing_second.safe_reason,
+            "MATCHER.HANDOFF_UNAVAILABLE",
         )
 
     def test_keyboard_accessibility_and_layer4_boundary(self) -> None:

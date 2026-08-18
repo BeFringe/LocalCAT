@@ -241,6 +241,14 @@ class EditorTMAdapter:
 
         return self._capability_host.matcher_snapshot()
 
+    def _is_current_text_matcher_handoff_for_controller(
+        self,
+        candidate: object,
+    ) -> bool:
+        """Prove candidate identity against this adapter's current Host issue."""
+
+        return candidate is self._capability_host.matcher_snapshot()
+
     def query_current(
         self,
         *,
