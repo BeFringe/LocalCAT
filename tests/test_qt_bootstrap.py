@@ -210,9 +210,15 @@ class QtBootstrapTest(unittest.TestCase):
         fake_window_module = types.ModuleType("qt_editor_window")
         setattr(fake_window_module, "QtEditorWindow", CapturingWindow)
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.dict(
-                sys.modules,
-                {"qt_editor_window": fake_window_module},
+            with (
+                patch.dict(
+                    sys.modules,
+                    {"qt_editor_window": fake_window_module},
+                ),
+                patch.object(
+                    qt_editor,
+                    "_start_capability_validation",
+                ) as start_validation,
             ):
                 exit_code = qt_editor.main(
                     ["--smoke-test", "--data-dir", temp_dir]
@@ -223,6 +229,7 @@ class QtBootstrapTest(unittest.TestCase):
             64,
         ).toImage()
         self.assertEqual(exit_code, 0)
+        start_validation.assert_called_once()
         self.assertEqual(set(captured), {"application", "window", "dialog"})
         for name, icon in captured.items():
             with self.subTest(name=name):

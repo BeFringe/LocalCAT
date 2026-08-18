@@ -175,6 +175,81 @@ def install_desktop_launcher(
     return launcher_path
 
 
+def _start_capability_validation(composition: object) -> object:
+    """Start one fail-closed validation lifecycle for this application run."""
+
+    from datetime import datetime, timedelta, timezone
+    from threading import Thread
+
+    from capability_host import CapabilityHostComposition
+
+    if type(composition) is not CapabilityHostComposition:
+        raise TypeError(
+            "editor capability validation requires one host composition"
+        )
+
+    generated_at_utc = datetime.now(timezone.utc)
+    valid_until_utc = generated_at_utc + timedelta(days=1)
+
+    def validate() -> None:
+        _ = composition.matcher_validation_owner.validate_text_v1(
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+            evaluated_at_utc=generated_at_utc,
+        )
+        gate_c = composition.retrieval_gate_c_validation_owner
+        if gate_c is None:
+            return
+        _ = gate_c.validate_gate_c(
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+            evaluated_at_utc=generated_at_utc,
+        )
+        gate_d = composition.retrieval_gate_d_owner
+        if gate_d is None:
+            return
+        _ = gate_d.start_gate_d(evaluated_at_utc=generated_at_utc)
+
+    worker = Thread(
+        target=validate,
+        name="LocalCAT-capability-validation",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def _compose_editor_controller(repository: object):
+    """Build the one formal TM composition graph owned by this app run."""
+
+    from datetime import datetime, timezone
+
+    from capability_host import compose_capability_host
+    from editor_controller import EditorController
+    from editor_tm_adapter import EditorTMAdapter
+    from resource_repository import ResourceRepository
+    from tm_application_composition import TMResourceResolver, TMRuntimeHost
+
+    if type(repository) is not ResourceRepository:
+        raise TypeError("editor composition requires ResourceRepository")
+    capability_composition = compose_capability_host(
+        evaluated_at_utc=datetime.now(timezone.utc),
+    )
+    runtime_host = TMRuntimeHost(
+        resolver=TMResourceResolver(),
+        configs=repository.list_resources(),
+    )
+    controller = EditorController(
+        repository,
+        tm_adapter=EditorTMAdapter(
+            runtime_host=runtime_host,
+            capability_host=capability_composition.host,
+        ),
+    )
+    _ = _start_capability_validation(capability_composition)
+    return controller, capability_composition
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.install_desktop_launcher:
@@ -186,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Installed LocalCAT desktop launcher: {launcher}")
         return 0
     try:
+        from typing import cast
+
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except ModuleNotFoundError as exc:
@@ -199,7 +276,6 @@ def main(argv: list[str] | None = None) -> int:
         raise
 
     try:
-        from editor_controller import EditorController
         from qt_editor_window import QtEditorWindow
         from resource_repository import ResourceRepository
 
@@ -210,13 +286,23 @@ def main(argv: list[str] | None = None) -> int:
             default_tm_path=root / "tm.jsonl",
             default_termbase_path=root / "terms.csv",
         )
-        controller = EditorController(repository)
+        controller, capability_composition = _compose_editor_controller(
+            repository
+        )
+        # Retain the owner-only validation ports for the complete QApplication
+        # lifetime; the Controller receives only the host read boundary.
+        _ = capability_composition
         if args.project is not None:
             controller.open_project(args.project)
         elif args.sample or args.smoke_test:
             controller.load_sample()
 
-        app = QApplication.instance() or QApplication([sys.argv[0]])
+        existing_app = QApplication.instance()
+        app = (
+            QApplication([sys.argv[0]])
+            if existing_app is None
+            else cast(QApplication, existing_app)
+        )
         app.setApplicationName("LocalCAT")
         app.setOrganizationName("LocalCAT")
         app.setDesktopFileName("localcat")

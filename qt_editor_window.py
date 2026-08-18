@@ -64,6 +64,7 @@ from editor_contracts import (
     SuggestionBundle,
     TermSuggestion,
     TMResourceDisplayMode,
+    TMThresholdUpdateOutcome,
     TMSuggestion,
     TMSuggestionReport,
     WorkspaceMode,
@@ -1475,12 +1476,13 @@ class QtEditorWindow(QMainWindow):
 
         if self.tm_threshold_chip.property("fuzzyAvailable") is not True:
             return
+        previous = self.controller.tm_preferences()
         try:
-            requested = prompt_tm_threshold(self, self.controller.tm_preferences())
+            requested = prompt_tm_threshold(self, previous)
             if requested is None:
                 return
             outcome = self.controller.update_tm_minimum_similarity(requested)
-        except (EditorControllerError, TypeError, ValueError):
+        except EditorControllerError:
             self._refresh_tm_threshold_entry()
             self.statusBar().showMessage(
                 "Fuzzy 阈值未更新；当前值保持不变。",
@@ -1491,26 +1493,25 @@ class QtEditorWindow(QMainWindow):
             self.refresh_suggestions()
         else:
             self._refresh_tm_threshold_entry()
-        if outcome.succeeded and self.settings_dialog is not None:
+        if (
+            outcome.preferences != previous
+            and self.settings_dialog is not None
+        ):
             self.settings_dialog.refresh_resources()
         self.statusBar().showMessage(tm_threshold_feedback(outcome), 7000)
 
-    def _settings_tm_threshold_changed(self, _minimum_similarity: float) -> None:
+    def _settings_tm_threshold_changed(self, outcome: object) -> None:
         """Refresh cards when the settings entry updates the shared preference."""
 
+        if type(outcome) is not TMThresholdUpdateOutcome:
+            raise TypeError("settings TM threshold outcome is invalid")
+        outcome.__post_init__()
         if self.controller.has_project:
             self.refresh_suggestions()
         else:
             self._refresh_tm_threshold_entry()
-        preferences = self.controller.tm_preferences()
-        percentage = preferences.minimum_similarity * 100.0
-        rendered = (
-            str(int(percentage))
-            if percentage.is_integer()
-            else f"{percentage:.6f}".rstrip("0").rstrip(".")
-        )
         self.statusBar().showMessage(
-            f"Fuzzy 阈值 {rendered}% 已保存；当前段建议已刷新。",
+            tm_threshold_feedback(outcome),
             7000,
         )
 

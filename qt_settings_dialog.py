@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import re
 
 from pathlib import Path
 
@@ -111,7 +110,6 @@ QAbstractItemView#newResourceKindPopup::item:selected {
     background-color: #c4e8f2;
 }
 """
-_SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)+")
 _TM_MODE_LABELS = {
     TMResourceDisplayMode.LEGACY_EXACT_ONLY: "Legacy exact-only",
     TMResourceDisplayMode.ACTIVATING: "激活中",
@@ -135,10 +133,19 @@ _TM_SAFE_REASON_LABELS = {
     "TM.ACTIVATION.PROGRAMMER_ERROR": "Canonical 操作未能安全完成",
     "MIGRATION.INITIAL_IO_FAILED": "首次激活未完成",
     "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE": "Canonical 权威无法确定",
+    "MIGRATION.RESOURCE_ID_INVALID": "资源身份无法验证",
+    "MIGRATION.RESOURCE_IDENTITY_MISMATCH": "资源身份无法验证",
+    "MIGRATION.COORDINATOR_IDENTITY_MISMATCH": "Canonical 权威无法验证",
+    "MIGRATION.COORDINATOR_UNAVAILABLE": "Canonical 权威无法验证",
+    "MIGRATION.ALREADY_ACTIVE": "资源已处于 canonical active",
+    "MIGRATION.ACTIVATION_NOT_READY": "Canonical 激活前置未就绪",
+    "MIGRATION.SOURCE_UNREADABLE": "本地来源不可读",
+    "MIGRATION.SOURCE_CHANGED": "本地来源已变更",
     "RETRIEVAL.CONTEXT_EVIDENCE_MISSING": "Context 尚未开放",
     "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_MISSING": "Fuzzy 正确性尚未开放",
     "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING": "Fuzzy 性能尚未开放",
 }
+_TM_ACTION_EXCEPTION_SAFE_CODES = frozenset(_TM_SAFE_REASON_LABELS)
 
 
 def _tm_safe_reason(code: str | None) -> str:
@@ -201,7 +208,7 @@ class QtSettingsDialog(QDialog):
 
     resources_changed = Signal()
     import_completed = Signal(object)
-    tm_threshold_changed = Signal(float)
+    tm_threshold_changed = Signal(object)
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -452,12 +459,13 @@ class QtSettingsDialog(QDialog):
 
         if self.tm_threshold_chip.property("fuzzyAvailable") is not True:
             return
+        previous = self.controller.tm_preferences()
         try:
-            requested = prompt_tm_threshold(self, self.controller.tm_preferences())
+            requested = prompt_tm_threshold(self, previous)
             if requested is None:
                 return
             outcome = self.controller.update_tm_minimum_similarity(requested)
-        except (EditorControllerError, TypeError, ValueError):
+        except EditorControllerError:
             self._refresh_tm_threshold_entry()
             self.status_label.setText(
                 "Fuzzy 阈值未更新；当前值保持不变。"
@@ -465,10 +473,8 @@ class QtSettingsDialog(QDialog):
             return
         self.refresh_resources()
         self.status_label.setText(tm_threshold_feedback(outcome))
-        if outcome.succeeded:
-            self.tm_threshold_changed.emit(
-                outcome.preferences.minimum_similarity
-            )
+        if outcome.preferences != previous:
+            self.tm_threshold_changed.emit(outcome)
 
     def _populate_table(
         self,
@@ -788,10 +794,16 @@ class QtSettingsDialog(QDialog):
         self.resources_changed.emit()
 
     def _show_tm_action_error(self, error: Exception) -> None:
-        raw = str(error)
+        raw = str(error) if type(error) is EditorControllerError else None
+        code = (
+            raw
+            if raw is not None
+            and raw in _TM_ACTION_EXCEPTION_SAFE_CODES
+            else None
+        )
         reason = (
-            _tm_safe_reason(raw)
-            if _SAFE_CODE.fullmatch(raw) is not None
+            _tm_safe_reason(code)
+            if code is not None
             else "内部状态无法安全确认"
         )
         self.status_label.setText(f"Canonical 操作无法开始：{reason}。")

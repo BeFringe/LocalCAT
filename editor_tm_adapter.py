@@ -412,8 +412,18 @@ class EditorTMAdapter:
     def _inspect_retrieval_status_for_controller(self) -> RetrievalDisplayState:
         """Return the current frozen retrieval display without running a query."""
 
+        _generation, display = (
+            self._inspect_retrieval_projection_for_controller()
+        )
+        return display
+
+    def _inspect_retrieval_projection_for_controller(
+        self,
+    ) -> tuple[int, RetrievalDisplayState]:
+        """Return one generation-bound display without running a query."""
+
         handoff = self._capability_host.retrieval_operation_snapshot()
-        return _project_retrieval_display(handoff)
+        return handoff.generation, _project_retrieval_display(handoff)
 
     def append_confirmed(
         self,

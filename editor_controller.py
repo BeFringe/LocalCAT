@@ -442,6 +442,118 @@ def _tm_suggestion_fields_equal(
     )
 
 
+def _stable_tm_safe_codes(
+    *groups: tuple[str, ...],
+) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for code in group:
+            if code in seen:
+                continue
+            seen.add(code)
+            result.append(code)
+    return tuple(result)
+
+
+def _merge_tm_lifecycle_and_query_status(
+    *,
+    lifecycle: TMResourceStatus,
+    retrieval: RetrievalDisplayState,
+    query: TMResourceStatus | None,
+) -> TMResourceStatus:
+    """Project fresh capability; let a same-generation report only narrow it."""
+
+    if (
+        type(lifecycle) is not TMResourceStatus
+        or type(retrieval) is not RetrievalDisplayState
+        or (query is not None and type(query) is not TMResourceStatus)
+    ):
+        raise TypeError("TM status merge requires exact display contracts")
+    lifecycle.__post_init__()
+    retrieval.__post_init__()
+    if query is not None:
+        query.__post_init__()
+        if (
+            lifecycle.resource_id != query.resource_id
+            or lifecycle.resource_name != query.resource_name
+        ):
+            raise ValueError("TM status merge resource identity mismatch")
+
+    if lifecycle.mode in (
+        TMResourceDisplayMode.UNAVAILABLE,
+        TMResourceDisplayMode.ACTIVATING,
+    ):
+        return replace(lifecycle)
+
+    if lifecycle.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+        if query is None or query.mode is not TMResourceDisplayMode.DEGRADED:
+            return replace(lifecycle)
+        return TMResourceStatus(
+            resource_id=lifecycle.resource_id,
+            resource_name=lifecycle.resource_name,
+            mode=TMResourceDisplayMode.DEGRADED,
+            exact_available=query.exact_available,
+            context_available=False,
+            fuzzy_available=False,
+            safe_codes=_stable_tm_safe_codes(
+                lifecycle.safe_codes,
+                query.safe_codes,
+            ),
+            retryable=lifecycle.retryable or query.retryable,
+        )
+
+    base_exact = lifecycle.exact_available
+    base_context = base_exact and retrieval.context_available
+    base_fuzzy = base_exact and retrieval.fuzzy_available
+    if query is None:
+        return TMResourceStatus(
+            resource_id=lifecycle.resource_id,
+            resource_name=lifecycle.resource_name,
+            mode=lifecycle.mode,
+            exact_available=base_exact,
+            context_available=base_context,
+            fuzzy_available=base_fuzzy,
+            safe_codes=_stable_tm_safe_codes(
+                lifecycle.safe_codes,
+                retrieval.safe_codes,
+            ),
+            retryable=lifecycle.retryable,
+        )
+
+    if query.mode is TMResourceDisplayMode.UNAVAILABLE:
+        mode = TMResourceDisplayMode.UNAVAILABLE
+    elif (
+        query.mode is TMResourceDisplayMode.DEGRADED
+        and lifecycle.mode is not TMResourceDisplayMode.SOURCE_DIVERGED
+    ):
+        mode = TMResourceDisplayMode.DEGRADED
+    else:
+        mode = lifecycle.mode
+
+    usable = mode is not TMResourceDisplayMode.UNAVAILABLE
+    return TMResourceStatus(
+        resource_id=lifecycle.resource_id,
+        resource_name=lifecycle.resource_name,
+        mode=mode,
+        exact_available=(
+            usable
+            and base_exact
+            and query.exact_available
+        ),
+        context_available=(
+            usable and base_context and query.context_available
+        ),
+        fuzzy_available=(usable and base_fuzzy and query.fuzzy_available),
+        safe_codes=_stable_tm_safe_codes(
+            lifecycle.safe_codes,
+            retrieval.safe_codes,
+            query.safe_codes,
+        ),
+        retryable=lifecycle.retryable or query.retryable,
+    )
+
+
 class EditorController:
     """Own one immutable editor session while engines remain UI-state free."""
 
@@ -734,9 +846,17 @@ class EditorController:
             )
 
     def tm_retrieval_status(self) -> RetrievalDisplayState:
-        """Return current frozen retrieval availability without querying a segment."""
+        """Return one fresh generation-bound projection without querying."""
 
         with self._tm_query_lock:
+            self._synchronize_tm_query_state(refresh_current=False)
+            blocked_code = self._tm_runtime_blocked_safe_code
+            if blocked_code is not None:
+                return RetrievalDisplayState(
+                    context_available=False,
+                    fuzzy_available=False,
+                    safe_codes=(blocked_code,),
+                )
             adapter = self._tm_adapter
             if adapter is None:
                 return RetrievalDisplayState(
@@ -744,11 +864,31 @@ class EditorController:
                     fuzzy_available=False,
                     safe_codes=("TM.RETRIEVAL.UNAVAILABLE",),
                 )
-            status = adapter._inspect_retrieval_status_for_controller()
+            status = self._inspect_tm_retrieval_status_no_query(adapter)
             if type(status) is not RetrievalDisplayState:
                 raise TypeError("TM retrieval display contract is invalid")
             status.__post_init__()
             return replace(status)
+
+    def _inspect_tm_retrieval_status_no_query(
+        self,
+        adapter: EditorTMAdapter,
+    ) -> RetrievalDisplayState:
+        """Read one host display and invalidate any differently-issued report."""
+
+        generation, status = (
+            adapter._inspect_retrieval_projection_for_controller()
+        )
+        if type(generation) is not int or generation < 0:
+            raise ValueError("TM retrieval display generation is invalid")
+        if type(status) is not RetrievalDisplayState:
+            raise TypeError("TM retrieval display contract is invalid")
+        status.__post_init__()
+        observed = self._observed_tm_signature
+        if observed is not None and observed[4] != generation:
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+        return replace(status)
 
     def update_tm_minimum_similarity(
         self,
@@ -771,6 +911,17 @@ class EditorController:
                 )
 
             if requested == previous:
+                if self._tm_adapter is not None and self._project is not None:
+                    try:
+                        self._require_tm_runtime_available()
+                        if self._current_tm_report is None:
+                            _ = self._query_and_issue_current_tm_report()
+                    except EditorControllerError:
+                        return TMThresholdUpdateOutcome(
+                            succeeded=False,
+                            preferences=previous,
+                            safe_code="TM.THRESHOLD.REFRESH_FAILED",
+                        )
                 return TMThresholdUpdateOutcome(
                     succeeded=True,
                     preferences=previous,
@@ -794,7 +945,20 @@ class EditorController:
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
             if self._tm_adapter is not None and self._project is not None:
-                _ = self.tm_suggestion_report()
+                try:
+                    self._require_tm_runtime_available()
+                    _ = self._query_and_issue_current_tm_report()
+                except EditorControllerError:
+                    return TMThresholdUpdateOutcome(
+                        succeeded=False,
+                        preferences=TMPreferences(
+                            minimum_similarity=(
+                                persisted.minimum_similarity
+                            ),
+                            result_limit=persisted.result_limit,
+                        ),
+                        safe_code="TM.THRESHOLD.REFRESH_FAILED",
+                    )
             return TMThresholdUpdateOutcome(
                 succeeded=True,
                 preferences=TMPreferences(
@@ -1561,9 +1725,10 @@ class EditorController:
             return replace(operation)
 
     def tm_resource_statuses(self) -> tuple[TMResourceStatus, ...]:
-        """Return current body-free lifecycle facts without querying or migrating."""
+        """Return fresh lifecycle facts with same-generation query authority."""
 
         with self._tm_query_lock:
+            self._synchronize_tm_query_state(refresh_current=False)
             configs = self.repository.list_resources()
             adapter = self._tm_adapter
             if adapter is None:
@@ -1572,10 +1737,19 @@ class EditorController:
                 runtime = TMResourceResolver().resolve(configs)
                 runtime.__post_init__()
                 statuses = tuple(replace(status) for status in runtime.statuses)
+                retrieval_status = RetrievalDisplayState(
+                    context_available=False,
+                    fuzzy_available=False,
+                    safe_codes=("TM.RETRIEVAL.UNAVAILABLE",),
+                )
             else:
                 statuses = adapter._inspect_resource_statuses_for_controller(
                     configs
                 )
+                retrieval_status = self._inspect_tm_retrieval_status_no_query(
+                    adapter
+                )
+            retrieval_status.__post_init__()
             for status in statuses:
                 status.__post_init__()
 
@@ -1601,32 +1775,20 @@ class EditorController:
                 projected_by_resource_id = {
                     status.resource_id: status for status in projected
                 }
-                statuses = tuple(
-                    (
-                        projected_by_resource_id[status.resource_id]
-                        if (
-                            projected_by_resource_id[status.resource_id].mode
-                            is TMResourceDisplayMode.DEGRADED
-                            and status.mode
-                            not in (
-                                TMResourceDisplayMode.SOURCE_DIVERGED,
-                                TMResourceDisplayMode.UNAVAILABLE,
-                            )
-                        )
-                        or projected_by_resource_id[status.resource_id].mode
-                        is status.mode
-                        else status
-                    )
-                    for status in statuses
+            else:
+                projected_by_resource_id = {}
+
+            statuses = tuple(
+                _merge_tm_lifecycle_and_query_status(
+                    lifecycle=status,
+                    retrieval=retrieval_status,
+                    query=projected_by_resource_id.get(status.resource_id),
                 )
+                for status in statuses
+            )
 
             blocked_code = self._tm_runtime_blocked_safe_code
             if blocked_code is not None:
-                with self._tm_activation_condition:
-                    operation = self._tm_activation_operation
-                    blocked_resource_id = (
-                        None if operation is None else operation.resource_id
-                    )
                 statuses = tuple(
                     TMResourceStatus(
                         resource_id=status.resource_id,
@@ -1638,9 +1800,6 @@ class EditorController:
                         safe_codes=(blocked_code,),
                         retryable=True,
                     )
-                    if blocked_resource_id is None
-                    or status.resource_id == blocked_resource_id
-                    else status
                     for status in statuses
                 )
 
@@ -1767,7 +1926,7 @@ class EditorController:
             self._observed_tm_signature = current
         elif current != self._observed_tm_signature:
             self._advance_tm_query_epoch()
-            self._observed_tm_signature = current
+            self._record_current_tm_baseline()
             refresh_required = True
         if refresh_current and refresh_required:
             _ = self._query_and_issue_current_tm_report()

@@ -121,6 +121,8 @@ def tm_threshold_feedback(outcome: TMThresholdUpdateOutcome) -> str:
         return f"Fuzzy 阈值保存失败；仍使用 {current}。"
     if outcome.safe_code == "TM.THRESHOLD.INVALID":
         return f"Fuzzy 阈值必须在 60% 至 100% 之间；仍使用 {current}。"
+    if outcome.safe_code == "TM.THRESHOLD.REFRESH_FAILED":
+        return f"{current} 已保存；当前段建议未刷新。"
     return f"Fuzzy 阈值未更新；仍使用 {current}。"
 
 
