@@ -522,6 +522,16 @@ class EditorController:
         return self._project_session_id
 
     @property
+    def tm_suggestion_reports_enabled(self) -> bool:
+        """Return whether the application TM report seam is configured.
+
+        This is a composition fact for presentation routing, not a retrieval
+        capability signal.  Match authorization remains in the frozen report.
+        """
+
+        return self._tm_adapter is not None
+
+    @property
     def query_epoch(self) -> int:
         """Return the aggregate query epoch after observing external drift."""
 
@@ -881,13 +891,19 @@ class EditorController:
             )
             return bundle
 
+    def term_suggestions(self) -> tuple[TermSuggestion, ...]:
+        """Return current-segment term suggestions without issuing a TM query."""
+
+        with self._tm_query_lock:
+            source = self.current_segment.source
+            return self._term_suggestions(source)
+
     def _legacy_suggestions(self) -> SuggestionBundle:
         """Query every currently active Lookup resource for the current source."""
 
         segment = self.current_segment
         source = segment.source
         tm_matches: list[LegacyExactTMSuggestion] = []
-        terms: list[TermSuggestion] = []
         for resource in self.repository.list_resources():
             if not resource.active or not resource.lookup:
                 continue
@@ -928,23 +944,36 @@ class EditorController:
                             match_type=wrapped.match_type,
                         )
                     )
-            else:
-                engine = self._glossary_engines.get(resource.id)
-                if engine is None:
-                    continue
-                for hit in engine.extract_terms(source):
-                    terms.append(
-                        TermSuggestion(
-                            source_term=hit.source_term,
-                            target_term=hit.target_term,
-                            start_index=hit.start_index,
-                            end_index=hit.end_index,
-                            resource_id=resource.id,
-                            resource_name=resource.name,
-                            definition=hit.definition,
-                        )
+        return SuggestionBundle(
+            tm_matches=tuple(tm_matches),
+            terms=self._term_suggestions(source),
+        )
+
+    def _term_suggestions(self, source: str) -> tuple[TermSuggestion, ...]:
+        terms: list[TermSuggestion] = []
+        for resource in self.repository.list_resources():
+            if (
+                not resource.active
+                or not resource.lookup
+                or resource.kind is not ResourceKind.TERMBASE
+            ):
+                continue
+            engine = self._glossary_engines.get(resource.id)
+            if engine is None:
+                continue
+            for hit in engine.extract_terms(source):
+                terms.append(
+                    TermSuggestion(
+                        source_term=hit.source_term,
+                        target_term=hit.target_term,
+                        start_index=hit.start_index,
+                        end_index=hit.end_index,
+                        resource_id=resource.id,
+                        resource_name=resource.name,
+                        definition=hit.definition,
                     )
-        return SuggestionBundle(tm_matches=tuple(tm_matches), terms=tuple(terms))
+                )
+        return tuple(terms)
 
     def confirm_current(self) -> ConfirmResult:
         """Write the current translation to every writable TM before confirmation."""

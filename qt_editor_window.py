@@ -62,6 +62,9 @@ from editor_contracts import (
     SegmentDensity,
     SuggestionBundle,
     TermSuggestion,
+    TMResourceDisplayMode,
+    TMSuggestion,
+    TMSuggestionReport,
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
@@ -206,6 +209,7 @@ class QtEditorWindow(QMainWindow):
         self.editor_font_size = self._display_preferences.editor_font_size
         self.settings_dialog: QtSettingsDialog | None = None
         self.current_suggestions = SuggestionBundle()
+        self.current_tm_report: TMSuggestionReport | None = None
         self.setObjectName("editorWindow")
         self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
         self.setMinimumSize(1080, 700)
@@ -1362,20 +1366,52 @@ class QtEditorWindow(QMainWindow):
 
         if not self.controller.has_project:
             self.current_suggestions = SuggestionBundle()
+            self.current_tm_report = None
             return self.current_suggestions
-        bundle = self.controller.suggestions()
+        report: TMSuggestionReport | None = None
+        tm_query_failed = False
+        if self.controller.tm_suggestion_reports_enabled:
+            try:
+                report = self.controller.tm_suggestion_report()
+            except EditorControllerError:
+                tm_query_failed = True
+                bundle = SuggestionBundle(
+                    terms=self.controller.term_suggestions(),
+                )
+            else:
+                bundle = SuggestionBundle(
+                    terms=self.controller.term_suggestions(),
+                )
+        else:
+            bundle = self.controller.suggestions()
         self.current_suggestions = bundle
+        self.current_tm_report = report
         self.source_display.setHtml(
             render_highlighted_source(self.controller.current_segment.source, bundle.terms)
         )
         self._clear_layout(self.tm_cards_layout)
         self._clear_layout(self.term_cards_layout)
 
-        if bundle.tm_matches:
-            for index, suggestion in enumerate(bundle.tm_matches):
-                self.tm_cards_layout.addWidget(self._tm_card(index, suggestion))
+        tm_matches: tuple[TMSuggestion | LegacyExactTMSuggestion, ...]
+        if report is not None:
+            tm_matches = report.suggestions
         else:
-            self.tm_cards_layout.addWidget(self._empty_suggestion("当前段暂无翻译记忆建议。"))
+            tm_matches = bundle.tm_matches
+        state_message = self._tm_state_message(
+            report=report,
+            query_failed=tm_query_failed,
+            has_suggestions=bool(tm_matches),
+        )
+        if state_message is not None:
+            self.tm_cards_layout.addWidget(
+                self._empty_suggestion(
+                    state_message,
+                    object_name="tmSuggestionState",
+                )
+            )
+        if tm_matches:
+            for index, suggestion in enumerate(tm_matches):
+                self.tm_cards_layout.addWidget(self._tm_card(index, suggestion))
         self.tm_cards_layout.addStretch()
 
         if bundle.terms:
@@ -1385,6 +1421,47 @@ class QtEditorWindow(QMainWindow):
             self.term_cards_layout.addWidget(self._empty_suggestion("当前段暂无术语建议。"))
         self.term_cards_layout.addStretch()
         return bundle
+
+    @staticmethod
+    def _tm_state_message(
+        *,
+        report: TMSuggestionReport | None,
+        query_failed: bool,
+        has_suggestions: bool,
+    ) -> str | None:
+        if query_failed:
+            return "TM 查询失败，请稍后重试。"
+        if report is None:
+            return None if has_suggestions else "当前段暂无翻译记忆建议。"
+
+        resource_problems = tuple(
+            status
+            for status in report.resource_statuses
+            if status.mode in (
+                TMResourceDisplayMode.DEGRADED,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+                TMResourceDisplayMode.UNAVAILABLE,
+            )
+        )
+        if resource_problems:
+            names = "、".join(status.resource_name for status in resource_problems)
+            query_failure = any(
+                "QUERY" in code
+                for status in resource_problems
+                for code in status.safe_codes
+            )
+            if query_failure:
+                return f"TM 资源查询失败：{names}。"
+            return f"TM 资源当前不可用：{names}。"
+
+        capability_closed = bool(report.retrieval_status.safe_codes) or any(
+            status.safe_codes for status in report.resource_statuses
+        )
+        if capability_closed:
+            return "部分 TM 匹配能力当前不可用。"
+        if not has_suggestions:
+            return "当前段暂无翻译记忆建议。"
+        return None
 
     @staticmethod
     def _clear_layout(layout: QVBoxLayout) -> None:
@@ -1408,13 +1485,65 @@ class QtEditorWindow(QMainWindow):
     def _tm_card(
         self,
         index: int,
-        suggestion: LegacyExactTMSuggestion,
+        suggestion: TMSuggestion | LegacyExactTMSuggestion,
     ) -> QWidget:
         card = QFrame()
         card.setObjectName(f"tmCard_{index}")
         card.setProperty("suggestionCard", True)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 11, 12, 11)
+
+        if type(suggestion) is TMSuggestion:
+            heading = QHBoxLayout()
+            match_type = QLabel(suggestion.match_type.value)
+            match_type.setObjectName(f"tmMatchType_{index}")
+            match_type.setProperty("tmMatchType", True)
+            similarity = QLabel(
+                f"{round(suggestion.final_similarity * 100)}%"
+            )
+            similarity.setObjectName(f"tmSimilarity_{index}")
+            similarity.setProperty("matchBadge", True)
+            heading.addWidget(match_type)
+            heading.addStretch()
+            heading.addWidget(similarity, alignment=Qt.AlignmentFlag.AlignTop)
+            layout.addLayout(heading)
+
+            if suggestion.matched_source != suggestion.query_source:
+                matched_source = self._plain_label(
+                    f"实际命中原文：{suggestion.matched_source}",
+                    f"tmMatchedSource_{index}",
+                )
+                matched_source.setProperty("tmMatchedSource", True)
+                layout.addWidget(matched_source)
+
+            target = self._plain_label(
+                suggestion.target,
+                f"tmTarget_{index}",
+            )
+            target.setProperty("suggestionTarget", True)
+            layout.addWidget(target)
+
+            footer = QHBoxLayout()
+            resource = self._plain_label(
+                suggestion.provenance.resource_name,
+                f"tmResource_{index}",
+            )
+            resource.setProperty("suggestionProvenance", True)
+            apply_button = QPushButton("应用译文")
+            apply_button.setObjectName(f"applyTm_{index}")
+            apply_button.clicked.connect(
+                lambda _checked=False, current=suggestion: self.apply_tm_suggestion(
+                    current
+                )
+            )
+            footer.addWidget(resource, 1)
+            footer.addWidget(apply_button)
+            layout.addLayout(footer)
+            return card
+
+        if type(suggestion) is not LegacyExactTMSuggestion:
+            raise TypeError("unsupported TM suggestion contract")
+
         heading = QHBoxLayout()
         source = self._plain_label(suggestion.source, "suggestionSource")
         badge = QLabel(f"{round(suggestion.similarity * 100)}%")
@@ -1466,14 +1595,27 @@ class QtEditorWindow(QMainWindow):
         layout.addLayout(footer)
         return card
 
-    def _empty_suggestion(self, message: str) -> QLabel:
-        return self._plain_label(message, "emptySuggestion")
+    def _empty_suggestion(
+        self,
+        message: str,
+        *,
+        object_name: str = "emptySuggestion",
+    ) -> QLabel:
+        label = self._plain_label(message, object_name)
+        label.setProperty("emptySuggestion", True)
+        return label
 
-    def apply_tm_suggestion(self, suggestion: LegacyExactTMSuggestion) -> bool:
+    def apply_tm_suggestion(
+        self,
+        suggestion: TMSuggestion | LegacyExactTMSuggestion,
+    ) -> bool:
         try:
             self.controller.apply_tm_suggestion(suggestion)
-        except EditorControllerError as exc:
-            self._show_error("无法应用翻译记忆", str(exc))
+        except EditorControllerError:
+            self.statusBar().showMessage(
+                "未应用 TM 建议：建议已过期或当前不可用。",
+                7000,
+            )
             return False
         cursor = self.target_editor.textCursor()
         cursor.beginEditBlock()
@@ -1483,7 +1625,13 @@ class QtEditorWindow(QMainWindow):
         finally:
             cursor.endEditBlock()
         self.target_editor.setTextCursor(cursor)
-        self.statusBar().showMessage(f"已应用来自 {suggestion.resource_name} 的译文。", 5000)
+        if type(suggestion) is TMSuggestion:
+            resource_name = suggestion.provenance.resource_name
+        elif type(suggestion) is LegacyExactTMSuggestion:
+            resource_name = suggestion.resource_name
+        else:
+            raise TypeError("unsupported TM suggestion contract")
+        self.statusBar().showMessage(f"已应用来自 {resource_name} 的译文。", 5000)
         return True
 
     def insert_term_suggestion(self, suggestion: TermSuggestion) -> bool:
@@ -1890,22 +2038,33 @@ QLabel#suggestionSource, QLabel#termSource {
     color: #45596c;
     font-size: 12px;
 }
-QLabel#suggestionTarget, QLabel#termTarget {
+QLabel#suggestionTarget, QLabel#termTarget,
+QLabel[suggestionTarget="true"] {
     color: #182f45;
     font-size: 14px;
     font-weight: 650;
 }
-QLabel#suggestionProvenance, QLabel#emptySuggestion {
+QLabel#suggestionProvenance, QLabel#emptySuggestion,
+QLabel[suggestionProvenance="true"], QLabel[emptySuggestion="true"] {
     color: #7a8b9c;
     font-size: 10px;
 }
-QLabel#matchBadge {
+QLabel#matchBadge, QLabel[matchBadge="true"] {
     color: white;
     background: #08a0c9;
     border-radius: 9px;
     padding: 3px 7px;
     font-size: 10px;
     font-weight: 750;
+}
+QLabel[tmMatchType="true"] {
+    color: #0b6f8d;
+    font-size: 10px;
+    font-weight: 750;
+}
+QLabel[tmMatchedSource="true"] {
+    color: #45596c;
+    font-size: 12px;
 }
 QLabel#termArrow {
     color: #0a97bd;
