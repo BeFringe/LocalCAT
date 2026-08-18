@@ -1,10 +1,10 @@
-"""Qt-free host for the Matcher Gate and Gate C TM retrieval state.
+"""Qt-free host for the Matcher Gate and Gate C/D TM retrieval state.
 
 The host starts exact-only, then lets the application composition owner rerun
 the Core validated matcher factory for the loaded checkout.  Ordinary callers
 only receive immutable snapshots and generation notifications.  Gate C uses
 the paired release recomputed for this checkout to replace the complete
-retrieval service; the later Gate D task may refresh only that formal graph.
+retrieval service; Gate D may refresh only that same formal graph.
 No capability is inferred from booleans, store health, or display state.
 """
 
@@ -19,7 +19,8 @@ from dataclasses import (
     is_dataclass,
     make_dataclass,
 )
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 import hashlib
 import importlib
 from importlib.machinery import ModuleSpec, SourceFileLoader
@@ -29,7 +30,9 @@ import os
 from pathlib import Path
 import stat
 import sys
-from threading import Condition, Lock, RLock
+import tempfile
+import time
+from threading import Condition, Lock, RLock, Thread
 from types import CodeType, FunctionType, ModuleType
 from typing import Any, Protocol, cast, final, runtime_checkable
 
@@ -61,6 +64,15 @@ _RETRIEVAL_VALIDATION_MODULE_NAME = "tm_retrieval_" + "validation"
 _RETRIEVAL_VALIDATION_FUNCTION_NAME = "recompute_retrieval_validation"
 _RETRIEVAL_APPROVED_ROOTS_RELATIVE_PATH = (
     Path("tests") / "fixtures" / "retrieval_gate_c_roots_v1.json"
+)
+_GATE_D_CONTRACT_RELATIVE_PATH = Path("benchmark_tm_contract.json")
+_GATE_D_MODULE_NAMES = (
+    "tm_benchmark",
+    "tm_benchmark_latency",
+    "tm_benchmark_oracle",
+    "tm_benchmark_process",
+    "tm_benchmark_query_process",
+    "tm_benchmark_gate",
 )
 
 
@@ -635,6 +647,10 @@ def _source_default_value(
 ) -> object:
     if isinstance(node, ast.Name) and node.id in named_defaults:
         return named_defaults[node.id]
+    if isinstance(node, ast.Attribute):
+        qualified = ast.unparse(node)
+        if qualified in named_defaults:
+            return named_defaults[qualified]
     try:
         return ast.literal_eval(node)
     except (TypeError, ValueError):
@@ -1471,6 +1487,26 @@ _RETRIEVAL_RUNTIME_MODULE_BINDINGS = tuple(
     if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
 )
 
+_GATE_D_CONTRACT_ANCHOR = _TrackedFileAnchor.capture(
+    _CAPABILITY_HOST_ROOT / _GATE_D_CONTRACT_RELATIVE_PATH
+)
+_GATE_D_MODULE_ANCHORS = tuple(
+    _ModuleSourceCodeAnchor.capture(
+        module_name=module_name,
+        path=_CAPABILITY_HOST_ROOT / f"{module_name}.py",
+        named_defaults=(
+            {
+                "BENCHMARK_PERCENTILE_METHOD": "nearest-rank",
+                "DEFAULT_TIMING_CLOCK_NAME": "perf_counter_ns",
+                "time.perf_counter_ns": time.perf_counter_ns,
+            }
+            if module_name == "tm_benchmark_latency"
+            else None
+        ),
+    )
+    for module_name in _GATE_D_MODULE_NAMES
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _CoreMatcherFactoryBinding:
@@ -1901,6 +1937,7 @@ class _CoreRetrievalValidationBinding:
         RetrievalCapabilityPublisher,
         TMRetrievalService,
         RetrievalCapabilitySnapshot,
+        RetrievalCapabilityManifest,
     ] | None:
         if not self.is_current():
             return None
@@ -1945,6 +1982,7 @@ class _CoreRetrievalValidationBinding:
             cast(RetrievalCapabilityPublisher, publisher),
             cast(TMRetrievalService, service),
             snapshot,
+            cast(RetrievalCapabilityManifest, manifest),
         )
 
 
@@ -2032,6 +2070,255 @@ def _load_retrieval_validation_binding(
         core_graphs=_RETRIEVAL_RUNTIME_MODULE_BINDINGS,
     )
     return binding, _RetrievalCheckoutIdentity.capture(binding)
+
+
+@dataclass(frozen=True, slots=True)
+class _GateDExecutionResult:
+    """Composition-private result after Core has refreshed the publisher."""
+
+    snapshot: RetrievalCapabilitySnapshot
+
+    def __post_init__(self) -> None:
+        if type(self.snapshot) is not RetrievalCapabilitySnapshot:
+            raise TypeError("Gate D result must carry a Core snapshot")
+
+
+class _GateDOperationalError(RuntimeError):
+    """One safe operational code from the Gate D owner lifecycle."""
+
+    error_code: str
+
+    def __init__(self, error_code: str) -> None:
+        if type(error_code) is not str or not error_code:
+            raise TypeError("Gate D error code must be a non-empty string")
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+class _GateDExecutionPort(Protocol):
+    def run_and_publish(
+        self,
+        *,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        contract_path: Path,
+        work_root: Path,
+        evidence_path: Path,
+        evaluated_at_utc: datetime,
+    ) -> _GateDExecutionResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _CoreGateDBinding:
+    """Late-bound current-checkout Core Gate D owner graph."""
+
+    graphs: tuple[_RuntimeModuleCodeBinding, ...]
+    gate_module: ModuleType
+    run_function: FunctionType
+    publish_function: FunctionType
+    error_type: type[BaseException]
+    run_result_type: type[object]
+    publication_result_type: type[object]
+
+    @classmethod
+    def capture(cls) -> _CoreGateDBinding:
+        modules = tuple(
+            importlib.import_module(anchor.module_name)
+            for anchor in _GATE_D_MODULE_ANCHORS
+        )
+        if any(type(module) is not ModuleType for module in modules):
+            raise RuntimeError("Gate D Core modules must be canonical modules")
+        graphs = tuple(
+            _RuntimeModuleCodeBinding.capture(
+                cast(ModuleType, module),
+                anchor,
+            )
+            for module, anchor in zip(
+                modules,
+                _GATE_D_MODULE_ANCHORS,
+                strict=True,
+            )
+        )
+        gate_module = cast(ModuleType, modules[-1])
+        run_function = gate_module.__dict__.get("run_benchmark_gate_d")
+        publish_function = gate_module.__dict__.get(
+            "publish_retrieval_capability_gate_d"
+        )
+        error_type = gate_module.__dict__.get("BenchmarkGateDError")
+        run_result_type = gate_module.__dict__.get(
+            "BenchmarkGateDRunResult"
+        )
+        publication_result_type = gate_module.__dict__.get(
+            "RetrievalCapabilityPublicationResult"
+        )
+        if (
+            type(run_function) is not FunctionType
+            or type(publish_function) is not FunctionType
+            or type(error_type) is not type
+            or not issubclass(cast(type[object], error_type), BaseException)
+            or type(run_result_type) is not type
+            or type(publication_result_type) is not type
+        ):
+            raise RuntimeError("Gate D Core owner exports are invalid")
+        binding = cls(
+            graphs=graphs,
+            gate_module=gate_module,
+            run_function=cast(FunctionType, run_function),
+            publish_function=cast(FunctionType, publish_function),
+            error_type=cast(type[BaseException], error_type),
+            run_result_type=cast(type[object], run_result_type),
+            publication_result_type=cast(
+                type[object], publication_result_type
+            ),
+        )
+        if not binding.is_current():
+            raise RuntimeError("Gate D Core owner graph is not current")
+        return binding
+
+    def is_current(self) -> bool:
+        return (
+            _GATE_D_CONTRACT_ANCHOR.is_current()
+            and all(graph.is_current() for graph in self.graphs)
+            and self.gate_module.__dict__.get("run_benchmark_gate_d")
+            is self.run_function
+            and self.gate_module.__dict__.get(
+                "publish_retrieval_capability_gate_d"
+            )
+            is self.publish_function
+            and self.gate_module.__dict__.get("BenchmarkGateDError")
+            is self.error_type
+            and self.gate_module.__dict__.get("BenchmarkGateDRunResult")
+            is self.run_result_type
+            and self.gate_module.__dict__.get(
+                "RetrievalCapabilityPublicationResult"
+            )
+            is self.publication_result_type
+        )
+
+    def run_and_publish(
+        self,
+        *,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        contract_path: Path,
+        work_root: Path,
+        evidence_path: Path,
+        evaluated_at_utc: datetime,
+    ) -> _GateDExecutionResult:
+        if (
+            not self.is_current()
+            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        try:
+            run_result = self.run_function(
+                contract_path,
+                work_root,
+                evidence_path,
+            )
+        except self.error_type as error:
+            raise _GateDOperationalError(
+                cast(Any, error).error_code
+            ) from error
+        if (
+            type(run_result) is not self.run_result_type
+            or not self.is_current()
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        try:
+            publication = self.publish_function(
+                base_manifest,
+                run_result,
+                publisher,
+                generated_at_utc=base_manifest.generated_at_utc,
+                valid_until_utc=base_manifest.valid_until_utc,
+                evaluated_at_utc=evaluated_at_utc,
+            )
+        except self.error_type as error:
+            raise _GateDOperationalError(
+                cast(Any, error).error_code
+            ) from error
+        if type(publication) is not self.publication_result_type:
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        snapshot = cast(Any, publication).snapshot
+        if type(snapshot) is not RetrievalCapabilitySnapshot:
+            raise TypeError("Core Gate D publication returned invalid snapshot")
+        return _GateDExecutionResult(snapshot=snapshot)
+
+
+@final
+class _RealGateDExecution:
+    """Load and invoke the pinned offline Core owner on the worker thread."""
+
+    __slots__ = ()
+
+    def run_and_publish(
+        self,
+        *,
+        base_manifest: RetrievalCapabilityManifest,
+        publisher: RetrievalCapabilityPublisher,
+        contract_path: Path,
+        work_root: Path,
+        evidence_path: Path,
+        evaluated_at_utc: datetime,
+    ) -> _GateDExecutionResult:
+        try:
+            binding = _CoreGateDBinding.capture()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            raise _GateDOperationalError(
+                "GATE_D.IMPLEMENTATION_CHANGED"
+            ) from error
+        return binding.run_and_publish(
+            base_manifest=base_manifest,
+            publisher=publisher,
+            contract_path=contract_path,
+            work_root=work_root,
+            evidence_path=evidence_path,
+            evaluated_at_utc=evaluated_at_utc,
+        )
+
+
+_REAL_GATE_D_EXECUTION = _RealGateDExecution()
+_REAL_GATE_D_EXECUTE = _REAL_GATE_D_EXECUTION.run_and_publish
+
+
+class GateDRunState(Enum):
+    """Safe lifecycle state; it never carries paths or evidence."""
+
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class GateDRunStatus:
+    """Safe immutable status of the process-local Gate D owner."""
+
+    epoch: int
+    state: GateDRunState
+    safe_code: str | None
+
+    def __post_init__(self) -> None:
+        _require_generation(self.epoch)
+        if type(self.state) is not GateDRunState:
+            raise TypeError("Gate D state must be GateDRunState")
+        if self.state is GateDRunState.FAILED:
+            if type(self.safe_code) is not str or not self.safe_code:
+                raise ValueError("failed Gate D status requires a safe code")
+        elif self.safe_code is not None:
+            raise ValueError("non-failed Gate D status cannot carry a code")
+
+
+@dataclass(frozen=True, slots=True)
+class _GateDGraphSnapshot:
+    """Private exact Gate C graph captured before one Gate D run."""
+
+    publisher: RetrievalCapabilityPublisher
+    service: TMRetrievalService
+    base_manifest: RetrievalCapabilityManifest
+    handoff: RetrievalHandoffSnapshot
+    capability: RetrievalCapabilitySnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -2153,6 +2440,21 @@ class RetrievalGateCValidationOwnerPort(Protocol):
         valid_until_utc: datetime,
         evaluated_at_utc: datetime,
     ) -> RetrievalHandoffSnapshot: ...
+
+
+@runtime_checkable
+class RetrievalGateDOwnerPort(Protocol):
+    """Composition-owner-only asynchronous Gate D lifecycle."""
+
+    def start_gate_d(
+        self,
+        *,
+        evaluated_at_utc: datetime,
+    ) -> GateDRunStatus: ...
+
+    def status(self) -> GateDRunStatus: ...
+
+    def wait(self, timeout: float | None = None) -> GateDRunStatus: ...
 
 
 @final
@@ -2338,8 +2640,8 @@ class CapabilityHost:
 
     Validation mutation is isolated behind composition-owner objects; the
     ordinary host surface accepts no evidence, manifest, caller flag, or store
-    health.  Gate C replaces the whole retrieval graph, while Gate D remains
-    in its later task.
+    health. Gate C replaces the whole retrieval graph; Gate D may refresh only
+    that same graph and republishes a read-only generation handoff.
     """
 
     __slots__ = (
@@ -2350,6 +2652,7 @@ class CapabilityHost:
         "__retrieval_notifications",
         "__retrieval_owner_identity",
         "__retrieval_checkout_identity",
+        "__retrieval_base_manifest",
         "__retrieval_publisher",
         "__retrieval_service",
         "__retrieval_handoff",
@@ -2391,6 +2694,9 @@ class CapabilityHost:
         self.__retrieval_validation_binding: (
             _CoreRetrievalValidationBinding | None
         ) = None
+        self.__retrieval_base_manifest: RetrievalCapabilityManifest | None = (
+            None
+        )
         self.__retrieval_notifications = _RetrievalGenerationNotifications(
             self.__lock,
             self.__retrieval_owner_identity,
@@ -2486,6 +2792,21 @@ class CapabilityHost:
             validation_binding=validation_binding,
         )
 
+    def _composition_gate_d_owner(
+        self,
+        composition_mint_identity: object,
+    ) -> _RetrievalGateDOwner:
+        """Mint the Gate D lifecycle only for application composition."""
+
+        if composition_mint_identity is not _COMPOSITION_MINT_IDENTITY:
+            raise PermissionError(
+                "Gate D owner mint requires application composition"
+            )
+        return _RetrievalGateDOwner(
+            host=self,
+            owner_identity=self.__retrieval_owner_identity,
+        )
+
     def _install_core_matcher(
         self,
         *,
@@ -2563,6 +2884,7 @@ class CapabilityHost:
         publisher: RetrievalCapabilityPublisher,
         service: TMRetrievalService,
         capability: RetrievalCapabilitySnapshot,
+        base_manifest: RetrievalCapabilityManifest,
     ) -> RetrievalHandoffSnapshot:
         """Atomically replace the full retrieval graph after Gate C."""
 
@@ -2581,6 +2903,8 @@ class CapabilityHost:
             raise TypeError("Gate C service must be TMRetrievalService")
         if type(capability) is not RetrievalCapabilitySnapshot:
             raise TypeError("Gate C capability must be a Core snapshot")
+        if type(base_manifest) is not RetrievalCapabilityManifest:
+            raise TypeError("Gate C base manifest must be a Core manifest")
         if cast(Any, service)._capability_publisher is not publisher:
             raise ValueError("Gate C service must retain the paired publisher")
         display = _retrieval_display(capability)
@@ -2608,8 +2932,84 @@ class CapabilityHost:
             )
             self.__retrieval_publisher = publisher
             self.__retrieval_service = service
+            self.__retrieval_base_manifest = base_manifest
             self.__retrieval_handoff = handoff
             self.__status = status
+            self.__retrieval_notifications._publish_locked(
+                self.__retrieval_owner_identity,
+                generation,
+            )
+            return handoff
+
+    def _capture_gate_d_graph(
+        self,
+        *,
+        owner_identity: object,
+    ) -> _GateDGraphSnapshot | None:
+        """Capture exactly one installed Gate C graph for a Gate D run."""
+
+        if owner_identity is not self.__retrieval_owner_identity:
+            raise PermissionError("Gate D capture requires composition owner")
+        with self.__lock:
+            manifest = self.__retrieval_base_manifest
+            if manifest is None:
+                return None
+            publisher = self.__retrieval_publisher
+            service = self.__retrieval_service
+            capability = publisher.snapshot()
+            if (
+                cast(Any, service)._capability_publisher is not publisher
+                or not capability.fuzzy_core.available
+            ):
+                return None
+            return _GateDGraphSnapshot(
+                publisher=publisher,
+                service=service,
+                base_manifest=manifest,
+                handoff=self.__retrieval_handoff,
+                capability=capability,
+            )
+
+    def _install_gate_d_capability(
+        self,
+        *,
+        owner_identity: object,
+        graph: _GateDGraphSnapshot,
+        capability: RetrievalCapabilitySnapshot,
+    ) -> RetrievalHandoffSnapshot | None:
+        """Publish one query-effective Gate D generation atomically."""
+
+        if owner_identity is not self.__retrieval_owner_identity:
+            raise PermissionError(
+                "Gate D publication requires composition owner"
+            )
+        if type(graph) is not _GateDGraphSnapshot:
+            raise TypeError("Gate D graph capture is invalid")
+        if type(capability) is not RetrievalCapabilitySnapshot:
+            raise TypeError("Gate D capability must be a Core snapshot")
+        display = _retrieval_display(capability)
+        with self.__lock:
+            if (
+                self.__retrieval_publisher is not graph.publisher
+                or self.__retrieval_service is not graph.service
+                or self.__retrieval_base_manifest is not graph.base_manifest
+                or self.__retrieval_handoff is not graph.handoff
+                or graph.publisher.snapshot() is not capability
+                or capability.context != graph.capability.context
+                or capability.fuzzy_core != graph.capability.fuzzy_core
+            ):
+                return None
+            generation = graph.handoff.generation + 1
+            handoff = RetrievalHandoffSnapshot(
+                generation=generation,
+                query_port=graph.handoff.query_port,
+                display=display,
+            )
+            self.__retrieval_handoff = handoff
+            self.__status = CapabilityDisplaySnapshot(
+                matcher=self.__matcher_handoff.display,
+                retrieval=display,
+            )
             self.__retrieval_notifications._publish_locked(
                 self.__retrieval_owner_identity,
                 generation,
@@ -2798,7 +3198,7 @@ class _RetrievalGateCValidationOwner:
                 return current
             if graph is None:
                 return current
-            publisher, service, capability = graph
+            publisher, service, capability, base_manifest = graph
             if (
                 not self.__checkout_identity.is_current()
                 or not self.__validation_binding.is_current()
@@ -2812,9 +3212,222 @@ class _RetrievalGateCValidationOwner:
                     publisher=publisher,
                     service=service,
                     capability=capability,
+                    base_manifest=base_manifest,
                 )
             except (OSError, RuntimeError, ValueError):
                 return current
+
+    def _is_bound_to(self, host: CapabilityHost) -> bool:
+        return self.__host is host
+
+
+@final
+class _RetrievalGateDOwner:
+    """Composition-private, process-local asynchronous Gate D owner."""
+
+    __slots__ = (
+        "__condition",
+        "__execute",
+        "__host",
+        "__owner_identity",
+        "__programmer_error",
+        "__retained_roots",
+        "__status",
+        "__thread",
+    )
+
+    def __init__(
+        self,
+        *,
+        host: CapabilityHost,
+        owner_identity: object,
+    ) -> None:
+        if type(host) is not CapabilityHost:
+            raise TypeError("Gate D owner requires CapabilityHost")
+        self.__host = host
+        self.__owner_identity = owner_identity
+        self.__execute = _REAL_GATE_D_EXECUTE
+        self.__condition = Condition(Lock())
+        self.__status = GateDRunStatus(
+            epoch=0,
+            state=GateDRunState.IDLE,
+            safe_code=None,
+        )
+        self.__thread: Thread | None = None
+        self.__programmer_error: Exception | None = None
+        self.__retained_roots: list[Path] = []
+
+    def start_gate_d(
+        self,
+        *,
+        evaluated_at_utc: datetime,
+    ) -> GateDRunStatus:
+        if (
+            type(evaluated_at_utc) is not datetime
+            or evaluated_at_utc.tzinfo is None
+            or evaluated_at_utc.utcoffset()
+            != timezone.utc.utcoffset(evaluated_at_utc)
+        ):
+            raise ValueError(
+                "Gate D evaluated_at_utc must be timezone-aware UTC"
+            )
+        graph = self.__host._capture_gate_d_graph(
+            owner_identity=self.__owner_identity,
+        )
+        with self.__condition:
+            if self.__status.state is GateDRunState.RUNNING:
+                return self.__status
+            if graph is None:
+                failed = GateDRunStatus(
+                    epoch=self.__status.epoch,
+                    state=GateDRunState.FAILED,
+                    safe_code="GATE_D.GATE_C_REQUIRED",
+                )
+                self.__status = failed
+                return failed
+            started = GateDRunStatus(
+                epoch=self.__status.epoch + 1,
+                state=GateDRunState.RUNNING,
+                safe_code=None,
+            )
+            self.__status = started
+            self.__programmer_error = None
+            thread = Thread(
+                target=self.__run,
+                kwargs={
+                    "epoch": started.epoch,
+                    "graph": graph,
+                    "evaluated_at_utc": evaluated_at_utc,
+                },
+                name=f"LocalCAT-GateD-{started.epoch}",
+                daemon=True,
+            )
+            self.__thread = thread
+            thread.start()
+            return started
+
+    def status(self) -> GateDRunStatus:
+        with self.__condition:
+            return self.__status
+
+    def wait(self, timeout: float | None = None) -> GateDRunStatus:
+        if timeout is not None:
+            if type(timeout) not in (int, float):
+                raise TypeError("Gate D timeout must be numeric")
+            numeric_timeout = float(timeout)
+            if not math.isfinite(numeric_timeout) or numeric_timeout < 0.0:
+                raise ValueError(
+                    "Gate D timeout must be finite and non-negative"
+                )
+        else:
+            numeric_timeout = None
+        with self.__condition:
+            self.__condition.wait_for(
+                lambda: self.__status.state is not GateDRunState.RUNNING,
+                timeout=numeric_timeout,
+            )
+            programmer_error = self.__programmer_error
+            status = self.__status
+        if programmer_error is not None:
+            raise programmer_error
+        return status
+
+    def __run(
+        self,
+        *,
+        epoch: int,
+        graph: _GateDGraphSnapshot,
+        evaluated_at_utc: datetime,
+    ) -> None:
+        try:
+            raw_root = tempfile.mkdtemp(
+                prefix="localcat-gate-d-",
+            )
+            work_root = Path(raw_root).resolve(strict=True)
+            os.chmod(work_root, 0o700)
+            mode = work_root.lstat().st_mode
+            if (
+                work_root.resolve(strict=True) != work_root
+                or not stat.S_ISDIR(mode)
+                or stat.S_IMODE(mode) != 0o700
+            ):
+                raise _GateDOperationalError(
+                    "GATE_D.WORK_ROOT_INVALID"
+                )
+            evidence_path = work_root / "benchmark_tm_evidence.json"
+            if evidence_path.exists():
+                raise _GateDOperationalError(
+                    "GATE_D.EVIDENCE_PATH_EXISTS"
+                )
+            self.__retained_roots.append(work_root)
+            result = self.__execute(
+                base_manifest=graph.base_manifest,
+                publisher=graph.publisher,
+                contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                work_root=work_root,
+                evidence_path=evidence_path,
+                evaluated_at_utc=evaluated_at_utc,
+            )
+            if type(result) is not _GateDExecutionResult:
+                raise TypeError("Gate D execution returned an invalid result")
+            installed = self.__host._install_gate_d_capability(
+                owner_identity=self.__owner_identity,
+                graph=graph,
+                capability=result.snapshot,
+            )
+            if installed is None:
+                raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
+        except _GateDOperationalError as error:
+            self.__finish(
+                GateDRunStatus(
+                    epoch=epoch,
+                    state=GateDRunState.FAILED,
+                    safe_code=error.error_code,
+                )
+            )
+            return
+        except OSError:
+            self.__finish(
+                GateDRunStatus(
+                    epoch=epoch,
+                    state=GateDRunState.FAILED,
+                    safe_code="GATE_D.WORK_ROOT_UNAVAILABLE",
+                )
+            )
+            return
+        except Exception as error:
+            self.__finish(
+                GateDRunStatus(
+                    epoch=epoch,
+                    state=GateDRunState.FAILED,
+                    safe_code="GATE_D.PROGRAMMER_ERROR",
+                ),
+                programmer_error=error,
+            )
+            return
+        self.__finish(
+            GateDRunStatus(
+                epoch=epoch,
+                state=GateDRunState.SUCCEEDED,
+                safe_code=None,
+            )
+        )
+
+    def __finish(
+        self,
+        status: GateDRunStatus,
+        *,
+        programmer_error: Exception | None = None,
+    ) -> None:
+        with self.__condition:
+            if (
+                self.__status.state is not GateDRunState.RUNNING
+                or self.__status.epoch != status.epoch
+            ):
+                return
+            self.__status = status
+            self.__programmer_error = programmer_error
+            self.__condition.notify_all()
 
     def _is_bound_to(self, host: CapabilityHost) -> bool:
         return self.__host is host
@@ -2829,6 +3442,7 @@ class CapabilityHostComposition:
     retrieval_gate_c_validation_owner: (
         RetrievalGateCValidationOwnerPort | None
     ) = None
+    retrieval_gate_d_owner: RetrievalGateDOwnerPort | None = None
 
     def __post_init__(self) -> None:
         if type(self.host) is not CapabilityHost:
@@ -2851,6 +3465,10 @@ class CapabilityHostComposition:
             raise ValueError(
                 "Gate C validation owner must be bound to this host"
             )
+        if type(self.retrieval_gate_d_owner) is not _RetrievalGateDOwner:
+            raise TypeError("Gate D owner must be host-owned")
+        if not self.retrieval_gate_d_owner._is_bound_to(self.host):
+            raise ValueError("Gate D owner must be bound to this host")
 
 
 def compose_capability_host(
@@ -2873,6 +3491,9 @@ def compose_capability_host(
             checkout_identity=retrieval_checkout,
             validation_binding=retrieval_binding,
         ),
+        retrieval_gate_d_owner=host._composition_gate_d_owner(
+            _COMPOSITION_MINT_IDENTITY,
+        ),
     )
 
 
@@ -2880,10 +3501,13 @@ __all__ = [
     "CapabilityHostComposition",
     "CapabilityDisplaySnapshot",
     "CapabilityHost",
+    "GateDRunState",
+    "GateDRunStatus",
     "MatcherGenerationNotificationPort",
     "MatcherHandoffSnapshot",
     "MatcherValidationOwnerPort",
     "RetrievalGateCValidationOwnerPort",
+    "RetrievalGateDOwnerPort",
     "RetrievalGenerationNotificationPort",
     "RetrievalHandoffSnapshot",
     "RetrievalQueryPort",
