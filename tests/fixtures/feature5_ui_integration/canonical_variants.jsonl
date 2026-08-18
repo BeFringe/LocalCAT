@@ -1,0 +1,6 @@
+{"source":"aabba","target":"context-variant","speaker":"Narrator"}
+{"source":"aabba","target":"exact-variant","speaker":"Other"}
+{"source":"abbaa","target":"high-fuzzy"}
+{"source":"bbaab","target":"boundary-fuzzy"}
+{"source":"bbbaa","target":"below-threshold"}
+{"source":"AABBA","target":"one-hundred-fuzzy"}
