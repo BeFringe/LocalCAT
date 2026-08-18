@@ -2,19 +2,21 @@
 
 本文件为 `feature5-ui-integration` 的跨 Spec 实施提供累计评审地图。它参照 Feature 5 Core 的 `feature5-review-clustering.md`，但不复制或改写 Core Gate A～D、Matcher Gate、产品 Requirements 或 task ownership。
 
-本轮所有 implementer 与 reviewer 均使用原生 subagent。评审集群的目的，是让 reviewer 在共享状态机、故障模型或 UI 旅程完整闭合后读取 `cluster-base..cluster-tip` 的累计补丁；它不是减少测试、取消逐任务 review 或把相邻 Spec checkbox 改记到 Integration 的理由。
+本轮实际 dispatch 的 implementer 与 reviewer 均使用原生 subagent。评审集群的目的，是让 reviewer 在共享状态机、故障模型或 UI 旅程完整闭合后读取 `cluster-base..cluster-tip` 的累计补丁；它不减少 task-focused validation，也不把相邻 Spec checkbox 改记到 Integration。与 Feature 5 Core 的集群节奏一致，普通子任务不机械增加一次独立对抗评审；只有独立高风险缺陷已在本任务范围闭合、或累计 reviewer 给出 concrete finding 时，才按需增加定点评审。
 
-## 与 cc-sdd 单任务门的关系
+## 与 cc-sdd 子任务完成门的关系
 
 每个可执行子任务仍严格执行：
 
 1. fresh implementer 读取 owning Spec，形成 Task Brief 并完成 task-focused validation；
-2. fresh task reviewer 独立读取实际 diff 与 Spec，返回结构化 `APPROVED`；
-3. parent 以 fresh evidence 验证 completion，显式暂存 task 文件与 owning `tasks.md`，小步提交；
-4. 集群全部成员提交后，才 dispatch 一次额外的 cluster reviewer，读取累计 diff、共享不变量与故障矩阵；
+2. parent 以 fresh evidence 验证 completion，确认当前切片不留下由后续任务补齐的本任务不变量；
+3. parent 显式暂存 task 文件与 owning `tasks.md`，形成可审计的小步提交；
+4. 集群全部成员提交后，dispatch 一次 cluster reviewer，读取累计 diff、共享不变量与故障矩阵；
 5. cluster review 通过后运行 fresh cluster suite，并记录 base、tip 与退出证据。
 
-cluster reviewer 只读，不代替 task reviewer，也不取得产品或代码所有权。cluster rejection 的修正使用新的 implementer → task reviewer → completion verification → commit；随后由同一 cluster reviewer 对修正后的 tip 定点复验。
+cluster reviewer 只读，不取得产品或代码所有权。cluster rejection 的修正使用 implementer → task-focused validation → parent completion verification → 小步提交；随后由同一 cluster reviewer 对修正后的 tip 定点复验。若 concrete finding 本身构成独立、边界闭合的高风险切片，可额外 dispatch fresh task reviewer，但这不是固定次数门。
+
+cluster 准备时只做无痕语义事件自检。只有实现预期改变 authority、持久格式、发布协议、依赖方向或跨 Spec frozen contract，才停止实施并形成 ADR candidate；普通实现选择和评审补救只把相对既有 Implementation Note 的信息增量记录在 owning `tasks.md`。Steering disposition 在 Feature GO 对当前结构一次收束，不按 cluster 准备/闭合次数机械写流水账。
 
 ## 推理强度
 
@@ -51,7 +53,7 @@ Gate C/D 的名称与授权语义完全继承 Feature 5 Core。B2 只复审 Inte
 ## Base、tip 与进入条件
 
 - `cluster-base` 是该 cluster 首个 in-scope task commit 的父提交；`cluster-tip` 是最后一个 task 或修正提交。实际 full hash 写入 owning `tasks.md` 的 Implementation Notes 或 cluster review report，不反复改写本文件。
-- G0 只在 1.1～1.3 均通过单任务门且精确 dd7 merge 成为可追踪 parent 后闭合。
+- G0 只在 1.1～1.3 均通过 task completion 门且精确 dd7 merge 成为可追踪 parent 后闭合。
 - M 的 base 是 G0 已复审 tip；M 的 task、checkbox、commit 和 review evidence 全部归 `qt-editor-mvp` maintenance ledger。
 - A 的 base 是 M 已复审 tip；未通过 M 不得开始 2.1。
 - F 必须在 Q1 前闭合；Q1 base 是 F 已复审 tip，Q2 base 是 Q1 已复审 tip。
@@ -61,7 +63,7 @@ Gate C/D 的名称与授权语义完全继承 Feature 5 Core。B2 只复审 Inte
 
 任一 cluster 只有在以下条件同时满足时才可复审：
 
-1. 全部成员已经逐任务 `APPROVED`、fresh completion verified 并小步提交；
+1. 全部成员已经通过 task-focused checks、fresh completion verified 并小步提交；按需定点评审不得留有 unresolved finding；
 2. owning worktree 中不存在未分类的新改动，用户 WIP 与不相关 untracked 未被吸收；
 3. 共享状态机或 UI 旅程的正向、失败、stale/tamper 与恢复分支均已实现；
 4. task-focused checks 全绿，且已知外部失败被精确记录、未掩盖新增失败；
@@ -83,4 +85,5 @@ Gate C/D 的名称与授权语义完全继承 Feature 5 Core。B2 只复审 Inte
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| v2 | 2026-08-18 | 对齐 Feature 5 Core 集群节奏：子任务以 task-focused validation、parent completion 与小步提交闭合，簇末执行一次累计对抗评审；独立高风险缺陷才按需定点评审。同步采用无痕语义事件自检、五类 ADR 门、信息增量 Implementation Note 与 Feature GO 单次 Steering 收束。 |
 | v1 | 2026-08-17 | 参照 `75304b4` 建立 G0～R 跨 Spec 累计评审地图；保留逐任务 cc-sdd review 门；明确 Gate C/D authority 与 Checkpoint M/Q ownership。 |
