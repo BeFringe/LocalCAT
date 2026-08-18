@@ -14,7 +14,14 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEventLoop
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
+from PySide6.QtGui import QAction, QColor
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QToolButton,
+)
 
 from capability_host import CapabilityHost
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
@@ -98,11 +105,23 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         assert status is not None
         return status
 
-    def _action(self, dialog: QtSettingsDialog, resource_id: str) -> QPushButton:
-        action = dialog.findChild(QPushButton, f"tmLifecycle_{resource_id}")
+    def _action(self, dialog: QtSettingsDialog, resource_id: str) -> QAction:
+        action = dialog.findChild(QAction, f"tmLifecycleAction_{resource_id}")
         self.assertIsNotNone(action)
         assert action is not None
         return action
+
+    def _more(self, dialog: QtSettingsDialog, resource_id: str) -> QToolButton:
+        more = dialog.findChild(QToolButton, f"more_{resource_id}")
+        self.assertIsNotNone(more)
+        assert more is not None
+        return more
+
+    def _kind_state(self, dialog: QtSettingsDialog, resource_id: str) -> QLabel:
+        state = dialog.findChild(QLabel, f"tmKindState_{resource_id}")
+        self.assertIsNotNone(state)
+        assert state is not None
+        return state
 
     def _complete_operation(
         self,
@@ -156,6 +175,45 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             )
             self.assertIn("Legacy exact-only", self._status(dialog, resource_id).text())
             self.assertEqual(self._action(dialog, resource_id).text(), "激活 canonical")
+            self.assertIsNone(dialog.findChild(QPushButton, f"tmLifecycle_{resource_id}"))
+            kind_state = self._kind_state(dialog, resource_id)
+            self.assertEqual(kind_state.property("tm_semantics"), "legacy")
+            self.assertIn("Legacy exact-only", kind_state.accessibleName())
+            dialog.close()
+
+    def test_1180_render_has_one_tm_name_nonoverlapping_status_and_yellow_legacy_dot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, (resource_id,) = _controller(Path(temporary))
+            resource = controller.list_resources()[0]
+            dialog = QtSettingsDialog(controller)
+            dialog.resize(1180, 680)
+            dialog.show()
+            self._events()
+
+            table = dialog.active_table
+            row = next(
+                row
+                for row in range(table.rowCount())
+                if table.cellWidget(row, 3) is not None
+                and table.cellWidget(row, 3).objectName() == f"tmResource_{resource_id}"
+            )
+            name = dialog.findChild(QLabel, f"resourceName_{resource_id}")
+            status = self._status(dialog, resource_id)
+            state = self._kind_state(dialog, resource_id)
+            assert name is not None
+
+            self.assertIsNone(table.item(row, 3))
+            self.assertEqual(name.text(), resource.name)
+            self.assertFalse(name.geometry().intersects(status.geometry()))
+            self.assertFalse(table.cellWidget(row, 3).grab().toImage().isNull())
+            state_image = state.grab().toImage()
+            self.assertFalse(state_image.isNull())
+            self.assertEqual(
+                state_image.pixelColor(state_image.rect().center()),
+                QColor("#d59a00"),
+            )
             dialog.close()
 
     def test_cancelled_preflight_keeps_bytes_and_never_starts(self) -> None:
@@ -177,7 +235,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                     autospec=True,
                 ) as activate,
             ):
-                self._action(dialog, resource_id).click()
+                self._action(dialog, resource_id).trigger()
 
             self.assertEqual(question.call_count, 1)
             prompt = str(question.call_args.args[2])
@@ -224,13 +282,13 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                     side_effect=blocking_failure,
                 ),
             ):
-                self._action(dialog, resource_id).click()
+                self._action(dialog, resource_id).trigger()
                 self.assertTrue(entered.wait(5.0))
                 self._events()
                 action = self._action(dialog, resource_id)
                 self.assertFalse(action.isEnabled())
                 self.assertIn("激活中", self._status(dialog, resource_id).text())
-                action.click()
+                action.trigger()
                 self.assertEqual(calls, [resource_id])
                 release.set()
                 self._complete_operation(dialog, controller)
@@ -262,7 +320,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 return QMessageBox.StandardButton.Yes
 
             with patch.object(QMessageBox, "question", side_effect=confirm):
-                self._action(dialog, resource_id).click()
+                self._action(dialog, resource_id).trigger()
                 self._complete_operation(dialog, controller)
 
                 self.assertEqual(
@@ -273,6 +331,13 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 self.assertEqual(
                     self._action(dialog, resource_id).text(),
                     "重建 canonical",
+                )
+                canonical_state = self._kind_state(dialog, resource_id)
+                self.assertEqual(canonical_state.property("tm_semantics"), "canonical")
+                canonical_image = canonical_state.grab().toImage()
+                self.assertEqual(
+                    canonical_image.pixelColor(canonical_image.rect().center()),
+                    QColor("#2f9e44"),
                 )
 
                 _write_legacy(
@@ -285,8 +350,11 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                     self._status(dialog, resource_id).property("tm_mode"),
                     "SOURCE_DIVERGED",
                 )
+                diverged_state = self._kind_state(dialog, resource_id)
+                self.assertEqual(diverged_state.property("tm_semantics"), "canonical")
+                self.assertIn("last-known-good", diverged_state.accessibleName())
 
-                self._action(dialog, resource_id).click()
+                self._action(dialog, resource_id).trigger()
                 self._complete_operation(dialog, controller)
 
             self.assertEqual(len(prompts), 2)
@@ -354,6 +422,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self.assertIn("Unavailable", unavailable.text())
             self.assertNotIn(str(missing.path), unavailable.text())
             self.assertFalse(self._action(dialog, missing_id).isEnabled())
+            unavailable_state = self._kind_state(dialog, missing_id)
+            self.assertEqual(unavailable_state.property("tm_semantics"), "unavailable")
             dialog.close()
 
     def test_unknown_preflight_exception_is_sanitized(self) -> None:
@@ -368,7 +438,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 autospec=True,
                 side_effect=RuntimeError(secret),
             ):
-                self._action(dialog, resource_id).click()
+                self._action(dialog, resource_id).trigger()
 
             feedback = dialog.status_label.text()
             self.assertIn("无法开始", feedback)

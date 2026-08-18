@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, QPersistentModelIndex, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -146,6 +146,9 @@ _TM_SAFE_REASON_LABELS = {
     "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING": "Fuzzy 性能尚未开放",
 }
 _TM_ACTION_EXCEPTION_SAFE_CODES = frozenset(_TM_SAFE_REASON_LABELS)
+_TM_KIND_LEGACY_COLOR = "#d59a00"
+_TM_KIND_CANONICAL_COLOR = "#2f9e44"
+_TM_KIND_UNAVAILABLE_COLOR = "#8291a1"
 
 
 def _tm_safe_reason(code: str | None) -> str:
@@ -371,7 +374,7 @@ class QtSettingsDialog(QDialog):
         table.setColumnWidth(4, 128)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        table.setColumnWidth(6, 154)
+        table.setColumnWidth(6, 128)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
         table.setColumnWidth(7, 32)
         full_cell_delegate = _FullCellWidgetDelegate(table)
@@ -417,7 +420,7 @@ class QtSettingsDialog(QDialog):
             status_by_resource_id=status_by_resource_id,
             operation=operation,
         )
-        self._refresh_tm_lifecycle_tab_order(resources)
+        self._refresh_resource_menu_tab_order(resources)
         if operation is not None and not operation.completed:
             self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
         else:
@@ -425,23 +428,23 @@ class QtSettingsDialog(QDialog):
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
             )
 
-    def _refresh_tm_lifecycle_tab_order(
+    def _refresh_resource_menu_tab_order(
         self,
         resources: tuple[ResourceConfig, ...],
     ) -> None:
-        """Keep enabled lifecycle actions reachable outside table cell navigation."""
+        """Keep each resource menu reachable outside table cell navigation."""
 
-        actions: list[QPushButton] = []
+        menus: list[QToolButton] = []
         for resource in resources:
-            action = self.findChild(QPushButton, f"tmLifecycle_{resource.id}")
-            if action is not None and action.isEnabled():
-                actions.append(action)
-        if not actions:
+            more = self.findChild(QToolButton, f"more_{resource.id}")
+            if more is not None and more.isEnabled():
+                menus.append(more)
+        if not menus:
             return
         previous: QWidget = self.tm_threshold_chip
-        for action in actions:
-            self.setTabOrder(previous, action)
-            previous = action
+        for more in menus:
+            self.setTabOrder(previous, more)
+            previous = more
         self.setTabOrder(previous, self.active_table)
 
     def _refresh_tm_threshold_entry(self) -> None:
@@ -486,11 +489,23 @@ class QtSettingsDialog(QDialog):
     ) -> None:
         for widget in table.findChildren(QWidget):
             if widget.objectName().startswith(
-                ("tmResource_", "resourceName_", "tmStatus_", "tmLifecycle_")
+                (
+                    "tmResource_",
+                    "resourceName_",
+                    "tmStatus_",
+                    "tmKindCell_",
+                    "tmKindState_",
+                    "resourceKind_",
+                    "more_",
+                )
             ):
-                if isinstance(widget, QPushButton):
+                if isinstance(widget, (QPushButton, QToolButton)):
                     widget.setEnabled(False)
                 widget.setObjectName("")
+        for action in table.findChildren(QAction):
+            if action.objectName().startswith("tmLifecycleAction_"):
+                action.setEnabled(False)
+                action.setObjectName("")
         table.clearContents()
         table.setRowCount(len(resources))
         for row, resource in enumerate(resources):
@@ -514,7 +529,6 @@ class QtSettingsDialog(QDialog):
                 holder_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 holder_layout.addWidget(checkbox)
                 table.setCellWidget(row, column, holder)
-            table.setItem(row, 3, QTableWidgetItem(resource.name))
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 table.setCellWidget(
                     row,
@@ -525,12 +539,24 @@ class QtSettingsDialog(QDialog):
                         operation=operation,
                     ),
                 )
+            else:
+                table.setItem(row, 3, QTableWidgetItem(resource.name))
             kind_label = (
                 "翻译记忆库"
                 if resource.kind is ResourceKind.TRANSLATION_MEMORY
                 else "术语表"
             )
-            table.setItem(row, 4, QTableWidgetItem(kind_label))
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                table.setCellWidget(
+                    row,
+                    4,
+                    self._make_tm_kind_cell(
+                        resource,
+                        status_by_resource_id.get(resource.id),
+                    ),
+                )
+            else:
+                table.setItem(row, 4, QTableWidgetItem(kind_label))
             path_item = QTableWidgetItem(str(resource.path))
             path_item.setToolTip(str(resource.path))
             table.setItem(row, 5, path_item)
@@ -541,7 +567,7 @@ class QtSettingsDialog(QDialog):
             )
             import_button.setObjectName(f"import_{resource.id}")
             import_button.setProperty("resource_id", resource.id)
-            import_button.setMinimumWidth(126)
+            import_button.setMinimumWidth(112)
             import_button.clicked.connect(
                 lambda _checked=False, configured=resource: self._prompt_import(configured)
             )
@@ -552,6 +578,26 @@ class QtSettingsDialog(QDialog):
             more_button.setToolTip(f"{resource.name} 的更多操作")
             more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             menu = QMenu(more_button)
+            menu.setObjectName(f"resourceMenu_{resource.id}")
+            menu.setAccessibleName(f"{resource.name} 的更多操作菜单")
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                action_text, action_tooltip, can_start = self._tm_lifecycle_action_spec(
+                    status_by_resource_id.get(resource.id),
+                )
+                lifecycle_action = menu.addAction(action_text)
+                lifecycle_action.setObjectName(f"tmLifecycleAction_{resource.id}")
+                lifecycle_action.setToolTip(action_tooltip)
+                lifecycle_action.setStatusTip(action_tooltip)
+                lifecycle_action.setEnabled(
+                    can_start
+                    and not (operation is not None and not operation.completed)
+                )
+                lifecycle_action.triggered.connect(
+                    lambda _checked=False, resource_id=resource.id: self._request_tm_lifecycle(
+                        resource_id
+                    )
+                )
+                menu.addSeparator()
             delete_action = menu.addAction("删除资源")
             delete_action.setObjectName(f"delete_{resource.id}")
             delete_action.triggered.connect(
@@ -575,6 +621,109 @@ class QtSettingsDialog(QDialog):
             table.setCellWidget(row, 7, more_button)
         table.resizeRowsToContents()
 
+    @staticmethod
+    def _tm_kind_projection(
+        status: TMResourceStatus | None,
+    ) -> tuple[str, str, str]:
+        """Return one safe, non-authoritative lifecycle marker projection."""
+
+        if status is None:
+            return (
+                "unavailable",
+                _TM_KIND_UNAVAILABLE_COLOR,
+                "状态暂不可用",
+            )
+        if status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            return (
+                "legacy",
+                _TM_KIND_LEGACY_COLOR,
+                "Legacy exact-only",
+            )
+        if status.mode in (
+            TMResourceDisplayMode.CANONICAL_ACTIVE,
+            TMResourceDisplayMode.SOURCE_DIVERGED,
+        ) or (
+            status.mode is TMResourceDisplayMode.DEGRADED
+            and status.exact_available
+        ):
+            description = (
+                "Canonical active"
+                if status.mode is TMResourceDisplayMode.CANONICAL_ACTIVE
+                else "Canonical last-known-good"
+            )
+            return (
+                "canonical",
+                _TM_KIND_CANONICAL_COLOR,
+                description,
+            )
+        return (
+            "unavailable",
+            _TM_KIND_UNAVAILABLE_COLOR,
+            _TM_MODE_LABELS[status.mode],
+        )
+
+    def _make_tm_kind_cell(
+        self,
+        resource: ResourceConfig,
+        status: TMResourceStatus | None,
+    ) -> QWidget:
+        semantics, color, description = self._tm_kind_projection(status)
+        holder = QWidget()
+        holder.setObjectName(f"tmKindCell_{resource.id}")
+        holder.setAccessibleName(f"翻译记忆库：{description}")
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(8, 0, 6, 0)
+        layout.setSpacing(7)
+
+        state = QLabel()
+        state.setObjectName(f"tmKindState_{resource.id}")
+        state.setProperty("tm_semantics", semantics)
+        state.setFixedSize(10, 10)
+        state.setStyleSheet(
+            f"background-color: {color}; border: none; border-radius: 5px;"
+        )
+        state.setAccessibleName(f"翻译记忆库：{description} 状态点")
+        state.setToolTip(state.accessibleName())
+        layout.addWidget(state)
+
+        kind = QLabel("翻译记忆库")
+        kind.setObjectName(f"resourceKind_{resource.id}")
+        kind.setToolTip(description)
+        layout.addWidget(kind, 1)
+        return holder
+
+    @staticmethod
+    def _tm_lifecycle_action_spec(
+        status: TMResourceStatus | None,
+    ) -> tuple[str, str, bool]:
+        if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            return (
+                "激活 canonical",
+                "显式检查并激活 canonical TM",
+                True,
+            )
+        if status is not None and (
+            status.mode
+            in (
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+            )
+            or (
+                status.mode is TMResourceDisplayMode.DEGRADED
+                and status.exact_available
+            )
+        ):
+            return (
+                "重建 canonical",
+                "显式重建 canonical TM，失败时保留 last-known-good",
+                True,
+            )
+        return (
+            "Canonical 不可用",
+            "当前状态不允许启动 canonical 操作",
+            False,
+        )
+
     def _make_tm_resource_cell(
         self,
         resource: ResourceConfig,
@@ -592,9 +741,6 @@ class QtSettingsDialog(QDialog):
         name.setObjectName(f"resourceName_{resource.id}")
         layout.addWidget(name)
 
-        lifecycle = QHBoxLayout()
-        lifecycle.setContentsMargins(0, 0, 0, 0)
-        lifecycle.setSpacing(8)
         status_label = QLabel()
         status_label.setObjectName(f"tmStatus_{resource.id}")
         status_label.setSizePolicy(
@@ -602,21 +748,8 @@ class QtSettingsDialog(QDialog):
             QSizePolicy.Policy.Preferred,
         )
         status_label.setWordWrap(True)
-        lifecycle.addWidget(status_label, 1)
+        layout.addWidget(status_label)
 
-        action = QPushButton()
-        action.setObjectName(f"tmLifecycle_{resource.id}")
-        action.setProperty("resource_id", resource.id)
-        action.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        action.clicked.connect(
-            lambda _checked=False, resource_id=resource.id: self._request_tm_lifecycle(
-                resource_id
-            )
-        )
-        lifecycle.addWidget(action)
-        layout.addLayout(lifecycle)
-
-        running = operation is not None and not operation.completed
         target_running = (
             operation is not None
             and not operation.completed
@@ -650,30 +783,6 @@ class QtSettingsDialog(QDialog):
         status_label.setAccessibleName(status_accessible_name)
         status_label.setToolTip(status_accessible_name)
 
-        if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
-            action.setText("激活 canonical")
-            action.setToolTip("显式检查并激活 canonical TM")
-            can_start = True
-        elif status is not None and (
-            status.mode
-            in (
-                TMResourceDisplayMode.CANONICAL_ACTIVE,
-                TMResourceDisplayMode.SOURCE_DIVERGED,
-            )
-            or (
-                status.mode is TMResourceDisplayMode.DEGRADED
-                and status.exact_available
-            )
-        ):
-            action.setText("重建 canonical")
-            action.setToolTip("显式重建 canonical TM，失败时保留 last-known-good")
-            can_start = True
-        else:
-            action.setText("Canonical 不可用")
-            action.setToolTip("当前状态不允许启动 canonical 操作")
-            can_start = False
-        action.setAccessibleName(f"{resource.name}：{action.text()}")
-        action.setEnabled(can_start and not running)
         return holder
 
     def _request_tm_lifecycle(self, resource_id: str) -> None:

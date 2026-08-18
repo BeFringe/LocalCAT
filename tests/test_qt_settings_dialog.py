@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QHeaderView,
+    QLabel,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -61,14 +62,22 @@ class QtSettingsDialogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = self._controller(Path(temp_dir))
             dialog = QtSettingsDialog(controller)
+            active = next(
+                resource
+                for resource in controller.list_resources()
+                if resource.name == "Primary TM"
+            )
 
             self.assertEqual(dialog.active_table.rowCount(), 1)
             self.assertEqual(dialog.inactive_table.rowCount(), 1)
             active_name = dialog.active_table.item(0, 3)
             inactive_name = dialog.inactive_table.item(0, 3)
-            assert active_name is not None
             assert inactive_name is not None
-            self.assertEqual(active_name.text(), "Primary TM")
+            self.assertIsNone(active_name)
+            tm_name = dialog.findChild(QLabel, f"resourceName_{active.id}")
+            self.assertIsNotNone(tm_name)
+            assert tm_name is not None
+            self.assertEqual(tm_name.text(), "Primary TM")
             self.assertEqual(inactive_name.text(), "Archive terms")
             dialog.close()
 
@@ -609,8 +618,8 @@ class QtSettingsDialogTest(unittest.TestCase):
             assert more_button is not None
 
             dialog.show()
-            for width in (860, 1040, 1320):
-                dialog.resize(width, 560)
+            for width, height in ((860, 560), (1180, 680), (1320, 680)):
+                dialog.resize(width, height)
                 self.app.processEvents()
                 import_left = import_button.mapTo(
                     table.viewport(),
@@ -625,6 +634,12 @@ class QtSettingsDialogTest(unittest.TestCase):
                 self.assertEqual(table.columnWidth(7), 32)
                 self.assertEqual(more_button.width(), 32)
                 self.assertEqual(gap, 0)
+                self.assertLessEqual(
+                    import_button.width() + more_button.width(),
+                    160,
+                )
+                self.assertFalse(import_button.grab().toImage().isNull())
+                self.assertFalse(more_button.grab().toImage().isNull())
 
             dialog.close()
 

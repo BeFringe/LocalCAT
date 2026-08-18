@@ -11,9 +11,16 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
+from PySide6.QtGui import QAction
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QToolButton,
+)
 
 from editor_contracts import EditorProject, EditorSegment
 from qt_editor_window import QtEditorWindow
@@ -211,7 +218,7 @@ class QtTMLayerBoundaryTests(unittest.TestCase):
             self.assertEqual(state.toolTip(), state.text())
             window.close()
 
-    def test_lifecycle_state_and_action_have_keyboard_contracts(self) -> None:
+    def test_lifecycle_state_and_more_menu_have_keyboard_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, (resource_id,) = _lifecycle_controller(Path(temporary))
             dialog = QtSettingsDialog(controller)
@@ -219,38 +226,52 @@ class QtTMLayerBoundaryTests(unittest.TestCase):
             self._events()
 
             state = dialog.findChild(QLabel, f"tmStatus_{resource_id}")
-            action = dialog.findChild(QPushButton, f"tmLifecycle_{resource_id}")
+            more = dialog.findChild(QToolButton, f"more_{resource_id}")
+            action = dialog.findChild(QAction, f"tmLifecycleAction_{resource_id}")
             self.assertIsNotNone(state)
+            self.assertIsNotNone(more)
             self.assertIsNotNone(action)
             assert state is not None
+            assert more is not None
             assert action is not None
             self.assertTrue(state.accessibleName())
             self.assertTrue(state.toolTip())
-            self.assertTrue(action.accessibleName())
+            self.assertTrue(more.accessibleName())
+            self.assertTrue(more.toolTip())
+            self.assertTrue(action.objectName())
             self.assertTrue(action.toolTip())
-            self.assertEqual(action.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+            self.assertEqual(more.focusPolicy(), Qt.FocusPolicy.StrongFocus)
 
             dialog.tm_threshold_chip.setFocus()
             for _step in range(16):
-                if action.hasFocus():
+                if more.hasFocus():
                     break
                 focused = QApplication.focusWidget()
                 self.assertIsNotNone(focused)
                 assert focused is not None
                 QTest.keyClick(focused, Qt.Key.Key_Tab)
                 self._events()
-            self.assertTrue(action.hasFocus())
+            self.assertTrue(more.hasFocus())
 
             persistent_state = state.text()
+            menu = more.menu()
+            self.assertIsNotNone(menu)
+            assert menu is not None
+
+            def activate_lifecycle_action() -> None:
+                menu.setActiveAction(action)
+                QTest.keyClick(menu, Qt.Key.Key_Return)
+
             with patch.object(
                 QMessageBox,
                 "question",
                 return_value=QMessageBox.StandardButton.Cancel,
             ) as confirm:
-                action.setFocus()
-                QTest.keyClick(action, Qt.Key.Key_Return)
-                action.setFocus()
-                QTest.keyClick(action, Qt.Key.Key_Space)
+                for key in (Qt.Key.Key_Return, Qt.Key.Key_Space):
+                    more.setFocus()
+                    QTimer.singleShot(0, activate_lifecycle_action)
+                    QTest.keyClick(more, key)
+                    self._events()
             self.assertEqual(confirm.call_count, 2)
             self.assertEqual(state.text(), persistent_state)
             self.assertIn("已取消", dialog.status_label.text())
