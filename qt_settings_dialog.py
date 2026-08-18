@@ -22,9 +22,11 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPainter,
     QResizeEvent,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -222,6 +224,53 @@ class _FullCellWidgetDelegate(QStyledItemDelegate):
         _index: QModelIndex | QPersistentModelIndex,
     ) -> None:
         editor.setGeometry(option.rect)
+
+
+class _ResourceTable(QTableWidget):
+    """Hand wheel input to the outer resource scroller at inner boundaries."""
+
+    def __init__(self, rows: int, columns: int) -> None:
+        super().__init__(rows, columns)
+        self._wheel_handoff_target: QScrollArea | None = None
+
+    def set_wheel_handoff_target(self, target: QScrollArea) -> None:
+        self._wheel_handoff_target = target
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        pixel_delta = event.pixelDelta().y()
+        vertical_delta = pixel_delta or event.angleDelta().y()
+        scrollbar = self.verticalScrollBar()
+        at_boundary = (
+            vertical_delta < 0 and scrollbar.value() >= scrollbar.maximum()
+        ) or (
+            vertical_delta > 0 and scrollbar.value() <= scrollbar.minimum()
+        )
+        target = self._wheel_handoff_target
+        if vertical_delta == 0 or not at_boundary or target is None:
+            super().wheelEvent(event)
+            return
+
+        if pixel_delta:
+            target_scrollbar = target.verticalScrollBar()
+            target_scrollbar.setValue(target_scrollbar.value() - pixel_delta)
+            event.accept()
+            return
+
+        target_position = target.viewport().mapFromGlobal(
+            event.globalPosition().toPoint()
+        )
+        forwarded = QWheelEvent(
+            QPointF(target_position),
+            event.globalPosition(),
+            event.pixelDelta(),
+            event.angleDelta(),
+            event.buttons(),
+            event.modifiers(),
+            event.phase(),
+            event.inverted(),
+        )
+        QApplication.sendEvent(target.viewport(), forwarded)
+        event.accept()
 
 
 class ImportWorker(QThread):
@@ -474,6 +523,8 @@ class QtSettingsDialog(QDialog):
         inactive_layout = QVBoxLayout(inactive_group)
         self.inactive_table = self._make_table("inactiveResourcesTable")
         inactive_layout.addWidget(self.inactive_table)
+        self.active_table.set_wheel_handoff_target(self.resource_tables_scroll)
+        self.inactive_table.set_wheel_handoff_target(self.resource_tables_scroll)
         resource_tables_layout.addWidget(inactive_group)
         resource_tables_layout.addStretch()
         self.resource_tables_scroll.setWidget(self.resource_tables_content)
@@ -508,8 +559,8 @@ class QtSettingsDialog(QDialog):
         self.setStyleSheet(_SETTINGS_STYLE)
 
     @staticmethod
-    def _make_table(object_name: str) -> QTableWidget:
-        table = QTableWidget(0, 8)
+    def _make_table(object_name: str) -> _ResourceTable:
+        table = _ResourceTable(0, 8)
         table.setObjectName(object_name)
         table.setHorizontalHeaderLabels(
             ["Active", "Lookup", "Update", "名称", "类型", "本地路径", "导入", ""]

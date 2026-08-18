@@ -14,8 +14,17 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QImage
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEventLoop,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -200,6 +209,27 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             f"{label.objectName()} clips {label.text()!r} at {contents.size().toTuple()}",
         )
         self.assertTrue(label.wordWrap())
+
+    def _wheel(
+        self,
+        receiver: QObject,
+        *,
+        angle_y: int = 0,
+        pixel_y: int = 0,
+    ) -> QWheelEvent:
+        event = QWheelEvent(
+            QPointF(10, 10),
+            QPointF(10, 10),
+            QPoint(0, pixel_y),
+            QPoint(0, angle_y),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(receiver, event)
+        self._events()
+        return event
 
     def _complete_operation(
         self,
@@ -730,6 +760,91 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                     self._events()
                     self.assertEqual(opened, [True])
                     last_more.menu().aboutToShow.disconnect(close_menu)
+            dialog.close()
+
+    def test_wheel_hands_off_between_inner_tables_and_outer_resource_scroll(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, resource_ids = _controller(Path(temporary), resources=6)
+            for resource_id in resource_ids[4:]:
+                resource = next(
+                    configured
+                    for configured in controller.list_resources()
+                    if configured.id == resource_id
+                )
+                controller.update_resource(replace(resource, active=False))
+
+            dialog = QtSettingsDialog(controller)
+            dialog.resize(860, 560)
+            dialog.show()
+            self._events()
+            active_inner = dialog.active_table.verticalScrollBar()
+            inactive_inner = dialog.inactive_table.verticalScrollBar()
+            outer = dialog.resource_tables_scroll.verticalScrollBar()
+            self.assertGreater(active_inner.maximum(), 0)
+            self.assertEqual(inactive_inner.maximum(), 0)
+            self.assertGreater(outer.maximum(), 0)
+            active_inner.setValue(active_inner.minimum())
+            outer.setValue(outer.minimum())
+
+            self._wheel(dialog.active_table.viewport(), angle_y=-120)
+            self.assertGreater(active_inner.value(), active_inner.minimum())
+            self.assertEqual(outer.value(), outer.minimum())
+            while active_inner.value() < active_inner.maximum():
+                self._wheel(dialog.active_table.viewport(), angle_y=-120)
+            self.assertEqual(active_inner.value(), active_inner.maximum())
+
+            self._wheel(dialog.active_table.viewport(), angle_y=-120)
+            self.assertGreater(outer.value(), outer.minimum())
+            for _ in range(12):
+                self._wheel(dialog.active_table.viewport(), angle_y=-120)
+            self.assertEqual(outer.value(), outer.maximum())
+            last_inactive_more = self._more(dialog, resource_ids[-1])
+            self.assertEqual(
+                last_inactive_more.visibleRegion().boundingRect(),
+                last_inactive_more.rect(),
+            )
+
+            inner_at_boundary = active_inner.value()
+            outer_at_boundary = outer.value()
+            self._wheel(dialog.active_table.viewport(), angle_y=-120)
+            self.assertEqual(active_inner.value(), inner_at_boundary)
+            self.assertEqual(outer.value(), outer_at_boundary)
+
+            self._wheel(dialog.inactive_table.viewport(), angle_y=120)
+            self.assertLess(outer.value(), outer.maximum())
+            outer.setValue(outer.maximum())
+            self._wheel(dialog.inactive_table.viewport(), pixel_y=48)
+            self.assertLess(outer.value(), outer.maximum())
+            self.assertEqual(inactive_inner.value(), inactive_inner.minimum())
+            for _ in range(20):
+                self._wheel(dialog.inactive_table.viewport(), pixel_y=48)
+            self.assertEqual(outer.value(), outer.minimum())
+            active_group = dialog.active_table.parentWidget()
+            self.assertIsNotNone(active_group)
+            assert active_group is not None
+            self.assertEqual(active_group.geometry().top(), 0)
+            self._wheel(dialog.active_table.viewport(), angle_y=120)
+            self.assertLess(active_inner.value(), active_inner.maximum())
+            self.assertEqual(outer.value(), outer.minimum())
+            while active_inner.value() > active_inner.minimum():
+                self._wheel(dialog.active_table.viewport(), angle_y=120)
+            first_active_more = self._more(dialog, resource_ids[0])
+            self.assertEqual(
+                first_active_more.visibleRegion().boundingRect(),
+                first_active_more.rect(),
+            )
+
+            self._wheel(dialog.inactive_table.viewport(), pixel_y=48)
+            self.assertEqual(outer.value(), outer.minimum())
+            self._wheel(dialog.inactive_table.viewport(), pixel_y=-48)
+            self.assertGreater(outer.value(), outer.minimum())
+            outer.setValue(outer.minimum())
+            self.assertEqual(
+                dialog.close_button.visibleRegion().boundingRect(),
+                dialog.close_button.rect(),
+            )
             dialog.close()
 
     def test_unknown_preflight_exception_is_sanitized(self) -> None:
