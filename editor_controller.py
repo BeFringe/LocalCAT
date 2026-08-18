@@ -20,6 +20,7 @@ from editor_contracts import (
     EditorSegment,
     ImportReport,
     ImportRequest,
+    ProjectToolCapability,
     ResourceConfig,
     ResourceKind,
     RecentProject,
@@ -38,7 +39,12 @@ from editor_contracts import (
     WriteReport,
 )
 from editor_tm_adapter import EditorTMAdapter, _TMQueryGenerationChanged
-from editor_project import load_project, sample_project, save_project as save_project_file
+from editor_project import (
+    ProjectError,
+    load_project,
+    sample_project,
+    save_project as save_project_file,
+)
 from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
@@ -686,10 +692,42 @@ class EditorController:
         segments = self.project.segments
         return self.confirmed_count / len(segments) if segments else 0.0
 
+    def project_tool_capability(self) -> ProjectToolCapability:
+        """Project the single-JSON tool gate from the sole project session."""
+
+        with self._tm_query_lock:
+            project = self._project
+            if project is None:
+                return ProjectToolCapability(
+                    project_session_id=None,
+                    single_json_tools_available=False,
+                    project_kind="none",
+                    unavailable_reason="PROJECT_TOOLS.NO_PROJECT",
+                )
+
+            path = project.path
+            project_kind = (
+                "sample"
+                if path is None
+                else path.suffix.removeprefix(".").lower() or "unknown"
+            )
+            available = path is not None and path.suffix.lower() == ".json"
+            return ProjectToolCapability(
+                project_session_id=self._project_session_id,
+                single_json_tools_available=available,
+                project_kind="json" if available else project_kind,
+                unavailable_reason=(
+                    None if available else "PROJECT_TOOLS.JSON_REQUIRED"
+                ),
+            )
+
     def open_project(self, path: Path) -> EditorProject:
         """Load a local JSON/TXT project and reset navigation only after success."""
 
-        project = load_project(path)
+        try:
+            project = load_project(path)
+        except ProjectError as exc:
+            raise EditorControllerError("PROJECT.LOAD_FAILED") from exc
         with self._tm_query_lock:
             self.set_project(project)
             remembered = self.workspace_state.find_project(project.path or path)
@@ -793,7 +831,10 @@ class EditorController:
     def save_project(self, path: Path) -> EditorProject:
         """Atomically save the current project and clear the session dirty flag."""
 
-        saved_path = save_project_file(self.project, path)
+        try:
+            saved_path = save_project_file(self.project, path)
+        except ProjectError as exc:
+            raise EditorControllerError("PROJECT.SAVE_FAILED") from exc
         self._project = replace(self.project, path=saved_path)
         self._dirty = False
         self._remember_current_position()

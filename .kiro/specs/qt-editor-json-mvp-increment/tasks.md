@@ -95,7 +95,7 @@
 
 - [ ] 3. 在 EditorController 中闭合会话与事务
 
-- [ ] 3.1a 建立项目 session 与单 JSON capability
+- [x] 3.1a 建立项目 session 与单 JSON capability
   - 在成功安装、打开、切换或关闭项目时维护 session identity
   - 只有扩展名不区分大小写为 JSON 的项目启用本规格项目工具；TXT 与无路径 sample 保持可打开但工具明确不可用
   - 项目 codec 错误统一转换为 Controller 错误
