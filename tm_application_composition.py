@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Callable, Protocol, TypeGuard, cast, final
+from typing import Callable, Protocol, TypeGuard, TypeVar, cast, final
 
 from editor_contracts import (
     ResourceConfig,
@@ -38,10 +38,18 @@ from tm_sqlite_store import (
 
 
 _PATH_UNAVAILABLE_CODE = "TM.RUNTIME.PATH_UNAVAILABLE"
+
+
+_OperationResultT = TypeVar("_OperationResultT")
 _CANONICAL_AUTHORITY_UNAVAILABLE_CODE = (
     "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE"
 )
 _OPEN_UNAVAILABLE_CODE = "TM.RUNTIME.OPEN_UNAVAILABLE"
+
+
+@final
+class _RuntimeGenerationChanged(RuntimeError):
+    """Application-private signal for a stale runtime commit reservation."""
 _SOURCE_BINDING_UNAVAILABLE_CODE = "TM.RUNTIME.SOURCE_BINDING_UNAVAILABLE"
 _QUERY_LEASE_UNAVAILABLE_CODE = "TM.RUNTIME.QUERY_LEASE_UNAVAILABLE"
 _CANONICAL_HEALTH_UNAVAILABLE_CODE = "TM.RUNTIME.CANONICAL_HEALTH_UNAVAILABLE"
@@ -547,6 +555,28 @@ class TMRuntimeHost:
             if type(generation) is not int or generation < 0:
                 raise ValueError("runtime generation drift")
             return generation
+
+    def _run_if_generation_current(
+        self,
+        generation: int,
+        operation: Callable[[], _OperationResultT],
+    ) -> _OperationResultT:
+        """Run one short application commit against an exact generation."""
+
+        if type(generation) is not int or generation < 0:
+            raise TypeError("runtime generation must be non-negative int")
+        if not callable(operation):
+            raise TypeError("runtime generation operation must be callable")
+        with self._lock:
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise _RuntimeGenerationChanged
+            if self._operation_template.generation != generation:
+                raise _RuntimeGenerationChanged
+            return operation()
 
     def refresh(
         self,

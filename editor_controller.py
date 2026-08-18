@@ -29,7 +29,7 @@ from editor_contracts import (
     TermSuggestion,
     WriteReport,
 )
-from editor_tm_adapter import EditorTMAdapter
+from editor_tm_adapter import EditorTMAdapter, _TMQueryGenerationChanged
 from editor_project import load_project, sample_project, save_project as save_project_file
 from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
@@ -74,6 +74,51 @@ def _clone_tm_suggestion_report(
     return cloned
 
 
+def _clone_tm_suggestion(suggestion: TMSuggestion) -> TMSuggestion:
+    """Capture one exact suggestion graph before membership comparison."""
+
+    if type(suggestion) is not TMSuggestion:
+        raise TypeError("TM suggestion must be TMSuggestion")
+    suggestion.__post_init__()
+    identity = replace(suggestion.query_identity)
+    cloned = replace(
+        suggestion,
+        provenance=replace(suggestion.provenance),
+        query_identity=identity,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _tm_suggestion_fields_equal(
+    candidate: TMSuggestion,
+    issued: TMSuggestion,
+) -> bool:
+    """Compare every frozen membership field without trusting dataclass eq."""
+
+    return (
+        candidate.resource_id == issued.resource_id
+        and candidate.record_id == issued.record_id
+        and candidate.query_source == issued.query_source
+        and candidate.matched_source == issued.matched_source
+        and candidate.target == issued.target
+        and candidate.match_type is issued.match_type
+        and candidate.final_similarity == issued.final_similarity
+        and candidate.provenance.resource_name
+        == issued.provenance.resource_name
+        and candidate.provenance.resource_mode
+        is issued.provenance.resource_mode
+        and candidate.query_identity.project_session_id
+        == issued.query_identity.project_session_id
+        and candidate.query_identity.segment_id
+        == issued.query_identity.segment_id
+        and candidate.query_identity.source_digest
+        == issued.query_identity.source_digest
+        and candidate.query_identity.query_epoch
+        == issued.query_identity.query_epoch
+    )
+
+
 class EditorController:
     """Own one immutable editor session while engines remain UI-state free."""
 
@@ -94,6 +139,11 @@ class EditorController:
         self._project_session_id = uuid4().hex
         self._tm_query_epoch = 0
         self._issued_tm_suggestions: tuple[TMSuggestion, ...] = ()
+        self._issued_legacy_tm_suggestions: tuple[
+            LegacyExactTMSuggestion,
+            ...,
+        ] = ()
+        self._legacy_issued_context: tuple[str, str, str, int] | None = None
         self._current_tm_report: TMSuggestionReport | None = None
         self._observed_tm_signature: tuple[
             str,
@@ -382,6 +432,25 @@ class EditorController:
         raise EditorControllerError("unable to capture a stable TM query snapshot")
 
     def suggestions(self) -> SuggestionBundle:
+        """Issue the temporary legacy bundle for the pre-integration Qt UI."""
+
+        with self._tm_query_lock:
+            self._synchronize_tm_query_state()
+            bundle = self._legacy_suggestions()
+            issued = tuple(replace(item) for item in bundle.tm_matches)
+            for item in issued:
+                item.__post_init__()
+            segment = self.current_segment
+            self._issued_legacy_tm_suggestions = issued
+            self._legacy_issued_context = (
+                self._project_session_id,
+                segment.id,
+                hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+                self._tm_query_epoch,
+            )
+            return bundle
+
+    def _legacy_suggestions(self) -> SuggestionBundle:
         """Query every currently active Lookup resource for the current source."""
 
         segment = self.current_segment
@@ -508,6 +577,8 @@ class EditorController:
         """Invalidate every issued suggestion before advancing one epoch."""
 
         self._issued_tm_suggestions = ()
+        self._issued_legacy_tm_suggestions = ()
+        self._legacy_issued_context = None
         self._current_tm_report = None
         self._tm_query_epoch += 1
 
@@ -575,6 +646,35 @@ class EditorController:
             self._advance_tm_query_epoch()
             self._observed_tm_signature = current
 
+    def _apply_tm_target_if_generations_current(
+        self,
+        target: str,
+    ) -> EditorProject:
+        """Commit a target while the issued runtime/retrieval pair is current."""
+
+        adapter = self._tm_adapter
+        if adapter is None:
+            return self.update_target(target)
+        signature = self._observed_tm_signature
+        if signature is None:
+            raise EditorControllerError(
+                "TM suggestion is stale for the current runtime"
+            )
+        runtime_generation = signature[3]
+        retrieval_generation = signature[4]
+        try:
+            return adapter._run_if_query_generations_current(
+                runtime_generation=runtime_generation,
+                retrieval_generation=retrieval_generation,
+                operation=lambda: self.update_target(target),
+            )
+        except _TMQueryGenerationChanged as error:
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+            raise EditorControllerError(
+                "TM suggestion is stale for the current runtime"
+            ) from error
+
     def _remember_current_position(self) -> None:
         if self._project is None or self._project.path is None:
             return
@@ -590,15 +690,96 @@ class EditorController:
 
     def apply_tm_suggestion(
         self,
-        suggestion: LegacyExactTMSuggestion,
+        suggestion: TMSuggestion | LegacyExactTMSuggestion,
     ) -> EditorProject:
         """Apply one typed TM suggestion without confirming the segment."""
 
-        if not isinstance(suggestion, LegacyExactTMSuggestion):
+        if type(suggestion) is LegacyExactTMSuggestion:
+            with self._tm_query_lock:
+                self._synchronize_tm_query_state()
+                try:
+                    candidate = replace(suggestion)
+                    candidate.__post_init__()
+                    issued = tuple(
+                        replace(item)
+                        for item in self._issued_legacy_tm_suggestions
+                    )
+                    for item in issued:
+                        item.__post_init__()
+                except ValueError as error:
+                    raise EditorControllerError(
+                        "legacy TM suggestion contract is invalid or tampered"
+                    ) from error
+                segment = self.current_segment
+                current_context = (
+                    self._project_session_id,
+                    segment.id,
+                    hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
+                    self._tm_query_epoch,
+                )
+                if self._legacy_issued_context != current_context:
+                    raise EditorControllerError(
+                        "legacy TM suggestion is stale for the current segment"
+                    )
+                if not any(
+                    candidate.source == member.source
+                    and candidate.target == member.target
+                    and candidate.resource_id == member.resource_id
+                    and candidate.resource_name == member.resource_name
+                    and candidate.similarity == member.similarity
+                    and candidate.match_type == member.match_type
+                    for member in issued
+                ):
+                    raise EditorControllerError(
+                        "legacy TM suggestion was not issued for the current query"
+                    )
+                if candidate.source != segment.source:
+                    raise EditorControllerError(
+                        "TM suggestion does not belong to the current segment"
+                    )
+                return self._apply_tm_target_if_generations_current(
+                    candidate.target
+                )
+        if type(suggestion) is not TMSuggestion:
             raise EditorControllerError("a TM suggestion contract is required")
-        if suggestion.source != self.current_segment.source:
-            raise EditorControllerError("TM suggestion does not belong to the current segment")
-        return self.update_target(suggestion.target)
+
+        with self._tm_query_lock:
+            self._synchronize_tm_query_state()
+            try:
+                candidate = _clone_tm_suggestion(suggestion)
+                issued = tuple(
+                    _clone_tm_suggestion(item)
+                    for item in self._issued_tm_suggestions
+                )
+            except ValueError as error:
+                raise EditorControllerError(
+                    "TM suggestion contract is invalid or was tampered with"
+                ) from error
+
+            segment = self.current_segment
+            identity = candidate.query_identity
+            source_digest = hashlib.sha256(
+                segment.source.encode("utf-8")
+            ).hexdigest()
+            if (
+                identity.project_session_id != self._project_session_id
+                or identity.segment_id != segment.id
+                or identity.source_digest != source_digest
+                or identity.query_epoch != self._tm_query_epoch
+            ):
+                raise EditorControllerError(
+                    "TM suggestion is stale for the current segment"
+                )
+            if not any(
+                _tm_suggestion_fields_equal(candidate, member)
+                for member in issued
+            ):
+                raise EditorControllerError(
+                    "TM suggestion was not issued for the current query"
+                )
+            return self._apply_tm_target_if_generations_current(
+                candidate.target
+            )
 
     def insert_term_suggestion(
         self,

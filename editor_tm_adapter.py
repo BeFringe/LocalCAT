@@ -12,8 +12,13 @@ from dataclasses import dataclass
 import hashlib
 import json
 import sqlite3
+from typing import Callable, TypeVar
 
-from capability_host import CapabilityHost, RetrievalHandoffSnapshot
+from capability_host import (
+    CapabilityHost,
+    RetrievalHandoffSnapshot,
+    _RetrievalGenerationChanged,
+)
 from editor_contracts import (
     EditorSegment,
     RetrievalDisplayState,
@@ -34,6 +39,7 @@ from tm_application_composition import (
     LegacyExactPort,
     TMRuntimeHost,
     TMRuntimeSnapshot,
+    _RuntimeGenerationChanged,
 )
 from tm_contracts import (
     CandidateRecallMetadata,
@@ -60,6 +66,13 @@ _WRITE_OPERATION_ERRORS = (
 )
 _LEGACY_APPEND_FAILED_CODE = "TM.WRITE.LEGACY_APPEND_FAILED"
 _CANONICAL_APPEND_FAILED_CODE = "TM.WRITE.CANONICAL_APPEND_FAILED"
+
+
+_OperationResultT = TypeVar("_OperationResultT")
+
+
+class _TMQueryGenerationChanged(RuntimeError):
+    """Controller-facing private signal for a stale TM query operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +332,39 @@ class EditorTMAdapter:
         ):
             raise ValueError("TM query host generation drift")
         return runtime_generation, retrieval_generation
+
+    def _run_if_query_generations_current(
+        self,
+        *,
+        runtime_generation: int,
+        retrieval_generation: int,
+        operation: Callable[[], _OperationResultT],
+    ) -> _OperationResultT:
+        """Linearize one short editor commit against both host generations."""
+
+        if type(runtime_generation) is not int or runtime_generation < 0:
+            raise TypeError("runtime generation must be non-negative int")
+        if type(retrieval_generation) is not int or retrieval_generation < 0:
+            raise TypeError("retrieval generation must be non-negative int")
+        if not callable(operation):
+            raise TypeError("TM generation operation must be callable")
+
+        def with_runtime_generation() -> _OperationResultT:
+            return self._capability_host._run_if_retrieval_generation_current(
+                retrieval_generation,
+                operation,
+            )
+
+        try:
+            return self._runtime_host._run_if_generation_current(
+                runtime_generation,
+                with_runtime_generation,
+            )
+        except (
+            _RuntimeGenerationChanged,
+            _RetrievalGenerationChanged,
+        ) as error:
+            raise _TMQueryGenerationChanged from error
 
     def append_confirmed(
         self,

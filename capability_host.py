@@ -34,7 +34,15 @@ import tempfile
 import time
 from threading import Condition, Lock, RLock, Thread
 from types import CodeType, FunctionType, ModuleType
-from typing import Any, Callable, Protocol, cast, final, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Protocol,
+    TypeVar,
+    cast,
+    final,
+    runtime_checkable,
+)
 
 from capability_gated_text_matcher import CapabilityGatedTextMatcherV1
 from editor_contracts import RetrievalDisplayState, TextMatcherDisplayState
@@ -58,6 +66,7 @@ from tm_retrieval_capability import (
 )
 
 
+_OperationResultT = TypeVar("_OperationResultT")
 _MATCHER_CLOSED_REASON = "MATCHER.VALIDATION_UNAVAILABLE"
 _COMPOSITION_MINT_IDENTITY = object()
 _RETRIEVAL_VALIDATION_MODULE_NAME = "tm_retrieval_" + "validation"
@@ -75,6 +84,11 @@ _GATE_D_MODULE_NAMES = (
     "tm_retrieval_capability",
     "tm_benchmark_gate",
 )
+
+
+@final
+class _RetrievalGenerationChanged(RuntimeError):
+    """Application-private signal for a stale retrieval commit reservation."""
 
 
 def _require_generation(value: object) -> None:
@@ -2997,6 +3011,29 @@ class CapabilityHost:
         with self.__lock:
             handoff, _capability = self.__capture_retrieval_operation_locked()
             return handoff
+
+    def _run_if_retrieval_generation_current(
+        self,
+        generation: int,
+        operation: Callable[[], _OperationResultT],
+    ) -> _OperationResultT:
+        """Run one short application commit against an exact generation."""
+
+        if type(generation) is not int or generation < 0:
+            raise TypeError("retrieval generation must be non-negative int")
+        if not callable(operation):
+            raise TypeError("retrieval generation operation must be callable")
+        with self.__retrieval_lifecycle_lock:
+            with self.__lock:
+                try:
+                    handoff, _publisher, _service = (
+                        self.__validate_retrieval_graph_locked()
+                    )
+                except ValueError as error:
+                    raise _RetrievalGenerationChanged from error
+                if handoff.generation != generation:
+                    raise _RetrievalGenerationChanged
+                return operation()
 
     def query_retrieval_operation(
         self,

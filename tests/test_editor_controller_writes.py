@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -10,7 +11,6 @@ from pathlib import Path
 from editor_contracts import (
     EditorProject,
     EditorSegment,
-    LegacyExactTMSuggestion,
     ResourceKind,
     TermSuggestion,
 )
@@ -100,12 +100,24 @@ class EditorControllerWritesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller, _ = self._session(Path(temp_dir))
             controller.update_target("")
-            tm = LegacyExactTMSuggestion(
-                source="The office is ready.",
-                target="办公室准备就绪。",
-                resource_id="tm",
-                resource_name="TM",
+            tm_resource = next(
+                resource
+                for resource in controller.list_resources()
+                if resource.kind is ResourceKind.TRANSLATION_MEMORY
             )
+            tm_resource.path.write_text(
+                json.dumps(
+                    {
+                        "source": "The office is ready.",
+                        "target": "办公室准备就绪。",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            controller.reload_resources()
+            tm = controller.suggestions().tm_matches[0]
             term = TermSuggestion(
                 source_term="office",
                 target_term="办公室",
