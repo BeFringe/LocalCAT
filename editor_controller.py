@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Condition, RLock, Thread
 from uuid import uuid4
 
 from capability_host import MatcherHandoffSnapshot
+from configured_term_adapter import ConfiguredTermAdapter
 from editor_contracts import (
     ConfirmResult,
     DisplayPreferences,
@@ -39,6 +40,12 @@ from editor_contracts import (
     TMSuggestion,
     TMSuggestionReport,
     TMThresholdUpdateOutcome,
+    PreparedTermMutation,
+    TermCommitOutcome,
+    TermCommitState,
+    TermDraft,
+    TermRecord,
+    TermRecordLocator,
     TermSuggestion,
     TextMatcherDisplayState,
     WriteReport,
@@ -51,7 +58,7 @@ from editor_project import (
     save_project as save_project_file,
 )
 from glossary_engine import GlossaryEngine
-from resource_importer import import_termbase, import_tmx, upsert_term
+from resource_importer import import_termbase, import_tmx
 from resource_repository import ResourceError, ResourceRepository
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from project_search import ProjectSearchError, ProjectSearchService
@@ -67,6 +74,7 @@ from tm_contracts import (
 from tm_engine import SourceUnit, TMEngine
 from tm_migration import MigrationPreflightError, TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator
+from termbase_store import TermbaseStore, TermbaseValidationError
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
 
 
@@ -77,6 +85,9 @@ _BASIC_PROJECT_SEARCH_OPTIONS = SearchOptions(
     match_case=False,
     whole_word=False,
 )
+
+_TermEngine = GlossaryEngine | ConfiguredTermAdapter
+_PreparedTermOperation = Callable[[Path], PreparedTermMutation]
 
 
 class EditorControllerError(RuntimeError):
@@ -482,6 +493,44 @@ def _clone_project_search_report(
     return cloned
 
 
+def _clone_term_records(
+    records: tuple[TermRecord, ...],
+) -> tuple[TermRecord, ...]:
+    """Validate and reconstruct a detached mixed-term snapshot graph."""
+
+    if type(records) is not tuple:
+        raise TypeError("private term records must be an exact tuple")
+    cloned: list[TermRecord] = []
+    for record in records:
+        if type(record) is not TermRecord:
+            raise TypeError("private term records must contain exact values")
+        locator = record.locator
+        if type(locator) is not TermRecordLocator:
+            raise TypeError("private term locator must be an exact value")
+        locator.__post_init__()
+        record.__post_init__()
+        cloned_locator = TermRecordLocator(
+            row_kind=locator.row_kind,
+            file_digest=locator.file_digest,
+            row_ordinal=locator.row_ordinal,
+            row_digest=locator.row_digest,
+            record_id=locator.record_id,
+        )
+        cloned_record = TermRecord(
+            locator=cloned_locator,
+            record_id=record.record_id,
+            source=record.source,
+            target=record.target,
+            policy=record.policy,
+            match_case=record.match_case,
+            whole_word=record.whole_word,
+        )
+        cloned_locator.__post_init__()
+        cloned_record.__post_init__()
+        cloned.append(cloned_record)
+    return tuple(cloned)
+
+
 def _project_search_hit_fields_equal(
     candidate: ProjectSearchHit,
     issued: ProjectSearchHit,
@@ -743,7 +792,10 @@ class EditorController:
         self._current_index = 0
         self._dirty = False
         self._tm_engines: dict[str, TMEngine] = {}
-        self._glossary_engines: dict[str, GlossaryEngine] = {}
+        self._glossary_engines: dict[str, _TermEngine] = {}
+        self._term_record_snapshots: dict[str, tuple[TermRecord, ...]] = {}
+        self._term_quarantines: dict[str, TermCommitOutcome] = {}
+        self._term_store = TermbaseStore()
         self.reload_resources(_refresh_runtime=False)
 
     @property
@@ -2568,8 +2620,10 @@ class EditorController:
         return self.update_target(updated)
 
     def add_term(self, source: str, target: str) -> ResourceConfig:
-        """Persist a term in the first active Update termbase and reload it."""
+        """Compatibility entry routed through the mixed term transaction."""
 
+        if type(source) is not str or type(target) is not str:
+            raise TypeError("term source and target must be exact strings")
         if not source.strip() or not target.strip():
             raise EditorControllerError("源术语和目标术语均不能为空。")
         resource = next(
@@ -2587,11 +2641,191 @@ class EditorController:
                 "没有可写术语表。请打开“语言资源设置”，"
                 "将至少一个术语表设为 Active，并开启 Update。"
             )
-        report = upsert_term(resource.path, source, target)
-        if not report.succeeded:
-            raise EditorControllerError("; ".join(report.errors))
-        self._glossary_engines[resource.id] = self._load_glossary_engine(resource.path)
+        outcome = self.create_term(
+            resource.id,
+            TermDraft(source=source, target=target),
+        )
+        if outcome.state is not TermCommitState.COMMITTED:
+            raise EditorControllerError(
+                outcome.error_code or "TERM.COMMIT_FAILED"
+            )
         return resource
+
+    def list_terms(self, resource_id: str) -> tuple[TermRecord, ...]:
+        """Return the immutable LKG snapshot for one writable termbase."""
+
+        with self._tm_query_lock:
+            resource = self._require_writable_termbase(resource_id)
+            records = self._term_record_snapshots.get(resource.id)
+            if records is None:
+                raise EditorControllerError("TERM.RUNTIME_UNAVAILABLE")
+            try:
+                return _clone_term_records(records)
+            except ValueError as error:
+                raise EditorControllerError("TERM.RUNTIME_INVALID") from error
+
+    def create_term(
+        self,
+        resource_id: str,
+        draft: TermDraft,
+    ) -> TermCommitOutcome:
+        """Create one v1 row through prepare/build/commit/publication."""
+
+        if not isinstance(draft, TermDraft):
+            raise TypeError("term draft must be a TermDraft")
+        draft.__post_init__()
+        return self._mutate_term_resource(
+            resource_id,
+            lambda path: self._term_store.prepare_create(path, draft),
+        )
+
+    def update_term(
+        self,
+        resource_id: str,
+        locator: TermRecordLocator,
+        draft: TermDraft,
+    ) -> TermCommitOutcome:
+        """Update one located row without changing its persisted row kind."""
+
+        if not isinstance(locator, TermRecordLocator):
+            raise TypeError("term locator must be a TermRecordLocator")
+        if not isinstance(draft, TermDraft):
+            raise TypeError("term draft must be a TermDraft")
+        locator.__post_init__()
+        draft.__post_init__()
+        return self._mutate_term_resource(
+            resource_id,
+            lambda path: self._term_store.prepare_update(
+                path,
+                locator,
+                draft,
+            ),
+        )
+
+    def delete_term(
+        self,
+        resource_id: str,
+        locator: TermRecordLocator,
+    ) -> TermCommitOutcome:
+        """Delete one located row through the same atomic publication path."""
+
+        if not isinstance(locator, TermRecordLocator):
+            raise TypeError("term locator must be a TermRecordLocator")
+        locator.__post_init__()
+        return self._mutate_term_resource(
+            resource_id,
+            lambda path: self._term_store.prepare_delete(path, locator),
+        )
+
+    def _require_writable_termbase(self, resource_id: str) -> ResourceConfig:
+        if type(resource_id) is not str:
+            raise TypeError("term resource id must be an exact string")
+        if not resource_id.strip():
+            raise ValueError("term resource id must not be empty")
+        try:
+            resource = self.repository.get(resource_id)
+        except ResourceError as error:
+            raise EditorControllerError("TERM.RESOURCE_UNKNOWN") from error
+        if resource.kind is not ResourceKind.TERMBASE:
+            raise EditorControllerError("TERM.RESOURCE_KIND_INVALID")
+        if not resource.active or not resource.update:
+            raise EditorControllerError("TERM.RESOURCE_NOT_WRITABLE")
+        return resource
+
+    def _mutate_term_resource(
+        self,
+        resource_id: str,
+        prepare: _PreparedTermOperation,
+    ) -> TermCommitOutcome:
+        """Publish one complete prebuilt term engine graph after commit only."""
+
+        if not callable(prepare):
+            raise TypeError("term prepare operation must be callable")
+        with self._tm_query_lock:
+            resource = self._require_writable_termbase(resource_id)
+            quarantined = self._term_quarantines.get(resource.id)
+            if quarantined is not None:
+                return quarantined
+
+            try:
+                prepared = prepare(resource.path)
+            except TermbaseValidationError as error:
+                raise EditorControllerError(error.code) from error
+            except (OSError, UnicodeError) as error:
+                raise EditorControllerError("TERM.PREPARE_FAILED") from error
+            if type(prepared) is not PreparedTermMutation:
+                raise TypeError(
+                    "term prepare operation must return PreparedTermMutation"
+                )
+            prepared.__post_init__()
+
+            try:
+                candidate_engines, candidate_records = (
+                    self._build_term_engine_sets(
+                        self.repository.list_resources(),
+                        candidate_records={
+                            resource.id: prepared.candidate_records,
+                        },
+                    )
+                )
+            except BaseException as error:
+                try:
+                    self._term_store.discard(prepared)
+                except (OSError, ValueError) as cleanup_error:
+                    LOGGER.warning(
+                        "Unable to discard failed term candidate for %s: %s",
+                        resource.id,
+                        type(cleanup_error).__name__,
+                    )
+                if isinstance(error, (OSError, UnicodeError, ValueError)):
+                    raise EditorControllerError(
+                        "TERM.CANDIDATE_BUILD_FAILED"
+                    ) from error
+                raise
+
+            outcome = self._term_store.commit(prepared)
+            if type(outcome) is not TermCommitOutcome:
+                raise TypeError("term commit must return TermCommitOutcome")
+            outcome.__post_init__()
+            if outcome.state is TermCommitState.COMMITTED:
+                report = outcome.report
+                if report is None:
+                    raise AssertionError(
+                        "committed term mutation must contain its report"
+                    )
+                if (
+                    report.resource_path != resource.path
+                    or report.records != prepared.candidate_records
+                ):
+                    raise AssertionError(
+                        "committed term report changed its prepared candidate"
+                    )
+
+                self._glossary_engines = candidate_engines
+                self._term_record_snapshots = candidate_records
+                _ = self._term_quarantines.pop(resource.id, None)
+                cleanup = self._term_store.finalize(prepared, outcome)
+                if not cleanup.cleaned:
+                    LOGGER.warning(
+                        "Committed termbase %s retained recovery artifact: %s",
+                        resource.id,
+                        cleanup.warning_code,
+                    )
+                return outcome
+
+            if outcome.state is TermCommitState.INDETERMINATE:
+                self._term_quarantines[resource.id] = outcome
+                return outcome
+
+            try:
+                self._term_store.discard(prepared)
+            except (OSError, ValueError) as cleanup_error:
+                LOGGER.warning(
+                    "Unable to discard non-committed term mutation for %s: %s",
+                    resource.id,
+                    type(cleanup_error).__name__,
+                )
+            return outcome
 
     def list_resources(self) -> tuple[ResourceConfig, ...]:
         """Return the current persistent resource configuration."""
@@ -2630,6 +2864,8 @@ class EditorController:
                 raise EditorControllerError(str(exc)) from exc
             self._tm_engines.pop(resource_id, None)
             self._glossary_engines.pop(resource_id, None)
+            self._term_record_snapshots.pop(resource_id, None)
+            self._term_quarantines.pop(resource_id, None)
             try:
                 self._reload_resources_after_persisted_mutation()
             except EditorControllerError as exc:
@@ -2683,28 +2919,35 @@ class EditorController:
             with self._tm_query_lock:
                 adapter = self._tm_adapter
                 if adapter is None:
-                    tm_engines, glossary_engines = self._build_resource_engine_sets(
-                        configs
-                    )
+                    (
+                        tm_engines,
+                        glossary_engines,
+                        term_records,
+                    ) = self._build_resource_engine_sets(configs)
                 elif not _refresh_runtime:
                     if configs:
                         initial_runtime = adapter._capture_runtime_for_controller(
                             configs
                         )
-                        tm_engines, glossary_engines = (
-                            self._build_resource_engine_sets(
-                                configs,
-                                runtime_snapshot=initial_runtime,
-                            )
+                        (
+                            tm_engines,
+                            glossary_engines,
+                            term_records,
+                        ) = self._build_resource_engine_sets(
+                            configs,
+                            runtime_snapshot=initial_runtime,
                         )
                     else:
-                        tm_engines, glossary_engines = (
-                            self._build_resource_engine_sets(configs)
-                        )
+                        (
+                            tm_engines,
+                            glossary_engines,
+                            term_records,
+                        ) = self._build_resource_engine_sets(configs)
                 else:
                     engine_candidate: tuple[
                         dict[str, TMEngine],
-                        dict[str, GlossaryEngine],
+                        dict[str, _TermEngine],
+                        dict[str, tuple[TermRecord, ...]],
                     ] | None = None
 
                     def validate_candidate(snapshot: object) -> None:
@@ -2719,17 +2962,18 @@ class EditorController:
                         raise ValueError(
                             "resource engine refresh candidate is missing"
                         )
-                    tm_engines, glossary_engines = engine_candidate
+                    tm_engines, glossary_engines, term_records = engine_candidate
 
                 self._tm_engines = tm_engines
                 self._glossary_engines = glossary_engines
+                self._term_record_snapshots = term_records
                 if self._project is not None:
                     self._advance_tm_query_epoch()
                     self._record_current_tm_baseline()
                     if adapter is not None:
                         _ = self._query_and_issue_current_tm_report()
                 self._tm_runtime_blocked_safe_code = None
-        except (OSError, UnicodeError, ValueError, csv.Error, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise EditorControllerError(f"unable to reload language resources: {exc}") from exc
 
     def _build_resource_engine_sets(
@@ -2737,7 +2981,11 @@ class EditorController:
         configs: tuple[ResourceConfig, ...],
         *,
         runtime_snapshot: object | None = None,
-    ) -> tuple[dict[str, TMEngine], dict[str, GlossaryEngine]]:
+    ) -> tuple[
+        dict[str, TMEngine],
+        dict[str, _TermEngine],
+        dict[str, tuple[TermRecord, ...]],
+    ]:
         """Build compatibility engines against one validated runtime cohort."""
 
         tm_engines = (
@@ -2748,7 +2996,7 @@ class EditorController:
                 runtime_snapshot,
             )
         )
-        glossary_engines: dict[str, GlossaryEngine] = {}
+        glossary_engines, term_records = self._build_term_engine_sets(configs)
         for resource in configs:
             if not resource.active:
                 continue
@@ -2757,11 +3005,111 @@ class EditorController:
                     tm_engines[resource.id] = self._load_tm_engine(
                         resource.path
                     )
-            else:
-                glossary_engines[resource.id] = self._load_glossary_engine(
-                    resource.path
+        return tm_engines, glossary_engines, term_records
+
+    def _build_term_engine_sets(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        *,
+        candidate_records: dict[str, tuple[TermRecord, ...]] | None = None,
+    ) -> tuple[
+        dict[str, _TermEngine],
+        dict[str, tuple[TermRecord, ...]],
+    ]:
+        """Build one complete active term cohort from a single Host issue."""
+
+        if type(configs) is not tuple or any(
+            type(config) is not ResourceConfig for config in configs
+        ):
+            raise TypeError("term engine configs must be exact ResourceConfig values")
+        overrides = {} if candidate_records is None else candidate_records
+        if type(overrides) is not dict:
+            raise TypeError("term candidate records must be a dictionary")
+
+        engines: dict[str, _TermEngine] = {}
+        snapshots: dict[str, tuple[TermRecord, ...]] = {}
+        pending: list[tuple[ResourceConfig, tuple[TermRecord, ...]]] = []
+        for resource in configs:
+            if resource.kind is not ResourceKind.TERMBASE:
+                continue
+            if resource.id in self._term_quarantines and resource.id not in overrides:
+                lkg_engine = self._glossary_engines.get(resource.id)
+                lkg_records = self._term_record_snapshots.get(resource.id)
+                if lkg_engine is None or lkg_records is None:
+                    raise ValueError("quarantined termbase lost its in-memory LKG")
+                engines[resource.id] = lkg_engine
+                snapshots[resource.id] = lkg_records
+                continue
+            if not resource.active:
+                continue
+
+            records = overrides.get(resource.id)
+            if records is None:
+                records = self._load_glossary_engine(resource.path)
+            if type(records) is not tuple or any(
+                type(record) is not TermRecord for record in records
+            ):
+                raise TypeError("term engine records must be exact TermRecord values")
+            for record in records:
+                record.__post_init__()
+            pending.append((resource, records))
+
+        adapter = self._tm_adapter
+        handoff: MatcherHandoffSnapshot | None = None
+        if adapter is not None and pending:
+            handoff = self.text_matcher_handoff()
+            if not adapter._is_current_text_matcher_handoff_for_controller(
+                handoff
+            ):
+                raise ValueError("term matcher handoff is not current-host issued")
+
+        for resource, records in pending:
+            snapshots[resource.id] = records
+            if handoff is None:
+                engines[resource.id] = self._build_legacy_term_engine(
+                    records,
+                    resource.name,
                 )
-        return tm_engines, glossary_engines
+            else:
+                engines[resource.id] = ConfiguredTermAdapter(
+                    records,
+                    resource.name,
+                    handoff,
+                )
+
+        if (
+            adapter is not None
+            and handoff is not None
+            and not adapter._is_current_text_matcher_handoff_for_controller(
+                handoff
+            )
+        ):
+            raise ValueError("term matcher handoff changed during candidate build")
+        return engines, snapshots
+
+    @staticmethod
+    def _build_legacy_term_engine(
+        records: tuple[TermRecord, ...],
+        glossary_source: str,
+    ) -> GlossaryEngine:
+        """Build the pre-integration legacy preset from validated mixed rows."""
+
+        engine = GlossaryEngine()
+        for record in records:
+            engine.add_term(
+                record.source,
+                record.target,
+                glossary_source,
+            )
+        return engine
+
+    def _load_glossary_engine(
+        self,
+        path: Path,
+    ) -> tuple[TermRecord, ...]:
+        """Retain the legacy fault seam while strict Store owns parsing."""
+
+        return self._term_store.list_records(path)
 
     def _build_tm_engine_set_for_runtime_snapshot(
         self,
@@ -2819,30 +3167,6 @@ class EditorController:
             if not isinstance(target, str) or not target.strip():
                 raise ValueError(f"translation memory line {line_number} has no target")
         return TMEngine(str(path))
-
-    @staticmethod
-    def _load_glossary_engine(path: Path) -> GlossaryEngine:
-        if not path.exists() or not path.is_file():
-            raise ValueError(f"termbase does not exist: {path}")
-        terms: dict[str, str] = {}
-        with path.open(encoding="utf-8-sig", newline="") as handle:
-            for line_number, row in enumerate(csv.reader(handle), start=1):
-                if not row or not any(cell.strip() for cell in row):
-                    continue
-                if len(row) < 2:
-                    raise ValueError(f"termbase row {line_number} has fewer than two columns")
-                source = row[0].strip()
-                target = row[1].strip()
-                if source.casefold() == "source" and target.casefold() == "target":
-                    continue
-                if not source or not target:
-                    raise ValueError(f"termbase row {line_number} has an empty term")
-                terms[source] = target
-        engine = GlossaryEngine()
-        for source, target in terms.items():
-            engine.add_term(source, target, path.name)
-        return engine
-
 
 if __name__ == "__main__":
     import tempfile

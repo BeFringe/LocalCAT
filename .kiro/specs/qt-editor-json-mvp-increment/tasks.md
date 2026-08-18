@@ -130,7 +130,7 @@
   - 完成时，clean、already-dirty、save-after-apply、跨项目、stale preview 和 stale undo 测试均得到一致 report
   - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.2, 5.3, 5.4, 5.5, 5.6, 9.4_
 
-- [ ] 3.4 闭合术语 prepare、候选 Engine、commit 与发布事务
+- [x] 3.4 闭合术语 prepare、候选 Engine、commit 与发布事务
   - 对可写 termbase 执行 prepare，并在 commit 前从 candidate records 构建完整候选 Engine 集合
   - candidate build 失败时 discard；commit 失败保留 last-known-good；indeterminate 时 quarantine 并携带 recovery 指引
   - 只有 committed outcome 才交换预构建引用并发布 mutation report；随后执行无数据修改的 cleanup
