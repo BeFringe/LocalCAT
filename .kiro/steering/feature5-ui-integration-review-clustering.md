@@ -1,4 +1,4 @@
-# Feature 5 UI Integration 评审集群（采纳稿 v1）
+# Feature 5 UI Integration 评审集群（采纳稿 v2）
 
 本文件为 `feature5-ui-integration` 的跨 Spec 实施提供累计评审地图。它参照 Feature 5 Core 的 `feature5-review-clustering.md`，但不复制或改写 Core Gate A～D、Matcher Gate、产品 Requirements 或 task ownership。
 
