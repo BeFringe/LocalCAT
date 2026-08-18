@@ -1,21 +1,51 @@
 """Qt-free application composition for translation-memory runtime resources.
 
-Task 3.7 owns only the deterministic projection from declarative
+Task 3.7 owns the deterministic projection from declarative
 ``ResourceConfig`` values to frozen, ordered runtime ports and Core
-``TMResourceHandle`` values. Query and append rules stay with injected
-legacy/Core owners; lifecycle classification, resource-local status, and
-snapshot replacement remain owned by Task 3.8.
+``TMResourceHandle`` values. Task 3.8 adds fail-closed lifecycle projection
+and single-pointer runtime publication. Query and append rules stay with
+the injected legacy/Core owners.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol
+import sqlite3
+import threading
+from typing import Callable, Protocol, TypeGuard, cast
 
-from editor_contracts import ResourceConfig, ResourceKind, TMResourceStatus
-from tm_contracts import TMRecordDraft, TMResourceHandle, TMStore
+from editor_contracts import (
+    ResourceConfig,
+    ResourceKind,
+    TMResourceDisplayMode,
+    TMResourceStatus,
+)
+from tm_activation_journal import ActivationPreparationError
+from tm_contracts import (
+    SourceBindingState,
+    StoreHealth,
+    TMRecordDraft,
+    TMResourceHandle,
+    TMStore,
+)
 from tm_engine import SourceUnit, TMEngine, TMMatch
+from tm_sqlite_store import (
+    SQLiteStoreSchemaError,
+    SourceBindingObservation,
+)
+
+
+_PATH_UNAVAILABLE_CODE = "TM.RUNTIME.PATH_UNAVAILABLE"
+_CANONICAL_AUTHORITY_UNAVAILABLE_CODE = (
+    "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE"
+)
+_OPEN_UNAVAILABLE_CODE = "TM.RUNTIME.OPEN_UNAVAILABLE"
+_SOURCE_BINDING_UNAVAILABLE_CODE = "TM.RUNTIME.SOURCE_BINDING_UNAVAILABLE"
+_QUERY_LEASE_UNAVAILABLE_CODE = "TM.RUNTIME.QUERY_LEASE_UNAVAILABLE"
+_CANONICAL_HEALTH_UNAVAILABLE_CODE = "TM.RUNTIME.CANONICAL_HEALTH_UNAVAILABLE"
+_SOURCE_DIVERGED_CODE = "TM.RUNTIME.SOURCE_DIVERGED"
 
 
 class LegacyPortBackend(Protocol):
@@ -60,6 +90,13 @@ type RuntimeOpenBinding = CanonicalOpenBinding | LegacyOpenBinding
 
 class RuntimeOpenPort(Protocol):
     def __call__(self, path: Path, /) -> RuntimeOpenBinding: ...
+
+
+class _CanonicalQueryViewPort(Protocol):
+    resource_id: str
+    generation: int
+
+    def health(self) -> StoreHealth: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +217,15 @@ class TMRuntimeSnapshot:
         ):
             raise TypeError("resource statuses must be a tuple of TMResourceStatus")
 
+        for status in self.statuses:
+            status.__post_init__()
+        for port in self.legacy_ports:
+            port.__post_init__()
+        for handle in self.canonical_handles:
+            handle.__post_init__()
+        for port in self.canonical_ports:
+            port.__post_init__()
+
         _validate_global_order(self.global_order_by_resource_id)
         if len(self.canonical_ports) != len(self.canonical_handles) or any(
             port.handle is not handle
@@ -221,6 +267,114 @@ class TMRuntimeSnapshot:
             resource_id not in global_order for resource_id in status_ids
         ):
             raise ValueError("resource statuses must bind unique configured resources")
+        status_by_resource_id = {
+            status.resource_id: status for status in self.statuses
+        }
+        port_by_resource_id = {port.resource_id: port for port in all_ports}
+        if set(port_by_resource_id) != {
+            resource_id
+            for resource_id, status in status_by_resource_id.items()
+            if status.mode is not TMResourceDisplayMode.UNAVAILABLE
+        }:
+            raise ValueError(
+                "runtime port status must have one-to-one availability"
+            )
+        status_order = tuple(global_order[resource_id] for resource_id in status_ids)
+        if any(
+            left >= right
+            for left, right in zip(status_order, status_order[1:])
+        ):
+            raise ValueError("resource statuses must preserve declarative order")
+
+        legacy_ids = {port.resource_id for port in self.legacy_ports}
+        canonical_ids = {port.resource_id for port in self.canonical_ports}
+        for resource_id, port in port_by_resource_id.items():
+            status = status_by_resource_id[resource_id]
+            if status.resource_name != port.resource_name:
+                raise ValueError("runtime port status resource name must match")
+            if resource_id in legacy_ids:
+                if status.mode is not TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+                    raise ValueError(
+                        "runtime port status must classify legacy exact-only"
+                    )
+                continue
+            if resource_id not in canonical_ids or status.mode not in (
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+            ):
+                raise ValueError(
+                    "canonical lifecycle status must be active or source-diverged"
+                )
+            if (
+                not status.exact_available
+                or status.context_available
+                or status.fuzzy_available
+            ):
+                raise ValueError(
+                    "canonical lifecycle status must expose exact only"
+                )
+
+
+class RuntimeResolverPort(Protocol):
+    """Narrow resolver port consumed by the atomic runtime host."""
+
+    def resolve(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> TMRuntimeSnapshot: ...
+
+
+class TMRuntimeHost:
+    """Own one atomically replaceable immutable resource snapshot.
+
+    Resolution and every Core precondition probe complete before the narrow
+    publication lock is acquired. A caller captures the current frozen value
+    once; that ordinary strong reference keeps the old ports and stores alive
+    for the operation even after a later refresh publishes a new value.
+    """
+
+    def __init__(
+        self,
+        *,
+        resolver: RuntimeResolverPort,
+        configs: tuple[ResourceConfig, ...],
+    ) -> None:
+        resolve = getattr(resolver, "resolve", None)
+        if not callable(resolve):
+            raise TypeError("runtime host resolver must provide resolve")
+        _validate_configs(configs)
+        initial = resolve(configs)
+        if type(initial) is not TMRuntimeSnapshot:
+            raise TypeError("runtime resolver must return TMRuntimeSnapshot")
+        _validate_snapshot_against_configs(initial, configs)
+        self._resolver = resolver
+        self._lock = threading.Lock()
+        self._snapshot = replace(initial, generation=0)
+
+    def snapshot(self) -> TMRuntimeSnapshot:
+        """Capture one complete snapshot for an operation."""
+
+        with self._lock:
+            return self._snapshot
+
+    def refresh(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> TMRuntimeSnapshot:
+        """Resolve completely, then publish exactly one new generation."""
+
+        _validate_configs(configs)
+        candidate = self._resolver.resolve(configs)
+        if type(candidate) is not TMRuntimeSnapshot:
+            raise TypeError("runtime resolver must return TMRuntimeSnapshot")
+        _validate_snapshot_against_configs(candidate, configs)
+        with self._lock:
+            published = replace(
+                candidate,
+                generation=self._snapshot.generation + 1,
+            )
+            self._snapshot = published
+            return published
 
 
 class TMResourceResolver:
@@ -256,11 +410,66 @@ class TMResourceResolver:
         legacy_ports: list[LegacyExactPort] = []
         canonical_ports: list[CanonicalResourcePort] = []
         canonical_handles: list[TMResourceHandle] = []
+        statuses: list[TMResourceStatus] = []
 
         for position, config in enumerate(configs):
             if config.kind is not ResourceKind.TRANSLATION_MEMORY:
                 continue
-            binding = self._runtime_open(config.path)
+            try:
+                binding = self._runtime_open(config.path)
+            except (
+                FileNotFoundError,
+                PermissionError,
+                IsADirectoryError,
+            ):
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=_PATH_UNAVAILABLE_CODE,
+                        retryable=True,
+                    )
+                )
+                continue
+            except ValueError as error:
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=(
+                            _CANONICAL_AUTHORITY_UNAVAILABLE_CODE
+                            if str(error).startswith("TM.CANONICAL_")
+                            else _OPEN_UNAVAILABLE_CODE
+                        ),
+                        retryable=False,
+                    )
+                )
+                continue
+            except ActivationPreparationError as error:
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=_CANONICAL_AUTHORITY_UNAVAILABLE_CODE,
+                        retryable=error.retryable,
+                    )
+                )
+                continue
+            except SQLiteStoreSchemaError:
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=_OPEN_UNAVAILABLE_CODE,
+                        retryable=False,
+                    )
+                )
+                continue
+            except (OSError, sqlite3.DatabaseError):
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=_OPEN_UNAVAILABLE_CODE,
+                        retryable=True,
+                    )
+                )
+                continue
             if type(binding) is LegacyOpenBinding:
                 legacy_ports.append(
                     LegacyExactPort(
@@ -274,15 +483,32 @@ class TMResourceResolver:
                         backend=binding.backend,
                     )
                 )
+                statuses.append(_legacy_status(config))
                 continue
             if type(binding) is not CanonicalOpenBinding:
                 raise TypeError(
                     "runtime_open must return a canonical or legacy binding"
                 )
             if binding.resource_id != config.id:
-                raise ValueError(
-                    "canonical resource identity must match configured resource id"
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=_CANONICAL_AUTHORITY_UNAVAILABLE_CODE,
+                        retryable=False,
+                    )
                 )
+                continue
+            try:
+                canonical_status = _probe_canonical_status(config, binding)
+            except _ResourcePreconditionFailure as failure:
+                statuses.append(
+                    _unavailable_status(
+                        config,
+                        code=failure.code,
+                        retryable=failure.retryable,
+                    )
+                )
+                continue
             handle = TMResourceHandle(
                 resource_id=config.id,
                 store=binding.store,
@@ -300,6 +526,7 @@ class TMResourceResolver:
                     handle=handle,
                 )
             )
+            statuses.append(canonical_status)
 
         return TMRuntimeSnapshot(
             generation=0,
@@ -307,7 +534,7 @@ class TMResourceResolver:
             canonical_ports=tuple(canonical_ports),
             canonical_handles=tuple(canonical_handles),
             global_order_by_resource_id=global_order,
-            statuses=(),
+            statuses=tuple(statuses),
         )
 
 
@@ -344,6 +571,15 @@ def _open_runtime_binding(path: Path) -> RuntimeOpenBinding:
     engine = TMEngine(str(path))
     store = engine.canonical_store
     if store is None:
+        if not path.is_file():
+            raise FileNotFoundError(_PATH_UNAVAILABLE_CODE)
+        try:
+            with path.open("rb") as stream:
+                _ = stream.read(1)
+        except (FileNotFoundError, PermissionError, IsADirectoryError):
+            raise
+        except OSError as error:
+            raise OSError(_PATH_UNAVAILABLE_CODE) from error
         return LegacyOpenBinding(backend=_TMEngineLegacyBackend(engine))
     return CanonicalOpenBinding(
         resource_id=store.coordinator.resource_id,
@@ -390,6 +626,51 @@ def _validate_global_order(mapping: tuple[tuple[str, int], ...]) -> None:
         raise ValueError("global resource order must be complete and continuous")
 
 
+def _validate_snapshot_against_configs(
+    snapshot: TMRuntimeSnapshot,
+    configs: tuple[ResourceConfig, ...],
+) -> None:
+    snapshot.__post_init__()
+    expected_global_order = tuple(
+        (config.id, position) for position, config in enumerate(configs)
+    )
+    if snapshot.global_order_by_resource_id != expected_global_order:
+        raise ValueError("runtime snapshot configured global order must match")
+
+    tm_configs = tuple(
+        config
+        for config in configs
+        if config.kind is ResourceKind.TRANSLATION_MEMORY
+    )
+    if tuple(status.resource_id for status in snapshot.statuses) != tuple(
+        config.id for config in tm_configs
+    ):
+        raise ValueError(
+            "runtime snapshot configured TM statuses must be complete and ordered"
+        )
+    config_by_resource_id = {config.id: config for config in tm_configs}
+    for status in snapshot.statuses:
+        if status.resource_name != config_by_resource_id[status.resource_id].name:
+            raise ValueError(
+                "runtime snapshot configured TM statuses must preserve names"
+            )
+
+    for port in (*snapshot.legacy_ports, *snapshot.canonical_ports):
+        config = config_by_resource_id[port.resource_id]
+        expected_order = expected_global_order[port.global_order]
+        if (
+            expected_order != (config.id, port.global_order)
+            or port.resource_name != config.name
+            or port.path != config.path
+            or port.active is not config.active
+            or port.lookup is not config.lookup
+            or port.update is not config.update
+        ):
+            raise ValueError(
+                "runtime snapshot configured TM port lineage must match"
+            )
+
+
 def _require_port_metadata(
     *,
     resource_id: str,
@@ -429,6 +710,304 @@ def _require_store_port(store: object) -> None:
             raise TypeError("canonical binding store must implement TMStore")
 
 
+class _ResourcePreconditionFailure(RuntimeError):
+    def __init__(self, code: str, *, retryable: bool) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+
+
+def _legacy_status(config: ResourceConfig) -> TMResourceStatus:
+    return TMResourceStatus(
+        resource_id=config.id,
+        resource_name=config.name,
+        mode=TMResourceDisplayMode.LEGACY_EXACT_ONLY,
+        exact_available=True,
+        context_available=False,
+        fuzzy_available=False,
+        safe_codes=(),
+        retryable=False,
+    )
+
+
+def _unavailable_status(
+    config: ResourceConfig,
+    *,
+    code: str,
+    retryable: bool,
+) -> TMResourceStatus:
+    return TMResourceStatus(
+        resource_id=config.id,
+        resource_name=config.name,
+        mode=TMResourceDisplayMode.UNAVAILABLE,
+        exact_available=False,
+        context_available=False,
+        fuzzy_available=False,
+        safe_codes=(code,),
+        retryable=retryable,
+    )
+
+
+def _probe_canonical_status(
+    config: ResourceConfig,
+    binding: CanonicalOpenBinding,
+) -> TMResourceStatus:
+    """Project one coherent Core source-binding/query-lease observation."""
+
+    try:
+        monitor = getattr(binding.store, "source_binding_monitor", None)
+        observe = getattr(monitor, "observe", None)
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=_safe_retryable(error),
+        ) from error
+    if not callable(observe):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+    try:
+        observation = observe()
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=_safe_retryable(error),
+        ) from error
+    if not _valid_source_observation(observation):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+    if observation.resource_id != binding.resource_id:
+        raise _ResourcePreconditionFailure(
+            _CANONICAL_AUTHORITY_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+
+    try:
+        query_lease = getattr(binding.store, "query_lease", None)
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
+        raise _ResourcePreconditionFailure(
+            _QUERY_LEASE_UNAVAILABLE_CODE,
+            retryable=_safe_retryable(error),
+        ) from error
+    if not callable(query_lease):
+        raise _ResourcePreconditionFailure(
+            _QUERY_LEASE_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+    query_lease_port = cast(
+        Callable[[], AbstractContextManager[_CanonicalQueryViewPort]],
+        query_lease,
+    )
+    try:
+        with query_lease_port() as view:
+            health_port = getattr(view, "health", None)
+            view_resource_id = getattr(view, "resource_id", None)
+            view_generation = getattr(view, "generation", None)
+            if (
+                not callable(health_port)
+                or type(view_resource_id) is not str
+                or type(view_generation) is not int
+                or isinstance(view_generation, bool)
+                or view_generation < 0
+            ):
+                raise _ResourcePreconditionFailure(
+                    _QUERY_LEASE_UNAVAILABLE_CODE,
+                    retryable=False,
+                )
+            if view_resource_id != binding.resource_id:
+                raise _ResourcePreconditionFailure(
+                    _CANONICAL_AUTHORITY_UNAVAILABLE_CODE,
+                    retryable=False,
+                )
+            health = health_port()
+    except _ResourcePreconditionFailure:
+        raise
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
+        raise _ResourcePreconditionFailure(
+            _QUERY_LEASE_UNAVAILABLE_CODE,
+            retryable=_safe_retryable(error),
+        ) from error
+
+    if not _valid_store_health(health):
+        raise _ResourcePreconditionFailure(
+            _CANONICAL_HEALTH_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+    if (
+        not health.healthy
+        or not health.exact_available
+        or health.generation != view_generation
+    ):
+        raise _ResourcePreconditionFailure(
+            _CANONICAL_HEALTH_UNAVAILABLE_CODE,
+            retryable=True,
+        )
+    try:
+        final_observation = observe()
+    except (
+        ActivationPreparationError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+        OSError,
+        ValueError,
+    ) as error:
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=_safe_retryable(error),
+        ) from error
+    if (
+        not _valid_source_observation(final_observation)
+        or final_observation.resource_id != binding.resource_id
+        or observation.generation != view_generation
+        or final_observation.generation != view_generation
+    ):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=True,
+        )
+    if (
+        observation.canonical_store_id
+        != final_observation.canonical_store_id
+        or observation.binding_digest != final_observation.binding_digest
+        or health.snapshot_binding_digest != final_observation.binding_digest
+    ):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=True,
+        )
+
+    allowed_health_states = {observation.state, final_observation.state}
+    if health.source_binding_state not in allowed_health_states:
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=True,
+        )
+    verified_states = (
+        SourceBindingState.VERIFIED_CURRENT,
+        SourceBindingState.VERIFIED_HISTORY,
+    )
+    if observation.state is not final_observation.state and not (
+        observation.state in verified_states
+        and final_observation.state
+        in (*verified_states, SourceBindingState.SOURCE_DIVERGED)
+    ):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=True,
+        )
+
+    if final_observation.state is SourceBindingState.SOURCE_DIVERGED:
+        return TMResourceStatus(
+            resource_id=config.id,
+            resource_name=config.name,
+            mode=TMResourceDisplayMode.SOURCE_DIVERGED,
+            exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+            safe_codes=(_SOURCE_DIVERGED_CODE,),
+            retryable=True,
+        )
+    if final_observation.state not in (
+        SourceBindingState.VERIFIED_CURRENT,
+        SourceBindingState.VERIFIED_HISTORY,
+    ):
+        raise _ResourcePreconditionFailure(
+            _SOURCE_BINDING_UNAVAILABLE_CODE,
+            retryable=False,
+        )
+    return TMResourceStatus(
+        resource_id=config.id,
+        resource_name=config.name,
+        mode=TMResourceDisplayMode.CANONICAL_ACTIVE,
+        exact_available=True,
+        context_available=False,
+        fuzzy_available=False,
+        safe_codes=(),
+        retryable=False,
+    )
+
+
+def _safe_retryable(error: BaseException) -> bool:
+    retryable = getattr(error, "retryable", None)
+    if type(retryable) is bool:
+        return retryable
+    return isinstance(error, OSError)
+
+
+def _valid_source_observation(
+    value: object,
+) -> TypeGuard[SourceBindingObservation]:
+    if type(value) is not SourceBindingObservation:
+        return False
+    observation = cast(SourceBindingObservation, value)
+    if (
+        type(observation.resource_id) is not str
+        or not observation.resource_id.strip()
+        or type(observation.canonical_store_id) is not str
+        or not observation.canonical_store_id.strip()
+        or type(observation.generation) is not int
+        or observation.generation < 0
+        or type(observation.head_revision) is not int
+        or observation.head_revision < 0
+        or type(observation.state) is not SourceBindingState
+    ):
+        return False
+    digest = observation.binding_digest
+    if digest is not None and (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return False
+    codes = observation.diagnostic_codes
+    return (
+        type(codes) is tuple
+        and all(type(code) is str and bool(code.strip()) for code in codes)
+        and len(codes) == len(set(codes))
+        and codes == tuple(sorted(codes))
+    )
+
+
+def _valid_store_health(value: object) -> TypeGuard[StoreHealth]:
+    if type(value) is not StoreHealth:
+        return False
+    health = cast(StoreHealth, value)
+    return (
+        type(health.healthy) is bool
+        and type(health.exact_available) is bool
+        and type(health.generation) is int
+        and health.generation >= 0
+        and type(health.source_binding_state) is SourceBindingState
+    )
+
+
 __all__ = [
     "CanonicalOpenBinding",
     "CanonicalResourcePort",
@@ -437,6 +1016,8 @@ __all__ = [
     "LegacyPortBackend",
     "RuntimeOpenBinding",
     "RuntimeOpenPort",
+    "RuntimeResolverPort",
     "TMResourceResolver",
+    "TMRuntimeHost",
     "TMRuntimeSnapshot",
 ]

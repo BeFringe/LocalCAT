@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 import inspect
 from pathlib import Path
 import tempfile
 import unittest
-from typing import NoReturn, cast
+from typing import Iterator, NoReturn, cast
 from unittest.mock import patch
 
-from editor_contracts import ResourceConfig, ResourceKind
+from editor_contracts import (
+    ResourceConfig,
+    ResourceKind,
+    TMResourceDisplayMode,
+)
 from tm_application_composition import (
     CanonicalOpenBinding,
     CanonicalResourcePort,
@@ -22,6 +27,7 @@ from tm_application_composition import (
     TMRuntimeSnapshot,
 )
 from tm_contracts import (
+    SourceBindingState,
     StoreHealth,
     TMRecord,
     TMRecordDraft,
@@ -29,6 +35,7 @@ from tm_contracts import (
     TMStore,
 )
 from tm_engine import TMEngine, TMMatch
+from tm_sqlite_store import SourceBindingObservation
 
 
 class _FakeCoordinator:
@@ -40,6 +47,7 @@ class _NoOperationStore:
     """Structural Core store whose data ports must stay untouched by resolve."""
 
     def __init__(self, resource_id: str) -> None:
+        self._resource_id = resource_id
         self.coordinator = _FakeCoordinator(resource_id)
 
     @staticmethod
@@ -63,6 +71,51 @@ class _NoOperationStore:
 
     def health(self) -> StoreHealth:
         return self._unexpected()
+
+    @property
+    def source_binding_monitor(self) -> _FakeSourceMonitor:
+        return _FakeSourceMonitor(self._resource_id)
+
+    @contextmanager
+    def query_lease(self) -> Iterator[_FakeQueryView]:
+        yield _FakeQueryView(self._resource_id)
+
+
+class _FakeSourceMonitor:
+    def __init__(self, resource_id: str) -> None:
+        self._resource_id = resource_id
+
+    def observe(self) -> SourceBindingObservation:
+        return SourceBindingObservation(
+            resource_id=self._resource_id,
+            canonical_store_id="store.test",
+            generation=0,
+            head_revision=0,
+            state=SourceBindingState.VERIFIED_CURRENT,
+            binding_digest=None,
+            diagnostic_codes=(),
+        )
+
+
+class _FakeQueryView:
+    def __init__(self, resource_id: str) -> None:
+        self.resource_id = resource_id
+        self.generation = 0
+
+    def health(self) -> StoreHealth:
+        return StoreHealth(
+            healthy=True,
+            schema_version=1,
+            generation=0,
+            record_count=0,
+            index_kind="GRAM_FALLBACK",
+            snapshot_binding_digest=None,
+            source_binding_state=SourceBindingState.VERIFIED_CURRENT,
+            exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+            diagnostic_codes=(),
+        )
 
 
 class _RecordingStore(_NoOperationStore):
@@ -238,7 +291,7 @@ class TMResourceResolverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = _config(root, "canonical.formal")
-            store = _NoOperationStore("unused")
+            store = _NoOperationStore("canonical.formal")
             del store.coordinator
 
             snapshot = TMResourceResolver(
@@ -404,7 +457,15 @@ class TMResourceResolverTests(unittest.TestCase):
                 tuple(port.handle for port in snapshot.canonical_ports),
                 snapshot.canonical_handles,
             )
-            self.assertEqual(snapshot.statuses, ())
+            self.assertEqual(
+                tuple(status.mode for status in snapshot.statuses),
+                (
+                    TMResourceDisplayMode.LEGACY_EXACT_ONLY,
+                    TMResourceDisplayMode.CANONICAL_ACTIVE,
+                    TMResourceDisplayMode.CANONICAL_ACTIVE,
+                    TMResourceDisplayMode.LEGACY_EXACT_ONLY,
+                ),
+            )
 
     def test_repeated_resolution_is_deterministic_and_returns_frozen_values(
         self,
@@ -575,13 +636,18 @@ class TMResourceResolverTests(unittest.TestCase):
 
             canonical = _config(root, "canonical.expected")
             foreign_store = _NoOperationStore("canonical.foreign")
-            with self.assertRaisesRegex(ValueError, "canonical resource identity"):
-                TMResourceResolver(
-                    runtime_open=lambda _path: CanonicalOpenBinding(
-                        resource_id="canonical.foreign",
-                        store=cast(TMStore, foreign_store),
-                    ),
-                ).resolve((canonical,))
+            foreign = TMResourceResolver(
+                runtime_open=lambda _path: CanonicalOpenBinding(
+                    resource_id="canonical.foreign",
+                    store=cast(TMStore, foreign_store),
+                ),
+            ).resolve((canonical,))
+            self.assertEqual(foreign.legacy_ports, ())
+            self.assertEqual(foreign.canonical_ports, ())
+            self.assertEqual(
+                foreign.statuses[0].mode,
+                TMResourceDisplayMode.UNAVAILABLE,
+            )
 
 
 if __name__ == "__main__":
