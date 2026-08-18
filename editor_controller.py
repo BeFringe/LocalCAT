@@ -20,6 +20,9 @@ from editor_contracts import (
     EditorSegment,
     ImportReport,
     ImportRequest,
+    ProjectSearchHit,
+    ProjectSearchReport,
+    ProjectSearchRequest,
     ProjectToolCapability,
     ResourceConfig,
     ResourceKind,
@@ -49,12 +52,15 @@ from glossary_engine import GlossaryEngine
 from resource_importer import import_termbase, import_tmx, upsert_term
 from resource_repository import ResourceError, ResourceRepository
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
+from project_search import ProjectSearchError, ProjectSearchService
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
     MigrationPreflight,
     MigrationReport,
+    SearchOptions,
     StoreHealth,
+    TextMatcherState,
 )
 from tm_engine import SourceUnit, TMEngine
 from tm_migration import MigrationPreflightError, TMMigrationService
@@ -63,6 +69,12 @@ from workspace_state import WorkspaceStateError, WorkspaceStateRepository
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+_BASIC_PROJECT_SEARCH_OPTIONS = SearchOptions(
+    match_case=False,
+    whole_word=False,
+)
 
 
 class EditorControllerError(RuntimeError):
@@ -449,6 +461,59 @@ def _tm_suggestion_fields_equal(
     )
 
 
+def _clone_project_search_report(
+    report: ProjectSearchReport,
+) -> ProjectSearchReport:
+    """Return a detached search graph without sharing issued hit objects."""
+
+    if type(report) is not ProjectSearchReport:
+        raise TypeError("project search report must be ProjectSearchReport")
+    report.__post_init__()
+    cloned = ProjectSearchReport(
+        hits=tuple(replace(hit) for hit in report.hits),
+        capability=replace(
+            report.capability,
+            supported_profiles=tuple(report.capability.supported_profiles),
+        ),
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _project_search_hit_fields_equal(
+    candidate: ProjectSearchHit,
+    issued: ProjectSearchHit,
+) -> bool:
+    """Compare the complete frozen hit membership without dataclass equality."""
+
+    return (
+        candidate.segment_id == issued.segment_id
+        and candidate.segment_index == issued.segment_index
+        and candidate.field is issued.field
+        and candidate.start_index == issued.start_index
+        and candidate.end_index == issued.end_index
+        and candidate.preview == issued.preview
+    )
+
+
+def _project_search_fields_digest(project: EditorProject) -> str:
+    """Bind one issued report to stable identities and searchable field values."""
+
+    if type(project) is not EditorProject:
+        raise TypeError("project search identity requires EditorProject")
+    project.__post_init__()
+    payload = tuple(
+        (segment.id, segment.source, segment.target, segment.speaker)
+        for segment in project.segments
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _stable_tm_safe_codes(
     *groups: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -580,6 +645,9 @@ class EditorController:
         self._tm_query_lock = RLock()
         self._project_session_id = uuid4().hex
         self._tm_query_epoch = 0
+        self._current_project_search_report: ProjectSearchReport | None = None
+        self._issued_project_search_hits: tuple[ProjectSearchHit, ...] = ()
+        self._issued_project_search_context: tuple[str, int, str] | None = None
         self._issued_tm_suggestions: tuple[TMSuggestion, ...] = ()
         self._issued_legacy_tm_suggestions: tuple[
             LegacyExactTMSuggestion,
@@ -692,6 +760,18 @@ class EditorController:
         segments = self.project.segments
         return self.confirmed_count / len(segments) if segments else 0.0
 
+    @property
+    def current_project_search_report(self) -> ProjectSearchReport | None:
+        """Return a defensive view of the last successfully issued search."""
+
+        with self._tm_query_lock:
+            report = self._current_project_search_report
+            return (
+                None
+                if report is None
+                else _clone_project_search_report(report)
+            )
+
     def project_tool_capability(self) -> ProjectToolCapability:
         """Project the single-JSON tool gate from the sole project session."""
 
@@ -719,6 +799,211 @@ class EditorController:
                 unavailable_reason=(
                     None if available else "PROJECT_TOOLS.JSON_REQUIRED"
                 ),
+            )
+
+    def search_project(
+        self,
+        request: ProjectSearchRequest,
+    ) -> ProjectSearchReport:
+        """Issue one generation-bound search over the current JSON project."""
+
+        with self._tm_query_lock:
+            _ = self._require_project_search_json_gate()
+            if type(request) is not ProjectSearchRequest:
+                raise TypeError(
+                    "project search request must be ProjectSearchRequest"
+                )
+            request.__post_init__()
+            handoff = self._capture_project_search_handoff()
+            self._authorize_project_search_request(handoff, request)
+            matcher = handoff.matcher
+            if matcher is None:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.HANDOFF_INVALID"
+                )
+
+            try:
+                report = ProjectSearchService(matcher).search(
+                    self.project,
+                    request,
+                )
+            except ProjectSearchError as error:
+                raise EditorControllerError(error.code) from error
+            try:
+                private_report = _clone_project_search_report(report)
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_INVALID"
+                ) from error
+            if private_report.capability != handoff.display:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_MISMATCH"
+                )
+
+            try:
+                issued_hits = tuple(
+                    replace(hit) for hit in private_report.hits
+                )
+                issued_context = (
+                    self._project_session_id,
+                    handoff.generation,
+                    _project_search_fields_digest(self.project),
+                )
+                public_report = _clone_project_search_report(
+                    private_report
+                )
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_INVALID"
+                ) from error
+            self._current_project_search_report = private_report
+            self._issued_project_search_hits = issued_hits
+            self._issued_project_search_context = issued_context
+            return public_report
+
+    def go_to_search_hit(self, hit: ProjectSearchHit) -> EditorProject:
+        """Navigate only one exact hit issued for the current search graph."""
+
+        if type(hit) is not ProjectSearchHit:
+            raise TypeError("project search hit must be ProjectSearchHit")
+        with self._tm_query_lock:
+            capability = self._require_project_search_json_gate()
+            context = self._issued_project_search_context
+            report = self._current_project_search_report
+            if context is None or report is None:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.NO_ISSUED_REPORT"
+                )
+            try:
+                candidate = replace(hit)
+                candidate.__post_init__()
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.HIT_NOT_ISSUED"
+                ) from error
+
+            handoff = self._capture_project_search_handoff()
+            issued_session_id, issued_generation, issued_project_digest = (
+                context
+            )
+            if (
+                issued_session_id != self._project_session_id
+                or issued_session_id != capability.project_session_id
+            ):
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.STALE_PROJECT_SESSION"
+                )
+            if (
+                handoff.generation != issued_generation
+                or handoff.display != report.capability
+            ):
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.STALE_MATCHER_GENERATION"
+                )
+            if (
+                _project_search_fields_digest(self.project)
+                != issued_project_digest
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_PROJECT")
+
+            issued = next(
+                (
+                    member
+                    for member in self._issued_project_search_hits
+                    if _project_search_hit_fields_equal(candidate, member)
+                ),
+                None,
+            )
+            if issued is None:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.HIT_NOT_ISSUED"
+                )
+            if (
+                issued.segment_index >= len(self.project.segments)
+                or self.project.segments[issued.segment_index].id
+                != issued.segment_id
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_PROJECT")
+            return self.go_to(issued.segment_index)
+
+    def _require_project_search_json_gate(self) -> ProjectToolCapability:
+        """Validate the public single-JSON gate before matcher access."""
+
+        try:
+            capability = self.project_tool_capability()
+        except ValueError as error:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+            ) from error
+        if type(capability) is not ProjectToolCapability:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+            )
+        try:
+            capability.__post_init__()
+        except ValueError as error:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+            ) from error
+        if not capability.single_json_tools_available:
+            reason = capability.unavailable_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if capability.project_session_id != self._project_session_id:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.PROJECT_GATE_INVALID"
+            )
+        return capability
+
+    def _capture_project_search_handoff(self) -> MatcherHandoffSnapshot:
+        """Capture and validate exactly one Core matcher handoff."""
+
+        try:
+            handoff = self.text_matcher_handoff()
+        except EditorControllerError:
+            raise
+        if type(handoff) is not MatcherHandoffSnapshot:
+            raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+        try:
+            handoff.__post_init__()
+        except ValueError as error:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.HANDOFF_INVALID"
+            ) from error
+        if handoff.display.state is TextMatcherState.UNAVAILABLE:
+            reason = handoff.display.safe_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.HANDOFF_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if handoff.matcher is None:
+            raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+        return handoff
+
+    def _authorize_project_search_request(
+        self,
+        handoff: MatcherHandoffSnapshot,
+        request: ProjectSearchRequest,
+    ) -> None:
+        """Apply the BASIC/TEXT_V1 gate without reproducing match semantics."""
+
+        state = handoff.display.state
+        if request.options == _BASIC_PROJECT_SEARCH_OPTIONS:
+            if state not in (
+                TextMatcherState.BASIC_VALIDATED,
+                TextMatcherState.TEXT_V1_VALIDATED,
+            ):
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.BASIC_UNAVAILABLE"
+                )
+            return
+        if state is not TextMatcherState.TEXT_V1_VALIDATED:
+            raise EditorControllerError(
+                "PROJECT_SEARCH.ADVANCED_OPTIONS_UNAVAILABLE"
             )
 
     def open_project(self, path: Path) -> EditorProject:
@@ -762,6 +1047,7 @@ class EditorController:
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._clear_project_search_state()
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
             return project
@@ -850,6 +1136,7 @@ class EditorController:
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._clear_project_search_state()
             self._advance_tm_query_epoch()
             self._observed_tm_signature = None
 
@@ -1904,6 +2191,13 @@ class EditorController:
         self._legacy_issued_context = None
         self._current_tm_report = None
         self._tm_query_epoch += 1
+
+    def _clear_project_search_state(self) -> None:
+        """Invalidate only project-search issuance, independent of TM epochs."""
+
+        self._current_project_search_report = None
+        self._issued_project_search_hits = ()
+        self._issued_project_search_context = None
 
     def _tm_signature(
         self,

@@ -108,7 +108,7 @@
   - 完成时，编辑、保存、关闭和 session 切换测试得到一致 revision/baseline，且不破坏现有会话
   - _Requirements: 5.5, 9.4_
 
-- [ ] 3.2a 接入项目搜索与稳定导航
+- [x] 3.2a 接入项目搜索与稳定导航
   - 所有入口先通过单 JSON gate，再调用纯搜索能力
   - 基础搜索只有在 `BASIC_VALIDATED` 时可执行；高级 options 只有在 `TEXT_V1_VALIDATED` 时接受
   - 使用稳定 segment identity 导航命中，保留当前未保存 target；空 query、无结果和 stale hit 不改变当前段
