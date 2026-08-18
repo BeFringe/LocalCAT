@@ -31,11 +31,12 @@ from tm_application_composition import (
     TMRuntimeHost,
     TMRuntimeSnapshot,
 )
-from tm_contracts import MigrationReport
+from tm_contracts import MigrationFailure, MigrationReport
 from tm_migration import TMMigrationService
 from tests.test_tm_initial_activation_recovery import (
     _ambiguous_failure,
     _legacy_failure,
+    _published_failure,
 )
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
@@ -358,6 +359,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                         outcome,
                         activated_generation=outcome.activated_generation + 1,
                     ),
+                    service_canonical_store_id=outcome.canonical_store_id,
                 )
 
             self.assertIs(runtime.snapshot(), before)
@@ -366,6 +368,177 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
             ):
                 controller.tm_suggestion_report()
+
+    def test_success_rejects_same_generation_foreign_service_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, runtime, repository, resource_id = _fixture(root)
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            self.assertTrue(
+                controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
+                ).succeeded
+            )
+            outcome = controller._tm_activation_outcome
+            self.assertIs(type(outcome), MigrationReport)
+            assert isinstance(outcome, MigrationReport)
+            before = runtime.snapshot()
+            foreign_service = controller_module._tm_rebuild_service(
+                repository.get(resource_id)
+            )
+            object.__setattr__(
+                foreign_service,
+                "_canonical_store_id",
+                "foreign.same-generation.store",
+            )
+
+            with (
+                patch.object(
+                    controller_module,
+                    "_tm_rebuild_service",
+                    return_value=foreign_service,
+                ),
+                patch.object(
+                    TMMigrationService,
+                    "rebuild_from_snapshot",
+                    autospec=True,
+                    return_value=outcome,
+                ),
+            ):
+                rebuild = controller.rebuild_tm_resource(resource_id)
+                completed = controller.wait_tm_activation(
+                    rebuild.operation_id,
+                    timeout=20.0,
+                )
+
+            self.assertFalse(completed.succeeded)
+            self.assertEqual(
+                completed.safe_code,
+                "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
+            )
+            self.assertIs(runtime.snapshot(), before)
+
+    def test_published_failure_rejects_same_generation_foreign_service_store(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, runtime, repository, resource_id = _fixture(root)
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            self.assertTrue(
+                controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
+                ).succeeded
+            )
+            before = runtime.snapshot()
+            foreign_service = controller_module._tm_rebuild_service(
+                repository.get(resource_id)
+            )
+            object.__setattr__(
+                foreign_service,
+                "_canonical_store_id",
+                "foreign.same-generation.store",
+            )
+
+            with (
+                patch.object(
+                    controller_module,
+                    "_tm_rebuild_service",
+                    return_value=foreign_service,
+                ),
+                patch.object(
+                    TMMigrationService,
+                    "rebuild_from_snapshot",
+                    autospec=True,
+                    return_value=_published_failure(),
+                ),
+            ):
+                rebuild = controller.rebuild_tm_resource(resource_id)
+                completed = controller.wait_tm_activation(
+                    rebuild.operation_id,
+                    timeout=20.0,
+                )
+
+            self.assertFalse(completed.succeeded)
+            self.assertEqual(
+                completed.safe_code,
+                "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
+            )
+            self.assertIs(runtime.snapshot(), before)
+            with self.assertRaisesRegex(
+                EditorControllerError,
+                "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
+            ):
+                controller.tm_suggestion_report()
+
+    def test_lkg_failure_rejects_same_generation_foreign_service_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, runtime, repository, resource_id = _fixture(root)
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            self.assertTrue(
+                controller.wait_tm_activation(
+                    started.operation_id,
+                    timeout=20.0,
+                ).succeeded
+            )
+            config = repository.get(resource_id)
+            config.path.write_text(
+                json.dumps({"source": "Hello", "target": "diverged"}) + "\n",
+                encoding="utf-8",
+            )
+            real_service = controller_module._tm_rebuild_service(config)
+            with patch.object(
+                TMMigrationService,
+                "_build_stage",
+                autospec=True,
+                side_effect=OSError("forced LKG outcome"),
+            ):
+                lkg_outcome = real_service.rebuild_from_snapshot(
+                    config.path,
+                    resource_id,
+                )
+            self.assertIs(type(lkg_outcome), MigrationFailure)
+            assert isinstance(lkg_outcome, MigrationFailure)
+            self.assertEqual(lkg_outcome.active_generation, 0)
+            before = runtime.snapshot()
+            foreign_service = controller_module._tm_rebuild_service(config)
+            object.__setattr__(
+                foreign_service,
+                "_canonical_store_id",
+                "foreign.same-generation.store",
+            )
+
+            with (
+                patch.object(
+                    controller_module,
+                    "_tm_rebuild_service",
+                    return_value=foreign_service,
+                ),
+                patch.object(
+                    TMMigrationService,
+                    "rebuild_from_snapshot",
+                    autospec=True,
+                    return_value=lkg_outcome,
+                ),
+            ):
+                rebuild = controller.rebuild_tm_resource(resource_id)
+                completed = controller.wait_tm_activation(
+                    rebuild.operation_id,
+                    timeout=20.0,
+                )
+
+            self.assertFalse(completed.succeeded)
+            self.assertEqual(
+                completed.safe_code,
+                "TM.ACTIVATION.RUNTIME_REFRESH_FAILED",
+            )
+            self.assertIs(runtime.snapshot(), before)
 
     def test_public_canonical_rebuild_failure_keeps_last_known_good_runtime(
         self,

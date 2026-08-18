@@ -171,6 +171,7 @@ def _validate_activation_runtime_candidate(
     *,
     resource_id: str,
     outcome: MigrationReport | MigrationFailure,
+    service_canonical_store_id: str,
 ) -> None:
     """Bind a complete runtime candidate to one exact Core outcome."""
 
@@ -178,6 +179,11 @@ def _validate_activation_runtime_candidate(
 
     if type(snapshot) is not TMRuntimeSnapshot:
         raise TypeError("activation runtime candidate must be TMRuntimeSnapshot")
+    if (
+        type(service_canonical_store_id) is not str
+        or not service_canonical_store_id.strip()
+    ):
+        raise TypeError("activation service canonical store id is required")
     snapshot.__post_init__()
     statuses = tuple(
         status for status in snapshot.statuses
@@ -208,10 +214,23 @@ def _validate_activation_runtime_candidate(
         health.__post_init__()
         return health
 
+    def require_service_canonical_store() -> None:
+        if canonical_port is None:
+            raise ValueError("activation runtime canonical port is missing")
+        coordinator = getattr(canonical_port.handle.store, "coordinator", None)
+        if (
+            coordinator is None
+            or getattr(coordinator, "canonical_store_id", None)
+            != service_canonical_store_id
+        ):
+            raise ValueError("activation service canonical store changed")
+
     if isinstance(outcome, MigrationReport):
         outcome.__post_init__()
         if outcome.resource_id != resource_id:
             raise ValueError("activation report resource identity changed")
+        if outcome.canonical_store_id != service_canonical_store_id:
+            raise ValueError("activation report service authority changed")
         if (
             status.mode is not TMResourceDisplayMode.CANONICAL_ACTIVE
             or not status.exact_available
@@ -226,16 +245,7 @@ def _validate_activation_runtime_candidate(
         health = canonical_health()
         if health.generation != outcome.activated_generation:
             raise ValueError("activation success runtime generation changed")
-        port = canonical_port
-        if port is None:
-            raise ValueError("activation runtime canonical port is missing")
-        coordinator = getattr(port.handle.store, "coordinator", None)
-        if (
-            coordinator is None
-            or getattr(coordinator, "canonical_store_id", None)
-            != outcome.canonical_store_id
-        ):
-            raise ValueError("activation success canonical store changed")
+        require_service_canonical_store()
         return
 
     outcome.__post_init__()
@@ -265,6 +275,7 @@ def _validate_activation_runtime_candidate(
         ):
             if canonical_health().generation != outcome.active_generation:
                 raise ValueError("published activation generation changed")
+            require_service_canonical_store()
             return
         raise ValueError("published activation runtime is not fail-closed")
     if outcome.active_generation is not None:
@@ -283,6 +294,7 @@ def _validate_activation_runtime_candidate(
             raise ValueError("canonical update failure did not preserve LKG")
         if canonical_health().generation != outcome.active_generation:
             raise ValueError("canonical LKG generation changed")
+        require_service_canonical_store()
         return
     if (
         status.mode is not TMResourceDisplayMode.LEGACY_EXACT_ONLY
@@ -311,11 +323,18 @@ def _activation_outcome_requires_query_block(
 def _validate_activation_compatibility_engine(
     engine: TMEngine,
     outcome: MigrationReport | MigrationFailure,
+    *,
+    service_canonical_store_id: str,
 ) -> None:
     """Re-prove one no-adapter Controller engine against the Core outcome."""
 
     if type(engine) is not TMEngine:
         raise TypeError("activation compatibility engine must be TMEngine")
+    if (
+        type(service_canonical_store_id) is not str
+        or not service_canonical_store_id.strip()
+    ):
+        raise TypeError("activation service canonical store id is required")
     store = engine.canonical_store
     if isinstance(outcome, MigrationReport):
         if store is None:
@@ -325,7 +344,8 @@ def _validate_activation_compatibility_engine(
         if (
             health.generation != outcome.activated_generation
             or store.coordinator.canonical_store_id
-            != outcome.canonical_store_id
+            != service_canonical_store_id
+            or outcome.canonical_store_id != service_canonical_store_id
         ):
             raise ValueError("activation success compatibility authority changed")
         return
@@ -336,7 +356,11 @@ def _validate_activation_compatibility_engine(
             raise ValueError("canonical failure compatibility engine is legacy")
         health = store.health()
         health.__post_init__()
-        if health.generation != outcome.active_generation:
+        if (
+            health.generation != outcome.active_generation
+            or store.coordinator.canonical_store_id
+            != service_canonical_store_id
+        ):
             raise ValueError("canonical failure compatibility generation changed")
         return
     if store is not None:
@@ -754,66 +778,71 @@ class EditorController:
     def tm_suggestion_report(self) -> TMSuggestionReport:
         """Query and atomically issue the current frozen TM suggestion tuple."""
 
+        with self._tm_query_lock:
+            self._require_tm_runtime_available()
+            self._synchronize_tm_query_state(refresh_current=False)
+            return self._query_and_issue_current_tm_report()
+
+    def _query_and_issue_current_tm_report(self) -> TMSuggestionReport:
+        """Run one production query without recursively synchronizing state."""
+
         adapter = self._tm_adapter
         if adapter is None:
             raise EditorControllerError("TM query adapter is not configured")
-        with self._tm_query_lock:
-            self._require_tm_runtime_available()
-            self._synchronize_tm_query_state()
-            for _attempt in range(4):
-                segment = self.current_segment
-                preferences = self.workspace_state.tm_preferences()
-                operation = adapter._query_current_operation(
-                    segment=segment,
-                    project_session_id=self._project_session_id,
-                    query_epoch=self._tm_query_epoch,
-                    preferences=preferences,
-                )
-                operation.__post_init__()
-                operation_signature = self._tm_signature(
-                    segment=segment,
-                    preferences=preferences,
-                    runtime_generation=operation.runtime_generation,
-                    retrieval_generation=operation.retrieval_generation,
-                )
-                try:
-                    current_signature = self._capture_current_tm_signature()
-                except ValueError:
-                    self._advance_tm_query_epoch()
-                    self._observed_tm_signature = None
-                    continue
-                if current_signature != operation_signature:
-                    self._advance_tm_query_epoch()
-                    self._observed_tm_signature = current_signature
-                    continue
-                if (
-                    self._observed_tm_signature is not None
-                    and operation_signature != self._observed_tm_signature
-                ):
-                    self._advance_tm_query_epoch()
-                    self._observed_tm_signature = operation_signature
-                    continue
-
-                report = operation.report
-                report.__post_init__()
-                identity = report.query_identity
-                expected_digest = hashlib.sha256(
-                    segment.source.encode("utf-8")
-                ).hexdigest()
-                if (
-                    identity.project_session_id != self._project_session_id
-                    or identity.segment_id != segment.id
-                    or identity.source_digest != expected_digest
-                    or identity.query_epoch != self._tm_query_epoch
-                ):
-                    raise EditorControllerError(
-                        "TM query report identity does not match the current session"
-                    )
-                private_report = _clone_tm_suggestion_report(report)
+        for _attempt in range(4):
+            segment = self.current_segment
+            preferences = self.workspace_state.tm_preferences()
+            operation = adapter._query_current_operation(
+                segment=segment,
+                project_session_id=self._project_session_id,
+                query_epoch=self._tm_query_epoch,
+                preferences=preferences,
+            )
+            operation.__post_init__()
+            operation_signature = self._tm_signature(
+                segment=segment,
+                preferences=preferences,
+                runtime_generation=operation.runtime_generation,
+                retrieval_generation=operation.retrieval_generation,
+            )
+            try:
+                current_signature = self._capture_current_tm_signature()
+            except ValueError:
+                self._advance_tm_query_epoch()
+                self._observed_tm_signature = None
+                continue
+            if current_signature != operation_signature:
+                self._advance_tm_query_epoch()
+                self._observed_tm_signature = current_signature
+                continue
+            if (
+                self._observed_tm_signature is not None
+                and operation_signature != self._observed_tm_signature
+            ):
+                self._advance_tm_query_epoch()
                 self._observed_tm_signature = operation_signature
-                self._current_tm_report = private_report
-                self._issued_tm_suggestions = private_report.suggestions
-                return report
+                continue
+
+            report = operation.report
+            report.__post_init__()
+            identity = report.query_identity
+            expected_digest = hashlib.sha256(
+                segment.source.encode("utf-8")
+            ).hexdigest()
+            if (
+                identity.project_session_id != self._project_session_id
+                or identity.segment_id != segment.id
+                or identity.source_digest != expected_digest
+                or identity.query_epoch != self._tm_query_epoch
+            ):
+                raise EditorControllerError(
+                    "TM query report identity does not match the current session"
+                )
+            private_report = _clone_tm_suggestion_report(report)
+            self._observed_tm_signature = operation_signature
+            self._current_tm_report = private_report
+            self._issued_tm_suggestions = private_report.suggestions
+            return report
         raise EditorControllerError("unable to capture a stable TM query snapshot")
 
     def suggestions(self) -> SuggestionBundle:
@@ -1260,6 +1289,7 @@ class EditorController:
         succeeded = False
         safe_code: str | None = None
         retryable = False
+        service_canonical_store_id: str | None = None
         try:
             if action == "INITIAL":
                 candidate = service.activate_initial(source, resource_id)
@@ -1280,20 +1310,31 @@ class EditorController:
                 raise TypeError(
                     "TM activation service returned an unsupported outcome"
                 )
+            service_canonical_store_id = service.canonical_store_id
+            if (
+                type(service_canonical_store_id) is not str
+                or not service_canonical_store_id.strip()
+            ):
+                raise TypeError(
+                    "TM activation service canonical store id is invalid"
+                )
         except MigrationPreflightError as error:
             safe_code = error.error_code
         except (OSError, UnicodeError):
             safe_code = "TM.ACTIVATION.IO_FAILED"
             retryable = True
         except BaseException as error:
+            outcome = None
+            succeeded = False
             worker_error = error
             safe_code = "TM.ACTIVATION.PROGRAMMER_ERROR"
 
-        if outcome is not None:
+        if outcome is not None and service_canonical_store_id is not None:
             try:
                 self._refresh_runtime_for_activation_outcome(
                     resource_id=resource_id,
                     outcome=outcome,
+                    service_canonical_store_id=service_canonical_store_id,
                 )
             except (ValueError, OSError, UnicodeError):
                 succeeded = False
@@ -1328,6 +1369,7 @@ class EditorController:
         *,
         resource_id: str,
         outcome: MigrationReport | MigrationFailure,
+        service_canonical_store_id: str,
     ) -> None:
         """Prevalidate and atomically publish one Core-outcome runtime graph."""
 
@@ -1335,6 +1377,11 @@ class EditorController:
             raise TypeError("activation completion resource id is required")
         if type(outcome) not in (MigrationReport, MigrationFailure):
             raise TypeError("activation completion outcome is unsupported")
+        if (
+            type(service_canonical_store_id) is not str
+            or not service_canonical_store_id.strip()
+        ):
+            raise TypeError("activation service canonical store id is required")
         outcome.__post_init__()
         adapter = self._tm_adapter
         with self._tm_query_lock:
@@ -1354,6 +1401,7 @@ class EditorController:
                         snapshot,
                         resource_id=resource_id,
                         outcome=outcome,
+                        service_canonical_store_id=service_canonical_store_id,
                     )
                     tm_engines = self._build_tm_engine_set_for_runtime_snapshot(
                         configs,
@@ -1378,6 +1426,9 @@ class EditorController:
                         _validate_activation_compatibility_engine(
                             target_engine,
                             outcome,
+                            service_canonical_store_id=(
+                                service_canonical_store_id
+                            ),
                         )
 
                 if adapter is None:
@@ -1400,6 +1451,9 @@ class EditorController:
                     _validate_activation_compatibility_engine(
                         target_engine,
                         outcome,
+                        service_canonical_store_id=(
+                            service_canonical_store_id
+                        ),
                     )
                     tm_engines = {
                         config.id: (
@@ -1420,17 +1474,18 @@ class EditorController:
                 if tm_engines is None:
                     raise ValueError("TM runtime compatibility candidate is missing")
                 self._tm_engines = tm_engines
-                self._tm_runtime_blocked_safe_code = None
                 self._advance_tm_query_epoch()
                 self._record_current_tm_baseline()
                 if adapter is not None and self._project is not None:
-                    _ = self.tm_suggestion_report()
+                    _ = self._query_and_issue_current_tm_report()
+                self._tm_runtime_blocked_safe_code = None
             except BaseException:
                 if _activation_outcome_requires_query_block(outcome):
+                    if self._tm_runtime_blocked_safe_code is None:
+                        self._advance_tm_query_epoch()
                     self._tm_runtime_blocked_safe_code = (
                         "TM.ACTIVATION.RUNTIME_REFRESH_FAILED"
                     )
-                    self._advance_tm_query_epoch()
                     self._observed_tm_signature = None
                 raise
 
@@ -1540,10 +1595,16 @@ class EditorController:
         except ValueError:
             self._observed_tm_signature = None
 
-    def _synchronize_tm_query_state(self) -> None:
+    def _synchronize_tm_query_state(
+        self,
+        *,
+        refresh_current: bool = True,
+    ) -> None:
         """Observe resource, capability, source, and preference changes."""
 
         if self._tm_adapter is None or self._project is None:
+            return
+        if self._tm_runtime_blocked_safe_code is not None:
             return
         try:
             current = self._capture_current_tm_signature()
@@ -1552,12 +1613,15 @@ class EditorController:
                 self._advance_tm_query_epoch()
                 self._observed_tm_signature = None
             return
+        refresh_required = self._current_tm_report is None
         if self._observed_tm_signature is None:
             self._observed_tm_signature = current
-            return
-        if current != self._observed_tm_signature:
+        elif current != self._observed_tm_signature:
             self._advance_tm_query_epoch()
             self._observed_tm_signature = current
+            refresh_required = True
+        if refresh_current and refresh_required:
+            _ = self._query_and_issue_current_tm_report()
 
     def _require_tm_runtime_available(self) -> None:
         """Block stale TM use after a published/ambiguous refresh failure."""
@@ -1565,6 +1629,29 @@ class EditorController:
         safe_code = self._tm_runtime_blocked_safe_code
         if safe_code is not None:
             raise EditorControllerError(safe_code)
+
+    def _latch_persisted_runtime_refresh_failure(self) -> None:
+        """Invalidate stale runtime authority after repository facts changed."""
+
+        with self._tm_query_lock:
+            if self._tm_adapter is None:
+                return
+            if self._tm_runtime_blocked_safe_code is None:
+                self._advance_tm_query_epoch()
+            self._tm_runtime_blocked_safe_code = "TM.RUNTIME.REFRESH_FAILED"
+            self._observed_tm_signature = None
+
+    def _reload_resources_after_persisted_mutation(self) -> None:
+        """Refresh a persisted mutation or fail closed without laundering errors."""
+
+        try:
+            self.reload_resources()
+        except EditorControllerError as error:
+            self._latch_persisted_runtime_refresh_failure()
+            raise EditorControllerError("TM.RUNTIME.REFRESH_FAILED") from error
+        except BaseException:
+            self._latch_persisted_runtime_refresh_failure()
+            raise
 
     def _apply_tm_target_if_generations_current(
         self,
@@ -1759,10 +1846,10 @@ class EditorController:
         with self._tm_query_lock:
             try:
                 resource = self.repository.create_resource(name, kind)
-                self.reload_resources()
-                return resource
             except ResourceError as exc:
                 raise EditorControllerError(str(exc)) from exc
+            self._reload_resources_after_persisted_mutation()
+            return resource
 
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig:
         """Persist resource state through the repository and rebuild engine sets."""
@@ -1770,10 +1857,10 @@ class EditorController:
         with self._tm_query_lock:
             try:
                 updated = self.repository.update_resource(resource)
-                self.reload_resources()
-                return updated
             except ResourceError as exc:
                 raise EditorControllerError(str(exc)) from exc
+            self._reload_resources_after_persisted_mutation()
+            return updated
 
     def delete_resource(self, resource_id: str) -> ResourceConfig:
         """Delete one configured resource and remove it from live engine sets."""
@@ -1786,7 +1873,7 @@ class EditorController:
             self._tm_engines.pop(resource_id, None)
             self._glossary_engines.pop(resource_id, None)
             try:
-                self.reload_resources()
+                self._reload_resources_after_persisted_mutation()
             except EditorControllerError as exc:
                 LOGGER.warning(
                     "Resource %s was deleted; remaining resources kept their last "
@@ -1799,30 +1886,34 @@ class EditorController:
     def import_resource(self, request: ImportRequest) -> ImportReport:
         """Import into one configured resource and hot reload on any written result."""
 
-        try:
-            resource = self.repository.get(request.resource_id)
-        except ResourceError as exc:
-            raise EditorControllerError(str(exc)) from exc
-        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-            report = import_tmx(
-                request.input_path,
-                resource.path,
-                request.source_locale,
-                request.target_locale,
-            )
-        else:
-            report = import_termbase(request.input_path, resource.path)
-        if report.imported:
+        with self._tm_query_lock:
             try:
-                self.reload_resources()
-            except EditorControllerError as exc:
-                return ImportReport(
-                    imported=report.imported,
-                    skipped=report.skipped,
-                    overwritten=report.overwritten,
-                    errors=(*report.errors, f"resource reload failed: {exc}"),
+                resource = self.repository.get(request.resource_id)
+            except ResourceError as exc:
+                raise EditorControllerError(str(exc)) from exc
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                report = import_tmx(
+                    request.input_path,
+                    resource.path,
+                    request.source_locale,
+                    request.target_locale,
                 )
-        return report
+            else:
+                report = import_termbase(request.input_path, resource.path)
+            if report.imported:
+                try:
+                    self._reload_resources_after_persisted_mutation()
+                except EditorControllerError as exc:
+                    return ImportReport(
+                        imported=report.imported,
+                        skipped=report.skipped,
+                        overwritten=report.overwritten,
+                        errors=(
+                            *report.errors,
+                            f"resource reload failed: {exc}",
+                        ),
+                    )
+            return report
 
     def reload_resources(self, *, _refresh_runtime: bool = True) -> None:
         """Build a complete active engine set before replacing the last known-good set."""
@@ -1874,12 +1965,12 @@ class EditorController:
 
                 self._tm_engines = tm_engines
                 self._glossary_engines = glossary_engines
-                self._tm_runtime_blocked_safe_code = None
                 if self._project is not None:
                     self._advance_tm_query_epoch()
                     self._record_current_tm_baseline()
                     if adapter is not None:
-                        _ = self.tm_suggestion_report()
+                        _ = self._query_and_issue_current_tm_report()
+                self._tm_runtime_blocked_safe_code = None
         except (OSError, UnicodeError, ValueError, csv.Error, json.JSONDecodeError) as exc:
             raise EditorControllerError(f"unable to reload language resources: {exc}") from exc
 

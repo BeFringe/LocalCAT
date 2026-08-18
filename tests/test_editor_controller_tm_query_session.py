@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from capability_host import CapabilityHost, CapabilityHostComposition, compose_c
 from editor_contracts import (
     EditorProject,
     EditorSegment,
+    ImportRequest,
     ResourceKind,
     TMPreferences,
     TMSuggestion,
@@ -164,7 +166,7 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             controller.close_project()
             self.assertEqual(controller.query_epoch, epoch + 4)
 
-    def test_raw_speaker_change_advances_epoch_and_invalidates_membership(self) -> None:
+    def test_raw_speaker_change_advances_epoch_and_requeries_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, _adapter, _runtime, _repository = self._controller(
                 Path(temporary)
@@ -175,7 +177,12 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             object.__setattr__(controller.current_segment, "speaker", "Narrator")
 
             self.assertEqual(controller.query_epoch, epoch + 1)
-            self.assertEqual(controller.issued_tm_suggestions, ())
+            refreshed = controller.issued_tm_suggestions
+            self.assertEqual(len(refreshed), 1)
+            self.assertEqual(
+                refreshed[0].query_identity.query_epoch,
+                epoch + 1,
+            )
 
     def test_raw_speaker_change_invalidates_legacy_membership_without_adapter(
         self,
@@ -252,6 +259,262 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             self.assertEqual(controller.issued_tm_suggestions, ())
             self.assertEqual(controller.tm_suggestion_report().suggestions, ())
 
+    def test_persisted_update_refresh_failure_blocks_old_query_apply_and_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, repository = self._controller(
+                Path(temporary)
+            )
+            termbase = controller.create_resource(
+                "Unrelated terms",
+                ResourceKind.TERMBASE,
+            )
+            issued = controller.tm_suggestion_report().suggestions[0]
+            controller.update_target("Draft target")
+            epoch = controller.query_epoch
+            tm = next(
+                item
+                for item in repository.list_resources()
+                if item.kind is ResourceKind.TRANSLATION_MEMORY
+            )
+            before_tm = tm.path.read_bytes()
+
+            with patch.object(
+                controller,
+                "_load_glossary_engine",
+                side_effect=ValueError("/secret/unrelated-termbase"),
+            ):
+                with self.assertRaisesRegex(
+                    EditorControllerError,
+                    "TM.RUNTIME.REFRESH_FAILED",
+                ) as update_failure:
+                    controller.update_resource(replace(tm, update=False))
+            self.assertNotIn("secret", str(update_failure.exception))
+
+            self.assertFalse(repository.get(tm.id).update)
+            self.assertEqual(controller.query_epoch, epoch + 1)
+            self.assertEqual(controller.issued_tm_suggestions, ())
+            for operation in (
+                controller.tm_suggestion_report,
+                lambda: controller.apply_tm_suggestion(issued),
+                controller.confirm_current,
+            ):
+                with self.subTest(operation=operation), self.assertRaisesRegex(
+                    EditorControllerError,
+                    "TM.RUNTIME.REFRESH_FAILED",
+                ):
+                    operation()
+            self.assertEqual(tm.path.read_bytes(), before_tm)
+
+            controller.reload_resources()
+
+            self.assertEqual(
+                controller.issued_tm_suggestions[0].target,
+                "你好。",
+            )
+            result = controller.confirm_current()
+            self.assertTrue(result.write_report.succeeded)
+            self.assertEqual(result.write_report.written_resource_ids, ())
+            self.assertEqual(tm.path.read_bytes(), before_tm)
+            self.assertTrue(termbase.path.exists())
+
+    def test_delete_refresh_failure_cannot_recreate_unregistered_tm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, repository = self._controller(
+                Path(temporary)
+            )
+            _ = controller.create_resource(
+                "Unrelated terms",
+                ResourceKind.TERMBASE,
+            )
+            tm = next(
+                item
+                for item in repository.list_resources()
+                if item.kind is ResourceKind.TRANSLATION_MEMORY
+            )
+            controller.update_target("Draft target")
+
+            with patch.object(
+                controller,
+                "_load_glossary_engine",
+                side_effect=ValueError("/secret/unrelated-termbase"),
+            ):
+                deleted = controller.delete_resource(tm.id)
+
+            self.assertEqual(deleted.id, tm.id)
+            self.assertFalse(tm.path.exists())
+            self.assertNotIn(
+                tm.id,
+                tuple(item.id for item in repository.list_resources()),
+            )
+            with self.assertRaisesRegex(
+                EditorControllerError,
+                "TM.RUNTIME.REFRESH_FAILED",
+            ):
+                controller.confirm_current()
+            self.assertFalse(tm.path.exists())
+
+            controller.reload_resources()
+
+            self.assertEqual(controller.issued_tm_suggestions, ())
+            self.assertFalse(tm.path.exists())
+
+    def test_create_and_import_refresh_failures_latch_persisted_state(self) -> None:
+        for action in ("create", "import"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                controller, _adapter, _runtime, repository = self._controller(root)
+                _ = controller.tm_suggestion_report()
+                imported_resource = None
+                source: Path | None = None
+                if action == "import":
+                    imported_resource = controller.create_resource(
+                        "Imported terms",
+                        ResourceKind.TERMBASE,
+                    )
+                    source = root / "import.csv"
+                    source.write_text(
+                        "Source,Target\nHello,你好\n",
+                        encoding="utf-8-sig",
+                    )
+
+                with patch.object(
+                    EditorTMAdapter,
+                    "_refresh_runtime",
+                    autospec=True,
+                    side_effect=ValueError("/secret/runtime-refresh"),
+                ):
+                    if action == "create":
+                        with self.assertRaises(EditorControllerError):
+                            controller.create_resource(
+                                "Persisted TM",
+                                ResourceKind.TRANSLATION_MEMORY,
+                            )
+                    else:
+                        assert imported_resource is not None
+                        assert source is not None
+                        report = controller.import_resource(
+                            ImportRequest(
+                                resource_id=imported_resource.id,
+                                input_path=source.resolve(),
+                            )
+                        )
+                        self.assertEqual(report.imported, 1)
+                        self.assertTrue(report.errors)
+
+                self.assertGreaterEqual(len(repository.list_resources()), 2)
+                self.assertEqual(controller.issued_tm_suggestions, ())
+                with self.assertRaisesRegex(
+                    EditorControllerError,
+                    "TM.RUNTIME.REFRESH_FAILED",
+                ):
+                    controller.tm_suggestion_report()
+
+                controller.reload_resources()
+                self.assertTrue(controller.issued_tm_suggestions)
+
+    def test_refresh_programmer_error_propagates_but_latch_stays_body_free(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, repository = self._controller(
+                Path(temporary)
+            )
+            tm = repository.list_resources()[0]
+            _ = controller.tm_suggestion_report()
+
+            with patch.object(
+                EditorTMAdapter,
+                "_refresh_runtime",
+                autospec=True,
+                side_effect=AssertionError("/secret/programmer-body"),
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "programmer-body",
+                ):
+                    controller.update_resource(replace(tm, update=False))
+
+            self.assertFalse(repository.get(tm.id).update)
+            self.assertEqual(controller.issued_tm_suggestions, ())
+            with self.assertRaisesRegex(
+                EditorControllerError,
+                "TM.RUNTIME.REFRESH_FAILED",
+            ) as raised:
+                controller.tm_suggestion_report()
+            self.assertNotIn("secret", str(raised.exception))
+
+    def test_query_cannot_cross_persisted_update_and_failed_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _adapter, _runtime, repository = self._controller(
+                Path(temporary)
+            )
+            _ = controller.create_resource(
+                "Unrelated terms",
+                ResourceKind.TERMBASE,
+            )
+            tm = next(
+                item
+                for item in repository.list_resources()
+                if item.kind is ResourceKind.TRANSLATION_MEMORY
+            )
+            refresh_entered = Event()
+            refresh_release = Event()
+            query_done = Event()
+            update_errors: list[BaseException] = []
+            query_errors: list[BaseException] = []
+            query_reports: list[object] = []
+
+            def fail_glossary_refresh(_path: Path):
+                refresh_entered.set()
+                if not refresh_release.wait(5.0):
+                    raise AssertionError("test refresh release timed out")
+                raise ValueError("forced glossary refresh failure")
+
+            def update_resource() -> None:
+                try:
+                    controller.update_resource(replace(tm, update=False))
+                except BaseException as error:
+                    update_errors.append(error)
+
+            def query_current() -> None:
+                try:
+                    query_reports.append(controller.tm_suggestion_report())
+                except BaseException as error:
+                    query_errors.append(error)
+                finally:
+                    query_done.set()
+
+            with patch.object(
+                controller,
+                "_load_glossary_engine",
+                side_effect=fail_glossary_refresh,
+            ):
+                update_thread = Thread(target=update_resource, daemon=True)
+                update_thread.start()
+                self.assertTrue(refresh_entered.wait(5.0))
+                query_thread = Thread(target=query_current, daemon=True)
+                query_thread.start()
+                try:
+                    self.assertFalse(query_done.wait(0.1))
+                finally:
+                    refresh_release.set()
+                update_thread.join(5.0)
+                query_thread.join(5.0)
+
+            self.assertFalse(update_thread.is_alive())
+            self.assertFalse(query_thread.is_alive())
+            self.assertEqual(len(update_errors), 1)
+            self.assertIs(type(update_errors[0]), EditorControllerError)
+            self.assertEqual(query_reports, [])
+            self.assertEqual(len(query_errors), 1)
+            self.assertEqual(
+                str(query_errors[0]),
+                "TM.RUNTIME.REFRESH_FAILED",
+            )
+            self.assertFalse(repository.get(tm.id).update)
+
     def test_runtime_refresh_invalidates_and_inflight_query_retries_new_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, adapter, runtime, repository = self._controller(
@@ -283,7 +546,41 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             self.assertEqual(report.query_identity.query_epoch, initial_epoch + 1)
             self.assertEqual(controller.issued_tm_suggestions, report.suggestions)
 
-    def test_capability_and_threshold_generation_changes_clear_then_requery(self) -> None:
+    def test_observer_auto_requery_retries_inflight_runtime_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, adapter, runtime, repository = self._controller(
+                Path(temporary)
+            )
+            first = controller.tm_suggestion_report()
+            initial_epoch = first.query_identity.query_epoch
+            _ = runtime.refresh(repository.list_resources())
+            original = EditorTMAdapter._query_current_operation
+            calls = 0
+
+            def query_with_second_refresh(current, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal calls
+                calls += 1
+                operation = original(current, **kwargs)
+                if current is adapter and calls == 1:
+                    _ = runtime.refresh(repository.list_resources())
+                return operation
+
+            with patch.object(
+                EditorTMAdapter,
+                "_query_current_operation",
+                new=query_with_second_refresh,
+            ):
+                refreshed = controller.issued_tm_suggestions
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(controller.query_epoch, initial_epoch + 2)
+            self.assertEqual(len(refreshed), 1)
+            self.assertEqual(
+                refreshed[0].query_identity.query_epoch,
+                initial_epoch + 2,
+            )
+
+    def test_capability_and_threshold_generation_changes_auto_requery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             composition = compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
             controller, _adapter, _runtime, _repository = self._controller(
@@ -301,17 +598,32 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
                 evaluated_at_utc=_EVALUATED_AT,
             )
 
-            self.assertEqual(controller.issued_tm_suggestions, ())
+            query_calls = 0
+            original_query = EditorTMAdapter._query_current_operation
+
+            def counted_query(current, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal query_calls
+                query_calls += 1
+                return original_query(current, **kwargs)
+
+            with patch.object(
+                EditorTMAdapter,
+                "_query_current_operation",
+                new=counted_query,
+            ):
+                automatically_refreshed = controller.issued_tm_suggestions
+
             self.assertEqual(controller.query_epoch, first_epoch + 1)
-            refreshed = controller.tm_suggestion_report()
+            self.assertEqual(query_calls, 1)
+            self.assertTrue(automatically_refreshed)
             self.assertEqual(
-                refreshed.query_identity.query_epoch,
+                automatically_refreshed[0].query_identity.query_epoch,
                 first_epoch + 1,
             )
             self.assertEqual(
                 tuple(
                     (item.resource_id, item.record_id, item.target)
-                    for item in refreshed.suggestions
+                    for item in automatically_refreshed
                 ),
                 tuple(
                     (item.resource_id, item.record_id, item.target)
@@ -322,11 +634,10 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             _ = controller.workspace_state.update_tm_preferences(
                 TMPreferences(minimum_similarity=0.75)
             )
-            self.assertEqual(controller.issued_tm_suggestions, ())
+            threshold_suggestions = controller.issued_tm_suggestions
             self.assertEqual(controller.query_epoch, first_epoch + 2)
-            threshold_report = controller.tm_suggestion_report()
             self.assertEqual(
-                threshold_report.query_identity.query_epoch,
+                threshold_suggestions[0].query_identity.query_epoch,
                 first_epoch + 2,
             )
 

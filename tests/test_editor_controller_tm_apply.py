@@ -361,7 +361,15 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
 
                 self.assertEqual(_editor_state(controller), initial_editor)
                 self.assertEqual(_regular_file_snapshot(root), initial_files)
-                self.assertEqual(controller.issued_tm_suggestions, ())
+                refreshed = controller.issued_tm_suggestions
+                self.assertNotIn(suggestion, refreshed)
+                self.assertTrue(
+                    all(
+                        item.query_identity.query_epoch
+                        > suggestion.query_identity.query_epoch
+                        for item in refreshed
+                    )
+                )
 
     def test_capability_generation_stale_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,7 +395,12 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
 
             self.assertEqual(_editor_state(controller), initial_editor)
             self.assertEqual(_regular_file_snapshot(root), initial_files)
-            self.assertEqual(controller.issued_tm_suggestions, ())
+            refreshed = controller.issued_tm_suggestions
+            self.assertEqual(len(refreshed), 1)
+            self.assertGreater(
+                refreshed[0].query_identity.query_epoch,
+                suggestion.query_identity.query_epoch,
+            )
 
     def test_programmer_assertion_is_not_laundered_or_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
