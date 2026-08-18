@@ -21,6 +21,7 @@ from capability_host import (
 )
 from editor_contracts import (
     EditorSegment,
+    ResourceConfig,
     RetrievalDisplayState,
     SuggestionQueryIdentity,
     TMPreferences,
@@ -365,6 +366,18 @@ class EditorTMAdapter:
             _RetrievalGenerationChanged,
         ) as error:
             raise _TMQueryGenerationChanged from error
+
+    def _refresh_runtime_after_activation(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        validate_candidate: Callable[[TMRuntimeSnapshot], None],
+    ) -> TMRuntimeSnapshot:
+        """Atomically publish one activation-proven runtime candidate."""
+
+        return self._runtime_host._refresh_validated(
+            configs,
+            validate_candidate,
+        )
 
     def append_confirmed(
         self,

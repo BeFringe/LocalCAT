@@ -27,6 +27,7 @@ from editor_contracts import (
     TMPreferences,
     TMActivationOperationView,
     TMActivationPreflightView,
+    TMResourceDisplayMode,
     TMSuggestion,
     TMSuggestionReport,
     TermSuggestion,
@@ -134,6 +135,111 @@ def _activation_view_equal(
         and left.valid_count == right.valid_count
         and left.invalid_count == right.invalid_count
         and left.variant_count == right.variant_count
+    )
+
+
+def _validate_activation_runtime_candidate(
+    snapshot: object,
+    *,
+    resource_id: str,
+    outcome: MigrationReport | MigrationFailure,
+) -> None:
+    """Bind a complete runtime candidate to one exact Core outcome."""
+
+    from tm_application_composition import TMRuntimeSnapshot
+
+    if type(snapshot) is not TMRuntimeSnapshot:
+        raise TypeError("activation runtime candidate must be TMRuntimeSnapshot")
+    snapshot.__post_init__()
+    statuses = tuple(
+        status for status in snapshot.statuses
+        if status.resource_id == resource_id
+    )
+    if len(statuses) != 1:
+        raise ValueError("activation runtime candidate status is incomplete")
+    status = statuses[0]
+    legacy_ids = tuple(port.resource_id for port in snapshot.legacy_ports)
+    canonical_ids = tuple(
+        port.handle.resource_id for port in snapshot.canonical_ports
+    )
+    if isinstance(outcome, MigrationReport):
+        outcome.__post_init__()
+        if outcome.resource_id != resource_id:
+            raise ValueError("activation report resource identity changed")
+        if (
+            status.mode is not TMResourceDisplayMode.CANONICAL_ACTIVE
+            or not status.exact_available
+            or status.context_available
+            or status.fuzzy_available
+            or resource_id in legacy_ids
+            or canonical_ids.count(resource_id) != 1
+        ):
+            raise ValueError("activation success runtime is not canonical")
+        return
+
+    outcome.__post_init__()
+    if outcome.canonical_authority_ambiguous:
+        if (
+            status.mode is not TMResourceDisplayMode.UNAVAILABLE
+            or status.exact_available
+            or resource_id in legacy_ids
+            or resource_id in canonical_ids
+        ):
+            raise ValueError("ambiguous activation retained query authority")
+        return
+    if outcome.canonical_authority_published:
+        if status.mode is TMResourceDisplayMode.UNAVAILABLE:
+            if (
+                status.exact_available
+                or resource_id in legacy_ids
+                or resource_id in canonical_ids
+            ):
+                raise ValueError("published-unavailable runtime is contradictory")
+            return
+        if (
+            status.mode is TMResourceDisplayMode.CANONICAL_ACTIVE
+            and status.exact_available
+            and resource_id not in legacy_ids
+            and canonical_ids.count(resource_id) == 1
+        ):
+            return
+        raise ValueError("published activation runtime is not fail-closed")
+    if outcome.active_generation is not None:
+        if (
+            status.mode
+            not in (
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+                TMResourceDisplayMode.SOURCE_DIVERGED,
+            )
+            or not status.exact_available
+            or status.context_available
+            or status.fuzzy_available
+            or resource_id in legacy_ids
+            or canonical_ids.count(resource_id) != 1
+        ):
+            raise ValueError("canonical update failure did not preserve LKG")
+        return
+    if (
+        status.mode is not TMResourceDisplayMode.LEGACY_EXACT_ONLY
+        or not status.exact_available
+        or status.context_available
+        or status.fuzzy_available
+        or legacy_ids.count(resource_id) != 1
+        or resource_id in canonical_ids
+    ):
+        raise ValueError("proven activation failure did not preserve legacy")
+
+
+def _activation_outcome_requires_query_block(
+    outcome: MigrationReport | MigrationFailure,
+) -> bool:
+    """Return whether stale legacy use is forbidden after refresh failure."""
+
+    if isinstance(outcome, MigrationReport):
+        return True
+    return (
+        outcome.canonical_authority_published
+        or outcome.canonical_authority_ambiguous
     )
 
 
@@ -252,6 +358,7 @@ class EditorController:
             None
         )
         self._tm_activation_worker_error: BaseException | None = None
+        self._tm_runtime_blocked_safe_code: str | None = None
         self._project: EditorProject | None = None
         self._current_index = 0
         self._dirty = False
@@ -477,6 +584,7 @@ class EditorController:
         if adapter is None:
             raise EditorControllerError("TM query adapter is not configured")
         with self._tm_query_lock:
+            self._require_tm_runtime_available()
             self._synchronize_tm_query_state()
             for _attempt in range(4):
                 segment = self.current_segment
@@ -538,6 +646,7 @@ class EditorController:
         """Issue the temporary legacy bundle for the pre-integration Qt UI."""
 
         with self._tm_query_lock:
+            self._require_tm_runtime_available()
             self._synchronize_tm_query_state()
             bundle = self._legacy_suggestions()
             issued = tuple(replace(item) for item in bundle.tm_matches)
@@ -622,6 +731,7 @@ class EditorController:
         """Write the current translation to every writable TM before confirmation."""
 
         with self._tm_query_lock:
+            self._require_tm_runtime_available()
             current = self.current_segment
             if not current.target.strip():
                 raise EditorControllerError(
@@ -715,7 +825,13 @@ class EditorController:
             raise EditorControllerError("TM activation resource id is required")
         with self._tm_activation_condition:
             if self._tm_activation_operation is not None:
-                raise EditorControllerError("a TM activation is already in progress")
+                if not self._tm_activation_operation.completed:
+                    raise EditorControllerError(
+                        "a TM activation is already in progress"
+                    )
+                self._tm_activation_operation = None
+                self._tm_activation_outcome = None
+                self._tm_activation_worker_error = None
             try:
                 config = self.repository.get(resource_id)
             except ResourceError as error:
@@ -906,6 +1022,22 @@ class EditorController:
             worker_error = error
             safe_code = "TM.ACTIVATION.PROGRAMMER_ERROR"
 
+        if outcome is not None and self._tm_adapter is not None:
+            try:
+                self._refresh_runtime_for_activation_outcome(
+                    resource_id=resource_id,
+                    outcome=outcome,
+                )
+            except (ValueError, OSError, UnicodeError):
+                succeeded = False
+                safe_code = "TM.ACTIVATION.RUNTIME_REFRESH_FAILED"
+                retryable = True
+            except BaseException as error:
+                succeeded = False
+                safe_code = "TM.ACTIVATION.PROGRAMMER_ERROR"
+                retryable = False
+                worker_error = error
+
         completed = TMActivationOperationView(
             operation_id=operation_id,
             resource_id=resource_id,
@@ -923,6 +1055,45 @@ class EditorController:
             self._tm_activation_worker_error = worker_error
             self._tm_activation_operation = completed
             self._tm_activation_condition.notify_all()
+
+    def _refresh_runtime_for_activation_outcome(
+        self,
+        *,
+        resource_id: str,
+        outcome: MigrationReport | MigrationFailure,
+    ) -> None:
+        """Prevalidate and atomically publish one Core-outcome runtime graph."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise TypeError("activation completion resource id is required")
+        if type(outcome) not in (MigrationReport, MigrationFailure):
+            raise TypeError("activation completion outcome is unsupported")
+        outcome.__post_init__()
+        adapter = self._tm_adapter
+        if adapter is None:
+            raise ValueError("TM runtime adapter is unavailable")
+        with self._tm_query_lock:
+            try:
+                _ = adapter._refresh_runtime_after_activation(
+                    self.repository.list_resources(),
+                    lambda snapshot: _validate_activation_runtime_candidate(
+                        snapshot,
+                        resource_id=resource_id,
+                        outcome=outcome,
+                    ),
+                )
+            except BaseException:
+                if _activation_outcome_requires_query_block(outcome):
+                    self._tm_runtime_blocked_safe_code = (
+                        "TM.ACTIVATION.RUNTIME_REFRESH_FAILED"
+                    )
+                    self._advance_tm_query_epoch()
+                    self._observed_tm_signature = None
+                raise
+            else:
+                self._tm_runtime_blocked_safe_code = None
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
 
     def tm_activation_operation(self) -> TMActivationOperationView | None:
         """Return the current body-free activation lifecycle snapshot."""
@@ -1046,6 +1217,13 @@ class EditorController:
             self._advance_tm_query_epoch()
             self._observed_tm_signature = current
 
+    def _require_tm_runtime_available(self) -> None:
+        """Block stale TM use after a published/ambiguous refresh failure."""
+
+        safe_code = self._tm_runtime_blocked_safe_code
+        if safe_code is not None:
+            raise EditorControllerError(safe_code)
+
     def _apply_tm_target_if_generations_current(
         self,
         target: str,
@@ -1096,6 +1274,7 @@ class EditorController:
 
         if type(suggestion) is LegacyExactTMSuggestion:
             with self._tm_query_lock:
+                self._require_tm_runtime_available()
                 self._synchronize_tm_query_state()
                 try:
                     candidate = replace(suggestion)
@@ -1144,6 +1323,7 @@ class EditorController:
             raise EditorControllerError("a TM suggestion contract is required")
 
         with self._tm_query_lock:
+            self._require_tm_runtime_available()
             self._synchronize_tm_query_state()
             try:
                 candidate = _clone_tm_suggestion(suggestion)

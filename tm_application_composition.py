@@ -584,7 +584,18 @@ class TMRuntimeHost:
     ) -> TMRuntimeSnapshot:
         """Resolve completely, then publish exactly one new generation."""
 
+        return self._refresh_validated(configs, lambda _candidate: None)
+
+    def _refresh_validated(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        validate_candidate: Callable[[TMRuntimeSnapshot], None],
+    ) -> TMRuntimeSnapshot:
+        """Resolve, run one application precommit validator, then publish."""
+
         _validate_configs(configs)
+        if not callable(validate_candidate):
+            raise TypeError("runtime candidate validator must be callable")
         private_configs = _clone_resource_configs(configs)
         candidate = self._resolver.resolve(private_configs)
         if type(candidate) is not TMRuntimeSnapshot:
@@ -595,6 +606,19 @@ class TMRuntimeHost:
             private_candidate,
             generation=0,
         )
+        validation_result = validate_candidate(private_candidate)
+        if validation_result is not None:
+            raise TypeError("runtime candidate validator must return None")
+        try:
+            _validate_snapshot_against_configs(private_candidate, private_configs)
+        except ValueError as error:
+            raise ValueError("runtime refresh candidate drift") from error
+        if not _runtime_snapshot_matches_private_binding(
+            published_candidate,
+            private_candidate,
+            private_configs,
+        ):
+            raise ValueError("runtime refresh candidate drift")
         with self._lock:
             if not _runtime_snapshot_matches_private_binding(
                 self._snapshot,
