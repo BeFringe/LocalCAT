@@ -85,7 +85,7 @@
   - _Boundary: ProjectSearchService_
   - _Depends: 1.1a_
 
-- [ ] 2.7 (P) 集成 legacy Trie 与 configured term matcher
+- [x] 2.7 (P) 集成 legacy Trie 与 configured term matcher
   - legacy 行始终保持区分大小写、连续子串和既有长词优先语义
   - capability 未验收时，v1 行以 legacy preset 参与建议，保存的 flags 不改变匹配结果
   - `TEXT_V1_VALIDATED` 后，仅 v1 cohort 使用 Feature 5 matcher 和逐记录选项；纯 CJK Whole Word 复用共享 golden 语义
