@@ -26,3 +26,7 @@ Use whichever pattern fits the work breakdown:
 ## Conditional Governance Closure
 
 When `design.md` requires an ADR, Steering sync, scope amendment, or downstream revalidation, include a numbered non-parallel task that names the governance owner, dependency, and observable completion evidence. Omit this task when `Governance Impact` explicitly records no governance work.
+
+## Implementation Notes
+
+Add this section only when implementation produces information that changes how later tasks must be understood or executed. Record concise cross-task learnings such as a newly proven counterexample, restored contract, deferred boundary, reproduction prerequisite, or validation constraint. Do not append routine approval history, test-count transcripts, per-cluster “no governance impact” dispositions, or checks that did not change the plan.

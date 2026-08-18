@@ -54,6 +54,11 @@ After all parallel research completes, synthesize implementation brief before st
 **Establish repo baseline**:
 - Run `git status --porcelain` and note any pre-existing uncommitted changes
 
+**Silent governance event gate**:
+- At task/cluster preparation, compare the planned change with the five semantic ADR thresholds in `.kiro/settings/rules/governance.md`
+- When no threshold is crossed, continue without appending a governance check or “no impact” disposition
+- When a threshold is crossed, continue only if the approved Design precisely maps the change to an adopted ADR and the change stays inside that ADR; otherwise stop before implementation and request the ADR candidate / human approval required by the project rule
+
 ## Step 2: Select Tasks & Determine Mode
 
 **Parse arguments**:
@@ -123,7 +128,8 @@ If multi-agent capability is available, for each task (one at a time):
 - Commit message format: `feat(<feature-name>): <task description>`
 
 **f) Record learnings**:
-- If this task revealed cross-cutting insights, append a one-line note to the `## Implementation Notes` section at the bottom of tasks.md
+- Only if this task revealed information that changes later-task judgment, append one concise note to `## Implementation Notes` (for example: a new counterexample, restored contract, deferred boundary, reproduction prerequisite, or validation constraint)
+- Do not record routine test counts, reviewer chronology, approval restatements, silent governance checks, or “no ADR/Steering impact” dispositions
 
 **g) Debug subagent** (triggered by BLOCKED, NEEDS_CONTEXT unresolved, or REJECTED after 2 remediation rounds):
 
@@ -148,7 +154,7 @@ The debug subagent runs in a **fresh context** — it receives only the error in
   - If the new implementer succeeds (READY_FOR_REVIEW → reviewer APPROVED) → normal flow
   - If the new implementer also fails → repeat debug cycle (max 2 debug rounds total). After 2 failed debug rounds → append `_Blocked: debug attempted twice, still failing — <ROOT_CAUSE>_` to tasks.md, skip
 - **Max 2 debug rounds per task**. Each round: fresh debug subagent → fresh implementer. If still failing after 2 rounds, the task is blocked.
-- Record debug findings in `## Implementation Notes` (this helps subsequent tasks avoid the same issue)
+- Record a debug finding in `## Implementation Notes` only when it changes how a later task must be implemented or validated
 
 **`(P)` markers**: Tasks marked `(P)` in tasks.md indicate they have no inter-dependencies and could theoretically run in parallel. However, kiro-impl processes them sequentially (one at a time) to avoid git conflicts and simplify review. The `(P)` marker is informational for task planning, not an execution directive.
 

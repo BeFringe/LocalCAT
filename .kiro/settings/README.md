@@ -19,3 +19,5 @@
 - `.kiro/steering/`：项目实际长期认知与治理文件，不是模板。
 
 模板与 Skills 应进入共享 Git 基线，使所有持久工作树使用相同流程；它们的升级必须使用独立的 `chore(sdd)` 或治理提交，不得夹带在 Feature 5、Qt 或 Parser 功能提交中。
+
+上游 cc-sdd 保留人工 Requirements → Design → Tasks 阶段审批，并允许项目通过 `.kiro/settings/templates/` 扩展文档结构、通过 `.kiro/settings/rules/` 扩展判断标准。LocalCAT 的 ADR/Steering 门属于这一项目级扩展，不是 cc-sdd 原生 ADR 工作流；它必须维持人工批准权，且不得演化成按 task、cluster 或引用次数机械产生日志与 ADR。
