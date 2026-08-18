@@ -264,14 +264,19 @@ class EditorController:
 
         if not isinstance(target, str):
             raise EditorControllerError("target text must be a string")
-        current = self.current_segment
-        if target == current.target:
+        with self._tm_query_lock:
+            current = self.current_segment
+            if target == current.target:
+                return self.project
+            segments = list(self.project.segments)
+            segments[self._current_index] = replace(
+                current,
+                target=target,
+                confirmed=False,
+            )
+            self._project = replace(self.project, segments=tuple(segments))
+            self._dirty = True
             return self.project
-        segments = list(self.project.segments)
-        segments[self._current_index] = replace(current, target=target, confirmed=False)
-        self._project = replace(self.project, segments=tuple(segments))
-        self._dirty = True
-        return self.project
 
     def move(self, direction: int, unconfirmed_only: bool = False) -> EditorProject:
         """Move one segment or find the next unconfirmed segment without losing edits."""
@@ -518,60 +523,89 @@ class EditorController:
     def confirm_current(self) -> ConfirmResult:
         """Write the current translation to every writable TM before confirmation."""
 
-        current = self.current_segment
-        if not current.target.strip():
-            raise EditorControllerError("target text must not be empty before confirmation")
-        unit = SourceUnit(
-            id=current.id,
-            text=current.source,
-            speaker=current.speaker or None,
-            file_source=self.project.name,
-        )
-        written: list[str] = []
-        errors: list[str] = []
-        for resource in self.repository.list_resources():
-            if (
-                resource.kind is not ResourceKind.TRANSLATION_MEMORY
-                or not resource.active
-                or not resource.update
-            ):
-                continue
-            engine = self._tm_engines.get(resource.id)
-            if engine is None:
-                errors.append(f"{resource.name}: translation memory is not loaded")
-            elif engine.save_record(unit, current.target):
-                written.append(resource.id)
+        with self._tm_query_lock:
+            current = self.current_segment
+            if not current.target.strip():
+                raise EditorControllerError(
+                    "target text must not be empty before confirmation"
+                )
+            adapter = self._tm_adapter
+            if adapter is not None:
+                report = adapter.append_confirmed(
+                    segment=current,
+                    target=current.target,
+                    file_source=self.project.name,
+                )
+                if type(report) is not WriteReport:
+                    raise TypeError("TM adapter must return WriteReport")
+                report.__post_init__()
+                if not report.outcomes and (
+                    report.written_resource_ids or report.errors
+                ):
+                    raise ValueError(
+                        "TM adapter write report must retain structured outcomes"
+                    )
             else:
-                errors.append(f"{resource.name}: unable to write translation memory")
+                unit = SourceUnit(
+                    id=current.id,
+                    text=current.source,
+                    speaker=current.speaker or None,
+                    file_source=self.project.name,
+                )
+                written: list[str] = []
+                errors: list[str] = []
+                for resource in self.repository.list_resources():
+                    if (
+                        resource.kind is not ResourceKind.TRANSLATION_MEMORY
+                        or not resource.active
+                        or not resource.update
+                    ):
+                        continue
+                    engine = self._tm_engines.get(resource.id)
+                    if engine is None:
+                        errors.append(
+                            f"{resource.name}: translation memory is not loaded"
+                        )
+                    elif engine.save_record(unit, current.target):
+                        written.append(resource.id)
+                    else:
+                        errors.append(
+                            f"{resource.name}: unable to write translation memory"
+                        )
+                report = WriteReport(
+                    written_resource_ids=tuple(written),
+                    errors=tuple(errors),
+                )
 
-        report = WriteReport(written_resource_ids=tuple(written), errors=tuple(errors))
-        if errors:
+            if not report.succeeded:
+                return ConfirmResult(
+                    project=self.project,
+                    current_index=self._current_index,
+                    write_report=report,
+                )
+
+            segments = list(self.project.segments)
+            segments[self._current_index] = replace(current, confirmed=True)
+            self._project = replace(self.project, segments=tuple(segments))
+            self._dirty = True
+            current_index = self._current_index
+            next_index = next(
+                (
+                    index
+                    for index in range(current_index + 1, len(segments))
+                    if not segments[index].confirmed
+                ),
+                current_index,
+            )
+            self._current_index = next_index
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+            self._remember_current_position()
             return ConfirmResult(
                 project=self.project,
-                current_index=self._current_index,
+                current_index=next_index,
                 write_report=report,
             )
-
-        segments = list(self.project.segments)
-        segments[self._current_index] = replace(current, confirmed=True)
-        self._project = replace(self.project, segments=tuple(segments))
-        self._dirty = True
-        current_index = self._current_index
-        next_index = next(
-            (
-                index
-                for index in range(current_index + 1, len(segments))
-                if not segments[index].confirmed
-            ),
-            current_index,
-        )
-        self._current_index = next_index
-        self._remember_current_position()
-        return ConfirmResult(
-            project=self.project,
-            current_index=next_index,
-            write_report=report,
-        )
 
     def _advance_tm_query_epoch(self) -> None:
         """Invalidate every issued suggestion before advancing one epoch."""
