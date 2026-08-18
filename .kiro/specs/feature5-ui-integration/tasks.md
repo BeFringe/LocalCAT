@@ -305,7 +305,7 @@
   - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 9.9_
   - _Boundary: TM Suggestion and Write Permission Validation_
 
-- [ ] 7.6 执行 Qt、legacy、Excel 与本地性回归
+- [x] 7.6 执行 Qt、legacy、Excel 与本地性回归
   - 运行 offscreen journeys、exact priority、raw speaker/Ren'Py、Trie、JSON/TXT/save/confirmed/dirty/resource switches 与 Excel 三态
   - 验证 DTD/ENTITY TMX 仍被拒绝且目标字节不变，项目、TM、术语、阈值和诊断不离开本机
   - 对 changed files 运行 `basedpyright --level error`，并执行 `git diff --check` 与四个用户 WIP SHA-256 复核
@@ -392,6 +392,7 @@
 - Task 7.3：同一次 production retrieval operation 的 Core report 与 adapter projection 逐字段闭合；真实 canonical 与交错 legacy 资源验证 exact/context/fuzzy、双 source、0.60 inclusive、跨资源 tie、确定性重查和唯一 global top-10，未引入 UI scorer、重排或后过滤权威。
 - Task 7.4：跨 Gate owner、runtime/query、Controller activation 与 Qt 状态投影闭合 capability/resource/activation failure matrix；closed/expired/foreign、局部 path/query/reopen、proven/ambiguous、source-diverged/LKG 均保留安全可见失败与健康结果，activated authority 不回落 JSONL。
 - Task 7.5：真实 canonical/legacy Controller journey 对六类 epoch、suggestion 全字段 substitution、三种 match type apply 与 Active/Lookup/Update 写入矩阵执行零修改证明；partial write 保留已成功资源事实，但不确认、不导航，Update=false、inactive 与失败资源字节不变。
+- Task 7.6：current-tip 回归确认真实 canonical 验收与 legacy/Trie/raw-speaker/Ren’Py、Qt、JSON/TXT、Excel 三态、TMX DTD/ENTITY 拒绝和本地性边界并存；未发现新的行为缺口，唯一预期失败为 Cluster F 源码变更后尚待簇出口统一重签的 acceptance/release evidence。
 
 - 用户 WIP 基线：`Demo.xlsx de4d85b4dc8ce2e828dea4b2941ad0748f937b307df61d8a3d98f454bbb2bb7f`；`spec.md d781dc2d324b69199d3078ee485a2ca224a9f18c5946f7712c8874af3719b611`；`terms.csv 36ec5fca0895fd0e4f1229a2650b9b5dfe2e3aa87599caeda67c04c68860a837`；`tm.jsonl 82b1597aba42dcc40bcd9404485ed9a1140103713af7872ea5eae1619c1e4f73`。
 - 合并前身份基线：授权 UI 根为 `ui-mvp@af23b2a534f3ff061d033470e3112ede309720cc`；授权 Feature 5 source 根为 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；两 tip 的 merge-base 与各自相对的历史共同基线均为 `459b524e72ce3d1f3925088669988a0e730cdb39`；UI object database 尚未引入 `dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b`；UI 本地旧迁移 ref 为 `feature5-migrate@fe7afa57bfdf7ac3fc347695c304588f8ad706f2`，不得用于精确 merge 或补齐到 `b90de57…`。
