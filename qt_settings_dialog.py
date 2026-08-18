@@ -15,7 +15,14 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QKeyEvent, QPaintEvent, QPainter
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QKeyEvent,
+    QPaintEvent,
+    QPainter,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -33,6 +40,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -63,6 +71,8 @@ from qt_tm_threshold import (
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
 TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+DEFAULT_VISIBLE_RESOURCE_ROWS = 3
+_EMPTY_RESOURCE_TABLE_BODY_HEIGHT = 36
 _RESOURCE_MORE_BUTTON_STYLE = """
 QToolButton {
     border: none;
@@ -249,6 +259,8 @@ class QtSettingsDialog(QDialog):
         self.new_resource_button: QPushButton
         self.tm_threshold_chip: QPushButton
         self.tm_threshold_state: QLabel
+        self._resource_row_resize_pending = False
+        self._resource_row_layout_signature: tuple[object, ...] | None = None
         self.controller = controller
         self.setObjectName("settingsDialog")
         self.setWindowTitle("LocalCAT · 语言资源设置")
@@ -267,6 +279,97 @@ class QtSettingsDialog(QDialog):
         self._build_ui()
         self.setTabOrder(self.new_resource_button, self.tm_threshold_chip)
         self.refresh_resources()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._schedule_resource_row_resize()
+
+    def _schedule_resource_row_resize(self) -> None:
+        if (
+            self._resource_row_resize_pending
+            or not hasattr(self, "active_table")
+        ):
+            return
+        self._resource_row_resize_pending = True
+        QTimer.singleShot(0, self._resize_resource_rows)
+
+    def _resize_resource_rows(self) -> None:
+        self._resource_row_resize_pending = False
+        signature_parts: list[object] = []
+        for table in (self.active_table, self.inactive_table):
+            row_count = table.rowCount()
+            table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            table.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                if row_count <= DEFAULT_VISIBLE_RESOURCE_ROWS
+                else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            table.resizeRowsToContents()
+            for row in range(row_count):
+                name_cell = table.cellWidget(row, 3)
+                if (
+                    name_cell is None
+                    or not name_cell.objectName().startswith("tmResource_")
+                ):
+                    continue
+                required_height = table.verticalHeader().minimumSectionSize()
+                for column in range(table.columnCount()):
+                    cell = table.cellWidget(row, column)
+                    if cell is None:
+                        continue
+                    layout = cell.layout()
+                    if layout is not None and layout.hasHeightForWidth():
+                        cell_height = layout.totalHeightForWidth(max(1, cell.width()))
+                    else:
+                        cell_height = max(
+                            cell.minimumSizeHint().height(),
+                            cell.sizeHint().height(),
+                        )
+                    required_height = max(required_height, cell_height)
+                table.setRowHeight(row, required_height)
+            visible_count = min(row_count, DEFAULT_VISIBLE_RESOURCE_ROWS)
+            if visible_count:
+                body_height = sum(
+                    sorted(
+                        (table.rowHeight(row) for row in range(row_count)),
+                        reverse=True,
+                    )[:visible_count]
+                )
+            else:
+                body_height = _EMPTY_RESOURCE_TABLE_BODY_HEIGHT
+            table_height = (
+                table.horizontalHeader().height()
+                + body_height
+                + table.frameWidth() * 2
+            )
+            table.setFixedHeight(table_height)
+            group = table.parentWidget()
+            if group is not None:
+                group.setMinimumHeight(0)
+                group.setMaximumHeight(16_777_215)
+                group.setFixedHeight(group.sizeHint().height())
+            signature_parts.extend(
+                (
+                    table.width(),
+                    table.viewport().width(),
+                    table_height,
+                    tuple(table.rowHeight(row) for row in range(row_count)),
+                )
+            )
+        resource_tables_layout = self.resource_tables_content.layout()
+        if resource_tables_layout is None:
+            raise AssertionError("resource tables content layout is required")
+        self.resource_tables_content.setMinimumHeight(0)
+        resource_tables_layout.invalidate()
+        self.resource_tables_content.setMinimumHeight(
+            self.resource_tables_content.sizeHint().height()
+        )
+        resource_tables_layout.activate()
+        self.resource_tables_content.updateGeometry()
+        signature = tuple(signature_parts)
+        if signature != self._resource_row_layout_signature:
+            self._resource_row_layout_signature = signature
+            self._schedule_resource_row_resize()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -340,19 +443,41 @@ class QtSettingsDialog(QDialog):
         threshold_layout.addWidget(self.tm_threshold_chip)
         content_layout.addWidget(threshold_panel)
 
+        self.resource_tables_scroll = QScrollArea()
+        self.resource_tables_scroll.setObjectName("resourceTablesScroll")
+        self.resource_tables_scroll.setWidgetResizable(True)
+        self.resource_tables_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.resource_tables_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.resource_tables_content = QWidget()
+        self.resource_tables_content.setObjectName("resourceTablesContent")
+        resource_tables_layout = QVBoxLayout(self.resource_tables_content)
+        resource_tables_layout.setContentsMargins(0, 0, 0, 0)
+        resource_tables_layout.setSpacing(16)
+
         active_group = QGroupBox("活动资源")
         active_group.setObjectName("activeResourcesGroup")
+        active_group_policy = active_group.sizePolicy()
+        active_group_policy.setVerticalPolicy(QSizePolicy.Policy.Fixed)
+        active_group.setSizePolicy(active_group_policy)
         active_layout = QVBoxLayout(active_group)
         self.active_table = self._make_table("activeResourcesTable")
         active_layout.addWidget(self.active_table)
-        content_layout.addWidget(active_group, 2)
+        resource_tables_layout.addWidget(active_group)
 
         inactive_group = QGroupBox("非活动资源")
         inactive_group.setObjectName("inactiveResourcesGroup")
+        inactive_group_policy = inactive_group.sizePolicy()
+        inactive_group_policy.setVerticalPolicy(QSizePolicy.Policy.Fixed)
+        inactive_group.setSizePolicy(inactive_group_policy)
         inactive_layout = QVBoxLayout(inactive_group)
         self.inactive_table = self._make_table("inactiveResourcesTable")
         inactive_layout.addWidget(self.inactive_table)
-        content_layout.addWidget(inactive_group, 1)
+        resource_tables_layout.addWidget(inactive_group)
+        resource_tables_layout.addStretch()
+        self.resource_tables_scroll.setWidget(self.resource_tables_content)
+        content_layout.addWidget(self.resource_tables_scroll, 1)
 
         footer = QHBoxLayout()
         feedback = QVBoxLayout()
@@ -395,7 +520,8 @@ class QtSettingsDialog(QDialog):
         table.setAlternatingRowColors(True)
         table.setShowGrid(False)
         table.setWordWrap(False)
-        table.setMinimumHeight(128)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         header = table.horizontalHeader()
         header.setMinimumSectionSize(32)
         for column in range(3):
@@ -454,6 +580,7 @@ class QtSettingsDialog(QDialog):
             operation=operation,
         )
         self._refresh_resource_menu_tab_order(resources)
+        self._schedule_resource_row_resize()
         if operation is not None and not operation.completed:
             self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
         else:
@@ -813,7 +940,7 @@ class QtSettingsDialog(QDialog):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        status_label.setWordWrap(False)
+        status_label.setWordWrap(True)
         layout.addWidget(status_label)
 
         target_running = (

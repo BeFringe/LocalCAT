@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -13,14 +14,17 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
-from PySide6.QtGui import QAction, QColor, QImage
+from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QToolButton,
 )
 
@@ -28,7 +32,7 @@ from capability_host import CapabilityHost
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
-from qt_settings_dialog import QtSettingsDialog
+from qt_settings_dialog import DEFAULT_VISIBLE_RESOURCE_ROWS, QtSettingsDialog
 from resource_repository import ResourceRepository
 from tm_application_composition import (
     TMResourceResolver,
@@ -178,6 +182,24 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         y_delta = abs((top + bottom + 1) / 2 - image.height() / 2) / ratio
         self.assertLessEqual(x_delta, 1.0)
         self.assertLessEqual(y_delta, 1.0)
+
+    def _assert_wrapped_label_is_fully_visible(self, label: QLabel) -> None:
+        contents = label.contentsRect()
+        required = QFontMetrics(label.font()).boundingRect(
+            QRect(0, 0, max(1, contents.width()), 10_000),
+            int(
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignTop
+                | Qt.TextFlag.TextWordWrap
+            ),
+            label.text(),
+        ).height()
+        self.assertGreaterEqual(
+            contents.height(),
+            required,
+            f"{label.objectName()} clips {label.text()!r} at {contents.size().toTuple()}",
+        )
+        self.assertTrue(label.wordWrap())
 
     def _complete_operation(
         self,
@@ -567,10 +589,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 dialog.resize(width, 680)
                 self._events()
                 for resource_id, expected_mode in expected_modes.items():
-                    self.assertEqual(
-                        self._status(dialog, resource_id).property("tm_mode"),
-                        expected_mode,
-                    )
+                    status = self._status(dialog, resource_id)
+                    self.assertEqual(status.property("tm_mode"), expected_mode)
                     button = self._more(dialog, resource_id)
                     row = next(
                         row
@@ -578,11 +598,138 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                         if dialog.active_table.cellWidget(row, 7) is button
                     )
                     observed_row_heights.add(dialog.active_table.rowHeight(row))
+                    holder = dialog.active_table.cellWidget(row, 3)
+                    self.assertIsNotNone(holder)
+                    assert holder is not None
+                    name = dialog.findChild(QLabel, f"resourceName_{resource_id}")
+                    self.assertIsNotNone(name)
+                    assert name is not None
+                    self.assertFalse(name.geometry().intersects(status.geometry()))
+                    self._assert_wrapped_label_is_fully_visible(status)
+                    self.assertLessEqual(
+                        status.geometry().bottom(),
+                        holder.contentsRect().bottom(),
+                    )
+                    self.assertGreaterEqual(
+                        dialog.active_table.rowHeight(row),
+                        holder.minimumSizeHint().height(),
+                    )
+                    capabilities = self._capabilities(dialog, resource_id)
+                    self.assertGreaterEqual(
+                        capabilities.contentsRect().width(),
+                        capabilities.sizeHint().width(),
+                    )
                     self.assertEqual(button.width(), 32)
                     self.assertEqual(button.toolTip(), button.accessibleName())
                     self.assertTrue(button.menu())
                     self._assert_app_owned_more_indicator(button)
+                self.assertEqual(
+                    dialog.active_table.verticalScrollBarPolicy(),
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+                )
+                last_row = dialog.active_table.rowCount() - 1
+                self.assertLessEqual(
+                    dialog.active_table.rowViewportPosition(last_row)
+                    + dialog.active_table.rowHeight(last_row),
+                    dialog.active_table.viewport().height(),
+                )
+                self.assertEqual(
+                    dialog.inactive_table.verticalScrollBarPolicy(),
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+                )
+                self.assertGreater(
+                    dialog.inactive_table.height(),
+                    dialog.inactive_table.horizontalHeader().height(),
+                )
+                active_group = dialog.active_table.parentWidget()
+                inactive_group = dialog.inactive_table.parentWidget()
+                assert active_group is not None
+                assert inactive_group is not None
+                self.assertLess(
+                    active_group.geometry().bottom(),
+                    inactive_group.geometry().top(),
+                )
             self.assertGreaterEqual(len(observed_row_heights), 2)
+            dialog.close()
+
+    def test_tables_show_three_rows_then_scroll_to_a_fully_clickable_last_row(
+        self,
+    ) -> None:
+        self.assertEqual(DEFAULT_VISIBLE_RESOURCE_ROWS, 3)
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, resource_ids = _controller(Path(temporary), resources=8)
+            for resource_id in resource_ids[4:]:
+                resource = next(
+                    configured
+                    for configured in controller.list_resources()
+                    if configured.id == resource_id
+                )
+                controller.update_resource(replace(resource, active=False))
+
+            dialog = QtSettingsDialog(controller)
+            dialog.show()
+            self._events()
+            for width, height in ((860, 560), (860, 734), (1180, 680)):
+                dialog.resize(width, height)
+                self._events()
+                self.assertEqual(
+                    dialog.close_button.visibleRegion().boundingRect(),
+                    dialog.close_button.rect(),
+                )
+                for table, ids in (
+                    (dialog.active_table, resource_ids[:4]),
+                    (dialog.inactive_table, resource_ids[4:]),
+                ):
+                    self.assertEqual(table.rowCount(), 4)
+                    self.assertEqual(
+                        table.verticalScrollMode(),
+                        QAbstractItemView.ScrollMode.ScrollPerPixel,
+                    )
+                    self.assertNotEqual(
+                        table.verticalScrollBarPolicy(),
+                        Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+                    )
+                    visible_rows_height = sum(
+                        sorted(
+                            (table.rowHeight(row) for row in range(table.rowCount())),
+                            reverse=True,
+                        )[:DEFAULT_VISIBLE_RESOURCE_ROWS]
+                    )
+                    self.assertEqual(
+                        table.height(),
+                        table.horizontalHeader().height()
+                        + visible_rows_height
+                        + table.frameWidth() * 2,
+                    )
+                    scrollbar = table.verticalScrollBar()
+                    self.assertGreater(scrollbar.maximum(), 0)
+                    scrollbar.setValue(scrollbar.maximum())
+                    self._events()
+                    last_row = table.rowCount() - 1
+                    self.assertGreaterEqual(table.rowViewportPosition(last_row), 0)
+                    self.assertLessEqual(
+                        table.rowViewportPosition(last_row)
+                        + table.rowHeight(last_row),
+                        table.viewport().height(),
+                    )
+                    last_more = self._more(dialog, ids[-1])
+                    tables_scroll = dialog.findChild(QScrollArea, "resourceTablesScroll")
+                    self.assertIsNotNone(tables_scroll)
+                    assert tables_scroll is not None
+                    tables_scroll.ensureWidgetVisible(last_more)
+                    self._events()
+                    self._assert_app_owned_more_indicator(last_more)
+                    opened: list[bool] = []
+
+                    def close_menu() -> None:
+                        opened.append(True)
+                        QTimer.singleShot(0, last_more.menu().close)
+
+                    last_more.menu().aboutToShow.connect(close_menu)
+                    QTest.mouseClick(last_more, Qt.MouseButton.LeftButton)
+                    self._events()
+                    self.assertEqual(opened, [True])
+                    last_more.menu().aboutToShow.disconnect(close_menu)
             dialog.close()
 
     def test_unknown_preflight_exception_is_sanitized(self) -> None:
