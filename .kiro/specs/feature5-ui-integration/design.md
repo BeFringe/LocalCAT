@@ -132,6 +132,8 @@ graph LR
 ├── qt_editor_window.py              # TM cards、阈值 chip、持久状态、非阻塞反馈
 ├── qt_settings_dialog.py            # 第二阈值入口、canonical 状态/激活动作
 ├── macos_app_launcher.py            # stdlib lightweight bundle builder/validator
+├── macos/LocalCATLauncher.c         # auditable native execv bootstrap source
+├── LocalCAT-launcher                # tracked universal arm64/x86_64 Mach-O bootstrap
 ├── LocalCAT-logo-silver.icns        # 由已跟踪 silver PNG 生成并验证的 macOS 图标
 ├── qt_editor.py                     # composition/bootstrap 与 macOS install CLI
 └── tests/
@@ -295,8 +297,8 @@ flowchart LR
 ```
 
 - bundle builder 在临时 sibling 中完整生成并验证后原子替换 user-local target；测试使用临时目录。
-- `CFBundleName`/`CFBundleDisplayName = LocalCAT`，稳定 bundle identifier，silver `.icns`，可执行文件名 `LocalCAT`。
-- launcher 记录安装时经验证的 Python 与 checkout bootstrap 绝对路径，不依赖 Finder 工作目录；任一路径失效时以可诊断非零退出，不伪装成功。
+- `CFBundleName`/`CFBundleDisplayName = LocalCAT`，稳定 bundle identifier，silver `.icns`，可执行文件名 `LocalCAT`。该 executable 是由可审计 C source 生成的通用 arm64/x86_64 Mach-O，最低 macOS 13.0，只链接 macOS CoreFoundation/libSystem；不复制 Python/PySide，不引入 packaging runtime。
+- builder 将安装时验证的 Python 与 checkout bootstrap 绝对路径写入 Info.plist；native launcher 读取并以 `execv` 参数数组启动，不依赖 Finder 工作目录。任一路径失效时以有限文案和非零状态退出，不伪装成功。
 - 先以 Finder/Dock 冷启动、Activity Monitor/Dock identity 和 Qt window icon 验证真实身份。若仍显示 Python 或环境不能保真，停止此 cluster，提出最小 PySide6 deployment amendment；不自动引入依赖。
 
 ## Requirements Traceability
@@ -589,7 +591,7 @@ class MacOSBundleReport:
 
 - build 只允许明确的 `.app` target，验证输入为绝对 regular files，临时目录与 target 同 parent。
 - `.icns` 由已跟踪 `LocalCAT-logo-silver.png` 通过 macOS 自带 `sips`/`iconutil` 生成并作为派生资产提交；builder 只复制并校验该 `.icns`，运行时不下载或安装图标工具。派生失败在该独立 cluster 内 fail，不引入第三方 packaging。
-- executable 使用参数数组/quoted static paths，不 `eval`、不展开用户输入；bundle 内不复制项目、TM 或 data dir。
+- executable 使用 `execv` 参数数组和 Info.plist 中的经验证绝对路径，不调用 shell/`eval`/`system`、不展开用户输入；bundle 内不复制项目、TM 或 data dir。
 - validation 检查 plist、identifier、display name、executable mode、icon、cold-launch marker 和 cwd-independent bootstrap。
 - 安装失败恢复旧 bundle 或保留 absence；不会影响 Linux `.desktop`。
 

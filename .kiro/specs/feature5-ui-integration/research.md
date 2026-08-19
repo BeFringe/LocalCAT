@@ -73,7 +73,9 @@
 - **Findings**：
   - user-local wrapper 可保存现有 Python/PySide environment和 data dir，但 shell executable `exec python` 是否保持 Dock identity 必须真实 smoke，不能仅靠 plist 推断。
   - 仓库只有 tracked silver PNG，没有 `.icns`；macOS 自带 `sips/iconutil` 可生成派生 asset。
-- **Implications**：先提交/验证 derived `.icns` 和 lightweight bundle；若真实 identity 失败，回到 Design amendment讨论最小 PySide deployment。
+  - 真实 LaunchServices 探针确认 shell script 作为 `CFBundleExecutable` 被 macOS 以 `-10669` 拒绝，不能把直接执行脚本或只读 plist 当作 Finder 验收。
+  - 仅链接系统 CoreFoundation 的双架构微型 Mach-O launcher 可从 Info.plist 读取安装时验证的绝对 Python/bootstrap，以 `execv` 参数数组启动；exec 后 AppKit 仍报告 `LocalCAT`、稳定 bundle id 和原 `.app` path，无需复制 PySide 或引入 py2app/PyInstaller。
+- **Implications**：提交 derived `.icns`、可审计 C source 与通用双架构 launcher；stdlib builder 只复制并验证资产，在临时 sibling 经 LaunchServices 冷启动后原子替换。若后续 macOS 取消该 identity 保真，再回 Design amendment讨论最小 PySide deployment。
 
 ## Architecture Pattern Evaluation
 
@@ -131,7 +133,7 @@
 - Gate D 实际运行昂贵 — 后台运行、exact/context 诚实可用、fuzzy 关闭状态持久可见。
 - mixed merge 重述 Core 排序 — 只合并 exact lane，context/fuzzy 完整保留 Core order，并用交错 fixture验证。
 - capability/resource refresh 导致旧卡片误用 — epoch + issued membership 双校验。
-- lightweight `.app` 仍显示 Python — 真实 Finder/Dock gate；失败后回 Design amendment。
+- lightweight `.app` 的 native bootstrap 或 exec 后 identity 漂移 — 每次构建都经 LaunchServices marker，簇出口再用 AppKit 读取 localized name、bundle id 与 bundle path；失败后回 Design amendment。
 
 ## References
 

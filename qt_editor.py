@@ -13,6 +13,7 @@ from pathlib import Path
 
 INSTALL_HINT = "python -m pip install -r requirements-ui.txt"
 APPLICATION_ICON_FILENAME = "LocalCAT-logo-silver.png"
+APPLICATION_ICNS_FILENAME = "LocalCAT-logo-silver.icns"
 APPLICATION_ICON_NAME = "localcat"
 # hicolor's freedesktop theme index declares apps directories only through
 # 512x512; resources installed into an undeclared 1024x1024/apps directory are
@@ -30,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Install a Linux application-menu launcher, then exit.",
     )
+    project.add_argument(
+        "--install-macos-app",
+        action="store_true",
+        help="Install the lightweight macOS LocalCAT.app, then exit.",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -39,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--smoke-test",
         action="store_true",
         help="Build one usable editor window, process events, then exit.",
+    )
+    parser.add_argument(
+        "--bundle-smoke-marker",
+        type=Path,
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -173,6 +184,66 @@ def install_desktop_launcher(
     launcher_path.chmod(0o755)
     _refresh_desktop_database(applications_dir)
     return launcher_path
+
+
+def install_macos_app(target_dir: Path | None = None) -> Path:
+    """Build and atomically install the user-local lightweight LocalCAT.app."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("LocalCAT.app installation is only supported on macOS")
+    from macos_app_launcher import MacOSAppLauncher
+
+    root = Path(__file__).resolve().parent
+    applications_dir = (
+        target_dir
+        if target_dir is not None
+        else Path.home() / "Applications"
+    ).expanduser().resolve()
+    applications_dir.mkdir(parents=True, exist_ok=True)
+    launcher = MacOSAppLauncher(
+        icon_path=(root / APPLICATION_ICNS_FILENAME).resolve(),
+    )
+    return launcher.build_bundle(
+        applications_dir / "LocalCAT.app",
+        Path(sys.executable).resolve(),
+        Path(__file__).resolve(),
+    )
+
+
+def _write_bundle_smoke_marker(
+    path: Path,
+    *,
+    application_name: str,
+    window_title: str,
+) -> None:
+    """Publish the private cold-launch marker only after a usable Qt window."""
+
+    import json
+
+    from macos_app_launcher import LOCALCAT_SMOKE_MARKER_VERSION
+
+    marker = path.expanduser()
+    if not marker.is_absolute() or marker.exists() or not marker.parent.is_dir():
+        raise ValueError("bundle smoke marker path is invalid")
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "application_name": application_name,
+                    "pid": os.getpid(),
+                    "version": LOCALCAT_SMOKE_MARKER_VERSION,
+                    "window_title": window_title,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _fuzzy_validation_display(composition: object):
@@ -354,6 +425,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Installed LocalCAT desktop launcher: {launcher}")
         return 0
+    if args.install_macos_app:
+        try:
+            bundle = install_macos_app()
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Unable to install LocalCAT.app: {exc}", file=sys.stderr)
+            return 1
+        print(f"Installed LocalCAT.app: {bundle}")
+        return 0
     try:
         from typing import cast
 
@@ -413,6 +492,12 @@ def main(argv: list[str] | None = None) -> int:
         # lifetime. The worker only emits; Qt invokes the window on its thread.
         _ = validation_worker
         app.processEvents()
+        if args.bundle_smoke_marker is not None:
+            _write_bundle_smoke_marker(
+                args.bundle_smoke_marker.expanduser().resolve(),
+                application_name=app.applicationName(),
+                window_title=window.windowTitle(),
+            )
 
         if args.smoke_test:
             if (
