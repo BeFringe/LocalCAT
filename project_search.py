@@ -11,6 +11,7 @@ from editor_contracts import (
     ProjectSearchReport,
     ProjectSearchRequest,
     SearchField,
+    SegmentTranslationStatus,
     TextMatcherDisplayState,
 )
 from tm_contracts import (
@@ -78,6 +79,11 @@ class ProjectSearchService:
         used_capability: TextMatcherCapability | None = None
 
         for segment_index, segment in enumerate(project.segments):
+            if (
+                request.status is not None
+                and _segment_translation_status(segment) is not request.status
+            ):
+                continue
             for field in _FIELD_ORDER:
                 if field not in selected_fields:
                     continue
@@ -132,6 +138,16 @@ def _field_text(segment: EditorSegment, field: SearchField) -> str:
     if field is SearchField.TARGET:
         return segment.target
     return segment.speaker
+
+
+def _segment_translation_status(
+    segment: EditorSegment,
+) -> SegmentTranslationStatus:
+    if segment.confirmed:
+        return SegmentTranslationStatus.TRANSLATED
+    if segment.target.strip() == "":
+        return SegmentTranslationStatus.UNFILLED
+    return SegmentTranslationStatus.DRAFT
 
 
 def _display_from_core(

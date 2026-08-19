@@ -16,6 +16,7 @@ from editor_contracts import (
     EditorSegment,
     ProjectSearchRequest,
     SearchField,
+    SegmentTranslationStatus,
 )
 from matcher_validation import build_validated_matcher_v1
 from project_search import ProjectSearchError, ProjectSearchService
@@ -214,6 +215,105 @@ class ProjectSearchServiceTests(unittest.TestCase):
         self.assertTrue(
             all(match_request.options is options for _, match_request in observed)
         )
+
+    def test_status_filter_is_derived_before_the_same_core_matcher_runs(
+        self,
+    ) -> None:
+        project = EditorProject(
+            name="Translation states",
+            segments=(
+                EditorSegment(
+                    id="unfilled",
+                    source="needle unfilled",
+                    target="  \t",
+                    speaker="needle unfilled speaker",
+                    confirmed=False,
+                ),
+                EditorSegment(
+                    id="draft",
+                    source="needle draft",
+                    target="needle draft target",
+                    speaker="needle draft speaker",
+                    confirmed=False,
+                ),
+                EditorSegment(
+                    id="translated",
+                    source="needle translated",
+                    target="",
+                    speaker="needle translated speaker",
+                    confirmed=True,
+                ),
+            ),
+        )
+        core_match = CapabilityGatedTextMatcherV1.match
+
+        for status, expected_texts, expected_hit_ids in (
+            (
+                SegmentTranslationStatus.UNFILLED,
+                ("needle unfilled", "  \t", "needle unfilled speaker"),
+                ("unfilled", "unfilled"),
+            ),
+            (
+                SegmentTranslationStatus.DRAFT,
+                (
+                    "needle draft",
+                    "needle draft target",
+                    "needle draft speaker",
+                ),
+                ("draft", "draft", "draft"),
+            ),
+            (
+                SegmentTranslationStatus.TRANSLATED,
+                ("needle translated", "", "needle translated speaker"),
+                ("translated", "translated"),
+            ),
+        ):
+            with self.subTest(status=status):
+                observed: list[
+                    tuple[CapabilityGatedTextMatcherV1, TextMatchRequest]
+                ] = []
+
+                def observe_match(
+                    matcher: CapabilityGatedTextMatcherV1,
+                    match_request: TextMatchRequest,
+                ):
+                    observed.append((matcher, match_request))
+                    return core_match(matcher, match_request)
+
+                request = ProjectSearchRequest(
+                    query="needle",
+                    fields=(
+                        SearchField.SOURCE,
+                        SearchField.TARGET,
+                        SearchField.SPEAKER,
+                    ),
+                    options=SearchOptions(
+                        match_case=False,
+                        whole_word=False,
+                    ),
+                    status=status,
+                )
+                with patch.object(
+                    CapabilityGatedTextMatcherV1,
+                    "match",
+                    new=observe_match,
+                ):
+                    report = ProjectSearchService(self.basic_matcher).search(
+                        project,
+                        request,
+                    )
+
+                self.assertEqual(
+                    tuple(match_request.text for _, match_request in observed),
+                    expected_texts,
+                )
+                self.assertTrue(
+                    all(matcher is self.basic_matcher for matcher, _ in observed)
+                )
+                self.assertEqual(
+                    tuple(hit.segment_id for hit in report.hits),
+                    expected_hit_ids,
+                )
 
     def test_advanced_options_are_passed_unchanged_to_real_text_v1_matcher(
         self,

@@ -93,7 +93,7 @@
   - _Boundary: ProjectSearchService_
   - _Depends: 1.1a_
 
-- [ ] 2.6a 在 matcher 前闭合段状态筛选
+- [x] 2.6a 在 matcher 前闭合段状态筛选
   - 只由 Qt-free `ProjectSearchService` 从 `target + confirmed` 派生 UNFILLED/DRAFT/TRANSLATED，Qt 不得事后筛选 hits
   - 状态匹配的段落继续按 segment 与 SOURCE/TARGET/SPEAKER 固定顺序交给同一 matcher，offset 与 preview 原样保留
   - 完成时，未填写、草稿、已翻译与全部四组在 source/target/raw-speaker 上均稳定，空 query 仍拒绝
