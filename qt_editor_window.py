@@ -246,6 +246,49 @@ class _TopBarSearchButton(QToolButton):
             painter.end()
 
 
+class _InlineMenuButton(QToolButton):
+    """Menu button with one app-owned chevron beside its label."""
+
+    def inlineChevronRect(self) -> QRect:
+        arrow_size = 8
+        return QRect(
+            max(0, self.width() - 18),
+            max(0, (self.height() - arrow_size) // 2),
+            arrow_size,
+            arrow_size,
+        )
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        label_width = self.fontMetrics().horizontalAdvance(self.text())
+        return QSize(max(hint.width(), label_width + 40), hint.height())
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        rect = self.inlineChevronRect()
+        center = rect.center()
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(QColor("#244b68" if self.isEnabled() else "#8da2b2"))
+            pen.setWidthF(1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(
+                QPolygonF(
+                    (
+                        QPointF(center.x() - 3.5, center.y() - 1.5),
+                        QPointF(center.x(), center.y() + 2.0),
+                        QPointF(center.x() + 3.5, center.y() - 1.5),
+                    )
+                )
+            )
+        finally:
+            painter.end()
+
+
 class ResponsiveSplitter(QSplitter):
     """QSplitter with inspectable stretch metadata for layout verification."""
 
@@ -608,7 +651,7 @@ class QtEditorWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
         search_panel = self._build_project_search_bar()
-        search_panel.setParent(page)
+        layout.addWidget(search_panel)
 
         self.main_splitter = ResponsiveSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setObjectName("mainWorkspaceSplitter")
@@ -629,8 +672,7 @@ class QtEditorWindow(QMainWindow):
         self.workspace_pages.setObjectName("editorWorkspacePages")
         self.workspace_pages.addWidget(self.main_splitter)
         self.workspace_pages.addWidget(self._build_browse_panel())
-        layout.addWidget(self.workspace_pages)
-        QTimer.singleShot(0, self._position_project_search_overlay)
+        layout.addWidget(self.workspace_pages, 1)
         return page
 
     def _build_project_search_bar(self) -> QWidget:
@@ -998,12 +1040,20 @@ class QtEditorWindow(QMainWindow):
         terms_layout.setContentsMargins(0, 0, 0, 0)
         term_toolbar = QHBoxLayout()
         term_toolbar.addStretch()
-        self.manage_terms_button = QToolButton()
+        self.manage_terms_button = _InlineMenuButton()
         self.manage_terms_button.setObjectName("manageTermsButton")
         self.manage_terms_button.setText("管理术语")
         self.manage_terms_button.setAccessibleName("管理术语")
         self.manage_terms_button.setToolTip(
             "选择一个 Active+Update 术语表并打开集中式术语管理"
+        )
+        self.manage_terms_button.setStyleSheet(
+            "QToolButton#manageTermsButton {"
+            " padding: 5px 24px 5px 10px;"
+            "}"
+            "QToolButton#manageTermsButton::menu-indicator {"
+            " image: none; width: 0px;"
+            "}"
         )
         self.manage_terms_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.manage_terms_button.setPopupMode(
@@ -1250,10 +1300,9 @@ class QtEditorWindow(QMainWindow):
     ) -> None:
         visible = bool(expanded and self.controller.has_project)
         self._project_search_expanded = visible
-        self._position_project_search_overlay()
+        self.source_display.setMinimumHeight(96 if visible else 155)
+        self.target_editor.setMinimumHeight(100 if visible else 190)
         self.project_search_panel.setVisible(visible)
-        if visible:
-            self.project_search_panel.raise_()
         blocker = QSignalBlocker(self.project_search_toggle)
         try:
             self.project_search_toggle.setChecked(visible)
@@ -1264,25 +1313,6 @@ class QtEditorWindow(QMainWindow):
                 Qt.FocusReason.ShortcutFocusReason
             )
             self.project_search_input.selectAll()
-
-    def _position_project_search_overlay(self) -> None:
-        """Anchor the transient search surface without reflowing the editor."""
-
-        if not hasattr(self, "editor_page") or not hasattr(
-            self,
-            "project_search_panel",
-        ):
-            return
-        margin = 14
-        width = max(1, self.editor_page.width() - (2 * margin))
-        self.project_search_panel.setFixedWidth(width)
-        height = self.project_search_panel.sizeHint().height()
-        self.project_search_panel.setGeometry(
-            margin,
-            margin,
-            width,
-            height,
-        )
 
     def _project_search_criteria_changed(self, _value: object) -> None:
         if self._refreshing:
@@ -2728,7 +2758,6 @@ class QtEditorWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._position_project_search_overlay()
         self._schedule_layout_refresh()
 
     def closeEvent(self, event: QCloseEvent) -> None:

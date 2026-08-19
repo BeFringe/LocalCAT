@@ -12,10 +12,10 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
+from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, QRect, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from capability_host import CapabilityHostComposition
 from editor_contracts import (
@@ -524,14 +524,21 @@ class QtProjectSearchTests(unittest.TestCase):
         self.assertFalse(window.project_search_panel.isVisible())
         self.assertFalse(window.project_search_toggle.isEnabled())
 
-    def test_native_find_shortcut_toggles_overlay_without_moving_editor_actions(
+    def test_native_find_shortcut_reflows_workspace_and_preserves_bottom_actions(
         self,
     ) -> None:
         self._validate_basic()
         window = self._open_window(expand_search=False)
+        window.resize(1080, 700)
         self._events()
         self._events()
-        workspace_geometry = window.main_splitter.geometry()
+
+        def window_rect(widget: QWidget) -> QRect:
+            top_left = widget.mapTo(window, QPoint(0, 0))
+            return QRect(top_left, widget.size())
+
+        collapsed_workspace = window_rect(window.workspace_pages)
+        collapsed_target_height = window.target_editor.height()
         action_centers = tuple(
             button.mapTo(window, button.rect().center())
             for button in (
@@ -550,7 +557,20 @@ class QtProjectSearchTests(unittest.TestCase):
         self._events()
 
         self.assertTrue(window.project_search_panel.isVisible())
-        self.assertEqual(window.main_splitter.geometry(), workspace_geometry)
+        expanded_workspace = window_rect(window.workspace_pages)
+        self.assertGreater(
+            expanded_workspace.top(),
+            collapsed_workspace.top(),
+        )
+        self.assertLess(
+            expanded_workspace.height(),
+            collapsed_workspace.height(),
+        )
+        self.assertLessEqual(
+            abs(expanded_workspace.bottom() - collapsed_workspace.bottom()),
+            1,
+        )
+        self.assertLess(window.target_editor.height(), collapsed_target_height)
         self.assertEqual(
             tuple(
                 button.mapTo(window, button.rect().center())
@@ -570,7 +590,27 @@ class QtProjectSearchTests(unittest.TestCase):
         )
         self._events()
         self.assertFalse(window.project_search_panel.isVisible())
-        self.assertEqual(window.main_splitter.geometry(), workspace_geometry)
+        self.assertEqual(window_rect(window.workspace_pages), collapsed_workspace)
+        self.assertEqual(window.target_editor.height(), collapsed_target_height)
+
+        window.set_workspace_mode(WorkspaceMode.BROWSE)
+        self._events()
+        collapsed_browse = window_rect(window.browse_table)
+        window.target_editor.setFocus()
+        QTest.keyClick(
+            window.target_editor,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self._events()
+        self.assertTrue(window.project_search_panel.isVisible())
+        expanded_browse = window_rect(window.browse_table)
+        self.assertGreater(expanded_browse.top(), collapsed_browse.top())
+        self.assertLess(expanded_browse.height(), collapsed_browse.height())
+        self.assertLessEqual(
+            abs(expanded_browse.bottom() - collapsed_browse.bottom()),
+            1,
+        )
 
     def test_explicit_clear_and_status_filter_share_controller_issuance(
         self,

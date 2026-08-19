@@ -61,7 +61,7 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 9. Where 统一兼容匹配能力已经合并并通过验收, the LocalCAT Qt 编辑器 shall 启用 Match Case 和 Whole Word 控件并让结果遵循已验收的统一语义
 10. Where Whole Word 已启用且查询词为纯 CJK 文本, the LocalCAT Qt 编辑器 shall 使用连续文本匹配并返回与未启用 Whole Word 时相同的结果
 11. When 项目搜索未被用户召出, the LocalCAT Qt 编辑器 shall 保持搜索面板折叠，并在顶栏提供可发现、可键盘操作的搜索入口
-12. When 用户点击搜索入口或使用平台原生 Find 快捷键（macOS `Command+F`，Qt portable text `Ctrl+F`）, the LocalCAT Qt 编辑器 shall 在展开时将焦点置于关键词、在再次触发时折叠，且不得因浮层展开移动主编辑区导航/确认动作；编辑/校对视图切换不得自行改变展开状态
+12. When 用户点击搜索入口或使用平台原生 Find 快捷键（macOS `Command+F`，Qt portable text `Ctrl+F`）, the LocalCAT Qt 编辑器 shall 在展开时将焦点置于关键词、在再次触发时折叠；搜索区作为布局行使编辑三栏/校对两栏整体下移，底部导航/确认动作须保持完整可见且位置稳定，由 target 编辑区/浏览列表自适应收矮；编辑/校对视图切换不得自行改变展开状态
 13. When 用户执行“清除”, the LocalCAT Qt 编辑器 shall 同时清空关键词、可见结果与 Controller 已签发搜索成员，且不改变当前段、项目内容、dirty 或已选字段/选项
 14. When 用户对非空关键词选择段状态, the LocalCAT Qt 编辑器 shall 在调用统一 matcher 前按下列唯一规则筛选段落：未确认且 `target.strip()` 为空是“未填写”，未确认且 target 非空是“草稿”，`confirmed=true` 是“已翻译”
 15. The LocalCAT Qt 编辑器 shall 将段状态筛选作为非空关键词搜索的附加条件；只选状态而未输入关键词时仍提示有效输入，不伪造文本字段或命中 offset

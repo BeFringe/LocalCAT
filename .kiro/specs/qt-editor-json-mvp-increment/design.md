@@ -565,7 +565,7 @@ class EditorController:
 
 - 主编辑区在 source/target 对齐位置显示 raw speaker；空值保留布局并显示“无 speaker”可访问文本。
 - browse table 增加 speaker 列，双击仍按 stable index 返回编辑。
-- 顶栏提供 checkable 放大镜入口；项目搜索面板初始折叠，以不改变主 workspace geometry 的顶部浮层展示。点击入口或平台原生 Find 快捷键展开并聚焦，再次触发折叠；编辑/浏览切换保留当前展开状态，该状态不持久化。macOS 原生显示为 `Command+F`，Qt portable text 仍为 `Ctrl+F`。
+- 顶栏提供 checkable 放大镜入口；项目搜索面板初始折叠，展开时作为主 workspace 上方的正常布局行，使编辑三栏/浏览两栏整体下移。workspace 底边与上一段/下一段/确认译文动作位置保持稳定，target 编辑区或浏览列表吸收高度变化。点击入口或平台原生 Find 快捷键展开并聚焦，再次触发折叠；编辑/浏览切换保留当前展开状态，该状态不持久化。macOS 原生显示为 `Command+F`，Qt portable text 仍为 `Ctrl+F`。
 - search bar 展示 query、source/target/speaker、全部/未填写/草稿/已翻译状态、结果计数与前后导航；advanced checkboxes 读取 capability 决定 enabled/reason。
 - 显式“清除”先调用 Controller clear，再清 query 与可见 report；保留字段、matcher options、状态筛选和面板展开状态。
 - Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。

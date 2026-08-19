@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCheckBox, QMenu, QToolButton
 
@@ -635,6 +635,22 @@ class QtTermbaseDialogTests(unittest.TestCase):
             self.assertEqual(button.text(), "管理术语")
             self.assertTrue(button.accessibleName())
             self.assertTrue(button.toolTip())
+            inline_chevron_rect = getattr(button, "inlineChevronRect", None)
+            self.assertTrue(callable(inline_chevron_rect))
+            assert callable(inline_chevron_rect)
+            chevron_rect = inline_chevron_rect()
+            self.assertIsInstance(chevron_rect, QRect)
+            assert isinstance(chevron_rect, QRect)
+            self.assertLessEqual(
+                abs(chevron_rect.center().y() - button.rect().center().y()),
+                1,
+            )
+            text_width = button.fontMetrics().horizontalAdvance(button.text())
+            self.assertLessEqual(chevron_rect.width(), 10)
+            self.assertLessEqual(
+                chevron_rect.left() - button.rect().center().x(),
+                (text_width // 2) + 10,
+            )
             menu = button.menu()
             self.assertIsInstance(menu, QMenu)
             assert menu is not None
