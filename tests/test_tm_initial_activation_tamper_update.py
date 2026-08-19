@@ -1488,7 +1488,7 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 (0, 0),
             )
 
-    def test_process_death_releases_lock_but_residue_stays_fail_stopped(
+    def test_process_death_orphan_stage_is_preserved_and_fresh_retry_succeeds(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1506,7 +1506,7 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             child_script = "\n".join(
                 (
                     "from pathlib import Path",
-                    "import hashlib, os, sys",
+                    "import hashlib, os, sqlite3, sys",
                     "from tm_contracts import CanonicalResourceIdentity",
                     "import tm_migration",
                     "source = Path(sys.argv[1]).resolve()",
@@ -1514,7 +1514,14 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     "reservation = tm_migration._InitialActivationResourceReservation.acquire(identity)",
                     "digest = hashlib.sha256(source.read_bytes()).hexdigest()",
                     "stage = tm_migration._deterministic_stage_ref(identity, source_digest=digest, stage_prefix='migration', path_salt='initial-' + ('a' * 32))",
-                    "stage.staged_db_path.write_bytes(b'crash-owned-residue')",
+                    "connection = sqlite3.connect(stage.staged_db_path)",
+                    "connection.execute('PRAGMA journal_mode=DELETE')",
+                    "connection.execute('CREATE TABLE residue (value TEXT NOT NULL)')",
+                    "connection.execute('INSERT INTO residue(value) VALUES (?)', ('before-crash',))",
+                    "connection.commit()",
+                    "connection.execute('BEGIN IMMEDIATE')",
+                    "connection.execute('UPDATE residue SET value = ?', ('crash-owned-residue-' + ('x' * 1000000),))",
+                    "assert Path(str(stage.staged_db_path) + '-journal').exists()",
                     "print('READY', flush=True)",
                     "sys.stdin.buffer.read(1)",
                     "os._exit(0)",
@@ -1536,6 +1543,13 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             )
             assert process.stdout is not None
             self.assertEqual(process.stdout.readline().strip(), "READY")
+            residue_journal = Path(f"{residue}-journal")
+            self.assertTrue(residue.exists())
+            self.assertTrue(residue_journal.exists())
+            residue_identity = os.lstat(residue)
+            journal_identity = os.lstat(residue_journal)
+            residue_bytes = residue.read_bytes()
+            journal_bytes = residue_journal.read_bytes()
             outcome: list[object | None] = [None]
             finished = threading.Event()
 
@@ -1566,19 +1580,22 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             self.assertEqual(child_stderr, "")
             worker.join(timeout=10.0)
             self.assertFalse(worker.is_alive())
-            self.assertIs(type(outcome[0]), MigrationFailure)
-            assert isinstance(outcome[0], MigrationFailure)
+            self.assertIs(type(outcome[0]), MigrationReport)
+            self.assertEqual(coordinator.current_generation, 0)
+            self.assertEqual(residue.read_bytes(), residue_bytes)
+            self.assertEqual(residue_journal.read_bytes(), journal_bytes)
+            self.assertEqual(os.lstat(residue).st_ino, residue_identity.st_ino)
             self.assertEqual(
-                outcome[0].error_code,
-                "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
+                os.lstat(residue_journal).st_ino,
+                journal_identity.st_ino,
             )
-            self.assertTrue(outcome[0].canonical_authority_ambiguous)
-            self.assertEqual(residue.read_bytes(), b"crash-owned-residue")
-            _assert_no_partial_initial_authority(
-                self,
-                identity=identity,
-                coordinator=coordinator,
-            )
+
+            reopened = TMEngine(str(identity.configured_jsonl_path))
+            self.assertIsNotNone(reopened.canonical_store)
+            match = reopened.query_exact("same")
+            self.assertIsNotNone(match)
+            assert match is not None
+            self.assertEqual(match.target, "winner")
 
     def test_concurrent_public_calls_linearize_to_one_generation(self) -> None:
         """One build wins; the peer recovers the same generation."""
@@ -1851,10 +1868,10 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 coordinator=coordinator,
             )
 
-    def test_two_coordinators_bind_clean_scan_to_ambiguous_transaction(
+    def test_second_coordinator_fresh_retries_after_unpublished_tamper(
         self,
     ) -> None:
-        """A clean scan cannot be reused by a second Core coordinator."""
+        """The failed owner stays closed; a later owner uses a fresh nonce."""
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1864,31 +1881,11 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 _service(identity, coordinator)
                 for coordinator in coordinators
             )
-            real_scan = tm_migration._has_initial_stage_residue
             real_build = tuple(service._build_stage for service in services)
-            scan_guard = threading.Lock()
             build_guard = threading.Lock()
-            second_scan_entered = threading.Event()
-            scan_calls = 0
             build_calls = 0
             foreign_path: Path | None = None
             foreign_bytes: bytes | None = None
-
-            def align_clean_scans(identity_arg: Any) -> bool:
-                nonlocal scan_calls
-                with scan_guard:
-                    scan_calls += 1
-                    call_number = scan_calls
-                if call_number == 1:
-                    # Without a physical resource reservation the peer
-                    # reaches the same clean scan immediately.  With the
-                    # reservation, this times out while still owning it and
-                    # the peer can scan only after the ambiguous residue is
-                    # visible.
-                    second_scan_entered.wait(timeout=1.0)
-                else:
-                    second_scan_entered.set()
-                return real_scan(identity_arg)
 
             def first_build_becomes_foreign(
                 service_index: int,
@@ -1931,10 +1928,6 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     "tm_sqlite_store._probe_fts5",
                     return_value=False,
                 ),
-                patch(
-                    "tm_migration._has_initial_stage_residue",
-                    side_effect=align_clean_scans,
-                ),
                 patch.object(
                     services[0],
                     "_build_stage",
@@ -1964,27 +1957,37 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     worker.join(timeout=20.0)
 
             self.assertFalse(any(worker.is_alive() for worker in workers))
-            self.assertEqual(scan_calls, 2)
-            self.assertEqual(build_calls, 1)
+            self.assertEqual(build_calls, 2)
+            self.assertEqual(
+                sum(type(outcome) is MigrationFailure for outcome in outcomes),
+                1,
+            )
+            self.assertEqual(
+                sum(type(outcome) is MigrationReport for outcome in outcomes),
+                1,
+            )
             for outcome in outcomes:
-                self.assertIs(type(outcome), MigrationFailure, outcomes)
-                assert isinstance(outcome, MigrationFailure)
-                self.assertEqual(
-                    outcome.error_code,
-                    "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-                )
-                self.assertTrue(outcome.canonical_authority_ambiguous)
+                if type(outcome) is MigrationFailure:
+                    assert isinstance(outcome, MigrationFailure)
+                    self.assertEqual(
+                        outcome.error_code,
+                        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
+                    )
+                    self.assertTrue(outcome.canonical_authority_ambiguous)
+                else:
+                    self.assertIs(type(outcome), MigrationReport, outcomes)
             assert foreign_path is not None
             assert foreign_bytes is not None
             self.assertEqual(foreign_path.read_bytes(), foreign_bytes)
-            for coordinator in coordinators:
-                _assert_no_partial_initial_authority(
-                    self,
-                    identity=identity,
-                    coordinator=coordinator,
-                )
+            self.assertEqual(
+                sum(
+                    coordinator.current_generation == 0
+                    for coordinator in coordinators
+                ),
+                1,
+            )
 
-    def test_same_byte_foreign_stage_inode_is_preserved_and_fails_stop(
+    def test_same_byte_foreign_stage_inode_fails_current_attempt_then_retries(
         self,
     ) -> None:
         for changed_asset in ("database", "manifest"):
@@ -2049,35 +2052,15 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
-                    self.assertIs(type(restarted_retry), MigrationFailure)
-                    assert isinstance(restarted_retry, MigrationFailure)
-                    self.assertEqual(
-                        restarted_retry.error_code,
-                        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-                    )
-                    self.assertFalse(
-                        restarted_retry.canonical_authority_published
-                    )
-                    self.assertTrue(
-                        restarted_retry.canonical_authority_ambiguous
-                    )
+                    self.assertIs(type(restarted_retry), MigrationReport)
+                    self.assertEqual(restarted_coordinator.current_generation, 0)
                     self.assertEqual(foreign_path.read_bytes(), foreign_bytes)
-                    _assert_no_partial_initial_authority(
-                        self,
-                        identity=identity,
-                        coordinator=restarted_coordinator,
-                    )
 
                     same_process_retry = service.activate_initial(
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
-                    self.assertIs(type(same_process_retry), MigrationFailure)
-                    assert isinstance(same_process_retry, MigrationFailure)
-                    self.assertEqual(
-                        same_process_retry.error_code,
-                        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-                    )
+                    self.assertIs(type(same_process_retry), MigrationReport)
 
                     # The residue family is bound to identity A.  An exact
                     # first activation for identity B in the same directory
@@ -2101,7 +2084,7 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     self.assertEqual(peer_coordinator.current_generation, 0)
                     self.assertEqual(foreign_path.read_bytes(), foreign_bytes)
 
-    def test_restart_discovery_preserves_symlink_and_hardlink_residue(
+    def test_restart_preserves_alias_residue_and_uses_fresh_nonce(
         self,
     ) -> None:
         for residue_kind in ("symlink", "hardlink"):
@@ -2168,23 +2151,15 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
-                    self.assertIs(type(retry), MigrationFailure)
-                    assert isinstance(retry, MigrationFailure)
-                    self.assertEqual(
-                        retry.error_code,
-                        "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-                    )
-                    self.assertTrue(retry.canonical_authority_ambiguous)
+                    self.assertIs(type(retry), MigrationReport)
+                    self.assertEqual(restarted_coordinator.current_generation, 0)
                     self.assertEqual(foreign_target.read_bytes(), foreign_bytes)
                     if residue_kind == "symlink":
                         self.assertTrue(residue_path.is_symlink())
                     else:
                         self.assertEqual(os.lstat(residue_path).st_nlink, 2)
-                    _assert_no_partial_initial_authority(
-                        self,
-                        identity=identity,
-                        coordinator=restarted_coordinator,
-                    )
+                    reopened = TMEngine(str(identity.configured_jsonl_path))
+                    self.assertIsNotNone(reopened.canonical_store)
 
 
 class CanonicalUpdatePreservationTests(unittest.TestCase):

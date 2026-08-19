@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -31,7 +32,12 @@ from tm_application_composition import (
     TMRuntimeHost,
     TMRuntimeSnapshot,
 )
-from tm_contracts import MigrationFailure, MigrationReport
+from tm_contracts import (
+    CanonicalResourceIdentity,
+    MigrationFailure,
+    MigrationReport,
+)
+import tm_migration
 from tm_migration import TMMigrationService
 from tests.test_tm_initial_activation_recovery import (
     _ambiguous_failure,
@@ -215,6 +221,114 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 TMResourceDisplayMode.CANONICAL_ACTIVE,
             )
             self.assertEqual(after_report.suggestions[0].target, "你好")
+
+    def test_orphan_stage_activation_keeps_peer_legacy_and_cohort_queryable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = ResourceRepository(root / "app-data")
+            orphaned = repository.create_resource(
+                "Orphaned legacy TM",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            peer = repository.create_resource(
+                "Healthy legacy TM",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            orphaned.path.write_text(
+                json.dumps({"source": "Hello", "target": "orphan target"})
+                + "\n",
+                encoding="utf-8",
+            )
+            peer.path.write_text(
+                json.dumps({"source": "Hello", "target": "peer target"})
+                + "\n",
+                encoding="utf-8",
+            )
+            identity = CanonicalResourceIdentity.from_configured_jsonl(
+                orphaned.id,
+                orphaned.path,
+            )
+            residue = tm_migration._deterministic_stage_ref(
+                identity,
+                source_digest=hashlib.sha256(orphaned.path.read_bytes()).hexdigest(),
+                stage_prefix="migration",
+                path_salt=f"initial-{'b' * 32}",
+            ).staged_db_path
+            residue.write_bytes(b"unpublished sqlite stage")
+            residue_journal = Path(f"{residue}-journal")
+            residue_journal.write_bytes(b"unpublished sqlite hot journal")
+            residue_before = residue.read_bytes()
+            journal_before = residue_journal.read_bytes()
+
+            runtime = TMRuntimeHost(
+                resolver=TMResourceResolver(),
+                configs=repository.list_resources(),
+            )
+            adapter = EditorTMAdapter(
+                runtime_host=runtime,
+                capability_host=CapabilityHost(
+                    evaluated_at_utc=_EVALUATED_AT
+                ),
+            )
+            controller = EditorController(repository, tm_adapter=adapter)
+            controller.set_project(
+                EditorProject(
+                    name="Orphan recovery",
+                    segments=(
+                        EditorSegment(
+                            id="segment-1",
+                            source="Hello",
+                            target="draft",
+                        ),
+                    ),
+                )
+            )
+            before = runtime.capture_operation_snapshot()
+            self.assertEqual(len(before.legacy_ports), 2)
+
+            preflight = controller.prepare_tm_activation(orphaned.id)
+            started = controller.activate_tm_resource(preflight)
+            completed = controller.wait_tm_activation(
+                started.operation_id,
+                timeout=20.0,
+            )
+
+            self.assertTrue(completed.succeeded)
+            self.assertIsNone(completed.safe_code)
+            after = runtime.capture_operation_snapshot()
+            modes = {
+                status.resource_id: status.mode for status in after.statuses
+            }
+            self.assertEqual(
+                modes,
+                {
+                    orphaned.id: TMResourceDisplayMode.CANONICAL_ACTIVE,
+                    peer.id: TMResourceDisplayMode.LEGACY_EXACT_ONLY,
+                },
+            )
+            self.assertEqual(len(after.canonical_ports), 1)
+            self.assertEqual(len(after.legacy_ports), 1)
+            self.assertIsNone(controller._tm_runtime_blocked_safe_code)
+            self.assertGreaterEqual(
+                len(controller.tm_suggestion_report().suggestions),
+                1,
+            )
+            self.assertEqual(residue.read_bytes(), residue_before)
+            self.assertEqual(residue_journal.read_bytes(), journal_before)
+
+            cold_runtime = TMRuntimeHost(
+                resolver=TMResourceResolver(),
+                configs=repository.list_resources(),
+            )
+            cold = cold_runtime.capture_operation_snapshot()
+            cold_modes = {
+                status.resource_id: status.mode for status in cold.statuses
+            }
+            self.assertEqual(cold_modes, modes)
+            self.assertEqual(residue.read_bytes(), residue_before)
+            self.assertEqual(residue_journal.read_bytes(), journal_before)
 
     def test_proven_first_failure_rebuilds_and_preserves_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

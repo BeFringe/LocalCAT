@@ -1044,7 +1044,7 @@ class TMMigrationService:
         # Core-private reservation serializes those coordinators/processes.
         # All recovery capable of advancing or cancelling durable facts runs
         # only after acquiring it, then the same descriptor-bound lock spans
-        # residue proof and the whole
+        # durable-authority proof and the whole
         # build -> seal -> publish -> reconcile transaction.
         try:
             reservation = _InitialActivationResourceReservation.acquire(
@@ -1157,26 +1157,6 @@ class TMMigrationService:
         with coordinator._condition:
             reservation.reprove()
             if coordinator._initial_activation_authority_is_unavailable():
-                return self._initial_authority_unavailable_failure(
-                    coordinator=coordinator,
-                    source_before=source_before,
-                    preflight=None,
-                    published_generation=None,
-                )
-            try:
-                initial_residue = _has_initial_stage_residue(
-                    self._resource_identity
-                )
-            except Exception as error:
-                if not _is_initial_activation_operational_error(error):
-                    raise
-                return self._initial_authority_unavailable_failure(
-                    coordinator=coordinator,
-                    source_before=source_before,
-                    preflight=None,
-                    published_generation=None,
-                )
-            if initial_residue:
                 return self._initial_authority_unavailable_failure(
                     coordinator=coordinator,
                     source_before=source_before,
@@ -4733,9 +4713,9 @@ class _InitialActivationResourceReservation:
     The lock pathname is deterministic and is never unlinked or replaced.
     Its descriptor and parent directory are retained no-follow for the full
     scan/build/reconcile transaction.  ``flock`` ownership is released by
-    the kernel on process death; the persistent file remains reusable, while
-    any stage residue created before the crash stays independently
-    discoverable by ``_has_initial_stage_residue``.
+    the kernel on process death; the persistent file remains reusable.
+    Unpublished stage residue from a dead owner is never reopened or reused
+    by a later fresh-nonce activation and is not a canonical authority fact.
     """
 
     __slots__ = (
@@ -5047,64 +5027,6 @@ class _InitialActivationResourceReservation:
         _traceback: object,
     ) -> None:
         self.release()
-
-
-def _has_initial_stage_residue(
-    identity: CanonicalResourceIdentity,
-) -> bool:
-    """Discover this resource's exact salted first-activation family.
-
-    The scan is directory-descriptor relative and compares only the closed
-    basename grammar emitted by ``_deterministic_stage_ref`` for an
-    ``initial-<uuid>`` migration attempt.  A matching name is sufficient to
-    fail stop regardless of whether it currently denotes a regular file,
-    hardlink, symlink, or another foreign entry; discovery never follows,
-    opens, or removes it.  Other resources in the same parent differ in the
-    target-identity field and remain outside this resource's family.
-    """
-
-    target_fragment = identity.target_identity[:16]
-    prefix = ".localcat-migration.initial-"
-    suffixes = (".sqlite3.stage", ".manifest.tmp")
-    try:
-        with _ExportParentHandle.bind(
-            identity.canonical_sidecar_path
-        ) as parent:
-            parent.reprove()
-            names = os.listdir(parent.descriptor)
-            parent.reprove()
-    except Exception as error:
-        if not _is_initial_activation_operational_error(error):
-            raise
-        raise MigrationPreflightError(
-            "MIGRATION.INITIAL_STAGE_DISCOVERY_UNAVAILABLE"
-        ) from error
-
-    for name in names:
-        if type(name) is not str or not name.startswith(prefix):
-            continue
-        suffix = next(
-            (candidate for candidate in suffixes if name.endswith(candidate)),
-            None,
-        )
-        if suffix is None:
-            continue
-        fields = name[len(prefix) : -len(suffix)].split(".")
-        if len(fields) != 3:
-            continue
-        attempt_nonce, observed_target, source_fragment = fields
-        if (
-            len(attempt_nonce) == 32
-            and all(character in "0123456789abcdef" for character in attempt_nonce)
-            and observed_target == target_fragment
-            and len(source_fragment) == 16
-            and all(
-                character in "0123456789abcdef"
-                for character in source_fragment
-            )
-        ):
-            return True
-    return False
 
 
 def _snapshot_id_for_origin(
@@ -5781,7 +5703,6 @@ def _require_proven_initial_legacy_state(
         or coordinator.active_store_path is not None
         or coordinator.durable_activation_phase is not None
         or any(_lstat_any_entry(path) for path in prohibited)
-        or _has_initial_stage_residue(identity)
     ):
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
