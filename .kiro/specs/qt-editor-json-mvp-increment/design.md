@@ -570,7 +570,7 @@ class EditorController:
 - 显式“清除”先调用 Controller clear，再清 query 与可见 report；保留字段、matcher options、状态筛选和面板展开状态。
 - Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。
 - Translation Matches/Termbase 页签使用实体 `Control+Tab` / `Control+Shift+Tab`。由于 Qt 在 macOS 将 portable `Ctrl` 映射为 Command，实现仅对这两个页签快捷键使用 portable `Meta` 以接收并显示 `⌃`；不得注册 `Command+Tab`。编辑/校对仍使用 portable `Ctrl+1/2`，在 macOS 原生显示为 `Command+1/2`。
-- inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。
+- inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。集中式术语管理从主窗口 Termbase 页和语言资源设置资源菜单提供两个入口；两者打开同一个 `QtTermbaseDialog`，只投影当前 Active+Update 术语表并复用同一 committed refresh 信号。
 - `Ctrl+Z`、`Ctrl+Y`、`Ctrl+Shift+Z` 仅在 target editor 聚焦时调用 native undo/redo；`textChanged` 继续同步 Controller。
 - 同段 suggestion 插入使用 `QTextCursor.beginEditBlock()`；切段/换项目时 signal-blocked `setPlainText()` 并明确清空 editor undo。
 - 所有项目/术语 mutation 都通过主窗口 `_refresh_from_controller()` 更新 edit、browse、progress 与 suggestions；dialogs 不直接修改这些 widgets。

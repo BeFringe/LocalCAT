@@ -598,6 +598,77 @@ class QtTermbaseDialogTests(unittest.TestCase):
             self.assertEqual(len(opened), 1)
             settings.close()
 
+    def test_main_termbase_tab_exposes_the_second_management_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _composition, _repository, resource_id, tm_id = (
+                self._controller(root)
+            )
+            project_path = root / "project.json"
+            _ = project_path.write_text(
+                json.dumps(
+                    {
+                        "name": "Main term management entry",
+                        "source_locale": "en-US",
+                        "target_locale": "zh-CN",
+                        "segments": [
+                            {
+                                "id": "segment-1",
+                                "source": "Legacy appears here.",
+                                "target": "",
+                                "speaker": "",
+                                "confirmed": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            controller.open_project(project_path)
+            window = QtEditorWindow(controller)
+            window.show()
+            self._events()
+            window.suggestion_tabs.setCurrentWidget(window.termbase_page)
+
+            button = window.manage_terms_button
+            self.assertTrue(button.isVisible())
+            self.assertEqual(button.text(), "管理术语")
+            self.assertTrue(button.accessibleName())
+            self.assertTrue(button.toolTip())
+            menu = button.menu()
+            self.assertIsInstance(menu, QMenu)
+            assert menu is not None
+            actions = {
+                action.objectName(): action for action in menu.actions()
+            }
+            self.assertIn(f"manageTermsMain_{resource_id}", actions)
+            self.assertNotIn(f"manageTermsMain_{tm_id}", actions)
+            action = actions[f"manageTermsMain_{resource_id}"]
+            self.assertTrue(action.isEnabled())
+
+            opened: list[QtTermbaseDialog] = []
+
+            def inspect_and_close() -> None:
+                active = QApplication.activeModalWidget()
+                self.assertIsInstance(active, QtTermbaseDialog)
+                assert isinstance(active, QtTermbaseDialog)
+                opened.append(active)
+                self.assertEqual(active.resource_id, resource_id)
+                active.terms_committed.emit()
+                QTest.mouseClick(active.close_button, Qt.MouseButton.LeftButton)
+
+            with patch.object(
+                window,
+                "_term_suggestions_changed",
+                wraps=window._term_suggestions_changed,
+            ) as refreshed:
+                QTimer.singleShot(0, inspect_and_close)
+                action.trigger()
+            self.assertEqual(refreshed.call_count, 1)
+            self.assertEqual(len(opened), 1)
+            window._confirm_unsaved = lambda: True
+            window.close()
+
     def test_committed_crud_refreshes_current_window_suggestions_immediately(
         self,
     ) -> None:

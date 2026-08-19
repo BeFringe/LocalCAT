@@ -79,6 +79,7 @@ from editor_contracts import (
     LegacyExactTMSuggestion,
     ProjectSearchReport,
     ProjectSearchRequest,
+    ResourceKind,
     SearchField,
     SearchOptions,
     SegmentDensity,
@@ -94,6 +95,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController, EditorControllerError
 from qt_settings_dialog import QtSettingsDialog
+from qt_termbase_dialog import QtTermbaseDialog
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -363,6 +365,8 @@ class QtEditorWindow(QMainWindow):
         self.tm_threshold_chip: QPushButton
         self.tm_threshold_state: QLabel
         self.termbase_page: QWidget
+        self.manage_terms_button: QToolButton
+        self.manage_terms_menu: QMenu
         self.add_term_button: QPushButton
         self.term_scroll: QScrollArea
         self.term_container: QWidget
@@ -994,6 +998,22 @@ class QtEditorWindow(QMainWindow):
         terms_layout.setContentsMargins(0, 0, 0, 0)
         term_toolbar = QHBoxLayout()
         term_toolbar.addStretch()
+        self.manage_terms_button = QToolButton()
+        self.manage_terms_button.setObjectName("manageTermsButton")
+        self.manage_terms_button.setText("管理术语")
+        self.manage_terms_button.setAccessibleName("管理术语")
+        self.manage_terms_button.setToolTip(
+            "选择一个 Active+Update 术语表并打开集中式术语管理"
+        )
+        self.manage_terms_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.manage_terms_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.manage_terms_menu = QMenu(self.manage_terms_button)
+        self.manage_terms_menu.setObjectName("manageTermsMenu")
+        self.manage_terms_menu.setAccessibleName("可管理术语表")
+        self.manage_terms_button.setMenu(self.manage_terms_menu)
+        term_toolbar.addWidget(self.manage_terms_button)
         self.add_term_button = QPushButton("＋ 添加术语")
         self.add_term_button.setObjectName("addTermButton")
         term_toolbar.addWidget(self.add_term_button)
@@ -1010,6 +1030,7 @@ class QtEditorWindow(QMainWindow):
         self.suggestion_tabs.addTab(self.translation_matches_page, "Translation Matches")
         self.suggestion_tabs.addTab(self.termbase_page, "Termbase")
         layout.addWidget(self.suggestion_tabs, 1)
+        self._refresh_manage_terms_menu()
         self._refresh_tm_threshold_entry()
         return panel
 
@@ -2200,10 +2221,70 @@ class QtEditorWindow(QMainWindow):
             self.refresh_suggestions()
         self.statusBar().showMessage("术语已更新，当前段建议已刷新。", 6000)
 
+    def _refresh_manage_terms_menu(self) -> None:
+        """Project current writable termbases into the main Termbase entry."""
+
+        self.manage_terms_menu.clear()
+        writable = tuple(
+            resource
+            for resource in self.controller.list_resources()
+            if resource.kind is ResourceKind.TERMBASE
+            and resource.active
+            and resource.update
+        )
+        if not writable:
+            unavailable = self.manage_terms_menu.addAction(
+                "无 Active+Update 术语表"
+            )
+            unavailable.setObjectName("manageTermsMainUnavailable")
+            unavailable.setEnabled(False)
+            return
+        for resource in writable:
+            action = self.manage_terms_menu.addAction(resource.name)
+            action.setObjectName(f"manageTermsMain_{resource.id}")
+            action.setToolTip(f"打开 {resource.name} 的集中式术语管理")
+            action.setStatusTip(action.toolTip())
+            action.triggered.connect(
+                lambda _checked=False, resource_id=resource.id: self._open_main_termbase_dialog(
+                    resource_id
+                )
+            )
+
+    def _open_main_termbase_dialog(self, resource_id: str) -> None:
+        """Open the same Controller-only dialog as the settings-row entry."""
+
+        resource = next(
+            (
+                configured
+                for configured in self.controller.list_resources()
+                if configured.id == resource_id
+                and configured.kind is ResourceKind.TERMBASE
+                and configured.active
+                and configured.update
+            ),
+            None,
+        )
+        if resource is None:
+            self._refresh_manage_terms_menu()
+            self.statusBar().showMessage(
+                "当前术语表已不可写；请在语言资源设置中刷新。",
+                6000,
+            )
+            return
+        dialog = QtTermbaseDialog(
+            self.controller,
+            resource.id,
+            resource.name,
+            self,
+        )
+        dialog.terms_committed.connect(self._term_suggestions_changed)
+        dialog.exec()
+
     def refresh_suggestions(self) -> SuggestionBundle:
         """Render the current controller bundle as safe, actionable cards."""
 
         self._refresh_project_search_controls()
+        self._refresh_manage_terms_menu()
         if not self.controller.has_project:
             self.current_suggestions = SuggestionBundle()
             self.current_tm_report = None

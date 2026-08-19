@@ -228,13 +228,14 @@
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
 
 - [x] 4.5 (P) 增加集中式术语管理对话框
-  - 从设置入口列出 resource、source、target、policy 和匹配选项状态
+  - 从主窗口 Termbase 页和设置资源菜单提供两个“管理术语”入口；两者列出当前 Active+Update resource 并打开同一个对话框
+  - 在集中式对话框列出 source、target、policy 和匹配选项状态
   - 新记录显示 false/true 默认值；gate 前禁用 options 并说明 flags 尚不参与匹配
   - 支持 source/target 编辑、legacy locator、删除确认、冲突反馈和 committed/recovery/quarantine outcome
   - 只有 committed outcome 更新列表并触发建议刷新；legacy 不显示虚假 flags，也不静默迁移
   - 完成时，新增、修改、删除、失败、重开对话框和重启恢复均由 Qt 集成测试证明
-  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13_
-  - _Boundary: QtTermbaseDialog, QtSettingsDialog Integration_
+  - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
+  - _Boundary: QtTermbaseDialog, QtEditorWindow, QtSettingsDialog Integration_
   - _Depends: 3.4, 3.5_
 
 - [x] 4.5a 完成 Requirement 7 fresh acceptance evidence

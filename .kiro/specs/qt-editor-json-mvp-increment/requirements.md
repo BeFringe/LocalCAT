@@ -130,6 +130,7 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 11. Where 统一兼容匹配能力已经合并并通过验收, the LocalCAT Qt 编辑器 shall 按每条新术语记录保存的 Match Case 和 Whole Word 设置执行匹配
 12. Where Whole Word 已启用且术语 source 为纯 CJK 文本, the LocalCAT Qt 编辑器 shall 使用连续文本匹配并返回与未启用 Whole Word 时相同的结果
 13. When 用户重新打开术语管理入口或重启编辑器, the LocalCAT Qt 编辑器 shall 恢复此前成功保存的术语变更和新记录匹配选项
+14. When 用户从主窗口 Termbase 页或语言资源设置访问“管理术语”, the LocalCAT Qt 编辑器 shall 让两个入口打开同一个集中式术语管理能力，并只列出当前 Active+Update 的术语表
 
 ### Requirement 8：Silver logo、紧凑资源操作与平台快捷键
 
