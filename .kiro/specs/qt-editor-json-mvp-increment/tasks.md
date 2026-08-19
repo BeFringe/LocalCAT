@@ -237,7 +237,7 @@
   - _Boundary: QtTermbaseDialog, QtSettingsDialog Integration_
   - _Depends: 3.4, 3.5_
 
-- [ ] 4.5a 完成 Requirement 7 fresh acceptance evidence
+- [x] 4.5a 完成 Requirement 7 fresh acceptance evidence
   - 使用真实 mixed legacy/v1 termbase、production Controller 与 Qt 对话框验证列表、新增、修改、删除与重启恢复
   - 分别验证 pre-gate legacy preset 与 `TEXT_V1_VALIDATED` configured matcher，包含纯 CJK Whole Word 与 legacy 两列行不被静默改写
   - 覆盖 committed、not committed、rolled back、indeterminate、recovery/quarantine 及 import metadata 保留；只有 committed outcome 可刷新当前建议
