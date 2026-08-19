@@ -315,6 +315,24 @@ def _fuzzy_validation_display(composition: object):
     )
 
 
+def _request_fuzzy_revalidation(composition: object):
+    """Start the explicit real Gate D run and return its safe lifecycle."""
+
+    from datetime import datetime, timezone
+
+    from capability_host import CapabilityHostComposition
+
+    if type(composition) is not CapabilityHostComposition:
+        raise TypeError("Fuzzy revalidation requires one host composition")
+    owner = composition.retrieval_gate_d_owner
+    if owner is None:
+        raise RuntimeError("Fuzzy revalidation owner is unavailable")
+    _ = owner.start_gate_d(
+        evaluated_at_utc=datetime.now(timezone.utc).replace(microsecond=0)
+    )
+    return _fuzzy_validation_display(composition)
+
+
 def _start_capability_validation(
     composition: object,
     on_capability_changed: object | None = None,
@@ -390,7 +408,7 @@ def _start_capability_validation(
                 notify_capability_change()
             return
         try:
-            started = gate_d.start_gate_d(
+            _ = gate_d.restore_gate_d(
                 evaluated_at_utc=generated_at_utc
             )
         except BaseException:
@@ -398,9 +416,6 @@ def _start_capability_validation(
                 notify_capability_change()
             raise
         notify_capability_change()
-        completed = gate_d.wait()
-        if completed != started:
-            notify_capability_change()
 
     worker = Thread(
         target=validate,
@@ -427,6 +442,9 @@ def _compose_editor_controller(repository: object):
         raise TypeError("editor composition requires ResourceRepository")
     capability_composition = compose_capability_host(
         evaluated_at_utc=datetime.now(timezone.utc),
+        gate_d_attestation_root=(
+            repository.config_dir / "gate-d-qualification"
+        ),
     )
     runtime_host = TMRuntimeHost(
         resolver=TMResourceResolver(),
@@ -438,6 +456,9 @@ def _compose_editor_controller(repository: object):
             runtime_host=runtime_host,
             capability_host=capability_composition.host,
             fuzzy_validation_status=lambda: _fuzzy_validation_display(
+                capability_composition
+            ),
+            fuzzy_validation_start=lambda: _request_fuzzy_revalidation(
                 capability_composition
             ),
         ),

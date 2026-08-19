@@ -225,6 +225,9 @@ class ClusterERemediationTests(unittest.TestCase):
                     fuzzy_validation_status=lambda: (
                         qt_editor._fuzzy_validation_display(composition)
                     ),
+                    fuzzy_validation_start=lambda: (
+                        qt_editor._request_fuzzy_revalidation(composition)
+                    ),
                 ),
             )
             controller.set_project(
@@ -464,7 +467,7 @@ class ClusterERemediationTests(unittest.TestCase):
                     ),
                     patch.object(
                         type(gate_d),
-                        "start_gate_d",
+                        "restore_gate_d",
                         autospec=True,
                         side_effect=benchmark,
                     ),
@@ -512,7 +515,7 @@ class ClusterERemediationTests(unittest.TestCase):
             return composition.host.retrieval_snapshot()
 
         def benchmark(_owner: object, **_kwargs: object) -> object:
-            order.append("gate_d")
+            order.append("gate_d_restore")
             return gate_d.status()
 
         with (
@@ -530,7 +533,7 @@ class ClusterERemediationTests(unittest.TestCase):
             ),
             patch.object(
                 type(gate_d),
-                "start_gate_d",
+                "restore_gate_d",
                 autospec=True,
                 side_effect=benchmark,
             ),
@@ -542,7 +545,7 @@ class ClusterERemediationTests(unittest.TestCase):
             worker.join(10.0)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(order, ["matcher", "gate_c", "gate_d"])
+        self.assertEqual(order, ["matcher", "gate_c", "gate_d_restore"])
 
     def test_capability_completion_refreshes_window_at_gate_c_and_gate_d(
         self,
@@ -575,6 +578,9 @@ class ClusterERemediationTests(unittest.TestCase):
                     capability_host=composition.host,
                     fuzzy_validation_status=lambda: (
                         qt_editor._fuzzy_validation_display(composition)
+                    ),
+                    fuzzy_validation_start=lambda: (
+                        qt_editor._request_fuzzy_revalidation(composition)
                     ),
                 ),
             )
@@ -612,8 +618,9 @@ class ClusterERemediationTests(unittest.TestCase):
                 ),
             )
             self.assertTrue(worker.daemon)
-            self.assertTrue(execution.started.wait(10.0))
-            self.assertTrue(worker.is_alive())
+            worker.join(10.0)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(execution.started.is_set())
             self._wait_for(lambda: len(refresh_threads) == 1)
 
             gate_c_report = window.current_tm_report
@@ -627,17 +634,26 @@ class ClusterERemediationTests(unittest.TestCase):
             )
             self.assertEqual(
                 window.tm_threshold_state.text(),
-                "Fuzzy 性能验证中",
+                "Fuzzy 需重新验证",
             )
             self.assertEqual(
                 gate_c_report.query_identity.query_epoch,
                 initial_epoch + 1,
             )
 
+            dialog = window.create_settings_dialog()
+            dialog._request_fuzzy_revalidation()
+            self.assertTrue(execution.started.wait(10.0))
+            self.assertEqual(
+                window.tm_threshold_state.text(),
+                "Fuzzy 性能验证中",
+            )
             gate_d_release.set()
-            self._wait_for(lambda: len(refresh_threads) == 2)
-            worker.join(10.0)
-            self.assertFalse(worker.is_alive())
+            self._wait_for(
+                lambda: bool(
+                    window.tm_threshold_chip.property("fuzzyAvailable")
+                )
+            )
             gate_d_report = window.current_tm_report
             self.assertIsNotNone(gate_d_report)
             assert gate_d_report is not None
@@ -652,6 +668,7 @@ class ClusterERemediationTests(unittest.TestCase):
                 gate_d_report.query_identity.query_epoch,
                 initial_epoch + 2,
             )
+            self.assertEqual(len(refresh_threads), 2)
             self.assertTrue(
                 all(thread is current_thread() for thread in refresh_threads)
             )
@@ -684,6 +701,12 @@ class ClusterERemediationTests(unittest.TestCase):
                 tm_adapter=EditorTMAdapter(
                     runtime_host=runtime,
                     capability_host=composition.host,
+                    fuzzy_validation_status=lambda: (
+                        qt_editor._fuzzy_validation_display(composition)
+                    ),
+                    fuzzy_validation_start=lambda: (
+                        qt_editor._request_fuzzy_revalidation(composition)
+                    ),
                 ),
             )
             controller.set_project(
@@ -708,8 +731,12 @@ class ClusterERemediationTests(unittest.TestCase):
                     window.refresh_suggestions,
                 ),
             )
-            self.assertTrue(execution.started.wait(10.0))
+            worker.join(10.0)
+            self.assertFalse(worker.is_alive())
             self._wait_for(lambda: len(refresh_threads) == 1)
+            dialog = window.create_settings_dialog()
+            dialog._request_fuzzy_revalidation()
+            self.assertTrue(execution.started.wait(10.0))
             destroyed = Event()
             window.destroyed.connect(lambda: destroyed.set())
             window.setAttribute(

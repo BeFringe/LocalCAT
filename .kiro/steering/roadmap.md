@@ -93,6 +93,13 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 - **Parser seam**: Parser 产生带 source reference/speaker/metadata 的 Document/Segment；不定义搜索、TM 排序或 speaker 显示。
 - **TMX seam**: TMX 始终属于语言资源 import/export。若未来需要编辑 TMX，另立 TM Resource Editor。
 
+### Future promotion and package boundaries
+
+- `multi-document-project-workspace` 先于 `collaborative-job-chunks`：先冻结 Project/Document/Segment 身份、保存与 reconciliation，再让 chunk 仅引用稳定 segment 身份；split/merge 不得重定义文档或段落。
+- `cross-device-sync-plugin` 只消费已经批准的项目包、资源导入导出和可选 namespaced chunk metadata。chunk schema 未经协作规格批准前，同步规格不得解释、合并或授权 chunk 权限。
+- ADR-013 的 `gate-d-qualification`、`device.key` 与 `qualification.json` 是设备本地运行资格，不属于项目包、TM 资源或 chunk metadata，禁止跨设备复制后直接授权 Fuzzy。设备间可以同步项目与经验证的资源，但每台设备必须用自己的兼容 attestation 或重新验证。
+- 三个未来规格均从 brief 单独提升为 Requirements → Design → Tasks，并分别形成 review cluster。建议顺序为：多文档 identity/origin → aggregate/save/reconcile → Controller/search scope → Qt；协作 chunk contract/split-merge → assignment/permission/progress → Qt；跨端 plugin/package → provider/planner/secrets → apply/recovery/Qt。不得把后续规格的未批准字段预埋为当前单 JSON 的第二套 authority。
+
 ## Existing Spec Updates
 
 - [ ] `qt-editor-mvp` -- 收口已完成 MVP 状态；只保留 silver logo 与“…”按钮维护事实。Dependencies: none

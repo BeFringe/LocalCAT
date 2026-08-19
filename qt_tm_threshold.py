@@ -77,7 +77,14 @@ def configure_tm_threshold_entry(
         state_text = "Fuzzy 性能验证中"
         tooltip = "Fuzzy 性能验证正在后台运行；完成前阈值不可调整"
     elif fuzzy_validation.state is FuzzyValidationState.FAILED:
-        state_text = "Fuzzy 不可用：Fuzzy 性能验证未通过"
+        if fuzzy_validation.safe_code in {
+            "GATE_D.REVALIDATION_REQUIRED",
+            "GATE_D.ATTESTATION_INVALID",
+            "GATE_D.REVALIDATION_UNAVAILABLE",
+        }:
+            state_text = "Fuzzy 需重新验证"
+        else:
+            state_text = "Fuzzy 不可用：Fuzzy 性能验证未通过"
         tooltip = state_text
     else:
         reason = _fuzzy_disabled_reason(retrieval_status)

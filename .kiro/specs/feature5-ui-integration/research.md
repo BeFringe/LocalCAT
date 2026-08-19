@@ -41,7 +41,7 @@
   - default retrieval publisher 绑定 sentinel digests，只能作为关闭初态；批准 roots 产生的 manifest 与其 expectation 不同。
   - `recompute_retrieval_validation()` 返回配对的 `expectation + manifest`；正式 publisher 必须由该 expectation 构造。
   - Gate D 只有 `run_benchmark_gate_d()` 产生的 owner-issued result 可经 `publish_retrieval_capability_gate_d()` 刷新同一 publisher。
-  - Gate D evidence 不能在下一进程重铸 receipt；重复启动必须新跑且使用新 absent evidence path。
+  - ADR-013 取代原 no-cache 结论：真实 Gate D 可由 Core 封存为设备本地 HMAC attestation；下一进程只有在完整 compatibility 与 provenance 复证后才可重铸一次性 receipt，普通 evidence JSON 仍不可重铸。
 - **Implications**：bootstrap 先提供 exact-only service；后台 Gate C 成功后原子换入新的 evaluator/publisher/service，Gate D 再刷新同一 publisher。所有失败保持当前较低能力。
 
 ### Feature 5 Requirement 2 首次 canonical activation 公开合同缺口

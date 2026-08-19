@@ -145,6 +145,8 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 5. When 资源设置窗口调整尺寸, the LocalCAT Qt 编辑器 shall 保持 ellipsis 可操作且不遮挡相邻关键信息
 6. When 用户在 macOS 使用实体 `Control+Tab` 或 `Control+Shift+Tab`, the LocalCAT Qt 编辑器 shall 切换 Translation Matches 与 Termbase，且不得注册会与系统应用切换冲突的 `Command+Tab`
 7. When 用户在 macOS 使用编辑/校对模式快捷键, the LocalCAT Qt 编辑器 shall 继续以 `Command+1` / `Command+2` 切换；其他平台继续使用其 Qt 原生主修饰键映射
+8. When 用户展开编辑/校对模式下拉项, the LocalCAT Qt 编辑器 shall 将 popup 完整放在顶栏控件下方，不覆盖当前“编辑”文字或触发区
+9. When 用户使用平台原生主修饰键 + `Shift+L`（macOS `Command+Shift+L`）, the LocalCAT Qt 编辑器 shall 在“紧凑”与“自动换行”两种段落显示密度之间切换，且工具提示显示原生快捷键
 
 ### Requirement 9：单 JSON 边界、兼容性与本地性
 

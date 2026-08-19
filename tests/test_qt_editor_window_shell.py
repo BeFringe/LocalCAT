@@ -19,12 +19,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QMessageBox,
+    QMenu,
     QStyle,
     QStyleOptionComboBox,
     QStyleOptionToolButton,
 )
 
-from editor_contracts import ResourceKind, WorkspaceMode
+from editor_contracts import ResourceKind, SegmentDensity, WorkspaceMode
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
 from qt_control_styles import LOCALCAT_COMBO_POPUP_STYLE, LOCALCAT_MENU_STYLE
@@ -197,6 +198,40 @@ class QtEditorWindowShellTest(unittest.TestCase):
             window._confirm_unsaved = lambda: True
             window.close()
 
+    def test_workspace_mode_popup_opens_below_the_topbar_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.load_sample()
+            window.resize(1180, 680)
+            window.show()
+            self._events()
+
+            combo = window.workspace_mode_combo
+            QTest.mouseClick(combo, Qt.MouseButton.LeftButton)
+            self._events()
+            popup = combo.mode_popup_menu
+            combo_top_left = combo.mapToGlobal(combo.rect().topLeft())
+            combo_global = QRect(combo_top_left, combo.size())
+
+            self.assertIsInstance(popup, QMenu)
+            self.assertTrue(popup.isVisible())
+            self.assertFalse(combo.view().window().isVisible())
+            self.assertEqual(
+                tuple(action.text() for action in popup.actions()),
+                ("编辑", "浏览 / 校对"),
+            )
+            self.assertGreaterEqual(
+                popup.geometry().top(),
+                combo_global.bottom() + 9,
+            )
+            self.assertFalse(popup.geometry().intersects(combo_global))
+            popup.actions()[1].trigger()
+            self._events()
+            self.assertIs(window.workspace_mode, WorkspaceMode.BROWSE)
+            combo.hidePopup()
+            window._confirm_unsaved = lambda: True
+            window.close()
+
     def test_topbar_controls_share_font_hover_and_popup_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             window = self._window(Path(temp_dir))
@@ -283,6 +318,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 "suggestion_tab_previous": f"{physical_control}+Shift+Tab",
                 "workspace_edit": "Ctrl+1",
                 "workspace_browse": "Ctrl+2",
+                "segment_density_toggle": "Ctrl+Shift+L",
             }
             for name, sequence in expected.items():
                 shortcut = window.shortcuts[name]
@@ -338,6 +374,18 @@ class QtEditorWindowShellTest(unittest.TestCase):
             )
             self.assertIs(window.workspace_mode, WorkspaceMode.EDIT)
             self.assertEqual(window.workspace_pages.currentIndex(), 0)
+
+            self.assertIs(window.segment_density, SegmentDensity.COMPACT)
+            window.shortcuts["segment_density_toggle"].activated.emit()
+            self.assertIs(window.segment_density, SegmentDensity.WRAPPED)
+            window.shortcuts["segment_density_toggle"].activated.emit()
+            self.assertIs(window.segment_density, SegmentDensity.COMPACT)
+            self.assertIn(
+                window._native_shortcut_text(
+                    window.shortcuts["segment_density_toggle"]
+                ),
+                window.segment_density_combo.toolTip(),
+            )
 
             native_tab = window._native_shortcut_text(
                 window.shortcuts["suggestion_tab_next"]

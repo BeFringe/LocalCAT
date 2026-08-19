@@ -226,6 +226,7 @@ class EditorTMAdapter:
 
     __slots__ = (
         "_capability_host",
+        "_fuzzy_validation_start",
         "_fuzzy_validation_status",
         "_runtime_host",
     )
@@ -236,6 +237,8 @@ class EditorTMAdapter:
         runtime_host: TMRuntimeHost,
         capability_host: CapabilityHost,
         fuzzy_validation_status: Callable[[], FuzzyValidationDisplay]
+        | None = None,
+        fuzzy_validation_start: Callable[[], FuzzyValidationDisplay]
         | None = None,
     ) -> None:
         if type(runtime_host) is not TMRuntimeHost:
@@ -250,9 +253,16 @@ class EditorTMAdapter:
             raise TypeError(
                 "editor TM adapter fuzzy validation status must be callable"
             )
+        if fuzzy_validation_start is not None and not callable(
+            fuzzy_validation_start
+        ):
+            raise TypeError(
+                "editor TM adapter fuzzy validation start must be callable"
+            )
         self._runtime_host = runtime_host
         self._capability_host = capability_host
         self._fuzzy_validation_status = fuzzy_validation_status
+        self._fuzzy_validation_start = fuzzy_validation_start
 
     def _text_matcher_handoff_for_controller(
         self,
@@ -480,6 +490,26 @@ class EditorTMAdapter:
                 safe_code=None,
             )
         status = reader()
+        if type(status) is not FuzzyValidationDisplay:
+            raise TypeError("fuzzy validation display contract is invalid")
+        status.__post_init__()
+        return FuzzyValidationDisplay(
+            state=status.state,
+            safe_code=status.safe_code,
+        )
+
+    def _start_fuzzy_validation_for_controller(
+        self,
+    ) -> FuzzyValidationDisplay:
+        """Request the composition-owned real Gate D run."""
+
+        starter = self._fuzzy_validation_start
+        if starter is None:
+            return FuzzyValidationDisplay(
+                state=FuzzyValidationState.FAILED,
+                safe_code="GATE_D.REVALIDATION_UNAVAILABLE",
+            )
+        status = starter()
         if type(status) is not FuzzyValidationDisplay:
             raise TypeError("fuzzy validation display contract is invalid")
         status.__post_init__()

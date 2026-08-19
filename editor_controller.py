@@ -1511,6 +1511,19 @@ class EditorController:
             status.__post_init__()
             return replace(status)
 
+    def revalidate_tm_fuzzy(self) -> FuzzyValidationDisplay:
+        """Explicitly start the real device qualification without granting it."""
+
+        with self._tm_query_lock:
+            adapter = self._tm_adapter
+            if adapter is None:
+                raise EditorControllerError("TM.FUZZY.REVALIDATION_UNAVAILABLE")
+            status = adapter._start_fuzzy_validation_for_controller()
+            if type(status) is not FuzzyValidationDisplay:
+                raise TypeError("fuzzy validation display contract is invalid")
+            status.__post_init__()
+            return replace(status)
+
     def _inspect_tm_retrieval_status_no_query(
         self,
         adapter: EditorTMAdapter,

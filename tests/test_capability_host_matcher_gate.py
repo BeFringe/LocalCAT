@@ -281,7 +281,7 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         self.assertFalse(hasattr(composition, "__dict__"))
         self.assertEqual(
             tuple(inspect.signature(compose_capability_host).parameters),
-            ("evaluated_at_utc",),
+            ("evaluated_at_utc", "gate_d_attestation_root"),
         )
         self.assertEqual(
             tuple(

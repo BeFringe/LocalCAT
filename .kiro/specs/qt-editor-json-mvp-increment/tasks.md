@@ -293,6 +293,11 @@
   - tooltip、accessible name 与 QtTest 均按原生显示文本验证两组快捷键
   - _Requirements: 8.6, 8.7_
 
+- [x] 4.9b 修复模式 popup 位置并增加段落密度切换键
+  - 编辑/校对 popup 固定在顶栏 combo 下方，不再覆盖当前“编辑”控件
+  - portable `Ctrl+Shift+L`在紧凑/自动换行间切换，并在 tooltip 中显示平台原生文本
+  - _Requirements: 8.8, 8.9_
+
 - [ ] 5. 完成集成验收与回归保护
 
 - [ ] 5.1 验证领域与 Controller 的失败原子性

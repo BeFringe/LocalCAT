@@ -44,6 +44,8 @@ LocalCAT 可安装一个独立、可禁用的跨端同步插件。用户选择�
 - 不同步明文 access key、secret、token 或加密密码；
 - 不在当前 Qt JSON、Feature 5 或 Parser 实施波次中加入远程依赖；
 - 不承诺后台进程在应用关闭时继续同步。
+- 不同步或导入 ADR-013 的 `gate-d-qualification`、`device.key`、`qualification.json`；Fuzzy qualification 是设备本地运行资格，另一设备必须独立恢复兼容的本地 attestation 或重新验证。
+- 不直接复制 live canonical SQLite sidecar、journal、stage residue 来铸造资源 authority；同步只消费 Core 批准的资源 export/import package 与 receipt。
 
 ## Upstream / Downstream
 
@@ -60,3 +62,12 @@ LocalCAT 可安装一个独立、可禁用的跨端同步插件。用户选择�
 同步前必须建议或验证可恢复备份；任何批量删除或覆盖都要经过保护阈值和显式确认；凭据应进入操作系统安全存储或等价秘密后端；插件停用或卸载后本地项目仍可正常打开。
 
 Remotely Save 的 `src/tests/docs/assets` 采用 Apache-2.0，而 `pro` 目录采用 PolyForm Strict；LocalCAT 只参考公开行为与文档，不复制 PRO 实现。
+
+## Promotion Clusters
+
+1. plugin host、同步 package manifest 与本地 snapshot/import boundary；
+2. provider capability、planner、凭据与加密；
+3. apply/recovery、冲突保护和操作日志；
+4. Qt 预览/确认与真实 provider acceptance。
+
+项目包必须先由 `multi-document-project-workspace` 冻结；可选 chunk metadata 还必须等待 `collaborative-job-chunks` 的 schema/permission clusters。同步实现不得为了抢跑后续规格而在当前单 JSON 项目或 workspace 中预埋第二套 authority。

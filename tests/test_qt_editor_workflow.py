@@ -251,6 +251,7 @@ class QtEditorWorkflowTest(unittest.TestCase):
                     ),
                     "workspace_edit": "Ctrl+1",
                     "workspace_browse": "Ctrl+2",
+                    "segment_density_toggle": "Ctrl+Shift+L",
                 },
             )
             native = {

@@ -113,9 +113,15 @@ Invariant capsule
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
+import platform
+import secrets
+import sqlite3
+import sys
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -179,6 +185,7 @@ from tm_retrieval_capability import (
     RetrievalCapabilityManifest,
     RetrievalCapabilityPublisher,
     RetrievalCapabilitySnapshot,
+    RetrievalCorrectnessCohortEvidence,
     _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR,
     _validated_refresh_retrieval_capability,
 )
@@ -2561,6 +2568,391 @@ def _issue_benchmark_gate_d_run_result(
         artifact_digest=artifact_digest,
         test_mode=test_mode,
         _receipt=receipt,
+    )
+
+
+_GATE_D_ATTESTATION_SCHEMA_VERSION = "localcat.gate-d-attestation.v1"
+_GATE_D_ATTESTATION_KEY_NAME = "device.key"
+_GATE_D_ATTESTATION_FILE_NAME = "qualification.json"
+_GATE_D_ATTESTATION_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _gate_d_attestation_canonical_json(payload: Mapping[str, object]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _gate_d_manifest_identity(
+    manifest: RetrievalCapabilityManifest,
+) -> dict[str, object]:
+    if type(manifest) is not RetrievalCapabilityManifest:
+        raise TypeError("Gate D attestation manifest must be exact")
+    manifest.__post_init__()
+
+    def cohorts(
+        values: tuple[RetrievalCorrectnessCohortEvidence, ...],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "cohort_digest": value.cohort_digest,
+                "cohort_id": value.cohort_id,
+                "passed": value.passed,
+            }
+            for value in values
+        ]
+
+    return {
+        "context_cohorts": cohorts(manifest.context_cohorts),
+        "evaluator_digest": manifest.evaluator_digest,
+        "evidence_schema_version": manifest.evidence_schema_version,
+        "fixture_digest": manifest.fixture_digest,
+        "fuzzy_core_cohorts": cohorts(manifest.fuzzy_core_cohorts),
+        "retrieval_artifact_digest": manifest.retrieval_artifact_digest,
+        "retrieval_build_digest": manifest.retrieval_build_digest,
+        "semantics_version": manifest.semantics_version,
+    }
+
+
+def _gate_d_runtime_identity() -> dict[str, object]:
+    return {
+        "machine": platform.machine(),
+        "platform_release": platform.release(),
+        "platform_system": platform.system(),
+        "python_cache_tag": sys.implementation.cache_tag,
+        "python_version": list(sys.version_info[:3]),
+        "sqlite_version": sqlite3.sqlite_version,
+        "sys_platform": sys.platform,
+        "unicode_version": unicodedata.unidata_version,
+    }
+
+
+def _gate_d_attestation_compatibility(
+    *,
+    contract_path: Path,
+    base_manifest: RetrievalCapabilityManifest,
+    bundle: BenchmarkEvidenceBundle,
+    device_key: bytes,
+) -> dict[str, object]:
+    if type(contract_path) is not _NATIVE_PATH_TYPE or not contract_path.is_absolute():
+        raise ValueError("Gate D contract path must be absolute")
+    if type(bundle) is not BenchmarkEvidenceBundle:
+        raise TypeError("Gate D attestation bundle must be exact")
+    _validate_benchmark_evidence_bundle(bundle)
+    contract = load_benchmark_contract(contract_path)
+    if benchmark_contract_digest(contract) != bundle.contract_digest:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+    current_fingerprint = benchmark_implementation_fingerprint()
+    if current_fingerprint != bundle.implementation_fingerprint:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+    return {
+        "benchmark": {
+            "bundle_schema_version": bundle.schema_version,
+            "contract_digest": bundle.contract_digest,
+            "implementation_fingerprint": current_fingerprint,
+            "intended_paths": ["FTS5_TRIGRAM", "GRAM_FALLBACK"],
+            "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
+        },
+        "device_key_digest": hashlib.sha256(device_key).hexdigest(),
+        "gate_c": _gate_d_manifest_identity(base_manifest),
+        "runtime": _gate_d_runtime_identity(),
+    }
+
+
+def _gate_d_require_state_root(state_root: Path, *, create: bool) -> Path:
+    if type(state_root) is not _NATIVE_PATH_TYPE or not state_root.is_absolute():
+        raise ValueError("Gate D attestation root must be absolute")
+    if create:
+        try:
+            state_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+        except OSError as error:
+            raise BenchmarkGateDError(
+                "GATE_D.ATTESTATION_UNAVAILABLE"
+            ) from error
+    try:
+        metadata = state_root.lstat()
+    except FileNotFoundError as error:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED") from error
+    except OSError as error:
+        raise BenchmarkGateDError(
+            "GATE_D.ATTESTATION_UNAVAILABLE"
+        ) from error
+    invalid_posix_permissions = os.name == "posix" and (
+        stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.getuid()
+    )
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or invalid_posix_permissions
+    ):
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+    return state_root
+
+
+def _gate_d_secure_read(path: Path, *, expected_size: int | None) -> bytes:
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED") from error
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
+    if stat.S_ISLNK(path_metadata.st_mode):
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED") from error
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
+    try:
+        metadata = os.fstat(descriptor)
+        invalid_posix_permissions = os.name == "posix" and (
+            stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or invalid_posix_permissions
+            or metadata.st_dev != path_metadata.st_dev
+            or metadata.st_ino != path_metadata.st_ino
+            or metadata.st_size > _GATE_D_ATTESTATION_MAX_BYTES
+            or (expected_size is not None and metadata.st_size != expected_size)
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _gate_d_device_key(state_root: Path, *, create: bool) -> bytes:
+    key_path = state_root / _GATE_D_ATTESTATION_KEY_NAME
+    try:
+        key_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        return _gate_d_secure_read(key_path, expected_size=32)
+    if not create:
+        raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+    key = secrets.token_bytes(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(key_path, flags, 0o600)
+    except FileExistsError:
+        return _gate_d_secure_read(key_path, expected_size=32)
+    except OSError as error:
+        raise BenchmarkGateDError(
+            "GATE_D.ATTESTATION_UNAVAILABLE"
+        ) from error
+    try:
+        view = memoryview(key)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("device key write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    except OSError as error:
+        try:
+            key_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise BenchmarkGateDError(
+            "GATE_D.ATTESTATION_UNAVAILABLE"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return key
+
+
+def _persist_gate_d_attestation(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+    run_result: BenchmarkGateDRunResult,
+    issued_at_utc: datetime,
+) -> None:
+    """Seal one real Gate D run for same-device compatible restoration."""
+
+    if type(run_result) is not BenchmarkGateDRunResult:
+        raise TypeError("Gate D attestation run result must be exact")
+    run_result.__post_init__()
+    if run_result.test_mode:
+        raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+    issued = _require_utc_datetime(issued_at_utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    root = _gate_d_require_state_root(state_root, create=True)
+    key = _gate_d_device_key(root, create=True)
+    bundle_json = benchmark_evidence_bundle_to_json(run_result.bundle)
+    unsigned: dict[str, object] = {
+        "artifact_digest": run_result.artifact_digest,
+        "artifact_size": run_result.artifact_size,
+        "bundle_digest": run_result.bundle_digest,
+        "bundle_json": bundle_json,
+        "compatibility": _gate_d_attestation_compatibility(
+            contract_path=contract_path,
+            base_manifest=base_manifest,
+            bundle=run_result.bundle,
+            device_key=key,
+        ),
+        "issued_at_utc": issued,
+        "schema_version": _GATE_D_ATTESTATION_SCHEMA_VERSION,
+    }
+    signature = hmac.new(
+        key,
+        _gate_d_attestation_canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    payload = dict(unsigned)
+    payload["signature"] = signature
+    encoded = (_gate_d_attestation_canonical_json(payload) + "\n").encode(
+        "utf-8"
+    )
+    if len(encoded) > _GATE_D_ATTESTATION_MAX_BYTES:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+    final_path = root / _GATE_D_ATTESTATION_FILE_NAME
+    try:
+        final_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        _gate_d_secure_read(final_path, expected_size=None)
+    temporary = root / (
+        f".{_GATE_D_ATTESTATION_FILE_NAME}.{secrets.token_hex(8)}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("attestation write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, final_path)
+        directory = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BenchmarkGateDError:
+        raise
+    except OSError as error:
+        raise BenchmarkGateDError(
+            "GATE_D.ATTESTATION_UNAVAILABLE"
+        ) from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _restore_gate_d_attestation(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+) -> BenchmarkGateDRunResult:
+    """Verify and re-mint one Core run receipt from same-device evidence."""
+
+    root = _gate_d_require_state_root(state_root, create=False)
+    key = _gate_d_device_key(root, create=False)
+    raw = _gate_d_secure_read(
+        root / _GATE_D_ATTESTATION_FILE_NAME,
+        expected_size=None,
+    )
+    try:
+        parsed = _parse_strict_json(raw.decode("utf-8"))
+        expected_fields = {
+            "artifact_digest",
+            "artifact_size",
+            "bundle_digest",
+            "bundle_json",
+            "compatibility",
+            "issued_at_utc",
+            "schema_version",
+            "signature",
+        }
+        if set(parsed) != expected_fields:
+            raise ValueError("attestation fields are invalid")
+        signature = _as_digest(parsed["signature"], "attestation signature")
+        unsigned = dict(parsed)
+        del unsigned["signature"]
+        expected_signature = hmac.new(
+            key,
+            _gate_d_attestation_canonical_json(unsigned).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            raise ValueError("attestation signature mismatch")
+        if parsed["schema_version"] != _GATE_D_ATTESTATION_SCHEMA_VERSION:
+            raise ValueError("attestation schema is unsupported")
+        _validate_evidence_utc_string(
+            _as_str(parsed["issued_at_utc"], "attestation issued instant"),
+            "issued_at_utc",
+        )
+        bundle_json = _as_str(parsed["bundle_json"], "attestation bundle")
+        bundle = benchmark_evidence_bundle_from_json(bundle_json)
+        artifact = bundle_json.encode("utf-8")
+        artifact_size = _as_int(
+            parsed["artifact_size"],
+            "attestation artifact size",
+            minimum=0,
+        )
+        artifact_digest = _as_digest(
+            parsed["artifact_digest"],
+            "attestation artifact digest",
+        )
+        bundle_digest = _as_digest(
+            parsed["bundle_digest"],
+            "attestation bundle digest",
+        )
+        if (
+            len(artifact) != artifact_size
+            or hashlib.sha256(artifact).hexdigest() != artifact_digest
+            or bundle.bundle_digest != bundle_digest
+        ):
+            raise ValueError("attestation artifact binding is invalid")
+        compatibility = _gate_d_attestation_compatibility(
+            contract_path=contract_path,
+            base_manifest=base_manifest,
+            bundle=bundle,
+            device_key=key,
+        )
+        if parsed["compatibility"] != compatibility:
+            raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+    except BenchmarkGateDError:
+        raise
+    except (UnicodeError, TypeError, ValueError) as error:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
+    return _issue_benchmark_gate_d_run_result(
+        bundle=bundle,
+        bundle_digest=bundle_digest,
+        artifact_size=artifact_size,
+        artifact_digest=artifact_digest,
+        test_mode=False,
     )
 
 

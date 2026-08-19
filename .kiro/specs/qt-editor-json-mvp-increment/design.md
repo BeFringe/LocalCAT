@@ -73,7 +73,7 @@
 - `EditorController` 已拥有唯一项目会话、导航、dirty、资源热重载和建议协调。
 - `EditorProject`/`EditorSegment` 是 frozen dataclass，适合纯扫描和批量 immutable replace。
 - `GlossaryEngine` 是运行时 Trie，不适合作为 CRUD 仓储；现有 importer 只保留两列。
-- 主窗口已有编辑/浏览共享会话，但尚未显示 speaker、搜索或项目工具。
+- 主窗口已有编辑/浏览共享会话；raw speaker 显示、speaker 搜索、项目搜索与集中式术语 CRUD 已闭合。尚未完成的是 1.1b/2.1/3.2b/4.2 的独立 speaker inventory 合同、服务与对话框，不得把它误记为 speaker profile 已实施。
 - `qt_editor_window.py` 直接依赖 `ProjectError` 是现有边界漂移，本增量一并收口。
 
 ### 架构模式与边界图
@@ -570,6 +570,7 @@ class EditorController:
 - 显式“清除”先调用 Controller clear，再清 query 与可见 report；保留字段、matcher options、状态筛选和面板展开状态。
 - Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。
 - Translation Matches/Termbase 页签使用实体 `Control+Tab` / `Control+Shift+Tab`。由于 Qt 在 macOS 将 portable `Ctrl` 映射为 Command，实现仅对这两个页签快捷键使用 portable `Meta` 以接收并显示 `⌃`；不得注册 `Command+Tab`。编辑/校对仍使用 portable `Ctrl+1/2`，在 macOS 原生显示为 `Command+1/2`。
+- 工作区模式使用应用自有的两项 action menu，从顶栏当前值下方展开；不得打开或事后搬移平台 combo popup，避免 macOS 以选中项对齐并从下向上遮住“编辑”。段落密度另以 portable `Ctrl+Shift+L`切换紧凑/自动换行，macOS 原生显示为 `Command+Shift+L`。
 - inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。集中式术语管理从主窗口 Termbase 页和语言资源设置资源菜单提供两个入口；两者打开同一个 `QtTermbaseDialog`，只投影当前 Active+Update 术语表并复用同一 committed refresh 信号。
 - `Ctrl+Z`、`Ctrl+Y`、`Ctrl+Shift+Z` 仅在 target editor 聚焦时调用 native undo/redo；`textChanged` 继续同步 Controller。
 - 同段 suggestion 插入使用 `QTextCursor.beginEditBlock()`；切段/换项目时 signal-blocked `setPlainText()` 并明确清空 editor undo。
@@ -577,6 +578,14 @@ class EditorController:
 - 所有新控件有稳定 `objectName`、tooltip 和 accessible name。
 - ellipsis 使用 `QToolButton(autoRaise=true)`、Fixed horizontal policy 和 32 logical px 最小键盘命中宽度；按钮宽度取 `sizeHint + 8` 且最大 40 logical px。
 - 资源表操作列使用 `ResizeToContents`/Fixed，不参与 Stretch；名称/路径列承担剩余宽度。窗口缩放时操作列保持可见且不覆盖相邻单元格。
+
+### Future compatibility seams
+
+- 当前单 JSON 的 segment id 对后续 workspace 视为 opaque local identity；多文档规格负责把它提升为 `(document_id, local_segment_id)`，当前 UI 不预埋 document/chunk 字段，也不按显示顺序重铸身份。
+- 当前项目搜索 request/hit/report 不另造第二套多源查询模型。多文档迁移通过扩展 `SearchScope(current_document, entire_project, current_chunk)` 选择同一个 matcher pipeline；`current_chunk` 只有在协作规格批准稳定成员引用后才可出现。
+- raw speaker 显示和 speaker 字段搜索已经可用；1.1b speaker inventory 仍未完成。`speaker-display-profiles` 后续只增加显示名、显式留空与头像，不能改写 raw speaker、搜索字段、项目保存或 TM identity。
+- 集中式术语管理对话框及主窗口/资源设置两级入口已由 4.5(P)/4.7a 闭合；`glossary-management` 后续只扩展批量、检索、注释/来源和互操作，不重建现有 Store/Controller/Qt 事务 authority。
+- ADR-013 的 Fuzzy device attestation 不进入项目、workspace package、TM 导出或未来跨端同步；跨设备恢复项目不能携带另一设备的 Fuzzy 授权。
 
 ## 数据模型
 

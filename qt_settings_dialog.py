@@ -52,8 +52,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid as _qt_object_is_valid
 
 from editor_contracts import (
+    FuzzyValidationState,
     ImportReport,
     ImportRequest,
     ResourceConfig,
@@ -289,6 +291,7 @@ class QtSettingsDialog(QDialog):
     resources_changed = Signal()
     import_completed = Signal(object)
     tm_threshold_changed = Signal(object)
+    fuzzy_validation_changed = Signal(object)
     term_suggestions_changed = Signal()
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
@@ -332,6 +335,12 @@ class QtSettingsDialog(QDialog):
 
     def _resize_resource_rows(self) -> None:
         self._resource_row_resize_pending = False
+        if (
+            not _qt_object_is_valid(self)
+            or not _qt_object_is_valid(self.active_table)
+            or not _qt_object_is_valid(self.inactive_table)
+        ):
+            return
         signature_parts: list[object] = []
         for table in (self.active_table, self.inactive_table):
             row_count = table.rowCount()
@@ -478,6 +487,18 @@ class QtSettingsDialog(QDialog):
         self.tm_threshold_chip.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.tm_threshold_chip.clicked.connect(self._request_tm_threshold_update)
         threshold_layout.addWidget(self.tm_threshold_chip)
+        self.fuzzy_revalidate_button = QPushButton("重新验证 Fuzzy")
+        self.fuzzy_revalidate_button.setObjectName("fuzzyRevalidateButton")
+        self.fuzzy_revalidate_button.setAccessibleName(
+            "重新运行本机 Fuzzy 性能资格验证"
+        )
+        self.fuzzy_revalidate_button.setToolTip(
+            "显式运行完整性能验证；验证期间 Exact 与 Context 保持可用"
+        )
+        self.fuzzy_revalidate_button.clicked.connect(
+            self._request_fuzzy_revalidation
+        )
+        threshold_layout.addWidget(self.fuzzy_revalidate_button)
         content_layout.addWidget(threshold_panel)
 
         self.resource_tables_scroll = QScrollArea()
@@ -649,13 +670,34 @@ class QtSettingsDialog(QDialog):
     def _refresh_tm_threshold_entry(self) -> None:
         """Render the settings entry from fresh defensive Controller values."""
 
+        retrieval_status = self.controller.tm_retrieval_status()
+        fuzzy_validation = self.controller.tm_fuzzy_validation_status()
         configure_tm_threshold_entry(
             self.tm_threshold_chip,
             self.tm_threshold_state,
             preferences=self.controller.tm_preferences(),
-            retrieval_status=self.controller.tm_retrieval_status(),
-            fuzzy_validation=self.controller.tm_fuzzy_validation_status(),
+            retrieval_status=retrieval_status,
+            fuzzy_validation=fuzzy_validation,
         )
+        needs_revalidation = not retrieval_status.fuzzy_available
+        self.fuzzy_revalidate_button.setVisible(needs_revalidation)
+        running = fuzzy_validation.state is FuzzyValidationState.RUNNING
+        self.fuzzy_revalidate_button.setEnabled(
+            needs_revalidation and not running
+        )
+        self.fuzzy_revalidate_button.setText(
+            "Fuzzy 验证中…" if running else "重新验证 Fuzzy"
+        )
+
+    def _request_fuzzy_revalidation(self) -> None:
+        try:
+            status = self.controller.revalidate_tm_fuzzy()
+        except EditorControllerError:
+            self.status_label.setText("Fuzzy 性能验证未能启动。")
+            self._refresh_tm_threshold_entry()
+            return
+        self._refresh_tm_threshold_entry()
+        self.fuzzy_validation_changed.emit(status)
 
     def _request_tm_threshold_update(self) -> None:
         """Submit one constrained value through the sole Controller update seam."""
@@ -1498,6 +1540,10 @@ QPushButton#settingsTmThresholdChip[fuzzyAvailable="false"] {
     color: #6f7d8a;
     background: #edf0f3;
     border-color: #cbd3da;
+}
+QPushButton#fuzzyRevalidateButton {
+    min-height: 26px;
+    padding: 1px 10px;
 }
 QLabel[tmMode="LEGACY_EXACT_ONLY"] {
     color: #40566d;

@@ -111,6 +111,9 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 7. When 能力或资源状态恢复并通过验证, the LocalCAT Qt 编辑器 shall 刷新状态与当前段建议
 8. While 当前进程的 Gate D 正在运行且 fuzzy 尚未正式发布, the LocalCAT Qt 编辑器 shall 显示“Fuzzy 性能验证中”，继续只按当前 capability 显示 Exact/Context，并保持 fuzzy 阈值入口不可提交
 9. If Gate D 失败或结束但 fuzzy 仍未获授权, the LocalCAT Qt 编辑器 shall 只显示批准的安全原因，不把 RUNNING、SUCCEEDED、旧 evidence 或资源 canonical 状态解释为 fuzzy 可用
+10. When 应用启动且本设备存在 ADR-013 compatibility key 完全匹配、HMAC 与 strict bundle 均通过的 Gate D attestation, the LocalCAT capability composition shall 由 Core 自动重授权 FUZZY，不重新执行 100k benchmark
+11. If 本设备资格缺失、损坏或 compatibility key 失配, the LocalCAT Qt 编辑器 shall 保持 Exact/Context 的当前正式能力、显示“Fuzzy 需重新验证”并只由显式用户操作启动 Gate D
+12. The Gate D compatibility key shall 不包含普通 TM 内容、canonical generation 或 Active/Lookup/Update 配置；这些变化不得单独撤销设备 Fuzzy 资格
 
 ### Requirement 7：统一文本匹配与 TM 设置入口
 

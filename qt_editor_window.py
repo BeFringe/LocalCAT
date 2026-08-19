@@ -10,6 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QObject,
     QEvent,
+    QPoint,
     QPointF,
     QRect,
     QSignalBlocker,
@@ -75,6 +76,8 @@ from editor_contracts import (
     MIN_EDITOR_FONT_SIZE,
     DisplayPreferences,
     EditorSegment,
+    FuzzyValidationDisplay,
+    FuzzyValidationState,
     LegacyExactTMSuggestion,
     ProjectSearchReport,
     ProjectSearchRequest,
@@ -150,6 +153,52 @@ def _paint_top_bar_chevron(
 
 class _TopBarModeCombo(QComboBox):
     """Workspace mode combo with an application-owned visible arrow."""
+
+    _POPUP_GAP = 8
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.mode_popup_menu = QMenu(self)
+        self.mode_popup_menu.setObjectName("workspaceModePopupMenu")
+        self.mode_popup_menu.setAccessibleName("工作区模式选项")
+        configure_menu(self.mode_popup_menu)
+        self.mode_popup_menu.triggered.connect(self._mode_action_triggered)
+
+    def showPopup(self) -> None:
+        """Open one app-owned menu below, never over, the current mode."""
+
+        if not self.isEnabled() or self.count() <= 0:
+            return
+        self.mode_popup_menu.clear()
+        for index in range(self.count()):
+            action = self.mode_popup_menu.addAction(self.itemText(index))
+            action.setData(index)
+            action.setCheckable(True)
+            action.setChecked(index == self.currentIndex())
+        self.mode_popup_menu.setMinimumWidth(self.width())
+        self.mode_popup_menu.adjustSize()
+        target = self.mapToGlobal(
+            QPoint(0, self.height() + self._POPUP_GAP)
+        )
+        screen = self.screen().availableGeometry()
+        x = min(
+            max(target.x(), screen.left()),
+            max(
+                screen.left(),
+                screen.right() - self.mode_popup_menu.width() + 1,
+            ),
+        )
+        self.mode_popup_menu.popup(QPoint(x, target.y()))
+
+    def hidePopup(self) -> None:
+        self.mode_popup_menu.hide()
+        super().hidePopup()
+
+    def _mode_action_triggered(self, action: QAction) -> None:
+        index = action.data()
+        if type(index) is not int or not 0 <= index < self.count():
+            return
+        self.setCurrentIndex(index)
 
     def _arrow_rect(self) -> QRect:
         option = QStyleOptionComboBox()
@@ -331,7 +380,7 @@ class QtEditorWindow(QMainWindow):
         self.project_name_label: QLabel
         self.language_label: QLabel
         self.progress_bar: QProgressBar
-        self.workspace_mode_combo: QComboBox
+        self.workspace_mode_combo: _TopBarModeCombo
         self.open_button: QToolButton
         self.project_menu: QMenu
         self.open_project_action: QAction
@@ -395,6 +444,11 @@ class QtEditorWindow(QMainWindow):
         self.workspace_mode = self._display_preferences.workspace_mode
         self.editor_font_size = self._display_preferences.editor_font_size
         self.settings_dialog: QtSettingsDialog | None = None
+        self._fuzzy_validation_timer = QTimer(self)
+        self._fuzzy_validation_timer.setInterval(250)
+        self._fuzzy_validation_timer.timeout.connect(
+            self._poll_fuzzy_validation
+        )
         self.current_suggestions = SuggestionBundle()
         self.current_tm_report: TMSuggestionReport | None = None
         self.current_project_search_report: ProjectSearchReport | None = None
@@ -1156,6 +1210,11 @@ class QtEditorWindow(QMainWindow):
                 ("Ctrl+2",),
                 lambda: self._set_workspace_mode_from_shortcut(WorkspaceMode.BROWSE),
             ),
+            (
+                "segment_density_toggle",
+                ("Ctrl+Shift+L",),
+                self._toggle_segment_density_from_shortcut,
+            ),
         )
         self.shortcuts: dict[str, QShortcut] = {}
         for name, sequences, callback in bindings:
@@ -1190,6 +1249,16 @@ class QtEditorWindow(QMainWindow):
         if not self.controller.has_project or not self.workspace_mode_combo.isEnabled():
             return
         self.set_workspace_mode(mode)
+
+    def _toggle_segment_density_from_shortcut(self) -> None:
+        if not self.controller.has_project or not self.segment_density_combo.isEnabled():
+            return
+        target = (
+            SegmentDensity.WRAPPED
+            if self.segment_density is SegmentDensity.COMPACT
+            else SegmentDensity.COMPACT
+        )
+        self.set_segment_density(target)
 
     @staticmethod
     def _native_shortcut_text(shortcut: QShortcut) -> str:
@@ -1236,6 +1305,10 @@ class QtEditorWindow(QMainWindow):
             "切换编辑或双语浏览校对模式 "
             f"(编辑 {self._native_shortcut_text(self.shortcuts['workspace_edit'])} / "
             f"校对 {self._native_shortcut_text(self.shortcuts['workspace_browse'])})"
+        )
+        self.segment_density_combo.setToolTip(
+            "段落列表：紧凑等高或完整自动换行 "
+            f"({self._native_shortcut_text(self.shortcuts['segment_density_toggle'])})"
         )
         project_search_shortcut = self._native_shortcut_text(
             self.project_search_shortcut
@@ -2212,11 +2285,21 @@ class QtEditorWindow(QMainWindow):
         dialog = QtSettingsDialog(self.controller, self)
         dialog.resources_changed.connect(self._resources_changed)
         dialog.tm_threshold_changed.connect(self._settings_tm_threshold_changed)
+        dialog.fuzzy_validation_changed.connect(
+            self._settings_fuzzy_validation_changed
+        )
+        dialog.destroyed.connect(
+            lambda _object=None: self._forget_settings_dialog(dialog)
+        )
         dialog.term_suggestions_changed.connect(
             self._term_suggestions_changed
         )
         self.settings_dialog = dialog
         return dialog
+
+    def _forget_settings_dialog(self, dialog: QtSettingsDialog) -> None:
+        if self.settings_dialog is dialog:
+            self.settings_dialog = None
 
     def _resources_changed(self) -> None:
         if self.controller.has_project:
@@ -2406,6 +2489,36 @@ class QtEditorWindow(QMainWindow):
             tm_threshold_feedback(outcome),
             7000,
         )
+
+    def _settings_fuzzy_validation_changed(self, status: object) -> None:
+        if type(status) is not FuzzyValidationDisplay:
+            raise TypeError("Fuzzy validation display is invalid")
+        status.__post_init__()
+        if status.state is FuzzyValidationState.RUNNING:
+            self._fuzzy_validation_timer.start()
+            self._refresh_tm_threshold_entry()
+            self.statusBar().showMessage("Fuzzy 性能验证中。", 5000)
+            return
+        self._fuzzy_validation_timer.stop()
+        if self.controller.has_project:
+            self.refresh_suggestions()
+        else:
+            self._refresh_tm_threshold_entry()
+        dialog = self.settings_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.refresh_resources()
+            dialog.status_label.setText(
+                "Fuzzy 性能资格已验证并保存到本机。"
+                if status.state is FuzzyValidationState.SUCCEEDED
+                else "Fuzzy 性能资格验证未通过。"
+            )
+
+    def _poll_fuzzy_validation(self) -> None:
+        status = self.controller.tm_fuzzy_validation_status()
+        if status.state is FuzzyValidationState.RUNNING:
+            self._refresh_tm_threshold_entry()
+            return
+        self._settings_fuzzy_validation_changed(status)
 
     @staticmethod
     def _tm_state_message(

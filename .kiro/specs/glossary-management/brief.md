@@ -2,17 +2,17 @@
 
 ## Stage Positioning
 
-本规格不再重复实现 Qt 第一阶段的基础术语管理。术语列表、新增、编辑、删除、冲突反馈、原子写入和 Trie 热重载归 `qt-editor-json-mvp-increment`，并继续保持旧两列术语的“区分大小写 + 允许子串”兼容行为。
+本规格不再重复实现 Qt 已完成的术语管理基线。`qt-editor-json-mvp-increment` 的 4.5(P)/4.5a/4.7a 已交付集中式列表、新增、编辑、删除、冲突反馈、原子事务、Trie/配置 matcher 热重载，以及主窗口 Termbase 页和资源设置菜单的两个入口；新 v1 记录已持久化 Match Case / Whole Word，旧两列记录保持既有语义。
 
-本规格保留第二阶段：Feature 5 的版本化 `SearchOptions` / `TextMatcher` 语义稳定后，为术语记录增加可持久化的 Match Case / Whole Word 字段、旧记录迁移、扩展 CSV/XLSX 互操作和统一匹配。新记录默认 `Match Case=false`、`Whole Word=true`；旧两列记录保持既有语义。Feature 1 的 Trie 重叠匹配与长词优先仍是独立能力，不并入 Feature 5。
+本规格后续只拥有基线之上的批量选择、管理器内检索/排序、注释与来源、扩展 CSV/XLSX 互操作和导出/QA。Feature 1 的 Trie 重叠匹配与长词优先仍是独立兼容能力，不并入 Feature 5。
 
 ## Problem
 
-当前术语表只能导入前两列或在当前建议处追加术语，用户不能集中查看、搜索、编辑、删除和排序，也不能为每条术语配置 Match Case / Whole Word。
+当前用户已经能集中查看并增删改术语，也能为 v1 记录配置 Match Case / Whole Word；仍缺少大词表下的管理器内检索、批量操作、排序、注释/来源与完整扩展导入导出。
 
 ## Current State
 
-`GlossaryEngine` 是逐字符 Trie：当前实际行为为区分大小写、允许子串、支持重叠并由 UI 最长优先。CSV/XLSX 只读取 source/target；旧两列记录没有匹配标志。
+`TermbaseStore`、Controller transaction 与 `QtTermbaseDialog` 已形成单一 CRUD/恢复路径；v1 记录保存匹配 flags，legacy 两列仍由逐字符 Trie 保持区分大小写、允许子串、支持重叠并由 UI 最长优先。当前互操作仍以已批准的 legacy/v1 输入为主，尚无批量管理与完整扩展导出。
 
 ## Desired Outcome
 

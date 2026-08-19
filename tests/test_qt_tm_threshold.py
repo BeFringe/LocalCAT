@@ -91,6 +91,19 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             preferences=TMPreferences(),
             retrieval_status=closed,
             fuzzy_validation=FuzzyValidationDisplay(
+                state=FuzzyValidationState.FAILED,
+                safe_code="GATE_D.REVALIDATION_REQUIRED",
+            ),
+        )
+        self.assertEqual(state_label.text(), "Fuzzy 需重新验证")
+        self.assertIs(button.property("fuzzyAvailable"), False)
+
+        configure_tm_threshold_entry(
+            button,
+            state_label,
+            preferences=TMPreferences(),
+            retrieval_status=closed,
+            fuzzy_validation=FuzzyValidationDisplay(
                 state=FuzzyValidationState.SUCCEEDED,
                 safe_code=None,
             ),
@@ -216,6 +229,34 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             self.assertIn("Fuzzy 不可用", window_state.text())
             self.assertEqual(window_chip.toolTip(), settings_chip.toolTip())
             self.assertIn(window_state.text(), window_chip.accessibleName())
+            self.assertTrue(dialog.fuzzy_revalidate_button.isVisible())
+
+            running = FuzzyValidationDisplay(
+                state=FuzzyValidationState.RUNNING,
+                safe_code=None,
+            )
+            observed: list[FuzzyValidationDisplay] = []
+            dialog.fuzzy_validation_changed.connect(observed.append)
+            with (
+                patch.object(
+                    controller,
+                    "revalidate_tm_fuzzy",
+                    return_value=running,
+                ) as start,
+                patch.object(
+                    controller,
+                    "tm_fuzzy_validation_status",
+                    return_value=running,
+                ),
+            ):
+                dialog.fuzzy_revalidate_button.click()
+            start.assert_called_once_with()
+            self.assertEqual(observed, [running])
+            self.assertEqual(
+                dialog.fuzzy_revalidate_button.text(),
+                "Fuzzy 验证中…",
+            )
+            self.assertFalse(dialog.fuzzy_revalidate_button.isEnabled())
 
             with (
                 patch(

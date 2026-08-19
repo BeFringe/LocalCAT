@@ -6,11 +6,11 @@
 
 ## Problem
 
-项目记录已经保存 `speaker`，但三栏编辑器和浏览/校对页没有独立展示，译者只能从正文包装或上下文猜测说话者，也无法为反复出现的角色配置更易读的显示方式。
+项目记录保存 raw `speaker`，现有 UI 也能显示并按 speaker 搜索，但重复角色仍只能看到原始标识；用户缺少统一 inventory，也无法把 `NVLHED` 等标识配置成更易读的显示名、显式留空或头像。
 
 ## Current State
 
-JSON 项目能读取/保存 `speaker`，TM 兼容桥也会使用原始 speaker 做严格精确匹配；左侧段落、SOURCE/TARGET 编辑区和四栏浏览表均未单独呈现 speaker。
+JSON 项目读取/保存 raw `speaker`，编辑面与项目搜索已经消费该字段，TM 兼容桥仍用原始值做严格精确匹配。`qt-editor-json-mvp-increment` 的 Task 1.1b/2.1/3.2b/4.2（独立 inventory contract/service/dialog）尚未实施；显示 profile、头像与 alias 也均未实施。
 
 ## Desired Outcome
 
@@ -41,7 +41,7 @@ JSON 项目能读取/保存 `speaker`，TM 兼容桥也会使用原始 speaker �
 
 ## Upstream / Downstream
 
-- **Upstream**: `qt-editor-json-mvp-increment` 的 raw speaker 展示和 Qt 工作区状态；Parser/codec 未来迁移时只需继续保留 speaker。
+- **Upstream**: `qt-editor-json-mvp-increment` 的 raw speaker 展示/搜索；其 inventory 子任务完成后可作为本规格的候选列表来源。Parser/codec 未来迁移时只需继续保留 raw speaker。
 - **Downstream**: 快速搜索 speaker、角色一致性检查、未来项目包导出。
 
 ## Existing Spec Touchpoints

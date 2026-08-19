@@ -63,8 +63,8 @@
 ## Governance Impact
 
 - **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`roadmap.md`、`spec-ownership.md` 与 repository safety rules。
-- **Applicable ADRs**：ADR-007～012；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。ADR-013 仍为 Gate D 跨进程重授权草案，不授权 cache/re-mint 实现。
-- **ADR disposition**：Follow ADR-012 处理 unpublished orphan residue；Gate D 继续 follow ADR-009/011 与现有 per-process 协议，直至 ADR-013 另行采纳。
+- **Applicable ADRs**：ADR-007～013；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。
+- **ADR disposition**：Follow ADR-012 处理 unpublished orphan residue；Gate D follow ADR-009/011 的单一 Core authority，并按 ADR-013 复证设备本地资格。
 - **Scope amendment**：Approved for ADR-012 orphan-residue remediation。首次迁移、完整激活、失败可重试、无 prior canonical 时保留 JSONL 兼容能力，已由 `tm-storage-retrieval-index` Requirement 2 批准；ADR-012 明确了 unpublished residue 不得被提升为 canonical authority fact。
 - **Steering sync**：Required。实现闭合时同步 `product.md`、`structure.md`、`tech.md` 的 exact-only/JSONL 当前态与新增文件边界；已同步的 integration boundary、roadmap 和 ownership 不重复改写。
 - **Downstream revalidation**：`qt-editor-json-mvp-increment` Requirement 3/7 matcher handoff、既有 Qt/Excel/legacy tests、macOS bootstrap；Parser/multi-document 仅登记未来触发器。
@@ -186,8 +186,8 @@ sequenceDiagram
 - UI 可先以 legacy/canonical exact-only 工作；验证未完成、失败或过期时 context/fuzzy 保持关闭。
 - matcher 只能来自 `build_validated_matcher_v1`；应用可原子替换“无 matcher”与正式 gated matcher，但不生成自己的 capability。
 - 初始 exact-only service 可使用 Core default closed publisher，但该 sentinel publisher **不得**接收批准 Gate C roots。`recompute_retrieval_validation()` 成功后，host 必须用同一 `release.expectation` 新建 Core evaluator/publisher，先以 `initial_manifest=None` 保持关闭，再只刷新 `release.manifest`，并原子替换整套 retrieval service。
-- Gate D 只能消费上述新 publisher 和同一 base manifest。`contract_path` 固定为合并后已跟踪的 `benchmark_tm_contract.json`；每次进程/代码 epoch 创建新的 `0700` private temporary `work_root`，`evidence_path = work_root / "benchmark_tm_evidence.json"` 且调用前必须不存在。runner 私有子树由 Core 清理；成功 evidence 可保留到进程结束作审计，旧 evidence 不能重铸 run receipt。`GATE_D.CLEANUP_PENDING` 或 identity 漂移时保留现场并保持 closed，application 不递归清理。
-- Gate D 运行不阻塞 Qt 主线程。首版不从普通应用缓存反向铸造 capability；每个进程重新取得当前代码/fixture/环境证据。Gate C 或 D 失败时保留当时已经正式开放的较低能力，绝不从失败事实提升能力。
+- Gate D 只能消费上述新 publisher 和同一 base manifest。真实重验仍固定 current `benchmark_tm_contract.json`，创建新的 `0700` private temporary `work_root` 与 absent evidence path；成功 real run 由 Core 写入 ADR-013 的设备本地 HMAC attestation。后续进程只能在 strict bundle、设备密钥、运行环境、implementation/proof/contract 与 Gate C identity 全部复证后重铸一次性 receipt；Qt/application 不解析、不重铸。
+- 启动先执行 Matcher 与 Gate C，再快速尝试 attestation restore；不得自动运行 100k Gate D。缺失、损坏或 compatibility drift 时保留 exact/context 并显示显式重验入口。用户启动的 Gate D 在后台运行，不阻塞 Qt 主线程；失败保持当前较低能力。
 - Qt 可经 Controller-only、process-local 的安全 lifecycle 投影区分 Gate D `IDLE/RUNNING/SUCCEEDED/FAILED`。该投影只驱动“Fuzzy 性能验证中”或有限失败原因，不参与 query、threshold 或 capability 判定；Exact/Context/Fuzzy 可用性仍只来自同代 `RetrievalDisplayState`。RUNNING 时阈值入口持续可发现但不可提交，正式 Gate D publication 后沿既有 queued generation bridge 刷新当前建议与入口。
 
 ### 当前段 mixed query
@@ -702,7 +702,7 @@ class MacOSBundleReport:
 | Gate B — Canonical physical readiness | 精确 dd7 已实现；验证 schema、mutable stage、完整候选索引、StageSealer、binding 与 exact parity | sealed artifact 可进入 physical activation | 不得发布部分 sidecar、generation 或仅凭可打开 SQLite 冒充 canonical ready |
 | Physical activation（不是 capability gate） | 顺序 4 补齐 application-facing 首次入口；运行时由用户对单一 legacy resource 显式触发 | 成功后该资源唯一 runtime authority 切换为 canonical SQLite，exact/save 立即可用 | 首次 proven failure 以外不得回落 JSONL；ambiguous durable facts 必须 unavailable；只有 unpublished orphan residue 时按 ADR-012 保留 legacy 并 fresh-nonce retry |
 | Gate C — Retrieval correctness | CapabilityHost 以固定 build/fixture/semantics 重新计算 Core validation release，并用配对 expectation + manifest 新建正式 publisher/service | CONTEXT correctness 可独立开放；fuzzy-core 只满足 FUZZY 的 correctness 前提 | 不得刷新 sentinel publisher、用 manifest 自报 PASS 或仅凭 Gate C 开放任一 fuzzy execution path |
-| Gate D — benchmark-v1 | Gate C 后，在同一正式 publisher 上按 intended FTS5/fallback path 运行 100k benchmark/oracle；每 process/code epoch 使用新的 private evidence root | 只有 Gate C fuzzy-core 与本次 intended path Gate D 都通过，FUZZY 才开放 | 超限、旧 receipt、cleanup pending 或 identity drift 不得开放 fuzzy，也不得撤销 canonical exact 或已开放 context |
+| Gate D — benchmark-v1 | Gate C 后，优先由 Core 复证 ADR-013 设备资格；缺失/失配时只允许显式运行 FTS5/fallback 100k benchmark/oracle | 只有 Gate C fuzzy-core 与兼容设备资格或本次真实 Gate D 都通过，FUZZY 才开放 | attestation 损坏/失配、超限、旧 receipt、cleanup pending 或 identity drift 不得开放 fuzzy，也不得撤销 canonical exact 或已开放 context |
 | Matcher Gate | 与 Gate C/D 独立，消费 matcher validation manifest 发布 UNAVAILABLE/BASIC/TEXT_V1 | BASIC 允许基础连续搜索；TEXT_V1 才允许 Match Case / Whole Word 与 configured terms | 不得从 SQLite、Gate C/D、FTS5、控件状态或调用方布尔值推断 matcher state |
 
 ### 实现时序与运行时状态不可混淆

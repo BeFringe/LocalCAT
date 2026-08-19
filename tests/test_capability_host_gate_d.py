@@ -1311,7 +1311,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(name for name in dir(owner) if not name.startswith("_")),
-            ("start_gate_d", "status", "wait"),
+            ("restore_gate_d", "start_gate_d", "status", "wait"),
         )
         self.assertEqual(
             tuple(inspect.signature(owner.start_gate_d).parameters),
@@ -1323,7 +1323,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
                     host_module.compose_capability_host
                 ).parameters
             ),
-            ("evaluated_at_utc",),
+            ("evaluated_at_utc", "gate_d_attestation_root"),
         )
         self.assertFalse(
             hasattr(host_module, "_compose_capability_host_for_gate_d_test")

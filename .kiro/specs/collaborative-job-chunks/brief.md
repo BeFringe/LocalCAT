@@ -49,3 +49,12 @@ LocalCAT 当前是单机个人编辑器，没有多文档 workspace、chunk、�
 ## Constraints
 
 拆分、合并和重排不得改变任何 segment 的规范身份；越出当前 chunk 的内容若可见必须明确只读；所有成员变化应有可审计报告与安全撤销路径。
+
+## Promotion Clusters
+
+1. chunk identity、稳定 segment membership 与 split/merge 不变量；
+2. assignment、permission、progress 与越界只读；
+3. Controller scope、搜索 `current_chunk` 与冲突/撤销；
+4. Qt 与 current-source acceptance。
+
+该规格必须在多文档 identity/reconciliation/save clusters 完成后启动。跨端同步只有在本规格批准 namespaced chunk metadata 后才可搬运该 metadata；同步插件不得解释成员资格或权限。

@@ -2187,6 +2187,8 @@ class _CoreGateDBinding:
     gate_module: ModuleType
     run_function: FunctionType
     publish_function: FunctionType
+    persist_attestation_function: FunctionType
+    restore_attestation_function: FunctionType
     error_type: type[BaseException]
     run_result_type: type[object]
     publication_result_type: type[object]
@@ -2217,6 +2219,12 @@ class _CoreGateDBinding:
         publish_function = gate_module.__dict__.get(
             "_publish_retrieval_capability_gate_d_prepared"
         )
+        persist_attestation_function = gate_module.__dict__.get(
+            "_persist_gate_d_attestation"
+        )
+        restore_attestation_function = gate_module.__dict__.get(
+            "_restore_gate_d_attestation"
+        )
         error_type = gate_module.__dict__.get("BenchmarkGateDError")
         run_result_type = gate_module.__dict__.get(
             "BenchmarkGateDRunResult"
@@ -2230,6 +2238,8 @@ class _CoreGateDBinding:
         if (
             type(run_function) is not FunctionType
             or type(publish_function) is not FunctionType
+            or type(persist_attestation_function) is not FunctionType
+            or type(restore_attestation_function) is not FunctionType
             or type(error_type) is not type
             or not issubclass(cast(type[object], error_type), BaseException)
             or type(run_result_type) is not type
@@ -2246,6 +2256,14 @@ class _CoreGateDBinding:
             gate_module=gate_module,
             run_function=cast(FunctionType, run_function),
             publish_function=cast(FunctionType, publish_function),
+            persist_attestation_function=cast(
+                FunctionType,
+                persist_attestation_function,
+            ),
+            restore_attestation_function=cast(
+                FunctionType,
+                restore_attestation_function,
+            ),
             error_type=cast(type[BaseException], error_type),
             run_result_type=cast(type[object], run_result_type),
             publication_result_type=cast(
@@ -2269,6 +2287,14 @@ class _CoreGateDBinding:
                 "_publish_retrieval_capability_gate_d_prepared"
             )
             is self.publish_function
+            and self.gate_module.__dict__.get(
+                "_persist_gate_d_attestation"
+            )
+            is self.persist_attestation_function
+            and self.gate_module.__dict__.get(
+                "_restore_gate_d_attestation"
+            )
+            is self.restore_attestation_function
             and self.gate_module.__dict__.get("BenchmarkGateDError")
             is self.error_type
             and self.gate_module.__dict__.get("BenchmarkGateDRunResult")
@@ -2374,6 +2400,73 @@ class _CoreGateDBinding:
         validated_result: Any = publication
         return validated_result
 
+    def persist_attestation(
+        self,
+        *,
+        run_result: object,
+        contract_path: Path,
+        state_root: Path,
+        base_manifest: RetrievalCapabilityManifest,
+        issued_at_utc: datetime,
+    ) -> None:
+        if (
+            type(run_result) is not self.run_result_type
+            or not self.is_current()
+            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        try:
+            self.persist_attestation_function(
+                contract_path=contract_path,
+                state_root=state_root,
+                base_manifest=base_manifest,
+                run_result=run_result,
+                issued_at_utc=issued_at_utc,
+            )
+        except self.error_type as error:
+            validated_error: Any = error
+            raise _GateDOperationalError(
+                validated_error.error_code
+            ) from error
+
+    def restore(
+        self,
+        *,
+        contract_path: Path,
+        state_root: Path,
+        base_manifest: RetrievalCapabilityManifest,
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> _CoreGateDPublication:
+        if (
+            not self.is_current()
+            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        try:
+            run_result = self.restore_attestation_function(
+                contract_path=contract_path,
+                state_root=state_root,
+                base_manifest=base_manifest,
+            )
+        except self.error_type as error:
+            validated_error: Any = error
+            raise _GateDOperationalError(
+                validated_error.error_code
+            ) from error
+        if (
+            type(run_result) is not self.run_result_type
+            or not self.is_current()
+        ):
+            raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
+        return _CoreGateDPublication(
+            _mint=_GATE_D_PUBLICATION_MINT,
+            binding=self,
+            run_result=run_result,
+            publication_owner_identity=publication_owner_identity,
+            publication_graph_nonce=publication_graph_nonce,
+        )
+
 
 @final
 class _CoreGateDPublication:
@@ -2449,6 +2542,27 @@ class _CoreGateDPublication:
                 prepare_publication=prepare_publication,
             )
 
+    def persist_attestation(
+        self,
+        *,
+        contract_path: Path,
+        state_root: Path,
+        base_manifest: RetrievalCapabilityManifest,
+        issued_at_utc: datetime,
+    ) -> None:
+        with self.__consume_lock:
+            if self.__consumed:
+                raise RuntimeError(
+                    "Gate D publication receipt was already consumed"
+                )
+            self.__binding.persist_attestation(
+                run_result=self.__run_result,
+                contract_path=contract_path,
+                state_root=state_root,
+                base_manifest=base_manifest,
+                issued_at_utc=issued_at_utc,
+            )
+
 
 @final
 class _RealGateDExecution:
@@ -2479,9 +2593,33 @@ class _RealGateDExecution:
             publication_graph_nonce=publication_graph_nonce,
         )
 
+    def restore(
+        self,
+        *,
+        contract_path: Path,
+        state_root: Path,
+        base_manifest: RetrievalCapabilityManifest,
+        publication_owner_identity: object,
+        publication_graph_nonce: object,
+    ) -> _CoreGateDPublication:
+        try:
+            binding = _CoreGateDBinding.capture()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            raise _GateDOperationalError(
+                "GATE_D.IMPLEMENTATION_CHANGED"
+            ) from error
+        return binding.restore(
+            contract_path=contract_path,
+            state_root=state_root,
+            base_manifest=base_manifest,
+            publication_owner_identity=publication_owner_identity,
+            publication_graph_nonce=publication_graph_nonce,
+        )
+
 
 _REAL_GATE_D_EXECUTION = _RealGateDExecution()
 _REAL_GATE_D_EXECUTE = _REAL_GATE_D_EXECUTION.run
+_REAL_GATE_D_RESTORE = _REAL_GATE_D_EXECUTION.restore
 
 
 class GateDRunState(Enum):
@@ -2664,6 +2802,12 @@ class RetrievalGateDOwnerPort(Protocol):
     """Composition-owner-only asynchronous Gate D lifecycle."""
 
     def start_gate_d(
+        self,
+        *,
+        evaluated_at_utc: datetime,
+    ) -> GateDRunStatus: ...
+
+    def restore_gate_d(
         self,
         *,
         evaluated_at_utc: datetime,
@@ -3218,6 +3362,8 @@ class CapabilityHost:
     def _composition_gate_d_owner(
         self,
         composition_mint_identity: object,
+        *,
+        attestation_root: Path | None,
     ) -> _RetrievalGateDOwner:
         """Mint the Gate D lifecycle only for application composition."""
 
@@ -3228,6 +3374,7 @@ class CapabilityHost:
         return _RetrievalGateDOwner(
             host=self,
             owner_identity=self.__retrieval_owner_identity,
+            attestation_root=attestation_root,
         )
 
     def _install_core_matcher(
@@ -3760,12 +3907,14 @@ class _RetrievalGateDOwner:
     """Composition-private, process-local asynchronous Gate D owner."""
 
     __slots__ = (
+        "__attestation_root",
         "__condition",
         "__execute",
         "__host",
         "__owner_identity",
         "__programmer_error",
         "__retained_roots",
+        "__restore",
         "__status",
         "__thread",
     )
@@ -3775,12 +3924,20 @@ class _RetrievalGateDOwner:
         *,
         host: CapabilityHost,
         owner_identity: object,
+        attestation_root: Path | None,
     ) -> None:
         if type(host) is not CapabilityHost:
             raise TypeError("Gate D owner requires CapabilityHost")
         self.__host = host
         self.__owner_identity = owner_identity
+        if attestation_root is not None and (
+            not isinstance(attestation_root, Path)
+            or not attestation_root.is_absolute()
+        ):
+            raise ValueError("Gate D attestation root must be absolute")
+        self.__attestation_root = attestation_root
         self.__execute = _REAL_GATE_D_EXECUTE
+        self.__restore = _REAL_GATE_D_RESTORE
         self.__condition = Condition(Lock())
         self.__status = GateDRunStatus(
             epoch=0,
@@ -3844,6 +4001,86 @@ class _RetrievalGateDOwner:
         with self.__condition:
             return self.__status
 
+    def restore_gate_d(
+        self,
+        *,
+        evaluated_at_utc: datetime,
+    ) -> GateDRunStatus:
+        """Restore one compatible device qualification without rerunning 100k."""
+
+        if (
+            type(evaluated_at_utc) is not datetime
+            or evaluated_at_utc.tzinfo is None
+            or evaluated_at_utc.utcoffset()
+            != timezone.utc.utcoffset(evaluated_at_utc)
+        ):
+            raise ValueError(
+                "Gate D evaluated_at_utc must be timezone-aware UTC"
+            )
+        graph = self.__host._capture_gate_d_graph(
+            owner_identity=self.__owner_identity,
+        )
+        with self.__condition:
+            if self.__status.state is GateDRunState.RUNNING:
+                return self.__status
+            epoch = self.__status.epoch + 1
+            self.__status = GateDRunStatus(
+                epoch=epoch,
+                state=GateDRunState.RUNNING,
+                safe_code=None,
+            )
+            self.__programmer_error = None
+        try:
+            if graph is None:
+                raise _GateDOperationalError("GATE_D.GATE_C_REQUIRED")
+            state_root = self.__attestation_root
+            if state_root is None:
+                raise _GateDOperationalError(
+                    "GATE_D.REVALIDATION_REQUIRED"
+                )
+            publication = self.__restore(
+                contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                state_root=state_root,
+                base_manifest=graph.base_manifest,
+                publication_owner_identity=self.__owner_identity,
+                publication_graph_nonce=graph.publication_nonce,
+            )
+            if type(publication) is not _CoreGateDPublication:
+                raise TypeError("Gate D restoration returned an invalid result")
+            self.__publish_publication(
+                epoch=epoch,
+                graph=graph,
+                publication=publication,
+                evaluated_at_utc=evaluated_at_utc,
+            )
+        except _GateDOperationalError as error:
+            failed = GateDRunStatus(
+                epoch=epoch,
+                state=GateDRunState.FAILED,
+                safe_code=error.error_code,
+            )
+            self.__finish(failed)
+            return failed
+        except OSError:
+            failed = GateDRunStatus(
+                epoch=epoch,
+                state=GateDRunState.FAILED,
+                safe_code="GATE_D.ATTESTATION_UNAVAILABLE",
+            )
+            self.__finish(failed)
+            return failed
+        except Exception as error:
+            self.__finish(
+                GateDRunStatus(
+                    epoch=epoch,
+                    state=GateDRunState.FAILED,
+                    safe_code="GATE_D.PROGRAMMER_ERROR",
+                ),
+                programmer_error=error,
+            )
+            raise
+        return self.status()
+
     def wait(self, timeout: float | None = None) -> GateDRunStatus:
         if timeout is not None:
             if type(timeout) not in (int, float):
@@ -3903,34 +4140,19 @@ class _RetrievalGateDOwner:
             )
             if type(publication) is not _CoreGateDPublication:
                 raise TypeError("Gate D execution returned an invalid result")
-            succeeded = GateDRunStatus(
-                epoch=epoch,
-                state=GateDRunState.SUCCEEDED,
-                safe_code=None,
-            )
-            with self.__condition:
-                old_status = self.__status
-                old_programmer_error = self.__programmer_error
-
-                def prepare_owner_success() -> None:
-                    self.__status = succeeded
-                    self.__programmer_error = None
-                    self.__condition.notify_all()
-
-                def rollback_owner_success() -> None:
-                    self.__status = old_status
-                    self.__programmer_error = old_programmer_error
-
-                installed = self.__host._publish_gate_d_capability(
-                    owner_identity=self.__owner_identity,
-                    graph=graph,
-                    publication=publication,
-                    evaluated_at_utc=evaluated_at_utc,
-                    prepare_owner_success=prepare_owner_success,
-                    rollback_owner_success=rollback_owner_success,
+            if self.__attestation_root is not None:
+                publication.persist_attestation(
+                    contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                    state_root=self.__attestation_root,
+                    base_manifest=graph.base_manifest,
+                    issued_at_utc=evaluated_at_utc,
                 )
-                if installed is None:
-                    raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
+            self.__publish_publication(
+                epoch=epoch,
+                graph=graph,
+                publication=publication,
+                evaluated_at_utc=evaluated_at_utc,
+            )
         except _GateDOperationalError as error:
             self.__finish(
                 GateDRunStatus(
@@ -3960,6 +4182,43 @@ class _RetrievalGateDOwner:
             )
             return
         return
+
+    def __publish_publication(
+        self,
+        *,
+        epoch: int,
+        graph: _GateDGraphSnapshot,
+        publication: _CoreGateDPublication,
+        evaluated_at_utc: datetime,
+    ) -> None:
+        succeeded = GateDRunStatus(
+            epoch=epoch,
+            state=GateDRunState.SUCCEEDED,
+            safe_code=None,
+        )
+        with self.__condition:
+            old_status = self.__status
+            old_programmer_error = self.__programmer_error
+
+            def prepare_owner_success() -> None:
+                self.__status = succeeded
+                self.__programmer_error = None
+                self.__condition.notify_all()
+
+            def rollback_owner_success() -> None:
+                self.__status = old_status
+                self.__programmer_error = old_programmer_error
+
+            installed = self.__host._publish_gate_d_capability(
+                owner_identity=self.__owner_identity,
+                graph=graph,
+                publication=publication,
+                evaluated_at_utc=evaluated_at_utc,
+                prepare_owner_success=prepare_owner_success,
+                rollback_owner_success=rollback_owner_success,
+            )
+            if installed is None:
+                raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
 
     def __finish(
         self,
@@ -4022,6 +4281,7 @@ class CapabilityHostComposition:
 def compose_capability_host(
     *,
     evaluated_at_utc: datetime,
+    gate_d_attestation_root: Path | None = None,
 ) -> CapabilityHostComposition:
     """Create the application-owned host and its private validation control."""
 
@@ -4041,6 +4301,7 @@ def compose_capability_host(
         ),
         retrieval_gate_d_owner=host._composition_gate_d_owner(
             _COMPOSITION_MINT_IDENTITY,
+            attestation_root=gate_d_attestation_root,
         ),
     )
 

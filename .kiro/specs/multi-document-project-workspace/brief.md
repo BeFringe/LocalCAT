@@ -61,3 +61,12 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 - workbook 是单文件保存单元：完整生成、验证并以同目录临时文件原子替换；失败保留原文件和 dirty 状态。
 - directory 是多文件保存单元，不能虚构跨文件 `os.replace` 原子性：先完成全部 staging/validation，再提交；失败报告必须逐文档区分 `saved`、`rolled_back`、`unchanged`、`failed`，保留未确认保存的 dirty 状态，并提供可重试/恢复信息。
 - Reader/Writer 只修改各自明确拥有的字段；未知列、工作表、代码、注释、空白和格式内容的保留范围由格式专属规格用 golden fixture 验证。
+
+## Promotion Clusters
+
+1. 身份与 origin：Project/Document/Segment、复合 segment identity、单 JSON 兼容适配。
+2. 聚合与持久化：document ordering、reconciliation、逐文档保存报告和失败恢复。
+3. 应用服务：Controller session、dirty/issued identity、`current_document` / `entire_project` search scope。
+4. Qt 与 current-source acceptance：章节导航、连续段落体验、窄宽布局和真实格式重开。
+
+每簇按人工阶段门推进；在 identity cluster 通过前不得开始 chunk，且不得把当前单 JSON segment id 改写为临时路径/列表索引。
