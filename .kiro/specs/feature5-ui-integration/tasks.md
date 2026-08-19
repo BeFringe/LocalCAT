@@ -336,7 +336,7 @@
 
 - [ ] 9. 闭合实现后 Steering 与 Feature GO
 
-- [ ] 9.1 同步实际结构与技术事实
+- [x] 9.1 同步实际结构与技术事实
   - 由 Governance owner 只按 Design 指定更新 `product.md`、`tech.md`、`structure.md` 的 canonical runtime、composition root 与新增文件事实
   - 对已同步的 integration boundary、roadmap 与 ownership 只做一致性复核；没有 owner-approved delta 时不例行重写
   - 由 UI owner记录原 Qt Req3/Req7 downstream revalidation、Parser/multi-document triggers 与各 cluster/commit ownership，不把相邻工作改记到本 Spec
