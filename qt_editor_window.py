@@ -2050,6 +2050,7 @@ class QtEditorWindow(QMainWindow):
             self.tm_threshold_state,
             preferences=self.controller.tm_preferences(),
             retrieval_status=self.controller.tm_retrieval_status(),
+            fuzzy_validation=self.controller.tm_fuzzy_validation_status(),
         )
 
     def _request_tm_threshold_update(self) -> None:

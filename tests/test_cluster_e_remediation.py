@@ -222,6 +222,9 @@ class ClusterERemediationTests(unittest.TestCase):
                 tm_adapter=EditorTMAdapter(
                     runtime_host=runtime,
                     capability_host=composition.host,
+                    fuzzy_validation_status=lambda: (
+                        qt_editor._fuzzy_validation_display(composition)
+                    ),
                 ),
             )
             controller.set_project(
@@ -570,6 +573,9 @@ class ClusterERemediationTests(unittest.TestCase):
                 tm_adapter=EditorTMAdapter(
                     runtime_host=runtime,
                     capability_host=composition.host,
+                    fuzzy_validation_status=lambda: (
+                        qt_editor._fuzzy_validation_display(composition)
+                    ),
                 ),
             )
             controller.set_project(
@@ -620,6 +626,10 @@ class ClusterERemediationTests(unittest.TestCase):
                 False,
             )
             self.assertEqual(
+                window.tm_threshold_state.text(),
+                "Fuzzy 性能验证中",
+            )
+            self.assertEqual(
                 gate_c_report.query_identity.query_epoch,
                 initial_epoch + 1,
             )
@@ -637,6 +647,7 @@ class ClusterERemediationTests(unittest.TestCase):
                 window.tm_threshold_chip.property("fuzzyAvailable"),
                 True,
             )
+            self.assertEqual(window.tm_threshold_state.text(), "Fuzzy 可用")
             self.assertEqual(
                 gate_d_report.query_identity.query_epoch,
                 initial_epoch + 2,

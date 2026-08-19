@@ -23,6 +23,8 @@ from capability_host import (
 )
 from editor_contracts import (
     EditorSegment,
+    FuzzyValidationDisplay,
+    FuzzyValidationState,
     ResourceConfig,
     RetrievalDisplayState,
     SuggestionQueryIdentity,
@@ -222,13 +224,19 @@ class _TMQueryOperation:
 class EditorTMAdapter:
     """Consume current runtime/capability snapshots without owning authority."""
 
-    __slots__ = ("_capability_host", "_runtime_host")
+    __slots__ = (
+        "_capability_host",
+        "_fuzzy_validation_status",
+        "_runtime_host",
+    )
 
     def __init__(
         self,
         *,
         runtime_host: TMRuntimeHost,
         capability_host: CapabilityHost,
+        fuzzy_validation_status: Callable[[], FuzzyValidationDisplay]
+        | None = None,
     ) -> None:
         if type(runtime_host) is not TMRuntimeHost:
             raise TypeError("editor TM adapter runtime host must be TMRuntimeHost")
@@ -236,8 +244,15 @@ class EditorTMAdapter:
             raise TypeError(
                 "editor TM adapter capability host must be CapabilityHost"
             )
+        if fuzzy_validation_status is not None and not callable(
+            fuzzy_validation_status
+        ):
+            raise TypeError(
+                "editor TM adapter fuzzy validation status must be callable"
+            )
         self._runtime_host = runtime_host
         self._capability_host = capability_host
+        self._fuzzy_validation_status = fuzzy_validation_status
 
     def _text_matcher_handoff_for_controller(
         self,
@@ -452,6 +467,26 @@ class EditorTMAdapter:
             self._inspect_retrieval_projection_for_controller()
         )
         return display
+
+    def _inspect_fuzzy_validation_for_controller(
+        self,
+    ) -> FuzzyValidationDisplay:
+        """Return process-local validation lifecycle without capability."""
+
+        reader = self._fuzzy_validation_status
+        if reader is None:
+            return FuzzyValidationDisplay(
+                state=FuzzyValidationState.IDLE,
+                safe_code=None,
+            )
+        status = reader()
+        if type(status) is not FuzzyValidationDisplay:
+            raise TypeError("fuzzy validation display contract is invalid")
+        status.__post_init__()
+        return FuzzyValidationDisplay(
+            state=status.state,
+            safe_code=status.safe_code,
+        )
 
     def _inspect_retrieval_projection_for_controller(
         self,

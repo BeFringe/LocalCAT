@@ -1082,6 +1082,38 @@ class RetrievalDisplayState:
             )
 
 
+class FuzzyValidationState(str, Enum):
+    """Process-local Gate D lifecycle without retrieval authority."""
+
+    IDLE = "idle"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class FuzzyValidationDisplay:
+    """Body-safe UI projection that never authorizes fuzzy retrieval."""
+
+    state: FuzzyValidationState
+    safe_code: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not FuzzyValidationState:
+            raise TypeError(
+                "fuzzy validation state must be FuzzyValidationState"
+            )
+        if self.state is FuzzyValidationState.FAILED:
+            _validate_safe_code(
+                self.safe_code,
+                "fuzzy validation failure code",
+            )
+        elif self.safe_code is not None:
+            raise ValueError(
+                "non-failed fuzzy validation cannot carry a safe code"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class TMSuggestionReport:
     """One immutable, body-safe current-segment TM query projection."""

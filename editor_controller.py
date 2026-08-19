@@ -19,6 +19,8 @@ from editor_contracts import (
     DisplayPreferences,
     EditorProject,
     EditorSegment,
+    FuzzyValidationDisplay,
+    FuzzyValidationState,
     ImportReport,
     ImportRequest,
     ProjectSearchHit,
@@ -1412,6 +1414,22 @@ class EditorController:
             status = self._inspect_tm_retrieval_status_no_query(adapter)
             if type(status) is not RetrievalDisplayState:
                 raise TypeError("TM retrieval display contract is invalid")
+            status.__post_init__()
+            return replace(status)
+
+    def tm_fuzzy_validation_status(self) -> FuzzyValidationDisplay:
+        """Return process-local validation lifecycle without authorizing fuzzy."""
+
+        with self._tm_query_lock:
+            adapter = self._tm_adapter
+            if adapter is None:
+                return FuzzyValidationDisplay(
+                    state=FuzzyValidationState.IDLE,
+                    safe_code=None,
+                )
+            status = adapter._inspect_fuzzy_validation_for_controller()
+            if type(status) is not FuzzyValidationDisplay:
+                raise TypeError("fuzzy validation display contract is invalid")
             status.__post_init__()
             return replace(status)
 

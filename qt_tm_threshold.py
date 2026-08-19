@@ -7,6 +7,8 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QLabel, QInputDialog, QPushButton, QWidget
 
 from editor_contracts import (
+    FuzzyValidationDisplay,
+    FuzzyValidationState,
     RetrievalDisplayState,
     TMPreferences,
     TMThresholdUpdateOutcome,
@@ -58,6 +60,7 @@ def configure_tm_threshold_entry(
     *,
     preferences: TMPreferences,
     retrieval_status: RetrievalDisplayState,
+    fuzzy_validation: FuzzyValidationDisplay,
 ) -> None:
     """Render one entry from defensive Controller values without retaining state."""
 
@@ -65,10 +68,17 @@ def configure_tm_threshold_entry(
         raise TypeError("TM threshold entry requires exact Qt widgets")
     preferences.__post_init__()
     retrieval_status.__post_init__()
+    fuzzy_validation.__post_init__()
     value_text = _threshold_text(preferences)
     if retrieval_status.fuzzy_available:
         state_text = "Fuzzy 可用"
         tooltip = "调整本机共享的 Fuzzy 最低相似度（60%～100%）"
+    elif fuzzy_validation.state is FuzzyValidationState.RUNNING:
+        state_text = "Fuzzy 性能验证中"
+        tooltip = "Fuzzy 性能验证正在后台运行；完成前阈值不可调整"
+    elif fuzzy_validation.state is FuzzyValidationState.FAILED:
+        state_text = "Fuzzy 不可用：Fuzzy 性能验证未通过"
+        tooltip = state_text
     else:
         reason = _fuzzy_disabled_reason(retrieval_status)
         state_text = f"Fuzzy 不可用：{reason}"

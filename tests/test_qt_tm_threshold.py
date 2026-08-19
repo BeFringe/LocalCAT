@@ -14,11 +14,19 @@ from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from editor_contracts import EditorProject, EditorSegment, TMPreferences
+from editor_contracts import (
+    EditorProject,
+    EditorSegment,
+    FuzzyValidationDisplay,
+    FuzzyValidationState,
+    RetrievalDisplayState,
+    TMPreferences,
+)
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
 from qt_editor_window import QtEditorWindow
 from qt_settings_dialog import QtSettingsDialog
+from qt_tm_threshold import configure_tm_threshold_entry
 from resource_repository import ResourceRepository
 from tests.test_editor_controller_tm_apply import (
     _canonical_controller,
@@ -54,6 +62,58 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
         assert settings_chip is not None
         assert settings_state is not None
         return window_chip, window_state, settings_chip, settings_state
+
+    def test_validation_lifecycle_never_authorizes_fuzzy(self) -> None:
+        button = QPushButton()
+        state_label = QLabel()
+        closed = RetrievalDisplayState(
+            context_available=True,
+            fuzzy_available=False,
+            safe_codes=("TM.RETRIEVAL.FUZZY_BENCHMARK_MISSING",),
+        )
+
+        configure_tm_threshold_entry(
+            button,
+            state_label,
+            preferences=TMPreferences(),
+            retrieval_status=closed,
+            fuzzy_validation=FuzzyValidationDisplay(
+                state=FuzzyValidationState.RUNNING,
+                safe_code=None,
+            ),
+        )
+        self.assertEqual(state_label.text(), "Fuzzy 性能验证中")
+        self.assertIs(button.property("fuzzyAvailable"), False)
+
+        configure_tm_threshold_entry(
+            button,
+            state_label,
+            preferences=TMPreferences(),
+            retrieval_status=closed,
+            fuzzy_validation=FuzzyValidationDisplay(
+                state=FuzzyValidationState.SUCCEEDED,
+                safe_code=None,
+            ),
+        )
+        self.assertIn("Fuzzy 不可用", state_label.text())
+        self.assertIs(button.property("fuzzyAvailable"), False)
+
+        configure_tm_threshold_entry(
+            button,
+            state_label,
+            preferences=TMPreferences(),
+            retrieval_status=closed,
+            fuzzy_validation=FuzzyValidationDisplay(
+                state=FuzzyValidationState.FAILED,
+                safe_code="GATE_D.BENCHMARK_FAILED",
+            ),
+        )
+        self.assertEqual(
+            state_label.text(),
+            "Fuzzy 不可用：Fuzzy 性能验证未通过",
+        )
+        self.assertNotIn("GATE_D", state_label.text())
+        self.assertIs(button.property("fuzzyAvailable"), False)
 
     def test_two_available_entries_share_value_state_and_keyboard_updates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

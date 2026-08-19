@@ -175,6 +175,45 @@ def install_desktop_launcher(
     return launcher_path
 
 
+def _fuzzy_validation_display(composition: object):
+    """Project the composition-private Gate D lifecycle into a safe DTO."""
+
+    from capability_host import (
+        CapabilityHostComposition,
+        GateDRunState,
+        GateDRunStatus,
+    )
+    from editor_contracts import (
+        FuzzyValidationDisplay,
+        FuzzyValidationState,
+    )
+
+    if type(composition) is not CapabilityHostComposition:
+        raise TypeError(
+            "fuzzy validation display requires one host composition"
+        )
+    owner = composition.retrieval_gate_d_owner
+    if owner is None:
+        return FuzzyValidationDisplay(
+            state=FuzzyValidationState.IDLE,
+            safe_code=None,
+        )
+    status = owner.status()
+    if type(status) is not GateDRunStatus:
+        raise TypeError("Gate D status contract is invalid")
+    status.__post_init__()
+    state = {
+        GateDRunState.IDLE: FuzzyValidationState.IDLE,
+        GateDRunState.RUNNING: FuzzyValidationState.RUNNING,
+        GateDRunState.SUCCEEDED: FuzzyValidationState.SUCCEEDED,
+        GateDRunState.FAILED: FuzzyValidationState.FAILED,
+    }[status.state]
+    return FuzzyValidationDisplay(
+        state=state,
+        safe_code=status.safe_code,
+    )
+
+
 def _start_capability_validation(
     composition: object,
     on_capability_changed: object | None = None,
@@ -243,17 +282,23 @@ def _start_capability_validation(
         current_generation = (
             composition.host.retrieval_operation_snapshot().generation
         )
-        if current_generation != gate_c_generation:
-            notify_capability_change()
+        gate_c_changed = current_generation != gate_c_generation
         gate_d = composition.retrieval_gate_d_owner
         if gate_d is None:
+            if gate_c_changed:
+                notify_capability_change()
             return
-        _ = gate_d.start_gate_d(evaluated_at_utc=generated_at_utc)
-        _ = gate_d.wait()
-        gate_d_generation = (
-            composition.host.retrieval_operation_snapshot().generation
-        )
-        if gate_d_generation != current_generation:
+        try:
+            started = gate_d.start_gate_d(
+                evaluated_at_utc=generated_at_utc
+            )
+        except BaseException:
+            if gate_c_changed:
+                notify_capability_change()
+            raise
+        notify_capability_change()
+        completed = gate_d.wait()
+        if completed != started:
             notify_capability_change()
 
     worker = Thread(
@@ -291,6 +336,9 @@ def _compose_editor_controller(repository: object):
         tm_adapter=EditorTMAdapter(
             runtime_host=runtime_host,
             capability_host=capability_composition.host,
+            fuzzy_validation_status=lambda: _fuzzy_validation_display(
+                capability_composition
+            ),
         ),
     )
     return controller, capability_composition
