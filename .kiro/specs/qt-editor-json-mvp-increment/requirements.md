@@ -131,7 +131,7 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 12. Where Whole Word 已启用且术语 source 为纯 CJK 文本, the LocalCAT Qt 编辑器 shall 使用连续文本匹配并返回与未启用 Whole Word 时相同的结果
 13. When 用户重新打开术语管理入口或重启编辑器, the LocalCAT Qt 编辑器 shall 恢复此前成功保存的术语变更和新记录匹配选项
 
-### Requirement 8：Silver logo 与紧凑更多操作
+### Requirement 8：Silver logo、紧凑资源操作与平台快捷键
 
 **目标：** 作为桌面用户，我希望应用图标与资源操作保持一致且紧凑，以便快速识别 LocalCAT 并清楚使用资源菜单。
 
@@ -142,6 +142,8 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 3. When 资源列表显示 ellipsis 更多按钮, the LocalCAT Qt 编辑器 shall 让按钮宽度与其内容和可操作范围相称且不占用多余列表空间
 4. When 用户使用指针或键盘访问 ellipsis 按钮, the LocalCAT Qt 编辑器 shall 提供可识别的更多操作说明并打开对应资源菜单
 5. When 资源设置窗口调整尺寸, the LocalCAT Qt 编辑器 shall 保持 ellipsis 可操作且不遮挡相邻关键信息
+6. When 用户在 macOS 使用实体 `Control+Tab` 或 `Control+Shift+Tab`, the LocalCAT Qt 编辑器 shall 切换 Translation Matches 与 Termbase，且不得注册会与系统应用切换冲突的 `Command+Tab`
+7. When 用户在 macOS 使用编辑/校对模式快捷键, the LocalCAT Qt 编辑器 shall 继续以 `Command+1` / `Command+2` 切换；其他平台继续使用其 Qt 原生主修饰键映射
 
 ### Requirement 9：单 JSON 边界、兼容性与本地性
 

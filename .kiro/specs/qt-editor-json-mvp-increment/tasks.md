@@ -286,6 +286,12 @@
   - 完成时，32–40 px、ResizeToContents/Fixed、resize、指针和键盘交互测试全部通过
   - _Requirements: 8.3, 8.4, 8.5_
 
+- [x] 4.9a 对齐 macOS 页签与工作区模式修饰键
+  - Translation Matches/Termbase 只注册实体 `Control+Tab` / `Control+Shift+Tab`，不得占用系统 `Command+Tab`
+  - 编辑/校对继续使用 macOS `Command+1` / `Command+2`，不随页签修复改成实体 Control
+  - tooltip、accessible name 与 QtTest 均按原生显示文本验证两组快捷键
+  - _Requirements: 8.6, 8.7_
+
 - [ ] 5. 完成集成验收与回归保护
 
 - [ ] 5.1 验证领域与 Controller 的失败原子性

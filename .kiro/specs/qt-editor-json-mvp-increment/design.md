@@ -569,6 +569,7 @@ class EditorController:
 - search bar 展示 query、source/target/speaker、全部/未填写/草稿/已翻译状态、结果计数与前后导航；advanced checkboxes 读取 capability 决定 enabled/reason。
 - 显式“清除”先调用 Controller clear，再清 query 与可见 report；保留字段、matcher options、状态筛选和面板展开状态。
 - Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。
+- Translation Matches/Termbase 页签使用实体 `Control+Tab` / `Control+Shift+Tab`。由于 Qt 在 macOS 将 portable `Ctrl` 映射为 Command，实现仅对这两个页签快捷键使用 portable `Meta` 以接收并显示 `⌃`；不得注册 `Command+Tab`。编辑/校对仍使用 portable `Ctrl+1/2`，在 macOS 原生显示为 `Command+1/2`。
 - inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。
 - `Ctrl+Z`、`Ctrl+Y`、`Ctrl+Shift+Z` 仅在 target editor 聚焦时调用 native undo/redo；`textChanged` 继续同步 Controller。
 - 同段 suggestion 插入使用 `QTextCursor.beginEditBlock()`；切段/换项目时 signal-blocked `setPlainText()` 并明确清空 editor undo。
@@ -640,7 +641,7 @@ mixed CSV 保持一个资源文件和一个提交边界。v1 id 只属于术语�
 - `卷一_引.json` inventory 显示稳定 speaker/计数，编辑与 browse speaker 一致。
 - 顶栏放大镜折叠/`Ctrl+F`、显式清除、status+keyword 筛选、speaker-only `littleoldme` 段 1 命中、search result 前后导航、disabled reason 与 Core capability enable journey。
 - 预览→取消、预览→apply、apply→undo，切项目后不可跨项目 undo。
-- target editor 三个标准快捷键；普通输入与 suggestion edit block 可撤销。
+- target editor 三个标准快捷键；普通输入与 suggestion edit block 可撤销；macOS 页签实体 Control 与编辑/校对 Command 快捷键分别可达且不冲突。
 - term create/edit/delete、重启恢复、legacy 行不显示虚假 flags。
 - desktop/window/dialog silver logo；ellipsis 验证 32–40 logical px、ResizeToContents、窄/宽窗口不遮挡、键盘和 tooltip。
 

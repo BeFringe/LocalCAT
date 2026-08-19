@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -241,9 +242,10 @@ class QtEditorWindowShellTest(unittest.TestCase):
             window.show()
             self._events()
 
+            physical_control = "Meta" if sys.platform == "darwin" else "Ctrl"
             expected = {
-                "suggestion_tab_next": "Ctrl+Tab",
-                "suggestion_tab_previous": "Ctrl+Shift+Tab",
+                "suggestion_tab_next": f"{physical_control}+Tab",
+                "suggestion_tab_previous": f"{physical_control}+Shift+Tab",
                 "workspace_edit": "Ctrl+1",
                 "workspace_browse": "Ctrl+2",
             }
@@ -269,17 +271,21 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self._events()
             window.target_editor.setFocus()
             self.assertEqual(window.suggestion_tabs.currentIndex(), 0)
+            tab_modifier = (
+                Qt.KeyboardModifier.MetaModifier
+                if sys.platform == "darwin"
+                else Qt.KeyboardModifier.ControlModifier
+            )
             QTest.keyClick(
                 window.target_editor,
                 Qt.Key.Key_Tab,
-                Qt.KeyboardModifier.ControlModifier,
+                tab_modifier,
             )
             self.assertEqual(window.suggestion_tabs.currentIndex(), 1)
             QTest.keyClick(
                 window.target_editor,
                 Qt.Key.Key_Tab,
-                Qt.KeyboardModifier.ControlModifier
-                | Qt.KeyboardModifier.ShiftModifier,
+                tab_modifier | Qt.KeyboardModifier.ShiftModifier,
             )
             self.assertEqual(window.suggestion_tabs.currentIndex(), 0)
 
@@ -320,6 +326,11 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 for shortcut in window.findChildren(QShortcut)
                 for key in shortcut.keys()
             }
+            if sys.platform == "darwin":
+                self.assertNotIn("Ctrl+Tab", registered)
+                self.assertNotIn("Ctrl+Shift+Tab", registered)
+                self.assertIn("⌃", native_tab)
+                self.assertIn("⌃", native_reverse_tab)
             for forbidden in (
                 "Ctrl+Left",
                 "Ctrl+Right",

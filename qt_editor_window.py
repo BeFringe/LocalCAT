@@ -1070,6 +1070,11 @@ class QtEditorWindow(QMainWindow):
         )
 
     def _install_shortcuts(self) -> None:
+        # On macOS Qt's portable ``Ctrl`` maps to the Command key.  The
+        # suggestion-tab contract deliberately uses the physical Control key,
+        # so spell that modifier as ``Meta`` there.  Workspace-mode shortcuts
+        # remain platform-primary Command+1/2 through portable ``Ctrl``.
+        physical_control = "Meta" if sys.platform == "darwin" else "Ctrl"
         bindings = (
             ("open", ("Ctrl+O",), self._choose_open),
             ("save", ("Ctrl+S",), self._choose_save),
@@ -1085,12 +1090,12 @@ class QtEditorWindow(QMainWindow):
             ("quit", ("Ctrl+Q",), self.close),
             (
                 "suggestion_tab_next",
-                ("Ctrl+Tab",),
+                (f"{physical_control}+Tab",),
                 lambda: self._cycle_suggestion_tab(1),
             ),
             (
                 "suggestion_tab_previous",
-                ("Ctrl+Shift+Tab",),
+                (f"{physical_control}+Shift+Tab",),
                 lambda: self._cycle_suggestion_tab(-1),
             ),
             (

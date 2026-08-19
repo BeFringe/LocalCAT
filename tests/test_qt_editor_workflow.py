@@ -241,8 +241,14 @@ class QtEditorWorkflowTest(unittest.TestCase):
                     "settings": "Ctrl+,",
                     "close_project": "Ctrl+Shift+W",
                     "quit": "Ctrl+Q",
-                    "suggestion_tab_next": "Ctrl+Tab",
-                    "suggestion_tab_previous": "Ctrl+Shift+Tab",
+                    "suggestion_tab_next": (
+                        "Meta+Tab" if sys.platform == "darwin" else "Ctrl+Tab"
+                    ),
+                    "suggestion_tab_previous": (
+                        "Meta+Shift+Tab"
+                        if sys.platform == "darwin"
+                        else "Ctrl+Shift+Tab"
+                    ),
                     "workspace_edit": "Ctrl+1",
                     "workspace_browse": "Ctrl+2",
                 },
