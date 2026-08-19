@@ -64,6 +64,14 @@ class SearchField(str, Enum):
     SPEAKER = "speaker"
 
 
+class SegmentTranslationStatus(str, Enum):
+    """Translation state derived from one JSON project segment."""
+
+    UNFILLED = "unfilled"
+    DRAFT = "draft"
+    TRANSLATED = "translated"
+
+
 class TermMatchPolicy(str, Enum):
     """Matching semantics attached to one persisted term row."""
 
@@ -1339,6 +1347,7 @@ class ProjectSearchRequest:
     query: str
     fields: tuple[SearchField, ...]
     options: SearchOptions
+    status: SegmentTranslationStatus | None = None
 
     def __post_init__(self) -> None:
         _validate_exact_non_empty_string(self.query, "project search query")
@@ -1362,6 +1371,13 @@ class ProjectSearchRequest:
                 "project search options must be exact Core SearchOptions"
             )
         self.options.__post_init__()
+        if (
+            self.status is not None
+            and type(self.status) is not SegmentTranslationStatus
+        ):
+            raise TypeError(
+                "project search status must be SegmentTranslationStatus or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)

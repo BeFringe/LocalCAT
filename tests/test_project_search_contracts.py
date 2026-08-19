@@ -9,6 +9,7 @@ from editor_contracts import (
     ProjectSearchRequest,
     ProjectToolCapability,
     SearchField,
+    SegmentTranslationStatus,
     TextMatcherDisplayState,
 )
 from tm_contracts import (
@@ -153,6 +154,7 @@ class ProjectSearchContractTests(unittest.TestCase):
                 SearchField.SPEAKER,
             ),
             options=SearchOptions(match_case=False, whole_word=False),
+            status=SegmentTranslationStatus.DRAFT,
         )
         hits = (
             _hit(),
@@ -178,6 +180,7 @@ class ProjectSearchContractTests(unittest.TestCase):
 
         self.assertEqual(request.query, "cat")
         self.assertEqual(request.fields[2], SearchField.SPEAKER)
+        self.assertIs(request.status, SegmentTranslationStatus.DRAFT)
         self.assertIs(type(request.options), SearchOptions)
         self.assertEqual(report.hits, hits)
         self.assertEqual(report.total, 3)
@@ -231,6 +234,18 @@ class ProjectSearchContractTests(unittest.TestCase):
                 fields=(SearchField.SOURCE,),
                 options=object(),  # pyright: ignore[reportArgumentType]
             ),
+            lambda: ProjectSearchRequest(
+                query="cat",
+                fields=(SearchField.SOURCE,),
+                options=valid_options,
+                status="draft",  # pyright: ignore[reportArgumentType]
+            ),
+            lambda: ProjectSearchRequest(
+                query="cat",
+                fields=(SearchField.SOURCE,),
+                options=valid_options,
+                status=SearchField.TARGET,  # pyright: ignore[reportArgumentType]
+            ),
         )
 
         for invalid_call in invalid_calls:
@@ -238,6 +253,43 @@ class ProjectSearchContractTests(unittest.TestCase):
                 (TypeError, ValueError)
             ):
                 _ = invalid_call()
+
+    def test_status_filter_is_optional_and_cannot_replace_a_text_hit(self) -> None:
+        valid_options = SearchOptions(match_case=False, whole_word=False)
+
+        unfiltered = ProjectSearchRequest(
+            query="cat",
+            fields=(SearchField.SOURCE,),
+            options=valid_options,
+        )
+        filtered = tuple(
+            ProjectSearchRequest(
+                query="cat",
+                fields=(SearchField.SOURCE,),
+                options=valid_options,
+                status=status,
+            )
+            for status in SegmentTranslationStatus
+        )
+
+        self.assertIsNone(unfiltered.status)
+        self.assertEqual(
+            tuple(request.status for request in filtered),
+            (
+                SegmentTranslationStatus.UNFILLED,
+                SegmentTranslationStatus.DRAFT,
+                SegmentTranslationStatus.TRANSLATED,
+            ),
+        )
+        with self.assertRaises(TypeError):
+            _ = ProjectSearchHit(
+                segment_id="seg-1",
+                segment_index=0,
+                field=None,  # pyright: ignore[reportArgumentType]
+                start_index=0,
+                end_index=1,
+                preview="",
+            )
 
     def test_hit_rejects_invalid_exact_types_offsets_fields_or_preview(self) -> None:
         invalid_calls = (

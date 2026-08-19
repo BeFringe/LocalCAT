@@ -16,7 +16,7 @@
   - 完成时，合法契约可稳定构造，非法 capability、tuple 或 offset 组合会在边界测试中失败
   - _Requirements: 3.1, 3.3, 3.7, 3.9, 9.1, 9.7_
 
-- [ ] 1.1c 扩展项目搜索状态契约
+- [x] 1.1c 扩展项目搜索状态契约
   - 新增 exact `SegmentTranslationStatus`，并在 `ProjectSearchRequest` 中以 `None | UNFILLED | DRAFT | TRANSLATED` 表达一个可选筛选
   - 继续要求非空 query、非空字段与唯一 Core `SearchOptions`；不改 hit 的 text field/half-open offset 契约
   - 完成时，合法状态可稳定往返，foreign enum、错型和 status-only 伪命中在契约边界失败
