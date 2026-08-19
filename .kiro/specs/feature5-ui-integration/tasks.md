@@ -223,7 +223,7 @@
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 7.7_
   - _Boundary: EditorController TM Threshold_
 
-- [x] 6. 构建本 Integration 拥有的 Qt TM surfaces
+- [ ] 6. 构建本 Integration 拥有的 Qt TM surfaces
 
 - [x] 6.1 (P) 升级当前段 TM suggestion cards
   - 显示 EXACT/CONTEXT/FUZZY、百分比、matched source、target 与 resource；query source 相同时避免无意义重复，fuzzy 时明确实际命中原文
@@ -259,6 +259,15 @@
   - 完成时，AST、accessibility、keyboard 与 offscreen boundary tests 全部通过
   - _Requirements: 1.7, 6.4, 7.5, 7.6, 7.7, 9.4, 9.5_
   - _Boundary: Qt Layer 4 Boundary and Accessibility_
+
+- [ ] 6.5 如实呈现 Gate D 性能验证运行态
+  - 通过 Controller-only、process-local 的冻结安全投影显示 `Fuzzy 性能验证中`；Qt 不导入 Gate D owner、evidence、receipt 或 benchmark implementation
+  - RUNNING/FAILED/SUCCEEDED 只说明验证 lifecycle，不授权任何 match type；Exact/Context/Fuzzy 与阈值 enabled 仍只由同代 retrieval display 决定
+  - 当前进程 Gate D 开始、Gate C 后运行、Gate D 正式发布/失败与 window destroyed late event 均通过既有 queued bridge刷新，不阻塞 Qt 主线程
+  - 完成时，真实 bootstrap journey 验证运行中文案、较低能力保留、阈值关闭、正式发布后开启及安全失败原因，Layer 4 AST 保持无越层
+  - _Requirements: 6.1, 6.2, 6.4, 6.7, 6.8, 6.9, 7.5, 7.6_
+  - _Boundary: Qt Gate D Lifecycle Projection_
+  - _Depends: 3.6, 5.1, 6.1, 6.3, 6.4_
 
 - [x] 7. 完成 TextMatcher handoff 与 canonical integration 验收
 
@@ -352,6 +361,7 @@
 - Task 2.3：仅在 Core 证明从未发布或 PREPARED/DB_REPLACED/MANIFEST_PUBLISHED 已完整回滚、fresh coordinator 冷复证 legacy authority 后返回 preservation-backed `MigrationFailure`；普通 I/O 完整回滚稳定为 `MIGRATION.INITIAL_IO_FAILED` 且可重试。独立评审三轮拒绝并闭合 source/target basename 置换、builder residue、terminal/quarantine 篡改、primary-error masking；unpublished pair 采用 Darwin `renameatx_np(RENAME_EXCL)` / Linux `renameat2(RENAME_NOREPLACE)` 的 dirfd-relative exclusive quarantine，无普通 rename 回退。最终评审 APPROVED；parent fresh completion mutation-negative 19/19、相关 336/336（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变；ambiguous 与 GENERATION_PUBLISHED 仍归 2.4。
 - Task 2.4：`GENERATION_PUBLISHED` 返回尾部异常经 fresh coordinator 恢复并复证同一 generation，不重建或生成第二权威；pending/corrupt/无法证明的 durable facts 以封闭互斥的 published-unavailable / ambiguous-unavailable `MigrationFailure` fail-stop，绝不回落 legacy。严格 codec 拒绝 authority 字段剥离、矛盾组合与任意深度 duplicate JSON key；首次激活调用图只归一明确 operational errors，`TypeError`、`AttributeError` 与 `AssertionError` 原样穿透。独立评审两轮拒绝并闭合 authority union 与嵌套 helper 的 programmer-error laundering 后 APPROVED；parent fresh completion 聚焦 81/81、相关 activation/migration/contracts 182/182（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变。Gate C/D approved-roots evidence 因本簇源码变化按设计 stale，留待 Task 2.5 后 Cluster A 以累计 reviewed tip 一次刷新，不作为 legacy/canonical authority 结论。
 - Task 2.5：首次激活以 Core-private、resource-bound 的持久 reservation 将跨 coordinator/process 的恢复、residue proof、build、seal、publish 与 reconcile 线性化；macOS/Linux 使用 retained no-follow dirfd、短期 parent bootstrap 与长期 `flock`，锁文件只创建一次且不 unlink，进程退出后由 kernel 释放，残留 stage 继续可发现并 fail-stop。锁不可取得时只允许 disposable immutable gen0 证明：不推进/取消 pending journal、不恢复 SQLite sidecar、不注入 live view；已发布权威返回 published-unavailable，未证明事实返回 ambiguous-unavailable。same-inode 内容篡改、foreign inode/symlink/hardlink、并发初始化/进程退出、PREPARED owner、hot journal 与 post-proof drift 均 mutation-negative；既有 explicit import/rebuild 失败仍保留可重开 LKG、SOURCE_DIVERGED 与原 JSONL。七轮对抗性 finding 依次闭合 process latch、restart residue、跨 coordinator TOCTOU、lock bootstrap、pre-lock recovery、completion-only 原子/只读与下游 runtime projection 后，fresh reviewer APPROVED；parent fresh completion 首次激活 72/72、相关 activation/migration/store/LKG 554/554（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变。Gate/acceptance/release evidence 继续留给紧随其后的 Cluster A 在累计 reviewed tip 统一刷新。
+- 2026-08-19 / Task 2.5 ADR-012 amendment：实机中断 mutable build 只留 `.stage + stage-journal`、无任何 durable publication fact 的反例，证明旧记录把 cleanup ownership 不可证明误当作 canonical authority 不可证明，并会误触发整个 TM cohort 关闭。ADR-012 已采纳：无 live reservation 且无 sidecar/manifest/durable journal/terminal/lineage 时，orphan stage 不影响 never-activated JSONL authority；旧 regular/symlink/hardlink/journal 不读不改不删，新激活使用 fresh nonce。真正 pending/corrupt durable facts、PREPARED owner、same-inode 篡改、lock 不可取得与 post-proof drift 继续 fail-stop，Controller 全局 ambiguity latch 不削弱。
 - 2026-08-18 / Cluster A：native fresh reviewer 对 `8f570250e66687eea0c2a8dac1dcdc6aeb23853e..508aac96b7e81dda0d234d0a64b79d77fac76a76` 累计补丁复审 APPROVED；在 reviewed tip 按 current tracked source 机械重签 Gate A CONTRACTS/matcher build 与 Gate C artifact/build roots，Gate A/C focused 66/66。真实 100k Gate D 以 current-source fingerprint `f463630188cf3a9fb80f670a300863ea1a43829b5b7fc7934058680fefcde96f` 产生 bundle `6d64b45d4833f1eb0bc556b8c452f23579257f02de00d9e2afb308200ca925bf`：FTS5/fallback recall 均为 1.0，migration `66.148/100.876 s`、fuzzy p95 `278.995/285.890 ms`，双路 PASS；fault `61/61`、acceptance `33/33`、release `86/86 GO`，证据/benchmark focused `273/273`。fresh offscreen full suite `1709/1709` / `408.529 s`（1 个明确 opt-in skip），Qt smoke 与字面 5000/200 双路 oracle 的 threshold/top-10 零遗漏；本轮只改 JSON/Markdown evidence，basedpyright 不适用，授权路径 `git diff --check` 通过，四个用户 WIP SHA-256 不变。
 - Task 3.1：以 Design 精确四字段 `SuggestionQueryIdentity` 冻结 session/segment/source digest 与聚合 `query_epoch`，后续 resource/capability/threshold 任一变化只递增该总 epoch，不暴露第二份 generation；新增双 source `TMSuggestion`、安全 provenance/resource/retrieval/matcher display projection，并直接复用 Core `TMMatchType`、`TextMatcherState` 与 `TextMatchProfile`。版本化 strict UI codec 拒绝 unknown/missing/duplicate key、bool-as-int、非有限数值、伪造 enum、mutable collection 与 legacy bridge；旧单 source DTO 明确更名为 `LegacyExactTMSuggestion`，只机械维持当前 exact-only Controller/Qt 行为，不进入新 codec 或冒充 issued suggestion。fresh task reviewer APPROVED；parent completion 相关 editor/controller/Qt journeys 70/70、changed-file basedpyright 0、py_compile 与授权路径 diff-check 通过，四个 WIP hash 不变。current-source acceptance/release evidence 随 consumer 身份变化按 B1 cluster 退出点统一刷新。
 - Task 3.2：新增冻结 `TMPreferences`，`minimum_similarity` 只接受 exact finite float 的 `0.60～1.00` 闭区间，`result_limit` 只接受 exact int `10`；device-local `workspace.json` 仅持久化阈值，跨项目与重启共享，不写入项目、TM、术语表或网络位置。缺失、损坏或旧 schema 状态只在内存回退 0.60 且不改原字节；非法更新与原子写失败保留旧合同/旧文件并清理 temporary。fresh task reviewer APPROVED；parent completion preference/workspace/editor/Qt 34/34、changed-file basedpyright 0、py_compile 与授权路径 diff-check 通过，四个 WIP hash 不变。Controller epoch、刷新与非阻塞反馈仍归 5.6/6.3。

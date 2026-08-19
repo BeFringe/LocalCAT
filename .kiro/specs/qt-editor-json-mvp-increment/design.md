@@ -57,6 +57,15 @@
 - Controller revision/dirty/confirmed 语义或 `QTextEdit` 刷新路径改变。
 - Parser 接管 JSON codec、多文档 workspace 或 speaker profile 落地。
 
+## Governance Impact
+
+- **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`spec-ownership.md`。
+- **Applicable ADRs**：ADR-009、ADR-011；项目搜索继续只消费 Feature 5 的中立 matcher handoff。
+- **ADR disposition**：None。可折叠表面、清除已签发结果与由现有 `target/confirmed` 派生的状态筛选不改变 authority、持久格式、发布协议、依赖方向或跨 Spec matcher contract。
+- **Scope amendment**：Approved，对应 Requirements Scope Lineage 中 2026-08-19 Requirement 3 表面 amendment。
+- **Steering sync**：Not required。产品定位、架构层级与技术栈不变；Feature GO 只核对最终实际 delta。
+- **Downstream revalidation**：Feature 5 Matcher Gate generation invalidation、JSON/TXT/sample capability、Qt search keyboard/accessibility 及 current-source Requirement 3 acceptance。
+
 ## 架构
 
 ### 现有架构分析
@@ -276,11 +285,17 @@ class SearchField(str, Enum):
     TARGET = "target"
     SPEAKER = "speaker"
 
+class SegmentTranslationStatus(str, Enum):
+    UNFILLED = "unfilled"
+    DRAFT = "draft"
+    TRANSLATED = "translated"
+
 @dataclass(frozen=True)
 class ProjectSearchRequest:
     query: str
     fields: tuple[SearchField, ...]
     options: SearchOptions
+    status: SegmentTranslationStatus | None = None
 
 @dataclass(frozen=True)
 class ProjectSearchHit:
@@ -442,6 +457,8 @@ class ProjectSearchService:
 ```
 
 - 空 query 在边界拒绝；字段按 segment order 与固定 SOURCE/TARGET/SPEAKER 顺序扫描。
+- 段状态是非空 query 的可选前置筛选：`confirmed=true` 为 TRANSLATED；否则 `target.strip()==""` 为 UNFILLED，其余为 DRAFT。未选状态时遍历全部段落。
+- service 只对通过状态筛选的段落调用唯一 Core matcher；Qt 不得对返回 hits 事后过滤。
 - 每个字段调用唯一 Core matcher，hit offsets 原样传递。
 - basic request 固定使用 `false/false`，要求 handoff state 至少为 `BASIC_VALIDATED`；只有 `TEXT_V1_VALIDATED` 才允许 Controller 接受其他 options。
 - service 不导航，Controller 用 hit 的 stable segment id/index 调用 `go_to()`。
@@ -515,6 +532,7 @@ class EditorController:
     def project_tool_capability(self) -> ProjectToolCapability: ...
     def speaker_inventory(self) -> SpeakerInventory: ...
     def search_project(self, request: ProjectSearchRequest) -> ProjectSearchReport: ...
+    def clear_project_search(self) -> None: ...
     def go_to_search_hit(self, hit: ProjectSearchHit) -> EditorProject: ...
     def preview_preprocessing(
         self, rules: tuple[LiteralReplaceRule, ...]
@@ -532,6 +550,8 @@ class EditorController:
 ```
 
 - `project_revision` 在 target/confirmed/project 内容变化时增加；仅导航不增加。
+- project-search issued context 绑定 session、matcher generation、request fields/status 与全项目 `id/source/target/speaker/confirmed` digest；任一依赖改变后旧 hit 不得导航。
+- `clear_project_search()` 只清空 Controller 当前 report、issued hits 和 issued context，不导航、不修改 project/revision/dirty。
 - 每次成功 open/set/close 生成新的 `project_session_id`；preview 与 batch snapshot 同时携带该 identity 和 revision。
 - `_require_json_project()` 精确检查 `project.path is not None and project.path.suffix.lower() == ".json"`；`.txt` 与无路径 sample 继续可打开，但这些入口明确 disabled/rejected。
 - apply 是单次 immutable project replacement；undo snapshot 包含 project identity、changed segment 的 before/after target、confirmed 和应用后 revision。
@@ -545,7 +565,10 @@ class EditorController:
 
 - 主编辑区在 source/target 对齐位置显示 raw speaker；空值保留布局并显示“无 speaker”可访问文本。
 - browse table 增加 speaker 列，双击仍按 stable index 返回编辑。
-- search bar 展示 query、字段、结果计数、前后导航；advanced checkboxes 读取 capability 决定 enabled/reason。
+- 顶栏提供 checkable 放大镜入口；项目搜索面板初始折叠，点击入口或 `Ctrl+F` 展开并聚焦，编辑/浏览切换保留当前展开状态，该状态不持久化。
+- search bar 展示 query、source/target/speaker、全部/未填写/草稿/已翻译状态、结果计数与前后导航；advanced checkboxes 读取 capability 决定 enabled/reason。
+- 显式“清除”先调用 Controller clear，再清 query 与可见 report；保留字段、matcher options、状态筛选和面板展开状态。
+- Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。
 - inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。
 - `Ctrl+Z`、`Ctrl+Y`、`Ctrl+Shift+Z` 仅在 target editor 聚焦时调用 native undo/redo；`textChanged` 继续同步 Controller。
 - 同段 suggestion 插入使用 `QTextCursor.beginEditBlock()`；切段/换项目时 signal-blocked `setPlainText()` 并明确清空 editor undo。
@@ -598,7 +621,7 @@ mixed CSV 保持一个资源文件和一个提交边界。v1 id 只属于术语�
 ### 单元测试
 
 - Inventory：首次顺序、计数、空 speaker、重复确定性、项目完全不变（1.1–1.7）。
-- Search orchestration：字段顺序、offset 透传、空 query、basic/advanced capability gate、无结果（3.1–3.10）。
+- Search orchestration：字段顺序、offset 透传、空 query、basic/advanced capability gate、无结果，以及未填写/草稿/已翻译派生与 matcher 前置筛选（3.1–3.16）。
 - Preprocessor：规则顺序、no-op、confirmed、stale/cross-project preview、编辑后 stale batch undo、clean/dirty/save-after-apply baseline（4.1–5.6）。
 - TermbaseStore：legacy/v1 mixed round-trip、legacy locator、默认 flags、merge overwrite、冲突、未知 marker、prepare/commit failure（7.1–7.13）。
 
@@ -615,7 +638,7 @@ mixed CSV 保持一个资源文件和一个提交边界。v1 id 只属于术语�
 ### E2E / QtTest
 
 - `卷一_引.json` inventory 显示稳定 speaker/计数，编辑与 browse speaker 一致。
-- search result 前后导航、disabled reason 与 Core capability enable journey。
+- 顶栏放大镜折叠/`Ctrl+F`、显式清除、status+keyword 筛选、speaker-only `littleoldme` 段 1 命中、search result 前后导航、disabled reason 与 Core capability enable journey。
 - 预览→取消、预览→apply、apply→undo，切项目后不可跨项目 undo。
 - target editor 三个标准快捷键；普通输入与 suggestion edit block 可撤销。
 - term create/edit/delete、重启恢复、legacy 行不显示虚假 flags。

@@ -12,6 +12,10 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 - **范围外**：新增项目格式、多项目或目录搜索、source 预处理、speaker 推断或拆分、别名与头像、正则或脚本、搜索驱动的 Replace All、模糊翻译记忆、云端和多人协作。
 - **相邻期望**：Match Case / Whole Word 的统一语义由 Feature 5 提供；能力合并并验收前，相关控件保持禁用。speaker alias、显式留空和头像属于后续阶段。既有 JSON/TXT、精确翻译记忆、术语建议和 Excel 工作流不得回归。
 
+### Scope Lineage
+
+2026-08-19 已批准的项目搜索表面 amendment 仅扩展现有 Requirement 3：将常驻搜索条收纳为顶栏可折叠入口，增加同时清除 query 与已签发结果的明确操作，并在非空关键词搜索中增加由 `target + confirmed` 派生的“未填写 / 草稿 / 已翻译”段状态筛选。它不改项目格式，不新增 approved/revise 层，不重新纳入本 Spec 已排除的 search-driven Replace/Replace All。
+
 ## 需求
 
 ### Requirement 1：Raw speaker 批量盘点
@@ -56,6 +60,12 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 8. While Match Case 和 Whole Word 控件处于禁用状态, the LocalCAT Qt 编辑器 shall 不让控件的视觉状态改变基础搜索结果
 9. Where 统一兼容匹配能力已经合并并通过验收, the LocalCAT Qt 编辑器 shall 启用 Match Case 和 Whole Word 控件并让结果遵循已验收的统一语义
 10. Where Whole Word 已启用且查询词为纯 CJK 文本, the LocalCAT Qt 编辑器 shall 使用连续文本匹配并返回与未启用 Whole Word 时相同的结果
+11. When 项目搜索未被用户召出, the LocalCAT Qt 编辑器 shall 保持搜索面板折叠，并在顶栏提供可发现、可键盘操作的搜索入口
+12. When 用户点击搜索入口或使用 `Ctrl+F`, the LocalCAT Qt 编辑器 shall 展开项目搜索并将焦点置于关键词；编辑/校对视图切换不得自行改变展开状态
+13. When 用户执行“清除”, the LocalCAT Qt 编辑器 shall 同时清空关键词、可见结果与 Controller 已签发搜索成员，且不改变当前段、项目内容、dirty 或已选字段/选项
+14. When 用户对非空关键词选择段状态, the LocalCAT Qt 编辑器 shall 在调用统一 matcher 前按下列唯一规则筛选段落：未确认且 `target.strip()` 为空是“未填写”，未确认且 target 非空是“草稿”，`confirmed=true` 是“已翻译”
+15. The LocalCAT Qt 编辑器 shall 将段状态筛选作为非空关键词搜索的附加条件；只选状态而未输入关键词时仍提示有效输入，不伪造文本字段或命中 offset
+16. If 已签发状态搜索所依赖的 target、confirmed、字段选择或状态筛选后来改变, the LocalCAT Qt 编辑器 shall 使旧搜索结果失效并拒绝使用其导航
 
 ### Requirement 4：Target-only 简易文字预处理
 

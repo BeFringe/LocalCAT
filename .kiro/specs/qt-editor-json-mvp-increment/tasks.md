@@ -6,6 +6,8 @@
 
 > **Q2 tasks-only amendment（2026-08-19）**：按同一 Checkpoint Q，将原 4.7 中混合的 term mutation 与 preprocessing 四视图刷新拆为 4.7a/4.7b，并新增 4.5a fresh acceptance 子任务。Q2 只可勾选 2.7、3.4、3.5、4.5、4.5a、4.7a；不得借术语实施完成 preprocessing 或其他 Requirement。
 
+> **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
+
 - [ ] 1. 建立冻结契约与能力边界
 
 - [x] 1.1a 建立单 JSON 搜索与 matcher 能力契约
@@ -13,6 +15,12 @@
   - 约束基础能力、高级选项与 Integration `TextMatcherDisplayState` 的合法组合，不定义第二份 readiness/digest authority
   - 完成时，合法契约可稳定构造，非法 capability、tuple 或 offset 组合会在边界测试中失败
   - _Requirements: 3.1, 3.3, 3.7, 3.9, 9.1, 9.7_
+
+- [ ] 1.1c 扩展项目搜索状态契约
+  - 新增 exact `SegmentTranslationStatus`，并在 `ProjectSearchRequest` 中以 `None | UNFILLED | DRAFT | TRANSLATED` 表达一个可选筛选
+  - 继续要求非空 query、非空字段与唯一 Core `SearchOptions`；不改 hit 的 text field/half-open offset 契约
+  - 完成时，合法状态可稳定往返，foreign enum、错型和 status-only 伪命中在契约边界失败
+  - _Requirements: 3.1, 3.5, 3.14, 3.15, 3.16, 9.1, 9.7_
 
 - [ ] 1.1b 建立 speaker inventory 能力契约
   - 覆盖项目工具可用性、speaker inventory item、空 speaker 计数和稳定顺序
@@ -85,6 +93,14 @@
   - _Boundary: ProjectSearchService_
   - _Depends: 1.1a_
 
+- [ ] 2.6a 在 matcher 前闭合段状态筛选
+  - 只由 Qt-free `ProjectSearchService` 从 `target + confirmed` 派生 UNFILLED/DRAFT/TRANSLATED，Qt 不得事后筛选 hits
+  - 状态匹配的段落继续按 segment 与 SOURCE/TARGET/SPEAKER 固定顺序交给同一 matcher，offset 与 preview 原样保留
+  - 完成时，未填写、草稿、已翻译与全部四组在 source/target/raw-speaker 上均稳定，空 query 仍拒绝
+  - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.14, 3.15_
+  - _Boundary: ProjectSearchService Status Filter_
+  - _Depends: 1.1c, 2.6_
+
 - [x] 2.7 (P) 集成 legacy Trie 与 configured term matcher
   - legacy 行始终保持区分大小写、连续子串和既有长词优先语义
   - capability 未验收时，v1 行以 legacy preset 参与建议，保存的 flags 不改变匹配结果
@@ -116,6 +132,14 @@
   - 使用稳定 segment identity 导航命中，保留当前未保存 target；空 query、无结果和 stale hit 不改变当前段
   - 完成时，Controller 测试可从搜索结果前后导航，同时搜索失败保持原项目和当前位置
   - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 9.1, 9.4_
+
+- [ ] 3.2c 绑定搜索状态与显式清除
+  - Controller issued context 增加 request status，project digest 纳入 confirmed，target/confirmed/filter 任一变化都拒绝旧 hit
+  - 公开 `clear_project_search()` 同时清 report、issued hits 与 context，不导航、不修改 project/revision/dirty
+  - 完成时，clear、status stale、confirmed-only stale、foreign/tampered request 都在项目状态变化前闭合
+  - _Requirements: 3.4, 3.13, 3.14, 3.16, 9.1, 9.4_
+  - _Boundary: EditorController Project Search Issuance_
+  - _Depends: 2.6a, 3.1a, 3.2a_
 
 - [ ] 3.2b 接入 speaker inventory
   - 入口先通过单 JSON gate，再调用纯 inventory 能力
@@ -176,6 +200,24 @@
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 9.1, 9.2, 9.4, 9.5_
   - _Boundary: Requirement 3 Acceptance_
   - _Depends: 1.1a, 2.6, 3.1a, 3.2a, 4.3_
+
+- [ ] 4.3b 收纳项目搜索表面并增加清除与状态入口
+  - 在顶栏增加 checkable 放大镜，搜索面板默认折叠；点击或 `Ctrl+F` 展开并聚焦，工作区模式切换保留展开状态
+  - 增加显式“清除”和全部/未填写/草稿/已翻译筛选；clear 保留字段、options、status 与面板展开状态
+  - 只有项目和 matcher capability 可用时才启用执行；无项目/TXT/sample/foreign handoff 继续 fail closed，Qt 不保存第二份 project/report authority
+  - 完成时，mouse/Tab/Enter/Space/`Ctrl+F`、折叠、clear、状态筛选和无副作用由 QtTest 证明
+  - _Requirements: 3.11, 3.12, 3.13, 3.14, 3.15, 3.16, 9.1, 9.4_
+  - _Boundary: Qt Project Search Surface Remediation_
+  - _Depends: 3.2c, 4.3_
+
+- [ ] 4.3c 完成 Requirement 3 search-surface amendment fresh acceptance
+  - 使用真实 `卷二_引.json`、production composition 与 Qt 验证 speaker-only `littleoldme` 从段 1 起返回稳定命中
+  - 验证非常驻顶栏入口、显式 clear、三状态与 BASIC/TEXT_V1 组合，以及 target/confirmed/matcher generation 改变后旧结果拒绝
+  - 验证未引入 Approved/Revise、status-only 伪命中、Replace/Replace All 或 Qt 本地 matcher fallback
+  - 完成时，Q1 current-source acceptance 对 Requirement 3.1–3.16 给出 fresh PASS，再恢复 Q2 累计评审
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14, 3.15, 3.16, 9.1, 9.2, 9.4, 9.5_
+  - _Boundary: Requirement 3 Search Surface Amendment Acceptance_
+  - _Depends: 1.1c, 2.6a, 3.2c, 4.3b_
 
 - [ ] 4.4 增加预处理规则、preview、apply 与 batch undo 对话框
   - 支持规则增删、启停和可见顺序；只呈现普通 literal 能力

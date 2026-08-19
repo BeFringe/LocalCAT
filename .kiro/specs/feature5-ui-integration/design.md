@@ -63,9 +63,9 @@
 ## Governance Impact
 
 - **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`roadmap.md`、`spec-ownership.md` 与 repository safety rules。
-- **Applicable ADRs**：ADR-007～011；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。
-- **ADR disposition**：Follow existing。当前设计不新增或取代 ADR。
-- **Scope amendment**：Not required。首次迁移、完整激活、失败可重试、无 prior canonical 时保留 JSONL 兼容能力，已由 `tm-storage-retrieval-index` Requirement 2 批准。本轮只在精确 dd7 merge 后补齐该既有要求缺失的 Core application-facing public contract，并在 Integration Design/Tasks 记账；不新增 Feature 5 产品需求，也不修订原 Qt Spec。
+- **Applicable ADRs**：ADR-007～012；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。ADR-013 仍为 Gate D 跨进程重授权草案，不授权 cache/re-mint 实现。
+- **ADR disposition**：Follow ADR-012 处理 unpublished orphan residue；Gate D 继续 follow ADR-009/011 与现有 per-process 协议，直至 ADR-013 另行采纳。
+- **Scope amendment**：Approved for ADR-012 orphan-residue remediation。首次迁移、完整激活、失败可重试、无 prior canonical 时保留 JSONL 兼容能力，已由 `tm-storage-retrieval-index` Requirement 2 批准；ADR-012 明确了 unpublished residue 不得被提升为 canonical authority fact。
 - **Steering sync**：Required。实现闭合时同步 `product.md`、`structure.md`、`tech.md` 的 exact-only/JSONL 当前态与新增文件边界；已同步的 integration boundary、roadmap 和 ownership 不重复改写。
 - **Downstream revalidation**：`qt-editor-json-mvp-increment` Requirement 3/7 matcher handoff、既有 Qt/Excel/legacy tests、macOS bootstrap；Parser/multi-document 仅登记未来触发器。
 
@@ -186,6 +186,7 @@ sequenceDiagram
 - 初始 exact-only service 可使用 Core default closed publisher，但该 sentinel publisher **不得**接收批准 Gate C roots。`recompute_retrieval_validation()` 成功后，host 必须用同一 `release.expectation` 新建 Core evaluator/publisher，先以 `initial_manifest=None` 保持关闭，再只刷新 `release.manifest`，并原子替换整套 retrieval service。
 - Gate D 只能消费上述新 publisher 和同一 base manifest。`contract_path` 固定为合并后已跟踪的 `benchmark_tm_contract.json`；每次进程/代码 epoch 创建新的 `0700` private temporary `work_root`，`evidence_path = work_root / "benchmark_tm_evidence.json"` 且调用前必须不存在。runner 私有子树由 Core 清理；成功 evidence 可保留到进程结束作审计，旧 evidence 不能重铸 run receipt。`GATE_D.CLEANUP_PENDING` 或 identity 漂移时保留现场并保持 closed，application 不递归清理。
 - Gate D 运行不阻塞 Qt 主线程。首版不从普通应用缓存反向铸造 capability；每个进程重新取得当前代码/fixture/环境证据。Gate C 或 D 失败时保留当时已经正式开放的较低能力，绝不从失败事实提升能力。
+- Qt 可经 Controller-only、process-local 的安全 lifecycle 投影区分 Gate D `IDLE/RUNNING/SUCCEEDED/FAILED`。该投影只驱动“Fuzzy 性能验证中”或有限失败原因，不参与 query、threshold 或 capability 判定；Exact/Context/Fuzzy 可用性仍只来自同代 `RetrievalDisplayState`。RUNNING 时阈值入口持续可发现但不可提交，正式 Gate D publication 后沿既有 queued generation bridge 刷新当前建议与入口。
 
 ### 当前段 mixed query
 
@@ -540,7 +541,7 @@ class TMMigrationService:
 - `source` 必须精确等于 service identity 的 configured JSONL，resource id 必须一致，coordinator 必须存在且没有 active generation；正式调用后不接受 UI cancellation token。
 - 成功发布首 generation；失败返回原 JSONL preservation 且不产生可见 canonical。若尾部异常但 `GENERATION_PUBLISHED` 已闭合，恢复后返回同一 generation 成功，不重复迁移。
 - 已 active 时稳定返回 `MIGRATION.ALREADY_ACTIVE` 且零 mutation；更新只走既有 `import_snapshot()` / `rebuild_from_snapshot()`，失败保留 last-known-good。
-- application 可按现有 public constructor 注入与 resource/store identity 精确绑定的 `ResourceStoreCoordinator`；`activate_initial()` 内部独占其 `_seal_stage`/publish/recovery 调用。private registry、StageSealer、sealed/prepared value 和 token 不得由外部注入或取得。并发、foreign identity、ambiguous durable facts、rollback/cleanup 不能证明时均 fail-closed 为稳定 code，不允许 legacy fallback。
+- application 可按现有 public constructor 注入与 resource/store identity 精确绑定的 `ResourceStoreCoordinator`；`activate_initial()` 内部独占其 `_seal_stage`/publish/recovery 调用。private registry、StageSealer、sealed/prepared value 和 token 不得由外部注入或取得。并发、foreign identity、ambiguous durable facts 或 rollback 不能证明时均 fail-closed 为稳定 code，不允许 legacy fallback。但按 ADR-012，无 live reservation 且无 durable publication/recovery fact 的 salted mutable stage orphan 不是 authority ambiguity；Core 必须保留其 inode/bytes、继续 legacy exact 并使用 fresh nonce 重试，不自动 cleanup。
 - 用户取消边界位于调用前；Core stage 建议固定为 `PREFLIGHT/BUILD/SEAL/PREPARE/JOURNAL/PUBLISH/VERIFY/RECOVERY`，UI 只接收安全映射。
 - 该 seam 完成 Feature 5 已批准 Requirement 2 的 application-facing 公开合同，同时是本 Spec Requirement 5 的执行性依赖；不由 `editor_tm_adapter.py` 或 Qt 实现。未通过 Core 既有合同、防篡改、seal、publication 与 recovery 回归前，必须阻断下游 Controller/TM UI，不得删除显式激活或从 UI 私补迁移链。
 
@@ -697,7 +698,7 @@ class MacOSBundleReport:
 |---|---|---|---|
 | Gate A — Contracts / algorithms | 精确 dd7 已实现；merge 后重验 frozen contracts、TextMatcher pure algorithm、scorers 与 evidence evaluator | 下游可以按版本化 Core contracts 编译和测试 | 不得把未验证合同、算法或 matcher profile 交给 UI |
 | Gate B — Canonical physical readiness | 精确 dd7 已实现；验证 schema、mutable stage、完整候选索引、StageSealer、binding 与 exact parity | sealed artifact 可进入 physical activation | 不得发布部分 sidecar、generation 或仅凭可打开 SQLite 冒充 canonical ready |
-| Physical activation（不是 capability gate） | 顺序 4 补齐 application-facing 首次入口；运行时由用户对单一 legacy resource 显式触发 | 成功后该资源唯一 runtime authority 切换为 canonical SQLite，exact/save 立即可用 | 首次 proven failure 以外不得回落 JSONL；ambiguous facts 必须 unavailable |
+| Physical activation（不是 capability gate） | 顺序 4 补齐 application-facing 首次入口；运行时由用户对单一 legacy resource 显式触发 | 成功后该资源唯一 runtime authority 切换为 canonical SQLite，exact/save 立即可用 | 首次 proven failure 以外不得回落 JSONL；ambiguous durable facts 必须 unavailable；只有 unpublished orphan residue 时按 ADR-012 保留 legacy 并 fresh-nonce retry |
 | Gate C — Retrieval correctness | CapabilityHost 以固定 build/fixture/semantics 重新计算 Core validation release，并用配对 expectation + manifest 新建正式 publisher/service | CONTEXT correctness 可独立开放；fuzzy-core 只满足 FUZZY 的 correctness 前提 | 不得刷新 sentinel publisher、用 manifest 自报 PASS 或仅凭 Gate C 开放任一 fuzzy execution path |
 | Gate D — benchmark-v1 | Gate C 后，在同一正式 publisher 上按 intended FTS5/fallback path 运行 100k benchmark/oracle；每 process/code epoch 使用新的 private evidence root | 只有 Gate C fuzzy-core 与本次 intended path Gate D 都通过，FUZZY 才开放 | 超限、旧 receipt、cleanup pending 或 identity drift 不得开放 fuzzy，也不得撤销 canonical exact 或已开放 context |
 | Matcher Gate | 与 Gate C/D 独立，消费 matcher validation manifest 发布 UNAVAILABLE/BASIC/TEXT_V1 | BASIC 允许基础连续搜索；TEXT_V1 才允许 Match Case / Whole Word 与 configured terms | 不得从 SQLite、Gate C/D、FTS5、控件状态或调用方布尔值推断 matcher state |

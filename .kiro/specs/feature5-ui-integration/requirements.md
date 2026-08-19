@@ -16,6 +16,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 `qt-editor-json-mvp-increment` 的获批基线明确排除了模糊 TM、context ranking、SQLite TM schema 与 JSONL TM 迁移。本规格以独立 Spec 新增 Feature 5 与 Qt 之间的跨线实施授权，不修订、回溯改变或将这些历史排除项记为原 Qt Spec 已完成。
 
+2026-08-19 首次激活恢复 amendment 由 ADR-012 授权：无 live reservation 且无任何 durable publication/recovery fact 时，unpublished mutable stage residue 不改变 never-activated JSONL authority，旧 residue 原样保留并允许 fresh-nonce retry。这一补救只恢复 Requirement 5.4/5.6 已批准的 legacy preservation，不授权自动 cleanup，也不放宽真正 durable ambiguity 的 fail-stop。
+
 ## 需求
 
 ### Requirement 1：当前段 TM 建议与可解释信息
@@ -107,6 +109,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 5. If 一个资源的路径、数据或查询发生局部失败, the LocalCAT Qt 编辑器 shall 标识受影响资源并保留其他资源的成功结果
 6. If 一个资源查询失败且其他资源没有建议, the LocalCAT Qt 编辑器 shall 显示资源失败而不是普通“无匹配”
 7. When 能力或资源状态恢复并通过验证, the LocalCAT Qt 编辑器 shall 刷新状态与当前段建议
+8. While 当前进程的 Gate D 正在运行且 fuzzy 尚未正式发布, the LocalCAT Qt 编辑器 shall 显示“Fuzzy 性能验证中”，继续只按当前 capability 显示 Exact/Context，并保持 fuzzy 阈值入口不可提交
+9. If Gate D 失败或结束但 fuzzy 仍未获授权, the LocalCAT Qt 编辑器 shall 只显示批准的安全原因，不把 RUNNING、SUCCEEDED、旧 evidence 或资源 canonical 状态解释为 fuzzy 可用
 
 ### Requirement 7：统一文本匹配与 TM 设置入口
 
