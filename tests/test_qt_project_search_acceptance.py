@@ -22,6 +22,7 @@ from editor_contracts import (
     ProjectSearchRequest,
     SearchField,
     SearchOptions,
+    SegmentTranslationStatus,
     TextMatcherDisplayState,
 )
 from editor_controller import EditorController, EditorControllerError
@@ -33,6 +34,8 @@ from resource_repository import ResourceRepository
 _GENERATED_AT = datetime(2030, 1, 1, tzinfo=timezone.utc)
 _VALID_UNTIL = datetime(2030, 1, 2, tzinfo=timezone.utc)
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_REAL_PROJECT_PATH = _REPOSITORY_ROOT / "po" / "卷二_引.json"
 
 
 def _write_project(path: Path) -> None:
@@ -122,8 +125,11 @@ class QtProjectSearchAcceptanceTests(unittest.TestCase):
             evaluated_at_utc=_EVALUATED_AT,
         )
 
-    def _open_window(self) -> QtEditorWindow:
-        self.controller.open_project(self.project_path)
+    def _open_window(
+        self,
+        project_path: Path | None = None,
+    ) -> QtEditorWindow:
+        self.controller.open_project(project_path or self.project_path)
         self.window = QtEditorWindow(self.controller)
         self.window.show()
         self._events()
@@ -466,6 +472,188 @@ class QtProjectSearchAcceptanceTests(unittest.TestCase):
                 "^display programmer fault$",
             ):
                 self.controller.search_project(request)
+
+    @unittest.skipUnless(
+        _REAL_PROJECT_PATH.is_file(),
+        "real 卷二_引.json acceptance project is not present",
+    )
+    def test_real_project_search_surface_amendment_journey(self) -> None:
+        """Exercise Requirement 3.1–3.16 through the real Qt surface."""
+
+        project_bytes = _REAL_PROJECT_PATH.read_bytes()
+        self._validate_basic()
+        window = self._open_window(_REAL_PROJECT_PATH)
+
+        self.assertFalse(window.project_search_panel.isVisible())
+        self.assertFalse(window.project_search_toggle.isChecked())
+        window.target_editor.setFocus()
+        QTest.keyClick(
+            window.target_editor,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self._events()
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertTrue(window.project_search_input.hasFocus())
+
+        window.project_search_source.setChecked(False)
+        window.project_search_target.setChecked(False)
+        window.project_search_speaker.setChecked(True)
+        unfilled_index = window.project_search_status.findData(
+            SegmentTranslationStatus.UNFILLED.value
+        )
+        self.assertGreaterEqual(unfilled_index, 0)
+        window.project_search_status.setCurrentIndex(unfilled_index)
+        window.project_search_input.setText("littleoldme")
+        QTest.keyClick(window.project_search_input, Qt.Key.Key_Return)
+        self._events()
+
+        unfilled_report = window.current_project_search_report
+        assert unfilled_report is not None
+        self.assertEqual(unfilled_report.total, 99)
+        self.assertTrue(
+            all(hit.field is SearchField.SPEAKER for hit in unfilled_report.hits)
+        )
+        first_hit = unfilled_report.hits[0]
+        self.assertEqual(
+            (
+                first_hit.segment_id,
+                first_hit.segment_index,
+                first_hit.start_index,
+                first_hit.end_index,
+                first_hit.preview,
+            ),
+            ("segment-1", 0, 0, 11, "littleoldme"),
+        )
+        self.assertEqual(self.controller.current_index, 0)
+        self.assertIn("SPEAKER", window.project_search_result.text())
+        self.assertIn("段落 1", window.project_search_result.text())
+        self.assertFalse(window.project_search_match_case.isEnabled())
+        self.assertFalse(window.project_search_whole_word.isEnabled())
+
+        window.target_editor.setPlainText("draft translation")
+        self._events()
+        self.assertEqual(
+            self.controller.project.segments[0].target,
+            "draft translation",
+        )
+        self.assertIsNone(window.current_project_search_report)
+        self.assertIn("已过期", window.project_search_result.text())
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.NO_ISSUED_REPORT$",
+        ):
+            self.controller.go_to_search_hit(first_hit)
+        self.assertEqual(self.controller.current_index, 0)
+
+        self._validate_text_v1()
+        window.refresh_suggestions()
+        self._events()
+        self.assertTrue(window.project_search_match_case.isEnabled())
+        self.assertTrue(window.project_search_whole_word.isEnabled())
+        draft_index = window.project_search_status.findData(
+            SegmentTranslationStatus.DRAFT.value
+        )
+        self.assertGreaterEqual(draft_index, 0)
+        window.project_search_status.setCurrentIndex(draft_index)
+        QTest.mouseClick(
+            window.project_search_button,
+            Qt.MouseButton.LeftButton,
+        )
+        self._events()
+
+        draft_report = window.current_project_search_report
+        assert draft_report is not None
+        self.assertEqual(draft_report.total, 1)
+        self.assertEqual(draft_report.hits[0].segment_id, "segment-1")
+        draft_hit = draft_report.hits[0]
+        confirmed = self.controller.confirm_current()
+        self.assertTrue(confirmed.write_report.succeeded)
+        self.assertTrue(self.controller.project.segments[0].confirmed)
+        self.assertEqual(
+            self.controller.project.segments[0].target,
+            "draft translation",
+        )
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.STALE_PROJECT$",
+        ):
+            self.controller.go_to_search_hit(draft_hit)
+
+        translated_index = window.project_search_status.findData(
+            SegmentTranslationStatus.TRANSLATED.value
+        )
+        self.assertGreaterEqual(translated_index, 0)
+        window.project_search_status.setCurrentIndex(translated_index)
+        QTest.mouseClick(
+            window.project_search_button,
+            Qt.MouseButton.LeftButton,
+        )
+        self._events()
+        translated_report = window.current_project_search_report
+        assert translated_report is not None
+        self.assertEqual(translated_report.total, 1)
+        self.assertEqual(translated_report.hits[0].segment_id, "segment-1")
+        matcher_stale_hit = translated_report.hits[0]
+        self._validate_basic()
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.STALE_MATCHER_GENERATION$",
+        ):
+            self.controller.go_to_search_hit(matcher_stale_hit)
+
+        before_clear_project = self.controller.project
+        before_clear_index = self.controller.current_index
+        before_clear_dirty = self.controller.dirty
+        QTest.mouseClick(
+            window.project_search_clear,
+            Qt.MouseButton.LeftButton,
+        )
+        self._events()
+        self.assertEqual(window.project_search_input.text(), "")
+        self.assertIsNone(window.current_project_search_report)
+        self.assertIsNone(self.controller.current_project_search_report)
+        self.assertFalse(window.project_search_source.isChecked())
+        self.assertFalse(window.project_search_target.isChecked())
+        self.assertTrue(window.project_search_speaker.isChecked())
+        self.assertEqual(
+            window.project_search_status.currentData(),
+            SegmentTranslationStatus.TRANSLATED.value,
+        )
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertIs(self.controller.project, before_clear_project)
+        self.assertEqual(self.controller.current_index, before_clear_index)
+        self.assertEqual(self.controller.dirty, before_clear_dirty)
+
+        with patch.object(
+            self.controller,
+            "search_project",
+            wraps=self.controller.search_project,
+        ) as status_only:
+            QTest.mouseClick(
+                window.project_search_button,
+                Qt.MouseButton.LeftButton,
+            )
+            self._events()
+        status_only.assert_not_called()
+        self.assertIn("有效关键词", window.project_search_result.text())
+        self.assertEqual(_REAL_PROJECT_PATH.read_bytes(), project_bytes)
+
+    def test_search_surface_amendment_does_not_claim_deferred_features(
+        self,
+    ) -> None:
+        source = (_REPOSITORY_ROOT / "qt_editor_window.py").read_text(
+            encoding="utf-8"
+        )
+        for deferred in (
+            "projectSearchReplace",
+            "replace_project_search",
+            "Replace All",
+            "Approved",
+            "Revise",
+        ):
+            with self.subTest(deferred=deferred):
+                self.assertNotIn(deferred, source)
 
 
 if __name__ == "__main__":

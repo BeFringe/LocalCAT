@@ -210,7 +210,7 @@
   - _Boundary: Qt Project Search Surface Remediation_
   - _Depends: 3.2c, 4.3_
 
-- [ ] 4.3c 完成 Requirement 3 search-surface amendment fresh acceptance
+- [x] 4.3c 完成 Requirement 3 search-surface amendment fresh acceptance
   - 使用真实 `卷二_引.json`、production composition 与 Qt 验证 speaker-only `littleoldme` 从段 1 起返回稳定命中
   - 验证非常驻顶栏入口、显式 clear、三状态与 BASIC/TEXT_V1 组合，以及 target/confirmed/matcher generation 改变后旧结果拒绝
   - 验证未引入 Approved/Revise、status-only 伪命中、Replace/Replace All 或 Qt 本地 matcher fallback
