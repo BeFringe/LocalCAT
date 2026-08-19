@@ -82,6 +82,7 @@ from editor_contracts import (
     SearchField,
     SearchOptions,
     SegmentDensity,
+    SegmentTranslationStatus,
     SuggestionBundle,
     TermSuggestion,
     TMResourceDisplayMode,
@@ -214,6 +215,35 @@ class _TopBarProjectButton(QToolButton):
             enabled=self.isEnabled(),
         )
 
+
+class _TopBarSearchButton(QToolButton):
+    """Top-bar search toggle with a platform-independent magnifier."""
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        center = self.rect().center()
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(
+                QColor("#ffffff" if self.isChecked() else (
+                    "#d6e7f4" if self.isEnabled() else "#7895aa"
+                ))
+            )
+            pen.setWidthF(1.9)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            lens_center = QPointF(center.x() - 1.5, center.y() - 1.5)
+            painter.drawEllipse(lens_center, 5.0, 5.0)
+            painter.drawLine(
+                QPointF(center.x() + 2.0, center.y() + 2.0),
+                QPointF(center.x() + 6.0, center.y() + 6.0),
+            )
+        finally:
+            painter.end()
+
+
 class ResponsiveSplitter(QSplitter):
     """QSplitter with inspectable stretch metadata for layout verification."""
 
@@ -291,6 +321,7 @@ class QtEditorWindow(QMainWindow):
         self.quit_action: QAction
         self.save_button: QToolButton
         self.settings_button: QToolButton
+        self.project_search_toggle: QToolButton
         self.empty_open_button: QPushButton
         self.sample_button: QPushButton
         self.main_splitter: ResponsiveSplitter
@@ -300,6 +331,9 @@ class QtEditorWindow(QMainWindow):
         self.unconfirmed_filter: QCheckBox
         self.segment_list: QListWidget
         self.project_search_input: QLineEdit
+        self.project_search_panel: QFrame
+        self.project_search_status: QComboBox
+        self.project_search_clear: QPushButton
         self.project_search_source: QCheckBox
         self.project_search_target: QCheckBox
         self.project_search_speaker: QCheckBox
@@ -343,27 +377,31 @@ class QtEditorWindow(QMainWindow):
         self.current_tm_report: TMSuggestionReport | None = None
         self.current_project_search_report: ProjectSearchReport | None = None
         self._project_search_ordinal: int | None = None
+        self._project_search_expanded = False
         self.setObjectName("editorWindow")
         self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
-        self.setTabOrder(self.settings_button, self.project_search_input)
+        self.setTabOrder(self.settings_button, self.project_search_toggle)
+        self.setTabOrder(self.project_search_toggle, self.project_search_input)
         self.setTabOrder(self.project_search_input, self.project_search_source)
         self.setTabOrder(self.project_search_source, self.project_search_target)
         self.setTabOrder(self.project_search_target, self.project_search_speaker)
         self.setTabOrder(
-            self.project_search_speaker,
-            self.project_search_match_case,
-        )
-        self.setTabOrder(
             self.project_search_match_case,
             self.project_search_whole_word,
         )
+        self.setTabOrder(self.project_search_speaker, self.project_search_status)
+        self.setTabOrder(
+            self.project_search_status,
+            self.project_search_match_case,
+        )
         self.setTabOrder(
             self.project_search_whole_word,
-            self.project_search_button,
+            self.project_search_clear,
         )
+        self.setTabOrder(self.project_search_clear, self.project_search_button)
         self.setTabOrder(self.project_search_button, self.project_search_previous)
         self.setTabOrder(self.project_search_previous, self.project_search_next)
         self.setTabOrder(self.project_search_next, self.segment_list)
@@ -446,6 +484,17 @@ class QtEditorWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
+
+        self.project_search_toggle = _TopBarSearchButton()
+        self.project_search_toggle.setObjectName("projectSearchToggle")
+        self.project_search_toggle.setCheckable(True)
+        self.project_search_toggle.setEnabled(False)
+        self.project_search_toggle.setFixedSize(QSize(34, 34))
+        self.project_search_toggle.setAccessibleName(
+            "展开或收起项目搜索"
+        )
+        self.project_search_toggle.setToolTip("项目搜索 (Ctrl+F)")
+        layout.addWidget(self.project_search_toggle)
 
         self.workspace_mode_combo = _TopBarModeCombo()
         self.workspace_mode_combo.setObjectName("workspaceModeCombo")
@@ -579,6 +628,7 @@ class QtEditorWindow(QMainWindow):
     def _build_project_search_bar(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("projectSearchPanel")
+        self.project_search_panel = panel
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 9, 12, 9)
         layout.setSpacing(6)
@@ -599,8 +649,17 @@ class QtEditorWindow(QMainWindow):
         self.project_search_button.setObjectName("projectSearchSubmit")
         self.project_search_button.setAccessibleName("执行项目搜索")
         self.project_search_button.setToolTip("执行当前项目搜索")
+        self.project_search_clear = QPushButton("清除")
+        self.project_search_clear.setObjectName("projectSearchClear")
+        self.project_search_clear.setAccessibleName(
+            "清除项目搜索关键词与结果"
+        )
+        self.project_search_clear.setToolTip(
+            "清除关键词、可见结果和已签发结果；保留搜索条件"
+        )
         query_row.addWidget(title)
         query_row.addWidget(self.project_search_input, 1)
+        query_row.addWidget(self.project_search_clear)
         query_row.addWidget(self.project_search_button)
         layout.addLayout(query_row)
 
@@ -625,6 +684,27 @@ class QtEditorWindow(QMainWindow):
             "projectSearchSpeaker",
             "搜索 raw speaker 字段",
             checked=True,
+        )
+        status_label = QLabel("状态")
+        status_label.setObjectName("projectSearchStatusLabel")
+        self.project_search_status = QComboBox()
+        self.project_search_status.setObjectName("projectSearchStatus")
+        self.project_search_status.setAccessibleName("段翻译状态筛选")
+        self.project_search_status.setToolTip(
+            "按未填写、草稿或已翻译筛选段；仍需输入关键词"
+        )
+        self.project_search_status.addItem("全部状态", None)
+        self.project_search_status.addItem(
+            "未填写",
+            SegmentTranslationStatus.UNFILLED.value,
+        )
+        self.project_search_status.addItem(
+            "草稿",
+            SegmentTranslationStatus.DRAFT.value,
+        )
+        self.project_search_status.addItem(
+            "已翻译",
+            SegmentTranslationStatus.TRANSLATED.value,
         )
         self.project_search_match_case = self._project_search_checkbox(
             "Match Case",
@@ -652,6 +732,9 @@ class QtEditorWindow(QMainWindow):
         options_row.addWidget(self.project_search_source)
         options_row.addWidget(self.project_search_target)
         options_row.addWidget(self.project_search_speaker)
+        options_row.addSpacing(8)
+        options_row.addWidget(status_label)
+        options_row.addWidget(self.project_search_status)
         options_row.addSpacing(8)
         options_row.addWidget(self.project_search_match_case)
         options_row.addWidget(self.project_search_whole_word)
@@ -692,6 +775,7 @@ class QtEditorWindow(QMainWindow):
         layout.addWidget(self.project_search_preview)
         self.project_search_previous.setEnabled(False)
         self.project_search_next.setEnabled(False)
+        panel.setVisible(False)
         return panel
 
     @staticmethod
@@ -934,6 +1018,9 @@ class QtEditorWindow(QMainWindow):
         self.sample_button.clicked.connect(self.load_sample)
         self.save_button.clicked.connect(self._choose_save)
         self.settings_button.clicked.connect(self._open_settings)
+        self.project_search_toggle.toggled.connect(
+            self._project_search_toggled
+        )
         self.segment_list.currentRowChanged.connect(self._select_visible_row)
         self.target_editor.textChanged.connect(self._target_changed)
         self.previous_button.clicked.connect(lambda: self._navigate(-1))
@@ -953,6 +1040,23 @@ class QtEditorWindow(QMainWindow):
         )
         self.project_search_button.clicked.connect(
             self._submit_project_search
+        )
+        self.project_search_clear.clicked.connect(
+            self._clear_project_search
+        )
+        self.project_search_input.textEdited.connect(
+            self._project_search_criteria_changed
+        )
+        for checkbox in (
+            self.project_search_source,
+            self.project_search_target,
+            self.project_search_speaker,
+            self.project_search_match_case,
+            self.project_search_whole_word,
+        ):
+            checkbox.toggled.connect(self._project_search_criteria_changed)
+        self.project_search_status.currentIndexChanged.connect(
+            self._project_search_criteria_changed
         )
         self.project_search_previous.clicked.connect(
             lambda: self._navigate_project_search(-1)
@@ -1079,6 +1183,9 @@ class QtEditorWindow(QMainWindow):
         project_search_shortcut = self._native_shortcut_text(
             self.project_search_shortcut
         )
+        self.project_search_toggle.setToolTip(
+            f"展开或收起项目搜索 ({project_search_shortcut})"
+        )
         self.project_search_input.setToolTip(
             f"输入非空关键词并按 Enter 搜索当前 JSON 项目 ({project_search_shortcut})"
         )
@@ -1087,8 +1194,54 @@ class QtEditorWindow(QMainWindow):
         )
 
     def _focus_project_search(self) -> None:
+        if not self.controller.has_project:
+            return
+        self._set_project_search_expanded(True)
         self.project_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.project_search_input.selectAll()
+
+    def _project_search_toggled(self, expanded: bool) -> None:
+        self._set_project_search_expanded(expanded, focus=expanded)
+
+    def _set_project_search_expanded(
+        self,
+        expanded: bool,
+        *,
+        focus: bool = False,
+    ) -> None:
+        visible = bool(expanded and self.controller.has_project)
+        self._project_search_expanded = visible
+        self.project_search_panel.setVisible(visible)
+        blocker = QSignalBlocker(self.project_search_toggle)
+        try:
+            self.project_search_toggle.setChecked(visible)
+        finally:
+            del blocker
+        if visible and focus:
+            self.project_search_input.setFocus(
+                Qt.FocusReason.ShortcutFocusReason
+            )
+            self.project_search_input.selectAll()
+
+    def _project_search_criteria_changed(self, _value: object) -> None:
+        if self._refreshing:
+            return
+        if self.current_project_search_report is None:
+            self.controller.clear_project_search()
+            return
+        self._clear_project_search_results(
+            "搜索条件已变化；请重新搜索。"
+        )
+
+    def _clear_project_search(self) -> None:
+        self.controller.clear_project_search()
+        blocker = QSignalBlocker(self.project_search_input)
+        try:
+            self.project_search_input.clear()
+        finally:
+            del blocker
+        self._clear_project_search_results(clear_controller=False)
+        self.project_search_input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _install_target_editor_shortcuts(self) -> None:
         bindings = (
@@ -1207,6 +1360,7 @@ class QtEditorWindow(QMainWindow):
         return True
 
     def _show_empty_state(self) -> None:
+        self._set_project_search_expanded(False)
         self.pages.setCurrentIndex(0)
         self.save_button.setEnabled(False)
         self.project_name_label.setText("未打开项目")
@@ -1339,6 +1493,7 @@ class QtEditorWindow(QMainWindow):
         return bool(selected) and self.save_project_path(Path(selected))
 
     def _render_project(self) -> None:
+        self._set_project_search_expanded(False)
         self.pages.setCurrentIndex(1)
         self.save_button.setEnabled(True)
         self.close_project_action.setEnabled(True)
@@ -1716,6 +1871,8 @@ class QtEditorWindow(QMainWindow):
         """Project the current JSON and matcher gates without executing search."""
 
         project_capability = self.controller.project_tool_capability()
+        self.project_search_toggle.setEnabled(self.controller.has_project)
+        self.project_search_clear.setEnabled(self.controller.has_project)
         display = None
         search_available = False
         advanced_available = False
@@ -1754,6 +1911,7 @@ class QtEditorWindow(QMainWindow):
             self.project_search_speaker,
         ):
             checkbox.setEnabled(search_available)
+        self.project_search_status.setEnabled(search_available)
         self.project_search_match_case.setEnabled(advanced_available)
         self.project_search_whole_word.setEnabled(advanced_available)
         self.project_search_capability.setText(message)
@@ -1797,6 +1955,14 @@ class QtEditorWindow(QMainWindow):
             ),
         )
 
+    def _project_search_status_filter(
+        self,
+    ) -> SegmentTranslationStatus | None:
+        value = self.project_search_status.currentData()
+        if value is None:
+            return None
+        return SegmentTranslationStatus(str(value))
+
     def _submit_project_search(self) -> None:
         """Issue one Controller search and activate its first issued hit."""
 
@@ -1819,6 +1985,7 @@ class QtEditorWindow(QMainWindow):
             query=query,
             fields=fields,
             options=self._project_search_options(),
+            status=self._project_search_status_filter(),
         )
         try:
             report = self.controller.search_project(request)
@@ -1916,7 +2083,14 @@ class QtEditorWindow(QMainWindow):
         self.project_search_previous.setEnabled(ordinal > 0)
         self.project_search_next.setEnabled(ordinal + 1 < report.total)
 
-    def _clear_project_search_results(self, message: str = "尚未搜索。") -> None:
+    def _clear_project_search_results(
+        self,
+        message: str = "尚未搜索。",
+        *,
+        clear_controller: bool = True,
+    ) -> None:
+        if clear_controller:
+            self.controller.clear_project_search()
         self.current_project_search_report = None
         self._project_search_ordinal = None
         self.project_search_result.setText(message)
@@ -2578,6 +2752,25 @@ QFrame#projectSearchPanel {
     border: 1px solid #d6e0ea;
     border-radius: 8px;
 }
+QToolButton#projectSearchToggle {
+    color: #d6e7f4;
+    background: #0b3e6a;
+    border: 1px solid #1e5c87;
+    border-radius: 5px;
+    font-size: 20px;
+    font-weight: 700;
+}
+QToolButton#projectSearchToggle:hover,
+QToolButton#projectSearchToggle:checked {
+    color: #ffffff;
+    background: #087da2;
+    border-color: #20a9ce;
+}
+QToolButton#projectSearchToggle:disabled {
+    color: #7895aa;
+    background: #154568;
+    border-color: #315b79;
+}
 QLabel#projectSearchTitle {
     color: #17314b;
     font-size: 13px;
@@ -2587,6 +2780,20 @@ QLabel#projectSearchScopeLabel {
     color: #64778b;
     font-size: 10px;
     font-weight: 700;
+}
+QLabel#projectSearchStatusLabel {
+    color: #64778b;
+    font-size: 10px;
+    font-weight: 700;
+}
+QComboBox#projectSearchStatus {
+    min-height: 28px;
+    min-width: 92px;
+    color: #405367;
+    background: #ffffff;
+    border: 1px solid #cbd7e2;
+    border-radius: 4px;
+    padding: 0 22px 0 7px;
 }
 QLineEdit#projectSearchQuery {
     min-height: 30px;
@@ -2620,6 +2827,11 @@ QPushButton#projectSearchSubmit {
 }
 QPushButton#projectSearchSubmit:hover {
     background: #078bb2;
+}
+QPushButton#projectSearchClear {
+    color: #24455f;
+    background: #f5f8fb;
+    border-color: #cbd7e2;
 }
 QPushButton#projectSearchPrevious,
 QPushButton#projectSearchNext {

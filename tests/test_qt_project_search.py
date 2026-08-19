@@ -23,7 +23,9 @@ from editor_contracts import (
     ProjectSearchRequest,
     SearchField,
     SearchOptions as EditorSearchOptions,
+    SegmentTranslationStatus,
     TextMatcherState as EditorTextMatcherState,
+    WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
 from qt_editor import _compose_editor_controller
@@ -136,11 +138,17 @@ class QtProjectSearchTests(unittest.TestCase):
             evaluated_at_utc=_EVALUATED_AT,
         )
 
-    def _open_window(self) -> QtEditorWindow:
+    def _open_window(self, *, expand_search: bool = True) -> QtEditorWindow:
         self.controller.open_project(self.project_path)
         self.window = QtEditorWindow(self.controller)
         self.window.show()
         self._events()
+        if expand_search:
+            QTest.mouseClick(
+                self.window.project_search_toggle,
+                Qt.MouseButton.LeftButton,
+            )
+            self._events()
         return self.window
 
     def test_basic_search_renders_fields_preview_and_issued_navigation(self) -> None:
@@ -434,12 +442,15 @@ class QtProjectSearchTests(unittest.TestCase):
         self.assertTrue(window.project_search_input.hasFocus())
 
         controls = (
+            window.project_search_toggle,
             window.project_search_input,
             window.project_search_source,
             window.project_search_target,
             window.project_search_speaker,
+            window.project_search_status,
             window.project_search_match_case,
             window.project_search_whole_word,
+            window.project_search_clear,
             window.project_search_button,
             window.project_search_previous,
             window.project_search_next,
@@ -466,6 +477,141 @@ class QtProjectSearchTests(unittest.TestCase):
             {"tm_contracts", "project_search", "text_matcher"}.isdisjoint(imported),
             imported,
         )
+
+    def test_search_surface_defaults_collapsed_and_has_two_discovery_paths(
+        self,
+    ) -> None:
+        self._validate_basic()
+        window = self._open_window(expand_search=False)
+
+        self.assertFalse(window.project_search_panel.isVisible())
+        self.assertFalse(window.project_search_toggle.isChecked())
+        self.assertTrue(window.project_search_toggle.isEnabled())
+        window.project_search_toggle.setFocus()
+        QTest.keyClick(window.project_search_toggle, Qt.Key.Key_Space)
+        self._events()
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertTrue(window.project_search_input.hasFocus())
+        window.project_search_input.setText("needle remains")
+
+        window.set_workspace_mode(WorkspaceMode.BROWSE)
+        window.set_workspace_mode(WorkspaceMode.EDIT)
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertEqual(window.project_search_input.text(), "needle remains")
+
+        QTest.mouseClick(
+            window.project_search_toggle,
+            Qt.MouseButton.LeftButton,
+        )
+        self.assertFalse(window.project_search_panel.isVisible())
+        window.target_editor.setFocus()
+        QTest.keyClick(
+            window.target_editor,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self._events()
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertTrue(window.project_search_input.hasFocus())
+        self.assertTrue(window.project_search_input.hasSelectedText())
+
+        self.assertTrue(window.open_project_path(self.project_path))
+        self._events()
+        self.assertFalse(window.project_search_panel.isVisible())
+        self.assertFalse(window.project_search_toggle.isChecked())
+        self.assertTrue(window.project_search_toggle.isEnabled())
+        self.assertTrue(window.close_current_project())
+        self.assertFalse(window.project_search_panel.isVisible())
+        self.assertFalse(window.project_search_toggle.isEnabled())
+
+    def test_explicit_clear_and_status_filter_share_controller_issuance(
+        self,
+    ) -> None:
+        self._validate_basic()
+        window = self._open_window()
+        window.project_search_status.setCurrentIndex(2)
+        window.project_search_source.setChecked(False)
+        window.project_search_match_case.setChecked(True)
+        window.project_search_whole_word.setChecked(True)
+        window.project_search_input.setText("needle")
+        before_project = self.controller.project
+        before_index = self.controller.current_index
+        before_dirty = self.controller.dirty
+
+        with patch.object(
+            self.controller,
+            "search_project",
+            wraps=self.controller.search_project,
+        ) as search:
+            QTest.mouseClick(
+                window.project_search_button,
+                Qt.MouseButton.LeftButton,
+            )
+            self._events()
+
+        request = cast(ProjectSearchRequest, search.call_args.args[0])
+        self.assertIs(request.status, SegmentTranslationStatus.DRAFT)
+        self.assertEqual(
+            request.fields,
+            (SearchField.TARGET, SearchField.SPEAKER),
+        )
+        self.assertIsNotNone(window.current_project_search_report)
+
+        with patch.object(
+            self.controller,
+            "clear_project_search",
+            wraps=self.controller.clear_project_search,
+        ) as criteria_clear:
+            window.project_search_status.setCurrentIndex(3)
+            self._events()
+        criteria_clear.assert_called_once_with()
+        self.assertIsNone(window.current_project_search_report)
+        self.assertIsNone(self.controller.current_project_search_report)
+
+        window.project_search_status.setCurrentIndex(2)
+        QTest.mouseClick(
+            window.project_search_button,
+            Qt.MouseButton.LeftButton,
+        )
+        self._events()
+        self.assertIsNotNone(window.current_project_search_report)
+
+        with patch.object(
+            self.controller,
+            "clear_project_search",
+            wraps=self.controller.clear_project_search,
+        ) as clear:
+            QTest.mouseClick(
+                window.project_search_clear,
+                Qt.MouseButton.LeftButton,
+            )
+            self._events()
+
+        clear.assert_called_once_with()
+        self.assertEqual(window.project_search_input.text(), "")
+        self.assertIsNone(window.current_project_search_report)
+        self.assertIsNone(self.controller.current_project_search_report)
+        self.assertFalse(window.project_search_source.isChecked())
+        self.assertEqual(window.project_search_status.currentIndex(), 2)
+        self.assertTrue(window.project_search_match_case.isChecked())
+        self.assertTrue(window.project_search_whole_word.isChecked())
+        self.assertIs(self.controller.project, before_project)
+        self.assertEqual(self.controller.current_index, before_index)
+        self.assertEqual(self.controller.dirty, before_dirty)
+        self.assertTrue(window.project_search_panel.isVisible())
+
+        with patch.object(
+            self.controller,
+            "search_project",
+            wraps=self.controller.search_project,
+        ) as status_only:
+            QTest.mouseClick(
+                window.project_search_button,
+                Qt.MouseButton.LeftButton,
+            )
+            self._events()
+        status_only.assert_not_called()
+        self.assertIn("有效关键词", window.project_search_result.text())
 
     def test_editor_contracts_explicitly_reexports_exact_core_search_types(
         self,
