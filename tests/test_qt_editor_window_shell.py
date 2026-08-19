@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from editor_contracts import ResourceKind, WorkspaceMode
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
+from qt_control_styles import LOCALCAT_COMBO_POPUP_STYLE, LOCALCAT_MENU_STYLE
 from resource_repository import ResourceRepository
 
 
@@ -193,6 +194,40 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self._assert_chevron_visible(project_image, project_rect)
             self.assertLessEqual(window.open_button.width(), 96)
             self.assertTrue(window.open_button.accessibleName())
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    def test_topbar_controls_share_font_hover_and_popup_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.load_sample()
+            window.show()
+            self._events()
+
+            controls = (
+                window.workspace_mode_combo,
+                window.open_button,
+                window.save_button,
+                window.settings_button,
+            )
+            self.assertEqual(
+                {control.fontMetrics().height() for control in controls},
+                {window.workspace_mode_combo.fontMetrics().height()},
+            )
+            self.assertIn("QComboBox#workspaceModeCombo:hover", window.styleSheet())
+            self.assertEqual(
+                window.workspace_mode_combo.view().styleSheet(),
+                LOCALCAT_COMBO_POPUP_STYLE,
+            )
+            self.assertEqual(window.project_menu.styleSheet(), LOCALCAT_MENU_STYLE)
+            self.assertEqual(
+                window.segment_density_combo.view().styleSheet(),
+                LOCALCAT_COMBO_POPUP_STYLE,
+            )
+            self.assertEqual(
+                window.project_search_status.view().styleSheet(),
+                LOCALCAT_COMBO_POPUP_STYLE,
+            )
             window._confirm_unsaved = lambda: True
             window.close()
 

@@ -67,7 +67,6 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionComboBox,
     QStyleOptionToolButton,
-    QStyledItemDelegate,
 )
 
 from editor_contracts import (
@@ -96,38 +95,13 @@ from editor_contracts import (
 from editor_controller import EditorController, EditorControllerError
 from qt_settings_dialog import QtSettingsDialog
 from qt_termbase_dialog import QtTermbaseDialog
+from qt_control_styles import configure_combo_popup, configure_menu
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
     prompt_tm_threshold,
     tm_threshold_feedback,
 )
-
-
-_WORKSPACE_MODE_POPUP_STYLE = """
-QAbstractItemView#workspaceModePopup {
-    color: #1f3850;
-    background-color: #ffffff;
-    selection-color: #0b304c;
-    selection-background-color: #c4e8f2;
-    border: 1px solid #9fb5c8;
-    outline: 0;
-}
-QAbstractItemView#workspaceModePopup::item {
-    color: #1f3850;
-    background-color: #ffffff;
-    min-height: 30px;
-    padding: 2px 8px;
-}
-QAbstractItemView#workspaceModePopup::item:hover {
-    color: #16344e;
-    background-color: #e7f4f8;
-}
-QAbstractItemView#workspaceModePopup::item:selected {
-    color: #0b304c;
-    background-color: #c4e8f2;
-}
-"""
 
 
 class _TMApplyButton(QPushButton):
@@ -550,12 +524,10 @@ class QtEditorWindow(QMainWindow):
         self.workspace_mode_combo.setToolTip("切换编辑或双语浏览校对模式")
         self.workspace_mode_combo.addItem("编辑", WorkspaceMode.EDIT.value)
         self.workspace_mode_combo.addItem("浏览 / 校对", WorkspaceMode.BROWSE.value)
-        workspace_mode_popup = self.workspace_mode_combo.view()
-        workspace_mode_popup.setObjectName("workspaceModePopup")
-        workspace_mode_popup.setAccessibleName("工作区模式选项")
-        workspace_mode_popup.setStyleSheet(_WORKSPACE_MODE_POPUP_STYLE)
-        workspace_mode_popup.setItemDelegate(
-            QStyledItemDelegate(workspace_mode_popup)
+        configure_combo_popup(
+            self.workspace_mode_combo,
+            object_name="workspaceModePopup",
+            accessible_name="工作区模式选项",
         )
         self.workspace_mode_combo.setCurrentIndex(
             0 if self.workspace_mode is WorkspaceMode.EDIT else 1
@@ -573,9 +545,11 @@ class QtEditorWindow(QMainWindow):
         self.open_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.project_menu = QMenu(self)
         self.project_menu.setObjectName("projectMenu")
+        configure_menu(self.project_menu)
         self.open_project_action = self.project_menu.addAction("打开项目…")
         self.recent_projects_menu = self.project_menu.addMenu("最近项目")
         self.recent_projects_menu.setObjectName("recentProjectsMenu")
+        configure_menu(self.recent_projects_menu)
         self.project_menu.addSeparator()
         self.close_project_action = self.project_menu.addAction("退出当前项目")
         self.project_menu.addSeparator()
@@ -756,6 +730,11 @@ class QtEditorWindow(QMainWindow):
             "已翻译",
             SegmentTranslationStatus.TRANSLATED.value,
         )
+        configure_combo_popup(
+            self.project_search_status,
+            object_name="projectSearchStatusPopup",
+            accessible_name="段翻译状态选项",
+        )
         self.project_search_match_case = self._project_search_checkbox(
             "Match Case",
             "projectSearchMatchCase",
@@ -862,6 +841,11 @@ class QtEditorWindow(QMainWindow):
         self.segment_density_combo.setToolTip("段落列表：紧凑等高或完整自动换行")
         self.segment_density_combo.addItem("紧凑", SegmentDensity.COMPACT.value)
         self.segment_density_combo.addItem("自动换行", SegmentDensity.WRAPPED.value)
+        configure_combo_popup(
+            self.segment_density_combo,
+            object_name="segmentDensityPopup",
+            accessible_name="段落显示密度选项",
+        )
         self.segment_density_combo.setCurrentIndex(
             0 if self.segment_density is SegmentDensity.COMPACT else 1
         )
@@ -1047,14 +1031,6 @@ class QtEditorWindow(QMainWindow):
         self.manage_terms_button.setToolTip(
             "选择一个 Active+Update 术语表并打开集中式术语管理"
         )
-        self.manage_terms_button.setStyleSheet(
-            "QToolButton#manageTermsButton {"
-            " padding: 5px 24px 5px 10px;"
-            "}"
-            "QToolButton#manageTermsButton::menu-indicator {"
-            " image: none; width: 0px;"
-            "}"
-        )
         self.manage_terms_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.manage_terms_button.setPopupMode(
             QToolButton.ToolButtonPopupMode.InstantPopup
@@ -1062,6 +1038,7 @@ class QtEditorWindow(QMainWindow):
         self.manage_terms_menu = QMenu(self.manage_terms_button)
         self.manage_terms_menu.setObjectName("manageTermsMenu")
         self.manage_terms_menu.setAccessibleName("可管理术语表")
+        configure_menu(self.manage_terms_menu)
         self.manage_terms_button.setMenu(self.manage_terms_menu)
         term_toolbar.addWidget(self.manage_terms_button)
         self.add_term_button = QPushButton("＋ 添加术语")
@@ -2817,6 +2794,7 @@ QToolButton {
     border: 1px solid #31577d;
     border-radius: 5px;
     font-weight: 650;
+    font-size: 13px;
 }
 QToolButton:hover {
     color: white;
@@ -2849,6 +2827,14 @@ QComboBox#workspaceModeCombo {
     background: #0b3e6a;
     border: 1px solid #315f86;
     border-radius: 5px;
+    font-size: 13px;
+    font-weight: 650;
+}
+QComboBox#workspaceModeCombo:hover,
+QComboBox#workspaceModeCombo:focus {
+    color: #ffffff;
+    background: #124875;
+    border-color: #4a789e;
 }
 QComboBox#workspaceModeCombo::drop-down {
     border: none;
@@ -3159,6 +3145,39 @@ QPushButton {
 QPushButton:hover {
     color: #087fa3;
     border-color: #079bc4;
+}
+QToolButton#manageTermsButton,
+QPushButton#addTermButton {
+    min-height: 32px;
+    padding: 2px 14px;
+    color: #15283a;
+    background: #eef3f7;
+    border: 1px solid #aebdca;
+    border-radius: 5px;
+    font-size: 13px;
+    font-weight: 650;
+}
+QToolButton#manageTermsButton {
+    padding: 2px 24px 2px 12px;
+}
+QToolButton#manageTermsButton:hover,
+QToolButton#manageTermsButton:focus,
+QPushButton#addTermButton:hover,
+QPushButton#addTermButton:focus {
+    color: #102637;
+    background: #e8f8fc;
+    border: 2px solid #20a9ce;
+    border-color: #20a9ce;
+}
+QToolButton#manageTermsButton:pressed,
+QPushButton#addTermButton:pressed {
+    color: #102637;
+    background: #d8f1f7;
+    border-color: #078bb2;
+}
+QToolButton#manageTermsButton::menu-indicator {
+    image: none;
+    width: 0px;
 }
 QPushButton#confirmTranslationButton, QPushButton#emptyOpenButton {
     color: white;

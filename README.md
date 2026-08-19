@@ -135,9 +135,12 @@ python qt_editor.py --project path/to/project.json
 # Linux：安装到用户应用菜单，之后可像普通桌面应用一样启动
 python qt_editor.py --install-desktop-launcher
 
-# macOS：原子安装 ~/Applications/LocalCAT.app
+# macOS：先退出正在运行的 LocalCAT，再原子安装并签名
+# ~/Applications/LocalCAT.app
 python qt_editor.py --install-macos-app
 ```
+
+仓库根目录的 `LocalCAT-launcher` 是供安装器封装的原生可执行模板，不能直接双击当作应用。macOS 安装命令会先在隐藏候选目录中构建并整包 ad-hoc 签名，完成真实冷启动验证后才原子发布 `~/Applications/LocalCAT.app`；已有 LocalCAT 运行时会拒绝替换，原安装保持不变。若曾手动拖入 `/Applications`，请先退出该实例，再选择保留手动副本或使用上述用户级安装位置，避免同时存在两个同 bundle id 的副本。
 
 缺少 PySide6 时，启动器会输出上述安装命令而不会显示未处理 traceback。macOS 轻量应用保留安装时的 Python 与当前 checkout 绝对路径；移动/删除这些路径后需重新执行安装命令。应用数据默认写入操作系统的本地应用数据目录，也可用 `--data-dir PATH` 覆盖。进入项目后可从顶栏“项目”菜单打开或切换最近项目、退出当前项目；再次打开同一项目会恢复最后段落。
 

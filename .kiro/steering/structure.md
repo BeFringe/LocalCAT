@@ -35,6 +35,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── qt_editor_window.py          # Layer 4 主编辑器、TM 与项目搜索
 ├── qt_settings_dialog.py        # Layer 4 语言资源设置
 ├── qt_termbase_dialog.py        # Layer 4 集中式术语管理
+├── qt_control_styles.py         # Layer 4 共享 popup/menu 视觉合同
 ├── qt_tm_threshold.py           # 双入口 fuzzy threshold 共享控件
 ├── logic_controller.py          # 旧 Excel 无状态三态入口
 ├── excel_adapter*.py            # Excel Layer 4

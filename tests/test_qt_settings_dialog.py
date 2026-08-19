@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
 from editor_controller import EditorController
+from qt_control_styles import LOCALCAT_COMBO_POPUP_STYLE, LOCALCAT_MENU_STYLE
 from qt_settings_dialog import QtSettingsDialog
 from resource_repository import ResourceRepository
 
@@ -231,6 +232,10 @@ class QtSettingsDialogTest(unittest.TestCase):
                 self.assertEqual(kind_input.objectName(), "newResourceKind")
                 self.assertEqual(kind_input.accessibleName(), "资源类型")
                 self.assertEqual(popup.objectName(), "newResourceKindPopup")
+                self.assertEqual(
+                    popup.styleSheet(),
+                    LOCALCAT_COMBO_POPUP_STYLE,
+                )
                 self.assertEqual(
                     rendered["data"],
                     (
@@ -441,6 +446,10 @@ class QtSettingsDialogTest(unittest.TestCase):
             button = dialog.findChild(QToolButton, f"more_{resource.id}")
             self.assertIsNotNone(button)
             assert button is not None
+            menu = button.menu()
+            self.assertIsNotNone(menu)
+            assert menu is not None
+            self.assertEqual(menu.styleSheet(), LOCALCAT_MENU_STYLE)
             expected_button_width = min(
                 40,
                 max(32, button.sizeHint().width() + 8),

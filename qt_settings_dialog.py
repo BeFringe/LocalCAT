@@ -64,6 +64,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController, EditorControllerError
 from qt_termbase_dialog import QtTermbaseDialog
+from qt_control_styles import configure_combo_popup, configure_menu
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -105,30 +106,6 @@ _RESOURCE_KIND_COMBO_STYLE = """
 QComboBox#newResourceKind {
     color: #1f3850;
     background-color: #ffffff;
-}
-"""
-_RESOURCE_KIND_POPUP_STYLE = """
-QAbstractItemView#newResourceKindPopup {
-    color: #1f3850;
-    background-color: #ffffff;
-    selection-color: #0b304c;
-    selection-background-color: #c4e8f2;
-    border: 1px solid #9fb5c8;
-    outline: 0;
-}
-QAbstractItemView#newResourceKindPopup::item {
-    color: #1f3850;
-    background-color: #ffffff;
-    min-height: 30px;
-    padding: 2px 8px;
-}
-QAbstractItemView#newResourceKindPopup::item:hover {
-    color: #16344e;
-    background-color: #e7f4f8;
-}
-QAbstractItemView#newResourceKindPopup::item:selected {
-    color: #0b304c;
-    background-color: #c4e8f2;
 }
 """
 _TM_MODE_LABELS = {
@@ -806,6 +783,7 @@ class QtSettingsDialog(QDialog):
             menu = QMenu(more_button)
             menu.setObjectName(f"resourceMenu_{resource.id}")
             menu.setAccessibleName(f"{resource.name} 的更多操作菜单")
+            configure_menu(menu)
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 action_text, action_tooltip, can_start = self._tm_lifecycle_action_spec(
                     status_by_resource_id.get(resource.id),
@@ -1277,10 +1255,11 @@ class QtSettingsDialog(QDialog):
         kind_input.addItem("翻译记忆库", ResourceKind.TRANSLATION_MEMORY)
         kind_input.addItem("术语表", ResourceKind.TERMBASE)
         kind_input.setStyleSheet(_RESOURCE_KIND_COMBO_STYLE)
-        kind_input.view().setObjectName("newResourceKindPopup")
-        kind_input.view().setAccessibleName("资源类型选项")
-        kind_input.view().setStyleSheet(_RESOURCE_KIND_POPUP_STYLE)
-        kind_input.view().setItemDelegate(QStyledItemDelegate(kind_input.view()))
+        configure_combo_popup(
+            kind_input,
+            object_name="newResourceKindPopup",
+            accessible_name="资源类型选项",
+        )
         layout.addWidget(kind_input)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok

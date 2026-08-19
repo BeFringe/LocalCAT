@@ -26,6 +26,7 @@ from editor_contracts import (
 from editor_controller import EditorController, EditorControllerError
 from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
+from qt_control_styles import LOCALCAT_MENU_STYLE
 from qt_settings_dialog import QtSettingsDialog
 from qt_termbase_dialog import QtTermbaseDialog
 from resource_repository import ResourceRepository
@@ -635,6 +636,13 @@ class QtTermbaseDialogTests(unittest.TestCase):
             self.assertEqual(button.text(), "管理术语")
             self.assertTrue(button.accessibleName())
             self.assertTrue(button.toolTip())
+            add_button = window.add_term_button
+            self.assertEqual(
+                button.fontMetrics().height(),
+                add_button.fontMetrics().height(),
+            )
+            self.assertIn("color: #15283a", window.styleSheet())
+            self.assertIn("border-color: #20a9ce", window.styleSheet())
             inline_chevron_rect = getattr(button, "inlineChevronRect", None)
             self.assertTrue(callable(inline_chevron_rect))
             assert callable(inline_chevron_rect)
@@ -654,6 +662,7 @@ class QtTermbaseDialogTests(unittest.TestCase):
             menu = button.menu()
             self.assertIsInstance(menu, QMenu)
             assert menu is not None
+            self.assertEqual(menu.styleSheet(), LOCALCAT_MENU_STYLE)
             actions = {
                 action.objectName(): action for action in menu.actions()
             }

@@ -191,6 +191,8 @@ def install_macos_app(target_dir: Path | None = None) -> Path:
 
     if sys.platform != "darwin":
         raise RuntimeError("LocalCAT.app installation is only supported on macOS")
+    if _localcat_app_is_running():
+        raise RuntimeError("quit LocalCAT before installing an updated LocalCAT.app")
     from macos_app_launcher import MacOSAppLauncher
 
     root = Path(__file__).resolve().parent
@@ -208,6 +210,34 @@ def install_macos_app(target_dir: Path | None = None) -> Path:
         Path(sys.executable).resolve(),
         Path(__file__).resolve(),
     )
+
+
+def _localcat_app_is_running() -> bool:
+    """Return whether LaunchServices currently owns the LocalCAT bundle id."""
+
+    osascript = Path("/usr/bin/osascript")
+    if not osascript.is_file():
+        raise RuntimeError("macOS application-state inspection is unavailable")
+    script = (
+        "ObjC.import('AppKit'); "
+        "$.NSRunningApplication."
+        "runningApplicationsWithBundleIdentifier('app.localcat.desktop')."
+        "count > 0"
+    )
+    completed = subprocess.run(
+        [str(osascript), "-l", "JavaScript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("unable to inspect running LocalCAT applications")
+    answer = completed.stdout.strip()
+    if answer == "true":
+        return True
+    if answer == "false":
+        return False
+    raise RuntimeError("running LocalCAT application state is invalid")
 
 
 def _write_bundle_smoke_marker(

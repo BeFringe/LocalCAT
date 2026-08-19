@@ -235,8 +235,8 @@ class MacOSAppLauncher:
             Path(bootstrap_value),
             label="configured LocalCAT bootstrap",
         )
-        if executable.read_bytes() != self.__launcher_template.read_bytes():
-            raise ValueError("bundle executable is not the approved native launcher")
+        _ = python_path, bootstrap_path
+        self.__validate_signature(candidate)
 
         self.__cold_launch(candidate)
         return MacOSBundleReport(
@@ -283,6 +283,76 @@ class MacOSAppLauncher:
         }
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump(info, stream, fmt=plistlib.FMT_XML, sort_keys=True)
+        if executable.read_bytes() != self.__launcher_template.read_bytes():
+            raise ValueError("candidate launcher copy is not exact")
+        self.__sign_candidate(candidate)
+
+    @staticmethod
+    def __sign_candidate(bundle: Path) -> None:
+        codesign = _require_absolute_regular_file(
+            Path("/usr/bin/codesign"),
+            label="macOS codesign tool",
+            executable=True,
+        )
+        completed = subprocess.run(
+            [
+                str(codesign),
+                "--force",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                str(bundle),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError("LocalCAT.app could not be signed")
+
+    @staticmethod
+    def __validate_signature(bundle: Path) -> None:
+        signature = _require_absolute_regular_file(
+            bundle / "Contents" / "_CodeSignature" / "CodeResources",
+            label="bundle sealed resources",
+        )
+        if signature.stat().st_size == 0:
+            raise ValueError("bundle sealed resources are empty")
+        codesign = _require_absolute_regular_file(
+            Path("/usr/bin/codesign"),
+            label="macOS codesign tool",
+            executable=True,
+        )
+        verified = subprocess.run(
+            [
+                str(codesign),
+                "--verify",
+                "--deep",
+                "--strict",
+                "--verbose=4",
+                str(bundle),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if verified.returncode != 0:
+            raise ValueError("LocalCAT.app signature is invalid")
+        described = subprocess.run(
+            [str(codesign), "-d", "--verbose=4", str(bundle)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        required = (
+            f"Identifier={LOCALCAT_BUNDLE_IDENTIFIER}",
+            "Info.plist entries=",
+            "Sealed Resources version=",
+        )
+        if described.returncode != 0 or not all(
+            value in described.stderr for value in required
+        ):
+            raise ValueError("LocalCAT.app signed identity is invalid")
 
     @staticmethod
     def __cold_launch(bundle: Path) -> None:

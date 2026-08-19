@@ -63,6 +63,35 @@ class MacOSAppLauncherTests(unittest.TestCase):
             )
             self.assertTrue(executable.stat().st_mode & 0o111)
             self.assertEqual(executable.read_bytes()[:4], b"\xca\xfe\xba\xbe")
+            signature = target / "Contents" / "_CodeSignature" / "CodeResources"
+            self.assertTrue(signature.is_file())
+            verified = subprocess.run(
+                [
+                    "/usr/bin/codesign",
+                    "--verify",
+                    "--deep",
+                    "--strict",
+                    "--verbose=4",
+                    str(target),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            identity = subprocess.run(
+                ["/usr/bin/codesign", "-d", "--verbose=4", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(identity.returncode, 0, identity.stderr)
+            self.assertIn(
+                f"Identifier={LOCALCAT_BUNDLE_IDENTIFIER}",
+                identity.stderr,
+            )
+            self.assertIn("Info.plist entries=", identity.stderr)
+            self.assertIn("Sealed Resources version=", identity.stderr)
             architectures = subprocess.run(
                 ["/usr/bin/lipo", "-archs", str(executable)],
                 capture_output=True,
@@ -259,14 +288,18 @@ class MacOSAppLauncherTests(unittest.TestCase):
             )
             executable = target / "Contents" / "MacOS" / "LocalCAT"
             executable_bytes = executable.read_bytes()
-            executable.write_bytes(
-                executable_bytes[:-1] + bytes((executable_bytes[-1] ^ 0xFF,))
-            )
+            tamper_offset = min(4096, len(executable_bytes) // 3)
+            tampered = bytearray(executable_bytes)
+            tampered[tamper_offset] ^= 0xFF
+            executable.write_bytes(tampered)
             executable.chmod(0o755)
             with self.assertRaises(ValueError):
                 launcher.validate_bundle(target)
-            executable.write_bytes((ROOT / "LocalCAT-launcher").read_bytes())
-            executable.chmod(0o755)
+            _ = launcher.build_bundle(
+                target,
+                Path(sys.executable).resolve(),
+                (ROOT / "qt_editor.py").resolve(),
+            )
             plist_path = target / "Contents" / "Info.plist"
             with plist_path.open("rb") as stream:
                 info = plistlib.load(stream)
@@ -276,6 +309,28 @@ class MacOSAppLauncherTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 launcher.validate_bundle(target)
 
+    def test_install_refuses_to_replace_a_running_app_before_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            applications = (Path(temporary) / "Applications").resolve()
+            applications.mkdir()
+            old_bundle = applications / "LocalCAT.app"
+            old_bundle.mkdir()
+            marker = old_bundle / "old.marker"
+            marker.write_text("keep running bundle", encoding="utf-8")
+
+            with (
+                patch.object(qt_editor, "_localcat_app_is_running", return_value=True),
+                patch("macos_app_launcher.MacOSAppLauncher.build_bundle") as build,
+                self.assertRaisesRegex(RuntimeError, "quit LocalCAT"),
+            ):
+                qt_editor.install_macos_app(applications)
+
+            build.assert_not_called()
+            self.assertEqual(
+                marker.read_text(encoding="utf-8"),
+                "keep running bundle",
+            )
+
     def test_install_cli_is_stdlib_first_and_uses_the_user_applications_target(
         self,
     ) -> None:
@@ -283,7 +338,12 @@ class MacOSAppLauncherTests(unittest.TestCase):
         self.assertTrue(parsed.install_macos_app)
         with tempfile.TemporaryDirectory() as temporary:
             applications = (Path(temporary) / "Applications").resolve()
-            installed = qt_editor.install_macos_app(applications)
+            with patch.object(
+                qt_editor,
+                "_localcat_app_is_running",
+                return_value=False,
+            ):
+                installed = qt_editor.install_macos_app(applications)
             self.assertEqual(installed, applications / "LocalCAT.app")
             self.assertTrue(installed.is_dir())
             with patch.object(
