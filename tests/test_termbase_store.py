@@ -654,6 +654,86 @@ class TermbaseStoreTests(unittest.TestCase):
         self.store.discard(prepared)
         self.assertEqual(tuple(self.path.parent.iterdir()), (self.path,))
 
+    def test_post_replace_programmer_faults_rollback_before_propagating(
+        self,
+    ) -> None:
+        cases = ("directory_fsync", "committed_digest")
+        for case in cases:
+            with self.subTest(case=case):
+                store = TermbaseStore()
+                path = self.path.parent / f"{case}.csv"
+                original = b"Source,old\n"
+                path.write_bytes(original)
+                prepared = store.prepare_create(
+                    path,
+                    TermDraft("New", "value"),
+                )
+                if case == "directory_fsync":
+                    injected = patch(
+                        "termbase_store._fsync_directory",
+                        side_effect=(
+                            TypeError("programmer fsync fault"),
+                            None,
+                        ),
+                    )
+                    message = "programmer fsync fault"
+                else:
+                    injected = patch(
+                        "termbase_store._digest_path",
+                        side_effect=(
+                            prepared.base_digest,
+                            TypeError("programmer digest fault"),
+                            prepared.base_digest,
+                        ),
+                    )
+                    message = "programmer digest fault"
+
+                with injected, self.assertRaisesRegex(TypeError, message):
+                    store.commit(prepared)
+
+                self.assertEqual(path.read_bytes(), original)
+                recovery = prepared.recovery_path
+                self.assertIsNotNone(recovery)
+                assert recovery is not None
+                self.assertTrue(recovery.exists())
+
+    def test_programmer_fault_stays_indeterminate_when_rollback_is_unproven(
+        self,
+    ) -> None:
+        original = b"Source,old\n"
+        self.path.write_bytes(original)
+        prepared = self.store.prepare_create(
+            self.path,
+            TermDraft("New", "value"),
+        )
+        real_replace = os.replace
+        replace_calls = 0
+
+        def fail_rollback_replace(source: Path, target: Path) -> None:
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == 1:
+                real_replace(source, target)
+                return
+            raise OSError("injected rollback failure")
+
+        with (
+            patch(
+                "termbase_store._fsync_directory",
+                side_effect=(TypeError("programmer fsync fault"), None),
+            ),
+            patch(
+                "termbase_store.os.replace",
+                side_effect=fail_rollback_replace,
+            ),
+        ):
+            outcome = self.store.commit(prepared)
+
+        self.assertIs(outcome.state, TermCommitState.INDETERMINATE)
+        self.assertEqual(outcome.error_code, "ROLLBACK_FAILED")
+        self.assertTrue(outcome.quarantined)
+        self.assertTrue(self.recovery_path(prepared).exists())
+
     def test_rollback_replace_failure_is_indeterminate_and_keeps_recovery(
         self,
     ) -> None:

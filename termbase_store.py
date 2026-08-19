@@ -49,6 +49,10 @@ class TermbaseValidationError(ValueError):
         super().__init__(f"{code}{location}")
 
 
+class _TermCommitVerificationError(RuntimeError):
+    """Internal value mismatch after replace, eligible for proven rollback."""
+
+
 class _CapturingLineIterator:
     """Feed ``csv.reader`` while retaining the physical text of each record."""
 
@@ -184,20 +188,33 @@ class TermbaseStore:
 
         try:
             _fsync_directory(resource_path.parent)
-        except Exception:
+        except OSError:
             return self._rollback_after_commit_failure(
                 prepared=prepared,
                 recovery_bytes=recovery_bytes,
                 error_code="DIRECTORY_FSYNC_FAILED",
             )
+        except Exception:
+            rollback = self._rollback_after_commit_failure(
+                prepared=prepared,
+                recovery_bytes=recovery_bytes,
+                error_code="DIRECTORY_FSYNC_FAILED",
+            )
+            if rollback.state is TermCommitState.ROLLED_BACK:
+                raise
+            return rollback
 
         try:
             committed_digest = _digest_path(resource_path)
             if committed_digest != staged_digest:
-                raise RuntimeError("committed digest mismatch")
+                raise _TermCommitVerificationError(
+                    "committed digest mismatch"
+                )
             committed_records = self.list_records(resource_path)
             if committed_records != prepared.candidate_records:
-                raise RuntimeError("committed records mismatch")
+                raise _TermCommitVerificationError(
+                    "committed records mismatch"
+                )
             old_records = self._records_from_bytes(recovery_bytes)
             counts = self._prepared_counts.get(
                 prepared,
@@ -218,12 +235,25 @@ class TermbaseStore:
                 imported=counts[3],
                 overwritten=counts[4],
             )
-        except Exception:
+        except (
+            OSError,
+            TermbaseValidationError,
+            _TermCommitVerificationError,
+        ):
             return self._rollback_after_commit_failure(
                 prepared=prepared,
                 recovery_bytes=recovery_bytes,
                 error_code="COMMIT_VERIFICATION_FAILED",
             )
+        except Exception:
+            rollback = self._rollback_after_commit_failure(
+                prepared=prepared,
+                recovery_bytes=recovery_bytes,
+                error_code="COMMIT_VERIFICATION_FAILED",
+            )
+            if rollback.state is TermCommitState.ROLLED_BACK:
+                raise
+            return rollback
 
         return self._remember_outcome(
             prepared,
