@@ -133,7 +133,7 @@
   - 完成时，Controller 测试可从搜索结果前后导航，同时搜索失败保持原项目和当前位置
   - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 9.1, 9.4_
 
-- [ ] 3.2c 绑定搜索状态与显式清除
+- [x] 3.2c 绑定搜索状态与显式清除
   - Controller issued context 增加 request status，project digest 纳入 confirmed，target/confirmed/filter 任一变化都拒绝旧 hit
   - 公开 `clear_project_search()` 同时清 report、issued hits 与 context，不导航、不修改 project/revision/dirty
   - 完成时，clear、status stale、confirmed-only stale、foreign/tampered request 都在项目状态变化前闭合

@@ -28,6 +28,7 @@ from editor_contracts import (
     ProjectSearchRequest,
     ProjectToolCapability,
     SearchField,
+    SegmentTranslationStatus,
     ResourceConfig,
     ResourceKind,
     RecentProject,
@@ -71,7 +72,11 @@ from resource_importer import (
 )
 from resource_repository import ResourceError, ResourceRepository
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
-from project_search import ProjectSearchError, ProjectSearchService
+from project_search import (
+    ProjectSearchError,
+    ProjectSearchService,
+    segment_translation_status,
+)
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
@@ -503,6 +508,27 @@ def _clone_project_search_report(
     return cloned
 
 
+def _clone_project_search_request(
+    request: ProjectSearchRequest,
+) -> ProjectSearchRequest:
+    """Validate and detach caller-owned search selection state."""
+
+    if type(request) is not ProjectSearchRequest:
+        raise TypeError("project search request must be ProjectSearchRequest")
+    request.__post_init__()
+    cloned = ProjectSearchRequest(
+        query=request.query,
+        fields=tuple(request.fields),
+        options=SearchOptions(
+            match_case=request.options.match_case,
+            whole_word=request.options.whole_word,
+        ),
+        status=request.status,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 def _clone_term_records(
     records: tuple[TermRecord, ...],
 ) -> tuple[TermRecord, ...]:
@@ -600,7 +626,13 @@ def _project_search_fields_digest(project: EditorProject) -> str:
         raise TypeError("project search identity requires EditorProject")
     project.__post_init__()
     payload = tuple(
-        (segment.id, segment.source, segment.target, segment.speaker)
+        (
+            segment.id,
+            segment.source,
+            segment.target,
+            segment.speaker,
+            segment.confirmed,
+        )
         for segment in project.segments
     )
     encoded = json.dumps(
@@ -644,6 +676,7 @@ def _fresh_project_search_unavailable_display(
 def _validate_project_search_report_against_project(
     report: ProjectSearchReport,
     project: EditorProject,
+    request: ProjectSearchRequest,
 ) -> None:
     """Bind issued hit identities and previews to the current project graph."""
 
@@ -651,14 +684,24 @@ def _validate_project_search_report_against_project(
         raise TypeError("project search binding requires ProjectSearchReport")
     if type(project) is not EditorProject:
         raise TypeError("project search binding requires EditorProject")
+    if type(request) is not ProjectSearchRequest:
+        raise TypeError("project search binding requires ProjectSearchRequest")
     report.__post_init__()
     project.__post_init__()
+    request.__post_init__()
     for hit in report.hits:
         if hit.segment_index >= len(project.segments):
             raise ValueError("project search hit index is outside the project")
         segment = project.segments[hit.segment_index]
         if segment.id != hit.segment_id:
             raise ValueError("project search hit identity does not match the project")
+        if hit.field not in request.fields:
+            raise ValueError("project search hit field was not requested")
+        if (
+            request.status is not None
+            and segment_translation_status(segment) is not request.status
+        ):
+            raise ValueError("project search hit status was not requested")
         if hit.field is SearchField.SOURCE:
             field_text = segment.source
         elif hit.field is SearchField.TARGET:
@@ -802,7 +845,17 @@ class EditorController:
         self._tm_query_epoch = 0
         self._current_project_search_report: ProjectSearchReport | None = None
         self._issued_project_search_hits: tuple[ProjectSearchHit, ...] = ()
-        self._issued_project_search_context: tuple[str, int, str] | None = None
+        self._issued_project_search_public_hits: tuple[
+            ProjectSearchHit,
+            ...,
+        ] = ()
+        self._issued_project_search_context: tuple[
+            str,
+            int,
+            str,
+            tuple[SearchField, ...],
+            SegmentTranslationStatus | None,
+        ] | None = None
         self._issued_tm_suggestions: tuple[TMSuggestion, ...] = ()
         self._issued_legacy_tm_suggestions: tuple[
             LegacyExactTMSuggestion,
@@ -925,11 +978,17 @@ class EditorController:
 
         with self._tm_query_lock:
             report = self._current_project_search_report
-            return (
-                None
-                if report is None
-                else _clone_project_search_report(report)
-            )
+            if report is None:
+                return None
+            public_report = _clone_project_search_report(report)
+            self._issued_project_search_public_hits += public_report.hits
+            return public_report
+
+    def clear_project_search(self) -> None:
+        """Clear only current project-search report and issued membership."""
+
+        with self._tm_query_lock:
+            self._clear_project_search_state()
 
     def project_tool_capability(self) -> ProjectToolCapability:
         """Project the single-JSON tool gate from the sole project session."""
@@ -1010,13 +1069,9 @@ class EditorController:
 
         with self._tm_query_lock:
             _ = self._require_project_search_json_gate()
-            if type(request) is not ProjectSearchRequest:
-                raise TypeError(
-                    "project search request must be ProjectSearchRequest"
-                )
-            request.__post_init__()
+            private_request = _clone_project_search_request(request)
             handoff = self._capture_project_search_handoff()
-            self._authorize_project_search_request(handoff, request)
+            self._authorize_project_search_request(handoff, private_request)
             matcher = handoff.matcher
             if matcher is None:
                 raise EditorControllerError(
@@ -1026,7 +1081,7 @@ class EditorController:
             try:
                 report = ProjectSearchService(matcher).search(
                     self.project,
-                    request,
+                    private_request,
                 )
             except ProjectSearchError as error:
                 raise EditorControllerError(error.code) from error
@@ -1035,6 +1090,7 @@ class EditorController:
                 _validate_project_search_report_against_project(
                     private_report,
                     self.project,
+                    private_request,
                 )
             except ValueError as error:
                 raise EditorControllerError(
@@ -1053,6 +1109,8 @@ class EditorController:
                     self._project_session_id,
                     handoff.generation,
                     _project_search_fields_digest(self.project),
+                    tuple(private_request.fields),
+                    private_request.status,
                 )
                 public_report = _clone_project_search_report(
                     private_report
@@ -1063,6 +1121,7 @@ class EditorController:
                 ) from error
             self._current_project_search_report = private_report
             self._issued_project_search_hits = issued_hits
+            self._issued_project_search_public_hits = public_report.hits
             self._issued_project_search_context = issued_context
             return public_report
 
@@ -1079,6 +1138,13 @@ class EditorController:
                 raise EditorControllerError(
                     "PROJECT_SEARCH.NO_ISSUED_REPORT"
                 )
+            if not any(
+                hit is public_hit
+                for public_hit in self._issued_project_search_public_hits
+            ):
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.HIT_NOT_ISSUED"
+                )
             try:
                 candidate = replace(hit)
                 candidate.__post_init__()
@@ -1088,9 +1154,13 @@ class EditorController:
                 ) from error
 
             handoff = self._capture_project_search_handoff()
-            issued_session_id, issued_generation, issued_project_digest = (
-                context
-            )
+            (
+                issued_session_id,
+                issued_generation,
+                issued_project_digest,
+                issued_fields,
+                issued_status,
+            ) = context
             if (
                 issued_session_id != self._project_session_id
                 or issued_session_id != capability.project_session_id
@@ -1129,6 +1199,14 @@ class EditorController:
                 != issued.segment_id
             ):
                 raise EditorControllerError("PROJECT_SEARCH.STALE_PROJECT")
+            segment = self.project.segments[issued.segment_index]
+            if issued.field not in issued_fields:
+                raise EditorControllerError("PROJECT_SEARCH.STALE_REQUEST")
+            if (
+                issued_status is not None
+                and segment_translation_status(segment) is not issued_status
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_REQUEST")
             return self.go_to(issued.segment_index)
 
     def _require_project_search_json_gate(self) -> ProjectToolCapability:
@@ -2490,6 +2568,7 @@ class EditorController:
 
         self._current_project_search_report = None
         self._issued_project_search_hits = ()
+        self._issued_project_search_public_hits = ()
         self._issued_project_search_context = None
 
     def _tm_signature(

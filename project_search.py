@@ -81,7 +81,7 @@ class ProjectSearchService:
         for segment_index, segment in enumerate(project.segments):
             if (
                 request.status is not None
-                and _segment_translation_status(segment) is not request.status
+                and segment_translation_status(segment) is not request.status
             ):
                 continue
             for field in _FIELD_ORDER:
@@ -140,9 +140,14 @@ def _field_text(segment: EditorSegment, field: SearchField) -> str:
     return segment.speaker
 
 
-def _segment_translation_status(
+def segment_translation_status(
     segment: EditorSegment,
 ) -> SegmentTranslationStatus:
+    """Derive the sole frozen translation state before matching fields."""
+
+    if type(segment) is not EditorSegment:
+        raise TypeError("segment translation status requires EditorSegment")
+    segment.__post_init__()
     if segment.confirmed:
         return SegmentTranslationStatus.TRANSLATED
     if segment.target.strip() == "":
@@ -160,4 +165,8 @@ def _display_from_core(
     )
 
 
-__all__ = ["ProjectSearchError", "ProjectSearchService"]
+__all__ = [
+    "ProjectSearchError",
+    "ProjectSearchService",
+    "segment_translation_status",
+]

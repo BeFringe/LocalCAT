@@ -17,6 +17,7 @@ from editor_contracts import (
     ProjectSearchRequest,
     ProjectToolCapability,
     SearchField,
+    SegmentTranslationStatus,
     TextMatcherDisplayState,
 )
 from editor_controller import EditorController, EditorControllerError
@@ -40,15 +41,18 @@ def _request(
     query: str = "needle",
     *,
     options: SearchOptions = _BASIC_OPTIONS,
+    fields: tuple[SearchField, ...] = (
+        SearchField.SOURCE,
+        SearchField.TARGET,
+        SearchField.SPEAKER,
+    ),
+    status: SegmentTranslationStatus | None = None,
 ) -> ProjectSearchRequest:
     return ProjectSearchRequest(
         query=query,
-        fields=(
-            SearchField.SOURCE,
-            SearchField.TARGET,
-            SearchField.SPEAKER,
-        ),
+        fields=fields,
         options=options,
+        status=status,
     )
 
 
@@ -374,6 +378,20 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
         self.assertEqual(fresh, report)
         self.assertIsNot(fresh, report)
         self.assertIsNot(fresh.hits[0], report.hits[0])
+        self.controller.go_to_search_hit(fresh.hits[0])
+        foreign_equal = ProjectSearchHit(
+            segment_id=fresh.hits[0].segment_id,
+            segment_index=fresh.hits[0].segment_index,
+            field=fresh.hits[0].field,
+            start_index=fresh.hits[0].start_index,
+            end_index=fresh.hits[0].end_index,
+            preview=fresh.hits[0].preview,
+        )
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.HIT_NOT_ISSUED$",
+        ):
+            self.controller.go_to_search_hit(foreign_equal)
         object.__setattr__(report.hits[0], "segment_index", 2)
         before_project = self.controller.project
         before_index = self.controller.current_index
@@ -433,6 +451,100 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
         self.assertIs(self.controller.project, replacement_project)
         self.assertEqual(self.controller.project_session_id, replacement_session)
         self.assertEqual(self.controller.current_index, 0)
+
+    def test_clear_removes_public_and_private_issuance_without_project_change(
+        self,
+    ) -> None:
+        self._validate_basic()
+        self.controller.open_project(self.project_path)
+        self.controller.update_target("unsaved needle remains")
+        report = self.controller.search_project(_request())
+        before_project = self.controller.project
+        before_index = self.controller.current_index
+        before_dirty = self.controller.dirty
+        before_epoch = self.controller.query_epoch
+
+        self.controller.clear_project_search()
+
+        self.assertIsNone(self.controller.current_project_search_report)
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.NO_ISSUED_REPORT$",
+        ):
+            self.controller.go_to_search_hit(report.hits[0])
+        self.assertIs(self.controller.project, before_project)
+        self.assertEqual(self.controller.current_index, before_index)
+        self.assertEqual(self.controller.dirty, before_dirty)
+        self.assertEqual(self.controller.query_epoch, before_epoch)
+
+    def test_filter_reissue_and_confirmed_only_change_reject_old_hits(
+        self,
+    ) -> None:
+        self._validate_basic()
+        self.controller.open_project(self.project_path)
+        first = self.controller.search_project(
+            _request(
+                fields=(SearchField.SOURCE,),
+                status=None,
+            )
+        )
+        old_shared_hit = first.hits[0]
+        second = self.controller.search_project(
+            _request(
+                fields=(SearchField.SOURCE, SearchField.TARGET),
+                status=SegmentTranslationStatus.DRAFT,
+            )
+        )
+        self.assertEqual(old_shared_hit, second.hits[0])
+
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.HIT_NOT_ISSUED$",
+        ):
+            self.controller.go_to_search_hit(old_shared_hit)
+
+        draft_hit = second.hits[0]
+        before_target = self.controller.current_segment.target
+        outcome = self.controller.confirm_current()
+        self.assertTrue(outcome.write_report.succeeded)
+        self.assertEqual(self.controller.project.segments[0].target, before_target)
+        self.assertTrue(self.controller.project.segments[0].confirmed)
+        after_confirm_project = self.controller.project
+        after_confirm_index = self.controller.current_index
+
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT_SEARCH\\.STALE_PROJECT$",
+        ):
+            self.controller.go_to_search_hit(draft_hit)
+        self.assertIs(self.controller.project, after_confirm_project)
+        self.assertEqual(self.controller.current_index, after_confirm_index)
+
+    def test_foreign_or_tampered_status_request_never_reaches_matcher(self) -> None:
+        self._validate_basic()
+        self.controller.open_project(self.project_path)
+        malformed = object.__new__(ProjectSearchRequest)
+        object.__setattr__(malformed, "query", "needle")
+        object.__setattr__(malformed, "fields", (SearchField.SOURCE,))
+        object.__setattr__(malformed, "options", _BASIC_OPTIONS)
+        object.__setattr__(malformed, "status", SearchField.SOURCE)
+        before_project = self.controller.project
+        before_index = self.controller.current_index
+
+        with patch.object(
+            self.controller,
+            "text_matcher_handoff",
+            wraps=self.controller.text_matcher_handoff,
+        ) as handoff, self.assertRaisesRegex(
+            TypeError,
+            "project search status must be SegmentTranslationStatus or None",
+        ):
+            self.controller.search_project(malformed)
+
+        handoff.assert_not_called()
+        self.assertIsNone(self.controller.current_project_search_report)
+        self.assertIs(self.controller.project, before_project)
+        self.assertEqual(self.controller.current_index, before_index)
 
     def test_empty_no_result_and_service_rejection_never_move_or_mutate(self) -> None:
         self._validate_basic()
