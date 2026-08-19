@@ -202,7 +202,7 @@
   - _Depends: 1.1a, 2.6, 3.1a, 3.2a, 4.3_
 
 - [x] 4.3b 收纳项目搜索表面并增加清除与状态入口
-  - 在顶栏增加 checkable 放大镜，搜索面板默认折叠；点击或 `Ctrl+F` 展开并聚焦，工作区模式切换保留展开状态
+  - 在顶栏增加 checkable 放大镜，搜索面板默认折叠；点击或平台原生 Find 快捷键开关不重排主 workspace 的顶部浮层，展开时聚焦，工作区模式切换保留展开状态
   - 增加显式“清除”和全部/未填写/草稿/已翻译筛选；clear 保留字段、options、status 与面板展开状态
   - 只有项目和 matcher capability 可用时才启用执行；无项目/TXT/sample/foreign handoff 继续 fail closed，Qt 不保存第二份 project/report authority
   - 完成时，mouse/Tab/Enter/Space/`Ctrl+F`、折叠、clear、状态筛选和无副作用由 QtTest 证明

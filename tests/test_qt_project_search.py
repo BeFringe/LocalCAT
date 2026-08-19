@@ -425,7 +425,7 @@ class QtProjectSearchTests(unittest.TestCase):
 
     def test_keyboard_accessibility_and_layer4_boundary(self) -> None:
         self._validate_basic()
-        window = self._open_window()
+        window = self._open_window(expand_search=False)
 
         search_shortcut = window.project_search_shortcut
         self.assertEqual(
@@ -523,6 +523,54 @@ class QtProjectSearchTests(unittest.TestCase):
         self.assertTrue(window.close_current_project())
         self.assertFalse(window.project_search_panel.isVisible())
         self.assertFalse(window.project_search_toggle.isEnabled())
+
+    def test_native_find_shortcut_toggles_overlay_without_moving_editor_actions(
+        self,
+    ) -> None:
+        self._validate_basic()
+        window = self._open_window(expand_search=False)
+        self._events()
+        self._events()
+        workspace_geometry = window.main_splitter.geometry()
+        action_centers = tuple(
+            button.mapTo(window, button.rect().center())
+            for button in (
+                window.previous_button,
+                window.next_button,
+                window.confirm_button,
+            )
+        )
+
+        window.target_editor.setFocus()
+        QTest.keyClick(
+            window.target_editor,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self._events()
+
+        self.assertTrue(window.project_search_panel.isVisible())
+        self.assertEqual(window.main_splitter.geometry(), workspace_geometry)
+        self.assertEqual(
+            tuple(
+                button.mapTo(window, button.rect().center())
+                for button in (
+                    window.previous_button,
+                    window.next_button,
+                    window.confirm_button,
+                )
+            ),
+            action_centers,
+        )
+
+        QTest.keyClick(
+            window.project_search_input,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self._events()
+        self.assertFalse(window.project_search_panel.isVisible())
+        self.assertEqual(window.main_splitter.geometry(), workspace_geometry)
 
     def test_explicit_clear_and_status_filter_share_controller_issuance(
         self,

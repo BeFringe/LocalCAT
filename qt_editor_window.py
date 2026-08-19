@@ -322,6 +322,7 @@ class QtEditorWindow(QMainWindow):
         self.save_button: QToolButton
         self.settings_button: QToolButton
         self.project_search_toggle: QToolButton
+        self.editor_page: QWidget
         self.empty_open_button: QPushButton
         self.sample_button: QPushButton
         self.main_splitter: ResponsiveSplitter
@@ -598,10 +599,12 @@ class QtEditorWindow(QMainWindow):
     def _build_editor_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("editorPage")
+        self.editor_page = page
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        layout.addWidget(self._build_project_search_bar())
+        search_panel = self._build_project_search_bar()
+        search_panel.setParent(page)
 
         self.main_splitter = ResponsiveSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setObjectName("mainWorkspaceSplitter")
@@ -623,6 +626,7 @@ class QtEditorWindow(QMainWindow):
         self.workspace_pages.addWidget(self.main_splitter)
         self.workspace_pages.addWidget(self._build_browse_panel())
         layout.addWidget(self.workspace_pages)
+        QTimer.singleShot(0, self._position_project_search_overlay)
         return page
 
     def _build_project_search_bar(self) -> QWidget:
@@ -1110,12 +1114,12 @@ class QtEditorWindow(QMainWindow):
             shortcut.activated.connect(callback)
             self.shortcuts[name] = shortcut
         self.project_search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
-        self.project_search_shortcut.setObjectName("projectSearchFocusShortcut")
+        self.project_search_shortcut.setObjectName("projectSearchToggleShortcut")
         self.project_search_shortcut.setContext(
             Qt.ShortcutContext.WindowShortcut
         )
         self.project_search_shortcut.activated.connect(
-            self._focus_project_search
+            self._toggle_project_search_shortcut
         )
         self._install_target_editor_shortcuts()
         self._update_shortcut_tooltips()
@@ -1193,12 +1197,21 @@ class QtEditorWindow(QMainWindow):
             f"执行当前项目搜索；{project_search_shortcut} 聚焦关键词"
         )
 
-    def _focus_project_search(self) -> None:
+    def _toggle_project_search_shortcut(self) -> None:
         if not self.controller.has_project:
             return
-        self._set_project_search_expanded(True)
-        self.project_search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
-        self.project_search_input.selectAll()
+        if self.project_search_panel.isVisible():
+            self._set_project_search_expanded(False)
+            if self.workspace_mode is WorkspaceMode.EDIT:
+                self.target_editor.setFocus(
+                    Qt.FocusReason.ShortcutFocusReason
+                )
+            else:
+                self.browse_table.setFocus(
+                    Qt.FocusReason.ShortcutFocusReason
+                )
+            return
+        self._set_project_search_expanded(True, focus=True)
 
     def _project_search_toggled(self, expanded: bool) -> None:
         self._set_project_search_expanded(expanded, focus=expanded)
@@ -1211,7 +1224,10 @@ class QtEditorWindow(QMainWindow):
     ) -> None:
         visible = bool(expanded and self.controller.has_project)
         self._project_search_expanded = visible
+        self._position_project_search_overlay()
         self.project_search_panel.setVisible(visible)
+        if visible:
+            self.project_search_panel.raise_()
         blocker = QSignalBlocker(self.project_search_toggle)
         try:
             self.project_search_toggle.setChecked(visible)
@@ -1222,6 +1238,25 @@ class QtEditorWindow(QMainWindow):
                 Qt.FocusReason.ShortcutFocusReason
             )
             self.project_search_input.selectAll()
+
+    def _position_project_search_overlay(self) -> None:
+        """Anchor the transient search surface without reflowing the editor."""
+
+        if not hasattr(self, "editor_page") or not hasattr(
+            self,
+            "project_search_panel",
+        ):
+            return
+        margin = 14
+        width = max(1, self.editor_page.width() - (2 * margin))
+        self.project_search_panel.setFixedWidth(width)
+        height = self.project_search_panel.sizeHint().height()
+        self.project_search_panel.setGeometry(
+            margin,
+            margin,
+            width,
+            height,
+        )
 
     def _project_search_criteria_changed(self, _value: object) -> None:
         if self._refreshing:
@@ -2607,6 +2642,7 @@ class QtEditorWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        self._position_project_search_overlay()
         self._schedule_layout_refresh()
 
     def closeEvent(self, event: QCloseEvent) -> None:
