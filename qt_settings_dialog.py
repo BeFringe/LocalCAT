@@ -312,6 +312,7 @@ class QtSettingsDialog(QDialog):
     resources_changed = Signal()
     import_completed = Signal(object)
     tm_threshold_changed = Signal(object)
+    term_suggestions_changed = Signal()
 
     def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -873,7 +874,14 @@ class QtSettingsDialog(QDialog):
             resource.name,
             self,
         )
+        dialog.terms_committed.connect(self._term_suggestions_committed)
         dialog.exec()
+
+    def _term_suggestions_committed(self) -> None:
+        """Refresh settings and forward one committed term publication."""
+
+        self.refresh_resources()
+        self.term_suggestions_changed.emit()
 
     @staticmethod
     def _tm_kind_projection(

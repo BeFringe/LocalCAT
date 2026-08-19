@@ -254,7 +254,7 @@
   - 完成时，三个快捷键、普通输入、suggestion 单步撤销、确认状态和空栈行为全部通过 QtTest
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
 
-- [ ] 4.7a 建立术语变更的主窗口刷新协调
+- [x] 4.7a 建立术语变更的主窗口刷新协调
   - committed term mutation 从同一 Controller 会话刷新资源状态与当前 suggestions；非 committed outcome 只显示错误/recovery/quarantine
   - 对话框不维护项目、术语或 Engine 副本，失败操作不得渲染部分新状态
   - 完成时，创建、修改、删除只在 committed 后立即改变当前 term suggestions，切段或重开不会恢复旧 Engine

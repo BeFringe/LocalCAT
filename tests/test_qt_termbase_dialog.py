@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -24,6 +25,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController, EditorControllerError
 from qt_editor import _compose_editor_controller
+from qt_editor_window import QtEditorWindow
 from qt_settings_dialog import QtSettingsDialog
 from qt_termbase_dialog import QtTermbaseDialog
 from resource_repository import ResourceRepository
@@ -595,6 +597,172 @@ class QtTermbaseDialogTests(unittest.TestCase):
             manage.trigger()
             self.assertEqual(len(opened), 1)
             settings.close()
+
+    def test_committed_crud_refreshes_current_window_suggestions_immediately(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, composition, _repository, resource_id, _tm_id = (
+                self._controller(root)
+            )
+            _ = composition.matcher_validation_owner.validate_text_v1(
+                generated_at_utc=_GENERATED_AT,
+                valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=_EVALUATED_AT,
+            )
+            controller.reload_resources()
+            project_path = root / "project.json"
+            _ = project_path.write_text(
+                json.dumps(
+                    {
+                        "name": "Term refresh journey",
+                        "source_locale": "en-US",
+                        "target_locale": "zh-CN",
+                        "segments": [
+                            {
+                                "id": "segment-1",
+                                "source": "Fresh appears here.",
+                                "target": "",
+                                "speaker": "",
+                                "confirmed": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            controller.open_project(project_path)
+            window = QtEditorWindow(controller)
+            window.show()
+            self._events()
+            self.assertEqual(window.current_suggestions.terms, ())
+            settings = window.create_settings_dialog()
+            resource = next(
+                item
+                for item in controller.list_resources()
+                if item.id == resource_id
+            )
+            more = settings.findChild(QToolButton, f"more_{resource_id}")
+            self.assertIsNotNone(more)
+            assert more is not None and more.menu() is not None
+            manage = next(
+                action
+                for action in more.menu().actions()
+                if action.objectName() == f"manageTerms_{resource_id}"
+            )
+            observed: list[tuple[str, ...]] = []
+
+            def operate_dialog() -> None:
+                active = QApplication.activeModalWidget()
+                if not isinstance(active, QtTermbaseDialog):
+                    raise AssertionError("term dialog must be active")
+                QTest.mouseClick(
+                    active.create_button,
+                    Qt.MouseButton.LeftButton,
+                )
+                active.source_input.setText("Fresh")
+                active.target_input.setText("first-target")
+                QTest.mouseClick(
+                    active.save_button,
+                    Qt.MouseButton.LeftButton,
+                )
+                self._events()
+                observed.append(
+                    tuple(
+                        item.target_term
+                        for item in window.current_suggestions.terms
+                    )
+                )
+
+                active.target_input.setText("second-target")
+                QTest.mouseClick(
+                    active.save_button,
+                    Qt.MouseButton.LeftButton,
+                )
+                self._events()
+                observed.append(
+                    tuple(
+                        item.target_term
+                        for item in window.current_suggestions.terms
+                    )
+                )
+
+                with patch.object(
+                    active,
+                    "_confirm_delete",
+                    return_value=True,
+                ):
+                    QTest.mouseClick(
+                        active.delete_button,
+                        Qt.MouseButton.LeftButton,
+                    )
+                self._events()
+                observed.append(
+                    tuple(
+                        item.target_term
+                        for item in window.current_suggestions.terms
+                    )
+                )
+                active.close()
+
+            with patch.object(
+                window,
+                "refresh_suggestions",
+                wraps=window.refresh_suggestions,
+            ) as refresh:
+                QTimer.singleShot(0, operate_dialog)
+                manage.trigger()
+
+            self.assertEqual(
+                observed,
+                [("first-target",), ("second-target",), ()],
+            )
+            self.assertEqual(refresh.call_count, 3)
+            self.assertIsNone(QApplication.activeModalWidget())
+            settings.close()
+            window._confirm_unsaved = lambda: True
+            window.close()
+
+    def test_noncommitted_term_outcome_emits_no_refresh_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _composition, _repository, resource_id, _tm_id = (
+                self._controller(root)
+            )
+            dialog = QtTermbaseDialog(
+                controller,
+                resource_id,
+                "Project terminology",
+            )
+            emissions: list[None] = []
+            dialog.terms_committed.connect(lambda: emissions.append(None))
+            dialog.create_button.click()
+            dialog.source_input.setText("Uncommitted")
+            dialog.target_input.setText("unchanged")
+            outcome = TermCommitOutcome(
+                state=TermCommitState.NOT_COMMITTED,
+                report=None,
+                error_code="SOURCE_CHANGED",
+                retryable=True,
+                recovery_path=None,
+                quarantined=False,
+                safe_detail=(
+                    "Prepare the termbase change again before retrying."
+                ),
+            )
+            with patch.object(
+                controller,
+                "create_term",
+                return_value=outcome,
+            ):
+                dialog.save_button.click()
+            self.assertEqual(emissions, [])
+            self.assertIn(
+                TermCommitState.NOT_COMMITTED.value,
+                dialog.feedback_label.text(),
+            )
+            dialog.close()
 
     def test_layer4_ast_boundary_forbids_store_engine_and_core_authorities(self) -> None:
         forbidden = {

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -97,6 +97,8 @@ def _controller_error_feedback(error: EditorControllerError) -> str:
 
 class QtTermbaseDialog(QDialog):
     """Manage one writable termbase exclusively through EditorController."""
+
+    terms_committed = Signal()
 
     def __init__(
         self,
@@ -356,6 +358,7 @@ class QtTermbaseDialog(QDialog):
         if selection >= 0:
             self.term_table.setCurrentCell(selection, 0)
             self.term_table.selectRow(selection)
+            self._load_selected()
         else:
             self._selected_record = None
             self._creating = True
@@ -524,6 +527,7 @@ class QtTermbaseDialog(QDialog):
                 preferred_row=preferred_row,
             )
             self._show_feedback("术语变更已保存。", failed=False)
+            self.terms_committed.emit()
             return
 
         error_code = (

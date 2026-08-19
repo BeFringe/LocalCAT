@@ -2144,6 +2144,9 @@ class QtEditorWindow(QMainWindow):
         dialog = QtSettingsDialog(self.controller, self)
         dialog.resources_changed.connect(self._resources_changed)
         dialog.tm_threshold_changed.connect(self._settings_tm_threshold_changed)
+        dialog.term_suggestions_changed.connect(
+            self._term_suggestions_changed
+        )
         self.settings_dialog = dialog
         return dialog
 
@@ -2151,6 +2154,11 @@ class QtEditorWindow(QMainWindow):
         if self.controller.has_project:
             self.refresh_suggestions()
         self.statusBar().showMessage("语言资源已更新，当前段建议已刷新。", 6000)
+
+    def _term_suggestions_changed(self) -> None:
+        if self.controller.has_project:
+            self.refresh_suggestions()
+        self.statusBar().showMessage("术语已更新，当前段建议已刷新。", 6000)
 
     def refresh_suggestions(self) -> SuggestionBundle:
         """Render the current controller bundle as safe, actionable cards."""
