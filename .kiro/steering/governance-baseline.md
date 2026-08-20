@@ -119,7 +119,7 @@ LocalCAT 治理系统是一个**双层认知架构**，核心问题是：如何�
 | 严格的向下依赖（L4→L3→L2→L1） | 红线 | structure.md |
 | LogicController 无状态 | 红线 | product.md |
 | 数据合约使用 frozen dataclass | 红线 | tech.md |
-| Parser → Engine 单向依赖 | 红线 | spec/design.md |
+| Parser 与 Engine 互不导入；Application 映射中立 parsed records | 红线 | ADR-015 |
 | Trie 用于 Glossary | 灰线→ADR 候选 | tech.md（记录为决策） |
 | 具体文件命名 | 灰线 | structure.md |
 

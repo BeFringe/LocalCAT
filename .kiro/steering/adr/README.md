@@ -17,8 +17,8 @@
 | ADR-001 | 已采纳 | Glossary 匹配结构 |
 | ADR-002 | 已采纳（部分被 ADR-007 取代） | legacy TM 存储与冲突策略 |
 | ADR-003 | 已采纳 | Excel 运行时依赖隔离 |
-| ADR-004 | 已采纳 | Parser 与 Engine 依赖方向 |
-| ADR-005 | 已采纳 | Parser 抽象入口 |
+| ADR-004 | 已取代（ADR-015） | Parser 与 Engine 依赖方向 |
+| ADR-005 | 已取代（ADR-015） | Parser 抽象入口 |
 | ADR-006 | 已采纳（部分被 ADR-007 取代） | legacy TM 精确索引策略 |
 | ADR-007 | 已采纳 | SQLite canonical TM 与外部源兼容边界 |
 | ADR-008 | 已采纳 | sealed/active 内容证明发布链 |
@@ -28,6 +28,7 @@
 | ADR-012 | 已采纳 | 未发布的首次激活残留不构成 canonical authority |
 | ADR-013 | 已采纳 | Gate D 跨进程证据重授权模型 |
 | ADR-014 | 已采纳 | 设备本地预处理偏好的 workspace 持久化 |
+| ADR-015 | 已采纳 | Parser/Codec 中立边界、用途感知选择与能力式扩展 |
 | ADR-016 | 已采纳 | 已发布 canonical authority 的设备身份重新证明 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。

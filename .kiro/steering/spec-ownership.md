@@ -20,9 +20,10 @@
 |---|---|---|
 | `feature5` | `tm-storage-retrieval-index` | 从 `ui-mvp` 基线继承的 `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`qt-editor-font-zoom`、Parser 与未来格式规格 |
 | `ui-mvp` | `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`qt-editor-font-zoom`；维护既有 `qt-editor-mvp` 验证事实 | Parser 与未来格式规格；Feature 5 Core 正式规格由精确 merge 继承，不在 UI 线重写 |
+| `parser-rebaseline` | `parser-subsystem-extraction` | `qt-editor-json-mvp-increment`、`feature5-ui-integration`、`tm-storage-retrieval-index`、`multi-document-project-workspace`、`rpy-project-codec`、`xliff-project-codec`、`tmx-context-interchange`、`speaker-display-profiles` 等相邻规格 |
 | `governance/kiro-steering` | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
 
-`feature5-ui-integration.md`、`feature5-ui-integration-review-clustering.md`、`roadmap.md` 和 `repository-safety.md` 是共享治理文件。任一垂直线发现冲突时可以提出修订，但共享补丁只能在 `ui-mvp` 提交一次，再通过可追踪 merge 由其他活动线继承，并同时复核三侧正式 Requirements/Design。`feature5-ui-integration` 的 Spec 与集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
+`feature5-ui-integration.md` 与 `feature5-ui-integration-review-clustering.md` 是 `ui-mvp` 拥有的跨层集成 Spec；`roadmap.md`、`repository-safety.md` 与其他 `.kiro/steering/**` 共享治理文件只由 `governance/kiro-steering` 提交。任一垂直线发现冲突时可以提出修订，但治理补丁必须先在治理线形成唯一提交，再通过可追踪 merge 由活动线继承，并同时复核受影响的正式 Requirements/Design。`feature5-ui-integration` 的集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
 
 ## 当前规格权威顺序
 
@@ -31,7 +32,7 @@
 3. `brief.md`、`research.md` 和旧横向规格仅作为来源与历史上下文；
 4. 对话、截图和 Agent 记忆只用于抢救缺失裁决：若能从成功补丁链逐字恢复并核对原审批记录，可保留历史阶段；凡依据摘要、现状或推断重新生成/改写的内容，必须写回正式文件并重新过人工审批门。
 
-旧 `qt-editor-mvp` 是已完成的横向基线；`qt-editor-json-mvp-increment` 是当前 Qt 单 JSON 纵向权威；`feature5-ui-integration` 是 Feature 5/Core 与 UI 的独立跨层权威；`qt-editor-font-zoom` 是独立 Qt 规格；`tm-storage-retrieval-index` 是 Feature 5 Core 唯一可写规格。Parser 与多文档/格式 briefs 不属于当前两条实施线。
+旧 `qt-editor-mvp` 是已完成的横向基线；`qt-editor-json-mvp-increment` 是当前 Qt 单 JSON 纵向权威；`feature5-ui-integration` 是 Feature 5/Core 与 UI 的独立跨层权威；`qt-editor-font-zoom` 是独立 Qt 规格；`tm-storage-retrieval-index` 是 Feature 5 Core 唯一可写规格。`parser-subsystem-extraction` 仅由 `parser-rebaseline` 线就地重新基线；多文档与未来格式 briefs 在该线保持只读。Parser runtime 的可写代码边界须等待获批的 Design/Tasks，不由本表提前授权。
 
 ## 暂存与提交规则
 

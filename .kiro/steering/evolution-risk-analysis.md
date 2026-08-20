@@ -36,13 +36,13 @@ tech.md 中记录了多个架构决策，但它们是作为"技术栈说明"存�
 - TM-priority strategy（业务逻辑决策）
 - 条件性 openpyxl import（依赖管理决策）
 
-parser-subsystem design.md 中也包含 ADR 级别的架构决策：
-- Parser → Engine 单向依赖（子系统边界决策）
-- ParserRegistry 全局单例定位（组件职责决策）
-- BaseParser 作为唯一抽象接口（扩展策略决策）
+历史 parser-subsystem design.md 中也包含过 ADR 级别的架构决策：
+- Parser → Engine 单向依赖（已由 ADR-015 的互不导入边界取代）
+- ParserRegistry 全局单例定位（遗留草案，不再是正面权威）
+- BaseParser 作为唯一抽象接口（已由 ADR-015 的行为/capability 合同取代）
 
 **后果：**
-- 后续功能可能无意中引入违反这些决策的实现（如 Parser 直接依赖 TM Engine 内部结构）
+- 后续功能可能无意中引入违反当前决策的实现（如 Parser 直接依赖 TM Engine 内部结构，或 Engine/Store 反向依赖 Parser）
 - Agent 或人类开发者无法区分"临时选择"和"不可逆决策"
 - tech.md 和 spec 归档后，这些决策失去可见性
 
