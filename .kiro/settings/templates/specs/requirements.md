@@ -1,39 +1,39 @@
-# Requirements Document
+# 需求文档
 
-## Introduction
+## 简介
 {{INTRODUCTION}}
 
-<!-- Optional when scope could be misread or the feature touches adjacent systems/specs -->
-## Boundary Context (Optional)
-- **In scope**: {{IN_SCOPE_BEHAVIORS}}
-- **Out of scope**: {{OUT_OF_SCOPE_BEHAVIORS}}
-- **Adjacent expectations**: {{ADJACENT_SYSTEM_OR_SPEC_EXPECTATIONS}}
+<!-- 当范围可能被误读或功能触及相邻系统/规格时必填 -->
+## 边界说明
+- **范围内**：{{IN_SCOPE_BEHAVIORS}}
+- **范围外**：{{OUT_OF_SCOPE_BEHAVIORS}}
+- **相邻期望**：{{ADJACENT_SYSTEM_OR_SPEC_EXPECTATIONS}}
 
-<!-- Required when amending an existing spec, reintroducing previously excluded scope, or depending on an adjacent spec -->
-## Scope Lineage (Conditional)
-- **Owning spec**: {{OWNING_SPEC}}
-- **Existing scope statement being amended**: {{EXISTING_SCOPE_REFERENCE_OR_NONE}}
-- **Adjacent specs / contracts**: {{ADJACENT_SPEC_REFERENCES_OR_NONE}}
-- **Approval status**: {{APPROVED_REFERENCE_OR_PENDING}}
+<!-- 修订既有规格、重新纳入历史排除范围或依赖相邻规格时必填 -->
+### Scope Lineage
+- **Owning spec**：{{OWNING_SPEC}}
+- **被修订的既有范围说明**：{{EXISTING_SCOPE_REFERENCE_OR_NONE}}
+- **相邻规格 / 契约**：{{ADJACENT_SPEC_REFERENCES_OR_NONE}}
+- **审批状态**：{{APPROVED_REFERENCE_OR_PENDING}}
 
-## Requirements
+## 需求
 
-### Requirement 1: {{REQUIREMENT_AREA_1}}
-<!-- Requirement headings MUST include a leading numeric ID only (for example: "Requirement 1: ...", "1. Overview", "2 Feature: ..."). Alphabetic IDs like "Requirement A" are not allowed. -->
-**Objective:** As a {{ROLE}}, I want {{CAPABILITY}}, so that {{BENEFIT}}
+### Requirement 1：{{REQUIREMENT_AREA_1}}
+<!-- Requirement 标题必须使用前置数字 ID；不得使用 Requirement A 等字母 ID。 -->
+**目标：** 作为 {{ROLE}}，我希望 {{CAPABILITY}}，以便 {{BENEFIT}}
 
-#### Acceptance Criteria
-1. When [event], the [system] shall [response/action]
-2. If [trigger], then the [system] shall [response/action]
-3. While [precondition], the [system] shall [response/action]
-4. Where [feature is included], the [system] shall [response/action]
-5. The [system] shall [response/action]
+#### 验收标准
+1. When [事件], the [系统] shall [响应 / 行为]
+2. If [异常或失败条件], the [系统] shall [响应 / 行为]
+3. While [前置状态], the [系统] shall [响应 / 行为]
+4. Where [可选能力已纳入], the [系统] shall [响应 / 行为]
+5. The [系统] shall [持续成立的行为]
 
-### Requirement 2: {{REQUIREMENT_AREA_2}}
-**Objective:** As a {{ROLE}}, I want {{CAPABILITY}}, so that {{BENEFIT}}
+### Requirement 2：{{REQUIREMENT_AREA_2}}
+**目标：** 作为 {{ROLE}}，我希望 {{CAPABILITY}}，以便 {{BENEFIT}}
 
-#### Acceptance Criteria
-1. When [event], the [system] shall [response/action]
-2. When [event] and [condition], the [system] shall [response/action]
+#### 验收标准
+1. When [事件], the [系统] shall [响应 / 行为]
+2. When [事件] 且 [条件] 成立, the [系统] shall [响应 / 行为]
 
-<!-- Additional requirements follow the same pattern -->
+<!-- 其他 Requirement 沿用相同格式 -->

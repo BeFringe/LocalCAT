@@ -2,7 +2,7 @@
   "feature_name": "{{FEATURE_NAME}}",
   "created_at": "{{TIMESTAMP}}",
   "updated_at": "{{TIMESTAMP}}",
-  "language": "en",
+  "language": "zh-CN",
   "phase": "initialized",
   "approvals": {
     "requirements": {
@@ -20,5 +20,4 @@
   },
   "ready_for_implementation": false
 }
-
 

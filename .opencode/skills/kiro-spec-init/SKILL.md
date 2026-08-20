@@ -22,7 +22,7 @@ Generate a unique feature name from the project description ($ARGUMENTS) and ini
      - `{{FEATURE_NAME}}` → generated feature name
      - `{{TIMESTAMP}}` → current ISO 8601 timestamp
      - `{{PROJECT_DESCRIPTION}}` → from brief.md if available, otherwise $ARGUMENTS
-     - `en` → language code (detect from user's input language, default to `en`)
+     - `zh-CN` → LocalCAT project language code（项目默认使用简体中文）
    - Write `spec.json` and `requirements.md` to spec directory
 
 ## Important Constraints

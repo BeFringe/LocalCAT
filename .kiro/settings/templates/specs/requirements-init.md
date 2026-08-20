@@ -1,9 +1,8 @@
-# Requirements Document
+# 需求文档
 
-## Project Description (Input)
+## 项目说明（输入）
 {{PROJECT_DESCRIPTION}}
 
-## Requirements
-<!-- Will be generated in /kiro-spec-requirements phase -->
-
+## 需求
+<!-- 将在 /kiro-spec-requirements 阶段生成 -->
 
