@@ -18,6 +18,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 2026-08-19 首次激活恢复 amendment 由 ADR-012 授权：无 live reservation 且无任何 durable publication/recovery fact 时，unpublished mutable stage residue 不改变 never-activated JSONL authority，旧 residue 原样保留并允许 fresh-nonce retry。这一补救只恢复 Requirement 5.4/5.6 已批准的 legacy preservation，不授权自动 cleanup，也不放宽真正 durable ambiguity 的 fail-stop。
 
+2026-08-21 canonical identity amendment 由 ADR-016 授权：已完整发布的 generation 在普通冷开时仍严格验证平台文件身份；若 source、manifest、SQLite 与 publication proof 只发生一致的 device-number 漂移，可由用户显式、同 generation、零内容变更地重新证明。该维护动作不运行或授权 Gate D/Fuzzy，也不放宽 inode、bytes、binding、phase 或 pending recovery 的 fail-stop。
+
 ## 需求
 
 ### Requirement 1：当前段 TM 建议与可解释信息
@@ -95,6 +97,10 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 8. While canonical 资源的 context 或 fuzzy 能力未分别获得当前授权, the LocalCAT Qt 编辑器 shall 不因资源已经激活而开放对应匹配类型
 9. If 已激活资源的外部来源后来发生分歧或显式更新失败, the LocalCAT Qt 编辑器 shall 保留 last-known-good canonical 状态并显示分歧或失败，不得静默回落 legacy 查询
 10. If 已激活资源不存在可验证的可用 canonical 状态, the LocalCAT Qt 编辑器 shall 停止使用该资源并显示明确错误
+11. If 已完整发布的 canonical generation 只因 source、manifest 与 SQLite attestation 的平台 device number 一致漂移而无法重开, the 语言资源设置 shall 将该资源显示为需要重新验证 canonical，并保持其他健康资源可用
+12. When 用户显式请求重新验证该 canonical 资源, the LocalCAT Core shall 在持久资源锁下重新证明精确 inode、size、SHA-256、resource/store/generation、binding 与已完成 publication phase，并只原子更新 device identity attestation
+13. When canonical 重新验证成功, the LocalCAT Qt 编辑器 shall 以同一 store id 和同一 generation 恢复该资源并刷新当前建议，不重建 TM、不修改 source/manifest/SQLite 内容，也不推断或改变 Context/Fuzzy 资格
+14. If identity mismatch 包含 device number 以外的差异、持久或当前 artifacts 使用混合 device、或存在 pending/ambiguous recovery fact, the LocalCAT Core shall 拒绝重新验证且保持该资源 unavailable 和零 mutation
 
 ### Requirement 6：能力状态与资源局部失败
 

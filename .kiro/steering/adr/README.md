@@ -28,5 +28,6 @@
 | ADR-012 | 已采纳 | 未发布的首次激活残留不构成 canonical authority |
 | ADR-013 | 已采纳 | Gate D 跨进程证据重授权模型 |
 | ADR-014 | 已采纳 | 设备本地预处理偏好的 workspace 持久化 |
+| ADR-016 | 已采纳 | 已发布 canonical authority 的设备身份重新证明 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。

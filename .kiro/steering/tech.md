@@ -77,5 +77,6 @@ python translation_runner.py
 - TM/termbase 候选图均先完整构建和验证，成功后一次替换；失败保留上一组可用实例或明确 fail closed。
 - 浏览/校对页与三栏编辑器共享同一个 `EditorProject` 会话，只读表格不复制或覆盖未保存译文。
 - canonical 查询固定 EXACT → CONTEXT → FUZZY；Gate D 按 ADR-013 由 Core 复证设备本地资格，兼容键命中可跨进程恢复，缺失/失配只允许显式重验。FUZZY 仍只在正式 capability 开放且候选分数达到 device-local 阈值时出现，从不自动应用。
+- 已发布 canonical 的跨重启平台文件身份恢复按 ADR-016；普通打开、内容证明、generation 与 Fuzzy 资格边界保持不变。
 - 项目搜索与版本化术语共用 capability-gated `TextMatcher`的 Unicode/Whole Word 语义；Qt 不复制 matcher 实现。
 - Parser 与 Engine 保持相互独立；SQLite 是 canonical TM 持久化基线，不归 Parser Foundation。ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
