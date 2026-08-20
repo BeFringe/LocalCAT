@@ -51,23 +51,32 @@ class QtSpeakerInventoryDialogTests(unittest.TestCase):
         )
 
     def test_dialog_uses_controller_inventory_and_inventory_only_avatars(self) -> None:
-        controller = _InventoryController(self._inventory())
-        dialog = QtSpeakerInventoryDialog(controller)  # type: ignore[arg-type]
-        self.addCleanup(dialog.close)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            avatar = QImage(16, 16, QImage.Format.Format_ARGB32)
+            avatar.fill(0xFF336699)
+            self.assertTrue(avatar.save(str(root / "adelaHalf.png")))
 
-        self.assertEqual(controller.calls, 1)
-        self.assertEqual(dialog.table.rowCount(), 2)
-        self.assertEqual(dialog.table.item(0, 1).text(), "adela")
-        self.assertEqual(dialog.table.item(0, 2).text(), "2")
-        matched_avatar = dialog.table.cellWidget(0, 0)
-        missing_avatar = dialog.table.cellWidget(1, 0)
-        self.assertIsNotNone(matched_avatar.pixmap())
-        self.assertLessEqual(matched_avatar.pixmap().width(), 48)
-        self.assertLessEqual(matched_avatar.pixmap().height(), 48)
-        self.assertIn("内置 speaker 头像", matched_avatar.accessibleName())
-        self.assertEqual(missing_avatar.text(), "—")
-        self.assertIn("无内置头像", missing_avatar.accessibleName())
-        self.assertIn("1 段无 speaker", dialog.summary_label.text())
+            controller = _InventoryController(self._inventory())
+            dialog = QtSpeakerInventoryDialog(  # type: ignore[arg-type]
+                controller,
+                avatar_catalog=SpeakerAvatarCatalog(root),
+            )
+            self.addCleanup(dialog.close)
+
+            self.assertEqual(controller.calls, 1)
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertEqual(dialog.table.item(0, 1).text(), "adela")
+            self.assertEqual(dialog.table.item(0, 2).text(), "2")
+            matched_avatar = dialog.table.cellWidget(0, 0)
+            missing_avatar = dialog.table.cellWidget(1, 0)
+            self.assertIsNotNone(matched_avatar.pixmap())
+            self.assertLessEqual(matched_avatar.pixmap().width(), 48)
+            self.assertLessEqual(matched_avatar.pixmap().height(), 48)
+            self.assertIn("内置 speaker 头像", matched_avatar.accessibleName())
+            self.assertEqual(missing_avatar.text(), "—")
+            self.assertIn("无内置头像", missing_avatar.accessibleName())
+            self.assertIn("1 段无 speaker", dialog.summary_label.text())
 
     def test_count_column_keeps_complete_header_visible_at_minimum_size(self) -> None:
         dialog = QtSpeakerInventoryDialog(  # type: ignore[arg-type]
