@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 )
 
 from editor_contracts import (
+    BatchOperationReport,
     EDITOR_FONT_SIZE_STEP,
     MAX_EDITOR_FONT_SIZE,
     MIN_EDITOR_FONT_SIZE,
@@ -96,7 +97,9 @@ from editor_contracts import (
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_preprocess_dialog import QtPreprocessDialog
 from qt_settings_dialog import QtSettingsDialog
+from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
 from qt_tm_threshold import (
@@ -385,6 +388,8 @@ class QtEditorWindow(QMainWindow):
         self.project_menu: QMenu
         self.open_project_action: QAction
         self.recent_projects_menu: QMenu
+        self.speaker_inventory_action: QAction
+        self.preprocess_action: QAction
         self.close_project_action: QAction
         self.quit_action: QAction
         self.save_button: QToolButton
@@ -604,6 +609,21 @@ class QtEditorWindow(QMainWindow):
         self.recent_projects_menu = self.project_menu.addMenu("最近项目")
         self.recent_projects_menu.setObjectName("recentProjectsMenu")
         configure_menu(self.recent_projects_menu)
+        self.project_menu.addSeparator()
+        self.speaker_inventory_action = self.project_menu.addAction(
+            "Raw speaker 盘点"
+        )
+        self.speaker_inventory_action.setObjectName(
+            "speakerInventoryProjectAction"
+        )
+        self.speaker_inventory_action.setToolTip(
+            "只读盘点当前 JSON 项目的 raw speaker 与出现次数"
+        )
+        self.preprocess_action = self.project_menu.addAction("Target 文字预处理")
+        self.preprocess_action.setObjectName("preprocessProjectAction")
+        self.preprocess_action.setToolTip(
+            "预览并显式应用有序的 target literal 替换规则"
+        )
         self.project_menu.addSeparator()
         self.close_project_action = self.project_menu.addAction("退出当前项目")
         self.project_menu.addSeparator()
@@ -1118,6 +1138,10 @@ class QtEditorWindow(QMainWindow):
     def _wire_actions(self) -> None:
         self.open_button.clicked.connect(self._choose_open)
         self.open_project_action.triggered.connect(self._choose_open)
+        self.speaker_inventory_action.triggered.connect(
+            self._open_speaker_inventory_dialog
+        )
+        self.preprocess_action.triggered.connect(self._open_preprocess_dialog)
         self.close_project_action.triggered.connect(self.close_current_project)
         self.quit_action.triggered.connect(self.close)
         self.empty_open_button.clicked.connect(self._choose_open)
@@ -1509,6 +1533,8 @@ class QtEditorWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.close_project_action.setEnabled(False)
+        self.speaker_inventory_action.setEnabled(False)
+        self.preprocess_action.setEnabled(False)
         self.workspace_mode_combo.setEnabled(False)
         self.segment_density_combo.setEnabled(False)
         self._clear_project_search_results("打开 JSON 项目后可搜索。")
@@ -1545,6 +1571,7 @@ class QtEditorWindow(QMainWindow):
             self.statusBar().showMessage("保存失败。", 7000)
             return False
         self._update_title()
+        self._refresh_project_tool_actions()
         self.refresh_recent_projects()
         self.statusBar().showMessage(f"已保存：{path}", 7000)
         return True
@@ -1641,6 +1668,7 @@ class QtEditorWindow(QMainWindow):
         self.workspace_mode_combo.setEnabled(True)
         self.segment_density_combo.setEnabled(True)
         self._clear_project_search_results()
+        self._refresh_project_tool_actions()
         self._refreshing = True
         try:
             project = self.controller.project
@@ -2274,6 +2302,111 @@ class QtEditorWindow(QMainWindow):
             6000,
         )
         return True
+
+    def _refresh_project_tool_actions(self) -> None:
+        """Project the Controller's single-JSON gate onto project tools."""
+
+        try:
+            capability = self.controller.project_tool_capability()
+            capability.__post_init__()
+        except (TypeError, ValueError, EditorControllerError):
+            self.speaker_inventory_action.setEnabled(False)
+            self.preprocess_action.setEnabled(False)
+            self.speaker_inventory_action.setToolTip(
+                "当前项目工具能力无法验证"
+            )
+            self.preprocess_action.setToolTip("当前项目工具能力无法验证")
+            return
+        available = capability.single_json_tools_available
+        self.speaker_inventory_action.setEnabled(available)
+        self.preprocess_action.setEnabled(available)
+        if available:
+            self.speaker_inventory_action.setToolTip(
+                "只读盘点当前 JSON 项目的 raw speaker 与出现次数"
+            )
+            self.preprocess_action.setToolTip(
+                "预览并显式应用有序的 target literal 替换规则"
+            )
+        else:
+            self.speaker_inventory_action.setToolTip(
+                "Raw speaker 盘点仅适用于当前单个 JSON 项目"
+            )
+            self.preprocess_action.setToolTip(
+                "文字预处理仅适用于当前单个 JSON 项目"
+            )
+
+    def _open_speaker_inventory_dialog(self) -> None:
+        """Open the Controller-owned, read-only raw speaker inventory."""
+
+        if not self.speaker_inventory_action.isEnabled():
+            self.statusBar().showMessage(
+                "Raw speaker 盘点仅适用于当前单个 JSON 项目。",
+                6000,
+            )
+            return
+        try:
+            dialog = QtSpeakerInventoryDialog(self.controller, self)
+        except (EditorControllerError, TypeError, ValueError) as error:
+            self._show_error("无法盘点 raw speaker", str(error))
+            self.statusBar().showMessage(
+                "Speaker 盘点失败；项目保持不变。",
+                6000,
+            )
+            return
+        dialog.exec()
+
+    def _open_preprocess_dialog(self) -> None:
+        """Open the dedicated Controller-only preprocessing surface."""
+
+        if not self.preprocess_action.isEnabled():
+            self.statusBar().showMessage(
+                "文字预处理仅适用于当前单个 JSON 项目。",
+                6000,
+            )
+            return
+        dialog = QtPreprocessDialog(self.controller, self)
+        dialog.mutation_committed.connect(self._preprocessing_changed)
+        dialog.exec()
+
+    def _preprocessing_changed(self, report: object) -> None:
+        """Refresh all four project projections after one committed mutation."""
+
+        if type(report) is not BatchOperationReport:
+            raise TypeError("preprocessing refresh requires BatchOperationReport")
+        report.__post_init__()
+        self._refresh_from_controller()
+        action = "应用" if report.operation == "apply" else "撤销"
+        self.statusBar().showMessage(
+            f"已{action}批量预处理 · {len(report.changed_segment_ids)} 个段落。",
+            6000,
+        )
+
+    def _refresh_from_controller(self) -> None:
+        """Re-render edit, browse, progress/dirty and suggestions from one snapshot."""
+
+        if not self.controller.has_project:
+            self._show_empty_state()
+            self._update_title()
+            return
+        if self.current_project_search_report is not None:
+            self._clear_project_search_results(
+                "项目内容已变化；请重新搜索。"
+            )
+        self._refreshing = True
+        try:
+            project = self.controller.project
+            self.project_name_label.setText(project.name)
+            self.language_label.setText(
+                f"{project.source_locale}  →  {project.target_locale}"
+            )
+            self.segment_count_label.setText(str(len(project.segments)))
+            self._populate_segment_list()
+            self._render_current_segment()
+            self._refresh_browse_table()
+        finally:
+            self._refreshing = False
+        self._refresh_project_tool_actions()
+        self._update_title()
 
     def _open_settings(self) -> None:
         dialog = self.create_settings_dialog()

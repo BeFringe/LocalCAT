@@ -10,6 +10,8 @@ from unittest import mock
 from editor_contracts import (
     DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
+    LiteralReplaceRule,
+    PreprocessPreferences,
     SegmentDensity,
     WorkspaceMode,
 )
@@ -152,6 +154,171 @@ class WorkspaceStateRepositoryTest(unittest.TestCase):
             self.assertEqual(repository.state_path.read_bytes(), state_snapshot)
             for path, snapshot in external_snapshots.items():
                 self.assertEqual(path.read_bytes(), snapshot)
+
+    def test_preprocess_preferences_round_trip_order_and_defensive_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            repository = WorkspaceStateRepository(config_dir)
+            preferences = PreprocessPreferences(
+                rules=(
+                    LiteralReplaceRule(
+                        find="first",
+                        replacement="one",
+                        enabled=False,
+                    ),
+                    LiteralReplaceRule(
+                        find="second",
+                        replacement="two",
+                        enabled=True,
+                    ),
+                ),
+                include_draft=False,
+                include_confirmed=True,
+            )
+
+            returned = repository.update_preprocess_preferences(preferences)
+            restored = WorkspaceStateRepository(config_dir)
+            payload = json.loads(repository.state_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(returned, preferences)
+            self.assertIsNot(returned, preferences)
+            self.assertIsNot(returned.rules[0], preferences.rules[0])
+            self.assertEqual(restored.preprocess_preferences(), preferences)
+            self.assertEqual(
+                payload["preprocessing"],
+                {
+                    "rules": [
+                        {
+                            "find": "first",
+                            "replacement": "one",
+                            "enabled": False,
+                        },
+                        {
+                            "find": "second",
+                            "replacement": "two",
+                            "enabled": True,
+                        },
+                    ],
+                    "include_draft": False,
+                    "include_confirmed": True,
+                },
+            )
+
+            object.__setattr__(returned.rules[0], "find", "tampered")
+            reread = repository.preprocess_preferences()
+            self.assertEqual(reread.rules[0].find, "first")
+            self.assertIsNot(reread.rules[0], repository.preprocess_preferences().rules[0])
+
+    def test_missing_or_invalid_preprocess_member_uses_complete_default(self) -> None:
+        invalid_members: tuple[object, ...] = (
+            [],
+            {"rules": [], "include_draft": False},
+            {
+                "rules": [],
+                "include_draft": False,
+                "include_confirmed": False,
+            },
+            {
+                "rules": [
+                    {"find": "", "replacement": "x", "enabled": True}
+                ],
+                "include_draft": True,
+                "include_confirmed": False,
+            },
+            {
+                "rules": [
+                    {"find": "x", "replacement": "y", "enabled": 1}
+                ],
+                "include_draft": True,
+                "include_confirmed": False,
+            },
+        )
+        for invalid in invalid_members:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp_dir:
+                config_dir = Path(temp_dir) / "app-data"
+                config_dir.mkdir()
+                state_path = config_dir / "workspace.json"
+                payload = {
+                    "schema_version": 1,
+                    "recent_projects": [],
+                    "display": {
+                        "segment_density": "wrapped",
+                        "workspace_mode": "browse",
+                        "editor_font_size": 20,
+                    },
+                    "preprocessing": invalid,
+                }
+                rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                state_path.write_text(rendered, encoding="utf-8")
+
+                with self.assertLogs("workspace_state", level="WARNING"):
+                    repository = WorkspaceStateRepository(config_dir)
+
+                self.assertEqual(
+                    repository.preprocess_preferences(),
+                    PreprocessPreferences(),
+                )
+                self.assertEqual(
+                    repository.display_preferences(),
+                    DisplayPreferences(
+                        segment_density=SegmentDensity.WRAPPED,
+                        workspace_mode=WorkspaceMode.BROWSE,
+                        editor_font_size=20,
+                    ),
+                )
+                self.assertEqual(state_path.read_text(encoding="utf-8"), rendered)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = WorkspaceStateRepository(Path(temp_dir) / "app-data")
+            self.assertEqual(
+                repository.preprocess_preferences(),
+                PreprocessPreferences(),
+            )
+
+    def test_preprocess_write_failure_preserves_file_and_last_known_good(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            repository = WorkspaceStateRepository(config_dir)
+            previous = PreprocessPreferences(
+                rules=(
+                    LiteralReplaceRule(
+                        find="old",
+                        replacement="kept",
+                        enabled=True,
+                    ),
+                ),
+                include_draft=True,
+                include_confirmed=False,
+            )
+            repository.update_preprocess_preferences(previous)
+            state_snapshot = repository.state_path.read_bytes()
+            candidate = PreprocessPreferences(
+                rules=(
+                    LiteralReplaceRule(
+                        find="new",
+                        replacement="lost",
+                        enabled=True,
+                    ),
+                ),
+                include_draft=False,
+                include_confirmed=True,
+            )
+
+            with (
+                mock.patch(
+                    "workspace_state.os.replace",
+                    side_effect=OSError("disk full"),
+                ),
+                self.assertRaises(WorkspaceStateError),
+            ):
+                repository.update_preprocess_preferences(candidate)
+
+            self.assertEqual(repository.preprocess_preferences(), previous)
+            self.assertEqual(repository.state_path.read_bytes(), state_snapshot)
+            self.assertEqual(
+                WorkspaceStateRepository(config_dir).preprocess_preferences(),
+                previous,
+            )
 
 
 if __name__ == "__main__":

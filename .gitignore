@@ -8,3 +8,4 @@
 !.opencode/skills/governance-summary/
 !.opencode/skills/governance-summary/**
 *.pyc
+speaker_avatars/*

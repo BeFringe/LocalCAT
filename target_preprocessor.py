@@ -23,8 +23,22 @@ def preview_preprocessing(
     project_session_id: str,
     revision: int,
     rules: tuple[LiteralReplaceRule, ...],
+    *,
+    include_draft: bool = True,
+    include_confirmed: bool = True,
 ) -> PreprocessPreview:
     """Preview ordered literal replacements without mutating the project."""
+
+    if type(include_draft) is not bool or type(include_confirmed) is not bool:
+        raise PreprocessValidationError(
+            "INVALID_STATUS_SELECTION",
+            "preprocess status selections must be exact booleans",
+        )
+    if not include_draft and not include_confirmed:
+        raise PreprocessValidationError(
+            "NO_SELECTED_STATUS",
+            "at least one preprocess segment status must be selected",
+        )
 
     for rule in rules:
         if not rule.find:
@@ -42,6 +56,10 @@ def preview_preprocessing(
 
     changes: list[PreprocessChange] = []
     for segment_index, segment in enumerate(project.segments):
+        if segment.confirmed and not include_confirmed:
+            continue
+        if not segment.confirmed and not include_draft:
+            continue
         updated_target = segment.target
         for rule in enabled_rules:
             updated_target = updated_target.replace(rule.find, rule.replacement)

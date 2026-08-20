@@ -15,6 +15,8 @@ from uuid import uuid4
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
 from editor_contracts import (
+    BatchOperationReport,
+    BatchUndoState,
     ConfirmResult,
     DisplayPreferences,
     EditorProject,
@@ -23,12 +25,17 @@ from editor_contracts import (
     FuzzyValidationState,
     ImportReport,
     ImportRequest,
+    LiteralReplaceRule,
+    PreprocessChange,
+    PreprocessPreferences,
+    PreprocessPreview,
     ProjectSearchHit,
     ProjectSearchReport,
     ProjectSearchRequest,
     ProjectToolCapability,
     SearchField,
     SegmentTranslationStatus,
+    SpeakerInventory,
     ResourceConfig,
     ResourceKind,
     RecentProject,
@@ -77,6 +84,7 @@ from project_search import (
     ProjectSearchService,
     segment_translation_status,
 )
+from speaker_inventory import build_speaker_inventory
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
@@ -90,6 +98,7 @@ from tm_engine import SourceUnit, TMEngine
 from tm_migration import MigrationPreflightError, TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator
 from termbase_store import TermbaseStore, TermbaseValidationError
+from target_preprocessor import PreprocessValidationError, preview_preprocessing
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
 
 
@@ -643,6 +652,74 @@ def _project_search_fields_digest(project: EditorProject) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _project_content_digest(project: EditorProject) -> str:
+    """Digest canonical editable project content without logging raw text."""
+
+    if type(project) is not EditorProject:
+        raise TypeError("project content digest requires EditorProject")
+    project.__post_init__()
+    payload = (
+        project.name,
+        project.source_locale,
+        project.target_locale,
+        tuple(
+            (
+                segment.id,
+                segment.source,
+                segment.target,
+                segment.speaker,
+                segment.confirmed,
+            )
+            for segment in project.segments
+        ),
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _clone_preprocess_preview(preview: PreprocessPreview) -> PreprocessPreview:
+    """Validate and detach one caller-owned preprocessing preview graph."""
+
+    if type(preview) is not PreprocessPreview:
+        raise TypeError("preprocess preview must be PreprocessPreview")
+    preview.__post_init__()
+    cloned = PreprocessPreview(
+        project_session_id=preview.project_session_id,
+        base_revision=preview.base_revision,
+        changes=tuple(replace(change) for change in preview.changes),
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _clone_preprocess_preferences(
+    preferences: PreprocessPreferences,
+) -> PreprocessPreferences:
+    """Validate and detach one device-local preprocessing preference graph."""
+
+    if type(preferences) is not PreprocessPreferences:
+        raise TypeError("preprocess preferences must be PreprocessPreferences")
+    preferences.__post_init__()
+    cloned = PreprocessPreferences(
+        rules=tuple(
+            LiteralReplaceRule(
+                find=rule.find,
+                replacement=rule.replacement,
+                enabled=rule.enabled,
+            )
+            for rule in preferences.rules
+        ),
+        include_draft=preferences.include_draft,
+        include_confirmed=preferences.include_confirmed,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 def _validate_exact_project_search_handoff(
     candidate: object,
 ) -> MatcherHandoffSnapshot:
@@ -890,6 +967,9 @@ class EditorController:
         self._project: EditorProject | None = None
         self._current_index = 0
         self._dirty = False
+        self._project_revision = 0
+        self._saved_project_digest: str | None = None
+        self._batch_undo_state: BatchUndoState | None = None
         self._tm_engines: dict[str, TMEngine] = {}
         self._glossary_engines: dict[str, _TermEngine] = {}
         self._term_record_snapshots: dict[str, tuple[TermRecord, ...]] = {}
@@ -915,6 +995,24 @@ class EditorController:
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    @property
+    def project_revision(self) -> int:
+        """Return the monotonic content revision for the current session."""
+
+        return self._project_revision
+
+    @property
+    def has_preprocessing_undo(self) -> bool:
+        """Return whether this session retains one applicable batch undo point."""
+
+        with self._tm_query_lock:
+            state = self._batch_undo_state
+            return (
+                self._project is not None
+                and state is not None
+                and state.project_session_id == self._project_session_id
+            )
 
     @property
     def project_session_id(self) -> str:
@@ -1241,6 +1339,70 @@ class EditorController:
             )
         return capability
 
+    def _require_preprocessing_json_gate(self) -> ProjectToolCapability:
+        """Validate the same single-JSON capability for preprocessing tools."""
+
+        try:
+            capability = self.project_tool_capability()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            ) from error
+        if type(capability) is not ProjectToolCapability:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            )
+        try:
+            capability.__post_init__()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            ) from error
+        if not capability.single_json_tools_available:
+            reason = capability.unavailable_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "PREPROCESS.PROJECT_GATE_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if capability.project_session_id != self._project_session_id:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            )
+        return capability
+
+    def _require_speaker_inventory_json_gate(self) -> ProjectToolCapability:
+        """Validate the single-JSON capability without introducing a new authority."""
+
+        try:
+            capability = self.project_tool_capability()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            ) from error
+        if type(capability) is not ProjectToolCapability:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            )
+        try:
+            capability.__post_init__()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            ) from error
+        if not capability.single_json_tools_available:
+            reason = capability.unavailable_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if capability.project_session_id != self._project_session_id:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            )
+        return capability
+
     def _capture_project_search_handoff(self) -> MatcherHandoffSnapshot:
         """Capture and validate exactly one Core matcher handoff."""
 
@@ -1335,6 +1497,9 @@ class EditorController:
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._project_revision = 0
+            self._saved_project_digest = _project_content_digest(project)
+            self._batch_undo_state = None
             self._clear_project_search_state()
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
@@ -1356,8 +1521,236 @@ class EditorController:
                 confirmed=False,
             )
             self._project = replace(self.project, segments=tuple(segments))
-            self._dirty = True
+            self._project_revision += 1
+            self._recompute_project_dirty()
             return self.project
+
+    def preview_preprocessing(
+        self,
+        rules: tuple[LiteralReplaceRule, ...],
+        *,
+        include_draft: bool = True,
+        include_confirmed: bool = True,
+    ) -> PreprocessPreview:
+        """Preview ordered target-only literal rules without changing the project."""
+
+        if type(rules) is not tuple or not all(
+            type(rule) is LiteralReplaceRule for rule in rules
+        ):
+            raise EditorControllerError("PREPROCESS.INVALID_RULES")
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            try:
+                preview = preview_preprocessing(
+                    self.project,
+                    self._project_session_id,
+                    self._project_revision,
+                    tuple(replace(rule) for rule in rules),
+                    include_draft=include_draft,
+                    include_confirmed=include_confirmed,
+                )
+                return _clone_preprocess_preview(preview)
+            except PreprocessValidationError as error:
+                raise EditorControllerError(
+                    f"PREPROCESS.{error.code}"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError("PREPROCESS.INVALID_RULES") from error
+
+    def preprocess_preferences(self) -> PreprocessPreferences:
+        """Return a detached view of saved device-local preprocessing settings."""
+
+        with self._tm_query_lock:
+            try:
+                preferences = self.workspace_state.preprocess_preferences()
+                return _clone_preprocess_preferences(preferences)
+            except WorkspaceStateError as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_READ_FAILED"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_INVALID"
+                ) from error
+
+    def update_preprocess_preferences(
+        self,
+        preferences: PreprocessPreferences,
+    ) -> PreprocessPreferences:
+        """Validate and atomically save device-local preprocessing settings."""
+
+        try:
+            private_preferences = _clone_preprocess_preferences(preferences)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PREFERENCES_INVALID"
+            ) from error
+        with self._tm_query_lock:
+            try:
+                saved = self.workspace_state.update_preprocess_preferences(
+                    private_preferences
+                )
+                return _clone_preprocess_preferences(saved)
+            except WorkspaceStateError as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_SAVE_FAILED"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_INVALID"
+                ) from error
+
+    def speaker_inventory(self) -> SpeakerInventory:
+        """Return a fresh, deterministic inventory without changing the session."""
+
+        with self._tm_query_lock:
+            self._require_speaker_inventory_json_gate()
+            try:
+                inventory = build_speaker_inventory(self.project)
+                result = SpeakerInventory(
+                    items=tuple(replace(item) for item in inventory.items),
+                    empty_count=inventory.empty_count,
+                    segment_count=inventory.segment_count,
+                )
+                result.__post_init__()
+                return result
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "SPEAKER_INVENTORY.INVALID_RESULT"
+                ) from error
+
+    def apply_preprocessing(
+        self,
+        preview: PreprocessPreview,
+    ) -> BatchOperationReport:
+        """Atomically apply one session/revision-bound preprocessing preview."""
+
+        try:
+            private_preview = _clone_preprocess_preview(preview)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError("PREPROCESS.PREVIEW_INVALID") from error
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            if private_preview.project_session_id != self._project_session_id:
+                raise EditorControllerError(
+                    "PREPROCESS.STALE_PROJECT_SESSION"
+                )
+            if private_preview.base_revision != self._project_revision:
+                raise EditorControllerError("PREPROCESS.STALE_REVISION")
+            if not private_preview.changes:
+                raise EditorControllerError("PREPROCESS.PREVIEW_INVALID")
+
+            segments = list(self.project.segments)
+            seen_indices: set[int] = set()
+            for change in private_preview.changes:
+                if type(change) is not PreprocessChange:
+                    raise EditorControllerError(
+                        "PREPROCESS.PREVIEW_INVALID"
+                    )
+                index = change.segment_index
+                if index in seen_indices or index >= len(segments):
+                    raise EditorControllerError(
+                        "PREPROCESS.PREVIEW_INVALID"
+                    )
+                seen_indices.add(index)
+                current = segments[index]
+                if (
+                    current.id != change.segment_id
+                    or current.target != change.before_target
+                    or current.confirmed != change.before_confirmed
+                ):
+                    raise EditorControllerError("PREPROCESS.STALE_SEGMENT")
+
+            dirty_before = self._dirty
+            baseline = self._saved_project_digest
+            if baseline is None:
+                raise EditorControllerError("PREPROCESS.BASELINE_UNAVAILABLE")
+            for change in private_preview.changes:
+                current = segments[change.segment_index]
+                segments[change.segment_index] = replace(
+                    current,
+                    target=change.after_target,
+                    confirmed=False,
+                )
+
+            self._project = replace(self.project, segments=tuple(segments))
+            self._project_revision += 1
+            self._recompute_project_dirty()
+            self._batch_undo_state = BatchUndoState(
+                project_session_id=self._project_session_id,
+                applied_revision=self._project_revision,
+                dirty_before=dirty_before,
+                saved_baseline_digest_at_apply=baseline,
+                changes=tuple(
+                    replace(change) for change in private_preview.changes
+                ),
+            )
+            report = BatchOperationReport(
+                operation="apply",
+                project_session_id=self._project_session_id,
+                resulting_revision=self._project_revision,
+                changed_segment_ids=tuple(
+                    change.segment_id for change in private_preview.changes
+                ),
+                dirty=self._dirty,
+            )
+            report.__post_init__()
+            return report
+
+    def undo_latest_preprocessing(self) -> BatchOperationReport:
+        """Undo the latest batch if every affected segment remains unchanged."""
+
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            state = self._batch_undo_state
+            if state is None:
+                raise EditorControllerError("PREPROCESS.NO_UNDO")
+            try:
+                state.__post_init__()
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError("PREPROCESS.UNDO_INVALID") from error
+            if state.project_session_id != self._project_session_id:
+                raise EditorControllerError(
+                    "PREPROCESS.STALE_UNDO_SESSION"
+                )
+
+            segments = list(self.project.segments)
+            seen_indices: set[int] = set()
+            for change in state.changes:
+                index = change.segment_index
+                if index in seen_indices or index >= len(segments):
+                    raise EditorControllerError("PREPROCESS.STALE_UNDO")
+                seen_indices.add(index)
+                current = segments[index]
+                if (
+                    current.id != change.segment_id
+                    or current.target != change.after_target
+                    or current.confirmed != change.after_confirmed
+                ):
+                    raise EditorControllerError("PREPROCESS.STALE_UNDO")
+
+            for change in state.changes:
+                current = segments[change.segment_index]
+                segments[change.segment_index] = replace(
+                    current,
+                    target=change.before_target,
+                    confirmed=change.before_confirmed,
+                )
+            self._project = replace(self.project, segments=tuple(segments))
+            self._project_revision += 1
+            self._batch_undo_state = None
+            self._recompute_project_dirty()
+            report = BatchOperationReport(
+                operation="undo",
+                project_session_id=self._project_session_id,
+                resulting_revision=self._project_revision,
+                changed_segment_ids=tuple(
+                    change.segment_id for change in state.changes
+                ),
+                dirty=self._dirty,
+            )
+            report.__post_init__()
+            return report
 
     def move(self, direction: int, unconfirmed_only: bool = False) -> EditorProject:
         """Move one segment or find the next unconfirmed segment without losing edits."""
@@ -1405,14 +1798,16 @@ class EditorController:
     def save_project(self, path: Path) -> EditorProject:
         """Atomically save the current project and clear the session dirty flag."""
 
-        try:
-            saved_path = save_project_file(self.project, path)
-        except ProjectError as exc:
-            raise EditorControllerError("PROJECT.SAVE_FAILED") from exc
-        self._project = replace(self.project, path=saved_path)
-        self._dirty = False
-        self._remember_current_position()
-        return self.project
+        with self._tm_query_lock:
+            try:
+                saved_path = save_project_file(self.project, path)
+            except ProjectError as exc:
+                raise EditorControllerError("PROJECT.SAVE_FAILED") from exc
+            self._project = replace(self.project, path=saved_path)
+            self._saved_project_digest = _project_content_digest(self.project)
+            self._dirty = False
+            self._remember_current_position()
+            return self.project
 
     def close_project(self) -> None:
         """Leave the current project after the frontend has handled unsaved changes."""
@@ -1424,6 +1819,9 @@ class EditorController:
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._project_revision = 0
+            self._saved_project_digest = None
+            self._batch_undo_state = None
             self._clear_project_search_state()
             self._advance_tm_query_epoch()
             self._observed_tm_signature = None
@@ -1947,7 +2345,9 @@ class EditorController:
             segments = list(self.project.segments)
             segments[self._current_index] = replace(current, confirmed=True)
             self._project = replace(self.project, segments=tuple(segments))
-            self._dirty = True
+            if not current.confirmed:
+                self._project_revision += 1
+            self._recompute_project_dirty()
             current_index = self._current_index
             next_index = next(
                 (
@@ -2575,6 +2975,14 @@ class EditorController:
         self._legacy_issued_context = None
         self._current_tm_report = None
         self._tm_query_epoch += 1
+
+    def _recompute_project_dirty(self) -> None:
+        """Compare current canonical content with the latest saved baseline."""
+
+        baseline = self._saved_project_digest
+        if baseline is None:
+            raise EditorControllerError("PROJECT.BASELINE_UNAVAILABLE")
+        self._dirty = _project_content_digest(self.project) != baseline
 
     def _clear_project_search_state(self) -> None:
         """Invalidate only project-search issuance, independent of TM epochs."""

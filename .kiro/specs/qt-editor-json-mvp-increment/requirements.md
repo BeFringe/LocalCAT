@@ -8,13 +8,17 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 
 ## 边界说明
 
-- **范围内**：当前单个 JSON 项目的 raw speaker inventory 与显示、基础 source/target/speaker 搜索、target-only 文字预处理及最近一次批量应用撤销、译文框撤销/重做、本地术语 CRUD 与匹配选项记录、silver logo 和窄 ellipsis。
-- **范围外**：新增项目格式、多项目或目录搜索、source 预处理、speaker 推断或拆分、别名与头像、正则或脚本、搜索驱动的 Replace All、模糊翻译记忆、云端和多人协作。
-- **相邻期望**：Match Case / Whole Word 的统一语义由 Feature 5 提供；能力合并并验收前，相关控件保持禁用。speaker alias、显式留空和头像属于后续阶段。既有 JSON/TXT、精确翻译记忆、术语建议和 Excel 工作流不得回归。
+- **范围内**：当前单个 JSON 项目的 raw speaker inventory、inventory-only 内置头像与 raw speaker 显示、基础 source/target/speaker 搜索、target-only 文字预处理及最近一次批量应用撤销、译文框撤销/重做、本地术语 CRUD 与匹配选项记录、silver logo 和窄 ellipsis。
+- **范围外**：新增项目格式、多项目或目录搜索、source 预处理、speaker 推断或拆分、speaker alias、显式留空 profile、编辑/浏览段落头像、头像配置或持久化、正则或脚本、搜索驱动的 Replace All、模糊翻译记忆、云端和多人协作。
+- **相邻期望**：Match Case / Whole Word 的统一语义由 Feature 5 提供；能力合并并验收前，相关控件保持禁用。speaker alias、显式留空 profile、编辑/浏览头像与可配置头像属于后续阶段；本增量只在只读 speaker inventory 中投影一组随应用分发的本地头像。既有 JSON/TXT、精确翻译记忆、术语建议和 Excel 工作流不得回归。
 
 ### Scope Lineage
 
 2026-08-19 已批准的项目搜索表面 amendment 仅扩展现有 Requirement 3：将常驻搜索条收纳为顶栏可折叠入口，增加同时清除 query 与已签发结果的明确操作，并在非空关键词搜索中增加由 `target + confirmed` 派生的“未填写 / 草稿 / 已翻译”段状态筛选。它不改项目格式，不新增 approved/revise 层，不重新纳入本 Spec 已排除的 search-driven Replace/Replace All。
+
+2026-08-19 已批准的 speaker inventory avatar amendment 仅扩展 Requirement 1 的只读盘点表面：若应用内置头像目录存在与 raw speaker 精确对应的 `[speaker]Half.png`，盘点表可显示其缩略图。匹配只用于 presentation，不进入 `SpeakerInventory`、JSON、TM identity、搜索字段或 speaker profile；缺失、歧义或无效图片必须安全退化为无头像。Requirement 2 / Task 4.1 的编辑与浏览 raw speaker 表面继续不显示头像。
+
+2026-08-19 已批准的 project-tool usability amendment 修复 speaker inventory“出现次数”表头裁切，并扩展 Requirement 4：预处理对话框以“草稿 / 已确认”两个独立复选框筛选 preview，可显式保存有序 literal 规则、启用状态与筛选偏好到设备本地 `workspace.json`。保存偏好不修改项目且不自动运行规则；只要 preview 包含已确认段，应用前继续显示既有“变化段落设为待确认”警告。
 
 ## 需求
 
@@ -31,6 +35,10 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 5. The LocalCAT Qt 编辑器 shall 在 speaker 盘点前后保持 source、target、speaker、confirmed、段落顺序和翻译记忆匹配身份不变
 6. When 用户对内容未变化的项目重复执行 speaker 盘点, the LocalCAT Qt 编辑器 shall 返回顺序和计数相同的结果
 7. If 当前项目没有任何非空 raw speaker, the LocalCAT Qt 编辑器 shall 显示空 inventory 和项目中的空 speaker 段落总数
+8. When 应用内置头像目录存在与非空 raw speaker 按 Unicode casefold 后精确对应的唯一 `[speaker]Half.png`, the speaker inventory 对话框 shall 在该 raw speaker 行显示只读缩略图，同时继续以原始 raw speaker 与计数作为文本权威
+9. If 对应头像缺失、规范化键重复、文件名不符合固定后缀或图片无法安全载入, the speaker inventory 对话框 shall 退化为无头像状态且不阻止 inventory 打开
+10. While speaker inventory 显示头像, the LocalCAT Qt 编辑器 shall 不把头像路径或匹配结果写入项目、workspace、术语、TM、搜索结果或 speaker profile，且不得把 raw speaker 当作可直接拼接的文件路径
+11. When speaker inventory 表格显示“出现次数”列, the LocalCAT Qt 编辑器 shall 为完整表头和计数保留足够宽度，且在对话框最小尺寸下不裁切表头首尾字符
 
 ### Requirement 2：Raw speaker 编辑与预览显示
 
@@ -84,6 +92,13 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 9. If 规则无效或没有可应用的实际变化, the LocalCAT Qt 编辑器 shall 说明原因且不创建虚假的项目修改
 10. The LocalCAT Qt 编辑器 shall 不在打开项目或编辑过程中自动运行文字预处理
 11. The LocalCAT Qt 编辑器 shall 不把正则、脚本或搜索驱动的 Replace All 表示为本增量可用能力
+12. When 用户选择预处理段状态, the LocalCAT Qt 编辑器 shall 使用“草稿”和“已确认”两个可同时选择的复选框而不是下拉菜单
+13. When 生成预处理 preview, the LocalCAT Qt 编辑器 shall 在应用规则前按 `confirmed=false` 为草稿、`confirmed=true` 为已确认筛选段落，并只在已选状态中计算变化
+14. If 用户未选择草稿或已确认中的任何一个, the LocalCAT Qt 编辑器 shall 拒绝 preview、说明至少选择一个状态且不修改项目
+15. When preview 生成成功, the LocalCAT Qt 编辑器 shall 显示受影响段落总数及其中草稿/已确认段落数量
+16. When 用户应用包含一个或多个已确认段落的 preview, the LocalCAT Qt 编辑器 shall 保留既有明确提示：变化段落将设为待确认；草稿-only preview 仍须经用户显式确认后才能应用
+17. When 用户执行“保存规则”, the LocalCAT Qt 编辑器 shall 原子保存当前可见顺序的 literal 规则、每条启用状态及草稿/已确认筛选到设备本地 workspace 偏好，并在重开对话框或重启后恢复；该操作不得修改项目或自动执行规则
+18. If 规则偏好保存失败或保存内容无效, the LocalCAT Qt 编辑器 shall 保留此前成功保存的偏好和当前项目，并显示可理解错误
 
 ### Requirement 5：撤销最近一次批量预处理
 

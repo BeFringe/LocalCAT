@@ -390,6 +390,72 @@ class EditorProject:
 
 
 @dataclass(frozen=True)
+class SpeakerInventoryItem:
+    """One non-empty raw speaker in first-occurrence order."""
+
+    raw_speaker: str
+    count: int
+    first_segment_id: str
+    first_index: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw_speaker, str):
+            raise TypeError("inventory raw speaker must be a string")
+        if not self.raw_speaker:
+            raise ValueError("inventory raw speaker must not be empty")
+        if not isinstance(self.count, int) or isinstance(self.count, bool):
+            raise TypeError("inventory count must be an integer")
+        if self.count <= 0:
+            raise ValueError("inventory count must be positive")
+        if not isinstance(self.first_segment_id, str):
+            raise TypeError("inventory first segment id must be a string")
+        if not self.first_segment_id.strip():
+            raise ValueError("inventory first segment id must not be empty")
+        if not isinstance(self.first_index, int) or isinstance(
+            self.first_index,
+            bool,
+        ):
+            raise TypeError("inventory first index must be an integer")
+        if self.first_index < 0:
+            raise ValueError("inventory first index must not be negative")
+
+
+@dataclass(frozen=True)
+class SpeakerInventory:
+    """Deterministic, read-only projection of project raw speakers."""
+
+    items: tuple[SpeakerInventoryItem, ...]
+    empty_count: int
+    segment_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("inventory items must be a tuple")
+        if not all(isinstance(item, SpeakerInventoryItem) for item in self.items):
+            raise TypeError("inventory items must contain SpeakerInventoryItem values")
+        for name, value in (
+            ("empty count", self.empty_count),
+            ("segment count", self.segment_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"inventory {name} must be an integer")
+            if value < 0:
+                raise ValueError(f"inventory {name} must not be negative")
+        raw_speakers = tuple(item.raw_speaker for item in self.items)
+        if len(raw_speakers) != len(set(raw_speakers)):
+            raise ValueError("inventory raw speakers must be unique")
+        first_indices = tuple(item.first_index for item in self.items)
+        if first_indices != tuple(sorted(first_indices)):
+            raise ValueError("inventory items must follow first-occurrence order")
+        if len(first_indices) != len(set(first_indices)):
+            raise ValueError("inventory first indices must be unique")
+        if any(index >= self.segment_count for index in first_indices):
+            raise ValueError("inventory first index must reference a project segment")
+        if self.empty_count + sum(item.count for item in self.items) != self.segment_count:
+            raise ValueError("inventory counts must cover every project segment")
+
+
+@dataclass(frozen=True)
 class LiteralReplaceRule:
     """One ordered, case-sensitive literal target replacement."""
 
@@ -404,6 +470,29 @@ class LiteralReplaceRule:
             raise ValueError("literal rule find value must not be empty")
         if not isinstance(self.enabled, bool):
             raise TypeError("literal rule enabled state must be a boolean")
+
+
+@dataclass(frozen=True)
+class PreprocessPreferences:
+    """Device-local saved literal rules and segment-status selection."""
+
+    rules: tuple[LiteralReplaceRule, ...] = ()
+    include_draft: bool = True
+    include_confirmed: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.rules) is not tuple:
+            raise TypeError("preprocess preference rules must be a tuple")
+        if not all(type(rule) is LiteralReplaceRule for rule in self.rules):
+            raise TypeError(
+                "preprocess preference rules must contain exact LiteralReplaceRule values"
+            )
+        if type(self.include_draft) is not bool:
+            raise TypeError("preprocess include_draft must be an exact boolean")
+        if type(self.include_confirmed) is not bool:
+            raise TypeError("preprocess include_confirmed must be an exact boolean")
+        if not self.include_draft and not self.include_confirmed:
+            raise ValueError("at least one preprocess segment status must be selected")
 
 
 @dataclass(frozen=True)

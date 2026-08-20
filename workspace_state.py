@@ -12,6 +12,8 @@ from typing import cast
 from editor_contracts import (
     DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
+    LiteralReplaceRule,
+    PreprocessPreferences,
     RecentProject,
     SegmentDensity,
     TMPreferences,
@@ -28,6 +30,30 @@ class WorkspaceStateError(RuntimeError):
     """Raised when local workspace state cannot be written safely."""
 
 
+def _clone_preprocess_preferences(
+    preferences: PreprocessPreferences,
+) -> PreprocessPreferences:
+    """Validate and detach the complete device-local preprocessing graph."""
+
+    if type(preferences) is not PreprocessPreferences:
+        raise TypeError("preprocess preferences contract is required")
+    preferences.__post_init__()
+    cloned = PreprocessPreferences(
+        rules=tuple(
+            LiteralReplaceRule(
+                find=rule.find,
+                replacement=rule.replacement,
+                enabled=rule.enabled,
+            )
+            for rule in preferences.rules
+        ),
+        include_draft=preferences.include_draft,
+        include_confirmed=preferences.include_confirmed,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 class WorkspaceStateRepository:
     """Own recent-project positions and editor display preferences."""
 
@@ -41,12 +67,14 @@ class WorkspaceStateRepository:
         self._recent: tuple[RecentProject, ...] = ()
         self._preferences = DisplayPreferences()
         self._tm_preferences = TMPreferences()
+        self._preprocess_preferences = PreprocessPreferences()
         if self.state_path.exists():
             try:
                 (
                     self._recent,
                     self._preferences,
                     self._tm_preferences,
+                    self._preprocess_preferences,
                 ) = self._read_state()
             except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 LOGGER.warning("Ignoring invalid workspace state: %s", exc)
@@ -74,7 +102,12 @@ class WorkspaceStateRepository:
             remembered,
             *(item for item in self._recent if item.path != remembered.path),
         )[:MAX_RECENT_PROJECTS]
-        self._write_state(updated, self._preferences, self._tm_preferences)
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._recent = updated
         return remembered
 
@@ -85,7 +118,12 @@ class WorkspaceStateRepository:
         updated = tuple(item for item in self._recent if item.path != normalized)
         if updated == self._recent:
             return
-        self._write_state(updated, self._preferences, self._tm_preferences)
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._recent = updated
 
     def display_preferences(self) -> DisplayPreferences:
@@ -101,7 +139,12 @@ class WorkspaceStateRepository:
 
         if not isinstance(preferences, DisplayPreferences):
             raise WorkspaceStateError("display preferences contract is required")
-        self._write_state(self._recent, preferences, self._tm_preferences)
+        self._write_state(
+            self._recent,
+            preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._preferences = preferences
         return preferences
 
@@ -122,13 +165,49 @@ class WorkspaceStateRepository:
             )
         except (TypeError, ValueError) as exc:
             raise WorkspaceStateError(f"invalid TM preferences: {exc}") from exc
-        self._write_state(self._recent, self._preferences, validated)
+        self._write_state(
+            self._recent,
+            self._preferences,
+            validated,
+            self._preprocess_preferences,
+        )
         self._tm_preferences = validated
         return validated
 
+    def preprocess_preferences(self) -> PreprocessPreferences:
+        """Return a detached device-local preprocessing preference graph."""
+
+        return _clone_preprocess_preferences(self._preprocess_preferences)
+
+    def update_preprocess_preferences(
+        self,
+        preferences: PreprocessPreferences,
+    ) -> PreprocessPreferences:
+        """Atomically replace preprocessing preferences after full validation."""
+
+        try:
+            validated = _clone_preprocess_preferences(preferences)
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceStateError(
+                f"invalid preprocess preferences: {exc}"
+            ) from exc
+        self._write_state(
+            self._recent,
+            self._preferences,
+            self._tm_preferences,
+            validated,
+        )
+        self._preprocess_preferences = validated
+        return _clone_preprocess_preferences(validated)
+
     def _read_state(
         self,
-    ) -> tuple[tuple[RecentProject, ...], DisplayPreferences, TMPreferences]:
+    ) -> tuple[
+        tuple[RecentProject, ...],
+        DisplayPreferences,
+        TMPreferences,
+        PreprocessPreferences,
+    ]:
         payload = cast(object, json.loads(self.state_path.read_text(encoding="utf-8")))
         if not isinstance(payload, dict):
             raise ValueError("workspace state root must be an object")
@@ -224,10 +303,74 @@ class WorkspaceStateRepository:
                         "Using default TM preferences from invalid workspace state"
                     )
 
+        preprocess_preferences = PreprocessPreferences()
+        raw_preprocessing = mapping.get("preprocessing")
+        if raw_preprocessing is not None:
+            try:
+                if not isinstance(raw_preprocessing, dict):
+                    raise TypeError("preprocessing must be an object")
+                preprocessing = cast(dict[str, object], raw_preprocessing)
+                if set(preprocessing) != {
+                    "rules",
+                    "include_draft",
+                    "include_confirmed",
+                }:
+                    raise ValueError(
+                        "preprocessing must contain the complete preference graph"
+                    )
+                raw_rules = preprocessing["rules"]
+                include_draft = preprocessing["include_draft"]
+                include_confirmed = preprocessing["include_confirmed"]
+                if not isinstance(raw_rules, list):
+                    raise TypeError("preprocessing rules must be an array")
+                if type(include_draft) is not bool:
+                    raise TypeError("preprocessing include_draft must be a boolean")
+                if type(include_confirmed) is not bool:
+                    raise TypeError(
+                        "preprocessing include_confirmed must be a boolean"
+                    )
+                rules: list[LiteralReplaceRule] = []
+                for raw_rule in cast(list[object], raw_rules):
+                    if not isinstance(raw_rule, dict):
+                        raise TypeError("preprocessing rule must be an object")
+                    rule = cast(dict[str, object], raw_rule)
+                    if set(rule) != {"find", "replacement", "enabled"}:
+                        raise ValueError(
+                            "preprocessing rule must contain find, replacement and enabled"
+                        )
+                    find = rule["find"]
+                    replacement = rule["replacement"]
+                    enabled = rule["enabled"]
+                    if type(find) is not str or type(replacement) is not str:
+                        raise TypeError(
+                            "preprocessing rule text values must be strings"
+                        )
+                    if type(enabled) is not bool:
+                        raise TypeError(
+                            "preprocessing rule enabled must be a boolean"
+                        )
+                    rules.append(
+                        LiteralReplaceRule(
+                            find=find,
+                            replacement=replacement,
+                            enabled=enabled,
+                        )
+                    )
+                preprocess_preferences = PreprocessPreferences(
+                    rules=tuple(rules),
+                    include_draft=include_draft,
+                    include_confirmed=include_confirmed,
+                )
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning(
+                    "Using default preprocess preferences from invalid workspace state"
+                )
+
         return (
             tuple(recent[:MAX_RECENT_PROJECTS]),
             preferences,
             tm_preferences,
+            preprocess_preferences,
         )
 
     def _write_state(
@@ -235,7 +378,11 @@ class WorkspaceStateRepository:
         recent: tuple[RecentProject, ...],
         preferences: DisplayPreferences,
         tm_preferences: TMPreferences,
+        preprocess_preferences: PreprocessPreferences,
     ) -> None:
+        preprocess_preferences = _clone_preprocess_preferences(
+            preprocess_preferences
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
             "recent_projects": [
@@ -253,6 +400,18 @@ class WorkspaceStateRepository:
             },
             "tm_preferences": {
                 "minimum_similarity": tm_preferences.minimum_similarity,
+            },
+            "preprocessing": {
+                "rules": [
+                    {
+                        "find": rule.find,
+                        "replacement": rule.replacement,
+                        "enabled": rule.enabled,
+                    }
+                    for rule in preprocess_preferences.rules
+                ],
+                "include_draft": preprocess_preferences.include_draft,
+                "include_confirmed": preprocess_preferences.include_confirmed,
             },
         }
         temp_path: Path | None = None

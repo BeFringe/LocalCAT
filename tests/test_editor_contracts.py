@@ -20,6 +20,7 @@ from editor_contracts import (
     LegacyExactTMSuggestion,
     LegacyTermRow,
     PreprocessChange,
+    PreprocessPreferences,
     PreprocessPreview,
     PreparedTermMutation,
     ResourceConfig,
@@ -182,6 +183,43 @@ class EditorContractsTest(unittest.TestCase):
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):
             first_change.after_target = "其他译文"  # type: ignore[misc]
+
+        preferences = PreprocessPreferences(
+            rules=rules,
+            include_draft=True,
+            include_confirmed=False,
+        )
+        self.assertEqual(
+            tuple(rule.find for rule in preferences.rules),
+            ("colour", "  "),
+        )
+        self.assertTrue(preferences.include_draft)
+        self.assertFalse(preferences.include_confirmed)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            preferences.include_confirmed = True  # type: ignore[misc]
+
+    def test_preprocess_preferences_reject_ambiguous_or_foreign_state(self) -> None:
+        rule = LiteralReplaceRule(find="x", replacement="y", enabled=True)
+        invalid_calls = (
+            lambda: PreprocessPreferences(
+                include_draft=False,
+                include_confirmed=False,
+            ),
+            lambda: PreprocessPreferences(rules=[rule]),  # type: ignore[arg-type]
+            lambda: PreprocessPreferences(
+                rules=(rule,),
+                include_draft=1,  # type: ignore[arg-type]
+            ),
+            lambda: PreprocessPreferences(
+                rules=(rule,),
+                include_confirmed="yes",  # type: ignore[arg-type]
+            ),
+        )
+        for invalid_call in invalid_calls:
+            with self.subTest(invalid_call=invalid_call), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                invalid_call()
 
     def test_preview_and_undo_contracts_carry_stale_state_evidence(self) -> None:
         change = PreprocessChange(
