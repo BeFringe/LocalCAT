@@ -32,6 +32,9 @@ _CANONICAL_RECOVERY_FAILED_CODE = "TM.CANONICAL_RECOVERY_FAILED"
 _CANONICAL_AMBIGUOUS_CODE = "TM.CANONICAL_ACTIVATION_AMBIGUOUS"
 _CANONICAL_IDENTITY_MISSING_CODE = "TM.CANONICAL_IDENTITY_MISSING"
 _CANONICAL_UNHEALTHY_CODE = "TM.CANONICAL_UNHEALTHY"
+_CANONICAL_REATTESTATION_REQUIRED_CODE = (
+    "TM.CANONICAL_REATTESTATION_REQUIRED"
+)
 
 
 # =============================================================================
@@ -207,6 +210,31 @@ def _activation_facts(configured_jsonl: Path) -> tuple[str, str] | None:
     raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
 
 
+def canonical_authority_facts(
+    configured_jsonl: Path,
+) -> tuple[str, str] | None:
+    """Return strict durable identity facts without opening the authority.
+
+    This read-only Core projection exists for an explicit maintenance owner
+    when the ordinary canonical open has already refused the resource.  It
+    never hydrates, repairs, or grants query authority.
+    """
+
+    path = _configured_jsonl_path(configured_jsonl)
+    facts = _activation_facts(path)
+    if facts is None:
+        return None
+    resource_id, canonical_store_id = facts
+    if (
+        type(resource_id) is not str
+        or not resource_id.strip()
+        or type(canonical_store_id) is not str
+        or not canonical_store_id.strip()
+    ):
+        raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
+    return resource_id, canonical_store_id
+
+
 def open_canonical_tm_store(
     configured_jsonl: Path,
     *,
@@ -237,6 +265,7 @@ def open_canonical_tm_store(
     if facts is None:
         return None
     resource_id, canonical_store_id = facts
+    coordinator: ResourceStoreCoordinator | None = None
     try:
         identity = CanonicalResourceIdentity.from_configured_jsonl(
             resource_id,
@@ -263,6 +292,16 @@ def open_canonical_tm_store(
         sqlite3.DatabaseError,
         OSError,
     ) as error:
+        if (
+            isinstance(error, ActivationPreparationError)
+            and error.code
+            == "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID"
+            and coordinator is not None
+            and coordinator.completed_authority_requires_reattestation()
+        ):
+            raise ValueError(
+                _CANONICAL_REATTESTATION_REQUIRED_CODE
+            ) from error
         code = getattr(error, "code", None)
         if isinstance(code, str) and code.startswith("ACTIVATION."):
             raise ValueError(

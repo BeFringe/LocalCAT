@@ -38,7 +38,12 @@ from PySide6.QtWidgets import (
 )
 
 from capability_host import CapabilityHost
-from editor_contracts import EditorProject, EditorSegment, ResourceKind
+from editor_contracts import (
+    EditorProject,
+    EditorSegment,
+    ResourceKind,
+    TMResourceDisplayMode,
+)
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
 from qt_settings_dialog import DEFAULT_VISIBLE_RESOURCE_ROWS, QtSettingsDialog
@@ -48,7 +53,10 @@ from tm_application_composition import (
     TMRuntimeHost,
     _TMEngineLegacyBackend,
 )
+from tm_contracts import CanonicalResourceIdentity
 from tm_migration import TMMigrationService
+from tm_sqlite_store import _activation_journal_path
+from tests.test_tm_canonical_reattestation import _rewrite_persisted_devices
 from tests.test_tm_initial_activation_recovery import _legacy_failure
 
 
@@ -249,6 +257,72 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         self.assertTrue(completed.completed)
         dialog._poll_tm_operation()
         self._events()
+
+    def test_device_drift_offers_canonical_revalidation_not_fuzzy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, (resource_id,) = _controller(Path(temporary))
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            completed = controller.wait_tm_activation(
+                started.operation_id,
+                timeout=20.0,
+            )
+            self.assertTrue(completed.succeeded)
+            config = controller.repository.get(resource_id)
+            identity = CanonicalResourceIdentity.from_configured_jsonl(
+                resource_id,
+                config.path,
+            )
+            _rewrite_persisted_devices(
+                _activation_journal_path(identity),
+                persisted_device=config.path.stat().st_dev + 17,
+            )
+            dialog = QtSettingsDialog(controller)
+            dialog.show()
+            self._events()
+
+            status = next(
+                item
+                for item in controller.tm_resource_statuses()
+                if item.resource_id == resource_id
+            )
+            self.assertEqual(
+                status.safe_codes,
+                ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",),
+            )
+            action = self._action(dialog, resource_id)
+            self.assertEqual(action.text(), "重新验证 canonical")
+            self.assertTrue(action.isEnabled())
+            with (
+                patch.object(
+                    QMessageBox,
+                    "question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch.object(
+                    controller,
+                    "revalidate_tm_fuzzy",
+                    side_effect=AssertionError(
+                        "canonical re-attestation must not run Gate D"
+                    ),
+                ) as fuzzy_revalidation,
+            ):
+                action.trigger()
+                self._events()
+                self._complete_operation(dialog, controller)
+                fuzzy_revalidation.assert_not_called()
+
+            refreshed = next(
+                item
+                for item in controller.tm_resource_statuses()
+                if item.resource_id == resource_id
+            )
+            self.assertEqual(
+                refreshed.mode,
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+            )
+            self.assertIn("已完成", dialog.status_label.text())
+            dialog.close()
 
     def test_open_and_refresh_are_read_only_and_show_legacy_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

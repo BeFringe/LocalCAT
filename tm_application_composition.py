@@ -44,6 +44,9 @@ _OperationResultT = TypeVar("_OperationResultT")
 _CANONICAL_AUTHORITY_UNAVAILABLE_CODE = (
     "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE"
 )
+_CANONICAL_REATTESTATION_REQUIRED_CODE = (
+    "TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED"
+)
 _OPEN_UNAVAILABLE_CODE = "TM.RUNTIME.OPEN_UNAVAILABLE"
 
 
@@ -743,13 +746,19 @@ class TMResourceResolver:
                 )
                 continue
             except ValueError as error:
+                message = str(error)
                 statuses.append(
                     _unavailable_status(
                         config,
                         code=(
-                            _CANONICAL_AUTHORITY_UNAVAILABLE_CODE
-                            if str(error).startswith("TM.CANONICAL_")
-                            else _OPEN_UNAVAILABLE_CODE
+                            _CANONICAL_REATTESTATION_REQUIRED_CODE
+                            if message
+                            == "TM.CANONICAL_REATTESTATION_REQUIRED"
+                            else (
+                                _CANONICAL_AUTHORITY_UNAVAILABLE_CODE
+                                if message.startswith("TM.CANONICAL_")
+                                else _OPEN_UNAVAILABLE_CODE
+                            )
                         ),
                         retryable=False,
                     )

@@ -1,5 +1,5 @@
 {
-  "artifact_digest": "df1bcd4c13aaacfbe637b85d9b1e6c8b7042fc5b3cc38043d6144bc95e02ed67",
+  "artifact_digest": "3e90aa229053942d3b8e1afec1614910ae70fa926acbb4a603f71ab794c97427",
  "artifact_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",
@@ -9,7 +9,7 @@
   "tm_similarity.py",
   "tm_sqlite_store.py"
  ],
-  "build_digest": "bdfc7d5db0289bfe13bdbb86aabf2c9c3bc5ea6343ac40baae33e7372939ede6",
+  "build_digest": "45dcfb3e5f0702d8ccf64a28d6ab429ce8fc2971cef7437eba68389c28f54363",
  "build_paths": [
   "tm_candidate_index.py",
   "tm_contracts.py",

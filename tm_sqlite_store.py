@@ -237,6 +237,8 @@ from tm_activation_recovery import (
     _validate_published_activation_set,
     _validate_replaced_activation_database,
     publish_activation,
+    completed_authority_requires_reattestation,
+    reattest_completed_authority,
     recover_durable_activation,
     rollback_durable_activation,
 )
@@ -3893,6 +3895,29 @@ class ResourceStoreCoordinator:
                 )
             self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
+
+    def reattest_completed_authority(self) -> ActivationRecoveryReport:
+        """Repair only a fully proven cross-restart ``st_dev`` drift.
+
+        The ordinary open path remains strict.  Callers must explicitly
+        request this maintenance transition; Core then re-proves and
+        atomically re-attests the exact same completed generation.
+        """
+
+        with self._condition:
+            report = reattest_completed_authority(
+                _CoordinatorStorePort(self)
+            )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
+            return report
+
+    def completed_authority_requires_reattestation(self) -> bool:
+        """Classify the exact repairable ``st_dev`` drift without granting it."""
+
+        with self._condition:
+            return completed_authority_requires_reattestation(
+                _CoordinatorStorePort(self)
+            )
 
     def rehydrate_runtime_authority(
         self,

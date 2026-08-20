@@ -276,7 +276,7 @@
   - _Boundary: ADR-013 Gate D Device Qualification_
   - _Depends: 3.6, 5.1, 6.1, 6.3, 6.4_
 
-- [ ] 6.7 按 ADR-016 重新证明已发布 canonical 的 device-only 身份漂移
+- [x] 6.7 按 ADR-016 重新证明已发布 canonical 的 device-only 身份漂移
   - 普通冷开保持 fail-closed；仅当 completed publication 的 source/manifest/SQLite 除一致 device-number 漂移外全部精确闭合时，显示资源局部“重新验证 canonical”动作
   - 显式维护在持久锁下原子更新 attestation 并恢复同一 store id / generation；任何 byte、inode、binding、phase、mixed-device 或 pending recovery 差异均零 mutation 拒绝
   - 成功经既有 runtime replacement 刷新当前建议，peer TM 与 ADR-013 Gate D/Fuzzy 资格保持正交

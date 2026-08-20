@@ -128,6 +128,9 @@ _TM_SAFE_REASON_LABELS = {
     "TM.RUNTIME.SOURCE_DIVERGED": "外部来源已变更",
     "TM.RUNTIME.REFRESH_FAILED": "运行时刷新失败",
     "TM.ACTIVATION.RUNTIME_REFRESH_FAILED": "激活后运行时验证失败",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED": "Canonical 文件身份需重新验证",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE": "Canonical 文件身份不满足重新验证条件",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_IDENTITY_INVALID": "Canonical 资源身份无法验证",
     "TM.LEGACY.QUERY_FAILED": "Legacy 查询失败",
     "TM.ACTIVATION.IO_FAILED": "本地读写失败",
     "TM.ACTIVATION.PROGRAMMER_ERROR": "Canonical 操作未能安全完成",
@@ -1010,6 +1013,17 @@ class QtSettingsDialog(QDialog):
     def _tm_lifecycle_action_spec(
         status: TMResourceStatus | None,
     ) -> tuple[str, str, bool]:
+        if (
+            status is not None
+            and status.mode is TMResourceDisplayMode.UNAVAILABLE
+            and status.safe_codes
+            == ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",)
+        ):
+            return (
+                "重新验证 canonical",
+                "重新证明同一 canonical 文件身份，不重建 TM 或运行 Fuzzy 验证",
+                True,
+            )
         if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
             return (
                 "激活 canonical",
@@ -1121,7 +1135,31 @@ class QtSettingsDialog(QDialog):
                 for item in self.controller.tm_resource_statuses()
                 if item.resource_id == resource_id
             )
-            if status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            if (
+                status.mode is TMResourceDisplayMode.UNAVAILABLE
+                and status.safe_codes
+                == ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",)
+            ):
+                answer = QMessageBox.question(
+                    self,
+                    "重新验证 canonical TM",
+                    (
+                        f"资源：{resource.name}\n\n"
+                        "将重新证明同一 canonical generation 的本地文件身份；"
+                        "不会重建或修改 TM 内容，也不会启动 Fuzzy 性能验证。"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.status_label.setText(
+                        f"已取消 {resource.name} 的 canonical 重新验证。"
+                    )
+                    return
+                started = self.controller.reattest_tm_resource(resource_id)
+                action_name = "Canonical 重新验证"
+            elif status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
                 preflight = self.controller.prepare_tm_activation(resource_id)
                 prompt = (
                     f"资源：{preflight.resource_name}\n"

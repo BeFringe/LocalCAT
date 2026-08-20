@@ -94,7 +94,7 @@ from tm_contracts import (
     StoreHealth,
     TextMatcherState,
 )
-from tm_engine import SourceUnit, TMEngine
+from tm_engine import SourceUnit, TMEngine, canonical_authority_facts
 from tm_migration import MigrationPreflightError, TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator
 from termbase_store import TermbaseStore, TermbaseValidationError
@@ -185,6 +185,42 @@ def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
     return TMMigrationService(
         resource_identity=identity,
         canonical_store_id=coordinator.canonical_store_id,
+        coordinator=coordinator,
+    )
+
+
+def _tm_reattestation_service(config: ResourceConfig) -> TMMigrationService:
+    """Construct an explicit owner for one refused canonical authority.
+
+    This path consumes only durable identity facts.  It does not open the
+    canonical store or grant query authority before the Core maintenance
+    transition repeats its device-only proof under the persistent lock.
+    """
+
+    if type(config) is not ResourceConfig:
+        raise TypeError("TM re-attestation config must be ResourceConfig")
+    config.__post_init__()
+    facts = canonical_authority_facts(config.path)
+    if facts is None:
+        raise EditorControllerError(
+            "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
+        )
+    resource_id, canonical_store_id = facts
+    if resource_id != config.id:
+        raise EditorControllerError(
+            "TM.RUNTIME.CANONICAL_REATTESTATION_IDENTITY_INVALID"
+        )
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        config.id,
+        config.path,
+    )
+    coordinator = ResourceStoreCoordinator(
+        canonical_store_id=canonical_store_id,
+        resource_identity=identity,
+    )
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=canonical_store_id,
         coordinator=coordinator,
     )
 
@@ -2526,6 +2562,75 @@ class EditorController:
                 raise
             return replace(operation)
 
+    def reattest_tm_resource(
+        self,
+        resource_id: str,
+    ) -> TMActivationOperationView:
+        """Start one explicit same-generation canonical re-attestation."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise EditorControllerError(
+                "TM re-attestation resource id is required"
+            )
+        with self._tm_activation_condition:
+            current_operation = self._tm_activation_operation
+            if current_operation is not None:
+                if not current_operation.completed:
+                    raise EditorControllerError(
+                        "a TM activation is already in progress"
+                    )
+                self._tm_activation_operation = None
+                self._tm_activation_outcome = None
+                self._tm_activation_worker_error = None
+            try:
+                config = self.repository.get(resource_id)
+            except ResourceError as error:
+                raise EditorControllerError(
+                    "TM re-attestation resource is unavailable"
+                ) from error
+            if config.kind is not ResourceKind.TRANSLATION_MEMORY:
+                raise EditorControllerError(
+                    "TM re-attestation requires a translation memory resource"
+                )
+            try:
+                service = _tm_reattestation_service(config)
+            except (OSError, UnicodeError, ValueError) as error:
+                raise EditorControllerError(
+                    "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
+                ) from error
+            operation = TMActivationOperationView(
+                operation_id=uuid4().hex,
+                resource_id=config.id,
+                phase="ACTIVATING",
+                completed=False,
+                succeeded=False,
+                safe_code=None,
+                retryable=False,
+            )
+            private_operation = replace(operation)
+            self._tm_activation_operation = private_operation
+            self._tm_activation_outcome = None
+            self._tm_activation_worker_error = None
+            self._prepared_tm_activation = None
+            worker = Thread(
+                target=self._run_tm_activation,
+                kwargs={
+                    "operation_id": private_operation.operation_id,
+                    "service": service,
+                    "source": config.path,
+                    "resource_id": config.id,
+                    "action": "REATTEST",
+                },
+                name=f"localcat-tm-reattest-{operation.operation_id[:8]}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                self._tm_activation_operation = None
+                raise
+            return replace(operation)
+
     def _start_initial_tm_activation(
         self,
         preflight: TMActivationPreflightView,
@@ -2641,6 +2746,11 @@ class EditorController:
                 candidate = service.activate_initial(source, resource_id)
             elif action == "REBUILD":
                 candidate = service.rebuild_from_snapshot(source, resource_id)
+            elif action == "REATTEST":
+                candidate = service.reattest_completed_authority(
+                    source,
+                    resource_id,
+                )
             else:
                 raise ValueError("TM operation action is unsupported")
             if type(candidate) is MigrationReport:
