@@ -23,7 +23,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── editor_contracts.py          # Qt 编辑器 frozen 跨层契约
 ├── editor_project.py            # JSON/TXT 项目与原子保存
 ├── resource_repository.py       # 资源清单和受控本地文件
-├── workspace_state.py           # 最近项目、段落断点与显示偏好
+├── workspace_state.py           # 最近项目、断点、显示/TM 与设备本地预处理偏好
 ├── resource_importer.py         # TMX/CSV/XLSX 安全原子导入
 ├── renpy_tm_compat.py           # 严格 speaker 对话封装查询与目标解包
 ├── project_search.py            # capability-gated 单项目搜索服务
@@ -71,7 +71,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `editor_controller.py` 可协调项目编解码、资源仓储、application adapters 和既有引擎，不导入 PySide6。
 - `editor_tm_adapter.py` 只消费 host-issued runtime/capability snapshot 和 ports，不成为新的存储、scorer 或 capability authority。
 - `capability_host.py` 协调 Matcher/Gate C/Gate D owner 与 application handoff；不把 evidence/receipt 暴露给 Controller 或 Qt。
-- `workspace_state.py` 只保存 Qt 无关的本地工作区状态；Qt 前端不得直接访问它。
+- `workspace_state.py` 只保存 Qt 无关的本地工作区状态；ADR-014 的 preprocessing member 仅包含规则与状态偏好，不保存项目正文、preview/session/revision 或 undo。Qt 前端不得直接访问它。
 - `logic_controller.py` 不导入 Qt/xlwings，保持无历史状态的三态接口。
 - `resource_importer.py` 不导入 PySide6；openpyxl 仅在 XLSX 路径中条件导入。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
@@ -95,7 +95,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_project_search*`、`tests/test_qt_project_search*`：单 JSON 搜索 contracts/service/Controller/Qt 与 current-source acceptance。
 - `tests/test_feature5_ui_*`：真实 canonical activation/retrieval、mixed merge、failure 与 apply/write 跨层验收。
 - `tests/test_capability_host*`、`tests/test_tm_retrieval*`：capability publication、in-flight generation 与 Core query 语义。
-- `tests/test_workspace_state.py`：最近项目、段落断点和显示偏好持久化。
+- `tests/test_workspace_state.py`：最近项目、段落断点、显示/TM 与预处理偏好的兼容读取、原子持久化和失败保留。
 - `tests/test_resource_*`：清单、托管/外部删除、TMX/CSV/XLSX、原子失败语义。
 - `tests/test_renpy_tm_compat.py`：安全 speaker token、引号转义与拒绝猜测性解包。
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。

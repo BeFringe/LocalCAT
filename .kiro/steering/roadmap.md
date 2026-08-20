@@ -142,7 +142,7 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 
 1. Qt JSON 首批预处理只修改 target；source 更新、重新导入差异和段落重关联属于后续 Parser / multi-document project reconciliation。
 2. target 内容变化撤销 `confirmed`，沿用当前编辑会话行为；译文框必须提供 `Ctrl+Z`、`Ctrl+Y`/`Ctrl+Shift+Z`。
-3. raw speaker 先行；alias、显式留空和头像后置。
+3. raw speaker inventory 先行；本轮头像只用于 inventory 的只读展示。alias、显式留空、speaker profile 以及编辑/浏览中的头像继续后置。
 4. 新术语记录默认 `Match Case=false`、`Whole Word=true`；旧两列记录不静默改变。
 5. 纯 CJK 查询在 Whole Word 下退化为连续文本匹配，因此与未勾选 Whole Word 的结果相同。
 6. `.kiro` 必须保持 Git 可跟踪；此前“完成 Qt JSON 与 Feature 5 后再解除忽略”的决定因可能丢失唯一 Spec 副本而撤销。

@@ -46,7 +46,7 @@ python qt_editor.py --install-macos-app
 | JSON / TXT | 编辑项目输入；项目保存为版本化 JSON |
 | TMX | Level 1 导入；最大 100 MB；拒绝 DTD/ENTITY；行内 XML 单元跳过 |
 | XLSX | 术语导入前两列；依赖 openpyxl |
-| workspace.json | 最近十个项目、稳定段落 ID/索引回退、列表密度和工作区模式；不写入翻译项目 |
+| workspace.json | 最近十个项目、稳定段落 ID/索引回退、显示/TM 偏好以及 ADR-014 批准的预处理规则/状态偏好；不写入翻译项目或执行会话 |
 
 项目保存、资源清单与导入均使用同目录临时文件加 `os.replace`。整体解析失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
 
@@ -70,7 +70,7 @@ python translation_runner.py
 ## 关键技术决策
 
 - Qt 会话状态属于 `EditorController`，不塞回旧无状态 `LogicController`。
-- 最近项目、最后段落与显示偏好由 Qt 无关的 `WorkspaceStateRepository` 原子保存；前端仍只通过 `EditorController` 访问。
+- 最近项目、最后段落、显示/TM 偏好与 ADR-014 的设备本地预处理偏好由 Qt 无关的 `WorkspaceStateRepository` 原子保存；前端仍只通过 `EditorController` 访问。
 - 资源状态由 `ResourceRepository` 原子持久化，设置对话框不直接写文件。
 - legacy 普通 source exact 优先；仅当 speaker token 安全且源/目标均为同 speaker 封装时，兼容桥才解包 Ren'Py/MateCat 记录。
 - Active + Lookup 决定查询集合；Active + Update 决定确认写回集合。
