@@ -21,10 +21,21 @@ Layer 1 resource / termbase / canonical TM storage
 ```text
 /
 ├── editor_contracts.py          # Qt 编辑器 frozen 跨层契约
-├── editor_project.py            # JSON/TXT 项目与原子保存
+├── editor_project.py            # JSON/TXT 单输入项目 Application facade
+├── parser_contracts.py          # stdlib-only 中立合同、capability 与 limit profile
+├── parser_source.py             # rooted source/snapshot/terminal 与 canonical 原子写
+├── parser_registry.py           # purpose-aware 不可变 registry，不导入具体 codec
+├── parser_composition.py        # 唯一内建注册点与 Application surface
+├── parser_json_support.py       # 有界 JSON lexical/depth/full-input preflight
+├── parser_xlsx_support.py       # ZIP/OPC XML/DTD/ENTITY 安全 preflight
+├── parser_localcat_codec.py     # LocalCAT JSON/TXT reader 与 JSON canonical serializer
+├── parser_gettext_codec.py      # PO/POT singular project-document codec
+├── parser_tmx_codec.py          # TMX Level 1 资源 codec
+├── parser_tm_json_codec.py      # normalized TM JSON 单输入资源 codec
+├── parser_termbase_codec.py     # CSV/XLSX 显式列选择资源 codec
 ├── resource_repository.py       # 资源清单和受控本地文件
 ├── workspace_state.py           # 最近项目、断点、显示/TM 与设备本地预处理偏好
-├── resource_importer.py         # TMX/CSV/XLSX 安全原子导入
+├── resource_importer.py         # TMX/CSV/XLSX Application policy 与事务导入
 ├── renpy_tm_compat.py           # 严格 speaker 对话封装查询与目标解包
 ├── project_search.py            # capability-gated 单项目搜索服务
 ├── editor_controller.py         # Qt 项目/搜索/TM/术语/资源会话
@@ -73,13 +84,16 @@ Layer 1 resource / termbase / canonical TM storage
 - `capability_host.py` 协调 Matcher/Gate C/Gate D owner 与 application handoff；不把 evidence/receipt 暴露给 Controller 或 Qt。
 - `workspace_state.py` 只保存 Qt 无关的本地工作区状态；ADR-014 的 preprocessing member 仅包含规则与状态偏好，不保存项目正文、preview/session/revision 或 undo。Qt 前端不得直接访问它。
 - `logic_controller.py` 不导入 Qt/xlwings，保持无历史状态的三态接口。
-- `resource_importer.py` 不导入 PySide6；openpyxl 仅在 XLSX 路径中条件导入。
+- `parser_contracts.py` 只依赖标准库；Parser Foundation 与各 codec 不导入 Engine、Store、Controller、Qt、workspace 或 sync/provider implementation。
+- `parser_registry.py` 不导入具体 codec；只有 `parser_composition.py` 显式注册内建 codec，并向 Application 提供选择、打开、验证、materialize、stream 与 canonical write surface。
+- `editor_project.py`、`resource_importer.py`、`logic_controller.py` 与 `tm_json_importer.py` 只负责既有类型映射、batch policy 和事务，不保留第二份 JSON/TXT/PO/POT/TMX/CSV/XLSX 语法。
+- openpyxl 只由 `parser_termbase_codec.py` 在 XLSX preflight 通过后条件导入，并固定 read-only/data-only、关闭 links/VBA；`resource_importer.py` 不拥有 active-sheet 或列选择语法。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。
 - `tm_snapshot_artifacts.py` 只拥有 snapshot/export deterministic artifact family、no-follow parent dirfd、strict file identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码；不反向导入 `tm_sqlite_store.py`、`tm_migration.py` 或 `tm_snapshot_recovery.py`，不拥有 ledger/binding/transaction 或 receipt reconciliation 状态。
 - 核心 Engine 不向上导入 Controller 或 Frontend。
 
-该边界由 `tests/test_qt_user_journey.py` 的 AST 守卫和 Excel 适配器契约测试持续验证。
+该边界由 `tests/test_parser_architecture_harness.py`、`tests/test_parser_wave4_architecture.py`、Qt AST 守卫和 Excel 适配器契约测试持续验证。
 
 ## 命名与代码风格
 
@@ -100,6 +114,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_renpy_tm_compat.py`：安全 speaker token、引号转义与拒绝猜测性解包。
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
+- `tests/test_parser_*`：contracts/source/registry/composition、八个用途/格式组合、golden/fault/security/facade 与跨格式 completion 矩阵。
 - `tests/test_macos_app_launcher.py`：Finder/LaunchServices identity、cwd-independent bootstrap、atomic replacement 与失效路径。
 - `tests/test_tm_schema_upgrade_module_boundaries.py`：schema-upgrade 依赖方向、owner 权威与 late-bound 兼容接缝。
 - `tests/test_tm_snapshot_artifacts_module_boundaries.py`：snapshot artifact 依赖方向、owner 权威、late-bound fault seam 与移动等价性。
@@ -107,4 +122,4 @@ Layer 1 resource / termbase / canonical TM storage
 
 ## 开发上下文
 
-当前方法是无常驻 Agent 状态的 Kiro 规格驱动开发。持久上下文位于 `AGENTS.md`、`.kiro/steering/` 和 `.kiro/specs/`；早期 `plugins/modular-cat-architect/` 仅为历史材料，不得覆盖当前 steering 或实现事实。Parser 遗留草案也不得直接实施，需按同目录 `research.md`/`rebaseline-plan.md` 重新走审批。
+当前方法是无常驻 Agent 状态的 Kiro 规格驱动开发。持久上下文位于 `AGENTS.md`、`.kiro/steering/` 和 `.kiro/specs/`；早期 `plugins/modular-cat-architect/` 仅为历史材料，不得覆盖当前 steering 或实现事实。Parser 已按 `parser-subsystem-extraction` 的批准 Requirements/Design/Tasks 就地重新基线；更早的同目录遗留草案仍只作历史留档。

@@ -2,9 +2,9 @@
 
 ## Overview
 
-LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项目、精确 TM、Trie 术语和 TMX/CSV/XLSX 语言资源导入。下一轮由两条垂直基线与一个独立集成阶段组成：Qt 继续完善**单 JSON 项目**，Feature 5 提供 SQLite、Levenshtein/Dice fuzzy 和兼容文本搜索基建，`feature5-ui-integration` 在两者之间建立正式 composition/Controller 接缝。
+LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项目、精确 TM、Trie 术语、Feature 5 canonical retrieval，以及完成重新基线的单输入 Parser Foundation。Parser 已用 purpose-aware registry、rooted sealed snapshot、verified terminal 与八个内建用途/格式组合统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的语法权威；Application 继续拥有项目会话、batch policy 与资源事务。
 
-常见多文档输入是同一项目中的多个 TXT、JSON 或 XLSX 文件，通常一个文件对应一章；它们在 Parser 重新基线与 `Project → Document/Chapter → Segment` 多文档模型后推进，不能继续扩充当前扁平 `EditorProject.segments`。单个 XLSX 内由多个 Sheet 分别承载章节属于特殊 workbook origin，也接入同一多文档模型。RPY 拆成两层：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出，可在 Parser Foundation 后由独立规格推进；把多个 RPY 或 workbook sheet 聚合成项目仍必须等待多文档模型。
+Parser 重新基线已经完成；常见多文档输入仍是同一项目中的多个 TXT、JSON 或 XLSX 文件，通常一个文件对应一章，它们必须等待 `Project → Document/Chapter → Segment` 多文档模型，不能继续扩充当前扁平 `EditorProject.segments`。单个 XLSX 内由多个 Sheet 分别承载章节属于特殊 workbook origin，也接入同一多文档模型。RPY 拆成两层：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出，可在 Parser Foundation 后由独立规格推进；把多个 RPY 或 workbook sheet 聚合成项目仍必须等待多文档模型。
 
 ## Approach Decision
 
@@ -27,9 +27,10 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 | Qt JSON | `ui-mvp` | 单 JSON、raw speaker、基础搜索/预处理/术语 CRUD、silver logo、紧凑“…” | 新项目格式、SQLite、fuzzy；合并前不启用 Match Case / Whole Word |
 | Feature 5 | `feature5` | canonical TM、SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher、exact/context/fuzzy query | Qt 控件、Parser codec、Glossary 管理 UI、Docker/协作 |
 | Feature 5 UI Integration | `ui-mvp`（独立 Spec） | 精确 Feature 5 merge、composition root、Controller adapter、TM suggestion/阈值/状态、macOS bundle | 重写 Core、接管 Qt Req3 搜索或 Req7 术语 CRUD |
-| Parser / Multi-document | 后续规格分支 | Parser registry、Project/Document/Segment、多格式 codec | 不阻塞前两条线 |
+| Parser Foundation | `parser-rebaseline` | 中立 contracts/source/registry/composition、八个单输入组合、唯一 Application surface | 不拥有多文档、RPY 实现、chunk、sync 或 TM storage |
+| Multi-document | 后续规格分支 | Project/Document/Segment、章节导航、保存与 reconciliation | 不改写 Parser 单输入局部身份 |
 
-`governance/kiro-steering` 不是第三条产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在 `ui-mvp` 和 `feature5` 两条正交线重复生成 patch-equivalent 治理提交。`parser-rebaseline` 同样不是提前启动 Parser runtime 的交付线，而是临时的 Spec-only 隔离 worktree，只拥有 `parser-subsystem-extraction` 契约门；Design/Tasks 获批前不拥有业务代码。
+`governance/kiro-steering` 不是第三条产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
 
 两条活动线使用单一、可追踪的继承链：共享 SDD/Steering 与已验收 Qt 基线先在 `ui-mvp` 提交一次，`feature5` 再通过 rebase/merge 继承该历史，并只追加 Feature 5 自身规格与实现。不得在两个 worktree 中分别重建等价补丁；共享治理或跨线契约也必须只提交一次，再由活动分支继承。分支 tip 无需长期相同，但共同改动必须拥有同一提交祖先。
 
@@ -57,8 +58,12 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
   - exact/context/fuzzy suggestion、双 source、device-local 60% 阈值、显式/stale apply；
   - mixed resources 的确定性全局 top-10、诚实降级与 resource-local failure；
   - `TextMatcher` 向原 Qt Requirement 3/7 的正式 handoff，以及独立 macOS `LocalCAT.app` 入口。
+- **Now — Parser Foundation**:
+  - stdlib-only 中立 contracts、rooted/sealed source、guarded terminal、用途感知 registry 与唯一内建 composition；
+  - LocalCAT JSON/TXT、PO/POT、TMX Level 1、normalized TM JSON、CSV/XLSX 八个 reader 组合；
+  - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
+  - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
 - **Later**:
-  - Parser 重新基线；
   - 独立的单输入 RPY format-codec plugin / repository ACL；
   - 多文档/多章节项目工作区；
   - 同项目多 TXT / JSON / XLSX，以及特殊的多 Sheet workbook、RPY folder/workbook 集成与 XLIFF codec；
@@ -106,10 +111,11 @@ LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项�
 ## Existing Spec Updates
 
 - [ ] `qt-editor-mvp` -- 收口已完成 MVP 状态；只保留 silver logo 与“…”按钮维护事实。Dependencies: none
-- [ ] `parser-subsystem-extraction` -- 后置重新基线，加入多文档/多章节契约与 TMX 非项目格式边界。Dependencies: Qt JSON + Feature 5 合并不要求等待它
+- [x] `parser-subsystem-extraction` -- 已完成中立单输入重新基线、八个首波组合、唯一语法权威与 Application facade 迁移；多文档/多章节继续由相邻 Spec 拥有。Dependencies: approved ADR-015 and current-source evidence revalidation
 
 ## Specs (dependency order)
 
+- [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
 - [ ] `qt-editor-json-mvp-increment` -- 单 JSON 的 speaker、基础搜索/预处理/术语 CRUD 与第二阶段选项入口。Dependencies: `qt-editor-mvp`
 - [ ] `tm-storage-retrieval-index` -- SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher 和 exact/context/fuzzy。Dependencies: current exact/JSONL behavior baseline
 - [ ] `feature5-ui-integration` -- 精确 merge Feature 5，建立 canonical/legacy composition、Controller adapter、TM suggestion/阈值/状态和 macOS 入口。Dependencies: `tm-storage-retrieval-index@dd7c9fdb...` 与已批准的 Qt frozen contracts；不依赖原 Qt 增量全部完成

@@ -292,78 +292,78 @@
   - _Boundary: Gettext Runner Application Adapters_
   - _Depends: 3.9, 3.10, 4.1_
 
-- [ ] 5. Wave 4：收口、复验与治理同步
-- [ ] 5.1 验证 guarded terminal 与 Application commit 原子性
+- [x] 5. Wave 4：收口、复验与治理同步
+- [x] 5.1 验证 guarded terminal 与 Application commit 原子性
   - 对每个 iterator/resource 路径注入 fatal tail、early close、consumer exception、cancel、无 EOF 与 resource commit failure。
   - 断言 provisional records 全部销毁、verified terminal 单次签发、batch 文件结果独立，且失败没有 store/target 修改。
   - 完成时，终态和事务测试矩阵对所有受影响入口通过。
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 15.3_
 
-- [ ] 5.2 验证 source、snapshot、stale 与取消安全
+- [x] 5.2 验证 source、snapshot、stale 与取消安全
   - 覆盖 safe-root、regular-file、sealed digest、原文件并发变化、validation/parse stale、lease 生命周期与有界取消点。
   - 断言失败或取消无 verified terminal、无残留 snapshot，且不回退到越过 root 的 pathname 访问。
   - 完成时，Source Boundary 故障矩阵在所有支持平台上通过或以 root-binding unavailable 明确 fail closed。
   - _Requirements: 6.3, 6.4, 6.6, 7.2, 8.2, 9.6, 9.7, 15.3_
 
-- [ ] 5.3 验证 limits、diagnostics、metadata 与编码边界
+- [x] 5.3 验证 limits、diagnostics、metadata 与编码边界
   - 参数化覆盖各 codec profile 的输入、字段、记录、materialization、issue、metadata 与结构深度边界。
   - 验证稳定 limit/encoding code、issue truncation、按 code 计数和安全摘要；确认 Gate D 100k 未被解释为 Parser limit。
   - 完成时，所有超限或无效编码均 fatal、无正文泄露、无 best-effort decoding，validation/terminal 携实际 profile/version。
   - _Requirements: 6.1, 6.2, 6.5, 8.1, 8.3, 8.4, 8.5, 8.6, 9.1, 9.2, 9.3_
 
-- [ ] 5.4 验证 JSON、XML 与 XLSX 专项安全
+- [x] 5.4 验证 JSON、XML 与 XLSX 专项安全
   - 覆盖 JSON lexical depth/完整输入、TMX DTD/ENTITY/外部解析，以及 XLSX archive expansion、每个 OPC XML member 与非执行型 cell 读取。
   - 断言 Parser 不访问网络、不执行 macro/formula/external link/object，危险输入在记录输出前失败。
   - 完成时，三类格式安全 fixture 均返回预期稳定结果，安全输入仍可正常解析。
   - _Requirements: 5.3, 8.1, 8.3, 9.4, 9.5, 9.7_
 
-- [ ] 5.5 验证 iterator、materialized 与 validation 等价
+- [x] 5.5 验证 iterator、materialized 与 validation 等价
   - 在 materialization 限制内比较同 snapshot 的接受顺序、records、issues、counts 与 terminal，validation 复用同一 grammar。
   - 覆盖空输入、warning、fatal tail 和 materialization limit，不允许任何视图重标 provisional record。
   - 完成时，跨格式 metamorphic/property tests 对全部八个组合通过。
   - _Requirements: 2.1, 2.2, 2.4, 7.7, 15.2_
 
-- [ ] 5.6 验证内容、RawSpeaker、target presence 与单输入身份
+- [x] 5.6 验证内容、RawSpeaker、target presence 与单输入身份
   - 验证内部字符、大小写、局部 ID 空洞/唯一性、missing/explicit-empty target 和无持久确认状态时的派生结果。
   - 断言不做 Unicode normalize、escape、speaker 推断、项目级身份、folder/workbook 聚合、进度或同步语义。
   - 完成时，全部支持格式的中立记录只表达单输入事实，延期 owner 边界保持可观察。
   - _Requirements: 2.3, 2.5, 2.6, 2.7, 9.2, 9.3, 12.1, 12.2, 12.3, 12.4, 12.5, 13.1, 13.2, 13.4, 13.5, 13.6_
 
-- [ ] 5.7 验证 capability、writer 与 plugin token fail-closed
+- [x] 5.7 验证 capability、writer 与 plugin token fail-closed
   - 核对八个内建 descriptor 的 reader/writer/streaming/profile 声明，以及 unsupported writer 在目标打开前失败。
   - 用模拟 provider 验证 opaque token 的 provider/codec/version/source/format-state identity；foreign、stale、missing、version mismatch 不修改目标。
   - 注入 canonical byte write 的 temp/fsync/replace failure，断言原目标保持不变且无成功 receipt。
   - 完成时，只有 LocalCAT JSON 可 canonical write，首波不存在内建 source-round-trip writer，plugin 私有状态不被 Core 解释。
   - _Requirements: 2.8, 3.9, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 11.7, 11.8, 15.3_
 
-- [ ] 5.8 删除平行语法并验证架构与延期边界
+- [x] 5.8 删除平行语法并验证架构与延期边界
   - 删除已迁移入口中的独立 tokenization、unescaping、validation、row-selection 和 writer 语法，不保留 BaseParser 准入或 Engine re-export。
   - 运行 AST/import guards，证明 Parser 与 Engine/Store 互不导入，composition 是唯一内建注册点，Parser 不取得 Qt/workspace/TMStore/provider 权威。
   - 用负向守卫保持 multi-document、ProjectPackage、RPY 实现、XLIFF、TMX context/export、speaker profile、自动术语列推断、Office/PDF/OCR、chunk 与 sync 延期。
   - 完成时，生产树每种格式只有一个 grammar owner，延期能力只能进入其 owning Spec。
   - _Requirements: 11.1, 11.4, 11.5, 11.6, 11.7, 11.8, 13.2, 13.4, 13.5, 13.6, 14.2, 14.4, 15.4, 15.6, 15.7_
 
-- [ ] 5.9 执行完整 facade 与相邻功能兼容回归
+- [x] 5.9 执行完整 facade 与相邻功能兼容回归
   - 运行 editor project、Controller/Qt 单项目、TMX/resource importer、legacy TM、termbase reload/LKG、Excel 三态、normalized CLI、runner 和 self-check suites。
   - 对已声明的版本化变化使用新合同断言；其余失败必须修复，不以 legacy facade 为由保留第二 parser。
   - 完成时，兼容矩阵全部通过，或每个差异都已在 Requirements/Design 的既有变化表中有对应依据。
   - _Requirements: 13.3, 14.1, 14.2, 14.3, 14.5, 14.6, 15.5_
 
-- [ ] 5.10 由 Integration TM owner 重验 Parser 触发的 current-source evidence
+- [x] 5.10 由 Integration TM owner 重验 Parser 触发的 current-source evidence
   - 基于实际 Parser diff 判定是否命中 resource importer、TM adapter、Engine 或 Feature 5 source fingerprint；未命中时形成可复核的 no-impact 结论。
   - 命中时由 Integration TM owner 在当前源码上重跑 Gate C、acceptance、fault 与 release suites，并按实际 source roots 判断是否需要 Gate D；Parser 不复制或自签 evidence。
   - 完成时，受影响的 TM evidence 与当前源码 fingerprint 一致，100k Gate D 仍保持原性能语义 owner。
   - _Requirements: 8.6, 11.3, 14.6, 15.5_
   - _Depends: 5.8, 5.9_
 
-- [ ] 5.11 由 Governance owner 同步 Parser runtime 的真实派生事实
+- [x] 5.11 由 Governance owner 同步 Parser runtime 的真实派生事实
   - 仅在 runtime 文件树和依赖方向真实落地后，同步 Parser 相关 structure/tech/roadmap 索引；不提前写入 RPY、多文档、chunk、sync 或 TM store 维护线。
   - 保持 ADR-015 与本规格 ownership，任何新边界变化返回其 owning Spec/ADR，不把实施记录写成新权威。
   - 完成时，Steering diff 只描述已存在的 Parser 组件、依赖和交接触发器，并通过治理一致性检查。
   - _Requirements: 11.1, 11.4, 14.6, 15.4, 15.7_
   - _Depends: 5.8, 5.10_
 
-- [ ] 5.12 执行 Parser Feature fresh completion 验证
+- [x] 5.12 执行 Parser Feature fresh completion 验证
   - 从干净环境运行全部 parser contracts、golden、fault、AST、facade compatibility 与相邻回归，不复用旧测试结果。
   - 机械核对八个组合、所有 stable codes/profile、单一 grammar exit 条件和本任务图的 Requirements 覆盖。
   - 完成时，Parser runtime、下游 TM evidence 和治理派生事实形成同一 current-source 闭环，且不存在未解释失败。

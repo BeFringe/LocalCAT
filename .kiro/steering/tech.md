@@ -7,13 +7,14 @@
 | 层 | 职责 | 当前关键文件 |
 |----|------|-------------|
 | Layer 1 Storage | legacy JSONL、canonical SQLite、mixed termbase CSV、资源/工作区状态与持久恢复 | `resource_repository.py`, `workspace_state.py`, `termbase_store.py`, `tm_sqlite_store.py`, `tm_activation_*.py` |
-| Layer 2 Engine / Parser | TM retrieval/scoring、capability-gated text matcher、项目搜索、Trie 术语、项目/资源解析 | `tm_retrieval.py`, `tm_similarity.py`, `text_matcher.py`, `project_search.py`, `glossary_engine.py`, `editor_project.py` |
-| Layer 3 Application / Logic | capability/runtime composition、TM adapter、Qt 有状态会话；Excel 无状态三态入口 | `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
+| Layer 2 Engine / Parser | TM retrieval/scoring、capability-gated text matcher、项目搜索、Trie 术语；中立 Parser contracts/source/registry 与格式 codec | `tm_retrieval.py`, `tm_similarity.py`, `text_matcher.py`, `project_search.py`, `glossary_engine.py`, `parser_contracts.py`, `parser_source.py`, `parser_registry.py`, `parser_*_codec.py` |
+| Layer 3 Application / Logic | Parser composition/facade mapping、capability/runtime composition、TM adapter、Qt 有状态会话；Excel 无状态三态入口 | `parser_composition.py`, `editor_project.py`, `resource_importer.py`, `tm_json_importer.py`, `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
 | Layer 4 Frontend | Excel、PySide6 主窗口/资源/术语交互与桌面启动入口 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_settings_dialog.py`, `qt_termbase_dialog.py`, `qt_editor.py` |
 
 关键约束：
 
 - Engine、Parser、Repository 不得导入 PySide6 或 xlwings。
+- Parser 与 Engine/Store 互不导入；Application 只经 `parser_contracts.py` 与 `parser_composition.py` 消费中立结果，只有 composition 可导入具体内建 codec。
 - Qt 模块只调用 `EditorController` 与 frozen contracts，不得直接导入 repository、store、retrieval、matcher 或 capability owner。
 - `CapabilityHost` 是 matcher/retrieval capability 发布权威；`TMRuntimeHost` 持有完整 resource snapshot，`EditorTMAdapter` 只将同一 operation 投影给 `EditorController`。
 - `LogicController` 的三态与 legacy TM 优先规则保持不变；`EditorController` 单独持有 Qt 项目、搜索、TM/术语 issuance 与资源操作会话。
@@ -22,6 +23,7 @@
 
 - Python：当前在 3.14 上开发与验证。
 - 核心与无头入口：标准库为主。
+- Parser contracts/source/registry 与 JSON/TXT/PO/POT/TMX/normalized JSON codec 使用标准库；XLSX codec 仅在安全 preflight 后条件使用 openpyxl。
 - Qt 前端：`PySide6==6.11.1`。
 - XLSX：`openpyxl>=3.1,<4`。
 - 交互式 Excel：xlwings，可选且只属于 Excel Layer 4。
@@ -43,18 +45,21 @@ python qt_editor.py --install-macos-app
 | JSONL | legacy TM 的 exact/source-LWW 兼容存储，也是首次 canonical 激活的可核对 source snapshot |
 | SQLite + sidecars/journal | 每资源 canonical TM；版本化记录、多译文、索引、generation、snapshot binding 与可崩溃恢复发布 |
 | UTF-8-SIG CSV | mixed termbase；legacy 两列行原样保留，v1 行携带稳定 id 与 Match Case / Whole Word |
-| JSON / TXT | 编辑项目输入；项目保存为版本化 JSON |
-| TMX | Level 1 导入；最大 100 MB；拒绝 DTD/ENTITY；行内 XML 单元跳过 |
-| XLSX | 术语导入前两列；依赖 openpyxl |
+| JSON / TXT | `project_document` 单输入；JSON 支持 schema-v1 canonical write，TXT source-only/read-only |
+| PO / POT | `project_document` singular profile；保留 opaque gettext metadata，plural 输入 fail closed |
+| TMX | `translation_memory` Level 1；最大 100 MB；拒绝 DTD/ENTITY/外部实体；行内 XML 单元 warning+skip |
+| normalized TM JSON | `translation_memory` 单文件数组根；单输入 codec 保序保重复，目录/LWW/JSONL 输出留在 CLI Application |
+| CSV / XLSX | `termbase` 显式列选择；既有入口主动传前两列兼容 preset，XLSX 只读 active worksheet且不聚合多 Sheet |
 | workspace.json | 最近十个项目、稳定段落 ID/索引回退、显示/TM 偏好以及 ADR-014 批准的预处理规则/状态偏好；不写入翻译项目或执行会话 |
 
-项目保存、资源清单与导入均使用同目录临时文件加 `os.replace`。整体解析失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
+LocalCAT JSON canonical writer 由 codec 只生成确定性 bytes，`parser_source.py` 在 rooted target parent 内执行独占临时文件、file fsync、原子 replace 与 readback receipt；resource/store 与 normalized CLI 继续拥有各自事务。任何入口只有在 verified terminal 后才可提交，整体解析、consumer 或 commit 失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
 
 ## 开发与测试标准
 
 - 跨层契约使用 `@dataclass(frozen=True)` 和 tuple 集合。
 - 新代码使用 `pathlib.Path`、现代类型语法和显式异常/结构化报告。
 - 正式测试使用 stdlib `unittest`；Qt 使用 offscreen 与 QtTest；旧核心继续保留模块自检。
+- Parser completion 使用合成可分发 golden、故障注入、mutation-sensitive completion matrix 与 AST/import closed-world guards；Gate D 100,000 条 TM 仍是 retrieval 性能资格，不是 Parser limit。
 - `.kiro/specs/` 保存需求、设计和任务；`.kiro/steering/` 保存当前项目级事实。
 
 ```bash
