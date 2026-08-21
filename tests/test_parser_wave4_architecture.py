@@ -156,6 +156,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "tm_retrieval_capability",
         "tm_retrieval_validation",
         "tm_snapshot_artifacts",
+        "tm_sqlite_candidate_projection",
         "tm_sqlite_store",
         "tm_stage_sealer",
         "tools.validate_tm_acceptance_matrix",

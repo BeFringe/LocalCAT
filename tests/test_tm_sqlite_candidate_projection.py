@@ -20,6 +20,10 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
     ("_chunks", ("values",)),
     ("_finish_candidate_projection_digest", ("table_digests", "fts5_available")),
     ("_fts5_match_expression", ("trigrams",)),
+    (
+        "_prepare_streamed_candidate_records",
+        ("candidate_records", "record_ids_by_ordinal"),
+    ),
     ("_proof_int", ("value", "code")),
     ("_proof_text", ("value", "code")),
     ("_record_id", ("value", "code")),
@@ -122,7 +126,6 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
             "connection",
             "candidate_records",
             "record_ids_by_ordinal",
-            "candidate_gram_facts",
             "fts5_available",
         ),
     ),
@@ -133,7 +136,7 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
             "candidate_records",
             "record_ids_by_ordinal",
             "candidate_gram_facts",
-            "fts5_available",
+            "gram_size",
         ),
     ),
     (
@@ -142,8 +145,7 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
             "connection",
             "candidate_records",
             "record_ids_by_ordinal",
-            "candidate_gram_facts",
-            "fts5_available",
+            "expected_gram_row_count",
         ),
     ),
     (
@@ -158,15 +160,6 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
     (
         "project_candidate_write_plan",
         ("plan", "record_ids_by_ordinal", "folded_sources_by_ordinal"),
-    ),
-    (
-        "project_streamed_candidate_index",
-        (
-            "candidate_records",
-            "record_ids_by_ordinal",
-            "candidate_gram_facts",
-            "fts5_available",
-        ),
     ),
     ("restore_streamed_stage_secondary_indexes", ("connection",)),
     ("streamed_stage_secondary_index_inventory", ("connection",)),
@@ -415,6 +408,55 @@ def future_candidate_callback(connection, callback):
         self.assertNotIn("SQLiteCandidateProofSnapshot", source)
         self.assertNotIn("receipt", source)
         self.assertNotIn("binding_digest", source)
+
+    def test_streamed_maxima_scan_is_physically_rowid_bounded(self) -> None:
+        tree = ast.parse(
+            (_ROOT / "tm_sqlite_candidate_projection.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "insert_streamed_candidate_proof_rows"
+        )
+        sql_literals = tuple(
+            node.value
+            for node in ast.walk(function)
+            if isinstance(node, ast.Constant) and type(node.value) is str
+        )
+        maxima_sql = next(
+            value
+            for value in sql_literals
+            if "INSERT INTO tm_gram_block_max" in value
+        )
+        self.assertIn("FROM tm_gram NOT INDEXED", maxima_sql)
+        self.assertIn("WHERE rowid BETWEEN ? AND ?", maxima_sql)
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE tm_gram (gram_size INTEGER NOT NULL, "
+            "gram TEXT NOT NULL, record_id INTEGER NOT NULL, "
+            "term_frequency INTEGER NOT NULL, "
+            "PRIMARY KEY(gram_size, gram, record_id))"
+        )
+        connection.execute(
+            "CREATE INDEX idx_tm_gram_lookup "
+            "ON tm_gram(gram_size, gram, record_id)"
+        )
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT gram_size, gram, record_id, "
+            "term_frequency FROM tm_gram NOT INDEXED "
+            "WHERE rowid BETWEEN ? AND ? AND record_id BETWEEN ? AND ? "
+            "AND gram_size IN (1, 2)",
+            (10, 20, 3, 7),
+        ).fetchall()
+        details = " ".join(str(row[3]).upper() for row in plan)
+        self.assertIn("INTEGER PRIMARY KEY", details)
+        self.assertIn("ROWID>?", details)
+        self.assertIn("ROWID<?", details)
 
 
 class CandidateProjectionReadTests(unittest.TestCase):

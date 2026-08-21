@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager, ExitStack
+import hashlib
 import inspect
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -266,7 +268,6 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store, _fts5_available = _store(root)
-            original_project = projection.project_streamed_candidate_index
             original_gram = projection.insert_streamed_candidate_gram_rows
             original_fts = projection.insert_streamed_candidate_fts_rows
             original_proof = projection.insert_streamed_candidate_proof_rows
@@ -285,7 +286,7 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
             )
             original_frequencies = tm_sqlite_store.character_ngram_frequencies
             observed: list[tuple[str, bool, frozenset[str]]] = []
-            projection_calls: list[frozenset[str]] = []
+            gram_sizes: list[int] = []
             connection_exits: list[bool] = []
 
             def observer(label: str, implementation: object):
@@ -308,12 +309,17 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
 
                 return observe
 
-            def observe_project(
+            def observe_gram(
+                connection: sqlite3.Connection,
                 *args: object,
                 **kwargs: object,
             ) -> object:
-                projection_calls.append(frozenset(kwargs))
-                return original_project(*args, **kwargs)
+                gram_sizes.append(cast(int, kwargs["gram_size"]))
+                return observer("gram", original_gram)(
+                    connection,
+                    *args,
+                    **kwargs,
+                )
 
             with (
                 _track_leased_connections(connection_exits),
@@ -334,13 +340,8 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
                 ) as restore_seam,
                 patch.object(
                     projection,
-                    "project_streamed_candidate_index",
-                    side_effect=observe_project,
-                ) as streamed_projection,
-                patch.object(
-                    projection,
                     "insert_streamed_candidate_gram_rows",
-                    side_effect=observer("gram", original_gram),
+                    side_effect=observe_gram,
                 ) as gram_projection,
                 patch.object(
                     projection,
@@ -386,12 +387,12 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
                     _defer_secondary_indexes=True,
                 )
 
-            self.assertEqual(streamed_projection.call_count, 6)
+            required_sizes = (1, 2) if _fts5_available else (1, 2, 3)
+            self.assertEqual(gram_sizes, list(required_sizes) * 2)
             self.assertEqual(
-                projection_calls,
-                [frozenset({"fts5_available"})] * 6,
+                gram_projection.call_count,
+                len(required_sizes) * 2,
             )
-            self.assertEqual(gram_projection.call_count, 2)
             self.assertEqual(fts_projection.call_count, 2)
             self.assertEqual(proof_projection.call_count, 2)
             self.assertEqual(insert_seam.call_count, 2)
@@ -399,15 +400,18 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
             suspend_seam.assert_called_once()
             restore_projection.assert_called_once()
             restore_seam.assert_called_once()
-            self.assertGreater(frequency_seam.call_count, 0)
+            self.assertEqual(
+                frequency_seam.call_count,
+                3 * len(required_sizes),
+            )
             self.assertEqual(
                 tuple(label for label, _transaction, _keys in observed),
                 (
                     "suspend",
-                    "gram",
+                    *("gram",) * len(required_sizes),
                     "fts",
                     "proof",
-                    "gram",
+                    *("gram",) * len(required_sizes),
                     "fts",
                     "proof",
                     "restore",
@@ -423,6 +427,377 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
             self.assertEqual(
                 _disk_state(stage)[1][-1],
                 [("migration.streamed-delegated", "completed", 3, 1)],
+            )
+
+    def test_streamed_projection_materializes_one_gram_size_at_a_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _stage_ref, store, fts5_available = _store(root)
+            original_gram = projection.insert_streamed_candidate_gram_rows
+            observed: list[tuple[int, frozenset[int], int]] = []
+
+            def observe_gram(
+                connection: sqlite3.Connection,
+                candidate_records: object,
+                record_ids_by_ordinal: object,
+                candidate_gram_facts: object,
+                *,
+                gram_size: int,
+            ) -> object:
+                self.assertIs(type(candidate_records), tuple)
+                self.assertIs(type(record_ids_by_ordinal), tuple)
+                self.assertIs(type(candidate_gram_facts), tuple)
+                facts = cast(tuple[tuple[int, int, str, int], ...], candidate_gram_facts)
+                observed.append(
+                    (
+                        gram_size,
+                        frozenset(fact[1] for fact in facts),
+                        len(facts),
+                    )
+                )
+                return original_gram(
+                    connection,
+                    cast(tuple[tuple[int, str], ...], candidate_records),
+                    cast(tuple[tuple[int, int], ...], record_ids_by_ordinal),
+                    facts,
+                    gram_size=gram_size,
+                )
+
+            with (
+                patch.object(
+                    projection,
+                    "insert_streamed_candidate_gram_rows",
+                    side_effect=observe_gram,
+                ) as gram_insert,
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.gram-size-projection",
+                    kind="migration",
+                    drafts=(
+                        (
+                            _draft(f"source-{index:05d}", f"target-{index:05d}"),
+                            index + 1,
+                        )
+                        for index in range(513)
+                    ),
+                    source_digest="d" * 64,
+                    source_path=(root / "gram-size.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=1_024,
+                )
+
+            required_sizes = (1, 2) if fts5_available else (1, 2, 3)
+            self.assertEqual(
+                tuple(item[0] for item in observed),
+                required_sizes,
+            )
+            self.assertTrue(all(item[1] == {item[0]} for item in observed))
+            self.assertTrue(all(item[2] > 0 for item in observed))
+            self.assertEqual(gram_insert.call_count, len(required_sizes))
+            revision = store.canonical_revision()
+            self.assertEqual(
+                (revision.head_revision, revision.record_count),
+                (1, 513),
+            )
+
+    def test_streamed_gram_partition_preserves_frozen_rowids_and_digest(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "fallback",
+                False,
+                2_658,
+                "233621e2f66bf934118fac352585ec6e2e215a7f84504ca7d2f42116d8054e10",
+            ),
+            (
+                "fts",
+                True,
+                2_007,
+                "7ad37835f6d7fb3efa85590eacc40db6a0cf601bcb41d9caafe57566898698b2",
+            ),
+        )
+        for label, expected_fts, expected_grams, expected_digest in cases:
+            with self.subTest(path=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                if expected_fts:
+                    stage, store, fts5_available = _store(root)
+                    if not fts5_available:
+                        continue
+                else:
+                    with patch.object(
+                        tm_sqlite_store,
+                        "_probe_fts5",
+                        return_value=False,
+                    ):
+                        stage, store, fts5_available = _store(root)
+                self.assertEqual(fts5_available, expected_fts)
+                sources = (
+                    "z",
+                    "a",
+                    "Ω",
+                    "Cafe\u0301",
+                    *(
+                        ("ba" if index % 2 else "ab") + str(index)
+                        for index in range(253)
+                    ),
+                )
+                store.append_streamed_batch(
+                    batch_id=f"migration.rowid-parity-{label}",
+                    kind="migration",
+                    drafts=iter(
+                        (
+                            _draft(source, f"target-{index}"),
+                            index + 1,
+                        )
+                        for index, source in enumerate(sources)
+                    ),
+                    source_digest="a" * 64,
+                    source_path=(root / f"rowid-parity-{label}.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=129,
+                )
+                connection = sqlite3.connect(stage.staged_db_path)
+                try:
+                    gram_rows = connection.execute(
+                        "SELECT rowid, gram_size, gram, record_id, "
+                        "term_frequency FROM tm_gram ORDER BY rowid"
+                    ).fetchall()
+                    maximum_rows = connection.execute(
+                        "SELECT rowid, gram_size, gram, block_id, "
+                        "max_term_frequency FROM tm_gram_block_max "
+                        "ORDER BY rowid"
+                    ).fetchall()
+                    block_rows = connection.execute(
+                        "SELECT block_id, record_count FROM tm_candidate_block "
+                        "ORDER BY block_id"
+                    ).fetchall()
+                    digest = projection.candidate_proof_projection_digest(
+                        connection,
+                        fts5_available=fts5_available,
+                    )
+                finally:
+                    connection.close()
+
+                self.assertEqual(len(gram_rows), expected_grams)
+                self.assertEqual(len(maximum_rows), 149)
+                self.assertEqual(
+                    tuple(row[0] for row in gram_rows),
+                    tuple(range(1, len(gram_rows) + 1)),
+                )
+                self.assertEqual(
+                    tuple(row[0] for row in maximum_rows),
+                    tuple(range(1, len(maximum_rows) + 1)),
+                )
+                maximum_payload = json.dumps(
+                    maximum_rows,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertEqual(
+                    hashlib.sha256(maximum_payload).hexdigest(),
+                    "eb6e682e51c75760e2257290eb9ac4b5a504dace33ded4a493a2d4ff6bd5ab39",
+                )
+                self.assertEqual(block_rows, [(0, 256), (1, 1)])
+                self.assertEqual(digest, expected_digest)
+
+    def test_streamed_fts_fault_mapping_is_narrow(self) -> None:
+        cases = (
+            (
+                "gram",
+                "insert_streamed_candidate_gram_rows",
+                sqlite3.OperationalError,
+            ),
+            ("fts", "insert_streamed_candidate_fts_rows", sqlite3.OperationalError),
+            (
+                "proof",
+                "insert_streamed_candidate_proof_rows",
+                sqlite3.OperationalError,
+            ),
+        )
+        for label, helper_name, expected_error in cases:
+            with self.subTest(helper=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage, store, fts5_available = _store(root)
+                if label == "fts" and not fts5_available:
+                    continue
+                before = _disk_state(stage)
+                fault = sqlite3.OperationalError("secret projection SQL body")
+                with (
+                    patch.object(projection, helper_name, side_effect=fault),
+                    self.assertRaises(expected_error) as raised,
+                ):
+                    store.append_streamed_batch(
+                        batch_id=f"migration.{label}-fault",
+                        kind="migration",
+                        drafts=iter(((_draft("alpha", "target"), 1),)),
+                        source_digest="f" * 64,
+                        source_path=(root / f"{label}.jsonl").resolve(),
+                        invalid_count=0,
+                        duplicate_source_count=0,
+                        chunk_size=2,
+                    )
+                self.assertIs(raised.exception, fault)
+                self.assertEqual(_disk_state(stage), before)
+
+    def test_streamed_fts_maps_only_the_actual_sql_write_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store, fts5_available = _store(root)
+            if not fts5_available:
+                self.skipTest("runtime does not provide FTS5 trigram")
+            connection = sqlite3.connect(stage.staged_db_path)
+            try:
+                connection.execute("DROP TABLE tm_fts")
+                connection.commit()
+            finally:
+                connection.close()
+            before = _disk_state(stage)
+            with self.assertRaisesRegex(
+                SQLiteStoreSchemaError,
+                "^STORE.FTS5_UNAVAILABLE$",
+            ) as raised:
+                store.append_streamed_batch(
+                    batch_id="migration.fts-sql-fault",
+                    kind="migration",
+                    drafts=iter(((_draft("alpha", "target"), 1),)),
+                    source_digest="6" * 64,
+                    source_path=(root / "fts-sql-fault.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=2,
+                )
+            self.assertNotIn("no such table", str(raised.exception).lower())
+            self.assertEqual(_disk_state(stage), before)
+
+    def test_streamed_fts_prepare_fault_is_not_relabelled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store, fts5_available = _store(root)
+            if not fts5_available:
+                self.skipTest("runtime does not provide FTS5 trigram")
+            before = _disk_state(stage)
+            fault = sqlite3.OperationalError("programmer prepare fault")
+            with (
+                patch.object(
+                    projection,
+                    "insert_streamed_candidate_gram_rows",
+                    return_value=None,
+                ),
+                patch.object(
+                    projection,
+                    "_prepare_streamed_candidate_records",
+                    side_effect=fault,
+                ),
+                self.assertRaises(sqlite3.OperationalError) as raised,
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.fts-prepare-fault",
+                    kind="migration",
+                    drafts=iter(((_draft("alpha", "target"), 1),)),
+                    source_digest="5" * 64,
+                    source_path=(root / "fts-prepare-fault.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=2,
+                )
+            self.assertIs(raised.exception, fault)
+            self.assertEqual(_disk_state(stage), before)
+
+    def test_deferred_indexes_restore_before_validation_and_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _stage_ref, store, _fts5_available = _store(root)
+            original_restore = (
+                tm_sqlite_store._restore_streamed_stage_secondary_indexes
+            )
+            original_validate = tm_sqlite_store.validate_candidate_proof_index
+            original_complete = tm_sqlite_store._complete_streamed_batch
+            original_gram = projection.insert_streamed_candidate_gram_rows
+            original_fts = projection.insert_streamed_candidate_fts_rows
+            original_proof = projection.insert_streamed_candidate_proof_rows
+            observed: list[tuple[str, bool]] = []
+
+            def observe(label: str, implementation: object):
+                def wrapper(
+                    connection: sqlite3.Connection,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    observed.append((label, connection.in_transaction))
+                    return cast(Any, implementation)(
+                        connection,
+                        *args,
+                        **kwargs,
+                    )
+
+                return wrapper
+
+            with (
+                patch.object(
+                    projection,
+                    "insert_streamed_candidate_gram_rows",
+                    side_effect=observe("gram", original_gram),
+                ),
+                patch.object(
+                    projection,
+                    "insert_streamed_candidate_fts_rows",
+                    side_effect=observe("fts", original_fts),
+                ),
+                patch.object(
+                    projection,
+                    "insert_streamed_candidate_proof_rows",
+                    side_effect=observe("proof", original_proof),
+                ),
+                patch.object(
+                    tm_sqlite_store,
+                    "_restore_streamed_stage_secondary_indexes",
+                    side_effect=observe("restore", original_restore),
+                ),
+                patch.object(
+                    tm_sqlite_store,
+                    "validate_candidate_proof_index",
+                    side_effect=observe("validate", original_validate),
+                ),
+                patch.object(
+                    tm_sqlite_store,
+                    "_complete_streamed_batch",
+                    side_effect=observe("publish", original_complete),
+                ),
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.restore-before-validation",
+                    kind="migration",
+                    drafts=iter(
+                        (
+                            (_draft("alpha", "first"), 1),
+                            (_draft("beta", "second"), 2),
+                        )
+                    ),
+                    source_digest="c" * 64,
+                    source_path=(root / "streamed.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=4,
+                    _defer_secondary_indexes=True,
+                )
+
+            self.assertEqual(
+                observed,
+                [
+                    *(("gram", True),) * (
+                        2 if _fts5_available else 3
+                    ),
+                    ("fts", True),
+                    ("proof", True),
+                    ("restore", True),
+                    ("validate", True),
+                    ("publish", True),
+                ],
             )
 
     def test_projection_helpers_cannot_return_authority_or_publish_partial_state(
@@ -540,6 +915,105 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
                                 chunk_size=2,
                             )
                     validator.assert_called_once()
+                self.assertEqual(_disk_state(stage), before)
+
+    def test_partial_streamed_projection_is_rejected_before_publication(
+        self,
+    ) -> None:
+        cases = ("gram-size-two", "gram-size-three", "fts", "block", "maximum")
+        for label in cases:
+            with self.subTest(partial=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                if label == "gram-size-three":
+                    with patch.object(
+                        tm_sqlite_store,
+                        "_probe_fts5",
+                        return_value=False,
+                    ):
+                        stage, store, fts5_available = _store(root)
+                else:
+                    stage, store, fts5_available = _store(root)
+                if label == "fts" and not fts5_available:
+                    continue
+                before = _disk_state(stage)
+                original_gram = projection.insert_streamed_candidate_gram_rows
+                original_proof = projection.insert_streamed_candidate_proof_rows
+
+                def partial_gram(
+                    connection: sqlite3.Connection,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    skipped_size = 3 if label == "gram-size-three" else 2
+                    if kwargs.get("gram_size") == skipped_size:
+                        return None
+                    return original_gram(connection, *args, **kwargs)
+
+                def delete_maxima(
+                    connection: sqlite3.Connection,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    result = original_proof(connection, *args, **kwargs)
+                    connection.execute("DELETE FROM tm_gram_block_max")
+                    return result
+
+                def delete_blocks(
+                    connection: sqlite3.Connection,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    result = original_proof(connection, *args, **kwargs)
+                    connection.execute("DELETE FROM tm_candidate_block")
+                    return result
+
+                if label in {"gram-size-two", "gram-size-three"}:
+                    helper_patch = patch.object(
+                        projection,
+                        "insert_streamed_candidate_gram_rows",
+                        side_effect=partial_gram,
+                    )
+                elif label == "fts":
+                    helper_patch = patch.object(
+                        projection,
+                        "insert_streamed_candidate_fts_rows",
+                        return_value=None,
+                    )
+                elif label == "block":
+                    helper_patch = patch.object(
+                        projection,
+                        "insert_streamed_candidate_proof_rows",
+                        side_effect=delete_blocks,
+                    )
+                else:
+                    helper_patch = patch.object(
+                        projection,
+                        "insert_streamed_candidate_proof_rows",
+                        side_effect=delete_maxima,
+                    )
+                with (
+                    helper_patch,
+                    patch.object(
+                        tm_sqlite_store,
+                        "_complete_streamed_batch",
+                        wraps=tm_sqlite_store._complete_streamed_batch,
+                    ) as publish,
+                    self.assertRaisesRegex(
+                        SQLiteStoreSchemaError,
+                        "^STORE.CANDIDATE_INDEX_INVALID$",
+                    ),
+                ):
+                    store.append_streamed_batch(
+                        batch_id=f"migration.partial-{label}",
+                        kind="migration",
+                        drafts=iter(((_draft("alpha", "target"), 1),)),
+                        source_digest="7" * 64,
+                        source_path=(root / f"partial-{label}.jsonl").resolve(),
+                        invalid_count=0,
+                        duplicate_source_count=0,
+                        chunk_size=2,
+                    )
+                publish.assert_not_called()
                 self.assertEqual(_disk_state(stage), before)
 
     def test_proof_validation_delegates_inside_store_transaction_and_maps_sqlite_body(
@@ -1036,7 +1510,6 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
             projection.insert_candidate_gram_rows,
             projection.insert_candidate_fts_rows,
             projection.maintain_candidate_proof_summaries,
-            projection.project_streamed_candidate_index,
             projection.insert_streamed_candidate_gram_rows,
             projection.insert_streamed_candidate_proof_rows,
             projection.candidate_proof_projection_digest,

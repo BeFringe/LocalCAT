@@ -55,8 +55,11 @@ Layer 1 resource / termbase / canonical TM storage
 ├── text_matcher.py               # 唯一 BASIC/TEXT_V1 Unicode matcher
 ├── capability_gated_text_matcher.py # matcher capability execution boundary
 ├── tm_contracts.py              # canonical TM frozen contracts
+├── tm_candidate_store_contracts.py # candidate DTO/error/port 中立叶合同
+├── tm_candidate_index.py        # candidate budget/stage/proof algorithm
 ├── tm_engine.py                 # legacy/canonical cold-open compatibility owner
 ├── tm_sqlite_store.py           # per-resource store/coordinator authority
+├── tm_sqlite_candidate_projection.py # SQLite candidate SQL/row data plane
 ├── tm_retrieval.py              # exact/context/fuzzy query pipeline
 ├── tm_retrieval_capability.py   # retrieval capability evaluator/publisher
 ├── tm_retrieval_validation.py   # current-source Gate C validation
@@ -91,6 +94,8 @@ Layer 1 resource / termbase / canonical TM storage
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。
 - `tm_snapshot_artifacts.py` 只拥有 snapshot/export deterministic artifact family、no-follow parent dirfd、strict file identity/digest proof、exclusive temp/recovery copy、replace/cleanup 原语与 durable handoff 值编解码；不反向导入 `tm_sqlite_store.py`、`tm_migration.py` 或 `tm_snapshot_recovery.py`，不拥有 ledger/binding/transaction 或 receipt reconciliation 状态。
+- `tm_candidate_index.py` 只消费 `tm_candidate_store_contracts.py` 的中立 port/DTO；`tm_sqlite_candidate_projection.py` 是 steady-state candidate recall/proof/write SQL 与 row decode 的唯一数据面 owner，仅使用调用方持有的 connection/transaction。
+- `tm_sqlite_store.py` / query view 继续独占 connection policy、lease、BEGIN/COMMIT/ROLLBACK、generation/head/count、stable error mapping 与 publication；projection 不打开、提交或发布 canonical authority。
 - 核心 Engine 不向上导入 Controller 或 Frontend。
 
 该边界由 `tests/test_parser_architecture_harness.py`、`tests/test_parser_wave4_architecture.py`、Qt AST 守卫和 Excel 适配器契约测试持续验证。
@@ -109,6 +114,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_project_search*`、`tests/test_qt_project_search*`：单 JSON 搜索 contracts/service/Controller/Qt 与 current-source acceptance。
 - `tests/test_feature5_ui_*`：真实 canonical activation/retrieval、mixed merge、failure 与 apply/write 跨层验收。
 - `tests/test_capability_host*`、`tests/test_tm_retrieval*`：capability publication、in-flight generation 与 Core query 语义。
+- `tests/test_tm_candidate_store_contracts.py`、`tests/test_tm_sqlite_candidate_projection.py`、`tests/test_tm_store_candidate_projection_*`：candidate 叶 port、SQL 唯一 owner、transaction/fault 与兼容 seam。
 - `tests/test_workspace_state.py`：最近项目、段落断点、显示/TM 与预处理偏好的兼容读取、原子持久化和失败保留。
 - `tests/test_resource_*`：清单、托管/外部删除、TMX/CSV/XLSX、原子失败语义。
 - `tests/test_renpy_tm_compat.py`：安全 speaker token、引号转义与拒绝猜测性解包。

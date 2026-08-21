@@ -145,31 +145,31 @@ Wave 0 治理与 characterization
 
 ## Wave 4：Final roots、Evidence、Gate C/D 与 GO
 
-- [ ] 5.1 完成 wrapper retirement 并冻结 final runtime roots
+- [x] 5.1 完成 wrapper retirement 并冻结 final runtime roots
   - 只移除 closed production/tests/evidence scan 证明无 consumer 的 wrapper；其余 compatibility seam继续 late-bound 委托唯一实现。
   - 完成最终 dependency/SQL-owner/patch-seam architecture cleanup；此后不得再修改 production runtime。
   - 在 retirement 后重跑 scoped characterization/fault tests，证明没有第二 SQL authority、consumer 或 patch target 漂移。
   - _Requirements: 7.1–7.4, 8.1–8.4_
 
-- [ ] 5.2 更新并冻结全部 evidence roots
+- [x] 5.2 更新并冻结全部 evidence roots
   - Gate C artifact/build roots 明确纳入 `tm_candidate_store_contracts.py`、`tm_sqlite_candidate_projection.py`、`tm_sqlite_store.py`、`tm_candidate_index.py`。
   - `BENCHMARK_IMPLEMENTATION_SOURCE_PATHS` 同时纳入上述四个实现 root；fault/acceptance matrix source registry按真实行为与故障影响纳入 leaf/projection/store/index，release继续消费两份新 matrix digest。
   - 完成本任务后锁定 production、Gate C roots、benchmark roots 与 fault/acceptance registries；后续任何变化均使之后 evidence stale。
   - _Requirements: 9.1–9.5_
 
-- [ ] 5.3 在冻结后的 final roots 上重放全量矩阵并真实重算 Gate C
+- [x] 5.3 在冻结后的 final roots 上重放全量矩阵并真实重算 Gate C
   - store/lifecycle/activation/reattestation/binding/snapshot/schema/migration/stage sealing。
   - candidate index/proof/query/retrieval/oracle/process/fault suites。
   - 重跑 Gate C，不手改 digest，不沿用旧 roots；无新增失败，既有外部噪声单列且签名不变。
   - _Requirements: 1.1–1.4, 9.1–9.5_
 
-- [ ] 5.4 在同一 final fingerprint 上真实运行 Gate D 100k 双路径
+- [x] 5.4 在同一 final fingerprint 上真实运行 Gate D 100k 双路径
   - FTS5 与 fallback intended paths 全部真实运行。
   - scorer/budget/corpus/cohort/seed/threshold/hard gates 不变。
   - 任一路径失败即 NO-GO，不发布 Fuzzy。
   - _Requirements: 9.1–9.5_
 
-- [ ] 5.5 重新生成 fault / acceptance / release evidence并完成治理收尾
+- [x] 5.5 重新生成 fault / acceptance / release evidence并完成治理收尾
   - owner 工具生成，strict 消费者复读；不得手改摘要。
   - fault/acceptance 使用 5.2 冻结的 source registry；release 消费两份新 digest，且只有 Gate C/D 与全部 current-source matrix通过后才可 GO。
   - strict 重读 fault/acceptance/release/Gate C/Gate D，证明它们绑定 5.2–5.4 的同一 final runtime fingerprint。

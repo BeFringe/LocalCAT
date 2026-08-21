@@ -7523,6 +7523,12 @@ class SQLiteTMStore:
                                 ),
                             )
                         if is_last:
+                            if _defer_secondary_indexes:
+                                _restore_streamed_stage_secondary_indexes(
+                                    connection,
+                                    lease,
+                                    before_publication=True,
+                                )
                             _validate_candidate_index_before_publication(
                                 connection,
                                 fts5_available=lease.fts5_available,
@@ -7544,11 +7550,6 @@ class SQLiteTMStore:
                     chunk_index += 1
                     if is_last:
                         break
-                if _defer_secondary_indexes:
-                    _restore_streamed_stage_secondary_indexes(
-                        connection,
-                        lease,
-                    )
 
     def records_by_id(
         self,
@@ -8014,23 +8015,6 @@ def _candidate_proof_snapshot_body(
         except Exception:
             connection.rollback()
             raise
-
-
-def _candidate_proof_query_maxima_digest(
-    blocks: tuple[SQLiteCandidateProofBlock, ...],
-) -> str:
-    return candidate_projection.candidate_proof_query_maxima_digest(blocks)
-
-
-def _candidate_proof_query_block_uppers(
-    connection: sqlite3.Connection,
-    *,
-    query_terms: tuple[tuple[int, str, int], ...],
-) -> dict[tuple[int, int], int]:
-    return candidate_projection.candidate_proof_query_block_uppers(
-        connection,
-        query_terms=query_terms,
-    )
 
 
 def _candidate_proof_block_records_body(
@@ -8961,39 +8945,6 @@ _CANDIDATE_PROJECTION_DIGEST_VERSION = "candidate-projection-digest-v2"
 _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS = 50_000
 
 
-def _candidate_projection_table_digest(table: str) -> Any:
-    return candidate_projection._candidate_projection_table_digest(table)
-
-
-def _update_candidate_projection_digest(
-    digest: Any,
-    row: tuple[object, ...],
-) -> None:
-    candidate_projection._update_candidate_projection_digest(digest, row)
-
-
-def _finish_candidate_projection_digest(
-    table_digests: dict[str, Any],
-    *,
-    fts5_available: bool,
-) -> str:
-    return candidate_projection._finish_candidate_projection_digest(
-        table_digests,
-        fts5_available=fts5_available,
-    )
-
-
-def _update_candidate_gram_projection_digest(
-    connection: sqlite3.Connection,
-    digest: Any,
-) -> None:
-    candidate_projection._update_candidate_gram_projection_digest(
-        connection,
-        digest,
-        gram_chunk_rows=_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
-    )
-
-
 def _candidate_proof_projection_digest(
     connection: sqlite3.Connection,
     *,
@@ -9137,10 +9088,24 @@ def _suspend_streamed_stage_secondary_indexes(
 def _restore_streamed_stage_secondary_indexes(
     connection: sqlite3.Connection,
     lease: _SQLiteGenerationView,
+    *,
+    before_publication: bool = False,
 ) -> None:
     """Bulk-build the exact frozen secondary-index schema before exposure."""
 
-    connection.execute("BEGIN IMMEDIATE")
+    if type(before_publication) is not bool:
+        raise TypeError("before_publication must be a built-in bool")
+    if before_publication:
+        if not connection.in_transaction:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+    else:
+        if connection.in_transaction:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+        connection.execute("BEGIN IMMEDIATE")
     try:
         identity = lease.stage.resource_identity
         _validate_store_identity(
@@ -9152,7 +9117,8 @@ def _restore_streamed_stage_secondary_indexes(
         meta = _read_meta(connection)
         if (
             meta.get("activation_status") != "UNPUBLISHED"
-            or _meta_int(meta, "head_revision") != 1
+            or _meta_int(meta, "head_revision")
+            != (0 if before_publication else 1)
             or lease.active_content_attestation is not None
         ):
             raise SQLiteStoreSchemaError(
@@ -9183,9 +9149,11 @@ def _restore_streamed_stage_secondary_indexes(
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_INDEX_INVALID"
             )
-        connection.commit()
+        if not before_publication:
+            connection.commit()
     except BaseException:
-        connection.rollback()
+        if not before_publication:
+            connection.rollback()
         raise
 
 
@@ -9416,42 +9384,49 @@ def _insert_streamed_candidate_index(
     )
     copied_record_ids = tuple(record_ids_by_ordinal.items())
     gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    candidate_gram_facts = tuple(
-        (draft[10], gram_size, gram, term_frequency)
-        for draft in prepared_drafts
-        for gram_size in gram_sizes
-        for gram, term_frequency in character_ngram_frequencies(
-            draft[2],
-            gram_size,
+    expected_gram_row_count = 0
+    for gram_size in gram_sizes:
+        candidate_gram_facts = tuple(
+            (draft[10], gram_size, gram, term_frequency)
+            for draft in prepared_drafts
+            for gram, term_frequency in character_ngram_frequencies(
+                draft[2],
+                gram_size,
+            )
         )
-    )
-    gram_result = candidate_projection.insert_streamed_candidate_gram_rows(
-        connection,
-        candidate_records,
-        copied_record_ids,
-        candidate_gram_facts,
-        fts5_available=fts5_available,
-    )
-    if gram_result is not None:
-        raise TypeError("streamed candidate projection returned authority")
+        gram_result = candidate_projection.insert_streamed_candidate_gram_rows(
+            connection,
+            candidate_records,
+            copied_record_ids,
+            candidate_gram_facts,
+            gram_size=gram_size,
+        )
+        if gram_result is not None:
+            raise TypeError("streamed candidate projection returned authority")
+        expected_gram_row_count += len(candidate_gram_facts)
+        del candidate_gram_facts
     try:
         fts_result = candidate_projection.insert_streamed_candidate_fts_rows(
             connection,
             candidate_records,
             copied_record_ids,
-            candidate_gram_facts,
             fts5_available=fts5_available,
         )
     except sqlite3.OperationalError as error:
-        raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+        if (
+            type(error) is sqlite3.OperationalError
+            and len(error.args) == 1
+            and error.args[0] is candidate_projection._STREAMED_FTS_WRITE_FAILED
+        ):
+            raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+        raise
     if fts_result is not None:
         raise TypeError("streamed candidate projection returned authority")
     proof_result = candidate_projection.insert_streamed_candidate_proof_rows(
         connection,
         candidate_records,
         copied_record_ids,
-        candidate_gram_facts,
-        fts5_available=fts5_available,
+        expected_gram_row_count=expected_gram_row_count,
     )
     if proof_result is not None:
         raise TypeError("streamed candidate projection returned authority")

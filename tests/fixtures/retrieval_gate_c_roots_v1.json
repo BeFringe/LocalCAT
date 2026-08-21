@@ -1,23 +1,27 @@
 {
-  "artifact_digest": "3e90aa229053942d3b8e1afec1614910ae70fa926acbb4a603f71ab794c97427",
+  "artifact_digest": "9fe66ef54893e0497c1ad6f8d44701d3e7c65d56a50e2b65a0055e9e931c2c7a",
  "artifact_paths": [
   "tm_candidate_index.py",
+  "tm_candidate_store_contracts.py",
   "tm_contracts.py",
   "tm_gate_a.py",
   "tm_retrieval.py",
   "tm_retrieval_capability.py",
   "tm_similarity.py",
+  "tm_sqlite_candidate_projection.py",
   "tm_sqlite_store.py"
  ],
-  "build_digest": "45dcfb3e5f0702d8ccf64a28d6ab429ce8fc2971cef7437eba68389c28f54363",
+  "build_digest": "56c1a11907f311118f78926821ac71dd4fe778c95526c2a22918bfebdf5c5ad9",
  "build_paths": [
   "tm_candidate_index.py",
+  "tm_candidate_store_contracts.py",
   "tm_contracts.py",
   "tm_gate_a.py",
   "tm_retrieval.py",
   "tm_retrieval_capability.py",
   "tm_retrieval_validation.py",
   "tm_similarity.py",
+  "tm_sqlite_candidate_projection.py",
   "tm_sqlite_store.py"
  ],
  "context_cohorts": {

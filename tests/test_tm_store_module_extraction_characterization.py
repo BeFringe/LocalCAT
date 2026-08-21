@@ -19,6 +19,7 @@ from tm_benchmark import (
     BENCHMARK_IMPLEMENTATION_SOURCE_PATHS,
     benchmark_implementation_fingerprint,
 )
+from tm_gate_a import aggregate_paths_digest
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -147,10 +148,10 @@ _FULL_MODULE_PATCH_CALL_COUNT = 306
 _FULL_MODULE_PATCH_DIGEST = (
     "ce059addd6233cf8ae9f2d455606ef49167964001d307dd2da309f885e4f035a"
 )
-_FULL_INSTANCE_PATCH_ENTRY_COUNT = 34
-_FULL_INSTANCE_PATCH_CALL_COUNT = 70
+_FULL_INSTANCE_PATCH_ENTRY_COUNT = 35
+_FULL_INSTANCE_PATCH_CALL_COUNT = 82
 _FULL_INSTANCE_PATCH_DIGEST = (
-    "c19d69925f03b7ee8d4be9ddbe0a03fb8001d60c9ff12fce5ab9a98a6c7b43e5"
+    "0d8e587f9c8e4501f8f9f06b84fe36289fc6960b45c1329b98eb99c35924411a"
 )
 
 _SQL_TOKENS = (
@@ -245,6 +246,17 @@ _BEHAVIOR_ANCHORS = (
     "test_query_lease_blocks_generation_publication_until_exit",
 )
 
+_RETIRED_STORE_WRAPPERS = frozenset(
+    {
+        "_candidate_proof_query_maxima_digest",
+        "_candidate_proof_query_block_uppers",
+        "_candidate_projection_table_digest",
+        "_update_candidate_projection_digest",
+        "_finish_candidate_projection_digest",
+        "_update_candidate_gram_projection_digest",
+    }
+)
+
 
 def _tree(relative: str) -> ast.Module:
     return ast.parse((_ROOT / relative).read_text(encoding="utf-8"))
@@ -273,6 +285,77 @@ def _candidate_store_consumers() -> dict[str, tuple[tuple[str, str | None], ...]
         if selected:
             observed[path.name] = selected
     return observed
+
+
+def _retired_store_consumers_in_tree(
+    relative: str,
+    tree: ast.Module,
+) -> set[tuple[str, str, str]]:
+    consumers: set[tuple[str, str, str]] = set()
+    store_aliases = {
+        item.asname or item.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for item in node.names
+        if item.name == "tm_sqlite_store"
+    }
+    store_prefix = "tm_sqlite_store" + "."
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "tm_sqlite_store":
+            consumers.update(
+                (relative, "import", item.name)
+                for item in node.names
+                if item.name in _RETIRED_STORE_WRAPPERS
+            )
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in store_aliases
+            and node.attr in _RETIRED_STORE_WRAPPERS
+        ):
+            consumers.add((relative, "attribute", node.attr))
+        if (
+            isinstance(node, ast.Constant)
+            and type(node.value) is str
+            and node.value.startswith(store_prefix)
+        ):
+            symbol = node.value.removeprefix(store_prefix)
+            if symbol in _RETIRED_STORE_WRAPPERS:
+                consumers.add((relative, "patch", symbol))
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in store_aliases
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in _RETIRED_STORE_WRAPPERS
+        ):
+            consumers.add((relative, "getattr", node.args[1].value))
+        target_arguments = list(node.args[:1])
+        target_arguments.extend(
+            keyword.value for keyword in node.keywords if keyword.arg == "target"
+        )
+        attribute_arguments = list(node.args[1:2])
+        attribute_arguments.extend(
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg == "attribute"
+        )
+        if not any(
+            isinstance(target, ast.Name) and target.id in store_aliases
+            for target in target_arguments
+        ):
+            continue
+        consumers.update(
+            (relative, "patch.object", attribute.value)
+            for attribute in attribute_arguments
+            if isinstance(attribute, ast.Constant)
+            and attribute.value in _RETIRED_STORE_WRAPPERS
+        )
+    return consumers
 
 
 def _patch_seams_in_tree(
@@ -503,6 +586,50 @@ def _sql_owners(relative: str) -> frozenset[str]:
 
 
 class TMStoreModuleExtractionCharacterizationTests(unittest.TestCase):
+    def test_closed_store_wrappers_are_retired_without_consumers(self) -> None:
+        store_tree = _tree("tm_sqlite_store.py")
+        defined = {
+            node.name
+            for node in store_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertTrue(_RETIRED_STORE_WRAPPERS.isdisjoint(defined))
+
+        consumers: set[tuple[str, str, str]] = set()
+        paths = (
+            *_ROOT.glob("*.py"),
+            *(_ROOT / "tests").glob("*.py"),
+            *(_ROOT / "tools").glob("*.py"),
+        )
+        for path in sorted(paths):
+            relative = path.relative_to(_ROOT).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            consumers.update(_retired_store_consumers_in_tree(relative, tree))
+        self.assertEqual(consumers, set())
+
+    def test_retired_store_consumer_scan_catches_aliases_and_patch_forms(self) -> None:
+        symbol = "_candidate_projection_table_digest"
+        tree = ast.parse(
+            f'''\
+import tm_sqlite_store as store
+from tm_sqlite_store import {symbol}
+store.{symbol}("tm_gram")
+getattr(store, "{symbol}")
+patch.object(store, "{symbol}")
+patch("tm_sqlite_store.{symbol}")
+'''
+        )
+        self.assertEqual(
+            _retired_store_consumers_in_tree("tools/synthetic.py", tree),
+            {
+                ("tools/synthetic.py", "attribute", symbol),
+                ("tools/synthetic.py", "getattr", symbol),
+                ("tools/synthetic.py", "import", symbol),
+                ("tools/synthetic.py", "patch", symbol),
+                ("tools/synthetic.py", "patch.object", symbol),
+            },
+        )
+
     def test_candidate_patch_inventory_is_closed_for_migrated_seams(self) -> None:
         tree = ast.parse(
             """
@@ -698,39 +825,40 @@ def getattr_query(connection, caller_query):
                 self.assertEqual(suite.countTestCases(), 1)
                 self.assertNotIn("_FailedTest", repr(suite))
 
-    def test_staged_current_source_evidence_staleness_is_explicit(self) -> None:
+    def test_final_source_registries_and_evidence_are_frozen_and_current(
+        self,
+    ) -> None:
         gate_c = json.loads(
             (_ROOT / "tests/fixtures/retrieval_gate_c_roots_v1.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual(
-            set(gate_c["artifact_paths"])
-            & {"tm_candidate_index.py", "tm_sqlite_store.py"},
-            {"tm_candidate_index.py", "tm_sqlite_store.py"},
-        )
-        self.assertEqual(
-            set(gate_c["build_paths"])
-            & {"tm_candidate_index.py", "tm_sqlite_store.py"},
-            {"tm_candidate_index.py", "tm_sqlite_store.py"},
-        )
-        future_roots = {
+        final_candidate_roots = {
+            "tm_candidate_index.py",
             "tm_candidate_store_contracts.py",
             "tm_sqlite_candidate_projection.py",
+            "tm_sqlite_store.py",
         }
-        self.assertTrue(future_roots.isdisjoint(gate_c["artifact_paths"]))
-        self.assertTrue(future_roots.isdisjoint(gate_c["build_paths"]))
-        self.assertTrue(future_roots.isdisjoint(BENCHMARK_IMPLEMENTATION_SOURCE_PATHS))
+        self.assertTrue(
+            final_candidate_roots.issubset(gate_c["artifact_paths"])
+        )
+        self.assertTrue(final_candidate_roots.issubset(gate_c["build_paths"]))
+        self.assertTrue(
+            final_candidate_roots.issubset(BENCHMARK_IMPLEMENTATION_SOURCE_PATHS)
+        )
+        self.assertEqual(
+            gate_c["artifact_digest"],
+            aggregate_paths_digest(_ROOT, tuple(gate_c["artifact_paths"])),
+        )
+        self.assertEqual(
+            gate_c["build_digest"],
+            aggregate_paths_digest(_ROOT, tuple(gate_c["build_paths"])),
+        )
 
         acceptance_paths = set(acceptance_matrix_source_paths())
         fault_paths = set(fault_matrix_source_paths())
-        self.assertTrue(
-            {"tm_candidate_index.py", "tm_sqlite_store.py"}.issubset(
-                acceptance_paths
-            )
-        )
-        self.assertTrue("tm_sqlite_store.py" in fault_paths)
-        self.assertTrue(future_roots.isdisjoint(acceptance_paths | fault_paths))
+        self.assertTrue(final_candidate_roots.issubset(acceptance_paths))
+        self.assertTrue(final_candidate_roots.issubset(fault_paths))
 
         acceptance = json.loads(
             (_ROOT / "acceptance_matrix_evidence.json").read_text(encoding="utf-8")
@@ -746,43 +874,42 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             acceptance["source_fingerprint"],
-            "95486b40df30d198281f7972db9078ff4d19caf7b49715ba34a4862c8fafcedf",
+            "c752ebb8ec763c73cbc7219df4eaa208f1abe6a7aa72ce08ce708d975a72d75d",
         )
         self.assertEqual(
             fault["source_fingerprint"],
-            "d503282bdfab54f8d9529311c333e9456bd5d318e09258c7e6e6fa6a7194ab62",
+            "70d62edb5b5bae2a37bbfdfe29bf12ad568ec1da05f6341ab85c21896863a06f",
         )
         self.assertEqual(
             benchmark["implementation_fingerprint"],
-            "2dadef65550cc338b57686961fe15cbe8a49aa04bdd583ea58beb8b5721f0e44",
+            "0a71eca62f427b747db08384af6514a43c07d08b8be4641007ed7c15cf2e7217",
         )
         self.assertEqual(
             release["source_fingerprint"],
-            "9451b258e765d4c32d6560d8509682a8313e5c84d4d37e8ee409df7e6f8c09c0",
+            "4607a7b40afeb723dc88262016c44fdd99f3a70c5b2c20176b133a37418ea575",
         )
+        self.assertTrue(benchmark["suite_report"]["passed"])
+        self.assertEqual(benchmark["suite_report"]["failed_paths"], [])
+        self.assertEqual(release["release_decision"], "GO")
+        self.assertEqual(release["blocked_criteria"], [])
         self.assertEqual(
             release["input_evidence"]["acceptance_source_fingerprint"],
             acceptance["source_fingerprint"],
         )
-        release_stale = tuple(
-            item["path"]
-            for item in release["source_files"]
-            if hashlib.sha256(
-                (_ROOT / item["path"]).read_bytes()
-            ).hexdigest()
-            != item["sha256"]
+        self.assertEqual(
+            {item["path"] for item in acceptance["source_files"]},
+            acceptance_paths,
         )
         self.assertEqual(
-            release_stale,
-            ("tests/test_tm_sqlite_store.py",),
+            {item["path"] for item in fault["source_files"]},
+            fault_paths,
         )
-        self.assertNotEqual(
+        self.assertEqual(
             benchmark_implementation_fingerprint(_ROOT),
             benchmark["implementation_fingerprint"],
         )
-        stale_by_evidence: dict[str, tuple[str, ...]] = {}
-        for name, evidence in (("acceptance", acceptance), ("fault", fault)):
-            stale_by_evidence[name] = tuple(
+        for evidence in (acceptance, fault, release):
+            stale_paths = tuple(
                 item["path"]
                 for item in evidence["source_files"]
                 if hashlib.sha256(
@@ -790,23 +917,7 @@ def getattr_query(connection, caller_query):
                 ).hexdigest()
                 != item["sha256"]
             )
-        self.assertEqual(
-            stale_by_evidence,
-            {
-                "acceptance": (
-                    "editor_controller.py",
-                    "qt_editor.py",
-                    "qt_settings_dialog.py",
-                    "tests/test_tm_sqlite_store.py",
-                    "tm_candidate_index.py",
-                    "tm_sqlite_store.py",
-                ),
-                "fault": (
-                    "tests/test_tm_sqlite_store.py",
-                    "tm_sqlite_store.py",
-                ),
-            },
-        )
+            self.assertEqual(stale_paths, ())
 
 
 if __name__ == "__main__":

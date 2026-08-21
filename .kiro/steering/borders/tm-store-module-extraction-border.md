@@ -37,11 +37,11 @@
 
 ## 归档门
 
-- [ ] Wave 0–4 与全部 cluster review 通过
-- [ ] final source roots 上 Gate C 通过
-- [ ] 同一 final fingerprint 上 100k FTS5/fallback Gate D 通过
-- [ ] fault/acceptance/release strict evidence GO
-- [ ] Steering 与 tasks completion 同实际 tree 一致
-- [ ] Multi-Document 等相邻主线无越界
+- [x] Wave 0–4 与全部 cluster review 通过
+- [x] final source roots 上 Gate C 通过
+- [x] 同一 final fingerprint 上 100k FTS5/fallback Gate D 通过
+- [x] fault/acceptance/release strict evidence GO
+- [x] Steering 与 tasks completion 同实际 tree 一致
+- [x] Multi-Document 等相邻主线无越界
 
-> 当前状态：执行中；Feature GO 后追加归档日期与最终约束状态。
+> 归档状态：2026-08-22 Feature GO。Final implementation fingerprint 为 `0a71eca62f427b747db08384af6514a43c07d08b8be4641007ed7c15cf2e7217`；Gate D bundle digest 为 `67d3a3f4f707dc820316f9a29e6be1ddd293a10de27c22daae552d116187cc39`。
