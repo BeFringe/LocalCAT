@@ -1,23 +1,23 @@
 {
   "feature_name": "parser-subsystem-extraction",
   "legacy_spec_id": "3b770de7-e9e4-47a9-9691-e6a8ae77903b",
-  "updated_at": "2026-07-27T04:51:23Z",
+  "updated_at": "2026-08-21T04:59:41Z",
   "language": "zh-CN",
-  "phase": "discovery",
+  "phase": "tasks-generated",
   "approvals": {
     "requirements": {
-      "generated": false,
-      "approved": false
+      "generated": true,
+      "approved": true
     },
     "design": {
-      "generated": false,
-      "approved": false
+      "generated": true,
+      "approved": true
     },
     "tasks": {
-      "generated": false,
-      "approved": false
+      "generated": true,
+      "approved": true
     }
   },
-  "ready_for_implementation": false,
+  "ready_for_implementation": true,
   "supersedes": "legacy design-first draft in this directory"
 }
