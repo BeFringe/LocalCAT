@@ -8,12 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
 
 from excel_adapter_openpyxl import run_file_mode_benchmark
 import logic_controller
+from glossary_engine import GlossaryEngine, GlossaryTerm
 from tests.test_tm_activation_journal import SOURCE_BYTES, _first_prepared
 
 
@@ -21,6 +22,142 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ExcelAdapterContractTest(unittest.TestCase):
+    def test_glossary_engine_batch_apply_rolls_back_second_add_failure(self) -> None:
+        engine = GlossaryEngine()
+        engine.add_term("existing", "kept", "existing.csv")
+        original_root = engine.root
+        original_count = engine._term_count
+        original_add = GlossaryEngine.add_term
+        calls = 0
+
+        def fail_second(staged, source, target, glossary_source, priority=1):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected second add failure")
+            return original_add(staged, source, target, glossary_source, priority)
+
+        rows = (
+            GlossaryTerm("first", "one", "batch.csv"),
+            GlossaryTerm("second", "two", "batch.csv"),
+        )
+        with patch.object(GlossaryEngine, "add_term", new=fail_second):
+            with self.assertRaisesRegex(RuntimeError, "second add failure"):
+                engine.apply_terms_atomic(rows)
+
+        self.assertIs(engine.root, original_root)
+        self.assertEqual(engine._term_count, original_count)
+        self.assertEqual(
+            [(hit.source_term, hit.target_term) for hit in engine.extract_terms("existing")],
+            [("existing", "kept")],
+        )
+        self.assertEqual(engine.extract_terms("first second"), [])
+
+    def test_glossary_application_calls_one_atomic_batch_after_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "terms.csv"
+            source.write_text("Source,Target\nfirst,one\nsecond,two\n", encoding="utf-8")
+            engine = GlossaryEngine()
+
+            with patch.object(
+                engine,
+                "apply_terms_atomic",
+                wraps=engine.apply_terms_atomic,
+            ) as apply_batch:
+                logic_controller.load_glossary_file(engine, source)
+
+        apply_batch.assert_called_once()
+        terms = apply_batch.call_args.args[0]
+        self.assertEqual(
+            [(item.source, item.target, item.glossary_source) for item in terms],
+            [("first", "one", "terms.csv"), ("second", "two", "terms.csv")],
+        )
+
+    def test_glossary_consumer_exception_propagates_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "terms.csv"
+            source.write_text("first,one\nsecond,two\n", encoding="utf-8")
+            engine = GlossaryEngine()
+            engine.add_term("existing", "kept", "existing.csv")
+            original_root = engine.root
+            original_count = engine._term_count
+
+            with patch.object(
+                engine,
+                "apply_terms_atomic",
+                side_effect=RuntimeError("consumer failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "consumer failure"):
+                    logic_controller.load_glossary_file(engine, source)
+
+        self.assertIs(engine.root, original_root)
+        self.assertEqual(engine._term_count, original_count)
+        self.assertEqual(engine.extract_terms("first second"), [])
+
+    def test_application_does_not_relabel_unexpected_parser_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            csv_source = Path(temporary) / "terms.csv"
+            po_source = Path(temporary) / "source.po"
+            csv_source.write_text("first,one\n", encoding="utf-8")
+            po_source.write_text('msgid "first"\nmsgstr "one"\n', encoding="utf-8")
+            surface = Mock()
+            surface.open_input.side_effect = AssertionError("programmer fault")
+
+            with patch.object(
+                logic_controller,
+                "create_parser_application_surface",
+                return_value=surface,
+            ):
+                with self.assertRaisesRegex(AssertionError, "programmer fault"):
+                    logic_controller.load_glossary_file(GlossaryEngine(), csv_source)
+                with self.assertRaisesRegex(AssertionError, "programmer fault"):
+                    logic_controller.load_gettext_source_units(po_source)
+
+    def test_glossary_application_adapter_stages_before_mutating_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "fatal-tail.csv"
+            source.write_bytes(b"Source,Target\nkept,value\ninvalid,\xff\n")
+            engine = GlossaryEngine()
+
+            with self.assertRaises(logic_controller.GlossaryLoadError) as raised:
+                logic_controller.load_glossary_file(engine, source)
+
+        self.assertEqual(raised.exception.code, "PARSER.SOURCE.ENCODING_FAILED")
+        self.assertEqual(engine.extract_terms("kept"), [])
+
+    def test_glossary_application_adapter_rejects_retired_xls_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "legacy.xls"
+            source.write_bytes(b"not-an-xlsx")
+            engine = GlossaryEngine()
+
+            with self.assertRaises(logic_controller.GlossaryLoadError) as raised:
+                logic_controller.load_glossary_file(engine, source)
+
+        self.assertEqual(raised.exception.code, "PARSER.SELECTION.UNSUPPORTED")
+        self.assertEqual(engine.extract_terms("anything"), [])
+
+    def test_all_three_glossary_consumers_share_the_application_adapter(self) -> None:
+        controller_source = (PROJECT_ROOT / "logic_controller.py").read_text(
+            encoding="utf-8"
+        )
+        engine_source = (PROJECT_ROOT / "glossary_engine.py").read_text(
+            encoding="utf-8"
+        )
+        translation_source = (PROJECT_ROOT / "translation_runner.py").read_text(
+            encoding="utf-8"
+        )
+        stress_source = (PROJECT_ROOT / "stress_runner.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("load_glossary_file(self.glossary_engine", controller_source)
+        self.assertIn("load_glossary_file(glossary_engine", translation_source)
+        self.assertIn("load_glossary_file(glossary_engine", stress_source)
+        self.assertNotIn("class GlossaryLoader", engine_source)
+        self.assertNotIn("csv.reader", engine_source)
+        self.assertNotIn("openpyxl", engine_source)
+
     def test_legacy_and_activated_sidecar_parity_for_identical_inputs(self) -> None:
         inputs = (
             "same",  # exact TM source that is also a glossary term (TM priority)

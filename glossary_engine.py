@@ -3,10 +3,9 @@ LocalCAT Phase 1: Glossary Engine
 Module for term extraction and glossary management.
 """
 
-import csv
+import copy
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set
-from pathlib import Path
 
 # =============================================================================
 # 1. Data Contract (Immutable)
@@ -25,6 +24,24 @@ class TermHit:
     glossary_source: str    # Name of the glossary file/source
     definition: Optional[str] = None
     priority: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class GlossaryTerm:
+    """Engine-owned neutral input for one atomic glossary batch."""
+
+    source: str
+    target: str
+    glossary_source: str
+    priority: int = 1
+
+    def __post_init__(self) -> None:
+        for field_name in ("source", "target", "glossary_source"):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value:
+                raise ValueError(f"GlossaryTerm.{field_name} must be a non-empty string")
+        if type(self.priority) is not int:
+            raise TypeError("GlossaryTerm.priority must be an exact integer")
 
 # =============================================================================
 # 2. Core Engine Implementation
@@ -68,6 +85,27 @@ class GlossaryEngine:
         })
         self._term_count += 1
 
+    def apply_terms_atomic(self, terms: tuple[GlossaryTerm, ...]) -> None:
+        """Apply a complete consumer batch through a staged Trie and one swap."""
+
+        if type(terms) is not tuple:
+            raise TypeError("terms must be an immutable tuple")
+        for term in terms:
+            if type(term) is not GlossaryTerm:
+                raise TypeError("terms must contain exact GlossaryTerm values")
+
+        staged = GlossaryEngine()
+        staged.root = copy.deepcopy(self.root)
+        staged._term_count = self._term_count
+        for term in terms:
+            staged.add_term(
+                term.source,
+                term.target,
+                term.glossary_source,
+                term.priority,
+            )
+        self.root, self._term_count = staged.root, staged._term_count
+
     def extract_terms(self, text: str) -> List[TermHit]:
         """
         Extracts all known terms from the text.
@@ -107,63 +145,7 @@ class GlossaryEngine:
         return hits
 
 # =============================================================================
-# 3. Loader Implementation
-# =============================================================================
-
-class GlossaryLoader:
-    """Handles loading terms from files (CSV, Excel)."""
-    
-    def __init__(self, engine: GlossaryEngine):
-        self.engine = engine
-
-    def load_file(self, file_path: str):
-        """Detects file type and loads terms."""
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        suffix = path.suffix.lower()
-        if suffix == '.csv':
-            self._load_csv(path)
-        elif suffix in ('.xlsx', '.xls'):
-            self._load_excel(path)
-        else:
-            raise ValueError(f"Unsupported file format: {suffix}")
-
-    def _load_csv(self, path: Path):
-        try:
-            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) >= 2:
-                        # Simple convention: Column A = Source, Column B = Target
-                        source = row[0].strip()
-                        target = row[1].strip()
-                        if source and target:
-                            self.engine.add_term(source, target, path.name)
-        except Exception as e:
-            print(f"Error loading CSV {path}: {e}")
-
-    def _load_excel(self, path: Path):
-        try:
-            # Conditional import to avoid hard dependency if not needed
-            import openpyxl
-            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            ws = wb.active
-            for row in ws.iter_rows(min_row=1, values_only=True):
-                if row and len(row) >= 2:
-                    source = str(row[0]).strip() if row[0] else ""
-                    target = str(row[1]).strip() if row[1] else ""
-                    if source and target:
-                        self.engine.add_term(source, target, path.name)
-            wb.close()
-        except ImportError:
-            print("Warning: openpyxl not installed. Skipping Excel file.")
-        except Exception as e:
-            print(f"Error loading Excel {path}: {e}")
-
-# =============================================================================
-# 4. Highlighter Implementation (Phase 1 Closing)
+# 3. Highlighter Implementation (Phase 1 Closing)
 # =============================================================================
 
 class TermHighlighter:
@@ -226,7 +208,7 @@ class TermHighlighter:
         return "".join(result)
 
 # =============================================================================
-# 5. Self-Test / Verification
+# 4. Self-Test / Verification
 # =============================================================================
 
 if __name__ == "__main__":

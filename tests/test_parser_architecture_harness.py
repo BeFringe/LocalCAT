@@ -107,11 +107,15 @@ class ParserDependencyPolicyTests(unittest.TestCase):
             ),
             SourceModule(
                 "parser_composition",
-                "import parser_registry\nimport parser_localcat_codec\n",
+                "import parser_registry\n"
+                "import parser_source\n"
+                "import parser_localcat_codec\n",
             ),
             SourceModule(
                 "editor_project",
-                "import parser_composition\nimport editor_controller\n",
+                "import parser_contracts\n"
+                "import parser_composition\n"
+                "import editor_controller\n",
             ),
             SourceModule(
                 "rpy_project_codec",
@@ -239,6 +243,26 @@ class ParserDependencyPolicyTests(unittest.TestCase):
                 "plugin.depends_on_neutral_contract_only",
                 "plugin.must_not_import_localcat_authorities",
             },
+        )
+
+    def test_application_cannot_construct_or_reach_behind_the_parser_surface(self) -> None:
+        findings = self.policy.check_module(
+            SourceModule(
+                "editor_project",
+                "import parser_composition as parser\n"
+                "parser.ParserApplicationSurface(object())\n"
+                "parser.OpenedParserInput(object())\n"
+                "parser.PreparedCanonicalWrite(b'raw')\n"
+                "parser.ParserRegistry(())\n"
+                "parser.CanonicalBytes()\n"
+                "parser.GuardedParseSession()\n"
+                "parser.atomic_write_bytes()\n",
+            )
+        )
+
+        self.assertEqual(
+            [finding.rule_id for finding in findings],
+            ["application.parser_surface_factory_only"] * 7,
         )
 
     def test_each_parser_layer_rejects_dependencies_outside_its_allowlist(self) -> None:

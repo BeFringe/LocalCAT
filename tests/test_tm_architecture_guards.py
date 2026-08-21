@@ -47,6 +47,11 @@ _FORBIDDEN_CORE_IMPORT_PREFIXES = (
     "resource_importer",
     "tmx",
 )
+_PARSER_APPLICATION_IMPORT_ALLOWLIST = {
+    "tm_json_importer.py": frozenset(
+        {"parser_composition", "parser_contracts"}
+    ),
+}
 _FORBIDDEN_CONSUMER_IMPORT_PREFIXES = (
     "matcher_capability",
     "text_matcher",
@@ -127,6 +132,15 @@ def _string_literals(tree: ast.AST) -> set[str]:
     }
 
 
+def _core_import_is_forbidden(relative: str, imported: str) -> bool:
+    if not imported.startswith(_FORBIDDEN_CORE_IMPORT_PREFIXES):
+        return False
+    return imported not in _PARSER_APPLICATION_IMPORT_ALLOWLIST.get(
+        relative,
+        frozenset(),
+    )
+
+
 class TMArchitectureGuardTests(unittest.TestCase):
     def test_feature5_core_file_set_is_closed_and_regular(self) -> None:
         self.assertEqual(
@@ -153,9 +167,36 @@ class TMArchitectureGuardTests(unittest.TestCase):
         for relative in FEATURE5_CORE_PATHS:
             for imported in _imports(_tree(relative)):
                 self.assertFalse(
-                    imported.startswith(_FORBIDDEN_CORE_IMPORT_PREFIXES),
+                    _core_import_is_forbidden(relative, imported),
                     f"{relative}: {imported}",
                 )
+
+    def test_parser_application_allowlist_is_narrow_and_has_positive_negative_probes(self) -> None:
+        importer_parser_imports = {
+            imported
+            for imported in _imports(_tree("tm_json_importer.py"))
+            if imported.startswith("parser")
+        }
+
+        self.assertEqual(
+            importer_parser_imports,
+            {"parser_composition", "parser_contracts"},
+        )
+        self.assertFalse(
+            _core_import_is_forbidden("tm_json_importer.py", "parser_composition")
+        )
+        self.assertFalse(
+            _core_import_is_forbidden("tm_json_importer.py", "parser_contracts")
+        )
+        self.assertTrue(
+            _core_import_is_forbidden("tm_json_importer.py", "parser_source")
+        )
+        self.assertTrue(
+            _core_import_is_forbidden("tm_json_importer.py", "parser_tm_json_codec")
+        )
+        self.assertTrue(
+            _core_import_is_forbidden("tm_engine.py", "parser_composition")
+        )
 
     def test_consumers_do_not_own_readiness_or_bypass_gated_matcher(
         self,

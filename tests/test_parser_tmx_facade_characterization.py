@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from parser_composition import create_parser_application_surface
 from resource_importer import import_tmx
 from tm_contracts import CanonicalResourceIdentity
 from tm_engine import open_canonical_tm_store
@@ -191,6 +192,35 @@ class TMXFacadeCharacterizationTests(unittest.TestCase):
         self,
     ) -> None:
         self._assert_failure_is_non_committing(b"<tmx><body><tu>")
+
+    def test_facade_delegates_to_surface_and_exposes_only_safe_issue_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "warnings.tmx"
+            target = root / "legacy.jsonl"
+            source.write_bytes(
+                _tmx(
+                    _unit(("en-US", "Keep body private"), ("zh-CN", "保密")),
+                    '<tu><tuv xml:lang="en-US"><seg>Secret <ph id="1"/>'
+                    '</seg></tuv><tuv xml:lang="zh-CN"><seg>私密</seg></tuv></tu>',
+                )
+            )
+
+            with patch(
+                "resource_importer.create_parser_application_surface",
+                wraps=create_parser_application_surface,
+            ) as surface_factory:
+                report = import_tmx(source, target, "en-US", "zh-CN")
+
+        self.assertEqual(surface_factory.call_count, 1)
+        self.assertEqual(report.imported, 1)
+        self.assertEqual(report.skipped, 1)
+        self.assertEqual(len(report.errors), 1)
+        self.assertTrue(
+            report.errors[0].startswith("PARSER.TMX.INLINE_XML_UNSUPPORTED:")
+        )
+        self.assertNotIn("Secret", report.errors[0])
+        self.assertNotIn("私密", report.errors[0])
 
     def _assert_failure_is_non_committing(self, payload: bytes) -> None:
         for canonical in (False, True):

@@ -51,6 +51,15 @@ class TMCoreSelfCheckTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Integration Test Complete.", result.stdout)
 
+    def test_gettext_selfcheck_runs_at_application_boundary_not_tm_engine(self) -> None:
+        controller = _run_script("logic_controller.py")
+        engine_source = (_ROOT / "tm_engine.py").read_text(encoding="utf-8")
+
+        self.assertEqual(controller.returncode, 0, controller.stderr)
+        self.assertIn("Parser Application Boundary: 1 singular unit(s)", controller.stdout)
+        self.assertNotIn("class POHandler", engine_source)
+        self.assertNotIn("def _extract_string", engine_source)
+
 
 if __name__ == "__main__":
     unittest.main()

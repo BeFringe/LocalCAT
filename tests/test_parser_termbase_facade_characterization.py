@@ -17,6 +17,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 from editor_contracts import LegacyTermRow
+from parser_composition import create_parser_application_surface
 from resource_importer import (
     ImportFailure,
     import_termbase,
@@ -192,6 +193,61 @@ class ParserTermbaseFacadeCharacterizationTests(unittest.TestCase):
             (1, 1, 0, ()),
         )
         self.assertEqual(rendered, [["Chosen", "selected-value"]])
+
+    def test_facades_delegate_to_the_single_parser_application_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "incoming.csv"
+            target = root / "managed.csv"
+            source.write_text("Source,Target\nAlpha,甲\n", encoding="utf-8-sig")
+
+            with patch(
+                "resource_importer.create_parser_application_surface",
+                wraps=create_parser_application_surface,
+            ) as surface_factory:
+                rows, skipped = read_legacy_termbase_import(source)
+                report = import_termbase(source, target)
+
+        self.assertEqual(rows, (LegacyTermRow("Alpha", "甲", 1),))
+        self.assertEqual(skipped, 1)
+        self.assertTrue(report.succeeded)
+        self.assertEqual(surface_factory.call_count, 2)
+
+    def test_fatal_csv_tail_discards_provisional_rows_and_preserves_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "fatal-tail.csv"
+            target = root / "managed.csv"
+            source.write_text(
+                'Alpha,甲\n"unterminated,乙\n',
+                encoding="utf-8-sig",
+            )
+            target.write_bytes(b"\xef\xbb\xbfKeep,stable\r\n")
+            original = target.read_bytes()
+
+            with self.assertRaises(ImportFailure):
+                _ = read_legacy_termbase_import(source)
+            report = import_termbase(source, target)
+
+            self.assertEqual(target.read_bytes(), original)
+
+        self.assertFalse(report.succeeded)
+        self.assertEqual(report.imported, 0)
+        self.assertTrue(report.errors)
+
+    def test_resource_importer_has_no_private_termbase_row_grammar(self) -> None:
+        import resource_importer
+
+        for name in (
+            "_read_termbase_rows",
+            "_read_csv_rows",
+            "_collect_terms",
+            "_is_header",
+            "SOURCE_HEADERS",
+            "TARGET_HEADERS",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(resource_importer, name))
 
 
 if __name__ == "__main__":

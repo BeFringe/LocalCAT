@@ -502,75 +502,7 @@ class TMEngine:
         return self._exact_index.get(text)
 
 # =============================================================================
-# 3. File Handler Implementation (PO Support)
-# =============================================================================
-
-class POHandler:
-    """
-    Parses .po files into SourceUnits.
-    Simple parser implementation to avoid external dependencies like polib for now.
-    """
-    
-    @staticmethod
-    def parse_file(file_path: str) -> list[SourceUnit]:
-        units = []
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"PO file not found: {file_path}")
-
-        current_msgctxt = None
-        current_msgid = None
-        current_msgstr = None # Not used in SourceUnit but good to track state
-        
-        # Simple state machine for PO parsing
-        # Note: This is a basic implementation. Multiline strings require more robust handling.
-        
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
-                if line.startswith('msgctxt '):
-                    current_msgctxt = POHandler._extract_string(line)
-                elif line.startswith('msgid '):
-                    current_msgid = POHandler._extract_string(line)
-                elif line.startswith('msgstr '):
-                    # End of a unit block (usually)
-                    if current_msgid: # Ignore empty header msgid ""
-                        unit = SourceUnit(
-                            id=f"{path.name}_{len(units)}", # Simple ID generation
-                            text=current_msgid,
-                            context_prev=current_msgctxt, # Mapping context to prev for now as per instructions
-                            file_source=path.name
-                        )
-                        units.append(unit)
-                    
-                    # Reset state
-                    current_msgctxt = None
-                    current_msgid = None
-                
-                i += 1
-                
-        except Exception as e:
-            print(f"Error parsing PO file {path}: {e}")
-            
-        return units
-
-    @staticmethod
-    def _extract_string(line: str) -> str:
-        """Helper to extract content between quotes."""
-        # Finds first and last quote
-        first = line.find('"')
-        last = line.rfind('"')
-        if first != -1 and last != -1 and last > first:
-            return line[first+1 : last]
-        return ""
-
-# =============================================================================
-# 4. Self-Test / Verification
+# 3. Self-Test / Verification
 # =============================================================================
 
 if __name__ == "__main__":
@@ -618,36 +550,8 @@ if __name__ == "__main__":
     assert match_final.target == "您好"
     print("  [PASS] Update persisted to disk")
 
-    # --- Case C: PO Parsing Verification ---
-    print("\n--- Case C: PO Parsing Verification ---")
-    test_po_content = """
-msgctxt "Menu Context"
-msgid "Open File"
-msgstr "打开文件"
-
-msgid "Save"
-msgstr "保存"
-"""
-    test_po_file = "test_temp.po"
-    with open(test_po_file, "w", encoding="utf-8") as f:
-        f.write(test_po_content)
-        
-    parsed_units = POHandler.parse_file(test_po_file)
-    
-    # Check Unit 1
-    assert parsed_units[0].text == "Open File"
-    assert parsed_units[0].context_prev == "Menu Context"
-    
-    # Check Unit 2
-    assert parsed_units[1].text == "Save"
-    assert parsed_units[1].context_prev is None
-    
-    print(f"  [PASS] Parsed {len(parsed_units)} units correctly.")
-    
     # Cleanup
     if os.path.exists(test_tm_file):
         os.remove(test_tm_file)
-    if os.path.exists(test_po_file):
-        os.remove(test_po_file)
         
     print("\nAll tests passed successfully.")

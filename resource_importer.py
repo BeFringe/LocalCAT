@@ -3,19 +3,37 @@
 from __future__ import annotations
 
 import csv
-import hashlib
+from dataclasses import dataclass
 import io
 import json
 import logging
 import os
 import sqlite3
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable, cast
+from typing import cast
 from uuid import uuid4
 
 from editor_contracts import ImportReport, LegacyTermRow
+from parser_composition import create_parser_application_surface
+from parser_contracts import (
+    ContractViolation,
+    EffectivePurpose,
+    FormatId,
+    IssueSeverity,
+    ParseIssue,
+    ReadRequest,
+    ResourceRecord,
+    SelectionFailure,
+    SelectionRequest,
+    SourceReference,
+    TERMBASE_CSV_V1,
+    TERMBASE_XLSX_V1,
+    TMX_LEVEL1_V1,
+    TermbaseColumnSelection,
+    TermbaseReadOptions,
+    TmxReadOptions,
+)
 from tm_contracts import TMRecordDraft
 from tm_engine import open_canonical_tm_store
 from tm_sqlite_store import (
@@ -25,15 +43,172 @@ from tm_sqlite_store import (
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_INPUT_BYTES = 100 * 1024 * 1024
-MAX_SEGMENT_CHARS = 1_000_000
-XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
-SOURCE_HEADERS = frozenset({"source", "source term", "source text", "原文", "源术语"})
-TARGET_HEADERS = frozenset({"target", "target term", "target text", "translation", "译文", "目标术语"})
+
+_TERMBASE_FORMAT_BY_SUFFIX = {
+    ".csv": TERMBASE_CSV_V1,
+    ".xlsx": TERMBASE_XLSX_V1,
+}
+_TERMBASE_EXISTING_ALLOWED_WARNING_CODES = frozenset(
+    {
+        "PARSER.TERMBASE.HEADER_SKIPPED",
+        "PARSER.TERMBASE.ROW_EMPTY",
+    }
+)
 
 
 class ImportFailure(RuntimeError):
     """Internal all-or-nothing import failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedResource:
+    records: tuple[ResourceRecord, ...]
+    warnings: tuple[ParseIssue, ...]
+    source_digest: str
+
+
+def _source_reference(path: Path) -> SourceReference:
+    expanded = path.expanduser()
+    absolute = expanded if expanded.is_absolute() else expanded.absolute()
+    parent = absolute.parent
+    return SourceReference(
+        safe_root=str(parent),
+        selected_path=str(absolute),
+        display_hint="selected resource",
+    )
+
+
+def _format_parser_failure(error: ContractViolation) -> str:
+    return f"{error.code}: {error.safe_summary}"
+
+
+def _format_parser_issue(issue: ParseIssue) -> str:
+    return f"{issue.code}: {issue.safe_summary}"
+
+
+def _stage_parser_resource(
+    path: Path,
+    *,
+    purpose: EffectivePurpose,
+    format_id: FormatId,
+    request: ReadRequest,
+) -> _StagedResource:
+    """Consume one guarded stream and expose records only after its terminal."""
+
+    surface = create_parser_application_surface()
+    try:
+        opened = surface.open_input(
+            _source_reference(path),
+            SelectionRequest(purpose=purpose, format_id=format_id),
+            request,
+        )
+    except ContractViolation as exc:
+        raise ImportFailure(_format_parser_failure(exc)) from None
+    if type(opened) is SelectionFailure:
+        raise ImportFailure(
+            f"{opened.code}: no compatible Parser codec is registered for the resource"
+        )
+
+    records: list[ResourceRecord] = []
+    warnings: list[ParseIssue] = []
+    source_digest = opened.source_identity.content_sha256
+    try:
+        try:
+            session = opened.stream()
+        except ContractViolation as exc:
+            raise ImportFailure(_format_parser_failure(exc)) from None
+        try:
+            try:
+                for event in session:
+                    if type(event) is ResourceRecord:
+                        records.append(event)
+                    elif (
+                        type(event) is ParseIssue
+                        and event.severity is IssueSeverity.WARNING
+                    ):
+                        warnings.append(event)
+                terminal = session.verified_terminal()
+            except ContractViolation as exc:
+                raise ImportFailure(_format_parser_failure(exc)) from None
+            if terminal.record_count != len(records):
+                raise ImportFailure(
+                    "PARSER.SESSION.UNVERIFIED: staged record count does not match the verified terminal"
+                )
+            if terminal.source != opened.source_identity:
+                raise ImportFailure(
+                    "PARSER.SOURCE.STALE: verified terminal does not bind the opened snapshot"
+                )
+        finally:
+            session.close()
+    finally:
+        opened.close()
+    return _StagedResource(
+        records=tuple(records),
+        warnings=tuple(warnings),
+        source_digest=source_digest,
+    )
+
+
+def _legacy_termbase_request(format_id: FormatId) -> ReadRequest:
+    return ReadRequest(
+        purpose=EffectivePurpose.TERMBASE,
+        format_id=format_id,
+        termbase_options=TermbaseReadOptions(
+            columns=TermbaseColumnSelection.legacy_first_two_columns()
+        ),
+    )
+
+
+def _stage_termbase(
+    path: Path,
+    *,
+    format_id: FormatId | None = None,
+) -> _StagedResource:
+    selected_format = format_id
+    if selected_format is None:
+        selected_format = _TERMBASE_FORMAT_BY_SUFFIX.get(path.suffix.lower())
+        if selected_format is None:
+            supported = ", ".join(sorted(_TERMBASE_FORMAT_BY_SUFFIX))
+            raise ImportFailure(
+                f"unsupported import format; expected one of: {supported}"
+            )
+    return _stage_parser_resource(
+        path,
+        purpose=EffectivePurpose.TERMBASE,
+        format_id=selected_format,
+        request=_legacy_termbase_request(selected_format),
+    )
+
+
+def _tmx_request(source_locale: str, target_locale: str) -> ReadRequest:
+    try:
+        options = TmxReadOptions(
+            source_locale=source_locale,
+            target_locale=target_locale,
+        )
+    except (TypeError, ValueError):
+        raise ImportFailure(
+            "PARSER.TMX.LOCALE_SELECTION_INVALID: TMX source and target locale selection is invalid"
+        ) from None
+    return ReadRequest(
+        purpose=EffectivePurpose.TRANSLATION_MEMORY,
+        format_id=TMX_LEVEL1_V1,
+        tmx_options=options,
+    )
+
+
+def _physical_row_ordinal(record: ResourceRecord) -> int:
+    prefix, separator, raw_ordinal = record.local_id.partition("-")
+    if prefix != "row" or separator != "-" or not raw_ordinal.isdecimal():
+        raise ImportFailure(
+            "PARSER.SYNTAX.INVALID_EVENT: termbase record has an invalid physical row identity"
+        )
+    ordinal = int(raw_ordinal)
+    if ordinal <= 0:
+        raise ImportFailure(
+            "PARSER.SYNTAX.INVALID_EVENT: termbase record has an invalid physical row identity"
+        )
+    return ordinal
 
 
 def read_legacy_termbase_import(
@@ -48,32 +223,18 @@ def read_legacy_termbase_import(
     """
 
     source = _validate_input(input_path, {".csv", ".xlsx"})
-    rows = _read_termbase_rows(source)
-    accepted: list[LegacyTermRow] = []
-    skipped = 0
-    for input_ordinal, row in enumerate(rows):
-        if len(row) < 2:
-            skipped += 1
-            continue
-        source_text = "" if row[0] is None else str(row[0]).strip()
-        target_text = "" if row[1] is None else str(row[1]).strip()
-        if (
-            _is_header(source_text, target_text)
-            or not source_text
-            or not target_text
-        ):
-            skipped += 1
-            continue
-        accepted.append(
-            LegacyTermRow(
-                source=source_text,
-                target=target_text,
-                input_ordinal=input_ordinal,
-            )
+    staged = _stage_termbase(source)
+    accepted = tuple(
+        LegacyTermRow(
+            source=record.source,
+            target=record.target,
+            input_ordinal=_physical_row_ordinal(record) - 1,
         )
+        for record in staged.records
+    )
     if not accepted:
         raise ImportFailure("termbase contains no valid source/target rows")
-    return tuple(accepted), skipped
+    return accepted, len(staged.warnings)
 
 
 def import_tmx(
@@ -91,28 +252,42 @@ def import_tmx(
     """
 
     try:
-        source_language = _normalize_locale(source_locale)
-        target_language = _normalize_locale(target_locale)
-        if source_language == target_language:
-            raise ImportFailure("source and target locales must be different")
         source = _validate_input(input_path, {".tmx"})
+        # Freeze compatibility receipt provenance before the Parser opens its
+        # sealed snapshot.  The Parser still receives the unresolved lexical
+        # selection so SourceReference preserves the user's selected path;
+        # no path lookup is repeated after streaming begins.
+        receipt_source = source.resolve()
         target = target_path.expanduser().resolve()
-        source_bytes = _read_tmx_snapshot(source)
-        incoming, ordered_units, skipped, warnings, duplicate_count = _parse_tmx(
-            io.BytesIO(source_bytes),
-            source_language,
-            target_language,
+        staged = _stage_parser_resource(
+            source,
+            purpose=EffectivePurpose.TRANSLATION_MEMORY,
+            format_id=TMX_LEVEL1_V1,
+            request=_tmx_request(source_locale, target_locale),
         )
-        if not incoming:
+        if not staged.records:
             raise ImportFailure(
                 "TMX contains no valid units for "
                 f"{source_locale.strip()} → {target_locale.strip()}"
             )
+        ordered_units = tuple(
+            (record.source, record.target) for record in staged.records
+        )
+        incoming: dict[str, dict[str, object]] = {}
+        duplicate_count = 0
+        for source_text, target_text in ordered_units:
+            if source_text in incoming:
+                duplicate_count += 1
+            incoming[source_text] = {
+                "source": source_text,
+                "target": target_text,
+            }
+        skipped = len(staged.warnings)
+        warnings = tuple(_format_parser_issue(issue) for issue in staged.warnings)
         canonical = open_canonical_tm_store(target)
         if canonical is not None:
-            source_digest = hashlib.sha256(source_bytes).hexdigest()
             drafts = tuple(
-                _tmx_import_draft(source_text, target_text, source.name)
+                _tmx_import_draft(source_text, target_text, receipt_source.name)
                 for source_text, target_text in ordered_units
             )
             try:
@@ -120,8 +295,8 @@ def import_tmx(
                     batch_id=f"import.{uuid4().hex}",
                     kind="import",
                     drafts=drafts,
-                    source_digest=source_digest,
-                    source_path=source,
+                    source_digest=staged.source_digest,
+                    source_path=receipt_source,
                     invalid_count=skipped,
                     duplicate_source_count=duplicate_count,
                 )
@@ -133,16 +308,20 @@ def import_tmx(
                 raise ImportFailure(
                     "canonical import transaction constraint failed"
                 ) from exc
+            except sqlite3.Error as exc:
+                raise ImportFailure(
+                    "canonical import transaction failed"
+                ) from exc
             LOGGER.info(
                 "Imported %d canonical TM entries from %s",
                 len(drafts),
-                source,
+                receipt_source,
             )
             return ImportReport(
                 imported=len(drafts),
                 skipped=skipped,
                 overwritten=0,
-                errors=tuple(warnings),
+                errors=warnings,
             )
         existing = _read_existing_tm(target)
         overwritten = duplicate_count + sum(key in existing for key in incoming)
@@ -158,13 +337,12 @@ def import_tmx(
             imported=len(incoming),
             skipped=skipped,
             overwritten=overwritten,
-            errors=tuple(warnings),
+            errors=warnings,
         )
     except (
         ImportFailure,
         OSError,
         UnicodeError,
-        ET.ParseError,
         ValueError,
         SQLiteStoreSchemaError,
         SQLiteStoreLifecycleError,
@@ -178,8 +356,14 @@ def import_termbase(input_path: Path, target_path: Path) -> ImportReport:
     try:
         source = _validate_input(input_path, {".csv", ".xlsx"})
         target = target_path.expanduser().resolve()
-        rows = _read_termbase_rows(source)
-        incoming, skipped, duplicate_count = _collect_terms(rows)
+        staged = _stage_termbase(source)
+        incoming: dict[str, str] = {}
+        duplicate_count = 0
+        for record in staged.records:
+            if record.source in incoming:
+                duplicate_count += 1
+            incoming[record.source] = record.target
+        skipped = len(staged.warnings)
         if not incoming:
             raise ImportFailure("termbase contains no valid source/target rows")
         existing = _read_existing_terms(target)
@@ -220,149 +404,14 @@ def upsert_term(target_path: Path, source_term: str, target_term: str) -> Import
 
 
 def _validate_input(input_path: Path, suffixes: set[str]) -> Path:
-    path = input_path.expanduser().resolve()
+    expanded = input_path.expanduser()
+    path = expanded if expanded.is_absolute() else expanded.absolute()
     if not path.exists() or not path.is_file():
         raise ImportFailure(f"input file does not exist: {path}")
     if path.suffix.lower() not in suffixes:
         supported = ", ".join(sorted(suffixes))
         raise ImportFailure(f"unsupported import format; expected one of: {supported}")
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise ImportFailure(f"unable to inspect input file '{path}': {exc}") from exc
-    if size > MAX_INPUT_BYTES:
-        raise ImportFailure("input exceeds the 100 MB safety limit")
     return path
-
-
-def _read_tmx_snapshot(path: Path) -> bytes:
-    """Read one bounded immutable TMX snapshot for validation and parsing."""
-
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise ImportFailure(f"unable to read TMX '{path}': {exc}") from exc
-    if len(data) > MAX_INPUT_BYTES:
-        raise ImportFailure("input exceeds the 100 MB safety limit")
-    declarations = data.upper()
-    if b"<!DOCTYPE" in declarations or b"<!ENTITY" in declarations:
-        raise ImportFailure("TMX containing DTD or ENTITY declarations is not supported")
-    return data
-
-
-def _normalize_locale(locale: str) -> str:
-    normalized = locale.strip().replace("_", "-").lower()
-    pieces = [piece for piece in normalized.split("-") if piece]
-    if not pieces or any(not piece.isalnum() for piece in pieces):
-        raise ImportFailure(f"invalid locale: {locale!r}")
-    return "-".join(pieces)
-
-
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1].lower()
-
-
-def _direct_child(element: ET.Element, name: str) -> ET.Element | None:
-    wanted = name.lower()
-    return next((child for child in element if _local_name(child.tag) == wanted), None)
-
-
-def _tuv_language(element: ET.Element) -> str | None:
-    raw = element.attrib.get(XML_LANG) or element.attrib.get("lang")
-    if raw is None or not raw.strip():
-        return None
-    try:
-        return _normalize_locale(raw)
-    except ImportFailure:
-        return None
-
-
-def _select_locale(
-    entries: list[tuple[str, str]],
-    requested: str,
-) -> tuple[str | None, str | None]:
-    exact = [text for locale, text in entries if locale == requested]
-    if exact:
-        return exact[-1], None
-    base = requested.split("-", 1)[0]
-    candidates = [(locale, text) for locale, text in entries if locale.split("-", 1)[0] == base]
-    locales = {locale for locale, _ in candidates}
-    if len(locales) == 1:
-        return candidates[-1][1], None
-    if len(locales) > 1:
-        return None, f"ambiguous base-language fallback for '{requested}'"
-    return None, f"language '{requested}' not found"
-
-
-def _parse_tmx(
-    source: io.BytesIO,
-    source_locale: str,
-    target_locale: str,
-) -> tuple[
-    dict[str, dict[str, object]],
-    tuple[tuple[str, str], ...],
-    int,
-    list[str],
-    int,
-]:
-    incoming: dict[str, dict[str, object]] = {}
-    ordered_units: list[tuple[str, str]] = []
-    skipped = 0
-    duplicate_count = 0
-    warnings: list[str] = []
-    total_units = 0
-    root: ET.Element | None = None
-
-    for event, element in ET.iterparse(source, events=("start", "end")):
-        if root is None and event == "start":
-            root = element
-        if event != "end" or _local_name(element.tag) != "tu":
-            continue
-        total_units += 1
-        entries: list[tuple[str, str]] = []
-        inline_tag = False
-        for tuv in (child for child in element if _local_name(child.tag) == "tuv"):
-            locale = _tuv_language(tuv)
-            segment = _direct_child(tuv, "seg")
-            if locale is None or segment is None:
-                continue
-            if len(segment):
-                inline_tag = True
-                break
-            text = (segment.text or "").strip()
-            if len(text) > MAX_SEGMENT_CHARS:
-                inline_tag = True
-                warnings.append(
-                    f"TMX unit {total_units} skipped: segment exceeds the safety length limit"
-                )
-                break
-            if text:
-                entries.append((locale, text))
-        if inline_tag:
-            skipped += 1
-            if not warnings or not warnings[-1].startswith(f"TMX unit {total_units} skipped:"):
-                warnings.append(f"TMX unit {total_units} skipped: inline XML tags are not supported")
-        else:
-            source_text, source_error = _select_locale(entries, source_locale)
-            target_text, target_error = _select_locale(entries, target_locale)
-            if source_text is None or target_text is None:
-                skipped += 1
-                if source_error and "ambiguous" in source_error:
-                    warnings.append(f"TMX unit {total_units} skipped: {source_error}")
-                elif target_error and "ambiguous" in target_error:
-                    warnings.append(f"TMX unit {total_units} skipped: {target_error}")
-            else:
-                ordered_units.append((source_text, target_text))
-                if source_text in incoming:
-                    duplicate_count += 1
-                incoming[source_text] = {"source": source_text, "target": target_text}
-        element.clear()
-        if root is not None and element is not root:
-            root.clear()
-
-    if total_units == 0:
-        raise ImportFailure("TMX contains no translation units")
-    return incoming, tuple(ordered_units), skipped, warnings, duplicate_count
 
 
 def _tmx_import_draft(
@@ -422,79 +471,23 @@ def _read_existing_tm(path: Path) -> dict[str, dict[str, object]]:
     return records
 
 
-def _read_termbase_rows(path: Path) -> Iterable[tuple[object, ...]]:
-    if path.suffix.lower() == ".csv":
-        return _read_csv_rows(path)
-    try:
-        import openpyxl
-    except ImportError as exc:
-        raise ImportFailure("XLSX import requires openpyxl 3.1 or newer") from exc
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        try:
-            sheet = workbook.active
-            if sheet is None:
-                raise ImportFailure("XLSX termbase has no active worksheet")
-            return list(sheet.iter_rows(values_only=True))
-        finally:
-            workbook.close()
-    except Exception as exc:
-        raise ImportFailure(f"unable to read XLSX termbase: {exc}") from exc
-
-
-def _read_csv_rows(path: Path) -> list[tuple[str, ...]]:
-    try:
-        with path.open(encoding="utf-8-sig", newline="") as handle:
-            return [tuple(row) for row in csv.reader(handle)]
-    except (OSError, UnicodeError, csv.Error) as exc:
-        raise ImportFailure(f"unable to read CSV termbase: {exc}") from exc
-
-
 def _read_existing_terms(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
+    staged = _stage_termbase(path, format_id=TERMBASE_CSV_V1)
+    rejected = tuple(
+        issue
+        for issue in staged.warnings
+        if issue.code not in _TERMBASE_EXISTING_ALLOWED_WARNING_CODES
+    )
+    if rejected:
+        raise ImportFailure(
+            "managed termbase contains an invalid source/target row"
+        )
     terms: dict[str, str] = {}
-    for line_number, row in enumerate(_read_csv_rows(path), start=1):
-        if not row or not any(cell.strip() for cell in row):
-            continue
-        if len(row) < 2:
-            raise ImportFailure(f"target termbase row {line_number} has fewer than two columns")
-        source = row[0].strip()
-        target = row[1].strip()
-        if _is_header(source, target):
-            continue
-        if not source or not target:
-            raise ImportFailure(f"target termbase row {line_number} has an empty term")
-        terms[source] = target
+    for record in staged.records:
+        terms[record.source] = record.target
     return terms
-
-
-def _collect_terms(
-    rows: Iterable[tuple[object, ...] | list[object]],
-) -> tuple[dict[str, str], int, int]:
-    terms: dict[str, str] = {}
-    skipped = 0
-    duplicate_count = 0
-    for row in rows:
-        if len(row) < 2:
-            skipped += 1
-            continue
-        source = "" if row[0] is None else str(row[0]).strip()
-        target = "" if row[1] is None else str(row[1]).strip()
-        if _is_header(source, target):
-            skipped += 1
-            continue
-        if not source or not target:
-            skipped += 1
-            continue
-        if source in terms:
-            duplicate_count += 1
-        terms[source] = target
-    return terms, skipped, duplicate_count
-
-
-def _is_header(source: str, target: str) -> bool:
-    return source.casefold() in SOURCE_HEADERS and target.casefold() in TARGET_HEADERS
 
 
 def _render_terms(terms: dict[str, str]) -> str:

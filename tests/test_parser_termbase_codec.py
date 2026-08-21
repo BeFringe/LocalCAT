@@ -341,6 +341,77 @@ class CsvTermbaseCodecTests(_ParserFixture):
             ),
         )
 
+    def test_semantically_empty_csv_rows_are_distinct_from_one_sided_rows(self) -> None:
+        from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
+
+        result = self._materialize(
+            descriptor=TERMBASE_CSV_DESCRIPTOR,
+            codec=CsvTermbaseCodec(),
+            name="empty-row-matrix.csv",
+            payload=(
+                b"\n"
+                b",\n"
+                b"  ,  \n"
+                b"  , \t ,   \n"
+                b",Target\n"
+                b"Source,\n"
+                b"Accepted,Translation\n"
+            ),
+            columns=_selection(source=0, target=1, policy="no_header"),
+        )
+
+        self.assertEqual(
+            tuple((record.local_id, record.source, record.target) for record in result.records),
+            (("row-7", "Accepted", "Translation"),),
+        )
+        self.assertEqual(
+            tuple((issue.code, issue.record_number) for issue in result.issues),
+            (
+                ("PARSER.TERMBASE.ROW_EMPTY", 1),
+                ("PARSER.TERMBASE.ROW_EMPTY", 2),
+                ("PARSER.TERMBASE.ROW_EMPTY", 3),
+                ("PARSER.TERMBASE.ROW_EMPTY", 4),
+                ("PARSER.TERMBASE.SOURCE_EMPTY", 5),
+                ("PARSER.TERMBASE.TARGET_EMPTY", 6),
+            ),
+        )
+
+    def test_warning_mapping_can_stage_without_mutating_managed_target(self) -> None:
+        from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
+
+        managed_target = self.root / "managed-target.csv"
+        managed_bytes = "Keep,保留\n".encode()
+        managed_target.write_bytes(managed_bytes)
+        result = self._materialize(
+            descriptor=TERMBASE_CSV_DESCRIPTOR,
+            codec=CsvTermbaseCodec(),
+            name="adjacent-import.csv",
+            payload=b"Source,Target\n,\nNew,Value\n",
+            columns=_selection(source=0, target=1, policy="legacy_allowlist"),
+        )
+
+        skipped_codes = {
+            "PARSER.TERMBASE.HEADER_SKIPPED",
+            "PARSER.TERMBASE.ROW_EMPTY",
+            "PARSER.TERMBASE.ROW_MISSING_COLUMN",
+            "PARSER.TERMBASE.SOURCE_EMPTY",
+            "PARSER.TERMBASE.TARGET_EMPTY",
+        }
+        skipped = sum(issue.code in skipped_codes for issue in result.issues)
+        staged = {"Keep": "保留"}
+        staged.update((record.source, record.target) for record in result.records)
+
+        self.assertEqual(skipped, 2)
+        self.assertEqual(
+            tuple(issue.code for issue in result.issues),
+            (
+                "PARSER.TERMBASE.HEADER_SKIPPED",
+                "PARSER.TERMBASE.ROW_EMPTY",
+            ),
+        )
+        self.assertEqual(staged, {"Keep": "保留", "New": "Value"})
+        self.assertEqual(managed_target.read_bytes(), managed_bytes)
+
     def test_header_failures_and_mixed_selector_same_column_are_pre_record_fatal(self) -> None:
         from parser_contracts import ValidationOutcome
         from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
@@ -745,6 +816,45 @@ class XlsxTermbaseCodecTests(_ParserFixture):
                 "PARSER.TERMBASE.ROW_MISSING_COLUMN",
                 "PARSER.TERMBASE.SOURCE_EMPTY",
                 "PARSER.TERMBASE.TARGET_EMPTY",
+            ),
+        )
+
+    def test_semantically_empty_xlsx_rows_are_distinct_from_one_sided_rows(self) -> None:
+        import openpyxl
+        from parser_termbase_codec import XlsxTermbaseCodec, TERMBASE_XLSX_DESCRIPTOR
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append([None, None])
+        sheet.append(["", ""])
+        sheet.append(["  ", "\t", "   "])
+        sheet.append(["", "Target"])
+        sheet.append(["Source", ""])
+        sheet.append(["Accepted", "Translation"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        workbook.close()
+
+        result = self._materialize(
+            descriptor=TERMBASE_XLSX_DESCRIPTOR,
+            codec=XlsxTermbaseCodec(),
+            name="empty-row-matrix.xlsx",
+            payload=buffer.getvalue(),
+            columns=_selection(source=0, target=1, policy="no_header"),
+        )
+
+        self.assertEqual(
+            tuple((record.local_id, record.source, record.target) for record in result.records),
+            (("row-6", "Accepted", "Translation"),),
+        )
+        self.assertEqual(
+            tuple((issue.code, issue.record_number) for issue in result.issues),
+            (
+                ("PARSER.TERMBASE.ROW_EMPTY", 1),
+                ("PARSER.TERMBASE.ROW_EMPTY", 2),
+                ("PARSER.TERMBASE.ROW_EMPTY", 3),
+                ("PARSER.TERMBASE.SOURCE_EMPTY", 4),
+                ("PARSER.TERMBASE.TARGET_EMPTY", 5),
             ),
         )
 

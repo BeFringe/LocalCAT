@@ -966,9 +966,14 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
             AllowedImportRule(
                 "composition.allowed_dependencies",
                 ("parser_composition",),
-                ("parser_contracts", "parser_registry", *PARSER_CODEC_PREFIXES),
+                (
+                    "parser_contracts",
+                    "parser_registry",
+                    "parser_source",
+                    *PARSER_CODEC_PREFIXES,
+                ),
                 (),
-                "composition is the sole built-in codec registration point",
+                "composition alone coordinates Source and built-in codecs for Application",
             ),
         ),
         import_rules=(
@@ -1006,6 +1011,25 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
             ),
         ),
         exclusive_call_rules=(
+            ExclusiveCallRule(
+                "application.parser_surface_factory_only",
+                (
+                    "parser_composition.ParserApplicationSurface",
+                    "parser_composition.OpenedParserInput",
+                    "parser_composition.PreparedCanonicalWrite",
+                    "parser_composition.ParserRegistry",
+                    "parser_composition.CanonicalBytes",
+                    "parser_composition.GuardedParseSession",
+                    "parser_composition.SealedSourceSnapshot",
+                    "parser_composition.create_sealed_snapshot",
+                    "parser_composition.atomic_write_bytes",
+                    "parser_composition.validate",
+                    "parser_composition.materialize",
+                ),
+                (*APPLICATION_FACADE_PREFIXES, "parser_composition"),
+                ("parser_composition",),
+                "Application uses the factory-created composition surface, not constructors",
+            ),
             ExclusiveCallRule(
                 "syntax.localcat_or_tm_json_owner",
                 ("json.load", "json.loads"),

@@ -231,14 +231,14 @@
   - 完成时，PO/POT golden 的 metadata、presence、状态、ID 和 plural failure 满足单输入文档合同。
   - _Requirements: 2.1, 2.3, 2.4, 2.5, 2.6, 4.1, 4.2, 4.4, 4.5, 4.6, 4.7, 4.9, 12.5, 13.1_
 
-- [ ] 4. Wave 3：注册内建 codec 并迁移 Application facade
-- [ ] 4.1 建立唯一内建 composition
+- [x] 4. Wave 3：注册内建 codec 并迁移 Application facade
+- [x] 4.1 建立唯一内建 composition
   - 在唯一 composition root 注册八个用途/格式 descriptor，并核对每个 codec 自行发布的 capability、limit profile 与 issue allowlist。
   - 保持 registry 不导入具体 codec，不做动态扫描、用途 fallback 或 reader 推导 writer。
   - 完成时，支持矩阵与 Requirements 一致，非法组合和重复注册在读取前确定性失败。
   - _Requirements: 1.2, 1.4, 1.6, 1.7, 1.8, 1.9, 8.1, 10.1, 10.3, 10.7, 11.4, 11.7_
 
-- [ ] 4.2 (P) 迁移单文档项目打开 facade
+- [x] 4.2 (P) 迁移单文档项目打开 facade
   - 让现有打开入口显式选择 project purpose，经 sealed snapshot 与 guarded terminal 后映射为 EditorProject。
   - 只在完整成功后安装新 session；稳定 ProjectError/Controller code、字段缺省和 one-project/one-document 行为不变。
   - 完成时，生产入口不再独立解析 JSON/TXT，characterization 与 Qt 单项目路径保持通过。
@@ -246,13 +246,13 @@
   - _Boundary: Editor Project Application Facade_
   - _Depends: 3.1, 3.2, 4.1_
 
-- [ ] 4.3 迁移单文档项目保存 facade
+- [x] 4.3 迁移单文档项目保存 facade
   - 由 Application 映射 EditorProject 到中立 write DTO，经 LocalCAT serializer 生成 bytes，再调用原子 byte writer。
   - 保持绝对 Path 返回、稳定保存错误、目标原子性和成功后才清 dirty；不把 schema 复制回 facade。
   - 完成时，读取与保存均只经过一个 LocalCAT 语法权威，TXT writer 仍在打开目标前拒绝。
   - _Requirements: 3.8, 3.9, 3.10, 10.2, 10.6, 11.2, 14.1, 14.2, 14.3, 14.4_
 
-- [ ] 4.4 (P) 迁移术语资源读取与事务导入 facade
+- [x] 4.4 (P) 迁移术语资源读取与事务导入 facade
   - 让只读和事务入口显式传入 legacy 0/1 preset，并在 verified terminal 后映射 accepted rows。
   - 保持 tuple/skipped/ImportFailure、source-LWW、原子写、metadata、reload 与 Store transaction owner；无有效行或 fatal 不写目标。
   - 完成时，resource importer 不再拥有第二份 header/列/active-sheet 规则。
@@ -260,7 +260,7 @@
   - _Boundary: Termbase Resource Application Facade_
   - _Depends: 3.4, 3.5, 4.1_
 
-- [ ] 4.5 (P) 迁移 Glossary consumer 并退出重复 row parser
+- [x] 4.5 (P) 迁移 Glossary consumer 并退出重复 row parser
   - 让既有 consumer 使用同一 termbase codec 结果，仅在成功终态后向现有 Engine 添加 accepted rows。
   - 移除吞异常/print 与 CSV/XLSX 私有语法；若无真实调用者则删除 loader，不在 Engine re-export Parser。
   - 完成时，LogicController/self-check 只剩 consumer mapping，生产中没有第二套术语 row-selection。
@@ -268,7 +268,7 @@
   - _Boundary: Glossary Application Adapter_
   - _Depends: 3.4, 3.5, 4.1_
 
-- [ ] 4.6 (P) 迁移 TMX 资源导入 facade
+- [x] 4.6 (P) 迁移 TMX 资源导入 facade
   - 让现有入口通过 TMX codec stage provisional records，仅在 verified terminal 后执行 canonical/legacy policy 与 Store transaction。
   - 保持 digest、variants/order、legacy LWW、ImportReport 映射和 warning 进入 errors 的现行可观察行为。
   - 完成时，私有 XML tokenizer 退出，fatal/cancel/commit failure 均不留下 partial store effect。
@@ -276,7 +276,7 @@
   - _Boundary: TMX Resource Application Facade_
   - _Depends: 3.6, 3.7, 4.1, 4.4_
 
-- [ ] 4.7 (P) 迁移 normalized TM JSON CLI/batch facade
+- [x] 4.7 (P) 迁移 normalized TM JSON CLI/batch facade
   - 每个输入文件独立取得终态后才进入调用方 batch；目录发现、continue/stop、跨文件 source-LWW 与输出 policy 留在 CLI。
   - 将输出改为失败不截断目标；坏文件不再被解释为 partial success，成功 stdout 保持兼容。
   - 完成时，CLI 不再拥有单输入 JSON row parser，per-file 结果不会互相重标。
@@ -284,7 +284,7 @@
   - _Boundary: Normalized TM JSON CLI Facade_
   - _Depends: 3.8, 4.1_
 
-- [ ] 4.8 (P) 迁移 gettext runners 并退出 Engine parser
+- [x] 4.8 (P) 迁移 gettext runners 并退出 Engine parser
   - 将 translation/stress runners 显式选择 project purpose，并在终态后映射为既有 SourceUnit 使用形状。
   - 语法、plural 或编码 fatal 使 runner 明确失败；删除 POHandler，Engine 不 re-export Parser。
   - 完成时，valid singular 输出与三态处理保持兼容，生产代码只剩一个 gettext grammar。

@@ -362,7 +362,7 @@ def _row_events(
     target_index: int,
     present_columns: frozenset[int] | None = None,
 ) -> Iterator[ResourceRecord | ParseIssue]:
-    if not row or all(value is None for value in row):
+    if not row or all(not _cell_text(value) for value in row):
         yield _warning(_ROW_EMPTY, "an empty physical row was skipped", ordinal)
         return
     if present_columns is None:
