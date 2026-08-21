@@ -213,10 +213,26 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         expected = self.source.read_bytes()
         self.assertEqual(snapshot.identity.content_sha256, hashlib.sha256(expected).hexdigest())
         self.assertEqual(snapshot.identity.byte_count, len(expected))
+        self.assertEqual(snapshot.source_name_hint, "chapter.txt")
         with snapshot.lease(self.descriptor()) as lease:
+            self.assertEqual(lease.source_name_hint, "chapter.txt")
             self.assertEqual(lease.read(), expected)
         snapshot.close()
         self.assertTrue(snapshot.released)
+
+        from parser_contracts import SourceReference
+
+        spoofed = SourceReference(
+            safe_root=str(self.root),
+            selected_path=str(self.source),
+            display_hint="spoofed-name.json",
+        )
+        spoofed_snapshot = create_sealed_snapshot(
+            spoofed,
+            limit_profile=self.profile(),
+        )
+        self.assertEqual(spoofed_snapshot.source_name_hint, "chapter.txt")
+        spoofed_snapshot.close()
 
     def test_rooted_open_rejects_escape_symlink_and_non_regular_without_consuming(self) -> None:
         from parser_contracts import SourceReference

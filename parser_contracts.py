@@ -421,10 +421,27 @@ class TermbaseReadOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class TmxReadOptions:
+    """Caller-owned locale pair required by the TMX Level 1 reader."""
+
+    source_locale: str
+    target_locale: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("source_locale", "target_locale"):
+            value = getattr(self, field_name)
+            _require_nonempty_text(value, field_name=f"TmxReadOptions.{field_name}")
+            if len(value) > 128:
+                raise ValueError(f"TmxReadOptions.{field_name} is too long")
+            _require_safe_summary(value)
+
+
+@dataclass(frozen=True, slots=True)
 class ReadRequest:
     purpose: EffectivePurpose
     format_id: FormatId
     termbase_options: TermbaseReadOptions | None = None
+    tmx_options: TmxReadOptions | None = None
 
     def __post_init__(self) -> None:
         _require_exact_instance(self.purpose, EffectivePurpose, "ReadRequest.purpose")
@@ -450,6 +467,22 @@ class ReadRequest:
             raise ContractViolation(
                 "PARSER.TERMBASE.COLUMN_SELECTION_NOT_APPLICABLE",
                 "termbase column selection is not valid for the requested purpose",
+            )
+        if self.format_id == TMX_LEVEL1_V1:
+            if self.tmx_options is None:
+                raise ContractViolation(
+                    "PARSER.TMX.LOCALE_SELECTION_REQUIRED",
+                    "TMX reads require an explicit source and target locale pair",
+                )
+            _require_exact_instance(
+                self.tmx_options,
+                TmxReadOptions,
+                "ReadRequest.tmx_options",
+            )
+        elif self.tmx_options is not None:
+            raise ContractViolation(
+                "PARSER.TMX.LOCALE_SELECTION_NOT_APPLICABLE",
+                "TMX locale selection is not valid for the requested format",
             )
 
 
@@ -1369,6 +1402,9 @@ class SnapshotCursorLease(Protocol):
 
     @property
     def source_identity(self) -> SourceSnapshotIdentity: ...
+
+    @property
+    def source_name_hint(self) -> str: ...
 
     @property
     def byte_count(self) -> int: ...

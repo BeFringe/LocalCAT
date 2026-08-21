@@ -154,8 +154,8 @@
   - 完成时，包含内部或外部实体的 workbook 在 openpyxl 之前失败，安全 workbook 保持可读。
   - _Requirements: 9.4, 9.5_
 
-- [ ] 3. Wave 2：实现八个首波格式 codec
-- [ ] 3.1 (P) 实现 LocalCAT JSON reader
+- [x] 3. Wave 2：实现八个首波格式 codec
+- [x] 3.1 (P) 实现 LocalCAT JSON reader
   - 按兼容规则读取数组/对象根、严格字段类型、trim、缺省 locale/name、ID 生成和整文档 fatal。
   - descriptor 单独发布 `localcat-json-v1` limits、issue allowlist 与 readable、non-streaming capability；canonical write 在任务 3.3 完成后启用。
   - 完成时，JSON golden 与现有读取 characterization 对记录、顺序、presence、RawSpeaker 和失败结果一致。
@@ -163,19 +163,19 @@
   - _Boundary: LocalCAT Project Codec_
   - _Depends: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.13_
 
-- [ ] 3.2 实现 source-only TXT reader
+- [x] 3.2 实现 source-only TXT reader
   - 按顺序过滤 trimmed empty line，为每个非空行产生 source-only segment 和稠密局部 ID。
   - descriptor 单独发布 `line-text-v1` limits、issue allowlist 与 reader-only、streaming capability，不推断 target、确认状态或 speaker profile。
   - 完成时，TXT golden 与现有 facade 对 name、顺序、missing target、空 RawSpeaker、空文档 fatal 和无 writer 能力一致。
   - _Requirements: 1.6, 2.1, 2.3, 2.4, 2.5, 2.6, 3.6, 3.7, 3.10, 8.1, 9.1, 9.2, 9.3, 12.2, 12.5, 13.1, 13.3_
 
-- [ ] 3.3 实现 LocalCAT JSON v1 canonical serializer
+- [x] 3.3 实现 LocalCAT JSON v1 canonical serializer
   - 把中立 write DTO 确定性序列化为 schema version 1 UTF-8 JSON，按序输出 name、locales 与全部 segment 字段。
   - 只声明 canonical write，不声称保留源字节/排版；TXT 始终拒绝 writer 请求。
   - 完成时，序列化 bytes 可交给原子 byte writer，load → canonical save 兼容结果与失败注入满足现有保存合同。
   - _Requirements: 3.8, 3.9, 3.10, 10.2, 10.3, 10.6, 10.7, 14.1_
 
-- [ ] 3.4 (P) 实现 CSV 术语 codec 与显式列选择
+- [x] 3.4 (P) 实现 CSV 术语 codec 与显式列选择
   - 严格读取 UTF-8/UTF-8-BOM CSV，以 header 名或零基索引选择两列，并支持显式 legacy 0/1 preset。
   - header、空行、缺列与空值产生结构化 warning/skipped；保留物理行 ordinal、接受顺序和重复 source。
   - descriptor 发布 CSV 自身 limits、issue allowlist 与 reader-only capability。
@@ -184,14 +184,14 @@
   - _Boundary: Termbase CSV Codec_
   - _Depends: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9_
 
-- [ ] 3.5 实现 XLSX 术语 codec 与 active-sheet 边界
+- [x] 3.5 实现 XLSX 术语 codec 与 active-sheet 边界
   - 在两层 preflight 通过后，以只读、data-only、禁 links/vba 的方式消费 active worksheet，并复用同一列选择与 row 语义。
   - 保持物理 row ordinal、warning/skipped、顺序和重复 source；报告 active-sheet-only capability，不聚合多 sheet。
   - descriptor 发布 XLSX limits、issue allowlist、条件依赖与 reader-only capability。
   - 完成时，安全 XLSX 与 CSV 列语义一致，危险或超限 workbook 在记录输出前失败。
   - _Requirements: 1.8, 2.2, 2.4, 5.5, 5.6, 5.7, 5.8, 5.9, 5.11, 5.12, 5.13, 8.1, 8.3, 9.4, 9.5, 10.7, 13.5_
 
-- [ ] 3.6 (P) 实现 TMX 安全 XML 流与 locale 选择
+- [x] 3.6 (P) 实现 TMX 安全 XML 流与 locale 选择
   - 在 sealed snapshot 上禁用 DTD/ENTITY/外部解析，按物理 TU 顺序迭代，并限制输入和单 segment 字符数。
   - 先做规范化 locale 精确匹配，再做无歧义 base fallback；malformed、无 TU 和输入级限制 fatal。
   - descriptor 发布 TMX v1 limits、issue allowlist 与 reader-only/streaming capability。
@@ -200,13 +200,13 @@
   - _Boundary: TMX Codec_
   - _Depends: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9_
 
-- [ ] 3.7 实现 TMX record 映射与 warning 语义
+- [x] 3.7 实现 TMX record 映射与 warning 语义
   - 对 inline XML、缺 pair、歧义 fallback 和超长 segment 发 record warning 并跳过，使用保留空洞的物理 TU ordinal 生成局部 ID。
   - 保持 accepted records 的顺序与同 source variants，不去重、不提交、不推断 CONTEXT/provenance。
   - 完成时，TMX golden 的 records、warnings、counts 和 terminal 与 resource policy 解耦且可重复。
   - _Requirements: 2.2, 2.4, 2.6, 5.2, 5.8, 5.9, 5.10, 9.2, 9.3_
 
-- [ ] 3.8 (P) 实现 normalized TM JSON 单输入 codec
+- [x] 3.8 (P) 实现 normalized TM JSON 单输入 codec
   - 严格接受 UTF-8 数组根，复用 JSON preflight，并按物理 array ordinal 保留接受顺序与 ID 空洞。
   - source/target trim 后非空；坏行和非字符串 speaker warning/skip，missing/null speaker 映射空 RawSpeaker；空有效结果 fatal。
   - descriptor 发布自身 limits、issue allowlist、reader-only/非 streaming capability，不写 JSONL。
@@ -215,7 +215,7 @@
   - _Boundary: Normalized TM JSON Codec_
   - _Depends: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.13_
 
-- [ ] 3.9 (P) 实现 gettext quoted-string 状态机
+- [x] 3.9 (P) 实现 gettext quoted-string 状态机
   - 统一解析 comments、msgctxt、msgid、msgstr、continuation 与合法 escapes，保留行位置并拒绝无效语法/转义。
   - 严格接受 UTF-8/UTF-8-BOM；header 只允许缺失 charset 或 UTF-8，其他 charset fatal。
   - descriptor 发布 PO/POT 各自 limits、issue allowlist 与 project-document reader-only capability。
@@ -224,7 +224,7 @@
   - _Boundary: Gettext Codec_
   - _Depends: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9_
 
-- [ ] 3.10 实现 gettext document 与 singular-profile 语义
+- [x] 3.10 实现 gettext document 与 singular-profile 语义
   - 把 singular entry 映射为有序 segment；空 msgid header 进入文档 metadata，comments/references/flags/previous value 保持不透明。
   - fuzzy 保留 target 并映射未确认，POT/未翻译 entry 保留 explicit empty target，plural 以 unsupported fatal 结束。
   - 使用输入位置确定性生成局部 ID，不解释 msgctxt 为 speaker 或 TM context。

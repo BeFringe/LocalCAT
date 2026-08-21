@@ -195,6 +195,7 @@ class SelectionContractTests(unittest.TestCase):
             ReadRequest,
             TermbaseColumnSelection,
             TermbaseReadOptions,
+            TmxReadOptions,
         )
 
         project = ReadRequest(
@@ -211,6 +212,16 @@ class SelectionContractTests(unittest.TestCase):
             termbase_options=termbase_options,
         )
         self.assertIs(termbase.termbase_options, termbase_options)
+        tmx_options = TmxReadOptions(
+            source_locale="en_US",
+            target_locale="zh-CN",
+        )
+        tmx = ReadRequest(
+            purpose=EffectivePurpose.TRANSLATION_MEMORY,
+            format_id=FormatId("tmx-level1-v1"),
+            tmx_options=tmx_options,
+        )
+        self.assertIs(tmx.tmx_options, tmx_options)
 
         cases = (
             (
@@ -234,6 +245,21 @@ class SelectionContractTests(unittest.TestCase):
                     "format_id": FormatId("tmx-level1-v1"),
                 },
                 "PARSER.SELECTION.UNSUPPORTED",
+            ),
+            (
+                {
+                    "purpose": EffectivePurpose.TRANSLATION_MEMORY,
+                    "format_id": FormatId("tmx-level1-v1"),
+                },
+                "PARSER.TMX.LOCALE_SELECTION_REQUIRED",
+            ),
+            (
+                {
+                    "purpose": EffectivePurpose.TRANSLATION_MEMORY,
+                    "format_id": FormatId("normalized-tm-json-v1"),
+                    "tmx_options": tmx_options,
+                },
+                "PARSER.TMX.LOCALE_SELECTION_NOT_APPLICABLE",
             ),
         )
         for kwargs, expected_code in cases:

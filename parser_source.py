@@ -330,6 +330,7 @@ class SealedSourceSnapshot:
     __slots__ = (
         "_temporary",
         "_limit_profile",
+        "_source_name_hint",
         "_active_leases",
         "_active_seekable",
         "_release_requested",
@@ -344,10 +345,14 @@ class SealedSourceSnapshot:
         *,
         identity: SourceSnapshotIdentity,
         limit_profile: LimitProfile,
+        source_name_hint: str,
     ) -> None:
         self._temporary = temporary
         self.identity = identity
         self._limit_profile = limit_profile
+        if type(source_name_hint) is not str or not source_name_hint:
+            raise ValueError("source_name_hint must be a non-empty exact string")
+        self._source_name_hint = source_name_hint
         self._active_leases = 0
         self._active_seekable = False
         self._release_requested = False
@@ -364,6 +369,10 @@ class SealedSourceSnapshot:
     @property
     def limit_profile(self) -> LimitProfile:
         return self._limit_profile
+
+    @property
+    def source_name_hint(self) -> str:
+        return self._source_name_hint
 
     @property
     def release_requested(self) -> bool:
@@ -480,6 +489,10 @@ class _SnapshotLeaseBase:
     @property
     def source_identity(self) -> SourceSnapshotIdentity:
         return self._snapshot.identity
+
+    @property
+    def source_name_hint(self) -> str:
+        return self._snapshot.source_name_hint
 
     @property
     def byte_count(self) -> int:
@@ -680,10 +693,12 @@ def create_sealed_snapshot(
                 byte_count=copied,
                 schema_version=_SNAPSHOT_SCHEMA_VERSION,
             )
+            source_name_hint = opened.relative_path.rsplit("/", 1)[-1]
         snapshot = SealedSourceSnapshot(
             temporary,
             identity=identity,
             limit_profile=limit_profile,
+            source_name_hint=source_name_hint,
         )
         temporary = None
         return snapshot
