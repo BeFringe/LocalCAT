@@ -4,7 +4,7 @@
 
 LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项目、精确 TM、Trie 术语、Feature 5 canonical retrieval，以及完成重新基线的单输入 Parser Foundation。Parser 已用 purpose-aware registry、rooted sealed snapshot、verified terminal 与八个内建用途/格式组合统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的语法权威；Application 继续拥有项目会话、batch policy 与资源事务。
 
-Parser 重新基线已经完成；常见多文档输入仍是同一项目中的多个 TXT、JSON 或 XLSX 文件，通常一个文件对应一章，它们必须等待 `Project → Document/Chapter → Segment` 多文档模型，不能继续扩充当前扁平 `EditorProject.segments`。单个 XLSX 内由多个 Sheet 分别承载章节属于特殊 workbook origin，也接入同一多文档模型。RPY 拆成两层：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出，可在 Parser Foundation 后由独立规格推进；把多个 RPY 或 workbook sheet 聚合成项目仍必须等待多文档模型。
+Parser 重新基线已经完成；常见多文档输入仍是同一项目中的多个 TXT、JSON 或 XLSX 文件，通常一个文件对应一章，它们必须等待 `Project → Document/Chapter → Segment` 多文档模型，不能继续扩充当前扁平 `EditorProject.segments`。单个 XLSX 内由多个 Sheet 分别承载章节属于特殊 workbook origin，也接入同一多文档模型。RPY 拆成两层：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出；该支线技术上消费 Parser plugin port 与多文档聚合，但产品排期置于跨设备同步主线之后。
 
 ## Approach Decision
 
@@ -64,11 +64,11 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
 - **Later**:
-  - 独立的单输入 RPY format-codec plugin / repository ACL；
   - 多文档/多章节项目工作区；
   - 同项目多 TXT / JSON / XLSX，以及特殊的多 Sheet workbook、RPY folder/workbook 集成与 XLIFF codec；
   - 可跨文档任意划分/合并的协作 chunk；
   - 仿 Remotely Save 的可选跨端同步插件；
+  - 独立的单输入 RPY format-codec plugin / repository ACL；
   - TMX context profile 和未来 TM Resource Editor。
 - **Out of the two active lanes**:
   - 机器翻译、云端、账号、多人协作、Docker 部署和共享资源；
@@ -122,10 +122,11 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 - [ ] `glossary-management` -- 启用每术语 Match Case / Whole Word、版本化记录与导入迁移。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `editor-search-preprocessing` -- 启用项目搜索 Match Case / Whole Word、扩展结果语义与大项目优化。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `speaker-display-profiles` -- 每项目 speaker 显示名/留空/头像。Dependencies: `qt-editor-json-mvp-increment`
-- [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；目录多文件项目接入另依赖 workspace。Dependencies: `parser-subsystem-extraction`（格式中立 plugin port）；`multi-document-project-workspace`（仅 folder/project 聚合）
 - [ ] `multi-document-project-workspace` -- Project/Document/Segment、章节导航、稳定复合 ID 和多文档保存报告。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
+- [ ] `language-resource-portability` -- TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/receipt 与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
 - [ ] `collaborative-job-chunks` -- 在不改变 Document 身份的前提下按稳定 segment 集合划分、合并和分配协作 chunk。Dependencies: `multi-document-project-workspace`
-- [ ] `cross-device-sync-plugin` -- 本地优先的可选同步插件边界、远程 provider、冲突保护与凭据安全。Dependencies: `multi-document-project-workspace`
+- [ ] `cross-device-sync-plugin` -- 本地优先的可选同步插件边界、远程 provider、冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`
+- [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；目录多文件项目另依赖 workspace，产品排期在同步之后。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `cross-device-sync-plugin`
 - [ ] `tmx-context-interchange` -- 经验证的 TMX props/context/provenance。Dependencies: `tm-storage-retrieval-index`
 - [ ] `xliff-project-codec` -- XLIFF 2.x Core 最小项目 codec。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`
 
