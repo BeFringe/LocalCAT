@@ -22,6 +22,7 @@ LOCALCAT_EXECUTABLE_NAME: Final = "LocalCAT"
 LOCALCAT_ICON_FILENAME: Final = "LocalCAT.icns"
 LOCALCAT_LAUNCHER_TEMPLATE_FILENAME: Final = "LocalCAT-launcher"
 LOCALCAT_SMOKE_MARKER_VERSION: Final = 1
+LOCALCAT_DIRECT_HANDOFF_VERSION: Final = 1
 
 _RENAME_SWAP: Final = 0x00000002
 
@@ -205,6 +206,7 @@ class MacOSAppLauncher:
             "CFBundleIdentifier": LOCALCAT_BUNDLE_IDENTIFIER,
             "CFBundlePackageType": "APPL",
             "CFBundleIconFile": LOCALCAT_ICON_FILENAME,
+            "LocalCATDirectHandoffVersion": LOCALCAT_DIRECT_HANDOFF_VERSION,
         }
         for key, value in expected.items():
             if info.get(key) != value:
@@ -279,6 +281,7 @@ class MacOSAppLauncher:
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
             "LocalCATBootstrapPath": str(bootstrap),
+            "LocalCATDirectHandoffVersion": LOCALCAT_DIRECT_HANDOFF_VERSION,
             "LocalCATPythonExecutable": str(python),
         }
         with (contents / "Info.plist").open("wb") as stream:

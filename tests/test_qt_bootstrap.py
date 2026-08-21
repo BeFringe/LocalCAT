@@ -34,7 +34,17 @@ class QtBootstrapTest(unittest.TestCase):
 
         self.assertLessEqual(
             top_level_imports,
-            {"__future__", "argparse", "os", "shutil", "subprocess", "sys", "pathlib"},
+            {
+                "__future__",
+                "argparse",
+                "os",
+                "pathlib",
+                "plistlib",
+                "shutil",
+                "stat",
+                "subprocess",
+                "sys",
+            },
         )
         source = (ROOT / "qt_editor.py").read_text(encoding="utf-8")
         self.assertNotIn("from qt_editor_window import", source.split("def main", 1)[0])
@@ -82,10 +92,16 @@ class QtBootstrapTest(unittest.TestCase):
         self.assertNotIn("Traceback", completed.stderr)
 
     def test_missing_openpyxl_only_returns_actionable_xlsx_error(self) -> None:
+        from tests.test_parser_xlsx_support import _archive_bytes
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / "terms.xlsx"
-            source.write_bytes(b"placeholder")
+            # A malformed placeholder now fails in the Parser's structural
+            # preflight before the optional dependency is consulted.  Use a
+            # valid, synthetic workbook so this test continues to isolate the
+            # missing-openpyxl branch it names.
+            source.write_bytes(_archive_bytes())
             target = root / "terms.csv"
             target.write_bytes(b"keep")
             original_import = builtins.__import__
@@ -184,6 +200,7 @@ class QtBootstrapTest(unittest.TestCase):
         )
         app.setWindowIcon(QIcon())
         captured: dict[str, QIcon] = {}
+        captured_identity: dict[str, str] = {}
 
         class CapturingWindow(QWidget):
             def __init__(self, _controller: object) -> None:
@@ -204,6 +221,12 @@ class QtBootstrapTest(unittest.TestCase):
                     QApplication,
                     current_app,
                 ).windowIcon()
+                captured_identity["application_name"] = (
+                    current_app.applicationName()
+                )
+                captured_identity["application_display_name"] = (
+                    current_app.applicationDisplayName()
+                )
                 captured["window"] = self.windowIcon()
                 captured["dialog"] = dialog.windowIcon()
 
@@ -230,6 +253,13 @@ class QtBootstrapTest(unittest.TestCase):
         ).toImage()
         self.assertEqual(exit_code, 0)
         start_validation.assert_called_once()
+        self.assertEqual(
+            captured_identity,
+            {
+                "application_name": "LocalCAT",
+                "application_display_name": "LocalCAT",
+            },
+        )
         self.assertEqual(set(captured), {"application", "window", "dialog"})
         for name, icon in captured.items():
             with self.subTest(name=name):

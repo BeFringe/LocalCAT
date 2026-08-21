@@ -270,6 +270,105 @@ class MacOSAppLauncherTests(unittest.TestCase):
             finally:
                 os.kill(process_id, signal.SIGTERM)
 
+    def test_native_launcher_accepts_one_process_scoped_checkout_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT direct handoff ") as temporary:
+            root = Path(temporary)
+            target = (root / "LocalCAT.app").resolve()
+            _ = self._launcher().build_bundle(
+                target,
+                Path(sys.executable).resolve(),
+                (ROOT / "qt_editor.py").resolve(),
+            )
+            marker = root / "handoff.json"
+            override = root / "override bootstrap.py"
+            override.write_text(
+                "import json, os, pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
+                "    'argv': sys.argv[2:],\n"
+                "    'native': os.environ.get('LOCALCAT_NATIVE_LAUNCH'),\n"
+                "    'python_override': os.environ.get('LOCALCAT_DIRECT_PYTHON'),\n"
+                "    'bootstrap_override': os.environ.get('LOCALCAT_DIRECT_BOOTSTRAP'),\n"
+                "}), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    str(target / "Contents" / "MacOS" / "LocalCAT"),
+                    "--localcat-direct-python",
+                    str(Path(sys.executable).resolve()),
+                    "--localcat-direct-bootstrap",
+                    str(override.resolve()),
+                    str(marker),
+                    "--from-current-worktree",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                json.loads(marker.read_text(encoding="utf-8")),
+                {
+                    "argv": ["--from-current-worktree"],
+                    "bootstrap_override": None,
+                    "native": "1",
+                    "python_override": None,
+                },
+            )
+
+    def test_direct_python_launch_hands_off_to_compatible_native_bundle(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT handoff bundle ") as temporary:
+            root = Path(temporary)
+            bundle = root / "LocalCAT.app"
+            executable = bundle / "Contents" / "MacOS" / "LocalCAT"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"native launcher")
+            executable.chmod(0o755)
+            with (bundle / "Contents" / "Info.plist").open("wb") as stream:
+                plistlib.dump(
+                    {
+                        "CFBundleDisplayName": "LocalCAT",
+                        "CFBundleExecutable": "LocalCAT",
+                        "CFBundleIdentifier": LOCALCAT_BUNDLE_IDENTIFIER,
+                        "LocalCATDirectHandoffVersion": 1,
+                    },
+                    stream,
+                )
+
+            with (
+                patch.object(
+                    qt_editor,
+                    "_macos_bundle_candidates",
+                    return_value=(bundle,),
+                ),
+                patch("qt_editor.os.execve") as execve,
+            ):
+                qt_editor._handoff_to_macos_native_launcher(
+                    ("--project", "chapter.json")
+                )
+
+            execve.assert_called_once()
+            called_executable, called_argv, called_environment = execve.call_args.args
+            self.assertEqual(called_executable, "/usr/bin/open")
+            self.assertEqual(
+                called_argv,
+                [
+                    "/usr/bin/open",
+                    "-W",
+                    str(bundle),
+                    "--args",
+                    "--localcat-direct-python",
+                    str(Path(sys.executable).resolve()),
+                    "--localcat-direct-bootstrap",
+                    str(Path(qt_editor.__file__).resolve()),
+                    "--project",
+                    "chapter.json",
+                ],
+            )
+            self.assertNotIn("LOCALCAT_DIRECT_BOOTSTRAP", called_environment)
+            self.assertNotIn("LOCALCAT_DIRECT_PYTHON", called_environment)
+
     def test_rejects_non_app_targets_and_tampered_bundle_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
