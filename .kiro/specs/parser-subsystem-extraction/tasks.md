@@ -63,92 +63,92 @@
   - 完成时，后续每波迁移都能检测第二 parser、反向依赖或延期 Feature 越界。
   - _Requirements: 2.7, 2.8, 11.1, 11.4, 11.5, 11.6, 11.7, 11.8, 13.1, 13.2, 13.4, 13.5, 13.6, 15.4, 15.6, 15.7_
 
-- [ ] 2. Wave 1：实现中立 Parser Foundation
-- [ ] 2.1 冻结用途、格式选择与读取请求合同
+- [x] 2. Wave 1：实现中立 Parser Foundation
+- [x] 2.1 冻结用途、格式选择与读取请求合同
   - 实现三个闭合用途、八个稳定格式标识、有界 hints、显式术语列选择与结构化 selection failure。
   - 校验 header-name/index selector、header policy、purpose/format/options 组合，不允许隐式用途或术语列默认。
   - 完成时，所有读取请求在消费输入记录前得到唯一且可验证的选择结果。
   - _Requirements: 1.1, 1.2, 1.3, 1.5, 1.8, 1.9, 5.11, 5.12, 5.13_
 
-- [ ] 2.2 实现单输入中立记录与 canonical write DTO
+- [x] 2.2 实现单输入中立记录与 canonical write DTO
   - 实现 ParsedDocument、ParsedSegment、ResourceRecord、target presence、translation state、RawSpeaker、metadata 与局部 ID 不变量。
   - 实现不依赖 EditorProject 的 canonical document write 表示，并保持一个输入内顺序与身份边界。
   - 完成时，中立对象不导入编辑器、Engine 或 Store 类型，且非法组合在构造边界确定性失败。
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 3.8, 12.1, 12.2, 12.3, 12.4, 12.5, 13.1_
 
-- [ ] 2.3 实现 capability 与 opaque round-trip token 合同
+- [x] 2.3 实现 capability 与 opaque round-trip token 合同
   - 区分 reader、validator、canonical write、source round-trip write、streaming、iterator、materialized 和格式 profile 能力。
   - 让 opaque token 绑定 provider/codec identity、版本、source fingerprint、format-state fingerprint 与不可解释 payload。
   - 完成时，foreign、stale、缺失或版本不兼容 token 均在打开写目标前结构化失败，Core 不解释 payload。
   - _Requirements: 2.8, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 11.7, 11.8_
 
-- [ ] 2.4 实现限制、诊断、验证报告与成功终态合同
+- [x] 2.4 实现限制、诊断、验证报告与成功终态合同
   - 实现不可变 LimitProfile、有限 issue-code namespace、结构化 ParseIssue、确定性计数与截断状态。
   - 冻结 ValidationReport 和仅由 Foundation 签发的 TerminalSuccess 形状、invariants 与 snapshot/codec/profile 绑定。
   - 完成时，合同层可拒绝无界 metadata、未知 issue code、fatal success 或矛盾计数，且诊断不携正文。
   - _Requirements: 6.1, 6.2, 6.5, 7.3, 8.1, 8.3, 8.4, 9.3_
 
-- [ ] 2.5 实现 rooted regular-file opener
+- [x] 2.5 实现 rooted regular-file opener
   - 从调用方 safe root 逐 component no-follow 打开目标，并证明最终对象为 root 内的 regular file。
   - 平台无法建立等价 rooted handle 时 fail closed，不回退到先 resolve 再普通 pathname open。
   - 完成时，outside-root、symlink/reparse、non-regular 与 read failure 均在消费内容前结构化失败。
   - _Requirements: 6.6, 9.6, 9.7_
 
-- [ ] 2.6 实现 sealed snapshot copy、fingerprint 与封存
+- [x] 2.6 实现 sealed snapshot copy、fingerprint 与封存
   - 从已绑定 descriptor 单次复制实际解析字节，在输入上限内同步计算 digest，并在复制前后核对 fstat 稳定性。
   - 私有 snapshot 完整 flush 后封存，codec 不能按 pathname 重开 snapshot 或原文件。
   - 完成时，并发变化不产生记录，snapshot identity 与实际解析 bytes 的 digest/byte count 一致。
   - _Requirements: 6.3, 6.4, 9.6_
 
-- [ ] 2.7 实现 snapshot lease、stale 与取消原语
+- [x] 2.7 实现 snapshot lease、stale 与取消原语
   - 为每次 validation/parse pass 签发绑定同一 sealed bytes 的 offset-0 cursor lease；XLSX 使用单活跃 seekable lease。
   - 在 bounded byte/record 边界传播取消，并在 snapshot 已释放时用 digest/profile 比较阻止 stale parse。
   - 完成时，重复 pass 不重读原路径，取消或 stale 均无 TerminalSuccess 且能安全清理所有 lease。
   - _Requirements: 6.3, 6.4, 7.2, 8.2, 9.6_
 
-- [ ] 2.8 实现 Foundation-owned guarded parse session
+- [x] 2.8 实现 Foundation-owned guarded parse session
   - 只接受 codec raw events，并校验 header cardinality、用途对应的 event kind、局部 ID 唯一性、limits、counts 与真实 EOF。
   - raw codec 不得发布可提交终态；wrapper 只在自然 EOF、完整消费和 fatal_count 为零后单次签发成功终态。
   - 完成时，伪造 terminal、terminal 后事件、fatal tail、early close 与 consumer exception 都不能授权 commit。
   - _Requirements: 2.4, 7.1, 7.2, 7.3, 8.3_
 
-- [ ] 2.9 让 validation、iterator 与 materialized view 共用唯一 grammar
+- [x] 2.9 让 validation、iterator 与 materialized view 共用唯一 grammar
   - validation 和 materialization 都消费 guarded raw stream，不允许 codec 实现第二套 validator。
   - materialized helper 在 profile 上限内保留 records、issues、顺序与终态等价；超限返回稳定 fatal。
   - 完成时，同一 sealed snapshot 的三个视图具有可比较的结果，只有 verified terminal 能产生 SUCCESS report。
   - _Requirements: 6.1, 6.3, 6.4, 6.5, 7.7, 8.1, 8.3, 8.4, 14.4_
 
-- [ ] 2.10 实现用途感知 registry
+- [x] 2.10 实现用途感知 registry
   - 以 `(EffectivePurpose, FormatId)` 为唯一键注册不可变 descriptor，并支持有界 hint 缩小与 supported-combination 报告。
   - 重复键、用途不兼容、capability 不匹配和无兼容 codec 均确定性拒绝，注册顺序不改变结果。
   - 完成时，非继承实现可按行为合同注册，且 registry 不导入任何具体 codec。
   - _Requirements: 1.1, 1.3, 1.4, 1.5, 1.9, 11.4, 11.6_
 
-- [ ] 2.11 实现外部 provider port 与空 composition seam
+- [x] 2.11 实现外部 provider port 与空 composition seam
   - 定义显式 provider 注册协议、版本兼容和 missing/disabled 失败，不做动态扫描或 Core fallback。
   - composition seam 此时只接收 descriptor/provider；内建 codec 等其实现完成后再统一注册。
   - 完成时，模拟 plugin 可仅凭中立合同注册和返回 opaque capability，私有 token/sidecar 类型不进入 Core。
   - _Requirements: 2.8, 10.4, 10.5, 11.4, 11.7, 11.8_
 
-- [ ] 2.12 实现格式中立的原子 byte target writer
+- [x] 2.12 实现格式中立的原子 byte target writer
   - 在已绑定 target parent 内创建独占临时对象，完成 flush/fsync、验证和原子 replace 后才签发 WriteReceipt。
   - writer 只接受已序列化 canonical bytes，不拥有 LocalCAT schema 或 EditorProject 映射。
   - 完成时，任一注入失败都保留原目标字节且无 receipt，成功 receipt 绑定目标 identity 与 digest。
   - _Requirements: 3.9, 9.6, 10.2, 10.6_
 
-- [ ] 2.13 实现共享的 bounded JSON lexical preflight
+- [x] 2.13 实现共享的 bounded JSON lexical preflight
   - 在标准库 materialization 前验证完整输入、字符串边界、结构深度、编码与 profile 限制。
   - 只提供 JSON 词法/结构安全，不解释 LocalCAT 或 normalized TM 字段语义。
   - 完成时，两类 JSON codec 可复用同一 preflight，并对截断、深度、超限和无效编码返回稳定 fatal。
   - _Requirements: 8.1, 8.3, 9.1, 9.2, 9.3_
 
-- [ ] 2.14 实现 XLSX archive 资源 preflight
+- [x] 2.14 实现 XLSX archive 资源 preflight
   - 在 openpyxl 前枚举 archive members，限制 member 数、总展开字节与压缩比，并拒绝异常 ZIP 结构。
   - 不执行 macro、formula、external link 或 embedded object，只允许后续以 data-only 读取 cell value。
   - 完成时，archive 配额越界在 workbook 打开前以稳定 limit code 失败。
   - _Requirements: 8.1, 8.3, 9.5_
 
-- [ ] 2.15 实现 XLSX OPC XML 安全 preflight
+- [x] 2.15 实现 XLSX OPC XML 安全 preflight
   - 枚举并检查每个 OPC XML member 的 bounded well-formedness，禁用参数实体并在 DTD、ENTITY 或 external entity callback 出现时 fail closed。
   - 该检查不依赖 openpyxl 环境是否启用 defusedxml，也不把 keep_links 当成 XML 安全替代。
   - 完成时，包含内部或外部实体的 workbook 在 openpyxl 之前失败，安全 workbook 保持可读。
