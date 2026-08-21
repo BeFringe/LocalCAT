@@ -1,0 +1,282 @@
+"""Wave 2 unit guards for the SQLite candidate read data plane."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+import sqlite3
+import unittest
+
+import tm_sqlite_candidate_projection as projection
+from tm_candidate_store_contracts import (
+    SQLiteCandidateProofBlock,
+    SQLiteStoreSchemaError,
+)
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        "CREATE TABLE tm_record ("
+        "record_id INTEGER PRIMARY KEY, source_fold_v1 TEXT NOT NULL, "
+        "source_fold_length INTEGER NOT NULL);"
+        "CREATE TABLE tm_gram ("
+        "record_id INTEGER NOT NULL, gram_size INTEGER NOT NULL, "
+        "gram TEXT NOT NULL, term_frequency INTEGER NOT NULL);"
+        "CREATE TABLE tm_gram_block_max ("
+        "block_id INTEGER NOT NULL, gram_size INTEGER NOT NULL, "
+        "gram TEXT NOT NULL, max_term_frequency INTEGER NOT NULL);"
+        "CREATE TABLE tm_candidate_block ("
+        "block_id INTEGER PRIMARY KEY, first_record_id INTEGER NOT NULL, "
+        "last_record_id INTEGER NOT NULL, record_count INTEGER NOT NULL, "
+        "min_source_fold_length INTEGER NOT NULL, "
+        "max_source_fold_length INTEGER NOT NULL);"
+    )
+    connection.executemany(
+        "INSERT INTO tm_record VALUES (?, ?, ?)",
+        ((1, "aba", 3), (2, "abb", 3)),
+    )
+    grams = (
+        (1, 1, "a", 2),
+        (1, 1, "b", 1),
+        (1, 2, "ab", 1),
+        (1, 2, "ba", 1),
+        (1, 3, "aba", 1),
+        (2, 1, "a", 1),
+        (2, 1, "b", 2),
+        (2, 2, "ab", 1),
+        (2, 2, "bb", 1),
+        (2, 3, "abb", 1),
+    )
+    connection.executemany("INSERT INTO tm_gram VALUES (?, ?, ?, ?)", grams)
+    maxima: dict[tuple[int, str], int] = {}
+    for _record_id, gram_size, gram, frequency in grams:
+        key = (gram_size, gram)
+        maxima[key] = max(maxima.get(key, 0), frequency)
+    connection.executemany(
+        "INSERT INTO tm_gram_block_max VALUES (0, ?, ?, ?)",
+        tuple((size, gram, frequency) for (size, gram), frequency in maxima.items()),
+    )
+    connection.execute(
+        "INSERT INTO tm_candidate_block VALUES (0, 1, 256, 2, 3, 3)"
+    )
+    connection.commit()
+    return connection
+
+
+class CandidateProjectionArchitectureTests(unittest.TestCase):
+    def test_imports_and_executable_calls_stay_inside_the_data_plane(self) -> None:
+        source = (_ROOT / "tm_sqlite_candidate_projection.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        imports: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split(".", 1)[0])
+        self.assertEqual(
+            imports,
+            {
+                "__future__",
+                "collections",
+                "hashlib",
+                "json",
+                "sqlite3",
+                "tm_candidate_store_contracts",
+            },
+        )
+        calls = {
+            ast.unparse(node.func)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        }
+        self.assertNotIn("sqlite3.connect", calls)
+        self.assertFalse(
+            {
+                call
+                for call in calls
+                if call.endswith((".connect", ".commit", ".rollback"))
+            }
+        )
+        transaction_sql = {
+            node.value.strip().upper()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and type(node.value) is str
+            if node.value.strip().upper()
+            in {"BEGIN", "BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"}
+        }
+        self.assertEqual(transaction_sql, set())
+        self.assertNotIn("tm_contracts", source)
+        self.assertNotIn("coordinator", source)
+
+    def test_projection_defines_no_authority_or_intermediate_dto_class(self) -> None:
+        source = (_ROOT / "tm_sqlite_candidate_projection.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        self.assertEqual(
+            tuple(node.name for node in tree.body if isinstance(node, ast.ClassDef)),
+            (),
+        )
+        self.assertNotIn("SQLiteCandidateRecallSnapshot", source)
+        self.assertNotIn("SQLiteCandidateProofSnapshot", source)
+        self.assertNotIn("receipt", source)
+        self.assertNotIn("binding_digest", source)
+
+
+class CandidateProjectionReadTests(unittest.TestCase):
+    def test_fts5_single_and_chunked_union_queries_return_sorted_ids(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE VIRTUAL TABLE tm_fts USING fts5("
+            "record_id UNINDEXED, source_fold_v1, tokenize='trigram')"
+        )
+        connection.executemany(
+            "INSERT INTO tm_fts(record_id, source_fold_v1) VALUES (?, ?)",
+            ((2, "abcxyz"), (1, "abcdef"), (3, "defghi")),
+        )
+        self.assertEqual(
+            projection.fts5_candidate_ids(connection, '"abc"'),
+            (1, 2),
+        )
+        self.assertEqual(
+            projection.fts5_candidate_ids_for_trigrams(
+                connection, ("abc", "def")
+            ),
+            (1, 2, 3),
+        )
+
+    def test_fallback_recall_overlap_and_transaction_authority(self) -> None:
+        connection = _connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO tm_record VALUES (3, 'sentinel', 8)"
+        )
+        self.assertTrue(connection.in_transaction)
+
+        overlaps = projection.gram_candidate_overlaps(
+            connection,
+            ((1, "a"), (1, "b"), (2, "ab")),
+            candidate_cap=2,
+        )
+        stage_matches, folded_sources = projection.candidate_recall_snapshot(
+            connection,
+            fts5_available=False,
+            fts_query_trigrams=("aba",),
+            query_grams_by_size=((3, ("aba",)), (2, ("ab", "ba")), (1, ("a", "b"))),
+            candidate_floor=2,
+            fts_query_degenerate=False,
+        )
+
+        self.assertEqual(overlaps, ((1, 3), (2, 3)))
+        self.assertEqual(
+            stage_matches,
+            (
+                ("GRAM_3", ((1, 1),)),
+                ("GRAM_2", ((1, 2), (2, 1))),
+                ("GRAM_1", ((1, 2), (2, 2))),
+            ),
+        )
+        self.assertEqual(set(folded_sources), {(1, "aba"), (2, "abb")})
+        self.assertTrue(connection.in_transaction)
+        connection.rollback()
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM tm_record").fetchone(),
+            (2,),
+        )
+
+    def test_proof_snapshot_sparse_and_dense_rows_match_existing_facts(self) -> None:
+        connection = _connection()
+        self.addCleanup(connection.close)
+        seed_stages, blocks, query_maxima_digest = (
+            projection.candidate_proof_snapshot(
+                connection,
+                folded_query="aba",
+                seed_limit=8,
+                fts5_available=False,
+                total_record_count=2,
+            )
+        )
+        block = blocks[0]
+        records = projection.candidate_proof_block_records(
+            connection,
+            folded_query="aba",
+            block=block,
+            total_record_count=2,
+        )
+        projection.validate_candidate_proof_blocks(
+            connection,
+            blocks=blocks,
+            query_maxima_digest=query_maxima_digest,
+        )
+        phase1 = projection.candidate_proof_dense_phase1(
+            connection,
+            folded_query="aba",
+            blocks=blocks,
+            total_record_count=2,
+        )
+        phase2 = projection.candidate_proof_dense_phase2(
+            connection,
+            total_record_count=2,
+            record_ids=(2,),
+            source_fold_lengths=(3,),
+        )
+
+        self.assertEqual(seed_stages[0], ("GRAM_3", (1,)))
+        self.assertEqual(
+            (block.character_intersection_upper, block.bigram_intersection_upper),
+            (3, 2),
+        )
+        self.assertEqual(
+            tuple(
+                (
+                    record.record_id,
+                    record.character_multiset_intersection,
+                    record.bigram_multiset_intersection,
+                )
+                for record in records
+            ),
+            ((1, 3, 2), (2, 2, 1)),
+        )
+        self.assertEqual(phase1, ((3, 3), (2, 1)))
+        self.assertEqual(phase2, ((2,), ("abb",), (3,)))
+
+    def test_stable_invalid_row_codes_and_programmer_fault_propagate(self) -> None:
+        class Cursor:
+            def fetchall(self) -> list[tuple[object, ...]]:
+                return [("not-an-id",)]
+
+        class InvalidRows:
+            def execute(self, *_args: object) -> Cursor:
+                return Cursor()
+
+        with self.assertRaisesRegex(
+            SQLiteStoreSchemaError, "STORE.FTS5_RESULT_INVALID"
+        ):
+            projection.fts5_candidate_ids(InvalidRows(), '"abc"')  # type: ignore[arg-type]
+
+        class SentinelError(RuntimeError):
+            pass
+
+        sentinel = SentinelError("programmer fault")
+
+        class HostileConnection:
+            def execute(self, *_args: object) -> None:
+                raise sentinel
+
+        with self.assertRaises(SentinelError) as raised:
+            projection.fts5_candidate_ids(
+                HostileConnection(),  # type: ignore[arg-type]
+                '"abc"',
+            )
+        self.assertIs(raised.exception, sentinel)
+
+
+if __name__ == "__main__":
+    unittest.main()

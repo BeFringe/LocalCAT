@@ -82,25 +82,25 @@ Wave 0 治理与 characterization
 
 ## Wave 2：SQLite Candidate 读数据面
 
-- [ ] 3.1 提取 recall / FTS5 / fallback 查询数据面
+- [x] 3.1 提取 recall / FTS5 / fallback 查询数据面
   - 移动 recall input SQL、stage rows、folded-source decode 到 `tm_sqlite_candidate_projection.py`。
   - store/view 保留 lifetime、connection、read transaction、identity/head/count 与 error mapping。
   - FTS5 unavailable/degenerate、GRAM_1/2/3、ordering/cap exact 等价。
   - _Requirements: 1.1–1.4, 4.1–4.5_
 
-- [ ] 3.2 提取 proof snapshot / block / maxima 数据面
+- [x] 3.2 提取 proof snapshot / block / maxima 数据面
   - 移动 seed stages、block/maxima digest、sparse records SQL 与 row decoding。
   - generation/head/count 的授权判断仍由 store 入口完成。
   - stale/invalid/query-failed stable code 与 rollback 保持。
   - _Requirements: 4.1–4.5, 6.1–6.5_
 
-- [ ] 3.3 提取 dense phase 1/2 数据面
+- [x] 3.3 提取 dense phase 1/2 数据面
   - 移动 length/bigram 与 ordered folded-source projection SQL。
   - 保持 opaque receipt/binding、U1/U2/U3/U4 与 P1/P2/P3 不变量。
   - dense/sparse/frontier/scorer invocation exact equivalence。
   - _Requirements: 3.3–3.4, 4.1–4.5_
 
-- [ ] 3.4 保留 read fault seams 与 closed-world SQL owner
+- [x] 3.4 保留 read fault seams 与 closed-world SQL owner
   - 既有 store private patch target继续 late-bound 委托 projection。
   - projection 禁止 connect/commit/rollback/coordinator/import store。
   - AST/mutation test 证明 recall/proof SQL 只在 projection 存在。
