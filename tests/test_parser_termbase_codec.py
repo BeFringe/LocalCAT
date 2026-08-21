@@ -119,6 +119,27 @@ class _ParserFixture(unittest.TestCase):
         finally:
             snapshot.close()
 
+    def _preview(self, *, descriptor, codec, name: str, payload: bytes):
+        from parser_contracts import TermbaseColumnPreviewRequest
+        from parser_source import create_sealed_snapshot
+
+        snapshot = create_sealed_snapshot(
+            self._input(name, payload),
+            limit_profile=descriptor.limit_profile,
+        )
+        lease = snapshot.lease(descriptor)
+        try:
+            return codec.preview_columns(
+                lease,
+                TermbaseColumnPreviewRequest(
+                    purpose=descriptor.purpose,
+                    format_id=descriptor.format_id,
+                ),
+            )
+        finally:
+            lease.close()
+            snapshot.close()
+
 
 class TermbaseCodecContractTests(unittest.TestCase):
     def test_descriptors_publish_distinct_frozen_term_profiles(self) -> None:
@@ -162,6 +183,7 @@ class TermbaseCodecContractTests(unittest.TestCase):
             self.assertTrue(descriptor.capabilities.readable)
             self.assertTrue(descriptor.capabilities.validatable)
             self.assertFalse(descriptor.capabilities.source_round_trip_write)
+            self.assertTrue(descriptor.capabilities.termbase_column_preview)
             self.assertIsNone(descriptor.canonical_serializer_factory)
             self.assertEqual(
                 descriptor.declared_issue_codes,
@@ -240,6 +262,48 @@ class CsvTermbaseCodecTests(_ParserFixture):
                     tuple((issue.code, issue.record_number) for issue in result.issues),
                     expected_issues,
                 )
+
+    def test_preview_uses_first_logical_record_and_bounds_columns_and_labels(self) -> None:
+        from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
+
+        long_header = "L" * 300
+        fields = ['"Source\ncontinued"', "Target", long_header]
+        fields.extend(f"column-{index}" for index in range(3, 257))
+        payload = (",".join(fields) + "\nAlpha,Beta\n").encode("utf-8")
+        preview = self._preview(
+            descriptor=TERMBASE_CSV_DESCRIPTOR,
+            codec=CsvTermbaseCodec(),
+            name="preview.csv",
+            payload=payload,
+        )
+
+        self.assertEqual(preview.total_column_count, 257)
+        self.assertEqual(len(preview.columns), 256)
+        self.assertTrue(preview.columns_truncated)
+        self.assertEqual(preview.columns[0].header_candidate, "Source\ncontinued")
+        self.assertEqual(preview.columns[2].header_candidate, "L" * 256)
+        self.assertEqual(preview.columns[2].header_original_char_count, 300)
+        self.assertTrue(preview.columns[2].header_truncated)
+        self.assertEqual(preview.source.content_sha256, preview.source.content_sha256)
+
+    def test_preview_empty_and_invalid_encoding_fail_with_stable_codes(self) -> None:
+        from parser_source import ParserSourceError
+        from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
+
+        cases = (
+            ("empty.csv", b"", "PARSER.TERMBASE.PREVIEW_EMPTY"),
+            ("bad.csv", b"Source,Target\n\xff", "PARSER.SOURCE.ENCODING_FAILED"),
+        )
+        for name, payload, expected in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(ParserSourceError) as caught:
+                    self._preview(
+                        descriptor=TERMBASE_CSV_DESCRIPTOR,
+                        codec=CsvTermbaseCodec(),
+                        name=name,
+                        payload=payload,
+                    )
+                self.assertEqual(caught.exception.code, expected)
 
     def test_first_row_header_skip_warning_is_body_safe_and_nonfatal(self) -> None:
         from parser_contracts import IssueSeverity
@@ -694,6 +758,36 @@ class CsvTermbaseCodecTests(_ParserFixture):
 
 
 class XlsxTermbaseCodecTests(_ParserFixture):
+    def test_preview_reads_only_active_first_row_after_preflight(self) -> None:
+        import openpyxl
+
+        from parser_termbase_codec import TERMBASE_XLSX_DESCRIPTOR, XlsxTermbaseCodec
+
+        workbook = openpyxl.Workbook()
+        active = workbook.active
+        active.title = "Chapter Terms"
+        active.append(("Source", "Target"))
+        active.cell(row=2, column=26, value="later width")
+        hidden = workbook.create_sheet("Not active")
+        hidden.append(("Wrong", "Columns", "Must not aggregate"))
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        workbook.close()
+
+        preview = self._preview(
+            descriptor=TERMBASE_XLSX_DESCRIPTOR,
+            codec=XlsxTermbaseCodec(),
+            name="preview.xlsx",
+            payload=buffer.getvalue(),
+        )
+        self.assertEqual(preview.active_sheet_name, "Chapter Terms")
+        self.assertEqual(preview.total_column_count, 2)
+        self.assertEqual(
+            tuple(column.header_candidate for column in preview.columns),
+            ("Source", "Target"),
+        )
+        self.assertTrue(preview.legacy_header_detected)
+
     def test_real_preflight_projects_descriptor_limits_and_active_sheet_only(self) -> None:
         import parser_termbase_codec as codec_module
         from parser_termbase_codec import XlsxTermbaseCodec, TERMBASE_XLSX_DESCRIPTOR

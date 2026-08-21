@@ -39,6 +39,7 @@ from parser_contracts import (
     SourceReference,
     TERMBASE_CSV_V1,
     TERMBASE_XLSX_V1,
+    TermbaseColumnPreviewRequest,
     TMX_LEVEL1_V1,
     TargetReference,
     builtin_purpose_for_format,
@@ -521,6 +522,94 @@ class ParserApplicationSurfaceTests(unittest.TestCase):
         self.assertEqual(report.source, opened.source_identity)
         self.assertEqual(materialized.terminal.source, opened.source_identity)
         self.assertEqual(len(materialized.records), 2)
+
+    def test_termbase_preview_is_codec_owned_and_snapshot_bound(self) -> None:
+        payload = b"Source,Target,Notes\nAlpha,Beta,ignored\n"
+        preview = self.surface.preview_termbase_columns(
+            self._source_reference("terms.csv", payload),
+            SelectionRequest(
+                EffectivePurpose.TERMBASE,
+                format_id=TERMBASE_CSV_V1,
+            ),
+            TermbaseColumnPreviewRequest(
+                EffectivePurpose.TERMBASE,
+                TERMBASE_CSV_V1,
+            ),
+        )
+
+        self.assertEqual(preview.source.content_sha256, hashlib.sha256(payload).hexdigest())
+        self.assertEqual(preview.format_id, TERMBASE_CSV_V1)
+        self.assertEqual(
+            tuple(column.header_candidate for column in preview.columns),
+            ("Source", "Target", "Notes"),
+        )
+        self.assertTrue(preview.legacy_header_detected)
+
+    def test_preview_capability_and_request_mismatch_fail_before_source_open(self) -> None:
+        missing = SourceReference(
+            str(self.root),
+            str(self.root / "missing.json"),
+            "missing.json",
+        )
+        with self.assertRaises(ContractViolation) as unsupported:
+            self.surface.preview_termbase_columns(
+                missing,
+                SelectionRequest(
+                    EffectivePurpose.PROJECT_DOCUMENT,
+                    format_id=LOCALCAT_JSON_V1,
+                ),
+                TermbaseColumnPreviewRequest(
+                    EffectivePurpose.TERMBASE,
+                    TERMBASE_CSV_V1,
+                ),
+            )
+        self.assertEqual(unsupported.exception.code, "PARSER.SELECTION.UNSUPPORTED")
+        self.assertFalse((self.root / "missing.json").exists())
+
+        plugin_format = FormatId("plugin-termbase")
+        plugin_descriptor = _descriptor(
+            "plugin-termbase",
+            purpose=EffectivePurpose.TERMBASE,
+            format_id=plugin_format,
+            provider_id="plugin.termbase",
+            extensions=(".terms",),
+        )
+        plugin_surface = create_parser_application_surface(
+            providers=(
+                ProviderBinding(
+                    provider_id="plugin.termbase",
+                    provider=_Provider(
+                        "plugin.termbase",
+                        "1",
+                        (plugin_descriptor,),
+                    ),
+                    enabled=True,
+                    compatible_versions=("1",),
+                ),
+            )
+        )
+        missing_plugin = SourceReference(
+            str(self.root),
+            str(self.root / "missing.terms"),
+            "missing.terms",
+        )
+        with self.assertRaises(ContractViolation) as no_preview:
+            plugin_surface.preview_termbase_columns(
+                missing_plugin,
+                SelectionRequest(
+                    EffectivePurpose.TERMBASE,
+                    format_id=plugin_format,
+                ),
+                TermbaseColumnPreviewRequest(
+                    EffectivePurpose.TERMBASE,
+                    plugin_format,
+                ),
+            )
+        self.assertEqual(
+            no_preview.exception.code,
+            "PARSER.CAPABILITY.PREVIEW_UNSUPPORTED",
+        )
+        self.assertFalse((self.root / "missing.terms").exists())
 
     def test_selection_failure_occurs_before_source_snapshot_open(self) -> None:
         reference = SourceReference(

@@ -24,6 +24,9 @@ from parser_contracts import (
     SeekableInputPreflightCodec,
     SnapshotCursorLease,
     SupportedCombination,
+    TermbaseColumnPreview,
+    TermbaseColumnPreviewCodec,
+    TermbaseColumnPreviewRequest,
     builtin_purpose_for_format,
 )
 
@@ -115,6 +118,57 @@ class _PinnedSeekablePreflightReader(_PinnedRawReader):
         request: ReadRequest,
     ) -> None:
         self._preflight_input(source, request)
+
+
+class _PinnedTermbasePreviewReader(_PinnedRawReader):
+    """Pinned reader carrying the selected codec's bounded preview behavior."""
+
+    __slots__ = ("_preview_columns",)
+
+    def __init__(
+        self,
+        descriptor: CodecDescriptor,
+        iter_raw: Callable[[SnapshotCursorLease, ReadRequest], Iterator[RawParseEvent]],
+        preview_columns: Callable[
+            [SnapshotCursorLease, TermbaseColumnPreviewRequest],
+            TermbaseColumnPreview,
+        ],
+    ) -> None:
+        super().__init__(descriptor, iter_raw)
+        object.__setattr__(self, "_preview_columns", preview_columns)
+
+    def preview_columns(
+        self,
+        source: SnapshotCursorLease,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview:
+        return self._preview_columns(source, request)
+
+
+class _PinnedSeekableTermbasePreviewReader(_PinnedSeekablePreflightReader):
+    """Pinned XLSX reader carrying structural preflight and bounded preview."""
+
+    __slots__ = ("_preview_columns",)
+
+    def __init__(
+        self,
+        descriptor: CodecDescriptor,
+        iter_raw: Callable[[SnapshotCursorLease, ReadRequest], Iterator[RawParseEvent]],
+        preflight_input: Callable[[SnapshotCursorLease, ReadRequest], None],
+        preview_columns: Callable[
+            [SnapshotCursorLease, TermbaseColumnPreviewRequest],
+            TermbaseColumnPreview,
+        ],
+    ) -> None:
+        super().__init__(descriptor, iter_raw, preflight_input)
+        object.__setattr__(self, "_preview_columns", preview_columns)
+
+    def preview_columns(
+        self,
+        source: SnapshotCursorLease,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview:
+        return self._preview_columns(source, request)
 
 
 class ParserRegistry:
@@ -309,6 +363,21 @@ class ParserRegistry:
                 "PARSER.SELECTION.FACTORY_MISMATCH",
                 "reader factory product does not match its registered descriptor contract",
             )
+        preview_columns = None
+        if descriptor.capabilities.termbase_column_preview:
+            try:
+                preview_columns = reader.preview_columns
+                preview_matches = isinstance(reader, TermbaseColumnPreviewCodec)
+            except Exception:
+                raise RegistryConfigurationError(
+                    "PARSER.SELECTION.FACTORY_MISMATCH",
+                    "reader factory product lacks its declared column preview behavior",
+                ) from None
+            if not preview_matches or not callable(preview_columns):
+                raise RegistryConfigurationError(
+                    "PARSER.SELECTION.FACTORY_MISMATCH",
+                    "reader factory product lacks its declared column preview behavior",
+                )
         if (
             descriptor.input_consumption_policy
             is InputConsumptionPolicy.XLSX_PREFLIGHT_ACTIVE_SHEET
@@ -326,11 +395,16 @@ class ParserRegistry:
                     "PARSER.SELECTION.FACTORY_MISMATCH",
                     "reader factory product lacks its required input preflight behavior",
                 )
-            return _PinnedSeekablePreflightReader(
-                descriptor,
-                iter_raw,
-                preflight_input,
-            )
+            if preview_columns is not None:
+                return _PinnedSeekableTermbasePreviewReader(
+                    descriptor,
+                    iter_raw,
+                    preflight_input,
+                    preview_columns,
+                )
+            return _PinnedSeekablePreflightReader(descriptor, iter_raw, preflight_input)
+        if preview_columns is not None:
+            return _PinnedTermbasePreviewReader(descriptor, iter_raw, preview_columns)
         return _PinnedRawReader(descriptor, iter_raw)
 
     def create_canonical_serializer(

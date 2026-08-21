@@ -56,6 +56,7 @@ def _capabilities(
     canonical_write: bool = False,
     opaque_features: tuple[str, ...] = (),
     format_profile: str = "test-profile",
+    termbase_column_preview: bool = False,
 ) -> CodecCapabilities:
     return CodecCapabilities(
         readable=readable,
@@ -66,6 +67,7 @@ def _capabilities(
         iterator_view=readable,
         materialized_view=readable,
         format_profile=format_profile,
+        termbase_column_preview=termbase_column_preview,
         opaque_features=opaque_features,
     )
 
@@ -134,6 +136,7 @@ def _descriptor(
     sniff_prefixes: tuple[bytes, ...] = (),
     opaque_features: tuple[str, ...] = (),
     canonical_write: bool = False,
+    termbase_column_preview: bool = False,
     input_consumption_policy: InputConsumptionPolicy = (
         InputConsumptionPolicy.SEALED_BYTES_EOF
     ),
@@ -151,6 +154,7 @@ def _descriptor(
         format_profile=profile.profile_id,
         opaque_features=opaque_features,
         canonical_write=canonical_write,
+        termbase_column_preview=termbase_column_preview,
     )
     descriptor = CodecDescriptor(
         identity=CodecIdentity(provider_id, name, "1.0"),
@@ -417,6 +421,20 @@ class ParserRegistryRegistrationTests(unittest.TestCase):
                     caught.exception.code,
                     "PARSER.SELECTION.CAPABILITY_MISMATCH",
                 )
+
+    def test_declared_termbase_preview_requires_structural_behavior(self) -> None:
+        descriptor = _descriptor(
+            "preview-missing",
+            purpose=EffectivePurpose.TERMBASE,
+            termbase_column_preview=True,
+        )
+        registry = ParserRegistry((descriptor,))
+
+        with self.assertRaises(RegistryConfigurationError) as caught:
+            registry.create_reader(descriptor)
+
+        self.assertEqual(caught.exception.code, "PARSER.SELECTION.FACTORY_MISMATCH")
+        self.assertNotIn("secret", str(caught.exception))
 
     def test_factory_product_must_publish_the_selected_descriptor(self) -> None:
         descriptor = _descriptor("factory-product")

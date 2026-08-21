@@ -657,6 +657,53 @@ class CapabilityContractTests(unittest.TestCase):
                 format_profile="profile",
             )
 
+    def test_termbase_preview_contract_is_bounded_and_identity_bound(self) -> None:
+        from parser_contracts import (
+            EffectivePurpose,
+            TERMBASE_CSV_V1,
+            TermbaseColumnPreview,
+            TermbaseColumnPreviewRequest,
+            TermbasePreviewColumn,
+        )
+
+        request = TermbaseColumnPreviewRequest(
+            purpose=EffectivePurpose.TERMBASE,
+            format_id=TERMBASE_CSV_V1,
+        )
+        preview = TermbaseColumnPreview(
+            source=NeutralRecordContractTests._snapshot(),
+            codec_identity=self._codec_identity(),
+            format_id=request.format_id,
+            columns=(
+                TermbasePreviewColumn(0, "Source", 6, False),
+                TermbasePreviewColumn(1, None),
+            ),
+            total_column_count=2,
+            columns_truncated=False,
+            legacy_header_detected=False,
+            active_sheet_name=None,
+        )
+        self.assertEqual(preview.columns[0].header_candidate, "Source")
+        with self.assertRaises(ValueError):
+            TermbaseColumnPreview(
+                source=preview.source,
+                codec_identity=preview.codec_identity,
+                format_id=preview.format_id,
+                columns=preview.columns,
+                total_column_count=3,
+                columns_truncated=False,
+                legacy_header_detected=False,
+                active_sheet_name=None,
+            )
+        with self.assertRaises(ValueError):
+            TermbasePreviewColumn(0, "x" * 257)
+
+    @staticmethod
+    def _codec_identity():
+        from parser_contracts import CodecIdentity
+
+        return CodecIdentity("localcat", "termbase-csv", "1")
+
     def test_round_trip_token_payload_remains_opaque_bytes(self) -> None:
         from parser_contracts import CodecIdentity, RoundTripTokenEnvelope
 

@@ -60,6 +60,9 @@ from editor_contracts import (
     ImportRequest,
     ResourceConfig,
     ResourceKind,
+    TermbaseImportHeaderMode,
+    TermbaseImportPreview,
+    TermbaseImportSelection,
     TMActivationOperationView,
     TMResourceDisplayMode,
     TMResourceStatus,
@@ -288,6 +291,159 @@ class ImportWorker(QThread):
         self.report_ready.emit(report)
 
 
+class PreviewWorker(QThread):
+    """Build one codec-owned termbase preview away from the GUI thread."""
+
+    def __init__(
+        self,
+        controller: EditorController,
+        input_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.input_path = input_path
+        self.preview: TermbaseImportPreview | None = None
+        self.error_message: str | None = None
+
+    def run(self) -> None:
+        try:
+            preview = self.controller.preview_termbase_import(self.input_path)
+            if type(preview) is not TermbaseImportPreview:
+                raise TypeError("术语表列预览返回了无效结果。")
+            self.preview = preview
+        except EditorControllerError as exc:
+            self.error_message = str(exc)
+        except Exception:
+            self.error_message = "术语表列预览未能安全完成。"
+
+
+class TermbaseColumnSelectionDialog(QDialog):
+    """Select two physical columns from one Controller-issued preview."""
+
+    def __init__(
+        self,
+        preview: TermbaseImportPreview,
+        parent: QWidget | None = None,
+    ) -> None:
+        if type(preview) is not TermbaseImportPreview:
+            raise TypeError("termbase column prompt requires TermbaseImportPreview")
+        super().__init__(parent)
+        self.preview = preview
+        self.setObjectName("termbaseColumnSelectionDialog")
+        self.setWindowTitle("选择术语表列")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        scope_parts = [f"格式：{preview.format_name}"]
+        if preview.active_sheet_name:
+            scope_parts.append(f"活动工作表：{preview.active_sheet_name}")
+        scope = QLabel(" · ".join(scope_parts))
+        scope.setObjectName("termbasePreviewScope")
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+
+        if preview.columns_truncated:
+            truncation = QLabel(
+                f"文件共有 {preview.total_column_count} 列；"
+                f"当前安全预览显示前 {len(preview.columns)} 列。"
+            )
+            truncation.setObjectName("termbasePreviewTruncation")
+            truncation.setWordWrap(True)
+            layout.addWidget(truncation)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("原文列"))
+        self.source_combo = QComboBox()
+        self.source_combo.setObjectName("termbaseSourceColumn")
+        self.source_combo.setAccessibleName("术语表原文列")
+        source_row.addWidget(self.source_combo, 1)
+        layout.addLayout(source_row)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("译文列"))
+        self.target_combo = QComboBox()
+        self.target_combo.setObjectName("termbaseTargetColumn")
+        self.target_combo.setAccessibleName("术语表译文列")
+        target_row.addWidget(self.target_combo, 1)
+        layout.addLayout(target_row)
+
+        for column in preview.columns:
+            label = self._column_label(column)
+            self.source_combo.addItem(label, column.zero_based_index)
+            self.target_combo.addItem(label, column.zero_based_index)
+        if len(preview.columns) > 1:
+            self.target_combo.setCurrentIndex(1)
+
+        configure_combo_popup(
+            self.source_combo,
+            object_name="termbaseSourceColumnPopup",
+            accessible_name="术语表原文列选项",
+        )
+        configure_combo_popup(
+            self.target_combo,
+            object_name="termbaseTargetColumnPopup",
+            accessible_name="术语表译文列选项",
+        )
+
+        self.header_checkbox = QCheckBox("首行是表头")
+        self.header_checkbox.setObjectName("termbaseFirstRowHeader")
+        self.header_checkbox.setAccessibleName("首行是表头")
+        self.header_checkbox.setChecked(preview.legacy_header_detected)
+        layout.addWidget(self.header_checkbox)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        self.buttons.setObjectName("termbaseColumnButtons")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.source_combo.currentIndexChanged.connect(self._update_accept_enabled)
+        self.target_combo.currentIndexChanged.connect(self._update_accept_enabled)
+        self._update_accept_enabled()
+
+    @staticmethod
+    def _column_label(column) -> str:
+        candidate = column.header_candidate
+        if candidate is None or not candidate:
+            display = "（空）"
+        else:
+            display = candidate.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            if column.header_truncated:
+                display += "…"
+        return f"第 {column.zero_based_index + 1} 列 · {display}"
+
+    def _update_accept_enabled(self, _index: int = -1) -> None:
+        source_index = self.source_combo.currentData()
+        target_index = self.target_combo.currentData()
+        enabled = (
+            type(source_index) is int
+            and type(target_index) is int
+            and source_index != target_index
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(enabled)
+
+    def selection(self) -> TermbaseImportSelection:
+        """Build the immutable selection consumed by the existing import command."""
+
+        return TermbaseImportSelection(
+            source_zero_based_index=self.source_combo.currentData(),
+            target_zero_based_index=self.target_combo.currentData(),
+            header_mode=(
+                TermbaseImportHeaderMode.FIRST_ROW
+                if self.header_checkbox.isChecked()
+                else TermbaseImportHeaderMode.NO_HEADER
+            ),
+            preview_column_count=len(self.preview.columns),
+            preview_source_identity=self.preview.source_identity,
+        )
+
+
 class QtSettingsDialog(QDialog):
     """Manage local TM and termbase configuration through EditorController only."""
 
@@ -311,6 +467,7 @@ class QtSettingsDialog(QDialog):
         self.resize(1040, 680)
         self.setModal(True)
         self.import_worker: ImportWorker | None = None
+        self.preview_worker: PreviewWorker | None = None
         self._import_busy = False
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
@@ -1370,39 +1527,146 @@ class QtSettingsDialog(QDialog):
         selected, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if not selected:
             return
+        if resource.kind is ResourceKind.TERMBASE:
+            self.start_termbase_preview(resource.id, Path(selected))
+            return
         source_locale = ""
         target_locale = ""
-        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-            try:
-                default_source = self.controller.project.source_locale
-                default_target = self.controller.project.target_locale
-            except EditorControllerError:
-                default_source = "en-US"
-                default_target = "zh-CN"
-            locale_dialog = QDialog(self)
-            locale_dialog.setWindowTitle("选择 TMX 语言对")
-            locale_layout = QVBoxLayout(locale_dialog)
-            locale_layout.addWidget(QLabel("源语言 locale"))
-            source_input = QLineEdit(default_source)
-            source_input.setObjectName("tmxSourceLocale")
-            locale_layout.addWidget(source_input)
-            locale_layout.addWidget(QLabel("目标语言 locale"))
-            target_input = QLineEdit(default_target)
-            target_input.setObjectName("tmxTargetLocale")
-            locale_layout.addWidget(target_input)
-            locale_buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
-            )
-            locale_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
-            locale_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-            locale_buttons.accepted.connect(locale_dialog.accept)
-            locale_buttons.rejected.connect(locale_dialog.reject)
-            locale_layout.addWidget(locale_buttons)
-            if locale_dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            source_locale = source_input.text()
-            target_locale = target_input.text()
+        try:
+            default_source = self.controller.project.source_locale
+            default_target = self.controller.project.target_locale
+        except EditorControllerError:
+            default_source = "en-US"
+            default_target = "zh-CN"
+        locale_dialog = QDialog(self)
+        locale_dialog.setWindowTitle("选择 TMX 语言对")
+        locale_layout = QVBoxLayout(locale_dialog)
+        locale_layout.addWidget(QLabel("源语言 locale"))
+        source_input = QLineEdit(default_source)
+        source_input.setObjectName("tmxSourceLocale")
+        locale_layout.addWidget(source_input)
+        locale_layout.addWidget(QLabel("目标语言 locale"))
+        target_input = QLineEdit(default_target)
+        target_input.setObjectName("tmxTargetLocale")
+        locale_layout.addWidget(target_input)
+        locale_buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        locale_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
+        locale_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        locale_buttons.accepted.connect(locale_dialog.accept)
+        locale_buttons.rejected.connect(locale_dialog.reject)
+        locale_layout.addWidget(locale_buttons)
+        if locale_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        source_locale = source_input.text()
+        target_locale = target_input.text()
         self.start_import(resource.id, Path(selected), source_locale, target_locale)
+
+    @staticmethod
+    def _lexical_absolute(path: Path) -> Path:
+        expanded = path.expanduser()
+        return expanded if expanded.is_absolute() else expanded.absolute()
+
+    def start_termbase_preview(
+        self,
+        resource_id: str,
+        input_path: Path,
+    ) -> bool:
+        """Start the codec-owned preview while holding the shared import gate."""
+
+        if self.is_importing:
+            self._show_import_feedback("已有导入任务正在运行，请等待完成。", failed=True)
+            return False
+        try:
+            resource = next(
+                configured
+                for configured in self.controller.list_resources()
+                if configured.id == resource_id
+            )
+        except StopIteration:
+            self._show_import_feedback(f"找不到资源：{resource_id}", failed=True)
+            return False
+        if resource.kind is not ResourceKind.TERMBASE:
+            self._show_import_feedback("只有术语表导入需要列预览。", failed=True)
+            return False
+        if not isinstance(input_path, Path):
+            self._show_import_feedback("术语表路径无效。", failed=True)
+            return False
+
+        lexical_input = self._lexical_absolute(input_path)
+        self.last_import_report = None
+        self._import_target_kind = ResourceKind.TERMBASE
+        self._import_busy = True
+        self._set_import_busy(True, f"正在预览 {resource.name} 的列…")
+        worker = PreviewWorker(self.controller, lexical_input, self)
+        self.preview_worker = worker
+        worker.finished.connect(
+            lambda current=worker, configured=resource: self._on_preview_finished(
+                current,
+                configured,
+            )
+        )
+        worker.start()
+        return True
+
+    def _on_preview_finished(
+        self,
+        worker: PreviewWorker,
+        resource: ResourceConfig,
+    ) -> None:
+        if self.preview_worker is not worker:
+            worker.deleteLater()
+            return
+        self.preview_worker = None
+        preview = worker.preview
+        error_message = worker.error_message
+        input_path = worker.input_path
+        worker.deleteLater()
+
+        if error_message is not None:
+            self._finish_preview_without_import(
+                f"无法预览术语表：{error_message}",
+                failed=True,
+            )
+            return
+        if preview is None:
+            self._finish_preview_without_import(
+                "无法预览术语表：预览结果不可用。",
+                failed=True,
+            )
+            return
+        if len(preview.columns) < 2:
+            self._finish_preview_without_import(
+                "术语表预览至少 2 列才能导入。",
+                failed=True,
+            )
+            return
+
+        prompt = TermbaseColumnSelectionDialog(preview, self)
+        try:
+            if prompt.exec() != QDialog.DialogCode.Accepted:
+                self._finish_preview_without_import("已取消术语表导入。", failed=False)
+                return
+            try:
+                selection = prompt.selection()
+                request = ImportRequest(
+                    resource_id=resource.id,
+                    input_path=input_path,
+                    termbase_selection=selection,
+                )
+            except (TypeError, ValueError) as exc:
+                self._finish_preview_without_import(str(exc), failed=True)
+                return
+        finally:
+            prompt.deleteLater()
+
+        self._launch_import(resource, request, busy_already=True)
+
+    def _finish_preview_without_import(self, message: str, *, failed: bool) -> None:
+        self._import_busy = False
+        self._set_import_busy(False)
+        self._show_import_feedback(message, failed=failed)
 
     def start_import(
         self,
@@ -1410,6 +1674,7 @@ class QtSettingsDialog(QDialog):
         input_path: Path,
         source_locale: str = "",
         target_locale: str = "",
+        termbase_selection: TermbaseImportSelection | None = None,
     ) -> bool:
         """Start a non-blocking import; return False when another import is active."""
 
@@ -1433,24 +1698,35 @@ class QtSettingsDialog(QDialog):
         try:
             request = ImportRequest(
                 resource_id=resource_id,
-                input_path=input_path.expanduser().resolve(),
+                input_path=self._lexical_absolute(input_path),
                 source_locale=source_locale,
                 target_locale=target_locale,
+                termbase_selection=termbase_selection,
             )
         except (TypeError, ValueError) as exc:
             self._show_import_feedback(str(exc), failed=True)
             return False
 
+        self._launch_import(resource, request, busy_already=False)
+        return True
+
+    def _launch_import(
+        self,
+        resource: ResourceConfig,
+        request: ImportRequest,
+        *,
+        busy_already: bool,
+    ) -> None:
+        if not busy_already:
+            self._import_busy = True
         self.last_import_report = None
         self._import_target_kind = resource.kind
-        self._import_busy = True
         self._set_import_busy(True, f"正在导入 {resource.name}…")
         worker = ImportWorker(self.controller, request, self)
         self.import_worker = worker
         worker.report_ready.connect(self._on_import_finished)
         worker.finished.connect(lambda current=worker: self._release_worker(current))
         worker.start()
-        return True
 
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
         self.active_table.setEnabled(not busy)
@@ -1501,7 +1777,7 @@ class QtSettingsDialog(QDialog):
 
     def reject(self) -> None:
         if self.is_importing:
-            self._show_import_feedback("导入完成前无法关闭设置。", failed=True)
+            self._show_import_feedback("导入预览或导入完成前无法关闭设置。", failed=True)
             return
         super().reject()
 

@@ -63,6 +63,10 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
   - LocalCAT JSON/TXT、PO/POT、TMX Level 1、normalized TM JSON、CSV/XLSX 八个 reader 组合；
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
+- **Now — Termbase column selection import**:
+  - CSV/XLSX 术语导入在 Qt 非阻塞取得 codec-owned 有界列 preview，用户显式选择 source/target 物理列和首行用途；
+  - preview 与正式导入绑定完整 source identity，并在同一新 sealed snapshot 上复核可见列数后才允许 stream/Store transaction；
+  - 不提供显式选择的调用继续 0/1 + legacy header allowlist；不增加语言列猜测、Sheet 选择、多 Sheet 聚合或资源导出。
 - **Later**:
   - 多文档/多章节项目工作区；
   - 同项目多 TXT / JSON / XLSX，以及特殊的多 Sheet workbook、RPY folder/workbook 集成与 XLIFF codec；
@@ -116,6 +120,7 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
+- [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [ ] `qt-editor-json-mvp-increment` -- 单 JSON 的 speaker、基础搜索/预处理/术语 CRUD 与第二阶段选项入口。Dependencies: `qt-editor-mvp`
 - [ ] `tm-storage-retrieval-index` -- SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher 和 exact/context/fuzzy。Dependencies: current exact/JSONL behavior baseline
 - [ ] `feature5-ui-integration` -- 精确 merge Feature 5，建立 canonical/legacy composition、Controller adapter、TM suggestion/阈值/状态和 macOS 入口。Dependencies: `tm-storage-retrieval-index@dd7c9fdb...` 与已批准的 Qt frozen contracts；不依赖原 Qt 增量全部完成

@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
-from editor_contracts import ImportReport, LegacyTermRow
+from editor_contracts import (
+    ImportReport,
+    LegacyTermRow,
+    TermbaseImportHeaderMode,
+    TermbaseImportPreview,
+    TermbaseImportPreviewColumn,
+    TermbaseImportSelection,
+    TermbaseImportSourceIdentity,
+)
 from parser_composition import create_parser_application_surface
 from parser_contracts import (
     ContractViolation,
@@ -27,12 +35,18 @@ from parser_contracts import (
     SelectionFailure,
     SelectionRequest,
     SourceReference,
+    SourceSnapshotIdentity,
     TERMBASE_CSV_V1,
     TERMBASE_XLSX_V1,
+    TermbaseColumnPreview,
+    TermbaseColumnPreviewRequest,
     TMX_LEVEL1_V1,
     TermbaseColumnSelection,
+    TermbaseColumnSelector,
+    TermbaseHeaderPolicy,
     TermbaseReadOptions,
     TmxReadOptions,
+    ColumnSelectorKind,
 )
 from tm_contracts import TMRecordDraft
 from tm_engine import open_canonical_tm_store
@@ -92,6 +106,8 @@ def _stage_parser_resource(
     purpose: EffectivePurpose,
     format_id: FormatId,
     request: ReadRequest,
+    expected_source_identity: SourceSnapshotIdentity | None = None,
+    expected_preview_column_count: int | None = None,
 ) -> _StagedResource:
     """Consume one guarded stream and expose records only after its terminal."""
 
@@ -109,10 +125,32 @@ def _stage_parser_resource(
             f"{opened.code}: no compatible Parser codec is registered for the resource"
         )
 
-    records: list[ResourceRecord] = []
-    warnings: list[ParseIssue] = []
-    source_digest = opened.source_identity.content_sha256
     try:
+        if (
+            expected_source_identity is not None
+            and opened.source_identity != expected_source_identity
+        ):
+            raise ImportFailure(
+                "PARSER.SOURCE.STALE: current termbase input differs from the previewed source"
+            )
+        if expected_preview_column_count is not None:
+            try:
+                current_preview = opened.preview_termbase_columns(
+                    TermbaseColumnPreviewRequest(
+                        purpose=purpose,
+                        format_id=format_id,
+                    )
+                )
+            except ContractViolation as exc:
+                raise ImportFailure(_format_parser_failure(exc)) from None
+            if len(current_preview.columns) != expected_preview_column_count:
+                raise ImportFailure(
+                    "PARSER.TERMBASE.COLUMN_SELECTION_INVALID: "
+                    "the selected columns do not match the current visible preview"
+                )
+        records: list[ResourceRecord] = []
+        warnings: list[ParseIssue] = []
+        source_digest = opened.source_identity.content_sha256
         try:
             session = opened.stream()
         except ContractViolation as exc:
@@ -149,13 +187,14 @@ def _stage_parser_resource(
     )
 
 
-def _legacy_termbase_request(format_id: FormatId) -> ReadRequest:
+def _termbase_request(
+    format_id: FormatId,
+    columns: TermbaseColumnSelection,
+) -> ReadRequest:
     return ReadRequest(
         purpose=EffectivePurpose.TERMBASE,
         format_id=format_id,
-        termbase_options=TermbaseReadOptions(
-            columns=TermbaseColumnSelection.legacy_first_two_columns()
-        ),
+        termbase_options=TermbaseReadOptions(columns=columns),
     )
 
 
@@ -163,6 +202,9 @@ def _stage_termbase(
     path: Path,
     *,
     format_id: FormatId | None = None,
+    columns: TermbaseColumnSelection | None = None,
+    expected_source_identity: SourceSnapshotIdentity | None = None,
+    expected_preview_column_count: int | None = None,
 ) -> _StagedResource:
     selected_format = format_id
     if selected_format is None:
@@ -176,7 +218,115 @@ def _stage_termbase(
         path,
         purpose=EffectivePurpose.TERMBASE,
         format_id=selected_format,
-        request=_legacy_termbase_request(selected_format),
+        request=_termbase_request(
+            selected_format,
+            columns or TermbaseColumnSelection.legacy_first_two_columns(),
+        ),
+        expected_source_identity=expected_source_identity,
+        expected_preview_column_count=expected_preview_column_count,
+    )
+
+
+def _parser_source_identity(
+    identity: TermbaseImportSourceIdentity,
+) -> SourceSnapshotIdentity:
+    return SourceSnapshotIdentity(
+        relative_reference_sha256=identity.relative_reference_sha256,
+        regular_file_identity=identity.regular_file_identity,
+        original_size=identity.original_size,
+        original_mtime_ns=identity.original_mtime_ns,
+        content_sha256=identity.content_sha256,
+        byte_count=identity.byte_count,
+        schema_version=identity.schema_version,
+    )
+
+
+def _editor_source_identity(
+    identity: SourceSnapshotIdentity,
+) -> TermbaseImportSourceIdentity:
+    return TermbaseImportSourceIdentity(
+        relative_reference_sha256=identity.relative_reference_sha256,
+        regular_file_identity=identity.regular_file_identity,
+        original_size=identity.original_size,
+        original_mtime_ns=identity.original_mtime_ns,
+        content_sha256=identity.content_sha256,
+        byte_count=identity.byte_count,
+        schema_version=identity.schema_version,
+    )
+
+
+def _selected_termbase_columns(
+    selection: TermbaseImportSelection,
+) -> TermbaseColumnSelection:
+    if type(selection) is not TermbaseImportSelection:
+        raise TypeError("termbase selection must use the exact import contract")
+    selection.__post_init__()
+    header_policy = (
+        TermbaseHeaderPolicy.FIRST_ROW
+        if selection.header_mode is TermbaseImportHeaderMode.FIRST_ROW
+        else TermbaseHeaderPolicy.NO_HEADER
+    )
+    return TermbaseColumnSelection(
+        source=TermbaseColumnSelector(
+            kind=ColumnSelectorKind.ZERO_BASED_INDEX,
+            zero_based_index=selection.source_zero_based_index,
+        ),
+        target=TermbaseColumnSelector(
+            kind=ColumnSelectorKind.ZERO_BASED_INDEX,
+            zero_based_index=selection.target_zero_based_index,
+        ),
+        header_policy=header_policy,
+    )
+
+
+def preview_termbase_import(input_path: Path) -> TermbaseImportPreview:
+    """Return one bounded Qt-safe column preview without touching any store."""
+
+    try:
+        source = _validate_input(input_path, {".csv", ".xlsx"})
+        format_id = _TERMBASE_FORMAT_BY_SUFFIX[source.suffix.lower()]
+        surface = create_parser_application_surface()
+        report = surface.preview_termbase_columns(
+            _source_reference(source),
+            SelectionRequest(
+                purpose=EffectivePurpose.TERMBASE,
+                format_id=format_id,
+            ),
+            TermbaseColumnPreviewRequest(
+                purpose=EffectivePurpose.TERMBASE,
+                format_id=format_id,
+            ),
+        )
+    except ContractViolation as exc:
+        raise ImportFailure(_format_parser_failure(exc)) from None
+    except OSError as exc:
+        raise ImportFailure(
+            f"unable to preview termbase input: {type(exc).__name__}"
+        ) from exc
+    if type(report) is SelectionFailure:
+        raise ImportFailure(
+            f"{report.code}: no compatible Parser codec is registered for the resource"
+        )
+    if type(report) is not TermbaseColumnPreview:
+        raise AssertionError("Parser termbase preview returned an invalid contract")
+    if report.format_id != format_id:
+        raise AssertionError("Parser termbase preview changed the selected format")
+    return TermbaseImportPreview(
+        format_name=source.suffix.lower().removeprefix("."),
+        columns=tuple(
+            TermbaseImportPreviewColumn(
+                zero_based_index=column.zero_based_index,
+                header_candidate=column.header_candidate,
+                header_original_char_count=column.header_original_char_count,
+                header_truncated=column.header_truncated,
+            )
+            for column in report.columns
+        ),
+        total_column_count=report.total_column_count,
+        columns_truncated=report.columns_truncated,
+        legacy_header_detected=report.legacy_header_detected,
+        active_sheet_name=report.active_sheet_name,
+        source_identity=_editor_source_identity(report.source),
     )
 
 
@@ -213,6 +363,7 @@ def _physical_row_ordinal(record: ResourceRecord) -> int:
 
 def read_legacy_termbase_import(
     input_path: Path,
+    selection: TermbaseImportSelection | None = None,
 ) -> tuple[tuple[LegacyTermRow, ...], int]:
     """Read one CSV/XLSX import without touching the managed resource.
 
@@ -223,7 +374,21 @@ def read_legacy_termbase_import(
     """
 
     source = _validate_input(input_path, {".csv", ".xlsx"})
-    staged = _stage_termbase(source)
+    columns = None
+    expected_source_identity = None
+    expected_preview_column_count = None
+    if selection is not None:
+        columns = _selected_termbase_columns(selection)
+        expected_source_identity = _parser_source_identity(
+            selection.preview_source_identity
+        )
+        expected_preview_column_count = selection.preview_column_count
+    staged = _stage_termbase(
+        source,
+        columns=columns,
+        expected_source_identity=expected_source_identity,
+        expected_preview_column_count=expected_preview_column_count,
+    )
     accepted = tuple(
         LegacyTermRow(
             source=record.source,

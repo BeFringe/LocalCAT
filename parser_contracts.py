@@ -550,6 +550,112 @@ class SourceSnapshotIdentity:
             raise ValueError("sealed snapshot byte count must equal the stable original size")
 
 
+MAX_TERMBASE_PREVIEW_COLUMNS = 256
+MAX_TERMBASE_PREVIEW_LABEL_CHARS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class TermbaseColumnPreviewRequest:
+    purpose: EffectivePurpose
+    format_id: FormatId
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(
+            self.purpose,
+            EffectivePurpose,
+            "TermbaseColumnPreviewRequest.purpose",
+        )
+        _require_exact_instance(
+            self.format_id,
+            FormatId,
+            "TermbaseColumnPreviewRequest.format_id",
+        )
+        builtin_purpose = builtin_purpose_for_format(self.format_id)
+        if self.purpose is not EffectivePurpose.TERMBASE or (
+            builtin_purpose is not None
+            and builtin_purpose is not EffectivePurpose.TERMBASE
+        ):
+            raise ContractViolation(
+                "PARSER.SELECTION.UNSUPPORTED",
+                "column preview requires a built-in termbase format",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class TermbasePreviewColumn:
+    zero_based_index: int
+    header_candidate: str | None
+    header_original_char_count: int = 0
+    header_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_int(
+            self.zero_based_index,
+            field_name="TermbasePreviewColumn.zero_based_index",
+        )
+        if self.header_candidate is not None:
+            if type(self.header_candidate) is not str:
+                raise TypeError("header_candidate must be an exact string or None")
+            if len(self.header_candidate) > MAX_TERMBASE_PREVIEW_LABEL_CHARS:
+                raise ValueError("header_candidate exceeds the preview label limit")
+            _require_nonnegative_int(
+                self.header_original_char_count,
+                field_name="TermbasePreviewColumn.header_original_char_count",
+            )
+            if self.header_original_char_count < len(self.header_candidate):
+                raise ValueError("preview header original length is inconsistent")
+            if type(self.header_truncated) is not bool:
+                raise TypeError("header_truncated must be an exact boolean")
+            if self.header_truncated != (
+                self.header_original_char_count > len(self.header_candidate)
+            ):
+                raise ValueError("preview header truncation state is inconsistent")
+        elif self.header_original_char_count != 0 or self.header_truncated:
+            raise ValueError("missing preview header cannot carry truncation facts")
+
+
+@dataclass(frozen=True, slots=True)
+class TermbaseColumnPreview:
+    source: SourceSnapshotIdentity
+    codec_identity: CodecIdentity
+    format_id: FormatId
+    columns: tuple[TermbasePreviewColumn, ...]
+    total_column_count: int
+    columns_truncated: bool
+    legacy_header_detected: bool
+    active_sheet_name: str | None
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.source, SourceSnapshotIdentity, "preview source")
+        _require_exact_instance(self.codec_identity, CodecIdentity, "preview codec identity")
+        _require_exact_instance(self.format_id, FormatId, "preview format")
+        _require_tuple(self.columns, field_name="preview columns")
+        if not self.columns:
+            raise ValueError("column preview must retain at least one physical column")
+        if len(self.columns) > MAX_TERMBASE_PREVIEW_COLUMNS:
+            raise ValueError("column preview retains too many columns")
+        if any(type(column) is not TermbasePreviewColumn for column in self.columns):
+            raise TypeError("column preview entries must use the exact preview contract")
+        if tuple(column.zero_based_index for column in self.columns) != tuple(
+            range(len(self.columns))
+        ):
+            raise ValueError("column preview must preserve dense physical order")
+        _require_nonnegative_int(self.total_column_count, field_name="preview total columns")
+        if self.total_column_count < len(self.columns):
+            raise ValueError("preview total column count is inconsistent")
+        if type(self.columns_truncated) is not bool:
+            raise TypeError("columns_truncated must be an exact boolean")
+        if self.columns_truncated != (self.total_column_count > len(self.columns)):
+            raise ValueError("preview truncation state is inconsistent")
+        if type(self.legacy_header_detected) is not bool:
+            raise TypeError("legacy_header_detected must be an exact boolean")
+        if self.active_sheet_name is not None:
+            if type(self.active_sheet_name) is not str:
+                raise TypeError("active_sheet_name must be an exact string or None")
+            if len(self.active_sheet_name) > MAX_TERMBASE_PREVIEW_LABEL_CHARS:
+                raise ValueError("active sheet name exceeds the preview label limit")
+
+
 @dataclass(frozen=True, slots=True)
 class RawSpeaker:
     value: str
@@ -656,6 +762,7 @@ class CodecCapabilities:
     materialized_view: bool
     format_profile: str
     active_sheet_only: bool = False
+    termbase_column_preview: bool = False
     opaque_features: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -668,6 +775,7 @@ class CodecCapabilities:
             "iterator_view",
             "materialized_view",
             "active_sheet_only",
+            "termbase_column_preview",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"CodecCapabilities.{field_name} must be exact bool")
@@ -1439,6 +1547,17 @@ class RawReaderCodec(Protocol):
 
 
 @runtime_checkable
+class TermbaseColumnPreviewCodec(Protocol):
+    descriptor: "CodecDescriptor"
+
+    def preview_columns(
+        self,
+        source: SnapshotCursorLease,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview: ...
+
+
+@runtime_checkable
 class CanonicalSerializerCodec(Protocol):
     descriptor: "CodecDescriptor"
 
@@ -1537,6 +1656,13 @@ class CodecDescriptor:
             )
         if self.capabilities.validatable and not self.capabilities.readable:
             raise ValueError("validatable descriptor must also be readable")
+        if self.capabilities.termbase_column_preview and (
+            not self.capabilities.readable
+            or self.purpose is not EffectivePurpose.TERMBASE
+        ):
+            raise ValueError(
+                "termbase column preview requires a readable termbase codec"
+            )
 
     @property
     def declared_issue_codes(self) -> tuple[str, ...]:

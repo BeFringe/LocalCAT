@@ -95,6 +95,13 @@ class TermCommitState(str, Enum):
     INDETERMINATE = "indeterminate"
 
 
+class TermbaseImportHeaderMode(str, Enum):
+    """How a confirmed physical column selection treats the first row."""
+
+    FIRST_ROW = "first_row"
+    NO_HEADER = "no_header"
+
+
 class TMResourceDisplayMode(str, Enum):
     """Non-authoritative UI projection of one TM resource lifecycle."""
 
@@ -1996,6 +2003,165 @@ class ImportReport:
         return not self.errors
 
 
+MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS = 256
+MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS = 256
+
+
+@dataclass(frozen=True)
+class TermbaseImportSourceIdentity:
+    """Qt-safe exact projection of one Parser sealed-source identity."""
+
+    relative_reference_sha256: str
+    regular_file_identity: str
+    original_size: int
+    original_mtime_ns: int
+    content_sha256: str
+    byte_count: int
+    schema_version: int
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.relative_reference_sha256, "relative reference digest"),
+            (self.content_sha256, "content digest"),
+        ):
+            if type(value) is not str or not _LOWER_SHA256_DIGEST.fullmatch(value):
+                raise ValueError(f"termbase preview {field_name} must be lowercase SHA-256")
+        _validate_exact_non_empty_string(
+            self.regular_file_identity,
+            "termbase preview regular file identity",
+        )
+        _validate_exact_nonnegative_int(
+            self.original_size,
+            "termbase preview original size",
+        )
+        _validate_exact_nonnegative_int(
+            self.original_mtime_ns,
+            "termbase preview original mtime",
+        )
+        _validate_exact_nonnegative_int(
+            self.byte_count,
+            "termbase preview byte count",
+        )
+        if self.original_size != self.byte_count:
+            raise ValueError("termbase preview byte count must equal original size")
+        if type(self.schema_version) is not int or self.schema_version <= 0:
+            raise ValueError("termbase preview schema version must be a positive integer")
+
+
+@dataclass(frozen=True)
+class TermbaseImportPreviewColumn:
+    zero_based_index: int
+    header_candidate: str | None
+    header_original_char_count: int = 0
+    header_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_exact_nonnegative_int(
+            self.zero_based_index,
+            "termbase preview column index",
+        )
+        if self.header_candidate is not None:
+            if type(self.header_candidate) is not str:
+                raise TypeError("termbase preview header candidate must be a string or None")
+            if len(self.header_candidate) > MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS:
+                raise ValueError("termbase preview header candidate is too long")
+            _validate_exact_nonnegative_int(
+                self.header_original_char_count,
+                "termbase preview header original length",
+            )
+            _validate_exact_bool(
+                self.header_truncated,
+                "termbase preview header truncation",
+            )
+            if self.header_original_char_count < len(self.header_candidate):
+                raise ValueError("termbase preview header length is inconsistent")
+            if self.header_truncated != (
+                self.header_original_char_count > len(self.header_candidate)
+            ):
+                raise ValueError("termbase preview header truncation is inconsistent")
+        elif self.header_original_char_count != 0 or self.header_truncated:
+            raise ValueError("missing termbase preview header cannot carry truncation facts")
+
+
+@dataclass(frozen=True)
+class TermbaseImportPreview:
+    format_name: str
+    columns: tuple[TermbaseImportPreviewColumn, ...]
+    total_column_count: int
+    columns_truncated: bool
+    legacy_header_detected: bool
+    active_sheet_name: str | None
+    source_identity: TermbaseImportSourceIdentity
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(self.format_name, "termbase preview format")
+        if len(self.format_name) > 32:
+            raise ValueError("termbase preview format name is too long")
+        if type(self.columns) is not tuple or any(
+            type(column) is not TermbaseImportPreviewColumn
+            for column in self.columns
+        ):
+            raise TypeError("termbase preview columns must be an exact immutable tuple")
+        if not self.columns:
+            raise ValueError("termbase preview must expose at least one column")
+        if len(self.columns) > MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS:
+            raise ValueError("termbase preview retains too many columns")
+        expected_indices = tuple(range(len(self.columns)))
+        if tuple(column.zero_based_index for column in self.columns) != expected_indices:
+            raise ValueError("termbase preview columns must preserve dense physical order")
+        _validate_exact_nonnegative_int(
+            self.total_column_count,
+            "termbase preview total column count",
+        )
+        if self.total_column_count < len(self.columns):
+            raise ValueError("termbase preview total column count is inconsistent")
+        _validate_exact_bool(self.columns_truncated, "termbase preview truncation")
+        if self.columns_truncated != (self.total_column_count > len(self.columns)):
+            raise ValueError("termbase preview truncation state is inconsistent")
+        _validate_exact_bool(
+            self.legacy_header_detected,
+            "termbase preview legacy header detection",
+        )
+        if self.active_sheet_name is not None:
+            if type(self.active_sheet_name) is not str:
+                raise TypeError("termbase preview active sheet name must be a string or None")
+            if len(self.active_sheet_name) > MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS:
+                raise ValueError("termbase preview active sheet name is too long")
+        if type(self.source_identity) is not TermbaseImportSourceIdentity:
+            raise TypeError("termbase preview source identity is invalid")
+
+
+@dataclass(frozen=True)
+class TermbaseImportSelection:
+    source_zero_based_index: int
+    target_zero_based_index: int
+    header_mode: TermbaseImportHeaderMode
+    preview_column_count: int
+    preview_source_identity: TermbaseImportSourceIdentity
+
+    def __post_init__(self) -> None:
+        _validate_exact_nonnegative_int(
+            self.source_zero_based_index,
+            "termbase import source column index",
+        )
+        _validate_exact_nonnegative_int(
+            self.target_zero_based_index,
+            "termbase import target column index",
+        )
+        if self.source_zero_based_index == self.target_zero_based_index:
+            raise ValueError("termbase source and target columns must differ")
+        if type(self.preview_column_count) is not int or self.preview_column_count <= 0:
+            raise ValueError("termbase preview column count must be a positive integer")
+        if self.preview_column_count > MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS:
+            raise ValueError("termbase preview column count exceeds the visible preview limit")
+        if max(self.source_zero_based_index, self.target_zero_based_index) >= self.preview_column_count:
+            raise ValueError("termbase column selection exceeds the visible preview")
+        if type(self.header_mode) is not TermbaseImportHeaderMode:
+            raise TypeError("termbase import header mode is invalid")
+        if type(self.preview_source_identity) is not TermbaseImportSourceIdentity:
+            raise TypeError("termbase import preview source identity is invalid")
+
+
 @dataclass(frozen=True)
 class TMResourceWriteOutcome:
     """Body-free result of one confirmed-translation TM append attempt."""
@@ -2104,9 +2270,15 @@ class ImportRequest:
     input_path: Path
     source_locale: str = ""
     target_locale: str = ""
+    termbase_selection: TermbaseImportSelection | None = None
 
     def __post_init__(self) -> None:
         if not self.resource_id.strip():
             raise ValueError("resource id must not be empty")
         if not self.input_path.is_absolute():
             raise ValueError("input path must be absolute")
+        if self.termbase_selection is not None:
+            if type(self.termbase_selection) is not TermbaseImportSelection:
+                raise TypeError("termbase selection must use the typed import contract")
+            if self.input_path.suffix.lower() not in {".csv", ".xlsx"}:
+                raise ValueError("termbase column selection only applies to CSV/XLSX imports")

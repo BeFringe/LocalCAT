@@ -54,6 +54,7 @@ from editor_contracts import (
     TermCommitOutcome,
     TermCommitState,
     TermDraft,
+    TermbaseImportPreview,
     TermRecord,
     TermRecordLocator,
     TermSuggestion,
@@ -75,6 +76,7 @@ from glossary_engine import GlossaryEngine
 from resource_importer import (
     ImportFailure,
     import_tmx,
+    preview_termbase_import as preview_termbase_import_file,
     read_legacy_termbase_import,
 )
 from resource_repository import ResourceError, ResourceRepository
@@ -3629,6 +3631,19 @@ class EditorController:
 
         return self.repository.list_resources()
 
+    def preview_termbase_import(
+        self,
+        input_path: Path,
+    ) -> TermbaseImportPreview:
+        """Preview codec-owned columns without entering TM or Store authority."""
+
+        if not isinstance(input_path, Path):
+            raise TypeError("termbase preview input path must be a Path")
+        try:
+            return preview_termbase_import_file(input_path)
+        except ImportFailure as error:
+            raise EditorControllerError(str(error)) from error
+
     def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create a managed resource and make it available immediately."""
 
@@ -3711,7 +3726,8 @@ class EditorController:
 
             try:
                 rows, skipped = read_legacy_termbase_import(
-                    request.input_path
+                    request.input_path,
+                    request.termbase_selection,
                 )
             except (
                 ImportFailure,

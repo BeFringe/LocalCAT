@@ -36,6 +36,11 @@ from editor_contracts import (
     TermRecordLocator,
     TermRowKind,
     TermSuggestion,
+    TermbaseImportHeaderMode,
+    TermbaseImportPreview,
+    TermbaseImportPreviewColumn,
+    TermbaseImportSelection,
+    TermbaseImportSourceIdentity,
     WriteReport,
     SegmentDensity,
     WorkspaceMode,
@@ -98,6 +103,79 @@ class EditorContractsTest(unittest.TestCase):
         self.assertTrue(write_report.succeeded)
         self.assertEqual(result.project.segments[0].target, "你好")
         self.assertEqual(request.input_path.suffix, ".tmx")
+
+    def test_termbase_preview_and_selection_contracts_are_bounded(self) -> None:
+        identity = TermbaseImportSourceIdentity(
+            relative_reference_sha256="1" * 64,
+            regular_file_identity="device:1:inode:2",
+            original_size=128,
+            original_mtime_ns=42,
+            content_sha256="2" * 64,
+            byte_count=128,
+            schema_version=1,
+        )
+        preview = TermbaseImportPreview(
+            format_name="csv",
+            columns=(
+                TermbaseImportPreviewColumn(0, "Source", 6, False),
+                TermbaseImportPreviewColumn(1, "Target", 6, False),
+            ),
+            total_column_count=2,
+            columns_truncated=False,
+            legacy_header_detected=True,
+            active_sheet_name=None,
+            source_identity=identity,
+        )
+        selection = TermbaseImportSelection(
+            source_zero_based_index=0,
+            target_zero_based_index=1,
+            header_mode=TermbaseImportHeaderMode.FIRST_ROW,
+            preview_column_count=2,
+            preview_source_identity=identity,
+        )
+        request = ImportRequest(
+            resource_id="terms",
+            input_path=Path("/tmp/terms.csv"),
+            termbase_selection=selection,
+        )
+
+        self.assertEqual(preview.columns[1].header_candidate, "Target")
+        self.assertIs(request.termbase_selection, selection)
+
+        with self.assertRaises(ValueError):
+            TermbaseImportSelection(
+                source_zero_based_index=1,
+                target_zero_based_index=1,
+                header_mode=TermbaseImportHeaderMode.NO_HEADER,
+                preview_column_count=2,
+                preview_source_identity=identity,
+            )
+        with self.assertRaises(ValueError):
+            TermbaseImportPreview(
+                format_name="csv",
+                columns=preview.columns,
+                total_column_count=3,
+                columns_truncated=False,
+                legacy_header_detected=False,
+                active_sheet_name=None,
+                source_identity=identity,
+            )
+        with self.assertRaises(ValueError):
+            TermbaseImportPreviewColumn(0, "x" * 257)
+        with self.assertRaises(ValueError):
+            TermbaseImportSelection(
+                source_zero_based_index=0,
+                target_zero_based_index=1,
+                header_mode=TermbaseImportHeaderMode.FIRST_ROW,
+                preview_column_count=257,
+                preview_source_identity=identity,
+            )
+        with self.assertRaises(ValueError):
+            ImportRequest(
+                resource_id="tm",
+                input_path=Path("/tmp/memory.tmx"),
+                termbase_selection=selection,
+            )
 
     def test_invalid_contract_values_fail_fast(self) -> None:
         with self.assertRaises(ValueError):

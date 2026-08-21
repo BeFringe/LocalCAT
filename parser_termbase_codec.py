@@ -16,6 +16,8 @@ import threading
 from typing import Iterable, Iterator, Sequence
 
 from parser_contracts import (
+    MAX_TERMBASE_PREVIEW_COLUMNS,
+    MAX_TERMBASE_PREVIEW_LABEL_CHARS,
     CodecCapabilities,
     CodecDescriptor,
     CodecIdentity,
@@ -33,7 +35,10 @@ from parser_contracts import (
     TERMBASE_CSV_V1,
     TERMBASE_XLSX_V1,
     TermbaseColumnSelection,
+    TermbaseColumnPreview,
+    TermbaseColumnPreviewRequest,
     TermbaseHeaderPolicy,
+    TermbasePreviewColumn,
 )
 from parser_source import ParserSourceError
 from parser_xlsx_support import (
@@ -84,6 +89,7 @@ _TARGET_EMPTY = "PARSER.TERMBASE.TARGET_EMPTY"
 _ACTIVE_SHEET_MISSING = "PARSER.TERMBASE.ACTIVE_SHEET_MISSING"
 _DEPENDENCY_MISSING = "PARSER.CAPABILITY.CONDITIONAL_DEPENDENCY_MISSING"
 _DEPENDENCY_INCOMPATIBLE = "PARSER.CAPABILITY.CONDITIONAL_DEPENDENCY_INCOMPATIBLE"
+_PREVIEW_EMPTY = "PARSER.TERMBASE.PREVIEW_EMPTY"
 
 _XLSX_PREFLIGHT_CODES = (
     ARCHIVE_INVALID,
@@ -276,11 +282,65 @@ def _validate_request(request: ReadRequest, expected_format) -> TermbaseColumnSe
     return options.columns
 
 
+def _validate_preview_request(
+    request: TermbaseColumnPreviewRequest,
+    expected_format,
+) -> None:
+    if type(request) is not TermbaseColumnPreviewRequest:
+        raise TypeError("request must be an exact TermbaseColumnPreviewRequest")
+    if request.purpose is not EffectivePurpose.TERMBASE or request.format_id != expected_format:
+        raise ParserSourceError(
+            "PARSER.SELECTION.UNSUPPORTED",
+            "preview request does not match the selected termbase codec",
+        )
+
+
 def _header_text(value: object) -> str | None:
     if type(value) is not str:
         return None
     trimmed = value.strip()
     return trimmed or None
+
+
+def _preview_column(index: int, value: object) -> TermbasePreviewColumn:
+    header = _header_text(value)
+    if header is None:
+        return TermbasePreviewColumn(index, None)
+    retained = header[:MAX_TERMBASE_PREVIEW_LABEL_CHARS]
+    return TermbasePreviewColumn(
+        zero_based_index=index,
+        header_candidate=retained,
+        header_original_char_count=len(header),
+        header_truncated=len(retained) != len(header),
+    )
+
+
+def _preview_from_row(
+    row: Sequence[object],
+    *,
+    source: SnapshotCursorLease,
+    descriptor: CodecDescriptor,
+    active_sheet_name: str | None,
+) -> TermbaseColumnPreview:
+    if not row:
+        raise ParserSourceError(
+            _PREVIEW_EMPTY,
+            "the selected termbase has no previewable first record",
+        )
+    retained_count = min(len(row), MAX_TERMBASE_PREVIEW_COLUMNS)
+    return TermbaseColumnPreview(
+        source=source.source_identity,
+        codec_identity=descriptor.identity,
+        format_id=descriptor.format_id,
+        columns=tuple(
+            _preview_column(index, row[index])
+            for index in range(retained_count)
+        ),
+        total_column_count=len(row),
+        columns_truncated=len(row) > retained_count,
+        legacy_header_detected=_legacy_header(row),
+        active_sheet_name=active_sheet_name,
+    )
 
 
 def _resolve_columns(
@@ -500,6 +560,48 @@ class CsvTermbaseCodec:
                 safe_summary="CSV input does not satisfy the declared CSV grammar",
             )
 
+    def preview_columns(
+        self,
+        source: SnapshotCursorLease,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview:
+        _validate_preview_request(request, TERMBASE_CSV_V1)
+        try:
+            reader = _DescriptorBoundCsvRows(
+                _Utf8CsvLines(source),
+                field_size_limit=self.descriptor.limit_profile.max_decoded_field_chars,
+            )
+            try:
+                first_record = next(reader)
+            except StopIteration:
+                raise ParserSourceError(
+                    _PREVIEW_EMPTY,
+                    "the selected CSV has no previewable logical record",
+                ) from None
+            return _preview_from_row(
+                first_record,
+                source=source,
+                descriptor=self.descriptor,
+                active_sheet_name=None,
+            )
+        except ParserSourceError:
+            raise
+        except UnicodeDecodeError:
+            raise ParserSourceError(
+                "PARSER.SOURCE.ENCODING_FAILED",
+                "CSV input is not strict UTF-8 or UTF-8-BOM",
+            ) from None
+        except _CsvFieldLimitExceeded:
+            raise ParserSourceError(
+                "PARSER.LIMIT.FIELD",
+                "a CSV field exceeds the active decoded-field limit",
+            ) from None
+        except csv.Error:
+            raise ParserSourceError(
+                "PARSER.SYNTAX.MALFORMED",
+                "CSV input does not satisfy the declared CSV grammar",
+            ) from None
+
 
 def _openpyxl_module():
     try:
@@ -538,6 +640,22 @@ def _xlsx_preflight_limits() -> XlsxPreflightLimits:
     )
 
 
+def _preflight_xlsx_source(source: SnapshotCursorLease) -> None:
+    try:
+        preflight_xlsx(source, _xlsx_preflight_limits())
+    except XlsxPreflightError as failure:
+        code = (
+            "PARSER.SYNTAX.MALFORMED"
+            if failure.code == ARCHIVE_INVALID
+            else failure.code
+        )
+        raise ParserSourceError(
+            code,
+            "XLSX archive or OPC XML preflight rejected the sealed input",
+        ) from None
+    _openpyxl_module()
+
+
 class XlsxTermbaseCodec:
     @property
     def descriptor(self) -> CodecDescriptor:
@@ -552,19 +670,7 @@ class XlsxTermbaseCodec:
             _validate_request(request, TERMBASE_XLSX_V1)
         except _SelectionFailure as failure:
             raise ParserSourceError(failure.code, failure.safe_summary) from None
-        try:
-            preflight_xlsx(source, _xlsx_preflight_limits())
-        except XlsxPreflightError as failure:
-            code = (
-                "PARSER.SYNTAX.MALFORMED"
-                if failure.code == ARCHIVE_INVALID
-                else failure.code
-            )
-            raise ParserSourceError(
-                code,
-                "XLSX archive or OPC XML preflight rejected the sealed input",
-            ) from None
-        _openpyxl_module()
+        _preflight_xlsx_source(source)
 
     def iter_raw(
         self,
@@ -618,6 +724,77 @@ class XlsxTermbaseCodec:
             if workbook is not None:
                 workbook.close()
 
+    def preview_columns(
+        self,
+        source: SnapshotCursorLease,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview:
+        _validate_preview_request(request, TERMBASE_XLSX_V1)
+        _preflight_xlsx_source(source)
+        module = _openpyxl_module()
+        invalid_file_error = module.utils.exceptions.InvalidFileException
+        expected_input_errors = (
+            invalid_file_error,
+            EOFError,
+            KeyError,
+            ValueError,
+        )
+        workbook = None
+        try:
+            workbook = module.load_workbook(
+                source,
+                read_only=True,
+                data_only=True,
+                keep_links=False,
+                keep_vba=False,
+            )
+            sheet = workbook.active
+            if sheet is None:
+                raise ParserSourceError(
+                    _ACTIVE_SHEET_MISSING,
+                    "XLSX termbase has no active worksheet",
+                )
+            try:
+                first_row = next(sheet.iter_rows(values_only=False))
+            except StopIteration:
+                raise ParserSourceError(
+                    _PREVIEW_EMPTY,
+                    "the active worksheet has no previewable first row",
+                ) from None
+            present = tuple(
+                index
+                for index, cell in enumerate(first_row)
+                if cell.__class__.__name__ != "EmptyCell"
+            )
+            if not present:
+                raise ParserSourceError(
+                    _PREVIEW_EMPTY,
+                    "the active worksheet has no previewable first row",
+                )
+            width = max(present) + 1
+            values = tuple(
+                getattr(cell, "value", None)
+                for cell in first_row[:width]
+            )
+            raw_title = getattr(sheet, "title", "")
+            title = raw_title if type(raw_title) is str else ""
+            return _preview_from_row(
+                values,
+                source=source,
+                descriptor=self.descriptor,
+                active_sheet_name=title[:MAX_TERMBASE_PREVIEW_LABEL_CHARS],
+            )
+        except ParserSourceError:
+            raise
+        except expected_input_errors:
+            raise ParserSourceError(
+                "PARSER.SYNTAX.MALFORMED",
+                "XLSX workbook does not satisfy the declared active-sheet grammar",
+            ) from None
+        finally:
+            if workbook is not None:
+                workbook.close()
+
 
 TERMBASE_CSV_DESCRIPTOR = CodecDescriptor(
     identity=CodecIdentity("localcat", "termbase-csv", "1"),
@@ -636,6 +813,7 @@ TERMBASE_CSV_DESCRIPTOR = CodecDescriptor(
         materialized_view=True,
         format_profile=CSV_LIMIT_PROFILE.profile_id,
         active_sheet_only=False,
+        termbase_column_preview=True,
         opaque_features=("explicit-column-selection", "legacy-header-allowlist"),
     ),
     limit_profile=CSV_LIMIT_PROFILE,
@@ -663,6 +841,7 @@ TERMBASE_XLSX_DESCRIPTOR = CodecDescriptor(
         materialized_view=True,
         format_profile=XLSX_LIMIT_PROFILE.profile_id,
         active_sheet_only=True,
+        termbase_column_preview=True,
         opaque_features=(
             "conditional-dependency:openpyxl>=3.1,<4",
             "data-only-cells",

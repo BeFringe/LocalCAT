@@ -1047,6 +1047,10 @@ class ParserCapabilityAndWriterTests(_Wave4Fixture):
                     capabilities.active_sheet_only,
                     case.format_id == TERMBASE_XLSX_V1,
                 )
+                self.assertEqual(
+                    capabilities.termbase_column_preview,
+                    case.format_id in {TERMBASE_CSV_V1, TERMBASE_XLSX_V1},
+                )
 
                 if case.format_id != LOCALCAT_JSON_V1:
                     target_parent = self.root / f"reader-only-{case.label}"

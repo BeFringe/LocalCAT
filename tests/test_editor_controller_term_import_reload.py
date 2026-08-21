@@ -18,6 +18,8 @@ from editor_contracts import (
     ImportRequest,
     ResourceConfig,
     ResourceKind,
+    TermbaseImportHeaderMode,
+    TermbaseImportSelection,
     TermCommitState,
     TermCommitOutcome,
     TermDraft,
@@ -203,6 +205,128 @@ class EditorControllerTermImportReloadTests(unittest.TestCase):
                 public is not owned and public.locator is not owned.locator
                 for public, owned in zip(records, private, strict=True)
             )
+        )
+
+    def test_controller_preview_is_store_free_and_propagates_programmer_faults(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller, _composition, _repository, (_resource,) = self._controller(
+                root,
+                b"Keep,stable\n",
+            )
+            source = root / "incoming.csv"
+            source.write_text(
+                "Target,Notes,Source\n甲,first,Alpha\n",
+                encoding="utf-8-sig",
+            )
+
+            with patch.object(
+                controller._term_store,
+                "prepare_merge_legacy",
+                side_effect=AssertionError("preview touched the term store"),
+            ):
+                preview = controller.preview_termbase_import(source)
+
+            self.assertEqual(preview.format_name, "csv")
+            self.assertEqual(
+                tuple(column.zero_based_index for column in preview.columns),
+                (0, 1, 2),
+            )
+
+            with patch(
+                "editor_controller.preview_termbase_import_file",
+                side_effect=AssertionError("injected controller preview fault"),
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "injected controller preview fault",
+                ):
+                    _ = controller.preview_termbase_import(source)
+
+    def test_controller_import_consumes_explicit_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller, _composition, _repository, (resource,) = self._controller(
+                root,
+                b"Keep,stable\n",
+            )
+            source = root / "incoming.csv"
+            source.write_text(
+                "Target,Notes,Source\n甲,first,Alpha\n乙,second,Beta\n",
+                encoding="utf-8-sig",
+            )
+            preview = controller.preview_termbase_import(source)
+            selection = TermbaseImportSelection(
+                source_zero_based_index=2,
+                target_zero_based_index=0,
+                header_mode=TermbaseImportHeaderMode.FIRST_ROW,
+                preview_column_count=len(preview.columns),
+                preview_source_identity=preview.source_identity,
+            )
+
+            report = controller.import_resource(
+                ImportRequest(
+                    resource_id=resource.id,
+                    input_path=source,
+                    termbase_selection=selection,
+                )
+            )
+            records = controller.list_terms(resource.id)
+
+        self.assertEqual(
+            (report.imported, report.skipped, report.overwritten, report.errors),
+            (2, 1, 0, ()),
+        )
+        self.assertEqual(
+            tuple((record.source, record.target) for record in records),
+            (("Keep", "stable"), ("Alpha", "甲"), ("Beta", "乙")),
+        )
+
+    def test_stale_selection_returns_error_without_term_store_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller, _composition, _repository, (resource,) = self._controller(
+                root,
+                b"Keep,stable\n",
+            )
+            source = root / "incoming.csv"
+            source.write_text("Source,Target\nAlpha,甲\n", encoding="utf-8-sig")
+            preview = controller.preview_termbase_import(source)
+            selection = TermbaseImportSelection(
+                source_zero_based_index=0,
+                target_zero_based_index=1,
+                header_mode=TermbaseImportHeaderMode.FIRST_ROW,
+                preview_column_count=len(preview.columns),
+                preview_source_identity=preview.source_identity,
+            )
+            source.write_text("Source,Target\nChanged,乙\n", encoding="utf-8-sig")
+
+            with patch.object(
+                controller._term_store,
+                "prepare_merge_legacy",
+                side_effect=AssertionError("stale import reached term store prepare"),
+            ) as prepare:
+                report = controller.import_resource(
+                    ImportRequest(
+                        resource_id=resource.id,
+                        input_path=source,
+                        termbase_selection=selection,
+                    )
+                )
+
+            prepare.assert_not_called()
+            retained = controller.list_terms(resource.id)
+
+        self.assertEqual(report.imported, 0)
+        self.assertEqual(report.skipped, 0)
+        self.assertEqual(report.overwritten, 0)
+        self.assertEqual(len(report.errors), 1)
+        self.assertIn("PARSER.SOURCE.STALE", report.errors[0])
+        self.assertEqual(
+            tuple((record.source, record.target) for record in retained),
+            (("Keep", "stable"),),
         )
 
     def test_import_candidate_failure_keeps_exact_bytes_and_engine_graph(self) -> None:

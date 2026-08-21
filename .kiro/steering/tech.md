@@ -49,7 +49,7 @@ python qt_editor.py --install-macos-app
 | PO / POT | `project_document` singular profile；保留 opaque gettext metadata，plural 输入 fail closed |
 | TMX | `translation_memory` Level 1；最大 100 MB；拒绝 DTD/ENTITY/外部实体；行内 XML 单元 warning+skip |
 | normalized TM JSON | `translation_memory` 单文件数组根；单输入 codec 保序保重复，目录/LWW/JSONL 输出留在 CLI Application |
-| CSV / XLSX | `termbase` 显式列选择；既有入口主动传前两列兼容 preset，XLSX 只读 active worksheet且不聚合多 Sheet |
+| CSV / XLSX | `termbase` 显式列选择；Qt 导入先消费 codec-owned 有界列 preview，并把完整 source identity 与可见列数绑定到正式导入；未提供选择的调用继续前两列兼容 preset，XLSX 只读 active worksheet且不聚合多 Sheet |
 | workspace.json | 最近十个项目、稳定段落 ID/索引回退、显示/TM 偏好以及 ADR-014 批准的预处理规则/状态偏好；不写入翻译项目或执行会话 |
 
 LocalCAT JSON canonical writer 由 codec 只生成确定性 bytes，`parser_source.py` 在 rooted target parent 内执行独占临时文件、file fsync、原子 replace 与 readback receipt；resource/store 与 normalized CLI 继续拥有各自事务。任何入口只有在 verified terminal 后才可提交，整体解析、consumer 或 commit 失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
@@ -85,3 +85,4 @@ python translation_runner.py
 - 已发布 canonical 的跨重启平台文件身份恢复按 ADR-016；普通打开、内容证明、generation 与 Fuzzy 资格边界保持不变。
 - 项目搜索与版本化术语共用 capability-gated `TextMatcher`的 Unicode/Whole Word 语义；Qt 不复制 matcher 实现。
 - Parser 与 Engine 按 ADR-015 保持互不导入；Application façade/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
+- CSV/XLSX 术语列 preview 是 Parser reader 的显式 capability：CSV 复用首个逻辑 record，XLSX 复用 OPC preflight 与 active worksheet 首行；正式导入在同一新 sealed snapshot 上先复核完整身份和可见列数，再允许 verified stream 与 TermbaseStore 事务。Qt/Controller 不拥有 CSV/XLSX grammar，也不自动猜测语言列。

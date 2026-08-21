@@ -25,6 +25,9 @@ from parser_contracts import (
     SourceReference,
     SourceSnapshotIdentity,
     TargetReference,
+    TermbaseColumnPreview,
+    TermbaseColumnPreviewCodec,
+    TermbaseColumnPreviewRequest,
     ValidationReport,
     WriteReceipt,
     builtin_purpose_for_format,
@@ -59,6 +62,53 @@ class ProviderConfigurationError(ContractViolation):
 
 class ParserApplicationError(ContractViolation):
     """Body-safe failure at the composition-owned Application surface."""
+
+
+def _preview_termbase_columns_on_snapshot(
+    reader,
+    snapshot: _SealedSourceSnapshot,
+    descriptor: CodecDescriptor,
+    request: TermbaseColumnPreviewRequest,
+) -> TermbaseColumnPreview:
+    """Run pinned preview behavior on one already sealed immutable source."""
+
+    if not descriptor.capabilities.termbase_column_preview:
+        raise ParserApplicationError(
+            "PARSER.CAPABILITY.PREVIEW_UNSUPPORTED",
+            "the selected codec does not publish termbase column preview",
+        )
+    if not isinstance(reader, TermbaseColumnPreviewCodec):
+        raise ParserApplicationError(
+            "PARSER.SELECTION.FACTORY_MISMATCH",
+            "the selected reader lacks its pinned column preview behavior",
+        )
+    lease = snapshot.lease(descriptor)
+    try:
+        try:
+            preview = reader.preview_columns(lease, request)
+        except ContractViolation as exc:
+            if exc.code not in descriptor.declared_issue_codes and exc.code not in {
+                "PARSER.TERMBASE.PREVIEW_EMPTY",
+                "PARSER.SELECTION.UNSUPPORTED",
+            }:
+                raise ParserApplicationError(
+                    "PARSER.PLUGIN.ISSUE_UNDECLARED",
+                    "the selected preview codec raised an undeclared failure code",
+                ) from None
+            raise
+        if (
+            type(preview) is not TermbaseColumnPreview
+            or preview.source != snapshot.identity
+            or preview.codec_identity != descriptor.identity
+            or preview.format_id != descriptor.format_id
+        ):
+            raise ParserApplicationError(
+                "PARSER.SELECTION.FACTORY_MISMATCH",
+                "column preview output does not match its selected authority",
+            )
+        return preview
+    finally:
+        lease.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +275,54 @@ class ParserApplicationSurface:
             primed_reader,
             _authority=_COMPOSITION_AUTHORITY,
         )
+
+    def preview_termbase_columns(
+        self,
+        reference: SourceReference,
+        selection: SelectionRequest,
+        request: TermbaseColumnPreviewRequest,
+        *,
+        cancellation: _CancellationToken | None = None,
+    ) -> TermbaseColumnPreview | SelectionFailure:
+        """Return one bounded codec-owned first-record column preview."""
+
+        if type(reference) is not SourceReference:
+            raise TypeError("reference must be exact SourceReference")
+        if type(selection) is not SelectionRequest:
+            raise TypeError("selection must be exact SelectionRequest")
+        if type(request) is not TermbaseColumnPreviewRequest:
+            raise TypeError("request must be exact TermbaseColumnPreviewRequest")
+        descriptor = self._registry.select(selection)
+        if type(descriptor) is SelectionFailure:
+            return descriptor
+        if (
+            request.purpose is not descriptor.purpose
+            or request.format_id != descriptor.format_id
+        ):
+            raise ParserApplicationError(
+                "PARSER.SELECTION.UNSUPPORTED",
+                "preview request does not match the selected codec authority",
+            )
+        if not descriptor.capabilities.termbase_column_preview:
+            raise ParserApplicationError(
+                "PARSER.CAPABILITY.PREVIEW_UNSUPPORTED",
+                "the selected codec does not publish termbase column preview",
+            )
+        reader = self._registry.create_reader(descriptor)
+        snapshot = _create_sealed_snapshot(
+            reference,
+            limit_profile=descriptor.limit_profile,
+            cancellation=cancellation,
+        )
+        try:
+            return _preview_termbase_columns_on_snapshot(
+                reader,
+                snapshot,
+                descriptor,
+                request,
+            )
+        finally:
+            snapshot.close()
 
     def write_canonical(
         self,
@@ -403,6 +501,30 @@ class OpenedParserInput:
             self._snapshot,
             self._request,
             cancellation=self._cancellation,
+        )
+
+    def preview_termbase_columns(
+        self,
+        request: TermbaseColumnPreviewRequest,
+    ) -> TermbaseColumnPreview:
+        """Preview columns on this exact snapshot before formal parsing."""
+
+        self._require_open()
+        if type(request) is not TermbaseColumnPreviewRequest:
+            raise TypeError("request must be exact TermbaseColumnPreviewRequest")
+        if (
+            request.purpose is not self._descriptor.purpose
+            or request.format_id != self._descriptor.format_id
+        ):
+            raise ParserApplicationError(
+                "PARSER.SELECTION.UNSUPPORTED",
+                "preview request does not match the opened codec authority",
+            )
+        return _preview_termbase_columns_on_snapshot(
+            self._reader(),
+            self._snapshot,
+            self._descriptor,
+            request,
         )
 
     def close(self) -> None:
