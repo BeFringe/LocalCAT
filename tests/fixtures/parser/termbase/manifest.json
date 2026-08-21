@@ -1,0 +1,565 @@
+{
+  "evidence_scope": "synthetic-corpus-only",
+  "formats": [
+    {
+      "capabilities": {
+        "active_sheet_only": false,
+        "read": true,
+        "requires_openpyxl": false,
+        "source_round_trip_write": false,
+        "write": false
+      },
+      "cases": [
+        {
+          "axes": ["valid"],
+          "byte_length": 52,
+          "case_id": "csv-header-name-valid",
+          "expect": {
+            "accepted_ids": ["row-2", "row-3"],
+            "commit_authorized": true,
+            "terminal": "success"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "3a6b23852ba2e14ce0c44621735c1e7c216665e4d5c47612a097fd6ad0fd47e8",
+          "source": {"kind": "file", "path": "payloads/csv_header_name_valid.csv"}
+        },
+        {
+          "axes": ["valid"],
+          "byte_length": 35,
+          "case_id": "csv-index-headerless-valid",
+          "expect": {
+            "accepted_ids": ["row-1", "row-2"],
+            "commit_authorized": true,
+            "terminal": "success"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "no_header",
+            "kind": "zero_based_index",
+            "source": 1,
+            "target": 0
+          },
+          "sha256": "110eb0341a6cdca27fa396ad9ae9cd83d96da0a92570a86c24ebbbde5b42460d",
+          "source": {"kind": "file", "path": "payloads/csv_index_headerless_valid.csv"}
+        },
+        {
+          "axes": ["valid"],
+          "byte_length": 33,
+          "case_id": "csv-legacy-preset-valid",
+          "expect": {
+            "accepted_ids": ["row-2", "row-3"],
+            "commit_authorized": true,
+            "terminal": "success"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "legacy_allowlist",
+            "kind": "zero_based_index",
+            "preset": "legacy_0_1",
+            "source": 0,
+            "target": 1
+          },
+          "sha256": "3c4514f9765470f200fae28b121f2e6e9b1e8eb94c5a09d36a9d737034976cd0",
+          "source": {"kind": "file", "path": "payloads/csv_legacy_valid.csv"}
+        },
+        {
+          "axes": ["record_warning"],
+          "byte_length": 67,
+          "case_id": "csv-record-warnings",
+          "expect": {
+            "accepted_ids": ["row-2", "row-7"],
+            "commit_authorized": true,
+            "terminal": "success_with_warnings",
+            "warning_ordinals": [3, 4, 5, 6],
+            "warning_reasons": ["empty_row", "missing_selected_column", "empty_source", "empty_target"]
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "bea6115d8818cfecf18dd07511fbc387e4202d2c5b0e871123622aa5f5d16216",
+          "source": {"kind": "file", "path": "payloads/csv_record_warnings.csv"}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 29,
+          "case_id": "csv-missing-header",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "failure_before_first_record": true,
+            "issue_code": "PARSER.TERMBASE.HEADER_MISSING",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "160e45aba0b6380fa80c64b54383f1aaf2f0c7cb9e26f76c9638e6a1bf5ab96c",
+          "source": {"kind": "file", "path": "payloads/csv_missing_header.csv"}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 38,
+          "case_id": "csv-duplicate-header",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "failure_before_first_record": true,
+            "issue_code": "PARSER.TERMBASE.HEADER_DUPLICATE",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "93a07ecb4ac7061e2e12396b517d1fcf9ca830225b948083ef87d5344cea4cf9",
+          "source": {"kind": "file", "path": "payloads/csv_duplicate_header.csv"}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 52,
+          "case_id": "csv-same-column",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "failure_before_first_record": true,
+            "issue_code": "PARSER.TERMBASE.COLUMN_SELECTION_SAME",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Target",
+            "target": "Target"
+          },
+          "sha256": "3a6b23852ba2e14ce0c44621735c1e7c216665e4d5c47612a097fd6ad0fd47e8",
+          "source": {"kind": "file", "path": "payloads/csv_header_name_valid.csv"}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 52,
+          "case_id": "csv-selection-required",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "failure_before_first_record": true,
+            "issue_code": "PARSER.TERMBASE.COLUMN_SELECTION_REQUIRED",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": null,
+          "sha256": "3a6b23852ba2e14ce0c44621735c1e7c216665e4d5c47612a097fd6ad0fd47e8",
+          "source": {"kind": "file", "path": "payloads/csv_header_name_valid.csv"}
+        },
+        {
+          "axes": ["format_boundary", "fatal_tail"],
+          "byte_length": 38,
+          "case_id": "csv-fatal-tail",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "failure_after_provisional_rows": true,
+            "issue_code": "PARSER.SYNTAX.MALFORMED",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "f5f86dd9d8fce4f047b49b1ae2fc356645e977a5e4f54d28e3439c780e79e3ef",
+          "source": {"kind": "file", "path": "payloads/csv_fatal_tail.csv"}
+        },
+        {
+          "axes": ["encoding"],
+          "byte_length": 27,
+          "case_id": "csv-utf8-bom-valid",
+          "expect": {
+            "accepted_ids": ["row-2"],
+            "commit_authorized": true,
+            "terminal": "success"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "787ba8a218fa330a192f609515138558df9fa8f12310a93cb24eb6994f7a32da",
+          "source": {"kind": "hex", "path": "payloads/csv_utf8_bom_valid.hex"}
+        },
+        {
+          "axes": ["encoding"],
+          "byte_length": 22,
+          "case_id": "csv-invalid-utf8",
+          "expect": {
+            "accepted_ids": [],
+            "commit_authorized": false,
+            "issue_code": "PARSER.SOURCE.ENCODING_FAILED",
+            "terminal": "fatal"
+          },
+          "format_id": "termbase-csv-v1",
+          "selection": {
+            "header_policy": "first_row",
+            "kind": "header_name",
+            "source": "Source",
+            "target": "Target"
+          },
+          "sha256": "33a9c6e346ccd0e4507bafac3673a3226f25afb696d677408632bd005df5f533",
+          "source": {"kind": "hex", "path": "payloads/csv_invalid_utf8.hex"}
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 19,
+          "case_id": "csv-input-byte-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.INPUT", "terminal": "fatal"},
+          "format_id": "termbase-csv-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 0, "target": 1},
+          "sha256": "621a012c2f0445932724b66e5ec0baa3cefe4fbdc4011d15929f8c9a8dc22f99",
+          "source": {
+            "kind": "csv-recipe-v1",
+            "runtime": {"dimension": "input_bytes", "offset": 1, "profile_limit": 104857600, "strategy": "repeat_complete_rows"},
+            "sample_utf8": "Alpha,甲\nBeta,乙\n"
+          }
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 9,
+          "case_id": "csv-field-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.FIELD", "terminal": "fatal"},
+          "format_id": "termbase-csv-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 0, "target": 1},
+          "sha256": "0788a563050a64d1d1c38e721c55f9fc554ef1a75958de898eff7e049a0df6a7",
+          "source": {
+            "kind": "csv-recipe-v1",
+            "runtime": {"dimension": "field_chars", "offset": 1, "profile_limit": 104857600, "strategy": "repeat_source_scalar"},
+            "sample_utf8": "AAAA,甲\n"
+          }
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 19,
+          "case_id": "csv-record-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.RECORD", "terminal": "fatal"},
+          "format_id": "termbase-csv-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 0, "target": 1},
+          "sha256": "621a012c2f0445932724b66e5ec0baa3cefe4fbdc4011d15929f8c9a8dc22f99",
+          "source": {
+            "kind": "csv-recipe-v1",
+            "runtime": {"dimension": "records", "offset": 1, "profile_limit": 1000000, "strategy": "repeat_complete_rows"},
+            "sample_utf8": "Alpha,甲\nBeta,乙\n"
+          }
+        },
+        {
+          "axes": ["cancel"],
+          "byte_length": 29,
+          "case_id": "csv-cancel-after-row",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.SOURCE.CANCELLED", "terminal": "cancelled"},
+          "format_id": "termbase-csv-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 0, "target": 1},
+          "sha256": "8a0d97fe18ec3c7795ea4ab1d23b029290dd311e3065e12c3e8d8291bcc57b40",
+          "source": {
+            "cancellation": {"cancel_after": 1, "checkpoint": "after_row", "physical_rows": 3},
+            "kind": "csv-recipe-v1",
+            "sample_utf8": "Alpha,甲\nBeta,乙\nGamma,丙\n"
+          }
+        }
+      ],
+      "effective_purpose": "language_resource.termbase",
+      "format_id": "termbase-csv-v1",
+      "limit_profile": {
+        "input_bytes": 104857600,
+        "materialized_records": 100000,
+        "max_field_chars": 104857600,
+        "records": 1000000
+      }
+    },
+    {
+      "capabilities": {
+        "active_sheet_only": true,
+        "read": true,
+        "requires_openpyxl": true,
+        "source_round_trip_write": false,
+        "write": false
+      },
+      "cases": [
+        {
+          "axes": ["valid", "encoding"],
+          "byte_length": 4536,
+          "case_id": "xlsx-header-name-valid",
+          "expect": {
+            "accepted_ids": ["row-2", "row-3"],
+            "commit_authorized": true,
+            "non_active_markers": ["DO_NOT_AGGREGATE_1", "DO_NOT_AGGREGATE_2"],
+            "terminal": "success",
+            "worksheet_mode": "active_sheet_only"
+          },
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "d1ad7d3bbf0a5c371620bf66f176d0ae5f9d8a62a789852652023a950c27c986",
+          "source": {
+            "active_sheet_index": 1,
+            "kind": "xlsx-recipe-v1",
+            "sheets": [
+              {"name": "Ignored", "rows": [["Source", "Target"], ["DO_NOT_AGGREGATE_1", "忽略"]]},
+              {"name": "Active", "rows": [["Source", "Target"], ["Alpha", "甲"], ["Beta", "乙"]]},
+              {"name": "AlsoIgnored", "rows": [["Source", "Target"], ["DO_NOT_AGGREGATE_2", "忽略"]]}
+            ]
+          }
+        },
+        {
+          "axes": ["valid"],
+          "byte_length": 2482,
+          "case_id": "xlsx-index-headerless-valid",
+          "expect": {"accepted_ids": ["row-1", "row-2"], "commit_authorized": true, "terminal": "success", "worksheet_mode": "active_sheet_only"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 1, "target": 0},
+          "sha256": "484786edc7704a5a00ff7f1971581a788cfc9786f24aa1670c6039ba9f5dc11e",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["甲", "Alpha"], ["乙", "Beta"]]}]}
+        },
+        {
+          "axes": ["valid"],
+          "byte_length": 2641,
+          "case_id": "xlsx-legacy-preset-valid",
+          "expect": {"accepted_ids": ["row-2", "row-3"], "commit_authorized": true, "terminal": "success", "worksheet_mode": "active_sheet_only"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "legacy_allowlist", "kind": "zero_based_index", "preset": "legacy_0_1", "source": 0, "target": 1},
+          "sha256": "184b0306918d153144b6c5ab14a87349448e54dc277f2f785a4e1a40e6d9ec42",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["source", "target"], ["Alpha", "甲"], ["Beta", "乙"]]}]}
+        },
+        {
+          "axes": ["record_warning"],
+          "byte_length": 3062,
+          "case_id": "xlsx-record-warnings",
+          "expect": {
+            "accepted_ids": ["row-2", "row-7"],
+            "commit_authorized": true,
+            "terminal": "success_with_warnings",
+            "warning_ordinals": [3, 4, 5, 6],
+            "warning_reasons": ["empty_row", "missing_selected_column", "empty_source", "empty_target"]
+          },
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "0aff1d93d5ea63c6aad250a97249ba82cd824dc8d6ef7d62f186b7793b2289d1",
+          "source": {
+            "active_sheet_index": 0,
+            "kind": "xlsx-recipe-v1",
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"], [], ["MissingOnly"], ["", "空源"], ["EmptyTarget", ""], ["Beta", "乙"]]}]
+          }
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2492,
+          "case_id": "xlsx-missing-header",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "issue_code": "PARSER.TERMBASE.HEADER_MISSING", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "0a718e00f77d5dd27ddc986efefd30019ce2169b0a44cbb46a126af73eae3ad8",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Origin", "Translation"], ["Alpha", "甲"]]}]}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2629,
+          "case_id": "xlsx-duplicate-header",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "issue_code": "PARSER.TERMBASE.HEADER_DUPLICATE", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "6ed698bcd2361bd5e9c25b5d1cb9bbe67b4945f161695f2b685d43af70af4b73",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Source", "Source", "Target"], ["Alpha", "Shadow", "甲"]]}]}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2487,
+          "case_id": "xlsx-same-column",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "issue_code": "PARSER.TERMBASE.COLUMN_SELECTION_SAME", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Target", "target": "Target"},
+          "sha256": "778ab5958cdad66de0df1f5e7be8d25800c2faf48e935978b3d95813c1eeea3d",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]}
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2487,
+          "case_id": "xlsx-selection-required",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "issue_code": "PARSER.TERMBASE.COLUMN_SELECTION_REQUIRED", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": null,
+          "sha256": "778ab5958cdad66de0df1f5e7be8d25800c2faf48e935978b3d95813c1eeea3d",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]}
+        },
+        {
+          "axes": ["format_boundary", "fatal_tail"],
+          "byte_length": 2455,
+          "case_id": "xlsx-fatal-tail",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_after_provisional_rows": true, "issue_code": "PARSER.SYNTAX.MALFORMED", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "e0198784e733199edcae1df38703c71dc43661a08a0b9018d1b684b36fa2908f",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}], "truncate_tail_bytes": 32}
+        },
+        {
+          "axes": ["encoding"],
+          "byte_length": 2007,
+          "case_id": "xlsx-invalid-xml-encoding",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "issue_code": "PARSER.SOURCE.ENCODING_FAILED", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "a34948da01dd0ca4fb70932d9e48f870be34a0149a5861a5226b3e0995f8328e",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [{"hex": "ff", "override": true, "path": "xl/worksheets/sheet1.xml"}],
+            "kind": "xlsx-recipe-v1",
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 3629,
+          "case_id": "xlsx-archive-expanded-byte-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.EXPANSION", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "c4b70db39f0cda7867e78f7a672f108caacd44858a247c20cd6b1db7071cd69f",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [{"count": 1024, "path": "xl/media/expanded.bin", "repeat_utf8": "X"}],
+            "kind": "xlsx-recipe-v1",
+            "runtime": {"dimension": "expanded_bytes", "offset": 1, "profile_limit": 268435456, "strategy": "repeat_member_payload"},
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 2868,
+          "case_id": "xlsx-archive-member-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.ARCHIVE_MEMBER", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "0737597778135d4827258043348317e2c02780e0adba431744c59def7b62d7d3",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [
+              {"path": "customXml/sample1.xml", "utf8": "<sample/>"},
+              {"path": "customXml/sample2.xml", "utf8": "<sample/>"},
+              {"path": "customXml/sample3.xml", "utf8": "<sample/>"}
+            ],
+            "kind": "xlsx-recipe-v1",
+            "runtime": {"dimension": "archive_members", "offset": 1, "profile_limit": 4096, "strategy": "repeat_unique_xml_members"},
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["limit"],
+          "byte_length": 2678,
+          "case_id": "xlsx-archive-ratio-limit",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.LIMIT.COMPRESSION_RATIO", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "c05f1da46a100aadd8e8a8bcf11edb503457f8130374e930db5b7ba7aec3f2b8",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [{"compression": "deflated", "count": 65536, "path": "xl/media/ratio.bin", "repeat_utf8": "A"}],
+            "kind": "xlsx-recipe-v1",
+            "runtime": {"dimension": "compression_ratio", "offset": 1, "profile_limit": 100, "strategy": "highly_compressible_member"},
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2623,
+          "case_id": "xlsx-dtd-member",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "forbidden_constructs": ["doctype"], "issue_code": "PARSER.TERMBASE.XML_DECLARATION_FORBIDDEN", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "bbd693c4db0a300bb61bb469030aa2832006f3d6dd04fe99e4e43b25eb92cc6b",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [{"path": "customXml/item1.xml", "utf8": "<!DOCTYPE root><root/>"}],
+            "kind": "xlsx-recipe-v1",
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2658,
+          "case_id": "xlsx-entity-member",
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "forbidden_constructs": ["doctype", "entity"], "issue_code": "PARSER.TERMBASE.XML_DECLARATION_FORBIDDEN", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "93168ebd3139464aab172ff48d2d52d864cb6f8372aea7fedad9d6b372d660e0",
+          "source": {
+            "active_sheet_index": 0,
+            "extra_members": [{"path": "customXml/item1.xml", "utf8": "<!DOCTYPE root [<!ENTITY local 'x'>]><root>&local;</root>"}],
+            "kind": "xlsx-recipe-v1",
+            "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]
+          }
+        },
+        {
+          "axes": ["format_boundary"],
+          "byte_length": 2487,
+          "case_id": "xlsx-openpyxl-missing",
+          "environment": {"openpyxl": "missing"},
+          "expect": {"accepted_ids": [], "commit_authorized": false, "failure_before_first_record": true, "issue_code": "PARSER.CAPABILITY.CONDITIONAL_DEPENDENCY_MISSING", "terminal": "fatal"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "first_row", "kind": "header_name", "source": "Source", "target": "Target"},
+          "sha256": "778ab5958cdad66de0df1f5e7be8d25800c2faf48e935978b3d95813c1eeea3d",
+          "source": {"active_sheet_index": 0, "kind": "xlsx-recipe-v1", "sheets": [{"name": "Terms", "rows": [["Source", "Target"], ["Alpha", "甲"]]}]}
+        },
+        {
+          "axes": ["cancel"],
+          "byte_length": 2637,
+          "case_id": "xlsx-cancel-after-row",
+          "expect": {"commit_authorized": false, "issue_code": "PARSER.SOURCE.CANCELLED", "terminal": "cancelled"},
+          "format_id": "termbase-xlsx-v1",
+          "selection": {"header_policy": "no_header", "kind": "zero_based_index", "source": 0, "target": 1},
+          "sha256": "677daa8df964d7a37db134e66344c55ecf1ce04dcec162ef8345e1feff2b5d52",
+          "source": {
+            "active_sheet_index": 0,
+            "cancellation": {"cancel_after": 1, "checkpoint": "after_row", "physical_rows": 3},
+            "kind": "xlsx-recipe-v1",
+            "sheets": [{"name": "Terms", "rows": [["Alpha", "甲"], ["Beta", "乙"], ["Gamma", "丙"]]}]
+          }
+        }
+      ],
+      "effective_purpose": "language_resource.termbase",
+      "format_id": "termbase-xlsx-v1",
+      "limit_profile": {
+        "archive_members": 4096,
+        "compression_ratio": 100,
+        "expanded_bytes": 268435456,
+        "input_bytes": 104857600,
+        "materialized_records": 100000,
+        "max_cell_chars": 1000000,
+        "records": 1048576
+      }
+    }
+  ],
+  "production_codec_exercised": false,
+  "provenance": {
+    "external_inputs": [],
+    "kind": "synthetic",
+    "redistributable": true
+  },
+  "purpose": "language_resource.termbase",
+  "schema_version": 1
+}

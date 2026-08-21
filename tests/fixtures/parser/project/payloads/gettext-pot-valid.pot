@@ -1,0 +1,11 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#. Synthetic template entry
+#: screens.rpy:5
+msgctxt "button"
+msgid ""
+"Start "
+"game"
+msgstr ""

@@ -1,0 +1,4 @@
+msgid "One choice"
+msgid_plural "Many choices"
+msgstr[0] ""
+msgstr[1] ""

@@ -2,62 +2,62 @@
 
 ## Tasks
 
-- [ ] 1. Wave 0：建立现行行为与失败护栏
-- [ ] 1.1 固定单文档项目 facade 的兼容行为
+- [x] 1. Wave 0：建立现行行为与失败护栏
+- [x] 1.1 固定单文档项目 facade 的兼容行为
   - 覆盖 LocalCAT JSON 数组根、对象根、字段缺省、顺序、局部 ID、空项目和 TXT source-only 读取。
   - 固定保存 schema、目标替换原子性、Controller 错误映射、session 安装与 dirty 清理时机。
   - 完成时，现有项目入口在尚未切换 codec 前已有可重复的成功与失败 characterization 证据。
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 13.3, 14.1, 14.3_
 
-- [ ] 1.2 固定 TMX 导入 facade 的兼容行为
+- [x] 1.2 固定 TMX 导入 facade 的兼容行为
   - 覆盖 locale 精确匹配与无歧义 fallback、同 source variants 与顺序、record warning、无有效 pair 和输入级 fatal。
   - 固定 canonical/legacy 分流、source digest、stage/commit/receipt，以及 `ImportReport` 中 imported、skipped、overwritten、errors 的现行关系。
   - 完成时，TMX 语法迁移前后的 Application 与 Store 可观察结果可逐项比较。
   - _Requirements: 5.1, 5.2, 5.3, 5.8, 5.9, 5.10, 7.4, 14.2, 14.3_
 
-- [ ] 1.3 固定术语资源 facade 的兼容行为
+- [x] 1.3 固定术语资源 facade 的兼容行为
   - 覆盖只读导入 seam、事务导入、前两列兼容 preset、header allowlist、跳过计数、source-LWW、metadata 保留与 reload。
   - 记录 active worksheet 与 Excel 三态 adapter 的非回归边界，不把多 sheet 聚合成项目。
   - 完成时，CSV/XLSX row-selection 被替换前已有无副作用读取与原子提交的兼容基线。
   - _Requirements: 5.5, 5.6, 5.7, 5.8, 5.9, 5.11, 5.12, 5.13, 14.2, 14.3, 14.6_
 
-- [ ] 1.4 固定 normalized TM JSON CLI 与 gettext runner 的兼容行为
+- [x] 1.4 固定 normalized TM JSON CLI 与 gettext runner 的兼容行为
   - 覆盖单文件记录接受、跨文件 source-LWW、输出失败、singular PO/POT、runner 输出与现行异常行为。
   - 将坏行静默跳过、非字符串 speaker 置空、gettext partial/empty success 标记为设计已声明的版本化变化，而不是兼容期望。
   - 完成时，CLI 与 runner 的保留行为和有意退役行为都有独立断言。
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.4, 12.2, 12.3, 14.2, 14.3, 14.5_
 
-- [ ] 1.5 建立项目文档格式的可分发 golden fixtures
+- [x] 1.5 建立项目文档格式的可分发 golden fixtures
   - 为 LocalCAT JSON 数组/对象、source-only TXT、PO/POT singular profile 建立 valid、格式边界、encoding、limit 与 cancel 合成输入。
   - 仅为可构造尾部错误的格式增加 fatal-tail；不为没有 recoverable warning 合同的项目格式发明 warning 行为。
   - 完成时，四个 project-document 组合均可从受控 fixture 重现其接受、拒绝和边界结果。
   - _Requirements: 1.6, 3.1, 3.2, 3.5, 3.6, 3.7, 4.1, 4.2, 4.3, 4.4, 4.7, 4.8, 4.9, 15.1_
 
-- [ ] 1.6 建立 TMX 与 normalized TM JSON 的可分发 golden fixtures
+- [x] 1.6 建立 TMX 与 normalized TM JSON 的可分发 golden fixtures
   - 为两个 translation-memory 组合建立 valid、格式边界、record warning、fatal-tail、encoding、limit 与 cancel 合成输入。
   - 从已知 TMX 样本只提炼最小合成 fixture 或安全摘要，不提交未确认授权的原文件。
   - 完成时，locale、variant、坏记录、speaker 与输入失败均能在本地独立复现。
   - _Requirements: 1.7, 5.1, 5.2, 5.3, 5.4, 5.8, 5.10, 12.1, 12.2, 12.3, 12.4, 15.1_
 
-- [ ] 1.7 建立 CSV/XLSX 术语资源的可分发 golden fixtures
+- [x] 1.7 建立 CSV/XLSX 术语资源的可分发 golden fixtures
   - 覆盖 header-name、zero-based index、headerless、legacy preset、缺列、重复 header、同列、空行和不完整行。
   - 覆盖 XLSX active sheet、archive expansion、DTD/ENTITY member 与条件依赖缺失；多 sheet 样本只验证不聚合。
   - 完成时，两个 termbase 组合的 valid、record warning、格式边界、encoding、limit 与 cancel 均有确定性 fixture。
   - _Requirements: 1.8, 5.5, 5.6, 5.7, 5.11, 5.12, 5.13, 9.4, 9.5, 15.1_
 
-- [ ] 1.8 建立终态与迭代视图对抗测试骨架
+- [x] 1.8 建立终态与迭代视图对抗测试骨架
   - 提供可注入 raw event、fatal tail、early close、consumer exception 和缺失 EOF 的测试 doubles。
   - 预置 iterator/materialized 等价断言所需的 records、issues、counts 与顺序比较器。
   - 完成时，后续 guarded session 实现可直接证明 provisional record 不会被伪成功授权。
   - _Requirements: 7.1, 7.2, 7.3, 7.7, 15.2, 15.3_
 
-- [ ] 1.9 建立 source、writer 与 commit 故障注入骨架
+- [x] 1.9 建立 source、writer 与 commit 故障注入骨架
   - 提供原文件并发变化、root escape、non-regular file、snapshot stale、临时写入、fsync、replace 和 resource commit 故障点。
   - 所有夹具使用隔离目标并能断言失败前后字节及 receipt 状态。
   - 完成时，Source Boundary 和 Application staging 可在不触碰用户文件的条件下验证 fail-closed。
   - _Requirements: 3.9, 6.3, 6.4, 6.6, 9.6, 10.2, 15.3_
 
-- [ ] 1.10 建立依赖方向与延期边界的架构测试骨架
+- [x] 1.10 建立依赖方向与延期边界的架构测试骨架
   - 准备 AST/import 检查，约束 Parser、Engine/Store、Application、composition 和 plugin implementation 的允许依赖方向。
   - 为 RPY 类型/token、workspace、多文档、chunk、同步和 TM storage authority 建立负向边界断言。
   - 完成时，后续每波迁移都能检测第二 parser、反向依赖或延期 Feature 越界。

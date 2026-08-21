@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tmx version="1.4">
+  <header srclang="en-US"/>
+  <body>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Accepted</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>接受</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Inline <ph id="1"/></seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>内联</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Missing target</seg></tuv>
+      <tuv xml:lang="fr-FR"><seg>Cible absente</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-GB"><seg>Ambiguous one</seg></tuv>
+      <tuv xml:lang="en-AU"><seg>Ambiguous two</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>模糊源</seg></tuv>
+    </tu>
+  </body>
+</tmx>

@@ -1,0 +1,655 @@
+{
+  "schema_version": 1,
+  "purpose": "project_document",
+  "provenance": {
+    "origin": "localcat-synthetic",
+    "external_downloads": [],
+    "contains_user_content": false
+  },
+  "generators": {
+    "repeat-fragments-v1": {
+      "version": 1,
+      "encoding": "utf-8",
+      "algorithm": "prefix + separator.join(item_template[index=1..repeat]) + suffix"
+    }
+  },
+  "formats": [
+    {
+      "format_id": "localcat-json-v1",
+      "filename_suffix": ".json",
+      "capabilities": {
+        "read": true,
+        "canonical_write": true,
+        "source_round_trip_write": false,
+        "streaming_input": false
+      },
+      "fatal_tail": {
+        "applicable": true,
+        "reason": "A complete JSON root followed by a trailing token is a reproducible whole-input syntax failure."
+      },
+      "cases": [
+        {
+          "case_id": "localcat-json-array-valid",
+          "axes": ["valid"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/localcat-array-valid.json",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 222,
+          "sha256": "0d6e5d5aa2a58b12fecbf7e0521605e3403ab9173b3ab87588c6d4074f9bdf43",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "segment_count": 2,
+            "document_name_source": "file_stem",
+            "default_locales": ["en-US", "zh-CN"]
+          }
+        },
+        {
+          "case_id": "localcat-json-object-valid",
+          "axes": ["valid"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/localcat-object-valid.json",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 261,
+          "sha256": "4bc7f1c7e0d6001d3a053c26cde616ef044445bee8b9da49cc868e0e28a11b20",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "segment_count": 1,
+            "target_presence": "explicit_empty"
+          }
+        },
+        {
+          "case_id": "localcat-json-duplicate-id",
+          "axes": ["format_boundary"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/localcat-invalid-segment.json",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 104,
+          "sha256": "bf695d9a8a61e036f685158e672737124e2090cf162d861dfea7302ca68947e4",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SYNTAX.DUPLICATE_LOCAL_ID"
+          }
+        },
+        {
+          "case_id": "localcat-json-bom-valid",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/localcat-json-bom-valid.hex",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 29,
+          "sha256": "a607d31216aaccf65ade270574f85d9080b5a88211dc61706872f459b24986f1",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "encoding": "utf-8-sig"
+          }
+        },
+        {
+          "case_id": "localcat-json-invalid-utf8",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/localcat-json-invalid-utf8.hex",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 17,
+          "sha256": "837cfec642d1812f40ec9e10d61bb2c0046eb3a4750ba7b491ed816bdd3f7491",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.ENCODING_FAILED"
+          }
+        },
+        {
+          "case_id": "localcat-json-fatal-tail",
+          "axes": ["format_boundary", "fatal_tail"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/localcat-fatal-tail.json",
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 64,
+          "sha256": "5be878828723ff2e0851a17c74470c4a11e9eceb87ffbe3745219ae1bd4e7c4f",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SYNTAX.MALFORMED"
+          }
+        },
+        {
+          "case_id": "localcat-json-record-limit",
+          "axes": ["limit"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "[",
+            "item_template": "{\"id\":\"segment-{index}\",\"source\":\"Source {index}\"}",
+            "separator": ",",
+            "suffix": "]\n",
+            "sample_repeat": 3,
+            "runtime": {
+              "value": "profile_limit_plus_offset",
+              "profile_field": "max_records",
+              "offset": 1
+            },
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 119,
+          "sha256": "7904e7ea71c3747320eaeed91e72957a1a737bfe28d025b176f8ca08d34228ca",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.LIMIT.RECORD"
+          }
+        },
+        {
+          "case_id": "localcat-json-cancel",
+          "axes": ["cancel"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "[",
+            "item_template": "{\"id\":\"segment-{index}\",\"source\":\"Source {index}\"}",
+            "separator": ",",
+            "suffix": "]\n",
+            "sample_repeat": 4,
+            "runtime": {
+              "action": "cancel",
+              "checkpoint": "bounded_byte_chunk",
+              "after_checkpoint": 1
+            },
+            "materialized_suffix": ".json"
+          },
+          "materialized_byte_length": 158,
+          "sha256": "42226a7584c06e0464700d6a70753706cde5843150281eaffda0737f87126fbf",
+          "expectation": {
+            "outcome": "cancelled",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.CANCELLED"
+          }
+        }
+      ]
+    },
+    {
+      "format_id": "line-text-v1",
+      "filename_suffix": ".txt",
+      "capabilities": {
+        "read": true,
+        "canonical_write": false,
+        "source_round_trip_write": false,
+        "streaming_input": true
+      },
+      "fatal_tail": {
+        "applicable": false,
+        "reason": "Every decodable non-empty trailing line is data; invalid trailing bytes are an encoding failure, not a recoverable record tail."
+      },
+      "cases": [
+        {
+          "case_id": "line-text-source-only-valid",
+          "axes": ["valid"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/line-text-valid.hex",
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 40,
+          "sha256": "05d5358b2e4b012ac99843c9c823bed02c962a28cbbab734b42bc3d5c5cd0294",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "segment_count": 3,
+            "target_presence": "missing",
+            "raw_speaker": ""
+          }
+        },
+        {
+          "case_id": "line-text-empty",
+          "axes": ["format_boundary"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/line-text-whitespace-only.hex",
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 6,
+          "sha256": "0bb0a6d70f29b78051ccd92a8f3de39b48daafaff97ab68bbbc6b4832d723daf",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SYNTAX.EMPTY_INPUT"
+          }
+        },
+        {
+          "case_id": "line-text-bom-valid",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/line-text-bom-valid.hex",
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 14,
+          "sha256": "2d022436116002a2a301fc81b22f2ab1603e8f73a211d415fb3e6a9db7aec1ac",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "encoding": "utf-8-sig"
+          }
+        },
+        {
+          "case_id": "line-text-invalid-utf8",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/line-text-invalid-utf8.hex",
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 8,
+          "sha256": "2b15fbf1e00865032fb1d77cff8646808820014b1674b613b60bba43b2a354cd",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.ENCODING_FAILED"
+          }
+        },
+        {
+          "case_id": "line-text-record-limit",
+          "axes": ["limit"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "Line {index}",
+            "separator": "\n",
+            "suffix": "\n",
+            "sample_repeat": 3,
+            "runtime": {
+              "value": "profile_limit_plus_offset",
+              "profile_field": "max_records",
+              "offset": 1
+            },
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 21,
+          "sha256": "ec1f9796b88620f692b2dbdfc17c114a1c06d78d527471486d49787f89a3cff1",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.LIMIT.RECORD"
+          }
+        },
+        {
+          "case_id": "line-text-cancel",
+          "axes": ["cancel"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "Line {index}",
+            "separator": "\n",
+            "suffix": "\n",
+            "sample_repeat": 4,
+            "runtime": {
+              "action": "cancel",
+              "checkpoint": "bounded_byte_chunk",
+              "after_checkpoint": 1
+            },
+            "materialized_suffix": ".txt"
+          },
+          "materialized_byte_length": 28,
+          "sha256": "d57532e60e6f606f4f7529d722c7e9ea16e1763620b5e81fbb6a562a1effbfc6",
+          "expectation": {
+            "outcome": "cancelled",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.CANCELLED"
+          }
+        }
+      ]
+    },
+    {
+      "format_id": "gettext-po-v1",
+      "filename_suffix": ".po",
+      "capabilities": {
+        "read": true,
+        "canonical_write": false,
+        "source_round_trip_write": false,
+        "streaming_input": true
+      },
+      "fatal_tail": {
+        "applicable": true,
+        "reason": "A malformed entry can follow a complete singular entry and must invalidate the complete input."
+      },
+      "cases": [
+        {
+          "case_id": "gettext-po-singular-valid",
+          "axes": ["valid"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-po-valid.po",
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 223,
+          "sha256": "e85466de29589e5dbe0e24b8ba68b6df8d2f36451791ba046240d45b052bc971",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "segment_count": 1,
+            "translation_state": "format_derived_unconfirmed",
+            "metadata": ["header", "comments", "references", "flags", "previous_value", "msgctxt"]
+          }
+        },
+        {
+          "case_id": "gettext-po-plural-unsupported",
+          "axes": ["format_boundary"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-po-plural.po",
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 93,
+          "sha256": "d3caf3a7ec29ac312d6fd1c4dae9bbadab99d293baaf54f312e0d1a006399da1",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.GETTEXT.PLURAL_UNSUPPORTED"
+          }
+        },
+        {
+          "case_id": "gettext-po-bom-valid",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/gettext-po-bom-valid.hex",
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 33,
+          "sha256": "e99fa23cfc930edc9c6467e4381139e8ee19f9ef7be938fbed7d40fc0943a529",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "encoding": "utf-8-sig"
+          }
+        },
+        {
+          "case_id": "gettext-po-invalid-utf8",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/gettext-po-invalid-utf8.hex",
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 21,
+          "sha256": "f66fbe3daa9b83b2a9e44d4c20f05b92533fbfd135e39ed8f7cac1c0034eba6a",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.ENCODING_FAILED"
+          }
+        },
+        {
+          "case_id": "gettext-po-fatal-tail",
+          "axes": ["format_boundary", "fatal_tail"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-po-fatal-tail.po",
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 61,
+          "sha256": "9e8c0aa5413b24164eaf0a0d4faf2f9f2a44a1f10dfb4ac9c9c93694434f6011",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.GETTEXT.SYNTAX"
+          }
+        },
+        {
+          "case_id": "gettext-po-record-limit",
+          "axes": ["limit"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "msgid \"Source {index}\"\nmsgstr \"Target {index}\"",
+            "separator": "\n\n",
+            "suffix": "\n",
+            "sample_repeat": 3,
+            "runtime": {
+              "value": "profile_limit_plus_offset",
+              "profile_field": "max_records",
+              "offset": 1
+            },
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 107,
+          "sha256": "bb115c5863098f40c768c4a820247203a61941b9bb070ff8dbf03ea07bed39f0",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.LIMIT.RECORD"
+          }
+        },
+        {
+          "case_id": "gettext-po-cancel",
+          "axes": ["cancel"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "msgid \"Source {index}\"\nmsgstr \"Target {index}\"",
+            "separator": "\n\n",
+            "suffix": "\n",
+            "sample_repeat": 4,
+            "runtime": {
+              "action": "cancel",
+              "checkpoint": "gettext_entry",
+              "after_checkpoint": 1
+            },
+            "materialized_suffix": ".po"
+          },
+          "materialized_byte_length": 143,
+          "sha256": "fa384b0a707d4840d08174788999b4c84edb584b34158d5c90c71a952654b930",
+          "expectation": {
+            "outcome": "cancelled",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.CANCELLED"
+          }
+        }
+      ]
+    },
+    {
+      "format_id": "gettext-pot-v1",
+      "filename_suffix": ".pot",
+      "capabilities": {
+        "read": true,
+        "canonical_write": false,
+        "source_round_trip_write": false,
+        "streaming_input": true
+      },
+      "fatal_tail": {
+        "applicable": true,
+        "reason": "A malformed entry can follow a complete template entry and must invalidate the complete input."
+      },
+      "cases": [
+        {
+          "case_id": "gettext-pot-singular-valid",
+          "axes": ["valid"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-pot-valid.pot",
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 161,
+          "sha256": "582468a5a40febe16a22b880fc8a2307158aff70c95758d2fd892cf13e47d942",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "segment_count": 1,
+            "target_presence": "explicit_empty",
+            "metadata": ["header", "comments", "references", "msgctxt"]
+          }
+        },
+        {
+          "case_id": "gettext-pot-plural-unsupported",
+          "axes": ["format_boundary"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-pot-plural.pot",
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 73,
+          "sha256": "0479b334bdff3b60d6e36276887188ced00c95581a1f92617971eeca701193b6",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.GETTEXT.PLURAL_UNSUPPORTED"
+          }
+        },
+        {
+          "case_id": "gettext-pot-bom-valid",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/gettext-pot-bom-valid.hex",
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 27,
+          "sha256": "d1f3e3b3f3d38ef945aecb56cc5c7dfea2e8064b667d8478a2fa94f1a4a0ebf3",
+          "expectation": {
+            "outcome": "success",
+            "terminal_success": true,
+            "recoverable_warning_count": 0,
+            "encoding": "utf-8-sig"
+          }
+        },
+        {
+          "case_id": "gettext-pot-invalid-utf8",
+          "axes": ["encoding"],
+          "payload": {
+            "kind": "hex",
+            "path": "payloads/gettext-pot-invalid-utf8.hex",
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 20,
+          "sha256": "5f7b6da492a887202cb79cddd16aa8836e1992912e5ddc4f2acf2d760180bb27",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.ENCODING_FAILED"
+          }
+        },
+        {
+          "case_id": "gettext-pot-fatal-tail",
+          "axes": ["format_boundary", "fatal_tail"],
+          "payload": {
+            "kind": "file",
+            "path": "payloads/gettext-pot-fatal-tail.pot",
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 55,
+          "sha256": "f90cac31266b838a3a8878fdd08d7473e85585dd655d508ed216d74d39be3048",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.GETTEXT.SYNTAX"
+          }
+        },
+        {
+          "case_id": "gettext-pot-record-limit",
+          "axes": ["limit"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "msgid \"Source {index}\"\nmsgstr \"\"",
+            "separator": "\n\n",
+            "suffix": "\n",
+            "sample_repeat": 3,
+            "runtime": {
+              "value": "profile_limit_plus_offset",
+              "profile_field": "max_records",
+              "offset": 1
+            },
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 83,
+          "sha256": "404872885ca1da2e77221d05f238290c5fc8eeb4cc4e81f1377304ab12448b3d",
+          "expectation": {
+            "outcome": "fatal",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.LIMIT.RECORD"
+          }
+        },
+        {
+          "case_id": "gettext-pot-cancel",
+          "axes": ["cancel"],
+          "payload": {
+            "kind": "recipe",
+            "generator": "repeat-fragments-v1",
+            "generator_version": 1,
+            "prefix": "",
+            "item_template": "msgid \"Source {index}\"\nmsgstr \"\"",
+            "separator": "\n\n",
+            "suffix": "\n",
+            "sample_repeat": 4,
+            "runtime": {
+              "action": "cancel",
+              "checkpoint": "gettext_entry",
+              "after_checkpoint": 1
+            },
+            "materialized_suffix": ".pot"
+          },
+          "materialized_byte_length": 111,
+          "sha256": "e0957e46285be835118a494a4dfd34cdd560d82f9a1f0732e03e576562408992",
+          "expectation": {
+            "outcome": "cancelled",
+            "terminal_success": false,
+            "recoverable_warning_count": 0,
+            "issue_family": "PARSER.SOURCE.CANCELLED"
+          }
+        }
+      ]
+    }
+  ]
+}

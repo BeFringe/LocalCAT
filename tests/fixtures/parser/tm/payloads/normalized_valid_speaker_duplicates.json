@@ -1,0 +1,16 @@
+[
+  {
+    "source": " Alpha ",
+    "speaker": " Alice Smith ",
+    "target": " 甲 "
+  },
+  {
+    "source": "Duplicate",
+    "speaker": null,
+    "target": "一"
+  },
+  {
+    "source": "Duplicate",
+    "target": "二"
+  }
+]

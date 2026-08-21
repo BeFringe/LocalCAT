@@ -1,0 +1,495 @@
+{
+  "formats": [
+    {
+      "cases": [
+        {
+          "byte_length": 761,
+          "covers": [
+            "valid"
+          ],
+          "expect": {
+            "accepted_ids": [
+              "tu-1",
+              "tu-2",
+              "tu-3",
+              "tu-4"
+            ],
+            "duplicate_sources": [
+              "Variant"
+            ],
+            "source_locale": "en-US",
+            "target_locale": "zh-CN",
+            "terminal": "success"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-valid-locale-fallback-variants",
+          "sha256": "8da7a025f5ce7c2acd0cd53db95542e34fa20522ae9bbb53beb230da1867826d",
+          "source": {
+            "path": "payloads/tmx_valid_locale_fallback_variants.tmx"
+          }
+        },
+        {
+          "byte_length": 704,
+          "covers": [
+            "record_warning"
+          ],
+          "expect": {
+            "accepted_ids": [
+              "tu-1"
+            ],
+            "terminal": "success_with_warnings",
+            "warning_ordinals": [
+              2,
+              3,
+              4
+            ],
+            "warning_reasons": [
+              "inline_xml",
+              "missing_locale_pair",
+              "ambiguous_base_fallback"
+            ]
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-record-warnings",
+          "sha256": "ec767367d80fe940640f04955aaa097a4b1dbece81a0bf175aa7bd14f4e91a4f",
+          "source": {
+            "path": "payloads/tmx_record_warnings.tmx"
+          }
+        },
+        {
+          "byte_length": 277,
+          "covers": [
+            "fatal_tail"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "provisional_ids": [
+              "tu-1"
+            ],
+            "terminal": "fatal"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-fatal-tail-after-valid-unit",
+          "sha256": "a9032f30ad05ba6092ce9b3aba6ada02e09faf1ff7f65d3e573a92a88e1422a3",
+          "source": {
+            "path": "payloads/tmx_fatal_tail.tmx"
+          }
+        },
+        {
+          "byte_length": 305,
+          "covers": [
+            "format_boundary"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "forbidden_constructs": [
+              "DTD",
+              "ENTITY"
+            ],
+            "terminal": "fatal"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-dtd-entity-boundary",
+          "sha256": "a0503be0bc3d4832cbb2fe7d00a9d6879e5be6c48c9c384b37f1289cf38169b6",
+          "source": {
+            "path": "payloads/tmx_dtd_entity.tmx"
+          }
+        },
+        {
+          "byte_length": 111,
+          "covers": [
+            "encoding"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "terminal": "fatal"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-invalid-utf8",
+          "sha256": "ef7f4a9f92d0d9959b92f431a98a82dba834cf652f1e8e69229f3b5b8c09330a",
+          "source": {
+            "hex": "3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d225554462d38223f3e3c746d783e3c626f64793e3c74753e3c74757620786d6c3a6c616e673d22656e2d5553223e3c7365673eff3c2f7365673e3c2f7475763e3c2f74753e3c2f626f64793e3c2f746d783e"
+          }
+        },
+        {
+          "byte_length": 1000195,
+          "covers": [
+            "limit",
+            "record_warning"
+          ],
+          "expect": {
+            "accepted_ids": [],
+            "limit_dimension": "decoded_segment_chars",
+            "observed": 1000001,
+            "terminal": "success_with_warnings",
+            "warning_ordinals": [
+              1
+            ],
+            "warning_reason": "segment_text_limit"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-segment-limit-warning",
+          "recipe_parameters": {
+            "segment_chars": 1000001
+          },
+          "sha256": "9762a013cdbe5a1631847f093999993dc847c8c3218c8d562553df8081870263",
+          "source": {
+            "recipe": {
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><tmx version=\"1.4\"><header srclang=\"en-US\"/><body><tu><tuv xml:lang=\"en-US\"><seg>"
+                },
+                {
+                  "count": 1000001,
+                  "repeat_utf8": "x"
+                },
+                {
+                  "utf8": "</seg></tuv><tuv xml:lang=\"zh-CN\"><seg>译文</seg></tuv></tu></body></tmx>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "byte_length": 104857601,
+          "covers": [
+            "limit"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "limit_dimension": "input_bytes",
+            "observed": 104857601,
+            "terminal": "fatal"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-input-byte-limit",
+          "recipe_parameters": {
+            "input_bytes": 104857601
+          },
+          "sha256": "2fa917e124a51e828f0f4e55282bad3a1c991edc0fd2449b23a9fc80d8a069f1",
+          "source": {
+            "recipe": {
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "<tmx>"
+                },
+                {
+                  "count": 104857590,
+                  "repeat_utf8": " "
+                },
+                {
+                  "utf8": "</tmx>"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "byte_length": 398,
+          "covers": [
+            "cancel"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "provisional_ids": [
+              "tu-1"
+            ],
+            "terminal": "cancelled"
+          },
+          "format_id": "tmx-level1-v1",
+          "id": "tmx-cancel-after-first-tu",
+          "sha256": "91ab074b88c516c4622b2100db63b4905f9953aed7edaccd5420acae5c8b8787",
+          "source": {
+            "recipe": {
+              "cancellation": {
+                "cancel_after": 1,
+                "checkpoint": "after_tu",
+                "physical_records": 3
+              },
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><tmx version=\"1.4\"><header srclang=\"en-US\"/><body>"
+                },
+                {
+                  "count": 3,
+                  "repeat_utf8": "<tu><tuv xml:lang=\"en-US\"><seg>Source</seg></tuv><tuv xml:lang=\"zh-CN\"><seg>译文</seg></tuv></tu>"
+                },
+                {
+                  "utf8": "</body></tmx>"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "effective_purpose": "language_resource.translation_memory",
+      "format_id": "tmx-level1-v1",
+      "limit_profile": {
+        "decoded_segment_chars": 1000000,
+        "input_bytes": 104857600,
+        "materialized_records": 100000,
+        "records": 1000000,
+        "streaming_input": true,
+        "structure_depth": 64
+      }
+    },
+    {
+      "cases": [
+        {
+          "byte_length": 224,
+          "covers": [
+            "valid"
+          ],
+          "expect": {
+            "accepted_ids": [
+              "record-1",
+              "record-2",
+              "record-3"
+            ],
+            "duplicate_sources": [
+              "Duplicate"
+            ],
+            "speaker_values": [
+              "Alice Smith",
+              "",
+              ""
+            ],
+            "terminal": "success"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-valid-speaker-and-duplicates",
+          "sha256": "d083abdc0c0a976ce0a2a9ab0603555b1f024b9131a889b00e52bef102c25159",
+          "source": {
+            "path": "payloads/normalized_valid_speaker_duplicates.json"
+          }
+        },
+        {
+          "byte_length": 442,
+          "covers": [
+            "record_warning"
+          ],
+          "expect": {
+            "accepted_ids": [
+              "record-1",
+              "record-6",
+              "record-7"
+            ],
+            "terminal": "success_with_warnings",
+            "warning_ordinals": [
+              2,
+              3,
+              4,
+              5
+            ],
+            "warning_reasons": [
+              "not_object",
+              "empty_source",
+              "invalid_target",
+              "non_string_speaker"
+            ]
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-record-warnings",
+          "sha256": "fb4b17a325a5f32810cebd5e5c91d8d11273d23f9f2ce13b3021944353c561ac",
+          "source": {
+            "path": "payloads/normalized_record_warnings.json"
+          }
+        },
+        {
+          "byte_length": 57,
+          "covers": [
+            "format_boundary"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "root_type": "object",
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-non-array-root",
+          "sha256": "148a7ee5eb7288d9760a6d1247e3decc65b28e5ccbfb3f0ae28bdabebbf56e52",
+          "source": {
+            "path": "payloads/normalized_non_array_root.json"
+          }
+        },
+        {
+          "byte_length": 69,
+          "covers": [
+            "fatal_tail"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "provisional_ids": [],
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-fatal-tail-after-valid-row",
+          "sha256": "59cb456a707e4462bf0ec27985b8e59674afde5bb588c9f75eff7e18ed57ea60",
+          "source": {
+            "path": "payloads/normalized_fatal_tail.json"
+          }
+        },
+        {
+          "byte_length": 29,
+          "covers": [
+            "encoding"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-invalid-utf8",
+          "sha256": "67b1770be39e913c3e6580737ec1f596fd996f826a8c87acc05342ac628c4b1e",
+          "source": {
+            "hex": "5b7b22736f75726365223a22ff222c22746172676574223a2274227d5d"
+          }
+        },
+        {
+          "byte_length": 32,
+          "covers": [
+            "encoding"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-utf8-bom-rejected",
+          "sha256": "9a7ab26d0fa12fffc314a8ece8a62bc75671ccd4bae49bf23a075027740cb1db",
+          "source": {
+            "hex": "efbbbf5b7b22736f75726365223a2273222c22746172676574223a2274227d5d"
+          }
+        },
+        {
+          "byte_length": 104857601,
+          "covers": [
+            "limit"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "limit_dimension": "input_bytes",
+            "observed": 104857601,
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-input-byte-limit",
+          "recipe_parameters": {
+            "input_bytes": 104857601
+          },
+          "sha256": "795cd8b451eff200038cf96cf9c38990719ed4b36ef98ac2194c10f341570303",
+          "source": {
+            "recipe": {
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "[\""
+                },
+                {
+                  "count": 104857597,
+                  "repeat_utf8": "x"
+                },
+                {
+                  "utf8": "\"]"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "byte_length": 2800029,
+          "covers": [
+            "limit"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "limit_dimension": "records",
+            "observed": 100001,
+            "terminal": "fatal"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-record-limit",
+          "recipe_parameters": {
+            "records": 100001
+          },
+          "sha256": "69abf548281ddee3099170e9305976c5c920b9cdc460ceb584356b49d8d868e6",
+          "source": {
+            "recipe": {
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "["
+                },
+                {
+                  "count": 100000,
+                  "repeat_utf8": "{\"source\":\"s\",\"target\":\"t\"},"
+                },
+                {
+                  "utf8": "{\"source\":\"s\",\"target\":\"t\"}]"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "byte_length": 85,
+          "covers": [
+            "cancel"
+          ],
+          "expect": {
+            "commit_authorized": false,
+            "provisional_ids": [
+              "record-1"
+            ],
+            "terminal": "cancelled"
+          },
+          "format_id": "normalized-tm-json-v1",
+          "id": "normalized-cancel-after-first-record",
+          "sha256": "833886f091520e29a386ac861c5d68097a700f6e74e353adb1d99a0ed2a1847e",
+          "source": {
+            "recipe": {
+              "cancellation": {
+                "cancel_after": 1,
+                "checkpoint": "after_record",
+                "physical_records": 3
+              },
+              "kind": "concat-v1",
+              "parts": [
+                {
+                  "utf8": "["
+                },
+                {
+                  "count": 2,
+                  "repeat_utf8": "{\"source\":\"s\",\"target\":\"t\"},"
+                },
+                {
+                  "utf8": "{\"source\":\"s\",\"target\":\"t\"}]"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "effective_purpose": "language_resource.translation_memory",
+      "format_id": "normalized-tm-json-v1",
+      "limit_profile": {
+        "decoded_field_chars": 104857600,
+        "input_bytes": 104857600,
+        "materialized_records": 100000,
+        "records": 100000,
+        "streaming_input": false,
+        "structure_depth": 64
+      }
+    }
+  ],
+  "provenance": {
+    "external_inputs": [],
+    "kind": "synthetic",
+    "redistributable": true
+  },
+  "purpose": "language_resource.translation_memory",
+  "schema_version": 1
+}
