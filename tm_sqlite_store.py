@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 import hashlib
@@ -26,11 +26,33 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import Any, NoReturn, Protocol, SupportsIndex, cast
+from typing import Any, NoReturn, Protocol, cast
 import unicodedata
 import uuid
 
 import tm_contracts as contract_module
+import tm_candidate_store_contracts as candidate_contracts
+from tm_candidate_store_contracts import (
+    CANDIDATE_INDEX_VERSION,
+    CANDIDATE_PROOF_BLOCK_SIZE,
+    CANDIDATE_PROOF_BLOCK_VERSION_V1,
+    CandidateProofIndexError,
+    SQLiteCandidateProofBlock,
+    SQLiteCandidateProofDensePhase1,
+    SQLiteCandidateProofDensePhase2,
+    SQLiteCandidateProofRecord,
+    SQLiteCandidateProofSnapshot,
+    SQLiteCandidateRecallSnapshot,
+    SQLiteCandidateRecord,
+    SQLiteCandidateWritePlan,
+    SQLiteGramRow,
+    SQLiteStoreSchemaError,
+    _CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
+    _SQLiteCandidateProofDenseReceipt,
+    build_candidate_write_plan,
+    character_ngram_frequencies,
+    unique_character_ngrams,
+)
 from text_matcher import (
     TEXT_MATCHER_SEMANTICS_VERSION,
     UNICODE_VERSION,
@@ -254,9 +276,6 @@ TM_LEGACY_SCHEMA_VERSION = 1
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
-CANDIDATE_INDEX_VERSION = "candidate-index-v1"
-CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
-CANDIDATE_PROOF_BLOCK_SIZE = 256
 BUSY_TIMEOUT_MS = 5000
 _CANDIDATE_QUERY_CHUNK_SIZE = 256
 _CANDIDATE_SEED_POSTING_CAP = 4096
@@ -649,14 +668,6 @@ CREATE VIRTUAL TABLE tm_fts USING fts5(
 """
 
 
-class SQLiteStoreSchemaError(RuntimeError):
-    """A safe, resource-local schema or connection policy failure."""
-
-
-class CandidateProofIndexError(ValueError):
-    """One canonical candidate-proof fact failed exact recomputation."""
-
-
 class SQLiteStoreLifecycleError(SQLiteStoreSchemaError):
     """A safe lifecycle failure scoped to one resource generation."""
 
@@ -688,164 +699,6 @@ class SchemaUpgradeAncestryError(SQLiteStoreSchemaError):
         super().__init__(code)
 
 
-@dataclass(frozen=True)
-class SQLiteCandidateRecord:
-    """Folded source input exposed to a pre-transaction plan builder."""
-
-    origin_ordinal: int
-    source_fold_v1: str
-
-    def __post_init__(self) -> None:
-        if type(self.origin_ordinal) is not int or self.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(self.source_fold_v1) is not str or not self.source_fold_v1:
-            raise ValueError("source_fold_v1 must be a non-empty string")
-
-
-@dataclass(frozen=True)
-class SQLiteGramRow:
-    """One declarative gram row for the store-owned transaction."""
-
-    origin_ordinal: int
-    gram_size: int
-    gram: str
-    term_frequency: int = 1
-
-    def __post_init__(self) -> None:
-        if type(self.origin_ordinal) is not int or self.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(self.gram_size) is not int or self.gram_size not in {1, 2, 3}:
-            raise ValueError("gram_size must be 1, 2, or 3")
-        if type(self.gram) is not str or len(self.gram) != self.gram_size:
-            raise ValueError("gram length must equal gram_size")
-        if type(self.term_frequency) is not int or self.term_frequency < 1:
-            raise ValueError("term_frequency must be a positive integer")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateWritePlan:
-    """Closed candidate rows returned without access to SQLite state."""
-
-    gram_rows: tuple[SQLiteGramRow, ...] = ()
-    fts_origin_ordinals: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if type(self.gram_rows) is not tuple:
-            raise TypeError("gram_rows must contain SQLiteGramRow values")
-        gram_keys: list[tuple[int, int, str]] = []
-        for row in self.gram_rows:
-            if type(row) is not SQLiteGramRow:
-                raise TypeError("gram_rows must contain SQLiteGramRow values")
-            origin_ordinal = row.origin_ordinal
-            gram_size = row.gram_size
-            gram = row.gram
-            term_frequency = row.term_frequency
-            if type(origin_ordinal) is not int or origin_ordinal < 0:
-                raise ValueError(
-                    "origin_ordinal must be a non-negative integer"
-                )
-            if type(gram_size) is not int or gram_size not in {1, 2, 3}:
-                raise ValueError("gram_size must be 1, 2, or 3")
-            if type(gram) is not str or len(gram) != gram_size:
-                raise ValueError("gram length must equal gram_size")
-            if type(term_frequency) is not int or term_frequency < 1:
-                raise ValueError("term_frequency must be a positive integer")
-            gram_keys.append((origin_ordinal, gram_size, gram))
-        if len(set(gram_keys)) != len(gram_keys):
-            raise ValueError("gram_rows must be unique")
-        if type(self.fts_origin_ordinals) is not tuple or any(
-            type(origin_ordinal) is not int or origin_ordinal < 0
-            for origin_ordinal in self.fts_origin_ordinals
-        ):
-            raise ValueError(
-                "fts_origin_ordinals must contain non-negative integers"
-            )
-        if len(set(self.fts_origin_ordinals)) != len(
-            self.fts_origin_ordinals
-        ):
-            raise ValueError("fts_origin_ordinals must be unique")
-
-
-def unique_character_ngrams(
-    folded_text: str,
-    gram_size: int,
-) -> tuple[str, ...]:
-    """Return first-occurrence unique code-point grams without folding."""
-
-    if type(folded_text) is not str:
-        raise TypeError("folded_text must be a built-in string")
-    if type(gram_size) is not int:
-        raise TypeError("gram_size must be a built-in integer")
-    if gram_size not in {1, 2, 3}:
-        raise ValueError("gram_size must be 1, 2, or 3")
-    seen: set[str] = set()
-    grams: list[str] = []
-    for offset in range(max(0, len(folded_text) - gram_size + 1)):
-        gram = folded_text[offset : offset + gram_size]
-        if gram not in seen:
-            seen.add(gram)
-            grams.append(gram)
-    return tuple(grams)
-
-
-def character_ngram_frequencies(
-    folded_text: str,
-    gram_size: int,
-) -> tuple[tuple[str, int], ...]:
-    """Return exact multiset frequencies in first-occurrence gram order."""
-
-    if type(folded_text) is not str:
-        raise TypeError("folded_text must be a built-in string")
-    if type(gram_size) is not int:
-        raise TypeError("gram_size must be a built-in integer")
-    if gram_size not in {1, 2, 3}:
-        raise ValueError("gram_size must be 1, 2, or 3")
-    frequencies: dict[str, int] = {}
-    for offset in range(max(0, len(folded_text) - gram_size + 1)):
-        gram = folded_text[offset : offset + gram_size]
-        frequencies[gram] = frequencies.get(gram, 0) + 1
-    return tuple(frequencies.items())
-
-
-def build_candidate_write_plan(
-    records: tuple[SQLiteCandidateRecord, ...],
-    *,
-    fts5_available: bool,
-) -> SQLiteCandidateWritePlan:
-    """Build the store-owned mandatory candidate plan for one generation."""
-
-    if type(records) is not tuple:
-        raise TypeError("records must be a built-in tuple")
-    if type(fts5_available) is not bool:
-        raise TypeError("fts5_available must be a built-in bool")
-    prepared: list[tuple[int, str]] = []
-    for record in records:
-        if type(record) is not SQLiteCandidateRecord:
-            raise TypeError("records must contain exact SQLiteCandidateRecord values")
-        if type(record.origin_ordinal) is not int or record.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(record.source_fold_v1) is not str or not record.source_fold_v1:
-            raise ValueError("source_fold_v1 must be a non-empty built-in string")
-        prepared.append((record.origin_ordinal, record.source_fold_v1))
-    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    return SQLiteCandidateWritePlan(
-        gram_rows=tuple(
-            SQLiteGramRow(origin_ordinal, gram_size, gram, term_frequency)
-            for origin_ordinal, folded_source in prepared
-            for gram_size in gram_sizes
-            for gram, term_frequency in character_ngram_frequencies(
-                folded_source,
-                gram_size,
-            )
-        ),
-        fts_origin_ordinals=(
-            tuple(origin_ordinal for origin_ordinal, _source in prepared)
-            if fts5_available
-            else ()
-        ),
-    )
-
-
 def _build_fts5_match_expression(trigrams: tuple[str, ...]) -> str:
     return " OR ".join(
         f'"{trigram.replace(chr(34), chr(34) * 2)}"'
@@ -856,195 +709,6 @@ def _build_fts5_match_expression(trigrams: tuple[str, ...]) -> str:
 def _chunked(values: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
     for offset in range(0, len(values), _CANDIDATE_QUERY_CHUNK_SIZE):
         yield values[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateRecallSnapshot:
-    """Private-value snapshot returned by the leased candidate read seam."""
-
-    fts5_available: bool
-    stage_matches: tuple[tuple[str, tuple[tuple[int, int], ...]], ...]
-    folded_sources: tuple[tuple[int, str], ...]
-
-    def __post_init__(self) -> None:
-        if type(self.fts5_available) is not bool:
-            raise TypeError("fts5_available must be a built-in bool")
-        if type(self.stage_matches) is not tuple:
-            raise TypeError("stage_matches must be a built-in tuple")
-        stage_names: list[str] = []
-        for stage_entry in self.stage_matches:
-            if type(stage_entry) is not tuple or len(stage_entry) != 2:
-                raise TypeError("stage_matches must contain built-in pairs")
-            stage_name, matches = stage_entry
-            if type(stage_name) is not str or type(matches) is not tuple:
-                raise TypeError("candidate stage snapshot values are invalid")
-            if stage_name not in {"FTS_TRIGRAM", "GRAM_3", "GRAM_2", "GRAM_1"}:
-                raise ValueError("candidate stage snapshot name is invalid")
-            stage_names.append(stage_name)
-            record_ids: list[int] = []
-            for match in matches:
-                if type(match) is not tuple or len(match) != 2:
-                    raise TypeError("candidate stage matches must be pairs")
-                record_id, matched_count = match
-                if (
-                    type(record_id) is not int
-                    or record_id < 1
-                    or type(matched_count) is not int
-                    or matched_count < 0
-                ):
-                    raise ValueError("candidate stage match is invalid")
-                if matched_count < 1:
-                    raise ValueError("candidate stage overlap is invalid")
-                record_ids.append(record_id)
-            if len(set(record_ids)) != len(record_ids):
-                raise ValueError("candidate stage matches must be unique")
-        if len(set(stage_names)) != len(stage_names):
-            raise ValueError("candidate stage snapshot names must be unique")
-        if type(self.folded_sources) is not tuple:
-            raise TypeError("folded_sources must be a built-in tuple")
-        source_ids: list[int] = []
-        for source_entry in self.folded_sources:
-            if type(source_entry) is not tuple or len(source_entry) != 2:
-                raise TypeError("folded_sources must contain built-in pairs")
-            record_id, folded_source = source_entry
-            if (
-                type(record_id) is not int
-                or record_id < 1
-                or type(folded_source) is not str
-                or not folded_source
-            ):
-                raise ValueError("candidate folded source is invalid")
-            source_ids.append(record_id)
-        if len(set(source_ids)) != len(source_ids):
-            raise ValueError("candidate folded sources must be unique")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofBlock:
-    """One verified block bound input without any record source text."""
-
-    block_id: int
-    first_record_id: int
-    last_record_id: int
-    record_count: int
-    min_source_fold_length: int
-    max_source_fold_length: int
-    character_intersection_upper: int
-    bigram_intersection_upper: int
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofRecord:
-    """Exact record-bound facts derived from relevant proof rows only."""
-
-    record_id: int
-    block_id: int
-    source_fold_length: int
-    character_multiset_intersection: int
-    bigram_multiset_intersection: int
-
-
-_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY = object()
-
-
-class _SQLiteCandidateProofDenseReceipt:
-    """Opaque store-issued identity binding for one dense projection."""
-
-    __slots__ = (
-        "phase",
-        "binding_digest",
-        "item_count",
-        "record_ids",
-        "source_folds_v1",
-        "source_fold_lengths",
-        "bigram_multiset_intersections",
-        "_sealed",
-    )
-
-    phase: str
-    binding_digest: str
-    item_count: int
-    record_ids: tuple[int, ...] | None
-    source_folds_v1: tuple[str, ...] | None
-    source_fold_lengths: tuple[int, ...]
-    bigram_multiset_intersections: tuple[int, ...] | None
-    _sealed: bool
-
-    def __init__(
-        self,
-        *,
-        phase: str,
-        binding_digest: str,
-        item_count: int,
-        record_ids: tuple[int, ...] | None,
-        source_folds_v1: tuple[str, ...] | None,
-        source_fold_lengths: tuple[int, ...],
-        bigram_multiset_intersections: tuple[int, ...] | None,
-        _factory_key: object,
-    ) -> None:
-        if _factory_key is not _CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY:
-            raise TypeError("dense proof receipts are store-owned")
-        self._sealed = False
-        self.phase = phase
-        self.binding_digest = binding_digest
-        self.item_count = item_count
-        self.record_ids = record_ids
-        self.source_folds_v1 = source_folds_v1
-        self.source_fold_lengths = source_fold_lengths
-        self.bigram_multiset_intersections = bigram_multiset_intersections
-        self._sealed = True
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_sealed", False):
-            raise AttributeError("dense proof receipts are immutable")
-        object.__setattr__(self, name, value)
-
-    def __copy__(self) -> _SQLiteCandidateProofDenseReceipt:
-        return self
-
-    def __deepcopy__(
-        self,
-        memo: dict[int, object],
-    ) -> _SQLiteCandidateProofDenseReceipt:
-        memo[id(self)] = self
-        return self
-
-    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
-        del protocol
-        raise TypeError("dense proof receipts cannot be serialized")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofDensePhase1:
-    """Length and exact-bigram facts from the committed dense phase one."""
-
-    source_fold_lengths: tuple[int, ...]
-    bigram_multiset_intersections: tuple[int, ...]
-    binding_digest: str
-    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofDensePhase2:
-    """Strict proof-only folded-source projection from committed phase two."""
-
-    record_ids: tuple[int, ...]
-    source_folds_v1: tuple[str, ...]
-    source_fold_lengths: tuple[int, ...]
-    binding_digest: str
-    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofSnapshot:
-    """Seed and block frontiers for one query generation, without record facts."""
-
-    index_kind: str
-    seed_stages: tuple[tuple[str, tuple[int, ...]], ...]
-    blocks: tuple[SQLiteCandidateProofBlock, ...]
-    total_record_count: int
-    head_revision: int
-    query_maxima_digest: str
 
 
 type _PreparedRecordDraft = tuple[
@@ -5607,6 +5271,16 @@ class SQLiteTMStore:
         return self._coordinator
 
     @property
+    def resource_id(self) -> str:
+        """Expose only the immutable resource identity required by recall ports."""
+
+        return self._coordinator.resource_id
+
+    @property
+    def candidate_port_scope(self) -> str:
+        return "STORE"
+
+    @property
     def source_binding_monitor(self) -> SourceBindingMonitor:
         return self._source_binding_monitor
 
@@ -8872,20 +8546,11 @@ def _validate_candidate_proof_dense_phase1_result(
         total_record_count=total_record_count,
         query_maxima_digest=query_maxima_digest,
     )
-    receipt = getattr(value, "_receipt", None)
-    if (
-        type(receipt) is not _SQLiteCandidateProofDenseReceipt
-        or receipt.phase != "DENSE_PHASE1_V1"
-        or receipt.binding_digest != expected_binding
-        or receipt.binding_digest != value.binding_digest
-        or receipt.item_count != total_record_count
-        or receipt.record_ids is not None
-        or receipt.source_folds_v1 is not None
-        or receipt.source_fold_lengths is not value.source_fold_lengths
-        or receipt.bigram_multiset_intersections
-        is not value.bigram_multiset_intersections
-    ):
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    candidate_contracts.validate_candidate_proof_dense_phase1_result(
+        value,
+        binding_digest=expected_binding,
+        total_record_count=total_record_count,
+    )
 
 
 def _validate_candidate_proof_dense_phase2_result(
@@ -8897,23 +8562,12 @@ def _validate_candidate_proof_dense_phase2_result(
 ) -> None:
     """Accept only the exact store-issued ordered phase-two projection."""
 
-    if type(value) is not SQLiteCandidateProofDensePhase2:
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-    receipt = getattr(value, "_receipt", None)
-    if (
-        type(receipt) is not _SQLiteCandidateProofDenseReceipt
-        or receipt.phase != "DENSE_PHASE2_V1"
-        or receipt.binding_digest != binding_digest
-        or receipt.binding_digest != value.binding_digest
-        or receipt.item_count != len(record_ids)
-        or receipt.record_ids is not value.record_ids
-        or receipt.source_folds_v1 is not value.source_folds_v1
-        or receipt.source_fold_lengths is not value.source_fold_lengths
-        or receipt.bigram_multiset_intersections is not None
-        or value.record_ids != record_ids
-        or value.source_fold_lengths != source_fold_lengths
-    ):
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    candidate_contracts.validate_candidate_proof_dense_phase2_result(
+        value,
+        binding_digest=binding_digest,
+        record_ids=record_ids,
+        source_fold_lengths=source_fold_lengths,
+    )
 
 
 def _validate_candidate_proof_dense_binding(
@@ -11286,6 +10940,11 @@ class SQLiteTMQueryView:
         return self._lease.stage.resource_identity.resource_id
 
     @property
+    def candidate_port_scope(self) -> str:
+        self._check_lifetime()
+        return "QUERY_VIEW"
+
+    @property
     def generation(self) -> int:
         self._check_lifetime()
         return self._lease.generation
@@ -11501,6 +11160,46 @@ class SQLiteTMQueryView:
             record_ids=tuple(record_ids),
             source_fold_lengths=tuple(source_fold_lengths),
             connection=self._candidate_connection(),
+        )
+
+    def validate_candidate_proof_dense_phase1_result(
+        self,
+        value: object,
+        *,
+        folded_query: str,
+        blocks: tuple[SQLiteCandidateProofBlock, ...],
+        head_revision: int,
+        total_record_count: int,
+        query_maxima_digest: str,
+    ) -> None:
+        """Validate a dense phase-one result on this captured generation."""
+
+        _validate_candidate_proof_dense_phase1_result(
+            value,
+            view=self,
+            folded_query=folded_query,
+            blocks=blocks,
+            head_revision=head_revision,
+            total_record_count=total_record_count,
+            query_maxima_digest=query_maxima_digest,
+        )
+
+    def validate_candidate_proof_dense_phase2_result(
+        self,
+        value: object,
+        *,
+        binding_digest: str,
+        record_ids: tuple[int, ...],
+        source_fold_lengths: tuple[int, ...],
+    ) -> None:
+        """Validate a dense phase-two result on this captured generation."""
+
+        self._check_lifetime()
+        _validate_candidate_proof_dense_phase2_result(
+            value,
+            binding_digest=binding_digest,
+            record_ids=record_ids,
+            source_fold_lengths=source_fold_lengths,
         )
 
     def health(self) -> StoreHealth:

@@ -39,32 +39,11 @@ _CANDIDATE_NAMES = (
     "build_candidate_write_plan",
     "unique_character_ngrams",
 )
-_EXPECTED_INDEX_STORE_IMPORTS = (
-    ("SQLiteCandidateRecord", None),
-    ("SQLiteCandidateProofBlock", None),
-    ("SQLiteCandidateProofDensePhase1", None),
-    ("SQLiteCandidateProofDensePhase2", None),
-    ("SQLiteCandidateProofRecord", None),
-    ("SQLiteCandidateProofSnapshot", None),
-    ("SQLiteCandidateRecallSnapshot", None),
-    ("SQLiteCandidateWritePlan", None),
-    ("SQLiteTMStore", None),
-    ("SQLiteTMQueryView", None),
-    ("SQLiteStoreSchemaError", None),
-    ("CANDIDATE_PROOF_BLOCK_SIZE", None),
-    ("CANDIDATE_PROOF_BLOCK_VERSION_V1", None),
-    ("_validate_candidate_proof_dense_phase1_result", None),
-    ("_validate_candidate_proof_dense_phase2_result", None),
-    ("build_candidate_write_plan", "_store_build_candidate_write_plan"),
-    ("unique_character_ngrams", "_store_unique_character_ngrams"),
-)
+_EXPECTED_INDEX_STORE_IMPORTS: tuple[tuple[str, str | None], ...] = ()
 _EXPECTED_STORE_CONSUMERS = {
     "editor_tm_adapter.py": (("SQLiteStoreSchemaError", None),),
     "resource_importer.py": (("SQLiteStoreSchemaError", None),),
     "tm_application_composition.py": (("SQLiteStoreSchemaError", None),),
-    "tm_candidate_index.py": tuple(
-        item for item in _EXPECTED_INDEX_STORE_IMPORTS if item[0] in _CANDIDATE_NAMES
-    ),
     "tm_engine.py": (("SQLiteStoreSchemaError", None),),
     "tm_migration.py": (
         ("SQLiteStoreSchemaError", None),
@@ -306,7 +285,7 @@ class TMStoreModuleExtractionCharacterizationTests(unittest.TestCase):
                 self.assertEqual(suite.countTestCases(), 1)
                 self.assertNotIn("_FailedTest", repr(suite))
 
-    def test_current_source_evidence_baseline_is_explicit_and_current(self) -> None:
+    def test_staged_current_source_evidence_staleness_is_explicit(self) -> None:
         gate_c = json.loads(
             (_ROOT / "tests/fixtures/retrieval_gate_c_roots_v1.json").read_text(
                 encoding="utf-8"
@@ -379,7 +358,7 @@ class TMStoreModuleExtractionCharacterizationTests(unittest.TestCase):
                 for item in release["source_files"]
             )
         )
-        self.assertEqual(
+        self.assertNotEqual(
             benchmark_implementation_fingerprint(_ROOT),
             benchmark["implementation_fingerprint"],
         )
@@ -400,8 +379,10 @@ class TMStoreModuleExtractionCharacterizationTests(unittest.TestCase):
                     "editor_controller.py",
                     "qt_editor.py",
                     "qt_settings_dialog.py",
+                    "tm_candidate_index.py",
+                    "tm_sqlite_store.py",
                 ),
-                "fault": (),
+                "fault": ("tm_sqlite_store.py",),
             },
         )
 

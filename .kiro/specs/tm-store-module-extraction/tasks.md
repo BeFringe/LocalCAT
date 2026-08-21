@@ -49,25 +49,25 @@ Wave 0 治理与 characterization
 
 ## Wave 1：叶合同与中立 Port
 
-- [ ] 2.1 新建 `tm_candidate_store_contracts.py`
+- [x] 2.1 新建 `tm_candidate_store_contracts.py`
   - 移动 candidate 常量、错误、DTO、opaque dense receipt 与纯 validators/builders，不复制定义。
   - 叶模块不导入 sqlite/store/index/retrieval/Engine/Application/Qt。
   - exact built-in/frozen/tuple/nested invariants 与 stable codes 保持不变。
   - _Requirements: 2.1–2.5, 8.1–8.4_
 
-- [ ] 2.2 保留 `tm_sqlite_store` 同一对象兼容导出
+- [x] 2.2 保留 `tm_sqlite_store` 同一对象兼容导出
   - 既有 candidate class/function/constant 名称继续可导入。
   - 对每个名称证明 `tm_sqlite_store.X is tm_candidate_store_contracts.X`。
   - 不创建 compatibility subclass、复制 dataclass 或平行 validator。
   - _Requirements: 2.5, 7.1–7.4_
 
-- [ ] 2.3 让 `tm_candidate_index.py` 只消费中立 port
+- [x] 2.3 让 `tm_candidate_index.py` 只消费中立 port
   - 移除 concrete `SQLiteTMStore` / `SQLiteTMQueryView` import 与 exact-type 准入。
   - 用 `CandidateRecallPort` / `CandidateProofPort` 验证行为、resource identity 和返回 DTO。
   - 保持 budget/stage/frontier/scorer/threshold/top-k algorithm owner 不变。
   - _Requirements: 3.1–3.4_
 
-- [ ] 2.4 建立 dependency/object-identity/forgery guards
+- [x] 2.4 建立 dependency/object-identity/forgery guards
   - 真实 production tree 证明 leaf、algorithm、store 依赖方向。
   - hostile port、forged nested DTO、resource mismatch 在首次 storage/scorer 前拒绝。
   - FTS5/fallback 与 proof report exact equivalence fresh 通过。

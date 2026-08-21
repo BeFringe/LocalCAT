@@ -7,7 +7,10 @@ import heapq
 import math
 import re
 
-from tm_sqlite_store import (
+from tm_candidate_store_contracts import (
+    CandidatePostingPort,
+    CandidateProofPort,
+    CandidateRecallPort,
     SQLiteCandidateRecord,
     SQLiteCandidateProofBlock,
     SQLiteCandidateProofDensePhase1,
@@ -16,15 +19,16 @@ from tm_sqlite_store import (
     SQLiteCandidateProofSnapshot,
     SQLiteCandidateRecallSnapshot,
     SQLiteCandidateWritePlan,
-    SQLiteTMStore,
-    SQLiteTMQueryView,
     SQLiteStoreSchemaError,
     CANDIDATE_PROOF_BLOCK_SIZE,
     CANDIDATE_PROOF_BLOCK_VERSION_V1,
-    _validate_candidate_proof_dense_phase1_result,
-    _validate_candidate_proof_dense_phase2_result,
-    build_candidate_write_plan as _store_build_candidate_write_plan,
-    unique_character_ngrams as _store_unique_character_ngrams,
+    build_candidate_write_plan as _contract_build_candidate_write_plan,
+    require_candidate_posting_port,
+    require_candidate_proof_port,
+    require_candidate_recall_port,
+    unique_character_ngrams as _contract_unique_character_ngrams,
+    validate_candidate_proof_dense_phase1_result,
+    validate_candidate_proof_dense_phase2_result,
 )
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
@@ -119,9 +123,9 @@ def _copy_candidate_recall_snapshot(
 
 
 def unique_character_ngrams(folded_text: str, gram_size: int) -> tuple[str, ...]:
-    """Delegate to the store-owned canonical gram builder."""
+    """Delegate to the neutral canonical gram builder."""
 
-    return _store_unique_character_ngrams(folded_text, gram_size)
+    return _contract_unique_character_ngrams(folded_text, gram_size)
 
 
 def unique_character_trigrams(folded_query: str) -> tuple[str, ...]:
@@ -135,9 +139,9 @@ def build_candidate_write_plan(
     *,
     fts5_available: bool,
 ) -> SQLiteCandidateWritePlan:
-    """Delegate to the store-owned mandatory candidate-plan builder."""
+    """Delegate to the neutral mandatory candidate-plan builder."""
 
-    return _store_build_candidate_write_plan(
+    return _contract_build_candidate_write_plan(
         records,
         fts5_available=fts5_available,
     )
@@ -160,6 +164,37 @@ def build_fts5_match_expression(trigrams: tuple[str, ...]) -> str:
         seen.add(trigram)
         phrases.append(f'"{trigram.replace(chr(34), chr(34) * 2)}"')
     return " OR ".join(phrases)
+
+
+def _copy_fts_candidate_ids(value: object) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if type(value) is not tuple or any(
+        type(record_id) is not int or record_id < 1 for record_id in value
+    ):
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+    return tuple(value)
+
+
+def _copy_gram_candidate_overlaps(
+    value: object,
+) -> tuple[tuple[int, int], ...]:
+    if type(value) is not tuple:
+        raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+    copied: list[tuple[int, int]] = []
+    for entry in value:
+        if type(entry) is not tuple or len(entry) != 2:
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+        record_id, matched_count = entry
+        if (
+            type(record_id) is not int
+            or record_id < 1
+            or type(matched_count) is not int
+            or matched_count < 1
+        ):
+            raise SQLiteStoreSchemaError("STORE.CANDIDATE_EVIDENCE_INVALID")
+        copied.append((record_id, matched_count))
+    return tuple(copied)
 
 
 @dataclass(frozen=True)
@@ -311,13 +346,12 @@ class GramPostingIndex:
 
     def candidates(
         self,
-        store: SQLiteTMStore,
+        store: CandidatePostingPort,
         folded_query: str,
         *,
         limit: int,
     ) -> GramCandidateResult:
-        if type(store) is not SQLiteTMStore:
-            raise TypeError("store must be SQLiteTMStore")
+        posting_port = require_candidate_posting_port(store)
         if type(folded_query) is not str:
             raise TypeError("folded_query must be a built-in string")
         if type(limit) is not int:
@@ -359,9 +393,11 @@ class GramPostingIndex:
             for gram in unique_character_ngrams(folded_query, gram_size)
         )
         cap = min(limit, self._hard_cap)
-        overlaps = store.gram_candidate_overlaps(
-            query_postings,
-            candidate_cap=cap,
+        overlaps = _copy_gram_candidate_overlaps(
+            posting_port.gram_candidate_overlaps(
+                query_postings,
+                candidate_cap=cap,
+            )
         )
         query_count = len(query_postings)
         evidence = tuple(
@@ -407,13 +443,12 @@ class FTS5TrigramIndex:
 
     def candidates(
         self,
-        store: SQLiteTMStore,
+        store: CandidatePostingPort,
         folded_query: str,
     ) -> FTS5CandidateResult:
         """Return deterministic candidate identities; never fold or fallback."""
 
-        if type(store) is not SQLiteTMStore:
-            raise TypeError("store must be SQLiteTMStore")
+        posting_port = require_candidate_posting_port(store)
         trigrams = unique_character_trigrams(folded_query)
         if not self._available:
             return FTS5CandidateResult(
@@ -429,10 +464,10 @@ class FTS5TrigramIndex:
                 available=False,
                 unavailable_code=FTS5_QUERY_TOO_SHORT_CODE,
             )
-        record_ids = (
-            store.fts5_candidate_ids(build_fts5_match_expression(trigrams))
+        record_ids = _copy_fts_candidate_ids(
+            posting_port.fts5_candidate_ids(build_fts5_match_expression(trigrams))
             if len(trigrams) <= 256
-            else store.fts5_candidate_ids_for_trigrams(trigrams)
+            else posting_port.fts5_candidate_ids_for_trigrams(trigrams)
         )
         if record_ids is None:
             return FTS5CandidateResult(
@@ -509,7 +544,7 @@ def _prepare_candidate_query(
 
 
 def _candidate_recall_snapshot_or_fail(
-    source: SQLiteTMStore | SQLiteTMQueryView,
+    source: CandidateRecallPort,
     prepared: _PreparedCandidateQuery,
 ) -> SQLiteCandidateRecallSnapshot:
     try:
@@ -1431,7 +1466,7 @@ class CandidateProofSession:
         self,
         *,
         resource_id: str,
-        view: SQLiteTMQueryView,
+        view: CandidateProofPort,
         folded_query: str,
         minimum_similarity: float,
         result_limit: int,
@@ -1444,14 +1479,16 @@ class CandidateProofSession:
             raise TypeError("minimum_similarity must be a finite float")
         if not 0.0 <= minimum_similarity <= 1.0:
             raise ValueError("minimum_similarity must be in [0, 1]")
-        if type(view) is not SQLiteTMQueryView or view.resource_id != resource_id:
-            raise TypeError("proof view must be the resource's exact query view")
+        proof_port = require_candidate_proof_port(
+            view,
+            resource_id=resource_id,
+        )
         if type(completion_policy) is not str or completion_policy not in {
             PRODUCTION_COMPLETION_POLICY,
             ORACLE_FULL_COMPLETION_POLICY,
         }:
             raise ValueError("candidate proof completion policy is invalid")
-        self._view = view
+        self._view = proof_port
         self._resource_id = resource_id
         self._folded_query = folded_query
         self._minimum_similarity = minimum_similarity
@@ -1460,7 +1497,7 @@ class CandidateProofSession:
         self._budget = candidate_budget_v1(result_limit)
         try:
             snapshot = _copy_proof_snapshot(
-                view.candidate_proof_snapshot(
+                proof_port.candidate_proof_snapshot(
                     folded_query=folded_query,
                     seed_limit=min(256, self._budget),
                 )
@@ -1557,9 +1594,13 @@ class CandidateProofSession:
             total_record_count=self._snapshot.total_record_count,
             query_maxima_digest=self._snapshot.query_maxima_digest,
         )
-        _validate_candidate_proof_dense_phase1_result(
+        validate_candidate_proof_dense_phase1_result(
             phase1,
-            view=self._view,
+            binding_digest=phase1.binding_digest,
+            total_record_count=self._snapshot.total_record_count,
+        )
+        self._view.validate_candidate_proof_dense_phase1_result(
+            phase1,
             folded_query=self._folded_query,
             blocks=self._snapshot.blocks,
             head_revision=self._snapshot.head_revision,
@@ -1705,7 +1746,13 @@ class CandidateProofSession:
             record_ids=request,
             source_fold_lengths=requested_source_lengths,
         )
-        _validate_candidate_proof_dense_phase2_result(
+        validate_candidate_proof_dense_phase2_result(
+            response,
+            binding_digest=phase1.binding_digest,
+            record_ids=request,
+            source_fold_lengths=requested_source_lengths,
+        )
+        self._view.validate_candidate_proof_dense_phase2_result(
             response,
             binding_digest=phase1.binding_digest,
             record_ids=request,
@@ -2578,7 +2625,7 @@ class CandidateRetriever:
     def candidates(
         self,
         resource_id: str,
-        store: SQLiteTMStore,
+        store: CandidateRecallPort,
         folded_query: str,
         *,
         result_limit: int,
@@ -2587,13 +2634,14 @@ class CandidateRetriever:
             raise TypeError("resource_id must be a built-in string")
         if not resource_id.strip():
             raise ValueError("resource_id must not be empty")
-        if type(store) is not SQLiteTMStore:
-            raise TypeError("store must be SQLiteTMStore")
+        recall_port = require_candidate_recall_port(
+            store,
+            resource_id=resource_id,
+            required_scope="STORE",
+        )
         _validate_candidate_scalars(folded_query, result_limit)
-        if store.coordinator.resource_id != resource_id:
-            raise ValueError("resource_id must match the store resource")
         prepared = _prepare_candidate_query(folded_query, result_limit)
-        snapshot = _candidate_recall_snapshot_or_fail(store, prepared)
+        snapshot = _candidate_recall_snapshot_or_fail(recall_port, prepared)
         return _build_candidate_report(
             resource_id,
             folded_query,
@@ -2604,7 +2652,7 @@ class CandidateRetriever:
     def candidates_from_view(
         self,
         resource_id: str,
-        view: SQLiteTMQueryView,
+        view: CandidateRecallPort,
         folded_query: str,
         *,
         result_limit: int,
@@ -2613,13 +2661,14 @@ class CandidateRetriever:
             raise TypeError("resource_id must be a built-in string")
         if not resource_id.strip():
             raise ValueError("resource_id must not be empty")
-        if type(view) is not SQLiteTMQueryView:
-            raise TypeError("view must be SQLiteTMQueryView")
+        recall_port = require_candidate_recall_port(
+            view,
+            resource_id=resource_id,
+            required_scope="QUERY_VIEW",
+        )
         _validate_candidate_scalars(folded_query, result_limit)
-        if view.resource_id != resource_id:
-            raise ValueError("resource_id must match the view resource")
         prepared = _prepare_candidate_query(folded_query, result_limit)
-        snapshot = _candidate_recall_snapshot_or_fail(view, prepared)
+        snapshot = _candidate_recall_snapshot_or_fail(recall_port, prepared)
         return _build_candidate_report(
             resource_id,
             folded_query,
@@ -2630,7 +2679,7 @@ class CandidateRetriever:
     def proof_session_from_view(
         self,
         resource_id: str,
-        view: SQLiteTMQueryView,
+        view: CandidateProofPort,
         folded_query: str,
         *,
         minimum_similarity: float,

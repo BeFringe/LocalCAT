@@ -108,17 +108,19 @@ tm_sqlite_store ───────────────┤
 | 读 DTO | `SQLiteCandidateRecallSnapshot`、`SQLiteCandidateProofBlock`、`SQLiteCandidateProofRecord`、`SQLiteCandidateProofSnapshot` |
 | dense DTO | `SQLiteCandidateProofDensePhase1/Phase2` 与不可伪造的 opaque receipt |
 | 纯原语 | n-gram/frequency/write-plan builder、dense result/binding validator |
-| port | `CandidateRecallPort`、`CandidateProofPort` 的 runtime-checkable behavior contract |
+| port | `CandidatePostingPort`、`CandidateRecallPort`、`CandidateProofPort` 的 runtime-checkable behavior contract |
 
 `SQLiteStoreSchemaError` 整体迁入叶模块，以保持 candidate algorithm 抛出/捕获的 exact class object；store re-export 同一对象，既有 consumer 不改变。它仍是 body-safe code 异常，不携 connection/path/query body。
 
 ### 读取 Port
 
-`CandidateRecallPort` 最小行为：
+`CandidatePostingPort` 只保留 fast/fallback seam 仍在使用的
+`fts5_candidate_ids*` 与 `gram_candidate_overlaps` 行为，并要求
+`candidate_port_scope == "STORE"`。`CandidateRecallPort` 最小行为：
 
 - `resource_id: str`；
+- `candidate_port_scope: "STORE" | "QUERY_VIEW"`；
 - `candidate_recall_snapshot(...) -> SQLiteCandidateRecallSnapshot`；
-- 兼容 fast/fallback seam 所需的 `fts5_candidate_ids*` 与 `gram_candidate_overlaps`，只在仍有生产 consumer 时保留。
 
 `CandidateProofPort` 扩展 recall port：
 
@@ -126,9 +128,11 @@ tm_sqlite_store ───────────────┤
 - `validate_candidate_proof_generation(...)`；
 - `candidate_proof_block_records(...)`；
 - `candidate_proof_dense_phase1(...)`；
-- `candidate_proof_dense_phase2(...)`。
+- `candidate_proof_dense_phase2(...)`；
+- view-owned generation/binding 验证行为。
 
 Port 不暴露 connection、lease/token、coordinator 或 transaction。Algorithm 在调用前验证 built-in `resource_id` 与 callable 行为，在返回后继续 exact-type/nested copy；port 不能用 `Protocol` 通过就跳过 DTO 防伪。Store/query-view 自己仍先执行 lifetime/generation 检查。
+`candidate_port_scope` 只区分 public store 与 captured query view 的既有调用形状，不携 generation、lease token 或 publication authority。Dense 结果先由叶合同纯 validator 验证 exact DTO/opaque receipt，再由 query view 验证 live generation/binding，二者都不得省略。
 
 ### Compatibility re-export
 
