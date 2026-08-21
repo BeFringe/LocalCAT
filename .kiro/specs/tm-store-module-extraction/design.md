@@ -12,7 +12,8 @@ tm_candidate_index ──> tm_candidate_store_contracts
 tm_sqlite_store ───────────────┤
         │                      │
         └──> tm_sqlite_candidate_projection
-                    └─────────> tm_candidate_store_contracts
+                    ├─────────> tm_candidate_store_contracts
+                    └─────────> text_matcher.fold_text_value_v1
 ```
 
 `tm_sqlite_store.py` 继续拥有公开 store/query-view 入口、connection policy、operation lease、transaction completion、generation、schema/bootstrap、ledger/binding 和 stable error mapping。新 projection 模块只在调用方已经建立的 connection/transaction 中执行 SQL 与 row decoding，不自行打开 authority、提交 transaction 或发布任何 capability。
@@ -150,7 +151,7 @@ tm_sqlite_store.SQLiteCandidateRecord is (
 
 ### 模块与输入
 
-新增 `tm_sqlite_candidate_projection.py`。它只依赖标准库 `sqlite3/hashlib/json`、叶合同和必要 frozen version 常量，不导入 store、candidate algorithm、retrieval、Engine/Application/Qt。
+新增 `tm_sqlite_candidate_projection.py`。它只依赖标准库 `sqlite3/hashlib/json/collections/typing`、叶合同、必要 frozen version 常量，以及中立纯函数 `text_matcher.fold_text_value_v1`；不导入 store、candidate algorithm、retrieval、Engine/Application/Qt。`fold_text_value_v1` 只用于 proof-index 对 canonical `source_raw` 的独立重算，不作为可注入 callback，也不复制 folding 算法。
 
 数据面函数接收：
 

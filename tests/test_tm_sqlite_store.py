@@ -1663,22 +1663,6 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 canonical_store_id="store.primary",
             )
 
-            class CommitFailingConnection:
-                def __init__(self, connection: sqlite3.Connection) -> None:
-                    self._connection = connection
-
-                def execute(self, *args: Any, **kwargs: Any):
-                    return self._connection.execute(*args, **kwargs)
-
-                def executemany(self, *args: Any, **kwargs: Any):
-                    return self._connection.executemany(*args, **kwargs)
-
-                def commit(self) -> None:
-                    raise sqlite3.OperationalError("injected commit failure")
-
-                def rollback(self) -> None:
-                    self._connection.rollback()
-
             @contextmanager
             def failing_connection(
                 database_path: Path,
@@ -1688,10 +1672,27 @@ class SQLiteTMStoreTests(unittest.TestCase):
                     database_path,
                     **kwargs,
                 ) as connection:
-                    yield cast(
-                        sqlite3.Connection,
-                        cast(object, CommitFailingConnection(connection)),
-                    )
+                    denied = False
+
+                    def deny_first_commit(
+                        action: int,
+                        argument1: str | None,
+                        _argument2: str | None,
+                        _database: str | None,
+                        _trigger: str | None,
+                    ) -> int:
+                        nonlocal denied
+                        if (
+                            action == sqlite3.SQLITE_TRANSACTION
+                            and argument1 == "COMMIT"
+                            and not denied
+                        ):
+                            denied = True
+                            return sqlite3.SQLITE_DENY
+                        return sqlite3.SQLITE_OK
+
+                    connection.set_authorizer(deny_first_commit)
+                    yield connection
 
             def gram_plan(
                 records: tuple[SQLiteCandidateRecord, ...],
@@ -1710,10 +1711,7 @@ class SQLiteTMStoreTests(unittest.TestCase):
                 "tm_sqlite_store._open_configured_connection",
                 failing_connection,
             ):
-                with self.assertRaisesRegex(
-                    sqlite3.OperationalError,
-                    "injected commit failure",
-                ):
+                with self.assertRaises(sqlite3.DatabaseError):
                     _ = store.append_batch(
                         batch_id="import.commit-failure",
                         kind="import",

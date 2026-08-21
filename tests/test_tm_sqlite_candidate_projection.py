@@ -15,6 +15,244 @@ from tm_candidate_store_contracts import (
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+_EXPECTED_PROJECTION_FUNCTION_SURFACE = (
+    ("_candidate_projection_table_digest", ("table",)),
+    ("_chunks", ("values",)),
+    ("_finish_candidate_projection_digest", ("table_digests", "fts5_available")),
+    ("_fts5_match_expression", ("trigrams",)),
+    ("_proof_int", ("value", "code")),
+    ("_proof_text", ("value", "code")),
+    ("_record_id", ("value", "code")),
+    (
+        "_update_candidate_gram_projection_digest",
+        ("connection", "digest", "gram_chunk_rows"),
+    ),
+    ("_update_candidate_projection_digest", ("digest", "row")),
+    (
+        "_validate_candidate_proof_index_core",
+        (
+            "connection",
+            "required_sizes",
+            "fts5_available",
+            "include_projection_digest",
+            "gram_chunk_rows",
+        ),
+    ),
+    ("_validate_candidate_proof_index_core.flush_block", ()),
+    ("_validate_candidate_proof_index_core.proof_int", ("value",)),
+    ("_validate_candidate_proof_index_core.proof_text", ("value",)),
+    (
+        "bounded_seed_stages",
+        ("connection", "folded_query", "fts5_available", "seed_limit"),
+    ),
+    (
+        "candidate_proof_block_records",
+        ("connection", "folded_query", "block", "total_record_count"),
+    ),
+    (
+        "candidate_proof_dense_phase1",
+        ("connection", "folded_query", "blocks", "total_record_count"),
+    ),
+    (
+        "candidate_proof_dense_phase2",
+        (
+            "connection",
+            "total_record_count",
+            "record_ids",
+            "source_fold_lengths",
+        ),
+    ),
+    (
+        "candidate_proof_projection_digest",
+        ("connection", "fts5_available", "gram_chunk_rows"),
+    ),
+    (
+        "candidate_proof_query_block_uppers",
+        ("connection", "query_terms"),
+    ),
+    ("candidate_proof_query_maxima_digest", ("blocks",)),
+    (
+        "candidate_proof_snapshot",
+        (
+            "connection",
+            "folded_query",
+            "seed_limit",
+            "fts5_available",
+            "total_record_count",
+        ),
+    ),
+    (
+        "candidate_recall_snapshot",
+        (
+            "connection",
+            "fts5_available",
+            "fts_query_trigrams",
+            "query_grams_by_size",
+            "candidate_floor",
+            "fts_query_degenerate",
+        ),
+    ),
+    ("fts5_candidate_ids", ("connection", "match_expression")),
+    ("fts5_candidate_ids_for_trigrams", ("connection", "trigrams")),
+    (
+        "gram_candidate_overlaps",
+        ("connection", "query_postings", "candidate_cap"),
+    ),
+    (
+        "insert_candidate_fts_rows",
+        (
+            "connection",
+            "plan",
+            "record_ids_by_ordinal",
+            "folded_sources_by_ordinal",
+        ),
+    ),
+    (
+        "insert_candidate_gram_rows",
+        (
+            "connection",
+            "plan",
+            "record_ids_by_ordinal",
+            "folded_sources_by_ordinal",
+        ),
+    ),
+    (
+        "insert_streamed_candidate_fts_rows",
+        (
+            "connection",
+            "candidate_records",
+            "record_ids_by_ordinal",
+            "candidate_gram_facts",
+            "fts5_available",
+        ),
+    ),
+    (
+        "insert_streamed_candidate_gram_rows",
+        (
+            "connection",
+            "candidate_records",
+            "record_ids_by_ordinal",
+            "candidate_gram_facts",
+            "fts5_available",
+        ),
+    ),
+    (
+        "insert_streamed_candidate_proof_rows",
+        (
+            "connection",
+            "candidate_records",
+            "record_ids_by_ordinal",
+            "candidate_gram_facts",
+            "fts5_available",
+        ),
+    ),
+    (
+        "maintain_candidate_proof_summaries",
+        (
+            "connection",
+            "plan",
+            "record_ids_by_ordinal",
+            "folded_sources_by_ordinal",
+        ),
+    ),
+    (
+        "project_candidate_write_plan",
+        ("plan", "record_ids_by_ordinal", "folded_sources_by_ordinal"),
+    ),
+    (
+        "project_streamed_candidate_index",
+        (
+            "candidate_records",
+            "record_ids_by_ordinal",
+            "candidate_gram_facts",
+            "fts5_available",
+        ),
+    ),
+    ("restore_streamed_stage_secondary_indexes", ("connection",)),
+    ("streamed_stage_secondary_index_inventory", ("connection",)),
+    ("suspend_streamed_stage_secondary_indexes", ("connection",)),
+    (
+        "validate_candidate_proof_blocks",
+        ("connection", "blocks", "query_maxima_digest"),
+    ),
+    (
+        "validate_candidate_proof_index",
+        ("connection", "required_sizes", "fts5_available", "gram_chunk_rows"),
+    ),
+    (
+        "validate_candidate_proof_index_with_digest",
+        ("connection", "required_sizes", "fts5_available", "gram_chunk_rows"),
+    ),
+)
+
+
+def _function_surface(tree: ast.Module) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    surface: list[tuple[str, tuple[str, ...]]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names = [node.name]
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.append(parent.name)
+            parent = parents.get(parent)
+        parameters = tuple(
+            argument.arg
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+        )
+        if node.args.vararg is not None:
+            parameters += (f"*{node.args.vararg.arg}",)
+        if node.args.kwarg is not None:
+            parameters += (f"**{node.args.kwarg.arg}",)
+        surface.append((".".join(reversed(names)), parameters))
+    return tuple(sorted(surface))
+
+
+def _projection_authority_violations(tree: ast.Module) -> frozenset[str]:
+    violations: set[str] = set()
+    sql_methods = {"execute", "executemany", "executescript"}
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        parameters = {
+            argument.arg
+            for argument in (
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            )
+        }
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr in sql_methods
+                ):
+                    violations.add(f"{function.name}:aliased-sql-method")
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in parameters:
+                violations.add(f"{function.name}:caller-callable")
+            if (
+                isinstance(node.func, ast.Call)
+                and isinstance(node.func.func, ast.Name)
+                and node.func.func.id == "getattr"
+                and len(node.func.args) >= 2
+                and isinstance(node.func.args[1], ast.Constant)
+                and node.func.args[1].value in sql_methods
+            ):
+                violations.add(f"{function.name}:dynamic-sql-method")
+    return frozenset(violations)
 
 
 def _connection() -> sqlite3.Connection:
@@ -87,7 +325,9 @@ class CandidateProjectionArchitectureTests(unittest.TestCase):
                 "hashlib",
                 "json",
                 "sqlite3",
+                "text_matcher",
                 "tm_candidate_store_contracts",
+                "typing",
             },
         )
         calls = {
@@ -113,6 +353,54 @@ class CandidateProjectionArchitectureTests(unittest.TestCase):
         self.assertEqual(transaction_sql, set())
         self.assertNotIn("tm_contracts", source)
         self.assertNotIn("coordinator", source)
+
+        text_matcher_imports = tuple(
+            (item.name, item.asname)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "text_matcher"
+            for item in node.names
+        )
+        self.assertEqual(
+            text_matcher_imports,
+            (("fold_text_value_v1", None),),
+        )
+
+    def test_projection_function_and_execution_surface_is_closed(self) -> None:
+        tree = ast.parse(
+            (_ROOT / "tm_sqlite_candidate_projection.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            _function_surface(tree),
+            _EXPECTED_PROJECTION_FUNCTION_SURFACE,
+        )
+        self.assertEqual(_projection_authority_violations(tree), frozenset())
+
+        hostile = ast.parse(
+            '''
+def future_candidate_alias(connection, caller_query):
+    executor = connection.execute
+    return executor(caller_query)
+
+def future_candidate_getattr(connection, caller_query):
+    return getattr(connection, "execute")(caller_query)
+
+def future_candidate_callback(connection, callback):
+    callback(connection)
+'''
+        )
+        self.assertEqual(
+            _projection_authority_violations(hostile),
+            frozenset(
+                {
+                    "future_candidate_alias:aliased-sql-method",
+                    "future_candidate_callback:caller-callable",
+                    "future_candidate_getattr:dynamic-sql-method",
+                }
+            ),
+        )
 
     def test_projection_defines_no_authority_or_intermediate_dto_class(self) -> None:
         source = (_ROOT / "tm_sqlite_candidate_projection.py").read_text(

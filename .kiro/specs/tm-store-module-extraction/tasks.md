@@ -115,23 +115,23 @@ Wave 0 治理与 characterization
 
 ## Wave 3：SQLite Candidate 写入 / Projection 数据面
 
-- [ ] 4.1 提取 write-plan apply 与 candidate row projection
+- [x] 4.1 提取 write-plan apply 与 candidate row projection
   - 移动 gram/FTS insert、block summary/maxima 与 projection digest SQL。
   - store 先完整验证/私有复制 write plan，再在既有 canonical transaction 中调用。
   - _Requirements: 5.1–5.5, 6.1–6.5_
 
-- [ ] 4.2 提取 proof-index validation 与 streamed index build
+- [x] 4.2 提取 proof-index validation 与 streamed index build
   - 移动 index recomputation、digest validation、secondary-index suspend/restore/build SQL。
   - chunk transaction、head/batch publication 与 completion authority 留在 store。
   - _Requirements: 5.1–5.5, 6.1–6.5_
 
-- [ ] 4.3 闭合 append/streamed transaction fault matrix
+- [x] 4.3 闭合 append/streamed transaction fault matrix
   - extension、plan、SQL、summary、chunk、commit 每个 fault 均保持旧 head/count/batch/bytes。
   - patch target仍被调用一次且参数/call order exact；programmer fault 不被吞。
   - activation、schema upgrade、snapshot、source binding、migration 邻接无回归。
   - _Requirements: 1.1–1.4, 5.1–5.5, 7.1–7.4_
 
-- [ ] 4.4 闭合 write SQL 唯一 owner 与 authority guard
+- [x] 4.4 闭合 write SQL 唯一 owner 与 authority guard
   - store 只保留 schema DDL、transaction wrapper 与 late-bound delegate。
   - projection 不发布 generation/capability/receipt/binding，不拥有 transaction completion。
   - _Requirements: 6.1–6.5, 8.1–8.4_

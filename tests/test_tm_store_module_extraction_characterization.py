@@ -147,10 +147,10 @@ _FULL_MODULE_PATCH_CALL_COUNT = 306
 _FULL_MODULE_PATCH_DIGEST = (
     "ce059addd6233cf8ae9f2d455606ef49167964001d307dd2da309f885e4f035a"
 )
-_FULL_INSTANCE_PATCH_ENTRY_COUNT = 19
-_FULL_INSTANCE_PATCH_CALL_COUNT = 49
+_FULL_INSTANCE_PATCH_ENTRY_COUNT = 34
+_FULL_INSTANCE_PATCH_CALL_COUNT = 70
 _FULL_INSTANCE_PATCH_DIGEST = (
-    "d923e57c0b6c37a516045e735259d0d13a6fe8ee8a3de6a441e3869922eadf6a"
+    "c19d69925f03b7ee8d4be9ddbe0a03fb8001d60c9ff12fce5ab9a98a6c7b43e5"
 )
 
 _SQL_TOKENS = (
@@ -159,6 +159,7 @@ _SQL_TOKENS = (
     "tm_candidate_block",
     "tm_candidate_gram_block_max",
     "candidate_index_digest",
+    "PRAGMA threads",
     "source_fold_v1",
     "source_fold_length",
 )
@@ -176,31 +177,37 @@ _EXPECTED_SQL_OWNERS = {
     ),
     "tm_sqlite_candidate_projection.py": frozenset(
         {
+            "_update_candidate_gram_projection_digest",
+            "_validate_candidate_proof_index_core",
             "bounded_seed_stages",
             "candidate_proof_block_records",
             "candidate_proof_dense_phase1",
             "candidate_proof_dense_phase2",
+            "candidate_proof_projection_digest",
             "candidate_proof_query_block_uppers",
             "candidate_proof_snapshot",
             "candidate_recall_snapshot",
             "fts5_candidate_ids",
             "fts5_candidate_ids_for_trigrams",
             "gram_candidate_overlaps",
+            "insert_candidate_fts_rows",
+            "insert_candidate_gram_rows",
+            "insert_streamed_candidate_fts_rows",
+            "insert_streamed_candidate_gram_rows",
+            "insert_streamed_candidate_proof_rows",
+            "maintain_candidate_proof_summaries",
+            "restore_streamed_stage_secondary_indexes",
+            "streamed_stage_secondary_index_inventory",
+            "suspend_streamed_stage_secondary_indexes",
             "validate_candidate_proof_blocks",
         }
     ),
     "tm_sqlite_store.py": frozenset(
         {
             "<module>",
-            "_apply_candidate_write_plan",
-            "_candidate_proof_projection_digest",
             "_insert_prepared_records_and_indexes",
-            "_insert_streamed_candidate_index",
             "_insert_streamed_records",
-            "_maintain_candidate_proof_summaries",
             "_probe_fts5",
-            "_update_candidate_gram_projection_digest",
-            "_validate_candidate_proof_index_core",
         }
     ),
 }
@@ -363,38 +370,71 @@ def _sql_owners_in_tree(relative: str, tree: ast.Module) -> frozenset[str]:
     owners: set[str] = set()
     if relative == "tm_sqlite_candidate_projection.py":
         bound_sql: dict[tuple[str, str], str] = {}
+        sql_call_aliases: dict[str, set[str]] = {}
+
+        def owner_name_for(node: ast.AST) -> str:
+            owner: ast.AST = node
+            while owner in parents and not isinstance(
+                owner, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                owner = parents[owner]
+            return (
+                owner.name
+                if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else "<module>"
+            )
+
+        def is_sql_method(value: ast.AST, owner_name: str) -> bool:
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr in {"execute", "executemany", "executescript"}
+            ):
+                return True
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "getattr"
+                and len(value.args) >= 2
+                and isinstance(value.args[1], ast.Constant)
+                and value.args[1].value
+                in {"execute", "executemany", "executescript"}
+            ):
+                return True
+            return (
+                isinstance(value, ast.Name)
+                and value.id in sql_call_aliases.get(owner_name, set())
+            )
+
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
             value = node.value
+            owner_name = owner_name_for(node)
+            if value is not None and is_sql_method(value, owner_name):
+                sql_call_aliases.setdefault(owner_name, set()).update(
+                    target.id for target in targets if isinstance(target, ast.Name)
+                )
             if not isinstance(value, ast.Constant) or type(value.value) is not str:
                 continue
-            owner: ast.AST = node
-            while owner in parents and not isinstance(
-                owner, (ast.FunctionDef, ast.AsyncFunctionDef)
-            ):
-                owner = parents[owner]
-            owner_name = (
-                owner.name if isinstance(owner, ast.FunctionDef) else "<module>"
-            )
             for target in targets:
                 if isinstance(target, ast.Name):
                     bound_sql[(owner_name, target.id)] = value.value
         for node in ast.walk(tree):
-            if (
-                not isinstance(node, ast.Call)
-                or not ast.unparse(node.func).endswith(".execute")
+            if not isinstance(node, ast.Call):
+                continue
+            owner_name = owner_name_for(node)
+            if not (
+                ast.unparse(node.func).endswith(
+                    (".execute", ".executemany", ".executescript")
+                )
+                or (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in sql_call_aliases.get(owner_name, set())
+                )
+                or is_sql_method(node.func, owner_name)
             ):
                 continue
-            owner: ast.AST = node
-            while owner in parents and not isinstance(
-                owner, (ast.FunctionDef, ast.AsyncFunctionDef)
-            ):
-                owner = parents[owner]
-            owner_name = (
-                owner.name if isinstance(owner, ast.FunctionDef) else "<module>"
-            )
             sql_text = " ".join(
                 item.value
                 for item in ast.walk(node)
@@ -417,6 +457,7 @@ def _sql_owners_in_tree(relative: str, tree: ast.Module) -> frozenset[str]:
                     "ALTER ",
                     "DROP ",
                     "WITH ",
+                    "PRAGMA ",
                 )
             ):
                 owners.add(f"<dynamic:{owner_name}>")
@@ -544,11 +585,24 @@ p.object(self.alternate_store, attribute="future_gram_query")
 def future_candidate_count(connection):
     query = "SELECT COUNT(*) FROM tm_record"
     return connection.execute(query).fetchone()
+
+def future_candidate_insert(connection, rows):
+    query = "INSERT INTO tm_gram VALUES (?, ?, ?, ?)"
+    connection.executemany(query, rows)
+
+def future_candidate_schema(connection):
+    connection.executescript("CREATE TABLE tm_candidate_future(value TEXT)")
 '''
         )
         self.assertEqual(
             _sql_owners_in_tree("tm_sqlite_candidate_projection.py", tree),
-            frozenset({"future_candidate_count"}),
+            frozenset(
+                {
+                    "future_candidate_count",
+                    "future_candidate_insert",
+                    "future_candidate_schema",
+                }
+            ),
         )
         dynamic_tree = ast.parse(
             '''
@@ -562,6 +616,23 @@ def future_candidate_dynamic(connection, caller_query):
                 dynamic_tree,
             ),
             frozenset({"<dynamic:future_candidate_dynamic>"}),
+        )
+        indirect_tree = ast.parse(
+            '''
+def alias_query(connection, caller_query):
+    executor = connection.execute
+    return executor(caller_query)
+
+def getattr_query(connection, caller_query):
+    return getattr(connection, "execute")(caller_query)
+'''
+        )
+        self.assertEqual(
+            _sql_owners_in_tree(
+                "tm_sqlite_candidate_projection.py",
+                indirect_tree,
+            ),
+            frozenset({"<dynamic:alias_query>", "<dynamic:getattr_query>"}),
         )
 
     def test_candidate_index_concrete_import_baseline_is_exact(self) -> None:
@@ -693,12 +764,17 @@ def future_candidate_dynamic(connection, caller_query):
             release["input_evidence"]["acceptance_source_fingerprint"],
             acceptance["source_fingerprint"],
         )
-        self.assertTrue(
-            all(
-                hashlib.sha256((_ROOT / item["path"]).read_bytes()).hexdigest()
-                == item["sha256"]
-                for item in release["source_files"]
-            )
+        release_stale = tuple(
+            item["path"]
+            for item in release["source_files"]
+            if hashlib.sha256(
+                (_ROOT / item["path"]).read_bytes()
+            ).hexdigest()
+            != item["sha256"]
+        )
+        self.assertEqual(
+            release_stale,
+            ("tests/test_tm_sqlite_store.py",),
         )
         self.assertNotEqual(
             benchmark_implementation_fingerprint(_ROOT),
@@ -721,10 +797,14 @@ def future_candidate_dynamic(connection, caller_query):
                     "editor_controller.py",
                     "qt_editor.py",
                     "qt_settings_dialog.py",
+                    "tests/test_tm_sqlite_store.py",
                     "tm_candidate_index.py",
                     "tm_sqlite_store.py",
                 ),
-                "fault": ("tm_sqlite_store.py",),
+                "fault": (
+                    "tests/test_tm_sqlite_store.py",
+                    "tm_sqlite_store.py",
+                ),
             },
         )
 

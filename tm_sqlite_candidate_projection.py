@@ -1,4 +1,4 @@
-"""SQLite candidate read data plane for caller-owned connections.
+"""SQLite candidate read/write data plane for caller-owned connections.
 
 This module owns candidate recall/proof SQL and row decoding.  It never opens
 connections, completes transactions, validates generation authority, or maps
@@ -12,18 +12,28 @@ from collections import Counter
 import hashlib
 import json
 import sqlite3
+from typing import Any
 
 from tm_candidate_store_contracts import (
     CANDIDATE_PROOF_BLOCK_SIZE,
+    CandidateProofIndexError,
     SQLiteCandidateProofBlock,
     SQLiteCandidateProofRecord,
     SQLiteStoreSchemaError,
+    character_ngram_frequencies,
     unique_character_ngrams,
 )
+from text_matcher import fold_text_value_v1
 
 
 CANDIDATE_QUERY_CHUNK_SIZE = 256
 CANDIDATE_SEED_POSTING_CAP = 4096
+_STREAMED_STAGE_SECONDARY_INDEX_NAMES = (
+    "idx_tm_exact",
+    "idx_tm_context_speaker",
+    "idx_tm_gram_lookup",
+    "idx_tm_gram_block_lookup",
+)
 
 
 def _chunks(values: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
@@ -910,6 +920,985 @@ def candidate_proof_dense_phase2(
     return ordered_record_ids, ordered_source_folds, ordered_source_lengths
 
 
+type ValidatedCandidateWritePlan = tuple[
+    tuple[tuple[int, int, str, int], ...],
+    tuple[int, ...],
+]
+
+
+def project_candidate_write_plan(
+    plan: ValidatedCandidateWritePlan,
+    *,
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    folded_sources_by_ordinal: tuple[tuple[int, str], ...],
+) -> tuple[
+    tuple[tuple[int, str, int, int], ...],
+    tuple[tuple[str, int], ...],
+    tuple[tuple[int, str], ...],
+    tuple[tuple[int, int, str, int], ...],
+]:
+    """Privately project one caller-validated bounded candidate plan."""
+
+    if type(plan) is not tuple or len(plan) != 2:
+        raise TypeError("validated candidate plan is invalid")
+    gram_rows, fts_origin_ordinals = plan
+    if type(gram_rows) is not tuple or type(fts_origin_ordinals) is not tuple:
+        raise TypeError("validated candidate plan is invalid")
+    if type(record_ids_by_ordinal) is not tuple or type(
+        folded_sources_by_ordinal
+    ) is not tuple:
+        raise TypeError("candidate ordinal projections must be tuples")
+    record_ids: dict[int, int] = {}
+    for item in record_ids_by_ordinal:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not int
+            or item[1] < 1
+            or item[0] in record_ids
+        ):
+            raise ValueError("candidate record identity projection is invalid")
+        record_ids[item[0]] = item[1]
+    folded_sources: dict[int, str] = {}
+    for item in folded_sources_by_ordinal:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not str
+            or not item[1]
+            or item[0] in folded_sources
+        ):
+            raise ValueError("candidate folded-source projection is invalid")
+        folded_sources[item[0]] = item[1]
+
+    seen_grams: set[tuple[int, int, str]] = set()
+    projected_gram_rows: list[tuple[int, str, int, int]] = []
+    for row in gram_rows:
+        if type(row) is not tuple or len(row) != 4:
+            raise TypeError("validated gram row is invalid")
+        origin_ordinal, gram_size, gram, term_frequency = row
+        key = (origin_ordinal, gram_size, gram)
+        if (
+            type(origin_ordinal) is not int
+            or origin_ordinal not in record_ids
+            or type(gram_size) is not int
+            or gram_size not in {1, 2, 3}
+            or type(gram) is not str
+            or len(gram) != gram_size
+            or type(term_frequency) is not int
+            or term_frequency < 1
+            or key in seen_grams
+        ):
+            raise ValueError("validated gram row is invalid")
+        seen_grams.add(key)
+        projected_gram_rows.append(
+            (gram_size, gram, record_ids[origin_ordinal], term_frequency)
+        )
+    seen_fts_ordinals: set[int] = set()
+    projected_fts_rows: list[tuple[str, int]] = []
+    for origin_ordinal in fts_origin_ordinals:
+        if (
+            type(origin_ordinal) is not int
+            or origin_ordinal not in record_ids
+            or origin_ordinal not in folded_sources
+            or origin_ordinal in seen_fts_ordinals
+        ):
+            raise ValueError("validated FTS row is invalid")
+        seen_fts_ordinals.add(origin_ordinal)
+        projected_fts_rows.append(
+            (folded_sources[origin_ordinal], record_ids[origin_ordinal])
+        )
+    proof_records = tuple(
+        (record_id, folded_sources[origin_ordinal])
+        for origin_ordinal, record_id in sorted(
+            record_ids.items(), key=lambda pair: pair[1]
+        )
+    )
+    proof_gram_rows = tuple(
+        (record_ids[origin_ordinal], gram_size, gram, term_frequency)
+        for origin_ordinal, gram_size, gram, term_frequency in gram_rows
+    )
+    return (
+        tuple(projected_gram_rows),
+        tuple(projected_fts_rows),
+        proof_records,
+        proof_gram_rows,
+    )
+
+
+def insert_candidate_gram_rows(
+    connection: sqlite3.Connection,
+    plan: ValidatedCandidateWritePlan,
+    *,
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    folded_sources_by_ordinal: tuple[tuple[int, str], ...],
+) -> None:
+    gram_rows, _fts_rows, _proof_records, _proof_gram_rows = (
+        project_candidate_write_plan(
+            plan,
+            record_ids_by_ordinal=record_ids_by_ordinal,
+            folded_sources_by_ordinal=folded_sources_by_ordinal,
+        )
+    )
+    connection.executemany(
+        "INSERT INTO tm_gram(gram_size, gram, record_id, term_frequency) "
+        "VALUES (?, ?, ?, ?)",
+        gram_rows,
+    )
+
+
+def insert_candidate_fts_rows(
+    connection: sqlite3.Connection,
+    plan: ValidatedCandidateWritePlan,
+    *,
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    folded_sources_by_ordinal: tuple[tuple[int, str], ...],
+) -> None:
+    _gram_rows, fts_rows, _proof_records, _proof_gram_rows = (
+        project_candidate_write_plan(
+            plan,
+            record_ids_by_ordinal=record_ids_by_ordinal,
+            folded_sources_by_ordinal=folded_sources_by_ordinal,
+        )
+    )
+    if fts_rows:
+        connection.executemany(
+            "INSERT INTO tm_fts(source_fold_v1, record_id) VALUES (?, ?)",
+            fts_rows,
+        )
+
+
+def maintain_candidate_proof_summaries(
+    connection: sqlite3.Connection,
+    *,
+    plan: ValidatedCandidateWritePlan,
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    folded_sources_by_ordinal: tuple[tuple[int, str], ...],
+) -> None:
+    """Maintain exact proof blocks inside the caller-owned transaction."""
+
+    _gram_rows, _fts_rows, proof_records, proof_gram_rows = (
+        project_candidate_write_plan(
+            plan,
+            record_ids_by_ordinal=record_ids_by_ordinal,
+            folded_sources_by_ordinal=folded_sources_by_ordinal,
+        )
+    )
+
+    for record_id, folded_source in proof_records:
+        source_fold_length = len(folded_source)
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
+        last_record_id = first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1
+        connection.execute(
+            "INSERT INTO tm_candidate_block("
+            "block_id, first_record_id, last_record_id, record_count, "
+            "min_source_fold_length, max_source_fold_length) "
+            "VALUES (?, ?, ?, 1, ?, ?) "
+            "ON CONFLICT(block_id) DO UPDATE SET "
+            "record_count = record_count + 1, "
+            "min_source_fold_length = min(min_source_fold_length, "
+            "excluded.min_source_fold_length), "
+            "max_source_fold_length = max(max_source_fold_length, "
+            "excluded.max_source_fold_length)",
+            (
+                block_id,
+                first_record_id,
+                last_record_id,
+                source_fold_length,
+                source_fold_length,
+            ),
+        )
+    for record_id, gram_size, gram, term_frequency in proof_gram_rows:
+        if gram_size not in {1, 2}:
+            continue
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        connection.execute(
+            "INSERT INTO tm_gram_block_max("
+            "gram_size, gram, block_id, max_term_frequency) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
+            "max_term_frequency = max(max_term_frequency, "
+            "excluded.max_term_frequency)",
+            (gram_size, gram, block_id, term_frequency),
+        )
+
+
+def project_streamed_candidate_index(
+    candidate_records: tuple[tuple[int, str], ...],
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    candidate_gram_facts: tuple[tuple[int, int, str, int], ...],
+    *,
+    fts5_available: bool,
+) -> tuple[
+    tuple[tuple[tuple[int, str, int, int], ...], ...],
+    tuple[tuple[str, int], ...],
+    tuple[tuple[int, int, int, int, int, int], ...],
+    tuple[tuple[int, str, int, int], ...],
+]:
+    """Project one bounded streamed chunk's candidate facts."""
+
+    if type(candidate_records) is not tuple:
+        raise TypeError("candidate_records must be a built-in tuple")
+    if type(record_ids_by_ordinal) is not tuple:
+        raise TypeError("record_ids_by_ordinal must be a built-in tuple")
+    if type(candidate_gram_facts) is not tuple:
+        raise TypeError("candidate_gram_facts must be a built-in tuple")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    record_ids: dict[int, int] = {}
+    for item in record_ids_by_ordinal:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not int
+            or item[1] < 1
+            or item[0] in record_ids
+        ):
+            raise ValueError("candidate record identity projection is invalid")
+        record_ids[item[0]] = item[1]
+    prepared: list[tuple[int, str, int]] = []
+    seen_ordinals: set[int] = set()
+    for item in candidate_records:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not int
+            or type(item[1]) is not str
+            or not item[1]
+            or item[0] in seen_ordinals
+            or item[0] not in record_ids
+        ):
+            raise ValueError("streamed candidate record is invalid")
+        seen_ordinals.add(item[0])
+        prepared.append((item[0], item[1], record_ids[item[0]]))
+    if seen_ordinals != set(record_ids):
+        raise ValueError("streamed candidate record identity is incomplete")
+
+    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    grams_by_size: dict[int, dict[str, list[tuple[int, int]]]] = {
+        gram_size: {} for gram_size in gram_sizes
+    }
+    block_stats: dict[int, list[int]] = {}
+    block_maxima: dict[tuple[int, str, int], int] = {}
+    fts_rows: list[tuple[str, int]] = []
+    for _origin_ordinal, folded_source, record_id in prepared:
+        source_fold_length = len(folded_source)
+        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        stats = block_stats.setdefault(
+            block_id,
+            [0, source_fold_length, source_fold_length],
+        )
+        stats[0] += 1
+        stats[1] = min(stats[1], source_fold_length)
+        stats[2] = max(stats[2], source_fold_length)
+        if fts5_available:
+            fts_rows.append((folded_source, record_id))
+    seen_gram_keys: set[tuple[int, int, str]] = set()
+    for fact in candidate_gram_facts:
+        if type(fact) is not tuple or len(fact) != 4:
+            raise TypeError("streamed candidate gram fact is invalid")
+        origin_ordinal, gram_size, gram, term_frequency = fact
+        key = (origin_ordinal, gram_size, gram)
+        if (
+            type(origin_ordinal) is not int
+            or origin_ordinal not in record_ids
+            or type(gram_size) is not int
+            or gram_size not in gram_sizes
+            or type(gram) is not str
+            or len(gram) != gram_size
+            or type(term_frequency) is not int
+            or term_frequency < 1
+            or key in seen_gram_keys
+        ):
+            raise ValueError("streamed candidate gram fact is invalid")
+        seen_gram_keys.add(key)
+        record_id = record_ids[origin_ordinal]
+        grams_by_size[gram_size].setdefault(gram, []).append(
+            (record_id, term_frequency)
+        )
+        if gram_size in {1, 2}:
+            block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+            maximum_key = (gram_size, gram, block_id)
+            block_maxima[maximum_key] = max(
+                block_maxima.get(maximum_key, 0),
+                term_frequency,
+            )
+    gram_row_groups: list[tuple[tuple[int, str, int, int], ...]] = []
+    for gram_size in gram_sizes:
+        bucket = grams_by_size[gram_size]
+        gram_row_groups.append(
+            tuple(
+                (gram_size, gram, record_id, term_frequency)
+                for gram in sorted(bucket)
+                for record_id, term_frequency in bucket[gram]
+            )
+        )
+    block_rows = tuple(
+        (
+            block_id,
+            block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1,
+            (block_id + 1) * CANDIDATE_PROOF_BLOCK_SIZE,
+            stats[0],
+            stats[1],
+            stats[2],
+        )
+        for block_id, stats in sorted(block_stats.items())
+    )
+    maximum_rows = tuple(
+        (gram_size, gram, block_id, maximum)
+        for (gram_size, gram, block_id), maximum in sorted(
+            block_maxima.items()
+        )
+    )
+    return tuple(gram_row_groups), tuple(fts_rows), block_rows, maximum_rows
+
+
+def insert_streamed_candidate_gram_rows(
+    connection: sqlite3.Connection,
+    candidate_records: tuple[tuple[int, str], ...],
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    candidate_gram_facts: tuple[tuple[int, int, str, int], ...],
+    *,
+    fts5_available: bool,
+) -> None:
+    gram_row_groups, _fts_rows, _block_rows, _maximum_rows = (
+        project_streamed_candidate_index(
+            candidate_records,
+            record_ids_by_ordinal,
+            candidate_gram_facts,
+            fts5_available=fts5_available,
+        )
+    )
+    for gram_rows in gram_row_groups:
+        connection.executemany(
+            "INSERT INTO tm_gram("
+            "gram_size, gram, record_id, term_frequency) "
+            "VALUES (?, ?, ?, ?)",
+            gram_rows,
+        )
+
+
+def insert_streamed_candidate_fts_rows(
+    connection: sqlite3.Connection,
+    candidate_records: tuple[tuple[int, str], ...],
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    candidate_gram_facts: tuple[tuple[int, int, str, int], ...],
+    *,
+    fts5_available: bool,
+) -> None:
+    _gram_row_groups, fts_rows, _block_rows, _maximum_rows = (
+        project_streamed_candidate_index(
+            candidate_records,
+            record_ids_by_ordinal,
+            candidate_gram_facts,
+            fts5_available=fts5_available,
+        )
+    )
+    if fts_rows:
+        connection.executemany(
+            "INSERT INTO tm_fts(source_fold_v1, record_id) VALUES (?, ?)",
+            fts_rows,
+        )
+
+
+def insert_streamed_candidate_proof_rows(
+    connection: sqlite3.Connection,
+    candidate_records: tuple[tuple[int, str], ...],
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    candidate_gram_facts: tuple[tuple[int, int, str, int], ...],
+    *,
+    fts5_available: bool,
+) -> None:
+    _gram_row_groups, _fts_rows, block_rows, maximum_rows = (
+        project_streamed_candidate_index(
+            candidate_records,
+            record_ids_by_ordinal,
+            candidate_gram_facts,
+            fts5_available=fts5_available,
+        )
+    )
+    connection.executemany(
+        "INSERT INTO tm_candidate_block("
+        "block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(block_id) DO UPDATE SET "
+        "record_count = record_count + excluded.record_count, "
+        "min_source_fold_length = min(min_source_fold_length, "
+        "excluded.min_source_fold_length), "
+        "max_source_fold_length = max(max_source_fold_length, "
+        "excluded.max_source_fold_length)",
+        block_rows,
+    )
+    connection.executemany(
+        "INSERT INTO tm_gram_block_max("
+        "gram_size, gram, block_id, max_term_frequency) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
+        "max_term_frequency = max(max_term_frequency, "
+        "excluded.max_term_frequency)",
+        maximum_rows,
+    )
+
+
+def streamed_stage_secondary_index_inventory(
+    connection: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Read the exact rebuildable secondary-index inventory."""
+
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' "
+        "AND name IN (?, ?, ?, ?) ORDER BY name",
+        _STREAMED_STAGE_SECONDARY_INDEX_NAMES,
+    ).fetchall()
+    inventory: list[str] = []
+    for row in rows:
+        if (
+            type(row) is not tuple
+            or len(row) != 1
+            or type(row[0]) is not str
+        ):
+            raise CandidateProofIndexError(
+                "streamed secondary-index inventory row is invalid"
+            )
+        inventory.append(row[0])
+    return tuple(inventory)
+
+
+def suspend_streamed_stage_secondary_indexes(
+    connection: sqlite3.Connection,
+) -> None:
+    """Drop the exact frozen rebuildable secondary-index set."""
+
+    connection.execute("DROP INDEX idx_tm_exact")
+    connection.execute("DROP INDEX idx_tm_context_speaker")
+    connection.execute("DROP INDEX idx_tm_gram_lookup")
+    connection.execute("DROP INDEX idx_tm_gram_block_lookup")
+
+
+def restore_streamed_stage_secondary_indexes(
+    connection: sqlite3.Connection,
+) -> None:
+    """Build the exact frozen secondary-index statement set."""
+
+    connection.execute(
+        "\n    CREATE INDEX idx_tm_exact\n"
+        "    ON tm_record(source_raw, record_id DESC)\n"
+        "    "
+    )
+    connection.execute(
+        "\n    CREATE INDEX idx_tm_context_speaker\n"
+        "    ON tm_record(source_raw, speaker_raw, record_id DESC)\n"
+        "    "
+    )
+    connection.execute(
+        "\n    CREATE INDEX idx_tm_gram_lookup\n"
+        "    ON tm_gram(gram_size, gram, record_id)\n"
+        "    "
+    )
+    connection.execute(
+        "\n    CREATE INDEX idx_tm_gram_block_lookup\n"
+        "    ON tm_gram_block_max(gram_size, gram, block_id)\n"
+        "    "
+    )
+
+
+_CANDIDATE_PROJECTION_DIGEST_VERSION = "candidate-projection-digest-v2"
+_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS = 50_000
+
+
+def _candidate_projection_table_digest(table: str) -> Any:
+    digest = hashlib.sha256()
+    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(table.encode("ascii"))
+    digest.update(b"\0")
+    return digest
+
+
+def _update_candidate_projection_digest(
+    digest: Any,
+    row: tuple[object, ...],
+) -> None:
+    framed = bytearray()
+    for value in row:
+        if type(value) is int and not isinstance(value, bool):
+            encoded = str(value).encode("ascii")
+            framed.extend(b"i")
+        elif type(value) is str:
+            encoded = value.encode("utf-8")
+            framed.extend(b"s")
+        else:
+            raise CandidateProofIndexError(
+                "candidate projection digest fact is invalid"
+            )
+        framed.extend(str(len(encoded)).encode("ascii"))
+        framed.extend(b":")
+        framed.extend(encoded)
+        framed.extend(b";")
+    framed.extend(b"\n")
+    digest.update(framed)
+
+
+def _finish_candidate_projection_digest(
+    table_digests: dict[str, Any],
+    *,
+    fts5_available: bool,
+) -> str:
+    expected_tables = (
+        "tm_gram",
+        "tm_candidate_block",
+        "tm_gram_block_max",
+        *(("tm_fts",) if fts5_available else ()),
+    )
+    if tuple(table_digests) != expected_tables:
+        raise CandidateProofIndexError(
+            "candidate projection digest domain is invalid"
+        )
+    digest = hashlib.sha256()
+    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
+    digest.update(b"\0complete\0")
+    for table in expected_tables:
+        digest.update(table.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(table_digests[table].digest())
+    return digest.hexdigest()
+
+
+def _update_candidate_gram_projection_digest(
+    connection: sqlite3.Connection,
+    digest: Any,
+    *,
+    gram_chunk_rows: int,
+) -> None:
+    """Hash term-major gram rows in bounded SQLite-native chunks."""
+
+    if type(gram_chunk_rows) is not int or gram_chunk_rows < 1:
+        raise TypeError("gram_chunk_rows must be a positive integer")
+    count_row = connection.execute(
+        "SELECT COUNT(*) FROM tm_gram NOT INDEXED"
+    ).fetchone()
+    if (
+        type(count_row) is not tuple
+        or len(count_row) != 1
+        or type(count_row[0]) is not int
+        or count_row[0] < 0
+    ):
+        raise CandidateProofIndexError(
+            "candidate projection digest count is invalid"
+        )
+    actual_count = count_row[0]
+    processed_count = 0
+    last_rowid: int | None = None
+    row_payload = (
+        "json_array("
+        "typeof(rowid), hex(CAST(rowid AS BLOB)), "
+        "typeof(record_id), hex(CAST(record_id AS BLOB)), "
+        "typeof(gram_size), hex(CAST(gram_size AS BLOB)), "
+        "typeof(gram), hex(CAST(gram AS BLOB)), "
+        "typeof(term_frequency), hex(CAST(term_frequency AS BLOB)), "
+        "rowid)"
+    )
+    while True:
+        where = ""
+        parameters: tuple[object, ...] = (
+            gram_chunk_rows,
+        )
+        if last_rowid is not None:
+            where = "WHERE rowid > ?"
+            parameters = (
+                last_rowid,
+                gram_chunk_rows,
+            )
+        row = connection.execute(
+            "SELECT group_concat(row_payload, char(10)), COUNT(*) FROM ("
+            f"SELECT {row_payload} AS row_payload "
+            f"FROM tm_gram NOT INDEXED {where} "
+            "ORDER BY rowid LIMIT ?)",
+            parameters,
+        ).fetchone()
+        if (
+            type(row) is not tuple
+            or len(row) != 2
+            or type(row[1]) is not int
+            or row[1] < 0
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest chunk is invalid"
+            )
+        chunk_count = row[1]
+        if chunk_count == 0:
+            if row[0] is not None:
+                raise CandidateProofIndexError(
+                    "candidate projection digest chunk is invalid"
+                )
+            break
+        if (
+            chunk_count > gram_chunk_rows
+            or type(row[0]) is not str
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest chunk is invalid"
+            )
+        payload = row[0]
+        encoded = payload.encode("utf-8")
+        digest.update(b"chunk:")
+        digest.update(str(chunk_count).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(len(encoded)).encode("ascii"))
+        digest.update(b":")
+        digest.update(encoded)
+        digest.update(b";")
+        try:
+            tail = json.loads(payload.rsplit("\n", 1)[-1])
+        except (TypeError, ValueError) as error:
+            raise CandidateProofIndexError(
+                "candidate projection digest tail is invalid"
+            ) from error
+        if (
+            type(tail) is not list
+            or len(tail) != 11
+            or type(tail[10]) is not int
+            or isinstance(tail[10], bool)
+        ):
+            raise CandidateProofIndexError(
+                "candidate projection digest tail is invalid"
+            )
+        next_rowid = tail[10]
+        if last_rowid is not None and next_rowid <= last_rowid:
+            raise CandidateProofIndexError(
+                "candidate projection digest order is invalid"
+            )
+        last_rowid = next_rowid
+        processed_count += chunk_count
+        if processed_count > actual_count:
+            raise CandidateProofIndexError(
+                "candidate projection digest count is invalid"
+            )
+    if processed_count != actual_count:
+        raise CandidateProofIndexError(
+            "candidate projection digest count is invalid"
+        )
+
+
+def candidate_proof_projection_digest(
+    connection: sqlite3.Connection,
+    *,
+    fts5_available: bool,
+    gram_chunk_rows: int = _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+) -> str:
+    """Hash every actual candidate projection row in canonical order."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise TypeError("connection must be an exact sqlite3 connection")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    table_digests: dict[str, Any] = {
+        "tm_gram": _candidate_projection_table_digest("tm_gram")
+    }
+    _update_candidate_gram_projection_digest(
+        connection,
+        table_digests["tm_gram"],
+        gram_chunk_rows=gram_chunk_rows,
+    )
+    block_digest = _candidate_projection_table_digest("tm_candidate_block")
+    for row in connection.execute(
+        "SELECT block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length "
+        "FROM tm_candidate_block ORDER BY block_id"
+    ):
+        _update_candidate_projection_digest(block_digest, row)
+    table_digests["tm_candidate_block"] = block_digest
+    maximum_digest = _candidate_projection_table_digest("tm_gram_block_max")
+    for row in connection.execute(
+        "SELECT block_id, gram_size, gram, max_term_frequency "
+        "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram"
+    ):
+        _update_candidate_projection_digest(maximum_digest, row)
+    table_digests["tm_gram_block_max"] = maximum_digest
+    if fts5_available:
+        fts_digest = _candidate_projection_table_digest("tm_fts")
+        for row in connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts "
+            "ORDER BY record_id"
+        ):
+            _update_candidate_projection_digest(fts_digest, row)
+        table_digests["tm_fts"] = fts_digest
+    return _finish_candidate_projection_digest(
+        table_digests,
+        fts5_available=fts5_available,
+    )
+
+
+def _validate_candidate_proof_index_core(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+    include_projection_digest: bool,
+    gram_chunk_rows: int = _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+) -> tuple[tuple[tuple[int, int], ...], int, str | None]:
+    """Stream-recompute exact facts, optionally binding projection rows."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise TypeError("connection must be an exact sqlite3 connection")
+    if type(required_sizes) is not tuple or any(
+        type(size) is not int for size in required_sizes
+    ):
+        raise TypeError("required_sizes must be a tuple of built-in integers")
+    if type(fts5_available) is not bool:
+        raise TypeError("fts5_available must be a built-in bool")
+    if type(include_projection_digest) is not bool:
+        raise TypeError("include_projection_digest must be a built-in bool")
+    expected_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    if required_sizes != expected_sizes:
+        raise ValueError("candidate gram sizes do not match the index path")
+    try:
+        worker_row = connection.execute("PRAGMA threads=2").fetchone()
+    except sqlite3.Error as error:
+        raise CandidateProofIndexError(
+            "candidate proof worker configuration is invalid"
+        ) from error
+    if (
+        type(worker_row) is not tuple
+        or len(worker_row) != 1
+        or type(worker_row[0]) is not int
+        or worker_row[0] not in {0, 1, 2}
+    ):
+        raise CandidateProofIndexError(
+            "candidate proof worker configuration is invalid"
+        )
+
+    def proof_int(value: object) -> int:
+        if type(value) is not int:
+            raise CandidateProofIndexError("candidate integer fact is invalid")
+        return value
+
+    def proof_text(value: object) -> str:
+        if type(value) is not str or not value:
+            raise CandidateProofIndexError("candidate text fact is invalid")
+        return value
+
+    record_cursor = connection.execute(
+        "SELECT record_id, source_raw, source_fold_v1, source_fold_length "
+        "FROM tm_record ORDER BY record_id"
+    )
+    gram_cursor = connection.execute(
+        "SELECT record_id, gram_size, gram, term_frequency FROM tm_gram "
+        "ORDER BY record_id, gram_size, gram"
+    )
+    block_cursor = connection.execute(
+        "SELECT block_id, first_record_id, last_record_id, record_count, "
+        "min_source_fold_length, max_source_fold_length "
+        "FROM tm_candidate_block ORDER BY block_id"
+    )
+    maximum_cursor = connection.execute(
+        "SELECT block_id, gram_size, gram, max_term_frequency "
+        "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram"
+    )
+    fts_cursor = (
+        connection.execute(
+            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
+        )
+        if fts5_available
+        else None
+    )
+    current_gram = gram_cursor.fetchone()
+    current_block = block_cursor.fetchone()
+    current_maximum = maximum_cursor.fetchone()
+    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
+    gram_counts = {size: 0 for size in required_sizes}
+    fts_count = 0
+    block_id: int | None = None
+    block_lengths: list[int] = []
+    block_maxima: dict[tuple[int, str], int] = {}
+
+    def flush_block() -> None:
+        nonlocal current_block, current_maximum
+        if block_id is None:
+            return
+        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
+        expected_block = (
+            block_id,
+            first_record_id,
+            first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1,
+            len(block_lengths),
+            min(block_lengths),
+            max(block_lengths),
+        )
+        if current_block is None or tuple(
+            proof_int(value) for value in current_block
+        ) != expected_block:
+            raise CandidateProofIndexError("candidate block fact is invalid")
+        current_block = block_cursor.fetchone()
+        actual_maxima: dict[tuple[int, str], int] = {}
+        while current_maximum is not None:
+            maximum_block_id = proof_int(current_maximum[0])
+            if maximum_block_id != block_id:
+                break
+            size = proof_int(current_maximum[1])
+            gram = proof_text(current_maximum[2])
+            frequency = proof_int(current_maximum[3])
+            key = (size, gram)
+            if size not in {1, 2} or frequency < 1 or key in actual_maxima:
+                raise CandidateProofIndexError(
+                    "candidate block maximum is invalid"
+                )
+            actual_maxima[key] = frequency
+            current_maximum = maximum_cursor.fetchone()
+        if actual_maxima != block_maxima:
+            raise CandidateProofIndexError(
+                "candidate block maximum is invalid"
+            )
+
+    expected_record_id = 1
+    for record_row in record_cursor:
+        record_id = proof_int(record_row[0])
+        source_raw = proof_text(record_row[1])
+        stored_folded_source = proof_text(record_row[2])
+        source_fold_length = proof_int(record_row[3])
+        folded_source = fold_text_value_v1(source_raw)
+        if (
+            not folded_source
+            or record_id != expected_record_id
+            or stored_folded_source != folded_source
+            or source_fold_length != len(folded_source)
+        ):
+            raise CandidateProofIndexError("candidate record fact is invalid")
+        expected_record_id += 1
+        next_block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
+        if block_id is not None and next_block_id != block_id:
+            flush_block()
+            block_lengths.clear()
+            block_maxima.clear()
+        block_id = next_block_id
+        block_lengths.append(source_fold_length)
+
+        actual_grams: dict[tuple[int, str], int] = {}
+        while current_gram is not None:
+            gram_record_id = proof_int(current_gram[0])
+            if gram_record_id != record_id:
+                break
+            size = proof_int(current_gram[1])
+            gram = proof_text(current_gram[2])
+            frequency = proof_int(current_gram[3])
+            key = (size, gram)
+            if (
+                size not in required_sizes
+                or frequency < 1
+                or key in actual_grams
+            ):
+                raise CandidateProofIndexError(
+                    "candidate gram fact is invalid"
+                )
+            actual_grams[key] = frequency
+            current_gram = gram_cursor.fetchone()
+        expected_grams = {
+            (size, gram): frequency
+            for size in required_sizes
+            for gram, frequency in character_ngram_frequencies(
+                folded_source, size
+            )
+        }
+        if actual_grams != expected_grams:
+            raise CandidateProofIndexError("candidate gram fact is invalid")
+        for (size, gram), frequency in actual_grams.items():
+            gram_counts[size] += 1
+            if size in {1, 2}:
+                key = (size, gram)
+                block_maxima[key] = max(
+                    block_maxima.get(key, 0), frequency
+                )
+
+        if fts5_available:
+            if current_fts is None:
+                raise CandidateProofIndexError(
+                    "candidate FTS fact is invalid"
+                )
+            fts_record_id = proof_int(current_fts[0])
+            fts_source = proof_text(current_fts[1])
+            if (fts_record_id, fts_source) != (record_id, folded_source):
+                raise CandidateProofIndexError(
+                    "candidate FTS fact is invalid"
+                )
+            fts_count += 1
+            current_fts = (
+                fts_cursor.fetchone() if fts_cursor is not None else None
+            )
+
+    flush_block()
+    if any(
+        row is not None
+        for row in (current_gram, current_block, current_maximum)
+    ):
+        raise CandidateProofIndexError(
+            "candidate proof index has extra rows"
+        )
+    if current_fts is not None:
+        raise CandidateProofIndexError("candidate FTS fact is invalid")
+    return (
+        tuple(sorted(gram_counts.items())),
+        fts_count,
+        (
+            candidate_proof_projection_digest(
+                connection,
+                fts5_available=fts5_available,
+                gram_chunk_rows=gram_chunk_rows,
+            )
+            if include_projection_digest
+            else None
+        ),
+    )
+
+
+def validate_candidate_proof_index_with_digest(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+    gram_chunk_rows: int = _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+) -> tuple[tuple[tuple[int, int], ...], int, str]:
+    gram_counts, fts_count, projection_digest = (
+        _validate_candidate_proof_index_core(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=fts5_available,
+            include_projection_digest=True,
+            gram_chunk_rows=gram_chunk_rows,
+        )
+    )
+    if type(projection_digest) is not str:
+        raise AssertionError("candidate projection digest is missing")
+    return gram_counts, fts_count, projection_digest
+
+
+def validate_candidate_proof_index(
+    connection: sqlite3.Connection,
+    *,
+    required_sizes: tuple[int, ...],
+    fts5_available: bool,
+    gram_chunk_rows: int = _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
+) -> tuple[tuple[tuple[int, int], ...], int]:
+    """Stream-recompute exact length, TF, block and optional FTS facts."""
+
+    gram_counts, fts_count, projection_digest = (
+        _validate_candidate_proof_index_core(
+            connection,
+            required_sizes=required_sizes,
+            fts5_available=fts5_available,
+            include_projection_digest=False,
+            gram_chunk_rows=gram_chunk_rows,
+        )
+    )
+    if projection_digest is not None:
+        raise AssertionError("candidate projection digest is unexpected")
+    return gram_counts, fts_count
+
+
 __all__ = [
     "CANDIDATE_QUERY_CHUNK_SIZE",
     "CANDIDATE_SEED_POSTING_CAP",
@@ -919,10 +1908,24 @@ __all__ = [
     "candidate_proof_dense_phase2",
     "candidate_proof_query_block_uppers",
     "candidate_proof_query_maxima_digest",
+    "candidate_proof_projection_digest",
     "candidate_proof_snapshot",
     "candidate_recall_snapshot",
     "fts5_candidate_ids",
     "fts5_candidate_ids_for_trigrams",
     "gram_candidate_overlaps",
+    "insert_candidate_fts_rows",
+    "insert_candidate_gram_rows",
+    "insert_streamed_candidate_fts_rows",
+    "insert_streamed_candidate_gram_rows",
+    "insert_streamed_candidate_proof_rows",
+    "maintain_candidate_proof_summaries",
+    "project_candidate_write_plan",
+    "project_streamed_candidate_index",
+    "restore_streamed_stage_secondary_indexes",
+    "streamed_stage_secondary_index_inventory",
+    "suspend_streamed_stage_secondary_indexes",
     "validate_candidate_proof_blocks",
+    "validate_candidate_proof_index",
+    "validate_candidate_proof_index_with_digest",
 ]
