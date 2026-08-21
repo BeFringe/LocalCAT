@@ -267,11 +267,12 @@ Store 内部不得在 import 时把 wrapper 绑定到另一个局部别名，否
 - append/streamed transaction 仍由 store 完成。
 - 保留 late-bound patch target并验证 rollback。
 
-### Wave 4：Evidence、Steering 与退役
+### Wave 4：Final roots、Evidence、Steering 与 GO
 
-- 最终 roots 上重放 current-source matrix、Gate C 与真实 Gate D。
-- 只删除确认无 consumer 的 wrapper。
-- runtime 文件真实存在后同步 `structure.md`，归档 border，标 Feature GO。
+- 先只删除 closed scan 证明无 consumer 的 wrapper并完成最终 architecture cleanup，从而固定 production runtime；随后把 leaf/projection/store/index 同时写入 Gate C artifact/build roots、`BENCHMARK_IMPLEMENTATION_SOURCE_PATHS` 与 fault/acceptance closed source registry，并冻结全部 current-source roots。
+- 在 registries 已冻结的同一 final fingerprint 上重放 store/retrieval 全量矩阵与 Gate C，再真实运行 Gate D。
+- 最后只生成 fault/acceptance/release evidence并同步不属于 evidence roots 的治理文档；runtime 文件真实存在后同步 `structure.md`，归档 border，标 Feature GO。
+- Gate C 开始后若 production、测试矩阵 registry 或任一 current-source root 再变化，所有后续证据一律 stale，必须从 Gate C 重新执行。
 
 ## 验证设计
 

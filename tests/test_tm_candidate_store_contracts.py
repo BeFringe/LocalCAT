@@ -182,6 +182,53 @@ class CandidateStoreContractArchitectureTests(unittest.TestCase):
 
 
 class CandidateStorePortTests(unittest.TestCase):
+    def test_hostile_port_property_fault_is_not_relabelled_or_swallowed(self) -> None:
+        class SentinelError(RuntimeError):
+            pass
+
+        sentinel = SentinelError("programmer fault")
+
+        class HostilePropertyPort(_RecallPort):
+            def __init__(self) -> None:
+                self.candidate_port_scope = "STORE"
+                self.snapshot = contracts.SQLiteCandidateRecallSnapshot(False, (), ())
+                self.calls = 0
+
+            @property
+            def resource_id(self) -> str:
+                raise sentinel
+
+        with self.assertRaises(SentinelError) as raised:
+            CandidateRetriever().candidates(
+                "tm.fake",
+                HostilePropertyPort(),
+                "abc",
+                result_limit=10,
+            )
+        self.assertIs(raised.exception, sentinel)
+
+    def test_hostile_port_callable_fault_is_not_relabelled_or_swallowed(self) -> None:
+        class SentinelError(RuntimeError):
+            pass
+
+        sentinel = SentinelError("programmer fault")
+
+        class HostileCallablePort(_RecallPort):
+            def candidate_recall_snapshot(self, **_kwargs: object) -> object:
+                self.calls += 1
+                raise sentinel
+
+        port = HostileCallablePort()
+        with self.assertRaises(SentinelError) as raised:
+            CandidateRetriever().candidates(
+                "tm.fake",
+                port,
+                "abc",
+                result_limit=10,
+            )
+        self.assertIs(raised.exception, sentinel)
+        self.assertEqual(port.calls, 1)
+
     def test_structural_recall_port_is_accepted_and_called_once(self) -> None:
         port = _RecallPort()
         report = CandidateRetriever().candidates(

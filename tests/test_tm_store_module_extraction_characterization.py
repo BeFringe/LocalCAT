@@ -117,13 +117,42 @@ _SQL_TOKENS = (
     "tm_candidate_block",
     "tm_candidate_gram_block_max",
     "candidate_index_digest",
+    "source_fold_v1",
+    "source_fold_length",
+)
+_MIGRATED_PATCH_MEMBERS = frozenset(
+    {
+        "_apply_candidate_write_plan",
+        "_bounded_seed_stages",
+        "_candidate_proof_block_records_body",
+        "_candidate_proof_dense_phase1_body",
+        "_candidate_proof_dense_phase2_body",
+        "_candidate_proof_snapshot_body",
+        "_candidate_recall_snapshot_body",
+        "_validate_candidate_proof_dense_binding",
+        "build_candidate_write_plan",
+        "candidate_proof_block_records",
+        "candidate_proof_dense_phase1",
+        "candidate_proof_dense_phase2",
+        "candidate_proof_snapshot",
+        "candidate_recall_snapshot",
+        "character_ngram_frequencies",
+        "fts5_candidate_ids",
+        "fts5_candidate_ids_for_trigrams",
+        "gram_candidate_overlaps",
+        "validate_candidate_proof_index",
+    }
 )
 _EXPECTED_SQL_OWNERS = {
     "tm_schema_upgrade.py": frozenset(
         {"_migrate_schema_copy", "flush_proof_block"}
     ),
     "tm_stage_sealer.py": frozenset(
-        {"_stage_closure_digests", "_validate_schema_upgrade_stage_facts"}
+        {
+            "_stage_closure_digests",
+            "_validate_schema_upgrade_stage_facts",
+            "_validate_stage_facts",
+        }
     ),
     "tm_sqlite_store.py": frozenset(
         {
@@ -132,24 +161,22 @@ _EXPECTED_SQL_OWNERS = {
             "_bounded_seed_stages",
             "_candidate_proof_block_records_body",
             "_candidate_proof_dense_phase1_body",
+            "_candidate_proof_dense_phase2_body",
             "_candidate_proof_projection_digest",
             "_candidate_proof_query_block_uppers",
             "_candidate_proof_snapshot_body",
             "_candidate_recall_snapshot_body",
-            "_finish_candidate_projection_digest",
+            "_insert_prepared_records_and_indexes",
             "_insert_streamed_candidate_index",
-            "_inspect_completed_active_schema_read_only",
+            "_insert_streamed_records",
             "_maintain_candidate_proof_summaries",
-            "_schema_digest",
+            "_probe_fts5",
             "_update_candidate_gram_projection_digest",
             "_validate_candidate_proof_dense_binding",
             "_validate_candidate_proof_index_core",
-            "_validate_foreign_key_schema",
-            "_validate_index_schema",
             "fts5_candidate_ids",
             "fts5_candidate_ids_for_trigrams",
             "gram_candidate_overlaps",
-            "inspect_stage_schema",
         }
     ),
 }
@@ -203,31 +230,47 @@ def _candidate_store_consumers() -> dict[str, tuple[tuple[str, str | None], ...]
     return observed
 
 
+def _patch_seams_in_tree(
+    relative: str,
+    tree: ast.Module,
+) -> tuple[Counter[tuple[str, str]], Counter[tuple[str, str]]]:
+    module_targets: Counter[tuple[str, str]] = Counter()
+    instance_targets: Counter[tuple[str, str]] = Counter()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for argument in node.args:
+            if (
+                isinstance(argument, ast.Constant)
+                and type(argument.value) is str
+                and argument.value.startswith(
+                    ("tm_sqlite_store.", "tm_sqlite_candidate_projection.")
+                )
+                and argument.value.rpartition(".")[2] in _MIGRATED_PATCH_MEMBERS
+            ):
+                module_targets[(relative, argument.value)] += 1
+        if (
+            ast.unparse(node.func) == "patch.object"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and type(node.args[1].value) is str
+            and node.args[1].value in _MIGRATED_PATCH_MEMBERS
+        ):
+            instance_targets[(relative, node.args[1].value)] += 1
+    return module_targets, instance_targets
+
+
 def _patch_seams() -> tuple[Counter[tuple[str, str]], Counter[tuple[str, str]]]:
     module_targets: Counter[tuple[str, str]] = Counter()
     instance_targets: Counter[tuple[str, str]] = Counter()
-    module_names = {target for _path, target in _EXPECTED_MODULE_PATCH_SEAMS}
-    instance_names = {target for _path, target in _EXPECTED_INSTANCE_PATCH_SEAMS}
     for path in sorted((_ROOT / "tests").glob("test_*.py")):
         relative = path.relative_to(_ROOT).as_posix()
-        for node in ast.walk(_tree(relative)):
-            if not isinstance(node, ast.Call):
-                continue
-            for argument in node.args:
-                if (
-                    isinstance(argument, ast.Constant)
-                    and type(argument.value) is str
-                    and argument.value in module_names
-                ):
-                    module_targets[(relative, argument.value)] += 1
-            if (
-                ast.unparse(node.func) == "patch.object"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and type(node.args[1].value) is str
-                and node.args[1].value in instance_names
-            ):
-                instance_targets[(relative, node.args[1].value)] += 1
+        observed_module, observed_instance = _patch_seams_in_tree(
+            relative,
+            _tree(relative),
+        )
+        module_targets.update(observed_module)
+        instance_targets.update(observed_instance)
     return module_targets, instance_targets
 
 
@@ -239,10 +282,28 @@ def _sql_owners(relative: str) -> frozenset[str]:
             parents[child] = node
     owners: set[str] = set()
     for node in ast.walk(tree):
+        if not isinstance(node, (ast.Call, ast.Assign, ast.AnnAssign)):
+            continue
+        sql_text = " ".join(
+            item.value
+            for item in ast.walk(node)
+            if isinstance(item, ast.Constant) and type(item.value) is str
+        )
         if not (
-            isinstance(node, ast.Constant)
-            and type(node.value) is str
-            and any(token in node.value for token in _SQL_TOKENS)
+            any(token in sql_text for token in _SQL_TOKENS)
+            and any(
+                keyword in sql_text.upper()
+                for keyword in (
+                    "SELECT ",
+                    "INSERT ",
+                    "UPDATE ",
+                    "DELETE ",
+                    "CREATE ",
+                    "ALTER ",
+                    "DROP ",
+                    "WITH ",
+                )
+            )
         ):
             continue
         owner: ast.AST = node
@@ -255,6 +316,46 @@ def _sql_owners(relative: str) -> frozenset[str]:
 
 
 class TMStoreModuleExtractionCharacterizationTests(unittest.TestCase):
+    def test_candidate_patch_inventory_does_not_prefilter_expected_targets(self) -> None:
+        tree = ast.parse(
+            """
+from unittest.mock import patch
+patch("tm_sqlite_candidate_projection.candidate_recall_snapshot")
+patch("tm_sqlite_store._bounded_seed_stages")
+patch.object(self.alternate_store, "_bounded_seed_stages")
+"""
+        )
+        module_targets, instance_targets = _patch_seams_in_tree(
+            "tests/test_synthetic.py",
+            tree,
+        )
+        self.assertEqual(
+            module_targets,
+            Counter(
+                {
+                    (
+                        "tests/test_synthetic.py",
+                        "tm_sqlite_candidate_projection.candidate_recall_snapshot",
+                    ): 1,
+                    (
+                        "tests/test_synthetic.py",
+                        "tm_sqlite_store._bounded_seed_stages",
+                    ): 1,
+                }
+            ),
+        )
+        self.assertEqual(
+            instance_targets,
+            Counter(
+                {
+                    (
+                        "tests/test_synthetic.py",
+                        "_bounded_seed_stages",
+                    ): 1
+                }
+            ),
+        )
+
     def test_candidate_index_concrete_import_baseline_is_exact(self) -> None:
         self.assertEqual(
             _imports_from("tm_candidate_index.py", "tm_sqlite_store"),

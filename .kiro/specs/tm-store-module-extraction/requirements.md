@@ -109,7 +109,7 @@ LocalCAT 的 canonical TM 已经具备 SQLite 持久化、generation lease、sou
 #### 验收标准
 
 1. Architecture guard 应证明 `tm_candidate_store_contracts` 是叶模块，`tm_candidate_index` 只依赖 candidate contracts 与 TM frozen reports/scorer contracts。
-2. Architecture guard 应证明 candidate SQL 仅存在于 `tm_sqlite_candidate_projection`，store 只保留 transaction/lifetime wrapper 与必需 schema DDL。
+2. Architecture guard 应证明 steady-state recall/proof/write/projection SQL 与 row decoding 仅存在于 `tm_sqlite_candidate_projection`，store 只保留 transaction/lifetime wrapper 与必需 schema DDL；已批准的 schema-copy 与 stage-sealing SQL owner 是独立的迁移/封存权威，不构成第二 operational candidate authority。
 3. Architecture guard 应拒绝 data plane 导入 store/candidate algorithm/retrieval/Engine/Application/Qt，以及 candidate algorithm 导入 store/data-plane concrete implementation。
 4. 系统应保持 Parser、Multi-Document、Chunk、Sync 与 TM Store 维护线互不导入。
 
