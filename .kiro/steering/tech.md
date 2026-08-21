@@ -84,5 +84,6 @@ python translation_runner.py
 - canonical 查询固定 EXACT → CONTEXT → FUZZY；Gate D 按 ADR-013 由 Core 复证设备本地资格，兼容键命中可跨进程恢复，缺失/失配只允许显式重验。FUZZY 仍只在正式 capability 开放且候选分数达到 device-local 阈值时出现，从不自动应用。
 - 已发布 canonical 的跨重启平台文件身份恢复按 ADR-016；普通打开、内容证明、generation 与 Fuzzy 资格边界保持不变。
 - 项目搜索与版本化术语共用 capability-gated `TextMatcher`的 Unicode/Whole Word 语义；Qt 不复制 matcher 实现。
-- Parser 与 Engine 按 ADR-015 保持互不导入；Application façade/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
+- Parser 与 Engine 按 ADR-015 保持互不导入；Application 兼容入口/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
 - CSV/XLSX 术语列 preview 是 Parser reader 的显式 capability：CSV 复用首个逻辑 record，XLSX 复用 OPC preflight 与 active worksheet 首行；正式导入在同一新 sealed snapshot 上先复核完整身份和可见列数，再允许 verified stream 与 TermbaseStore 事务。Qt/Controller 不拥有 CSV/XLSX grammar，也不自动猜测语言列。
+- TM candidate 模块解耦按 ADR-017：candidate algorithm 只消费中立 storage port，SQLite candidate SQL 由独立数据面拥有；`SQLiteTMStore` / query view 继续独占 connection、transaction、generation 与公开入口。该决策不改变 schema、proof/scorer 或 Gate C/D 硬门，runtime 文件表只在实际落地后同步。

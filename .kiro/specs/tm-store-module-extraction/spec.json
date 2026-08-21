@@ -1,0 +1,22 @@
+{
+  "feature_name": "tm-store-module-extraction",
+  "created_at": "2026-08-21T00:00:00Z",
+  "updated_at": "2026-08-21T14:40:00Z",
+  "language": "zh-CN",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}

@@ -30,5 +30,6 @@
 | ADR-014 | 已采纳 | 设备本地预处理偏好的 workspace 持久化 |
 | ADR-015 | 已采纳 | Parser/Codec 中立边界、用途感知选择与能力式扩展 |
 | ADR-016 | 已采纳 | 已发布 canonical authority 的设备身份重新证明 |
+| ADR-017 | 已采纳 | TM candidate storage port 与 SQLite candidate 数据面责任分离 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。
