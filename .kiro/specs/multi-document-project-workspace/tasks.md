@@ -79,43 +79,47 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ### Cluster 2A：Aggregation / Reconciliation
 
-- [ ] 2.1 建立 document ordering 与连续 workspace 聚合
+- [x] 2.1 建立 document ordering 与连续 workspace 聚合
   - manifest/import 顺序只决定显示和导航顺序，不改变 Document/Segment 身份。
   - workspace 组合 codec 已产生的单文档结果，不复制格式 grammar 或 writer。
   - 提供有界显式文件 intake：用户选择同一 portable root 下的 JSON/TXT/PO/POT 列表，逐个取得 Parser verified terminal 后才聚合；不扫描目录、不自动包含相邻文件、不赋予 reader-only writer。
+  - 保留同一 root fd 和所有 selected regular-file identities 至整批 terminal 完成，拒绝 hardlink/symlink/root replacement/file drift；发布的 staged DTO 必须明确 `durable=False` 且原 source bytes不变。
+  - 冻结 flat segment 投影、document/project progress 与 deterministic workspace content digest；现有 Document 不得因 incoming selection reorder 改变顺序，真正 new Document 只按 incoming 顺序追加。
 
-- [ ] 2.2 建立 source reconciliation
+- [x] 2.2 建立 source reconciliation
   - 按稳定复合 ID 与 source fingerprint 产生 `unchanged`、`source_changed`、`new`、`removed`、`ambiguous`、`unresolved`。
   - `source_changed` 保留 target 但撤销确认；`removed`、`ambiguous`、`unresolved` 保留恢复引用并要求显式处置，不按列表索引或正文相似猜测。
   - 冻结设备本地 `OriginBinding` 的 exact root/source_ref/revision → document_id 回接；新 source identity 允许变化并参与 reconciliation，preview 后再变才 stale。重命名只经显式映射，forged/stale/cross-root binding 在首次 mutation 前拒绝。
+  - `keep_detached` 后 detached-only Document 留在 workspace，但不伪造 live `OriginBinding`；apply 仅消费当前 service 签发的一次性 operation，必须复验 project/session/revision/workspace/source identities 后才单次 swap。
 
 ### Cluster 2B：Save / Recovery
 
-- [ ] 2.3 建立 carrier-neutral save candidate、LKG 与结构化报告
+- [x] 2.3 建立 carrier-neutral save candidate、LKG 与结构化报告
   - 冻结逐 Document baseline、完整 candidate、staging/validation/publication/readback 与 last-known-good 语义；只清除已证明持久化的 dirty。
   - 报告区分 `saved`、`rolled_back`、`unchanged`、`failed` 与不确定/需恢复状态，不用项目级布尔值抹平局部结果。
 
-- [ ] 2.4 闭合 save/recovery fault model 与未来 origin 原子性红线
+- [x] 2.4 闭合 save/recovery fault model 与未来 origin 原子性红线
   - 覆盖 candidate、validation、publication、readback、commit、rollback 与 cold recovery fault；任何不确定状态保持 LKG、dirty 与恢复信息。
   - directory/workbook 仅冻结后续 profile 必须遵守的逐文档 journal/单文件原子替换红线；本 Cluster 不启用 directory discovery、workbook project profile 或新 source writer。
 
 ### Cluster 2C：ProjectPackage Logical + Physical Closure
 
-- [ ] 2.5 建立版本化 `ProjectPackageManifest` 与 carrier-neutral package contracts
+- [x] 2.5 建立版本化 `ProjectPackageManifest` 与 carrier-neutral package contracts
   - manifest 固定项目/文档身份、顺序、member reference、版本与 digest；未知版本、重复 member、digest/identity/path 冲突 fail closed。
   - document content 与 `codec_private_member` 只作为带 digest 的 member；通用 workspace 不解释 codec-private bytes。
   - preview 无写入且与最终 apply 消费同一已验证计划；receipt 对账 package identity/version/member digest、reconciliation 与逐文档结果。
   - 不把 TM/术语资源装入 ProjectPackage，也不建立 ProjectPackage/ResourcePackage 共同 authority。
 
-- [ ] 2.6 在任何 2C production 实现前批准 ProjectPackage 物理 carrier 决策
+- [x] 2.6 在任何 2C production 实现前批准 ProjectPackage 物理 carrier 决策
   - 用 current-source prototype/fixture 比较目录、单文件 archive 或其他候选的确定性、原子替换、路径安全、流式校验与恢复语义。
   - 把选定 carrier、版本迁移和拒绝方案写入 owner 批准的 C2C decision record；若治理门判定需新 ADR，则新增后继 ADR，不改写已采纳 ADR-018；未批准时 2C implementation NO-GO。
+  - 人工已批准 ADR-019：v1 唯一 carrier 为严格闭集的 `localcat-project-package-zip-v1`/`ZIP_STORED`；拒绝 ZIP64、压缩、宽松 `zipfile` 读取和并行 directory reader/writer。
 
-- [ ] 2.7 实现手工 export / validate / preview / import / apply / receipt
+- [x] 2.7 实现手工 export / validate / preview / import / apply / receipt
   - export 只在完整 staging、member digest 和 readback validation 成功后发布，不完整导出不得覆盖旧包。
   - import 复验物理 carrier 与逻辑 manifest，并让 preview 后的 apply 使用同一事务/计划；失败保留旧项目与可重试信息。
 
-- [ ] 2.8 闭合冷重开与 package fault matrix
+- [x] 2.8 闭合冷重开与 package fault matrix
   - 覆盖截断、重复/缺失/额外 member、路径穿越、digest/version/codec声明不符、preview 后篡改、commit/readback/reopen 失败。
   - live codec unavailable 只产生 body-safe warning并禁止source write-back，不阻止package离线导入/target编辑；只有声明损坏或请求解释private member的操作才fail closed。
   - 用至少两个 Document 且跨文档复用同一 local segment ID 的真实 ProjectPackage 冷重开，逐项核对项目/文档/segment 身份、顺序、source/target、opaque member 与 receipt。
@@ -124,7 +128,7 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 - 2A/2B/2C 各自通过定点对抗检查，累计 diff 再通过 Cluster 2 独立 reviewer。
 - `collaborative-job-chunks` 的统一进入门位于完整 Cluster 2 之后；不得在仅有 Cluster 1 identity 时开始 chunk schema/权限实现。
-- 现有 `language-resource-portability` brief 在 Cluster 2 已验证 package 原语后提升为独立 R/D/T，独立拥有 TM JSONL 与术语 CSV/v1 ResourcePackage；不得抽取共同 authority。
+- Cluster 2 后恢复/确认 `language-resource-portability` brief，再提升 TM JSONL 与术语 CSV/v1 ResourcePackage R/D/T；`tmx-context-interchange` 未来只拥有可选 TMX export profile。两项不得互相冒充或抽取 ProjectPackage 共同 authority。
 - 独立提交：`feat(workspace): 闭合 ProjectPackage 手工包事务`。
 
 ## Cluster 3：应用服务（brief Promotion Cluster 3）
@@ -179,8 +183,8 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ## 相邻规格边界
 
-- 现有 `language-resource-portability` brief 在 Cluster 2 后提升为独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费已批准 ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。
-- `tmx-context-interchange` 只拥有 TMX language-resource context/provenance/export profile；TMX 不是 ProjectDocument，也不由本规格开放 TMX writer。
+- 恢复/确认 `language-resource-portability` brief 后，提升独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费已批准 ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。
+- `tmx-context-interchange` 只拥有 ResourcePackage 未来可增加的 TMX export profile、TMX context/provenance 与有损取舍；TMX 不是 ProjectDocument，也不由本规格开放 TMX writer。
 - `rpy-project-codec` 独立拥有 RPY token/sidecar/占位符与 writer；folder 接入依赖本规格，但产品排期仍在 sync 后。
 - PO/POT reader 或未来 canonical writer 归独立 format codec；本规格的 `single_file`/`directory` origin 不自动赋予 PO/POT writer 能力。
 - CONTEXT 精确语义及“上下文一致”UI 投影归 `feature5-ui-integration`（Integration TM surface）；本规格不增加 evidence 字段或匹配判定。

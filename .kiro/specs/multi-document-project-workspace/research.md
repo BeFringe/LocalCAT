@@ -9,7 +9,7 @@
   - Parser 已为 `project_document` 提供 LocalCAT JSON、TXT、PO 和 POT 的单输入读取，但只有 LocalCAT JSON 声明 canonical writer；TXT/PO/POT 的后续 target 与编辑状态需由 ProjectPackage 保存，不能伪装成源格式回写。
   - TMX 在 purpose-aware registry 中只属于 `language_resource.translation_memory`；XLSX 当前只是术语资源的 active-worksheet reader，两者都不能被多文档工作区推断成项目文档。
   - 首个可验收的真实多文档 substrate 应是版本化 ProjectPackage：它同时给出稳定身份、成员摘要、编辑 overlay、preview/apply/receipt 和冷重开边界。直接目录聚合、multi-sheet XLSX 与 RPY 均不是本轮 substrate。
-  - ProjectPackage 是项目工作区的交换/恢复单元；后续 ResourcePackage 是 TM/术语资源可移植性单元。二者不共享 authority，也不应抽象为一个“通用包”。
+  - ProjectPackage 是项目工作区的交换/恢复单元；后续 JSONL/CSV ResourcePackage 由 `language-resource-portability` 独立拥有，`tmx-context-interchange` 未来只增加可选 TMX export profile。二者不共享 authority，也不应抽象为一个“通用包”。
 
 ## Research Log
 
@@ -50,9 +50,10 @@
 ### ProjectPackage 与 ResourcePackage
 
 - **ProjectPackage 唯一职责**：项目、文档、段落的稳定身份；source snapshot/member；target/确认/编辑 overlay；项目级进度；手工导入导出、preview/apply/receipt 和 source reconciliation。
-- **ResourcePackage 唯一职责**：后续 TM JSONL/TMX 和术语 CSV/v1 等资源导入导出产物、报告和 receipt；它不是项目文档容器。
+- **ResourcePackage 唯一职责**：由 `language-resource-portability` 冻结的 TM JSONL/术语 CSV/v1 资源 profile、导入导出产物、报告和 receipt；它不是项目文档容器。
+- **tmx-context-interchange 唯一职责**：未来可增加的 TMX export profile、context/provenance 与有损互操作语义；它不拥有 ResourcePackage container/apply authority。
 - **Decision**：不建立共同 package authority。ProjectPackage manifest 不收编 live canonical SQLite、sidecar、journal、stage residue 或 TMX 项目文档；sync 未来分别消费 Core 批准的项目包和资源包。
-- **Follow-up**：在 Multi-Document Cluster 2 手工项目包闭环冻结后，另起 ResourcePackage 收尾 brief，不回写本 Spec 成为两类包的统一 authority。
+- **Follow-up**：在 Multi-Document Cluster 2 手工项目包闭环冻结后，恢复/确认 `language-resource-portability` brief 并推进 JSONL/CSV ResourcePackage 收尾；TMX profile继续由 `tmx-context-interchange` 后置治理。两者都不回写本 Spec 成为统一 authority。
 
 ### Reader-only 源的编辑所有权
 

@@ -76,7 +76,7 @@ Project workspace ───────────────> ProjectPackage
 | `language-resource-portability` | TM JSONL、术语 CSV/v1、ResourcePackage manifest/profile、资源 import/export receipt |
 | `cross-device-sync-plugin` | provider、remote plan、凭据、加密、远端冲突与操作日志 |
 | `rpy-project-codec` | RPY grammar、repository ACL、token/sidecar、占位符保护、source round-trip writer |
-| `tmx-context-interchange` | TMX export profile、context/provenance 与有损取舍 |
+| `tmx-context-interchange` | ResourcePackage 未来可增加的 TMX export profile、context/provenance 与有损取舍；不拥有 ResourcePackage 容器事务 |
 | Integration TM surface | CONTEXT 能力与最小 UI 标签；不由项目工作区推导 evidence 字段 |
 
 ### 禁止进入通用工作区
@@ -104,17 +104,28 @@ C0 规格/ADR
   → C1 identity/origin/single-JSON adapter
     → C2A aggregation/reconciliation
       → C2B save/recovery
-        → C2C ProjectPackage logical + physical closure
-          → C3 Controller/search scope
-            → C4 Qt/current-source acceptance
+        → ADR-019 批准 deterministic ZIP v1
+          → C2C ProjectPackage logical + physical closure
 
-C2A + C2B + C2C
-  → collaborative-job-chunks
+C2C 完成后分成三条后续线
+  ├→ C3 Controller/search scope → C4 Qt/current-source acceptance
+  ├→ collaborative-job-chunks
+  └→ 从 83526a1 恢复/确认 language-resource-portability Brief
+        → 提升独立 ResourcePackage R/D/T
+          → 闭合 TM JSONL + 术语 CSV/v1 ResourcePackage
 
-C2C
-  → language-resource-portability 独立 R/D/T
-  → cross-device-sync-plugin（另需 ResourcePackage）
+未来可选扩展
+  → tmx-context-interchange 提供 TMX export profile
+    → 接入已批准的 ResourcePackage container/preview/apply/receipt
+
+cross-device-sync-plugin
+  ← 已批准的 ProjectPackage
+  ← 已批准的 ResourcePackage
 ```
+
+这里的“三条后续线”以完整 C2C 通过为门，不以“只选定 ZIP profile”替代真实 exporter/importer、冷重开与 fault matrix。三条线也不是共同 authority：Chunk 只消费稳定复合 segment identity；`language-resource-portability` 独立拥有 JSONL/CSV ResourcePackage，并只借鉴已经验证的原子发布、digest、preview、receipt 与恢复原语。它们均不得反向拥有 ProjectPackage。C3/C4 继续完成 Multi-Document 自身的 Controller/Qt 产品面。
+
+“恢复/确认 Brief”是复读 83526a1 已提交的 handoff，并重新把它放入实施顺序；当前分支已经包含该文件，不需要把旧 evidence JSON 或一次性 worktree 倒灌回来。Brief 只确认 JSONL/CSV ResourcePackage 的问题、范围、owner、上下游和启动门，没有 approved Requirements/Design/Tasks，也没有 runtime 能力。“ResourcePackage 收尾”才是随后把该 Brief 提升为独立 R/D/T，经人工门后实现并验收 TM JSONL 与术语 CSV/v1 的 export/validate/preview/import/apply/receipt。`tmx-context-interchange` 是未来可选 TMX profile owner，不替代这条首轮收尾线，也不取得 ResourcePackage container authority。
 
 每簇验证前必须锚定以下现象：
 
@@ -346,14 +357,14 @@ SHA256(
 
 首个产品可达的多文档 workspace 不依赖预制 fixture，也不扫描目录。Application-owned `project_workspace_intake.py` 提供 `stage_selected_project_documents(root, selected_paths, request)`；`project_workspace.py` 只接收它已验证并私有复制的 immutable Document facts，不导入 Parser 或打开 source：
 
-1. `root` 通过 rooted no-follow source boundary 固定，`selected_paths` 必须是 exact tuple、至少两个、顺序即初始 document order；
-2. 每个 path 必须是 root 内用户明确选择的 regular file，拒绝重复、symlink、越界、枚举过程中新增的未选择文件；
+1. `root` 的 final component 通过 `O_DIRECTORY | O_NOFOLLOW` 绑定并保留同一 root fd 到整批完成，冻结设备本地 dev/inode；`selected_paths` 必须是 exact tuple、至少两个、顺序即初始 document order；
+2. 每个 path 必须是 root 内用户明确选择的 regular file，从 retained root fd 逐 component no-follow 预绑定；拒绝重复、hardlink alias、symlink、越界与 non-regular。未选择文件无论何时出现都不得被 Core 枚举、读取、自动纳入或影响 selection binding；
 3. 首批 suffix/format 闭集为 LocalCAT JSON、TXT、PO、POT，且每个输入都经现有 `ParserApplicationSurface.open_input()`、自然 EOF 与 verified terminal；TMX、CSV/XLSX termbase、normalized TM JSON 不可作为 ProjectDocument；
-4. 任一输入、terminal、limit、identity 或 duplicate-local-id 失败时，整个 intake 不发布 workspace；
+4. 每个 Parser source snapshot 必须与预绑定 regular identity/size/mtime 和 normalized relative-ref digest 精确对账；末尾再经 retained file/root fd 复验 status 与 content digest。任一输入、terminal、limit、identity、duplicate-local-id 或 root/file drift 失败时，整个 intake 不发布 workspace；
 5. 成功后产生 `DIRECTORY` origin、profile `explicit-selected-files-v1` 和规范化 relative source refs。该 profile只记录用户明确选择的一组 source，不递归 discovery、不监视目录、不授予 source write-back；
 6. `directory/explicit-selected-files-v1` 在本规格中只允许保存 ProjectPackage，不允许多文件 origin write-back。JSON live writer是未来回写的必要但不充分条件；只有 legacy `single_file` LocalCAT JSON 继续使用既有 writer。TXT/PO/POT 的 target/confirmed只写package overlay。
 
-这个 intake 只建立 carrier-neutral staged workspace。只有 C2C ProjectPackage 成功发布并 cold reopen 后，它才成为 durable 多文档项目；失败时原 source bytes与当前session均不变。
+这个 intake 只建立 carrier-neutral `StagedSelectedProjectDocuments(durable=False, source_write_back_authorized=False)`。只有 C2C ProjectPackage 成功发布并 cold reopen 后，它才成为 durable 多文档项目；失败时原 source bytes与当前session均不变。`revalidate_staged_selected_documents()` 只对同一 exact binding 重开新 sealed snapshots 供 preview/apply 比对，不发布或修改原 staged workspace。
 
 ### 聚合与扁平导航
 
@@ -398,16 +409,16 @@ current workspace + exact session/revision
 
 1. 先按 `document_id`，再按 exact `local_segment_id`。外部 source 重新解析前，Application 只能从设备本地 `OriginBinding` 的 exact `(root identity, normalized source_ref, binding revision) → document_id` 映射取得既有 ID；新 sealed source identity允许变化并作为 incoming事实计算source fingerprint。无稳定绑定的 origin adapter只能产生新的 ID，不得按 display name、sheet name、source text或 index 猜旧 ID。
 2. 同一复合 ID且 source fingerprint相同为 `unchanged`：保留当前 package target/confirmed，不让 origin target 静默覆盖。
-3. 同一复合 ID且 source fingerprint不同为 `source_changed`：采用新的 source-owned facts，保留当前 target，强制 `confirmed=False`。
+3. 同一复合 ID且 source fingerprint不同为 `source_changed`：采用新的 source-owned facts，保留当前 target，强制 `confirmed=False`。fingerprint 对 source、raw speaker 与 codec 已发布的中立 `format_metadata` 做 type-tagged canonical digest；Application 不解释 gettext 或其他 codec-private key。
 4. 只在 incoming 中为 `new`：采用 incoming source；target 若由 reader 提供则可作为初始 workspace target，否则为空，但一律不得凭空标记confirmed；任何后续编辑由overlay持久。
 5. 只在 current 中为 `removed`：不自动删除。public preview列出复合 ID，apply 前调用方必须对每项明确选择 `keep_detached` 或 `remove`；缺少、重复或 forged decision均拒绝。
 6. 已认证update mapping对同一旧ID给出多个互斥新ID、或多个旧ID竞争同一新ID时为`ambiguous`；缺失足够稳定关联事实、无法证明应归入new/removed配对时为`unresolved`。两类都保留旧overlay/恢复引用并要求显式处置，不运行正文相似或index fallback。
 7. incoming内部重复document/local ID、fingerprint shape错误或source-ref collision属于fatal invalid input，不产出可apply preview；这类伪造/损坏不能降级为可批准的ambiguous。
 8. source_ref/display/order改变不自动改变ID；同ID下这些metadata变化单独报告，不伪装为segment source变化。
 
-`OriginBinding` 是设备本地、版本化且不进入 ProjectPackage 的中立映射。正常内容更新保持root/ref/revision回接并产生`source_changed`；preview创建后source identity再次变化才使preview stale。外部文件重命名不自动继承旧 ID：用户必须在 preview 中显式确认 old/new source_ref mapping，Application同时复证旧新 rooted source identities并签发新 binding revision。重复目标、跨root、stale revision、casefold/NFC冲突或伪造 mapping在Parser读取或workspace mutation前拒绝。Cluster 2A fault matrix必须覆盖正常更新、rename确认、源替换、binding stale与跨项目复用。
+`OriginBinding` 是设备本地、版本化且不进入 ProjectPackage 的中立映射。正常内容更新或 selection reorder 保持 exact `source_ref → document_id` relation 与 revision，并按 fingerprint 产生`unchanged/source_changed`；新增、移除或已证明重命名使 mapping relation 变化时，revision 恰好前进一次。preview创建后source identity再次变化才使preview stale。外部文件重命名不自动继承旧 ID：用户必须在 preview 中显式确认 old/new source_ref mapping，Application同时复证旧新 rooted source identities并签发新 binding revision。同一 source_ref 不得在新 binding 中改换 document_id；重复目标、跨root、stale revision、casefold/NFC冲突或伪造 mapping在Parser读取或workspace mutation前拒绝。Cluster 2A fault matrix必须覆盖正常更新、rename确认、源替换、binding stale与跨项目复用。
 
-`keep_detached` 保留旧Document/Segment content与overlay并标记`source_presence=detached`，使用户仍能导出/复制target；它不伪造source writer。`remove`只在显式确认且preview仍current时执行。`ambiguous` / `unresolved`必须由用户选择保留detached、接受一个由preview列出的已认证关联或取消；未完成全部决定时不得发布新workspace authority。未来若要正文相似度辅助人工重关联，只能返回不具授权力的建议，不能签发identity或绕过显式决定。
+`keep_detached` 保留旧Document/Segment content与overlay并标记`source_presence=detached`，使用户仍能导出/复制target；它不伪造source writer。设备本地 `OriginBinding` 只精确覆盖仍含 attached segment 的 Documents；detached-only Document 可继续存在 workspace/package 中而不伪造 live source binding。`remove`只在显式确认且preview仍current时执行。`ambiguous` / `unresolved`必须由用户选择保留detached、接受一个由preview列出的已认证关联或取消；未完成全部决定时不得发布新workspace authority。未来若要正文相似度辅助人工重关联，只能返回不具授权力的建议，不能签发identity或绕过显式决定。
 
 ### Stale preview 与 capability
 
@@ -512,6 +523,14 @@ workbook是一个物理文件保存单元，即使逻辑上包含多个Document�
 
 programmer fault保持可观察，不能被折叠成 source input failure；已知 OS/codec/stale错误在 Application boundary映射为稳定 body-safe code。没有 complete durable proof时不得清除 dirty或删除 recovery artifact。
 
+C2B 的具体协调合同还冻结以下事实：
+
+- 首次完整保存的 LKG 是显式 `None`；不得用 current/candidate workspace 伪造已存在的 durable baseline，其 `DocumentSaveResult.before_digest` 也为 `None`。
+- carrier 在 stage、validation、stale revalidation 或 durable journal arm 期间报错后，coordinator 必须检查是否已留下 candidate/journal residue；只有确证无 residue 才能报 `clean`，否则报 `recovery_required`。
+- publication 后必须先独立 readback candidate，再执行 carrier finalize/cleanup，最后再次独立 readback 并确认 recovery journal 已清空。第一次 durable proof 已成立但 finalize/cleanup 不完整时，baseline 可采纳 candidate，但 report 必须保持 `recovery_required`；任何后续 readback 不再精确命中 candidate 时不得报 committed。
+- cold recovery preview 只公开 body-safe operation/project/digest/action facts，service 私下绑定 exact port identity、phase、candidate/LKG digest 与 action闭集；preview 一次消费，同 operation id 下替换 candidate、LKG、project 或 phase 都必须 fail closed。carrier recovery handle 保持 opaque，coordinator 只能通过 port 的 `describe_pending_recovery(handle) -> PendingRecoveryFacts` 取得冻结事实，不得猜测 handle 的私有属性或类型。
+- report 的 `workspace_revision` 与 `workspace_content_digest` 必须同时绑定该 save operation 的初始 revision 与已发布 candidate；publication 期间发生的后续 workspace edit 不得被拼成一对从未同存的 revision/digest。
+
 ## C2C：ProjectPackage 逻辑与物理闭环
 
 ### Authority
@@ -563,7 +582,7 @@ ProjectPackage v1 是多文档 workspace 的 canonical persistence：
 
 ### C2C Physical carrier 人工决策门
 
-C0只冻结logical manifest/member/receipt与carrier必须保持的安全/事务语义，不批准具体物理容器。C2C开始时必须先提交carrier spike与人工decision record；未批准前不得把`.zip`、目录或任一扩展名写入production contract。
+C0只冻结logical manifest/member/receipt与carrier必须保持的安全/事务语义，当时不批准具体物理容器。C2C current-source spike与独立对抗审查完成后，项目 owner已在ADR-019批准严格闭集的单文件`localcat-project-package-zip-v1`/`ZIP_STORED`为v1唯一production carrier。未选的versioned-directory与裸目录不保留并行runtime；扩展名仍不参与格式或身份判定。
 
 所有候选carrier必须证明：
 
@@ -574,9 +593,9 @@ C0只冻结logical manifest/member/receipt与carrier必须保持的安全/事务
 - export/import receipt能唯一绑定最终carrier artifact/content digest并支持cold reopen；
 - 无网络、无常驻服务、无provider依赖，且符合`ProjectLimitProfile v1`。
 
-首选候选是单文件deterministic ZIP，原因是手工搬运和未来provider只需处理一个immutable artifact；但它在C0仍只是候选。C2C spike至少要与“versioned directory root + atomic current pointer”比较crash recovery、跨平台path语义、原子发布、实现复杂度和大member流式能力。普通裸目录in-place覆盖不合格，因为它会虚构跨member原子性。
+候选比较已完成：单文件deterministic ZIP对手工搬运和未来provider只暴露一个immutable artifact；versioned directory + atomic current pointer虽可实现，但手工复制与provider listing可见pointer/generation不一致，并扩大跨平台path、durability、orphan GC和TOCTOU状态面。ADR-019因此选定前者并拒绝并行directory reader/writer。
 
-如果人工批准ZIP候选，建议profile为`localcat-project-package-zip-v1`，布局为：
+已批准profile为`localcat-project-package-zip-v1`，布局为：
 
 ```text
 manifest.json
@@ -585,9 +604,9 @@ sources/<document_id>/<sha256>.bin          # reader-only/source snapshot when r
 codec-private/<document_id>/<sha256>.bin   # optional, at most one/document
 ```
 
-ZIP候选必须额外证明固定member order/timestamp/permission/comment/extra、明确compression/ZIP64策略、duplicate/casefold/NFC collision、CRC/trailing data、symlink/executable/encryption拒绝以及bounded stream读取；这些条目是selection acceptance，不是C0已批准事实。
+ADR-019进一步冻结classic single-disk、stored-only、no-ZIP64/no-encryption/no-data-descriptor/no-extra/no-comment，固定member order/timestamp/permission/flags，并要求duplicate/casefold/NFC collision、CRC/trailing data、symlink/executable与raw envelope异常fail closed。读取必须先raw preflight，再从retained regular-file handle用小buffer流式复算byte count/CRC/SHA-256，不extract成员。
 
-如果人工批准versioned-directory候选，必须将每次完整candidate写入新immutable generation root，并只用一个经fsync的原子pointer切换current generation；不得逐member覆盖active generation，也不得把generation residue当成成功package。未被选择的候选不得保留并行production reader/writer。
+versioned-directory候选已被ADR-019拒绝作为v1；不得将实验性generation/pointer实现保留为production reader/writer。
 
 ### Export
 
@@ -667,6 +686,7 @@ receipt不包含正文、private bytes、absolute path、credential、device key
 - workspace可存储、复制、比较digest、删除整个member，但不得解析、局部merge、重写或把它投影到UI；
 - source write-back前，Application只向exact matching live codec提供受限read-only handle；identity/version/source fingerprint不匹配则在目标open前拒绝；
 - package import不要求对应codec当前已安装，因此reader-only离线查看和target编辑仍可工作；缺codec只使source write-back unavailable；
+- `OpenedProjectPackage.codec_availability(exact CodecIdentity tuple)`只投影逐Document的availability与`PROJECT.PACKAGE.CODEC_UNAVAILABLE`，不导入registry、不授予writer；公开member读取仅提供bounded stream，private path还必须携带exact matching identity，不提供整块materialize捷径；
 - export必须bit-for-bit保留未修改document的private member；document source reconciliation需要新private member时，由codec产生完整replacement，workspace不合并旧新bytes；
 - Chunk与Sync只见member reference/digest或整个package bytes，不读取payload。
 
@@ -741,7 +761,7 @@ UI文案为“当前章节 / 搜索全部章节”。`ProjectSearchRequest`增�
 | Contract/identity | `PROJECT.WORKSPACE.CONTRACT_INVALID`, `IDENTITY_DUPLICATE`, `PATH_INVALID`, `LIMIT_EXCEEDED` |
 | Reconcile | `PROJECT.RECONCILE.INPUT_INVALID`, `PREVIEW_STALE`, `DECISION_REQUIRED`, `SOURCE_STALE`, `APPLY_FAILED` |
 | Save | `PROJECT.SAVE.WRITER_UNAVAILABLE`, `STAGE_FAILED`, `VALIDATION_FAILED`, `SOURCE_STALE`, `COMMIT_FAILED`, `ROLLBACK_FAILED`, `RECOVERY_REQUIRED` |
-| Package | `PROJECT.PACKAGE.SOURCE_UNSAFE`, `FORMAT_UNSUPPORTED`, `MANIFEST_INVALID`, `MEMBER_INVALID`, `DIGEST_MISMATCH`, `LIMIT_EXCEEDED`, `PREVIEW_STALE`, `SOURCE_STALE`, `DESTINATION_STALE`, `APPLY_FAILED`, `RECOVERY_REQUIRED` |
+| Package | `PROJECT.PACKAGE.SOURCE_UNSAFE`, `FORMAT_UNSUPPORTED`, `MANIFEST_INVALID`, `MEMBER_INVALID`, `DIGEST_MISMATCH`, `LIMIT_EXCEEDED`, `PREVIEW_STALE`, `SOURCE_STALE`, `DESTINATION_STALE`, `APPLY_FAILED`, `RECOVERY_REQUIRED`, `CODEC_UNAVAILABLE` |
 
 public error/report/log不得包含source/target/speaker/private bytes、carrier raw manifest JSON、绝对路径、OS exception string、credential或device identity。安全字段限于stable code、project/document/segment opaque ID、digest、profile、enum状态和非负counts。绝对路径可由UI从用户当前selection单独显示，不能拼进Core error。
 
@@ -779,7 +799,7 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 - logical manifest/document/private member contracts、carrier spike/人工决策与获批physical profile。
 - export/cold validate/preview/import/apply/cold reopen/receipt完整链。
 - 用真实至少2 Document package作为首个production multi-doc substrate。
-- 完成本Cluster后，Chunk可开始独立C0；现有 `language-resource-portability` brief 可借鉴实现原语提升为独立R/D/T，但不复用schema/authority。
+- 完成本Cluster后，Chunk可开始独立C0；恢复/确认现有 `language-resource-portability` brief 后，可借鉴实现原语提升 JSONL/CSV ResourcePackage R/D/T，但不复用 ProjectPackage schema/authority。`tmx-context-interchange` 只在未来为该 ResourcePackage 增加可选 TMX export profile。
 
 ### Cluster 3：Controller / Search
 

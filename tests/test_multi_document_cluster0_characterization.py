@@ -185,19 +185,19 @@ _RUNTIME_SOURCE_DIGESTS = {
     "parser_composition.py": "afa777612e8149acec0ee68c8f8e689a1dc1eab376668419a63a1ac71d673e7e",
 }
 
-_PYTHON_SOURCE_ENTRY_COUNT = 260
+_PYTHON_SOURCE_ENTRY_COUNT = 270
 _PYTHON_SOURCE_PATH_DIGEST = (
-    "976edc2309a62619bdd52390bdde57eb9affed914134141bdb0cc3914ca1ae80"
+    "f2a640126aa1c548acc3f32ebb081c818ffe353f426d9ae09cd20a545196d4b0"
 )
-_PRODUCTION_IMPORT_ENTRY_COUNT = 463
-_PRODUCTION_IMPORT_CALL_COUNT = 463
+_PRODUCTION_IMPORT_ENTRY_COUNT = 571
+_PRODUCTION_IMPORT_CALL_COUNT = 571
 _PRODUCTION_IMPORT_DIGEST = (
-    "3838fe5f7e4978e0906d0a4a4f65334b32ec7c32dfdfa335d2fe534086c92ec4"
+    "fb8e39137453dbe0e4c8a2b929650e6640e43f98f23a8aef71c6ab8fa9d51ad7"
 )
-_TEST_IMPORT_ENTRY_COUNT = 816
-_TEST_IMPORT_CALL_COUNT = 1002
+_TEST_IMPORT_ENTRY_COUNT = 879
+_TEST_IMPORT_CALL_COUNT = 1065
 _TEST_IMPORT_DIGEST = (
-    "8a46da5dfbc8c6d9548bc9bb832ef363aad29726f68e09e621e1d68c678005ff"
+    "6cf504b21420337e2dce6c6cecaf4b0deb622a0895b8c2a61c51242d07aa4771"
 )
 _CRITICAL_PRODUCTION_IMPORTS = frozenset(
     {
@@ -218,6 +218,30 @@ _CRITICAL_PRODUCTION_IMPORTS = frozenset(
             None,
         ),
         ("project_search.py", "editor_contracts", "ProjectSearchHit", None),
+        (
+            "project_save.py",
+            "project_workspace",
+            "ProjectWorkspaceService",
+            None,
+        ),
+        (
+            "project_save.py",
+            "project_workspace_contracts",
+            "ProjectWorkspace",
+            None,
+        ),
+        (
+            "project_package.py",
+            "project_save",
+            "ProjectSaveService",
+            None,
+        ),
+        (
+            "project_package.py",
+            "project_workspace",
+            "ProjectWorkspaceService",
+            None,
+        ),
         ("workspace_state.py", "editor_contracts", "RecentProject", None),
         ("parser_source.py", "parser_contracts", "SourceReference", None),
         (
@@ -225,6 +249,24 @@ _CRITICAL_PRODUCTION_IMPORTS = frozenset(
             "parser_source",
             "create_sealed_snapshot",
             "_create_sealed_snapshot",
+        ),
+        (
+            "project_workspace_intake.py",
+            "parser_composition",
+            "create_parser_application_surface",
+            None,
+        ),
+        (
+            "project_workspace_intake.py",
+            "project_workspace_contracts",
+            "StagedSelectedProjectDocuments",
+            None,
+        ),
+        (
+            "project_workspace.py",
+            "project_workspace_contracts",
+            "StagedSelectedProjectDocuments",
+            None,
         ),
         (
             "parser_composition.py",
@@ -417,21 +459,25 @@ _EXPECTED_SERIALIZATION_CALLS = Counter(
         ("workspace_state.py", "self.state_path.read_text"): 1,
     }
 )
-_PATCH_ENTRY_COUNT = 36
-_PATCH_CALL_COUNT = 51
+_PATCH_ENTRY_COUNT = 46
+_PATCH_CALL_COUNT = 63
 _PATCH_INVENTORY_DIGEST = (
-    "c1999224063bcc127f6e074b79203ed3ef4db62908d111cb2806edf63d7920bf"
+    "75bb093ee19d32ed251397d33c5d16337cf0f466dace4971afa7c92973a836d5"
 )
 
 _INVENTORY_MODULES = frozenset(_CURRENT_SOURCE_ROOTS)
-_C1_CONSUMER_MODULES = frozenset(
+_WORKSPACE_CONSUMER_MODULES = frozenset(
     {
         "project_workspace_contracts",
         "project_workspace_identity",
         "editor_project_workspace_adapter",
+        "project_workspace_intake",
+        "project_workspace",
+        "project_save",
+        "project_package",
     }
 )
-_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES | _C1_CONSUMER_MODULES
+_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES | _WORKSPACE_CONSUMER_MODULES
 _SEMANTIC_SOURCE_FILES = _CURRENT_SOURCE_FILES
 
 
@@ -683,10 +729,10 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
             _CURRENT_SOURCE_FILES,
         )
         self.assertEqual(_INVENTORY_MODULES, frozenset(_CURRENT_SOURCE_ROOTS))
-        self.assertTrue(_INVENTORY_MODULES.isdisjoint(_C1_CONSUMER_MODULES))
+        self.assertTrue(_INVENTORY_MODULES.isdisjoint(_WORKSPACE_CONSUMER_MODULES))
         self.assertEqual(
             _CLOSED_CONSUMER_MODULES,
-            _INVENTORY_MODULES | _C1_CONSUMER_MODULES,
+            _INVENTORY_MODULES | _WORKSPACE_CONSUMER_MODULES,
         )
         observed_digests = {
             relative: hashlib.sha256((_ROOT / relative).read_bytes()).hexdigest()
@@ -748,6 +794,22 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
             (
                 "tests/test_multi_document_cluster1_contracts.py",
                 "editor_project_workspace_adapter.create_parser_application_surface",
+            ),
+            (
+                "tests/test_multi_document_cluster2a_aggregation.py",
+                "project_workspace.secrets.token_hex",
+            ),
+            (
+                "tests/test_multi_document_cluster2b_save_recovery.py",
+                "project_save._resign_document",
+            ),
+            (
+                "tests/test_multi_document_cluster2c_zip_security.py",
+                "project_package._port_validate_artifact",
+            ),
+            (
+                "tests/test_multi_document_cluster2c_zip_security.py",
+                "project_package._unlink_in_bound_parent",
             ),
         ):
             self.assertGreater(patches[seam], 0, seam)

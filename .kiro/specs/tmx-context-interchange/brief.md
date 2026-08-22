@@ -12,14 +12,16 @@ LocalCAT 已安全导入 TMX Level 1 文本和部分 MateCat 样本，但 canoni
 
 用户导入受支持的 TMX 时可保留 provenance，并仅在属性名/语义经样本验证后映射上下文；导出范围清楚，不把缺少 context 的文件误报为损坏。
 
+若 TMX export profile 后续获批，它可作为 `language-resource-portability` 的一个可选 ResourcePackage profile 被调用；本规格拥有 TMX payload grammar、context/provenance 映射与有损报告，不拥有 ResourcePackage container、资源 import/apply transaction 或 provider 传输。
+
 ## Approach
 
 以 profile 驱动的 TMX 互操作层处理标准字段和经验证 vendor props；未知属性作为原始 metadata 保存。该规格消费 canonical TM store，而不是在 Parser 内实现检索。
 
 ## Scope
 
-- **In**: 标准 TMX 文本、语言、TU/TUV 标识、已验证 MateCat/MyMemory props、未知 prop 保留、context/provenance 导入、受控 export、fixture/round-trip。
-- **Out**: MyMemory 在线 API、所有厂商私有扩展、复杂内联标签的首批编辑、项目文档打开。
+- **In**: 标准 TMX 文本、语言、TU/TUV 标识、已验证 MateCat/MyMemory props、未知 prop 保留、context/provenance 导入、受控 export、fixture/round-trip，以及可选 TMX ResourcePackage profile 的 payload/capability 合同。
+- **Out**: ResourcePackage container/manifest authority、资源 apply transaction、provider 传输、MyMemory 在线 API、所有厂商私有扩展、复杂内联标签的首批编辑、项目文档打开。
 
 ## Boundary Candidates
 
@@ -38,7 +40,7 @@ LocalCAT 已安全导入 TMX Level 1 文本和部分 MateCat 样本，但 canoni
 ## Upstream / Downstream
 
 - **Upstream**: Parser 的安全 XML/流式错误语义；SQLite canonical TM records。
-- **Downstream**: context-aware suggestions、TMX exchange/export。
+- **Downstream**: context-aware suggestions、TMX exchange/export；可选地由 `language-resource-portability` 将已批准的 TMX payload profile 封装进 ResourcePackage。
 
 ## Existing Spec Touchpoints
 

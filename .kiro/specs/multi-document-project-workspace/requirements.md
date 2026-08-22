@@ -10,7 +10,7 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 
 - **范围内**：Project/Document/Segment 不可变合同；项目、文档和复合段落身份；ProjectOrigin 叶合同与 ProjectPackage canonical persistence；用户显式选择多个 JSON/TXT/PO/POT 单文档输入并逐个经 Parser 验证的有界 intake；版本化 `ProjectPackageManifest`、document member、target/state overlay 和 opaque `codec_private_member`；member digest、路径安全和 stale binding；手工 export/validate/preview/import/apply/receipt；source reconciliation；文档/项目 dirty、保存报告与恢复；章节顺序、切换、连续导航、当前章节/全部章节搜索范围和 Qt 反馈；现有单 JSON 兼容适配。
 - **范围外**：直接扫描多 JSON/TXT 目录；multi-sheet XLSX project profile；RPY codec 或 RPY 项目入口；PO/POT canonical/source-round-trip writer；TMX 项目文档；ResourcePackage 及 TM/术语资源导入导出；chunk 拆分/分配/权限；provider/远程列举/凭据/加密/同步冲突；TM CONTEXT、provenance/evidence 字段、Fuzzy 授权或 speaker display profile。
-- **相邻期望**：Parser/Codec 只产生单文档内容、局部 ID、能力和诊断；workspace 聚合项目。`collaborative-job-chunks` 在 Cluster 2 通过后只引用稳定 segment identity。`cross-device-sync-plugin` 未来只传输已批准 ProjectPackage，并复用同一 import/apply 交易。现有 `language-resource-portability` brief 在本规格 Cluster 2 冻结后提升为独立 ResourcePackage R/D/T。
+- **相邻期望**：Parser/Codec 只产生单文档内容、局部 ID、能力和诊断；workspace 聚合项目。`collaborative-job-chunks` 在 Cluster 2 通过后只引用稳定 segment identity。`cross-device-sync-plugin` 未来在项目侧只传输已批准 ProjectPackage、在资源侧只传输已批准 ResourcePackage，并分别复用各自的 import/apply 交易。现有 `language-resource-portability` brief 在本规格 Cluster 2 冻结后提升 JSONL/CSV ResourcePackage R/D/T；`tmx-context-interchange` 未来只增加可选 TMX export profile。
 
 ### Scope Lineage（范围沿革）
 
@@ -79,7 +79,7 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 5. While RPY 实施尚未在 Sync 主线后获得独立批准, the product shall 不得打开、聚合或写回 RPY 项目，也不得在通用合同中预埋 RPY 语法。
 6. If 包声明未知或未批准的 ProjectOrigin/profile, the workspace shall 返回结构化 unsupported 失败并保持当前项目不变。
 7. When 用户首次创建多文档项目时, the product shall 只接受用户显式选择且位于一个已验证 portable root 下的 JSON、TXT、PO 或 POT 文件列表，逐个通过既有 `project_document` Parser surface 获得 verified terminal 后聚合，并将完整 workspace 保存为 ProjectPackage。
-8. The 显式文件 intake shall 保留用户选择顺序、拒绝重复/越界/非 regular/symlink 输入并设置 `directory/explicit-selected-files-v1` origin profile，但不得递归枚举目录、自动吸收未选择文件或据此授予 source writer。
+8. The 显式文件 intake shall 在同一 retained rooted binding 下保留用户选择顺序，拒绝重复/hardlink alias/越界/非 regular/symlink/root 或文件 drift 输入并设置 `directory/explicit-selected-files-v1` origin profile；未选择文件不得被 Core 枚举、读取、自动吸收或影响 binding，也不得据此授予 source writer。
 9. While `directory/explicit-selected-files-v1` 是当前 origin profile, the workspace shall 只允许保存 ProjectPackage，不得对所选 JSON/TXT/PO/POT 执行多文件 origin write-back；既有单文件 LocalCAT JSON writer 仅保留在 legacy `single_file` compatibility path。
 
 ### Requirement 4：版本化 ProjectPackageManifest 与 member 边界
@@ -95,6 +95,7 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 5. If manifest 版本不受支持、必需 member 缺失、member 大小/摘要不匹配、未声明 member 影响规范语义，或同一 member 被冲突引用, the validator shall fail closed 且不产生可 apply preview。
 6. The ProjectPackageManifest shall 不得收编 live canonical TM SQLite、sidecar、journal、stage residue、device qualification 或凭据。
 7. The ProjectPackage contract shall 不得声明自己是 ResourcePackage，也不得把 TMX、TM JSONL 或术语 CSV/v1 资源成员提升为 Project Document authority。
+8. While exact matching live codec 不可用, the package shall 仍允许离线打开、导入、target编辑与ProjectPackage保存，并只投影body-safe `PROJECT.PACKAGE.CODEC_UNAVAILABLE` warning；source write-back与`codec_private_member`读取shall fail closed，且availability不得铸造writer authority。
 
 ### Requirement 5：路径安全与包内引用
 

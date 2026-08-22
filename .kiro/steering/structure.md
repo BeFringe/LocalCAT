@@ -25,6 +25,10 @@ Layer 1 resource / termbase / canonical TM storage
 ├── project_workspace_identity.py # 多文档稳定 ID、portable ref 与 source digest 中立叶
 ├── project_workspace_contracts.py # Project/Document/Segment/Origin immutable contracts
 ├── editor_project_workspace_adapter.py # legacy 单 JSON ↔ workspace 唯一兼容映射层
+├── project_workspace_intake.py # 显式多文件 rooted intake 与 Parser verified facts 映射
+├── project_workspace.py       # carrier-neutral workspace 聚合、progress 与 reconciliation
+├── project_save.py            # carrier-neutral candidate/LKG、baseline、save report 与 cold recovery
+├── project_package.py         # deterministic ZIP v1 ProjectPackage、严格验证与手工导入导出事务
 ├── parser_contracts.py          # stdlib-only 中立合同、capability 与 limit profile
 ├── parser_source.py             # rooted source/snapshot/terminal 与 canonical 原子写
 ├── parser_registry.py           # purpose-aware 不可变 registry，不导入具体 codec
@@ -94,6 +98,9 @@ Layer 1 resource / termbase / canonical TM storage
 - `parser_registry.py` 不导入具体 codec；只有 `parser_composition.py` 显式注册内建 codec，并向 Application 提供选择、打开、验证、materialize、stream 与 canonical write surface。
 - `editor_project.py`、`resource_importer.py`、`logic_controller.py` 与 `tm_json_importer.py` 只负责既有类型映射、batch policy 和事务，不保留第二份 JSON/TXT/PO/POT/TMX/CSV/XLSX 语法。
 - `project_workspace_identity.py` 与 `project_workspace_contracts.py` 是 Qt/Engine/Store/provider/chunk/resource 无关的中立叶；`editor_project_workspace_adapter.py` 是 legacy 单 JSON 与 workspace 的唯一兼容映射层，只通过 `parser_contracts.py` / `parser_composition.py` 取得 verified terminal，不拥有 JSON grammar 或 writer。
+- `project_workspace_intake.py` 仅对用户显式选中的 JSON/TXT/PO/POT 保留单次 rooted batch binding，通过 Parser 中立 surface 取得 verified facts；不枚举目录、不导入具体 codec/parser_source、不授予 source writer。`project_workspace.py` 只消费已验证 immutable facts，拥有扁平投影、progress 与 reconciliation，不导入 Parser/intake/Qt/TM/Store/provider/chunk/resource。
+- `project_save.py` 只消费 workspace 的 canonical digest/service/contracts，拥有 carrier-neutral save candidate、真实 LKG/逐Document baseline、结构化报告与 cold-recovery 阶段协调；不导入 Parser/codec、物理 archive/carrier、Qt、TM/Store、provider、chunk 或 ResourcePackage。当前显式选择的 JSON/TXT/PO/POT 仍只保存 package overlay，不执行 source write-back。
+- `project_package.py` 是 ADR-019 批准的唯一 ProjectPackage v1 carrier owner：它拥有严格 `ZIP_STORED` envelope/manifest/member grammar、bounded stream、artifact/content digest、手工 export/validate/preview/import/apply/receipt 与物理 recovery port；不导入具体 codec/registry、Qt、TM/Store、provider、chunk 或 ResourcePackage，不 extract member，不解释 `codec_private_member`。
 - openpyxl 只由 `parser_termbase_codec.py` 在 XLSX preflight 通过后条件导入，并固定 read-only/data-only、关闭 links/VBA；`resource_importer.py` 不拥有 active-sheet 或列选择语法。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。

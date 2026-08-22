@@ -32,7 +32,7 @@ LocalCAT 为 TM 和术语资源提供可验证、可冷重开、原子发布的�
 - TM JSONL 导出复用已实现的 `TMMigrationService.export_jsonl()` 与 `ExportReport`，不重写 canonical scan grammar。
 - 术语出口以 `TermbaseStore` 的受管 v1/legacy 记录事实为输入，不从 Qt 或 Parser preview 中推断运行时权威。
 - `termbase-column-selection-import` 的显式列选择只是 import consumer 事实，不自动成为 export schema。
-- `tmx-context-interchange` 独占 TMX export profile、context/provenance 取舍与跨 CAT 互操作；本规格不以 JSONL 冒充 TMX。
+- `tmx-context-interchange` 独占可选 TMX profile 的语法、context/provenance 取舍、损失报告与跨 CAT 互操作；若该 profile 后续获批，它接入本规格拥有的 ResourcePackage container/preview/apply/receipt，不取得 ResourcePackage 容器或资源事务 authority。本规格首轮只闭合 TM JSONL 与术语 CSV/v1，不以 JSONL 冒充 TMX，也不抢跑 TMX profile。
 
 ## Promotion Timing
 

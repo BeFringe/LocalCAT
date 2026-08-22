@@ -32,5 +32,6 @@
 | ADR-016 | 已采纳 | 已发布 canonical authority 的设备身份重新证明 |
 | ADR-017 | 已采纳 | TM candidate storage port 与 SQLite candidate 数据面责任分离 |
 | ADR-018 | 已采纳 | ProjectPackage 作为多文档工作区持久权威 |
+| ADR-019 | 已采纳 | ProjectPackage v1 确定性单文件 ZIP carrier |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。

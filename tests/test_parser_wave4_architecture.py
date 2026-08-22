@@ -69,6 +69,7 @@ _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
     {
         "editor_project",
         "editor_project_workspace_adapter",
+        "project_workspace_intake",
         "resource_importer",
         "tm_json_importer",
         "logic_controller",
@@ -136,6 +137,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "generate_decision_memo",
         "macos_app_launcher",
         "matcher_capability",
+        "project_package",
         "qt_editor",
         "renpy_tm_compat",
         "resource_repository",

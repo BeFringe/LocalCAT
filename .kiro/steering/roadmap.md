@@ -129,10 +129,10 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 - [ ] `speaker-display-profiles` -- 每项目 speaker 显示名/留空/头像。Dependencies: `qt-editor-json-mvp-increment`
 - [ ] `multi-document-project-workspace` -- Project/Document/Segment、章节导航、稳定复合 ID 和多文档保存报告。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [ ] `language-resource-portability` -- TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/receipt 与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
+- [ ] `tmx-context-interchange` -- ResourcePackage 未来可增加的 TMX export profile、context/provenance 与有损取舍；不拥有 ResourcePackage container/apply authority。Dependencies: `tm-storage-retrieval-index`, `language-resource-portability`
 - [ ] `collaborative-job-chunks` -- 在不改变 Document 身份的前提下按稳定 segment 集合划分、合并和分配协作 chunk。Dependencies: `multi-document-project-workspace`
 - [ ] `cross-device-sync-plugin` -- 本地优先的可选同步插件边界、远程 provider、冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`
 - [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；目录多文件项目另依赖 workspace，产品排期在同步之后。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `cross-device-sync-plugin`
-- [ ] `tmx-context-interchange` -- 经验证的 TMX props/context/provenance。Dependencies: `tm-storage-retrieval-index`
 - [ ] `xliff-project-codec` -- XLIFF 2.x Core 最小项目 codec。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`
 
 ## Deferred Format Backlog

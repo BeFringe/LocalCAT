@@ -57,4 +57,4 @@ LocalCAT 当前是单机个人编辑器，没有多文档 workspace、chunk、�
 3. Controller scope、搜索 `current_chunk` 与冲突/撤销；
 4. Qt 与 current-source acceptance。
 
-该规格必须在多文档 identity/reconciliation/save clusters 完成后启动。跨端同步只有在本规格批准 namespaced chunk metadata 后才可搬运该 metadata；同步插件不得解释成员资格或权限。
+该规格必须在 Multi-Document 完整 Cluster 2（C2A aggregation/reconciliation、C2B save/recovery 与 C2C ProjectPackage 手工闭环）完成后启动。跨端同步只有在本规格批准 namespaced chunk metadata 且后续 ProjectPackage schema/version 或明确 extension 同步获批后，才可搬运该 metadata；同步插件不得解释成员资格或权限。

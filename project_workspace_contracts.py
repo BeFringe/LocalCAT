@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import os
 import re
 import unicodedata
 
-from parser_contracts import CodecIdentity, FormatId
+from parser_contracts import CodecIdentity, FormatId, SourceSnapshotIdentity
 from project_workspace_identity import (
     ProjectWorkspaceError,
     normalize_portable_ref_v1,
@@ -89,6 +90,11 @@ class ProjectPersistenceKind(Enum):
     PROJECT_PACKAGE = "project_package"
 
 
+class SourcePresence(Enum):
+    ATTACHED = "attached"
+    DETACHED = "detached"
+
+
 @dataclass(frozen=True, slots=True)
 class SegmentIdentity:
     document_id: str
@@ -159,12 +165,82 @@ class ProjectSourceSegment:
     source: str
     raw_speaker: str
     source_fingerprint: str
+    source_presence: SourcePresence = SourcePresence.ATTACHED
 
     def __post_init__(self) -> None:
         validate_local_segment_id(self.local_segment_id)
         _exact_text(self.source, allow_controls=True)
         _exact_text(self.raw_speaker, allow_empty=True, allow_controls=True)
         validate_sha256(self.source_fingerprint)
+        if type(self.source_presence) is not SourcePresence:
+            _fail()
+
+
+@dataclass(frozen=True, slots=True)
+class OriginBindingDocument:
+    source_ref: str
+    document_id: str
+    format_id: str
+    codec_identity: CodecIdentity
+    source_identity: SourceSnapshotIdentity
+
+    def __post_init__(self) -> None:
+        normalized = normalize_portable_ref_v1(self.source_ref)
+        if normalized != self.source_ref:
+            _fail("PROJECT.WORKSPACE.PATH_INVALID")
+        validate_document_id(self.document_id)
+        try:
+            FormatId(self.format_id)
+        except (TypeError, ValueError):
+            _fail()
+        if type(self.codec_identity) is not CodecIdentity:
+            _fail()
+        if type(self.source_identity) is not SourceSnapshotIdentity:
+            _fail()
+
+
+@dataclass(frozen=True, slots=True)
+class OriginBinding:
+    schema_version: int
+    project_id: str
+    profile_version: str
+    absolute_root: str
+    root_device: int
+    root_inode: int
+    revision: int
+    documents: tuple[OriginBindingDocument, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail()
+        validate_project_id(self.project_id)
+        profile = _exact_text(self.profile_version)
+        if profile != "explicit-selected-files-v1":
+            _fail()
+        root = _exact_text(self.absolute_root)
+        if not os.path.isabs(root):
+            _fail("PROJECT.WORKSPACE.PATH_INVALID")
+        _exact_nonnegative_int(self.root_device)
+        _exact_nonnegative_int(self.root_inode)
+        if type(self.revision) is not int or self.revision < 1:
+            _fail()
+        _exact_tuple(self.documents)
+        if len(self.documents) < 2 or len(self.documents) > MAX_PROJECT_DOCUMENTS:
+            _fail("PROJECT.WORKSPACE.LIMIT_EXCEEDED")
+        if any(type(item) is not OriginBindingDocument for item in self.documents):
+            _fail()
+        validate_portable_ref_collection(
+            tuple(item.source_ref for item in self.documents),
+            allow_exact_duplicates=False,
+        )
+        document_ids = tuple(item.document_id for item in self.documents)
+        if len(document_ids) != len(set(document_ids)):
+            _fail("PROJECT.WORKSPACE.IDENTITY_DUPLICATE")
+        file_identities = tuple(
+            item.source_identity.regular_file_identity for item in self.documents
+        )
+        if len(file_identities) != len(set(file_identities)):
+            _fail("PROJECT.WORKSPACE.IDENTITY_DUPLICATE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +453,41 @@ class ProjectWorkspace:
                 _fail()
 
 
+@dataclass(frozen=True, slots=True)
+class StagedSelectedProjectDocuments:
+    workspace: ProjectWorkspace
+    origin_binding: OriginBinding
+    source_identities: tuple[SourceSnapshotIdentity, ...]
+    source_write_back_authorized: bool
+    durable: bool
+
+    def __post_init__(self) -> None:
+        if type(self.workspace) is not ProjectWorkspace:
+            _fail()
+        if type(self.origin_binding) is not OriginBinding:
+            _fail()
+        _exact_tuple(self.source_identities)
+        if any(
+            type(item) is not SourceSnapshotIdentity
+            for item in self.source_identities
+        ):
+            _fail()
+        if len(self.source_identities) != len(self.workspace.documents):
+            _fail()
+        if tuple(
+            item.source_identity for item in self.origin_binding.documents
+        ) != self.source_identities:
+            _fail()
+        if self.origin_binding.project_id != self.workspace.project_id:
+            _fail()
+        if type(self.source_write_back_authorized) is not bool:
+            _fail()
+        if self.source_write_back_authorized:
+            _fail()
+        if type(self.durable) is not bool or self.durable:
+            _fail()
+
+
 def require_workspace_segment_identity(
     workspace: ProjectWorkspace,
     expected_project_id: str,
@@ -407,6 +518,8 @@ __all__ = (
     "MAX_PROJECT_DOCUMENTS",
     "MAX_SEGMENTS_PER_DOCUMENT",
     "MAX_SEGMENTS_PER_PROJECT",
+    "OriginBinding",
+    "OriginBindingDocument",
     "PROJECT_LIMIT_PROFILE_ID",
     "ProjectDocument",
     "ProjectOrigin",
@@ -417,6 +530,8 @@ __all__ = (
     "ProjectWorkspace",
     "ProjectWorkspaceError",
     "SegmentIdentity",
+    "SourcePresence",
+    "StagedSelectedProjectDocuments",
     "WriterCapabilitySnapshot",
     "require_workspace_segment_identity",
 )

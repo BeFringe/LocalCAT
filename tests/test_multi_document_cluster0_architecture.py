@@ -40,6 +40,7 @@ _FUTURE_MODULE_PREFIXES_BY_OWNER = {
         "project_package",
         "project_package_manifest",
         "project_reconciliation",
+        "project_save",
         "project_workspace",
     ),
     "collaborative-job-chunks": (
@@ -67,6 +68,7 @@ _EXPECTED_FUTURE_MODULE_PREFIXES_BY_OWNER = {
         "project_package",
         "project_package_manifest",
         "project_reconciliation",
+        "project_save",
         "project_workspace",
     ),
     "collaborative-job-chunks": (
@@ -97,13 +99,22 @@ _WORKSPACE_AUTHORITY_NAMES = frozenset(
     {
         "DocumentId",
         "ProjectDocument",
+        "ProjectDocumentWriterPort",
         "ProjectImportReceipt",
         "ProjectOrigin",
         "ProjectPackage",
         "ProjectPackageManifest",
+        "ProjectRecoveryReport",
+        "ProjectSaveReport",
+        "ProjectSaveService",
         "ProjectSegment",
         "ProjectSegmentId",
+        "ProjectWorkspacePersistencePort",
+        "ProjectWorkspaceService",
+        "ReconciliationPreview",
         "ReconciliationReceipt",
+        "PendingRecoveryFacts",
+        "WorkspaceSaveBaseline",
         "codec_private_member",
     }
 )
@@ -111,13 +122,22 @@ _EXPECTED_WORKSPACE_AUTHORITY_NAMES = frozenset(
     {
         "DocumentId",
         "ProjectDocument",
+        "ProjectDocumentWriterPort",
         "ProjectImportReceipt",
         "ProjectOrigin",
         "ProjectPackage",
         "ProjectPackageManifest",
+        "ProjectRecoveryReport",
+        "ProjectSaveReport",
+        "ProjectSaveService",
         "ProjectSegment",
         "ProjectSegmentId",
+        "ProjectWorkspacePersistencePort",
+        "ProjectWorkspaceService",
+        "ReconciliationPreview",
         "ReconciliationReceipt",
+        "PendingRecoveryFacts",
+        "WorkspaceSaveBaseline",
         "codec_private_member",
     }
 )
@@ -139,8 +159,12 @@ _APPLICATION_PARSER_FACADES = frozenset(
 _CURRENT_WORKSPACE_PRODUCTION_MODULES = frozenset(
     {
         "editor_project_workspace_adapter",
+        "project_package",
+        "project_save",
+        "project_workspace",
         "project_workspace_contracts",
         "project_workspace_identity",
+        "project_workspace_intake",
     }
 )
 _WORKSPACE_ADAPTER_MODULE = "editor_project_workspace_adapter"
@@ -149,6 +173,40 @@ _WORKSPACE_ADAPTER_LOCAL_IMPORT_ALLOWLIST = frozenset(
         "editor_contracts",
         "parser_composition",
         "parser_contracts",
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
+)
+_WORKSPACE_CORE_MODULE = "project_workspace"
+_WORKSPACE_CORE_LOCAL_IMPORT_ALLOWLIST = frozenset(
+    {
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
+)
+_WORKSPACE_INTAKE_MODULE = "project_workspace_intake"
+_WORKSPACE_INTAKE_LOCAL_IMPORT_ALLOWLIST = frozenset(
+    {
+        "parser_composition",
+        "parser_contracts",
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
+)
+_WORKSPACE_SAVE_MODULE = "project_save"
+_WORKSPACE_SAVE_LOCAL_IMPORT_ALLOWLIST = frozenset(
+    {
+        "project_workspace",
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
+)
+_WORKSPACE_PACKAGE_MODULE = "project_package"
+_WORKSPACE_PACKAGE_LOCAL_IMPORT_ALLOWLIST = frozenset(
+    {
+        "parser_contracts",
+        "project_save",
+        "project_workspace",
         "project_workspace_contracts",
         "project_workspace_identity",
     }
@@ -511,6 +569,19 @@ def _workspace_adapter_import_is_forbidden(target: str) -> bool:
     return root not in _WORKSPACE_ADAPTER_LOCAL_IMPORT_ALLOWLIST
 
 
+def _workspace_local_import_is_forbidden(
+    target: str,
+    *,
+    allowlist: frozenset[str],
+) -> bool:
+    if target == _COMPUTED_IMPORT_TARGET:
+        return True
+    root = target.partition(".")[0]
+    if root in sys.stdlib_module_names or root == "__future__":
+        return False
+    return root not in allowlist
+
+
 def _boundary_violations(
     modules: dict[str, _SourceModule],
 ) -> tuple[_ImportViolation, ...]:
@@ -530,7 +601,9 @@ def _boundary_violations(
                     ),
                 )
             )
-        if _is_future_workspace(name):
+        if (
+            _is_future_workspace(name) or name == _WORKSPACE_SAVE_MODULE
+        ) and name != _WORKSPACE_PACKAGE_MODULE:
             rules.append(
                 (
                     "workspace-no-concrete-cross-layer-dependency",
@@ -576,6 +649,58 @@ def _boundary_violations(
                             target,
                         )
                     )
+        if name == _WORKSPACE_CORE_MODULE:
+            for target in targets:
+                if _workspace_local_import_is_forbidden(
+                    target,
+                    allowlist=_WORKSPACE_CORE_LOCAL_IMPORT_ALLOWLIST,
+                ):
+                    violations.add(
+                        _ImportViolation(
+                            "workspace-core-exact-local-imports",
+                            name,
+                            target,
+                        )
+                    )
+        if name == _WORKSPACE_INTAKE_MODULE:
+            for target in targets:
+                if _workspace_local_import_is_forbidden(
+                    target,
+                    allowlist=_WORKSPACE_INTAKE_LOCAL_IMPORT_ALLOWLIST,
+                ):
+                    violations.add(
+                        _ImportViolation(
+                            "workspace-intake-exact-local-imports",
+                            name,
+                            target,
+                        )
+                    )
+        if name == _WORKSPACE_SAVE_MODULE:
+            for target in targets:
+                if _workspace_local_import_is_forbidden(
+                    target,
+                    allowlist=_WORKSPACE_SAVE_LOCAL_IMPORT_ALLOWLIST,
+                ):
+                    violations.add(
+                        _ImportViolation(
+                            "workspace-save-exact-local-imports",
+                            name,
+                            target,
+                        )
+                    )
+        if name == _WORKSPACE_PACKAGE_MODULE:
+            for target in targets:
+                if _workspace_local_import_is_forbidden(
+                    target,
+                    allowlist=_WORKSPACE_PACKAGE_LOCAL_IMPORT_ALLOWLIST,
+                ):
+                    violations.add(
+                        _ImportViolation(
+                            "workspace-package-exact-local-imports",
+                            name,
+                            target,
+                        )
+                    )
         for rule, forbidden_prefixes in rules:
             for target in targets:
                 parser_segment = _parser_module_segment(target)
@@ -611,7 +736,11 @@ def _boundary_violations(
                         or _tm_store_or_engine_segment(target) is not None
                         or _provider_module_segment(target) is not None
                         or _chunk_module_segment(target) is not None
-                        or _editor_or_application_module_segment(target) is not None
+                        or (
+                            parser_segment is None
+                            and _editor_or_application_module_segment(target)
+                            is not None
+                        )
                     )
                 ):
                     matches_rule_prefix = True
@@ -712,6 +841,14 @@ class MultiDocumentCluster1GuardSelfTests(unittest.TestCase):
                 ),
                 (
                     "workspace-no-concrete-cross-layer-dependency",
+                    "parser_source.SealedSourceSnapshot",
+                ),
+                (
+                    "workspace-core-exact-local-imports",
+                    "parser_localcat_codec",
+                ),
+                (
+                    "workspace-core-exact-local-imports",
                     "parser_source.SealedSourceSnapshot",
                 ),
             },
@@ -835,6 +972,144 @@ class MultiDocumentCluster1GuardSelfTests(unittest.TestCase):
             {(item.rule, item.imported) for item in _boundary_violations({mutation.name: mutation})},
             {("workspace-adapter-exact-local-imports", "tm_engine")},
         )
+
+    def test_workspace_core_has_no_parser_or_intake_dependency(self) -> None:
+        approved = _SourceModule(
+            _WORKSPACE_CORE_MODULE,
+            "import hashlib\n"
+            "from project_workspace_contracts import ProjectWorkspace\n"
+            "from project_workspace_identity import validate_project_id\n",
+        )
+        forbidden = _SourceModule(
+            _WORKSPACE_CORE_MODULE,
+            "from parser_composition import create_parser_application_surface\n"
+            "from project_workspace_intake import stage_selected_project_documents\n",
+        )
+
+        self.assertEqual(_boundary_violations({approved.name: approved}), ())
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({forbidden.name: forbidden})},
+            {
+                (
+                    "workspace-core-exact-local-imports",
+                    "parser_composition.create_parser_application_surface",
+                ),
+                (
+                    "workspace-core-exact-local-imports",
+                    "project_workspace_intake.stage_selected_project_documents",
+                ),
+            },
+        )
+
+    def test_workspace_intake_accepts_only_neutral_parser_facades(self) -> None:
+        approved = _SourceModule(
+            _WORKSPACE_INTAKE_MODULE,
+            "import os\n"
+            "from parser_composition import create_parser_application_surface\n"
+            "from parser_contracts import ParsedSegment\n"
+            "from project_workspace_contracts import ProjectWorkspace\n"
+            "from project_workspace_identity import validate_project_id\n",
+        )
+        forbidden = _SourceModule(
+            _WORKSPACE_INTAKE_MODULE,
+            "from parser_source import create_sealed_snapshot\n"
+            "from parser_localcat_codec import LocalcatProjectCodec\n"
+            "from project_workspace import ProjectWorkspaceService\n",
+        )
+
+        self.assertEqual(_boundary_violations({approved.name: approved}), ())
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({forbidden.name: forbidden})},
+            {
+                (
+                    "workspace-intake-exact-local-imports",
+                    "parser_source.create_sealed_snapshot",
+                ),
+                (
+                    "workspace-intake-exact-local-imports",
+                    "parser_localcat_codec.LocalcatProjectCodec",
+                ),
+                (
+                    "workspace-intake-exact-local-imports",
+                    "project_workspace.ProjectWorkspaceService",
+                ),
+                (
+                    "workspace-no-concrete-cross-layer-dependency",
+                    "parser_source.create_sealed_snapshot",
+                ),
+                (
+                    "workspace-no-concrete-cross-layer-dependency",
+                    "parser_localcat_codec.LocalcatProjectCodec",
+                ),
+            },
+        )
+
+    def test_workspace_save_is_carrier_neutral_and_depends_only_on_workspace(self) -> None:
+        approved = _SourceModule(
+            _WORKSPACE_SAVE_MODULE,
+            "from project_workspace import ProjectWorkspaceService\n"
+            "from project_workspace_contracts import ProjectWorkspace\n"
+            "from project_workspace_identity import validate_project_id\n",
+        )
+        forbidden = _SourceModule(
+            _WORKSPACE_SAVE_MODULE,
+            "import zipfile\n"
+            "from parser_composition import create_parser_application_surface\n"
+            "from qt_editor import EditorWindow\n"
+            "from sync_provider import SyncProvider\n",
+        )
+
+        self.assertEqual(_boundary_violations({approved.name: approved}), ())
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({forbidden.name: forbidden})},
+            {
+                ("workspace-no-concrete-cross-layer-dependency", "zipfile"),
+                (
+                    "workspace-save-exact-local-imports",
+                    "parser_composition.create_parser_application_surface",
+                ),
+                (
+                    "workspace-save-exact-local-imports",
+                    "qt_editor.EditorWindow",
+                ),
+                ("workspace-save-exact-local-imports", "sync_provider.SyncProvider"),
+                (
+                    "workspace-no-concrete-cross-layer-dependency",
+                    "qt_editor.EditorWindow",
+                ),
+                (
+                    "workspace-no-concrete-cross-layer-dependency",
+                    "sync_provider.SyncProvider",
+                ),
+            },
+        )
+
+    def test_save_authority_cannot_be_reverse_imported_across_layers(self) -> None:
+        mutations = (
+            _SourceModule(
+                "parser_future_codec",
+                "from project_save import ProjectSaveService\n",
+            ),
+            _SourceModule(
+                "qt_future_window",
+                "from project_save import ProjectSaveService\n",
+            ),
+            _SourceModule(
+                "tm_future_engine",
+                "from project_save import ProjectSaveService\n",
+            ),
+            _SourceModule(
+                "editor_future_controller",
+                "from project_save import ProjectSaveService\n",
+            ),
+        )
+
+        for mutation in mutations:
+            with self.subTest(importer=mutation.name):
+                self.assertNotEqual(
+                    _boundary_violations({mutation.name: mutation}),
+                    (),
+                )
 
     def test_other_editor_static_alias_cannot_reverse_import_workspace(self) -> None:
         mutation = _SourceModule(
@@ -977,7 +1252,15 @@ class MultiDocumentCluster1ProductionArchitectureTests(unittest.TestCase):
         observed = {
             name
             for name in self.modules
-            if _matches_future_prefix(name) or name == _WORKSPACE_ADAPTER_MODULE
+            if (
+                _matches_future_prefix(name)
+                or name
+                in {
+                    _WORKSPACE_ADAPTER_MODULE,
+                    _WORKSPACE_SAVE_MODULE,
+                    _WORKSPACE_PACKAGE_MODULE,
+                }
+            )
         }
         self.assertEqual(observed, _CURRENT_WORKSPACE_PRODUCTION_MODULES)
 
