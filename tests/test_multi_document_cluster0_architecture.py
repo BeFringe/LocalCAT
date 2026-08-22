@@ -1,4 +1,4 @@
-"""Cluster 0 current-source architecture guards for the future workspace boundary."""
+"""Cluster 1 current-source architecture guards for the workspace boundary."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import ast
 from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -26,9 +27,9 @@ class _ImportViolation:
     imported: str
 
 
-# These are the only names reserved for post-Cluster-0 authorities.  Keeping
-# the inventory closed makes a new spelling an explicit governance change,
-# not an accidental way around the guards below.
+# These are the only names reserved for workspace and downstream authorities.
+# Cluster 1 authorizes an exact three-module subset below; every other spelling
+# remains an explicit governance change, not a way around the guards.
 _FUTURE_MODULE_PREFIXES_BY_OWNER = {
     "multi-document-project-workspace": (
         "multi_document",
@@ -134,6 +135,23 @@ _CONCRETE_CODEC_OR_ARCHIVE_PREFIXES = (
 )
 _APPLICATION_PARSER_FACADES = frozenset(
     {"parser_composition", "parser_contracts"}
+)
+_CURRENT_WORKSPACE_PRODUCTION_MODULES = frozenset(
+    {
+        "editor_project_workspace_adapter",
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
+)
+_WORKSPACE_ADAPTER_MODULE = "editor_project_workspace_adapter"
+_WORKSPACE_ADAPTER_LOCAL_IMPORT_ALLOWLIST = frozenset(
+    {
+        "editor_contracts",
+        "parser_composition",
+        "parser_contracts",
+        "project_workspace_contracts",
+        "project_workspace_identity",
+    }
 )
 _WORKSPACE_FORBIDDEN_FUTURE_PREFIXES = (
     *_FUTURE_MODULE_PREFIXES_BY_OWNER["collaborative-job-chunks"],
@@ -389,6 +407,25 @@ def _is_editor_or_application(module_name: str) -> bool:
     ) and not _is_parser_or_codec(module_name)
 
 
+def _editor_or_application_module_segment(module_name: str) -> str | None:
+    return next(
+        (
+            segment
+            for segment in module_name.split(".")
+            if (
+                segment.startswith("editor_")
+                or segment.endswith("_controller")
+                or segment.endswith("_importer")
+                or segment.endswith("_runner")
+                or segment.endswith("_application")
+                or "_application_" in segment
+            )
+            and not _is_parser_or_codec(segment)
+        ),
+        None,
+    )
+
+
 def _is_qt(module_name: str) -> bool:
     leaf = module_name.rpartition(".")[2]
     return leaf == "qt" or leaf.startswith("qt_")
@@ -465,6 +502,15 @@ def _chunk_module_segment(module_name: str) -> str | None:
     )
 
 
+def _workspace_adapter_import_is_forbidden(target: str) -> bool:
+    if target == _COMPUTED_IMPORT_TARGET:
+        return True
+    root = target.partition(".")[0]
+    if root in sys.stdlib_module_names or root == "__future__":
+        return False
+    return root not in _WORKSPACE_ADAPTER_LOCAL_IMPORT_ALLOWLIST
+
+
 def _boundary_violations(
     modules: dict[str, _SourceModule],
 ) -> tuple[_ImportViolation, ...]:
@@ -474,7 +520,7 @@ def _boundary_violations(
         rules: list[tuple[str, tuple[str, ...]]] = []
         if _is_parser_or_codec(name):
             rules.append(("parser-no-future-workspace", _ALL_FUTURE_MODULE_PREFIXES))
-        if _is_editor_or_application(name):
+        if _is_editor_or_application(name) and name != _WORKSPACE_ADAPTER_MODULE:
             rules.append(
                 (
                     "application-no-codec-or-future-authority",
@@ -520,6 +566,16 @@ def _boundary_violations(
             )
         if _is_tm_store_or_engine(name):
             rules.append(("tm-no-future-workspace", _WORKSPACE_MODULE_PREFIXES))
+        if name == _WORKSPACE_ADAPTER_MODULE:
+            for target in targets:
+                if _workspace_adapter_import_is_forbidden(target):
+                    violations.add(
+                        _ImportViolation(
+                            "workspace-adapter-exact-local-imports",
+                            name,
+                            target,
+                        )
+                    )
         for rule, forbidden_prefixes in rules:
             for target in targets:
                 parser_segment = _parser_module_segment(target)
@@ -555,6 +611,7 @@ def _boundary_violations(
                         or _tm_store_or_engine_segment(target) is not None
                         or _provider_module_segment(target) is not None
                         or _chunk_module_segment(target) is not None
+                        or _editor_or_application_module_segment(target) is not None
                     )
                 ):
                     matches_rule_prefix = True
@@ -568,7 +625,7 @@ def _boundary_violations(
     return tuple(sorted(violations, key=lambda item: (item.rule, item.importer, item.imported)))
 
 
-class MultiDocumentCluster0GuardSelfTests(unittest.TestCase):
+class MultiDocumentCluster1GuardSelfTests(unittest.TestCase):
     def test_import_guard_uses_ast_and_catches_static_and_literal_dynamic_mutations(
         self,
     ) -> None:
@@ -727,6 +784,92 @@ class MultiDocumentCluster0GuardSelfTests(unittest.TestCase):
             },
         )
 
+    def test_workspace_contract_leaf_cannot_import_editor_family(self) -> None:
+        mutation = _SourceModule(
+            "project_workspace_contracts",
+            "from editor_controller import EditorController\n",
+        )
+
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({mutation.name: mutation})},
+            {
+                (
+                    "workspace-no-concrete-cross-layer-dependency",
+                    "editor_controller.EditorController",
+                )
+            },
+        )
+
+    def test_workspace_adapter_accepts_only_approved_local_seams(self) -> None:
+        approved = _SourceModule(
+            _WORKSPACE_ADAPTER_MODULE,
+            "import os\n"
+            "from pathlib import Path\n"
+            "from editor_contracts import EditorProject\n"
+            "from parser_composition import create_parser_application_surface\n"
+            "from parser_contracts import ParsedSegment\n"
+            "from project_workspace_contracts import ProjectWorkspace\n"
+            "from project_workspace_identity import validate_project_id\n",
+        )
+        forbidden = _SourceModule(
+            _WORKSPACE_ADAPTER_MODULE,
+            "from editor_project import load_project\n"
+            "from parser_source import SealedSourceSnapshot\n",
+        )
+
+        self.assertEqual(_boundary_violations({approved.name: approved}), ())
+        self.assertEqual(
+            {item.imported for item in _boundary_violations({forbidden.name: forbidden})},
+            {"editor_project.load_project", "parser_source.SealedSourceSnapshot"},
+        )
+
+    def test_workspace_adapter_dynamic_import_alias_fails_closed(self) -> None:
+        mutation = _SourceModule(
+            _WORKSPACE_ADAPTER_MODULE,
+            "import importlib as imported\n"
+            "module_alias = imported\n"
+            "module_alias.import_module('tm_engine')\n",
+        )
+
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({mutation.name: mutation})},
+            {("workspace-adapter-exact-local-imports", "tm_engine")},
+        )
+
+    def test_other_editor_static_alias_cannot_reverse_import_workspace(self) -> None:
+        mutation = _SourceModule(
+            "editor_other_adapter",
+            "import project_workspace_contracts as workspace_contracts\n",
+        )
+
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({mutation.name: mutation})},
+            {
+                (
+                    "application-no-codec-or-future-authority",
+                    "project_workspace_contracts",
+                )
+            },
+        )
+
+    def test_other_application_dynamic_alias_cannot_reverse_import_workspace(self) -> None:
+        mutation = _SourceModule(
+            "future_controller",
+            "import importlib as imported\n"
+            "module_alias = imported\n"
+            "module_alias.import_module('project_workspace_identity')\n",
+        )
+
+        self.assertEqual(
+            {(item.rule, item.imported) for item in _boundary_violations({mutation.name: mutation})},
+            {
+                (
+                    "application-no-codec-or-future-authority",
+                    "project_workspace_identity",
+                )
+            },
+        )
+
     def test_nested_future_authority_spelling_is_reserved(self) -> None:
         mutation = _SourceModule(
             "editor_future_panel",
@@ -810,7 +953,7 @@ class MultiDocumentCluster0GuardSelfTests(unittest.TestCase):
         )
 
 
-class MultiDocumentCluster0ProductionArchitectureTests(unittest.TestCase):
+class MultiDocumentCluster1ProductionArchitectureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.modules = _production_modules()
@@ -830,13 +973,21 @@ class MultiDocumentCluster0ProductionArchitectureTests(unittest.TestCase):
             len(set(_ALL_FUTURE_MODULE_PREFIXES)),
         )
 
-    def test_cluster0_explicitly_freezes_future_production_modules_as_absent(self) -> None:
+    def test_cluster1_workspace_production_inventory_is_exact_and_closed(self) -> None:
         observed = {
             name
             for name in self.modules
-            if _matches_future_prefix(name)
+            if _matches_future_prefix(name) or name == _WORKSPACE_ADAPTER_MODULE
         }
-        self.assertEqual(observed, set())
+        self.assertEqual(observed, _CURRENT_WORKSPACE_PRODUCTION_MODULES)
+
+    def test_current_workspace_modules_obey_their_distinct_dependency_rules(self) -> None:
+        observed = tuple(
+            item
+            for item in self.violations
+            if item.importer in _CURRENT_WORKSPACE_PRODUCTION_MODULES
+        )
+        self.assertEqual(observed, ())
 
     def test_parser_and_codec_define_no_workspace_or_package_authority(self) -> None:
         observed = {

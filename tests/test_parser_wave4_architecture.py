@@ -68,6 +68,7 @@ _EXPECTED_MIGRATED_APPLICATION_FACADES = frozenset(
 _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
     {
         "editor_project",
+        "editor_project_workspace_adapter",
         "resource_importer",
         "tm_json_importer",
         "logic_controller",

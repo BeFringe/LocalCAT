@@ -64,7 +64,7 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 4. When 用户修改 `display_name` 或文档 `order`、移动整个包的绝对位置、或切换 UI 排序时, the workspace shall 保持 `project_id`、`document_id` 和 Segment_Identity 不变。
 5. The workspace shall 不得将显示名、sheet 名、文件 stem、枚举顺序或扁平列表下标作为持久身份。
 6. If manifest 中的 project/document/segment 身份为空、重复、形状不合法或引用不存在的所属对象, the workspace shall 在发布任何项目状态前 fail closed。
-7. When 现有单 JSON 通过兼容适配打开时, the workspace shall 保留当前 segment id、顺序、target、speaker 和 confirmed 行为，不得要求旧项目先迁移为多文档包。
+7. When 现有单 JSON 满足 Workspace v1 eligibility 并通过兼容适配打开时, the workspace shall 保留当前 segment id、顺序、target、speaker 和 confirmed 行为；if 其 name/local ID/source ref 不满足 v1 安全限制, the adapter shall 结构化拒绝提升、保持原文件不变，且不影响旧 `load_project()` / `save_project()` 继续使用。
 
 ### Requirement 3：ProjectOrigin 与首个真实多文档 substrate
 

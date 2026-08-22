@@ -280,7 +280,7 @@ ProjectPackage v1 的可移植 ID 采用闭合 ASCII token：
 
 - `project_id = "prj-" + 64 lowercase hex`；
 - `document_id = "doc-" + 64 lowercase hex`；
-- `local_segment_id` 保留 codec 产生的 exact non-empty opaque string，但 UTF-8 最多 1024 bytes、不得含 NUL/control/surrogate；
+- `local_segment_id` 保留 codec 产生的 exact non-empty opaque string，但一旦提升为 Workspace/ProjectPackage v1，UTF-8 最多 1024 bytes且不得含 NUL/control/surrogate；不符合者不改写 ID，而是结构化拒绝该次提升，旧 `load_project()` / `save_project()` 仍独立可用；
 - 新 project 使用 256-bit cryptographic random seed 的 SHA-256 token；测试可注入 deterministic ID issuer，但生产不得用 display/order/time 单独生成；
 - `explicit-selected-files-v1` intake 的 document ID 使用 `SHA256("localcat.document.explicit-selected-files.v1\0" || normalized_source_ref)` 一次性确定，随后由 ProjectPackage 原样持久；同一项目内规范化 ref collision 在签发前拒绝；
 - legacy single JSON adapter用带domain separator的device-local origin key产生project ID，并用normalized source_ref产生document ID，随后由package原样持久；
@@ -292,6 +292,8 @@ legacy derivation 使用长度前缀的 UTF-8 fields：
 SHA256("localcat.project.single-json.v1\0" || device_local_origin_key)
 SHA256("localcat.document.single-json.v1\0" || normalized_source_ref)
 ```
+
+`length_prefixed_utf8` 的 v1 字节合同固定为“8-byte unsigned big-endian UTF-8 byte length + exact UTF-8 bytes”；不得改用字符数、平台字节序或可变长整数。`device_local_origin_key` 必须是已验证 absolute lexical binding 的 64 位 lowercase SHA-256，不能把 `source_ref` 直接当 project binding key。
 
 `device_local_origin_key`是对已验证single-file绝对lexical binding的body-safe digest，不把绝对path写进package；同一路径内容替换后仍稳定，legacy文件移动可被视为新binding，显式export后则由manifest ID脱离路径保持稳定。这只给未带manifest的既有单JSON建立兼容身份；它不是未来目录或workbook的ID方案。后续获批origin adapter必须优先使用已有manifest ID；无manifest时只能按其获批profile产生一次ID并立即写入ProjectPackage。
 
@@ -305,6 +307,8 @@ SHA256("localcat.document.single-json.v1\0" || normalized_source_ref)
 4. identity 比较按规范化 UTF-8 bytes 大小写敏感；同时对同一 package 的所有 refs 做 NFC + `casefold()` 冲突检查，避免在大小写不敏感或 normalization-insensitive 文件系统上提取覆盖。
 5. normalization 输出只能作为 rooted handle 下的相对引用。运行时打开/写入仍须逐 component no-follow 证明；lexical normalization 不能代替安全文件绑定。
 6. 后续 workbook profile中的多个 Document可以共享同一 workbook `source_ref`；稳定 document_id必须来自manifest。sheet/display name永远不进入source_ref identity；本规格不据此启用workbook origin。
+
+C1 只批准 legacy single JSON 的 `SINGLE_FILE/localcat-json-v1` 实际入口；`DIRECTORY/explicit-selected-files-v1` 留给 C2A，`WORKBOOK` 在 C1 仅是可构造的 origin 叶类型，没有获批产品 profile、扫描或 writer。叶合同接受规范的版本 token 不等于启用对应产品能力；C2C package validator仍须按已批准 profile allowlist fail closed。
 
 设备本地 `OriginBinding` 另行保存已验证 absolute root、规范化 source_ref → document_id 映射、binding revision 与最近一次 observed source identity；只存在 Application session 或设备本地 workspace state，不进入 package，也不随 sync 搬运。换设备后必须由用户显式重新绑定 origin。最近一次 source identity 是变更/preview-stale 事实，不参与稳定 document ID 回接键。
 
@@ -334,6 +338,7 @@ SHA256(
 - 从 workspace 投影回 legacy EditorProject 只允许 `documents` 恰好一个且为 LocalCAT JSON；多 Document 必须拒绝，不能静默 flatten 后交给旧 saver。
 - TXT 的既有 load/save-as-JSON 路径继续回归，但 C1 不宣称 TXT 已由 workspace adapter 接管；任何迁移须在后续 task 显式批准。
 - 用户显式 export 为 ProjectPackage 后，包保留同一 project/document/segment identity与`SINGLE_FILE` source-origin描述；原JSON不被覆盖或删除。ProjectPackage成为canonical persistence，但不重写成第四种origin，也不让原single-file来源成为第二workspace authority。
+- legacy `load_project()` / `save_project()` 的 accepted domain 与行为保持 exact，adapter 不改它们。但“提升为 Workspace”是一个显式的 v1 eligibility boundary：超过 name/ID 限制、含 control 的 opaque local ID 或不具备 portable `source_ref` 的旧文件必须返回 body-safe `PROJECT.WORKSPACE.LIMIT_EXCEEDED` / `CONTRACT_INVALID` / `PATH_INVALID`，且不修改原文件、不发布部分 workspace。用户仍可继续使用 legacy 单项目路径；不得为了提升而截断、转义或重铸 ID。
 
 ## C2A：聚合与 Source Reconciliation
 
@@ -706,7 +711,7 @@ UI文案为“当前章节 / 搜索全部章节”。`ProjectSearchRequest`增�
 
 ### ProjectLimitProfile v1
 
-所有限制属于profile `localcat-project-limits-v1`，在validate/stage/materialize前执行：
+所有限制属于profile `localcat-project-limits-v1`，在建立 Workspace、新建 ProjectPackage candidate 或将 legacy project 提升为 Workspace/ProjectPackage 的 validate/stage/materialize 前执行。这些限制不反向改变独立 legacy facade 的 accepted domain：
 
 | 项目 | v1 上限 |
 |---|---:|

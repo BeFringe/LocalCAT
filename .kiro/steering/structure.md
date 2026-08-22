@@ -22,6 +22,9 @@ Layer 1 resource / termbase / canonical TM storage
 /
 ├── editor_contracts.py          # Qt 编辑器 frozen 跨层契约
 ├── editor_project.py            # JSON/TXT 单输入项目 Application facade
+├── project_workspace_identity.py # 多文档稳定 ID、portable ref 与 source digest 中立叶
+├── project_workspace_contracts.py # Project/Document/Segment/Origin immutable contracts
+├── editor_project_workspace_adapter.py # legacy 单 JSON ↔ workspace 唯一兼容映射层
 ├── parser_contracts.py          # stdlib-only 中立合同、capability 与 limit profile
 ├── parser_source.py             # rooted source/snapshot/terminal 与 canonical 原子写
 ├── parser_registry.py           # purpose-aware 不可变 registry，不导入具体 codec
@@ -90,6 +93,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `parser_contracts.py` 只依赖标准库；Parser Foundation 与各 codec 不导入 Engine、Store、Controller、Qt、workspace 或 sync/provider implementation。
 - `parser_registry.py` 不导入具体 codec；只有 `parser_composition.py` 显式注册内建 codec，并向 Application 提供选择、打开、验证、materialize、stream 与 canonical write surface。
 - `editor_project.py`、`resource_importer.py`、`logic_controller.py` 与 `tm_json_importer.py` 只负责既有类型映射、batch policy 和事务，不保留第二份 JSON/TXT/PO/POT/TMX/CSV/XLSX 语法。
+- `project_workspace_identity.py` 与 `project_workspace_contracts.py` 是 Qt/Engine/Store/provider/chunk/resource 无关的中立叶；`editor_project_workspace_adapter.py` 是 legacy 单 JSON 与 workspace 的唯一兼容映射层，只通过 `parser_contracts.py` / `parser_composition.py` 取得 verified terminal，不拥有 JSON grammar 或 writer。
 - openpyxl 只由 `parser_termbase_codec.py` 在 XLSX preflight 通过后条件导入，并固定 read-only/data-only、关闭 links/VBA；`resource_importer.py` 不拥有 active-sheet 或列选择语法。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。
@@ -111,6 +115,7 @@ Layer 1 resource / termbase / canonical TM storage
 ## 测试布局
 
 - `tests/test_editor_*`：纯逻辑、项目和资源协调。
+- `tests/test_multi_document_cluster*`：多文档 workspace 的 current-source characterization、分 Cluster 架构边界、identity/origin/package/session 与最终验收。
 - `tests/test_project_search*`、`tests/test_qt_project_search*`：单 JSON 搜索 contracts/service/Controller/Qt 与 current-source acceptance。
 - `tests/test_feature5_ui_*`：真实 canonical activation/retrieval、mixed merge、failure 与 apply/write 跨层验收。
 - `tests/test_capability_host*`、`tests/test_tm_retrieval*`：capability publication、in-flight generation 与 Core query 语义。

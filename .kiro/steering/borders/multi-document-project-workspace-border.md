@@ -41,7 +41,7 @@ Cluster 0 人工批准
 
 ## 灰线
 
-- Cluster 1 的单 JSON 兼容可以使用 adapter 或同构投影，只要旧入口、对象行为、保存和冷重开 exact compatible。
+- Cluster 1 的单 JSON adapter 不改旧入口、对象行为、保存和冷重开；提升为 Workspace 时单独执行 v1 eligibility。不合规旧值必须 body-safe 拒绝提升且原文件不变，不得截断或重铸 ID；legacy facade 仍 exact compatible。
 - Cluster 2B 可用 carrier-neutral fault harness 验证 candidate/LKG/save/recovery；Cluster 2C 可用 carrier-neutral fixture 先验证逻辑 manifest，但两者都不能替代 2C/Cluster 4 的真实物理 ProjectPackage 验收。
 - ProjectPackage 物理 carrier 可在获批决策中选择目录、单文件 archive 或其他等价方案；本 border 不预先指定实现。
 - 内部 search scope 可为未来 `current_chunk` 保留扩展位，但当前不得访问 chunk owner、映射 Document 或显示控件。

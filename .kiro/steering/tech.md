@@ -8,7 +8,7 @@
 |----|------|-------------|
 | Layer 1 Storage | legacy JSONL、canonical SQLite、mixed termbase CSV、资源/工作区状态与持久恢复 | `resource_repository.py`, `workspace_state.py`, `termbase_store.py`, `tm_sqlite_store.py`, `tm_activation_*.py` |
 | Layer 2 Engine / Parser | TM retrieval/scoring、capability-gated text matcher、项目搜索、Trie 术语；中立 Parser contracts/source/registry 与格式 codec | `tm_retrieval.py`, `tm_similarity.py`, `text_matcher.py`, `project_search.py`, `glossary_engine.py`, `parser_contracts.py`, `parser_source.py`, `parser_registry.py`, `parser_*_codec.py` |
-| Layer 3 Application / Logic | Parser composition/facade mapping、capability/runtime composition、TM adapter、Qt 有状态会话；Excel 无状态三态入口 | `parser_composition.py`, `editor_project.py`, `resource_importer.py`, `tm_json_importer.py`, `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
+| Layer 3 Application / Logic | Parser composition/facade mapping、workspace immutable contracts/identity/compatibility adapter、capability/runtime composition、TM adapter、Qt 有状态会话；Excel 无状态三态入口 | `parser_composition.py`, `editor_project.py`, `project_workspace_identity.py`, `project_workspace_contracts.py`, `editor_project_workspace_adapter.py`, `resource_importer.py`, `tm_json_importer.py`, `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
 | Layer 4 Frontend | Excel、PySide6 主窗口/资源/术语交互与桌面启动入口 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_settings_dialog.py`, `qt_termbase_dialog.py`, `qt_editor.py` |
 
 关键约束：

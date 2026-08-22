@@ -185,19 +185,19 @@ _RUNTIME_SOURCE_DIGESTS = {
     "parser_composition.py": "afa777612e8149acec0ee68c8f8e689a1dc1eab376668419a63a1ac71d673e7e",
 }
 
-_PYTHON_SOURCE_ENTRY_COUNT = 256
+_PYTHON_SOURCE_ENTRY_COUNT = 260
 _PYTHON_SOURCE_PATH_DIGEST = (
-    "6e5eaed77e8be903f994ac99c0342d6268700331385b5aea84a0258397196ecf"
+    "976edc2309a62619bdd52390bdde57eb9affed914134141bdb0cc3914ca1ae80"
 )
-_PRODUCTION_IMPORT_ENTRY_COUNT = 425
-_PRODUCTION_IMPORT_CALL_COUNT = 425
+_PRODUCTION_IMPORT_ENTRY_COUNT = 463
+_PRODUCTION_IMPORT_CALL_COUNT = 463
 _PRODUCTION_IMPORT_DIGEST = (
-    "4624d94ad8a225c9839210a5f43d2a9f16c71f40764d182060627e749200a8a8"
+    "3838fe5f7e4978e0906d0a4a4f65334b32ec7c32dfdfa335d2fe534086c92ec4"
 )
-_TEST_IMPORT_ENTRY_COUNT = 789
-_TEST_IMPORT_CALL_COUNT = 975
+_TEST_IMPORT_ENTRY_COUNT = 816
+_TEST_IMPORT_CALL_COUNT = 1002
 _TEST_IMPORT_DIGEST = (
-    "c392b4eae13919cb6eec08359906120380ba112a04876fb0f7771afa56ebf626"
+    "8a46da5dfbc8c6d9548bc9bb832ef363aad29726f68e09e621e1d68c678005ff"
 )
 _CRITICAL_PRODUCTION_IMPORTS = frozenset(
     {
@@ -236,6 +236,48 @@ _CRITICAL_PRODUCTION_IMPORTS = frozenset(
         ("qt_editor.py", "qt_editor_window", "QtEditorWindow", None),
         ("qt_editor_window.py", "editor_contracts", "ProjectSearchRequest", None),
         ("qt_editor_window.py", "editor_controller", "EditorController", None),
+        (
+            "project_workspace_contracts.py",
+            "parser_contracts",
+            "CodecIdentity",
+            None,
+        ),
+        (
+            "project_workspace_contracts.py",
+            "project_workspace_identity",
+            "normalize_portable_ref_v1",
+            None,
+        ),
+        (
+            "editor_project_workspace_adapter.py",
+            "editor_contracts",
+            "EditorProject",
+            None,
+        ),
+        (
+            "editor_project_workspace_adapter.py",
+            "parser_composition",
+            "create_parser_application_surface",
+            None,
+        ),
+        (
+            "editor_project_workspace_adapter.py",
+            "parser_contracts",
+            "LOCALCAT_JSON_V1",
+            None,
+        ),
+        (
+            "editor_project_workspace_adapter.py",
+            "project_workspace_contracts",
+            "ProjectWorkspace",
+            None,
+        ),
+        (
+            "editor_project_workspace_adapter.py",
+            "project_workspace_identity",
+            "derive_legacy_single_json_project_id",
+            None,
+        ),
     }
 )
 
@@ -375,13 +417,21 @@ _EXPECTED_SERIALIZATION_CALLS = Counter(
         ("workspace_state.py", "self.state_path.read_text"): 1,
     }
 )
-_PATCH_ENTRY_COUNT = 34
-_PATCH_CALL_COUNT = 47
+_PATCH_ENTRY_COUNT = 36
+_PATCH_CALL_COUNT = 51
 _PATCH_INVENTORY_DIGEST = (
-    "1741896f9073ef233cd23d33ea2c9c7ee47e59dcfe83feae9ea7c8066ec470e9"
+    "c1999224063bcc127f6e074b79203ed3ef4db62908d111cb2806edf63d7920bf"
 )
 
 _INVENTORY_MODULES = frozenset(_CURRENT_SOURCE_ROOTS)
+_C1_CONSUMER_MODULES = frozenset(
+    {
+        "project_workspace_contracts",
+        "project_workspace_identity",
+        "editor_project_workspace_adapter",
+    }
+)
+_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES | _C1_CONSUMER_MODULES
 _SEMANTIC_SOURCE_FILES = _CURRENT_SOURCE_FILES
 
 
@@ -466,14 +516,17 @@ def _import_consumers(
     for path in paths:
         relative = path.relative_to(_ROOT).as_posix()
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), relative)):
-            if isinstance(node, ast.ImportFrom) and node.module in _INVENTORY_MODULES:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module in _CLOSED_CONSUMER_MODULES
+            ):
                 for item in node.names:
                     observed[
                         (relative, cast(str, node.module), item.name, item.asname)
                     ] += 1
             elif isinstance(node, ast.Import):
                 for item in node.names:
-                    if item.name in _INVENTORY_MODULES:
+                    if item.name in _CLOSED_CONSUMER_MODULES:
                         observed[(relative, item.name, "<module>", item.asname)] += 1
     return observed
 
@@ -517,7 +570,7 @@ def _patch_inventory(
                 target = cast(str, argument.value)
                 if any(
                     target == module or target.startswith(f"{module}.")
-                    for module in _INVENTORY_MODULES
+                    for module in _CLOSED_CONSUMER_MODULES
                 ):
                     observed[(relative, target)] += 1
     return observed
@@ -629,6 +682,12 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
             tuple(_RUNTIME_SOURCE_DIGESTS),
             _CURRENT_SOURCE_FILES,
         )
+        self.assertEqual(_INVENTORY_MODULES, frozenset(_CURRENT_SOURCE_ROOTS))
+        self.assertTrue(_INVENTORY_MODULES.isdisjoint(_C1_CONSUMER_MODULES))
+        self.assertEqual(
+            _CLOSED_CONSUMER_MODULES,
+            _INVENTORY_MODULES | _C1_CONSUMER_MODULES,
+        )
         observed_digests = {
             relative: hashlib.sha256((_ROOT / relative).read_bytes()).hexdigest()
             for relative in _RUNTIME_SOURCE_DIGESTS
@@ -686,6 +745,10 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
             ("tests/test_parser_wave4_safety.py", "parser_source.os.replace"),
             ("tests/test_workspace_state.py", "workspace_state.os.replace"),
             ("tests/test_qt_bootstrap.py", "qt_editor.sys.platform"),
+            (
+                "tests/test_multi_document_cluster1_contracts.py",
+                "editor_project_workspace_adapter.create_parser_application_surface",
+            ),
         ):
             self.assertGreater(patches[seam], 0, seam)
 

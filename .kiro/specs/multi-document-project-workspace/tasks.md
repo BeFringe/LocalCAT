@@ -52,19 +52,20 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ## Cluster 1：身份与 Origin（brief Promotion Cluster 1）
 
-- [ ] 1.1 建立 Project / Document / Segment immutable contracts
+- [x] 1.1 建立 Project / Document / Segment immutable contracts
   - `ProjectDocument` 使用稳定 `document_id`；项目内 segment identity 固定为 `(document_id, local_segment_id)`。
   - display name、sheet name、列表位置和枚举顺序不得成为持久身份。
 
-- [ ] 1.2 建立 `single_file` / `directory` / `workbook` origin 与稳定 `source_ref`
+- [x] 1.2 建立 `single_file` / `directory` / `workbook` origin 与稳定 `source_ref`
   - 规范化相对 `source_ref` 与 manifest-issued ID 的优先级、路径安全和重复/冲突拒绝语义。
   - origin 只描述项目来源，不据此宣称任意 XLSX、RPY、PO/POT 或其他 codec 已可写。
 
-- [ ] 1.3 建立既有单 JSON 兼容适配
+- [x] 1.3 建立既有单 JSON 兼容适配
   - 既有单 JSON 行为可投影为一个 Project/一个 Document，但不得改变其 current-source open/save/segment identity 语义。
+  - Workspace v1 eligibility 在 adapter 提升时执行；不合规旧文件结构化拒绝且原字节不变，legacy `load_project()` / `save_project()` 仍完全兼容。
   - 当前单 JSON 路径继续可独立工作，不把本规格变成 Parser Foundation 的反向前置。
 
-- [ ] 1.4 闭合身份与 origin 的对抗测试
+- [x] 1.4 闭合身份与 origin 的对抗测试
   - 覆盖重命名、重排、同名文档、路径规范化、重复 ID、伪造复合 ID、跨项目身份与旧入口兼容。
   - 独立 reviewer 证明没有临时路径/显示名/列表索引权威。
 
