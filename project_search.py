@@ -11,9 +11,15 @@ from editor_contracts import (
     ProjectSearchReport,
     ProjectSearchRequest,
     SearchField,
+    SearchScope,
     SegmentTranslationStatus,
     TextMatcherDisplayState,
+    WorkspaceSearchHit,
+    WorkspaceSearchReport,
+    WorkspaceSearchRequest,
 )
+from project_workspace import ProjectWorkspaceService
+from project_workspace_contracts import ProjectSegment
 from tm_contracts import (
     CapabilityGatedTextMatcher,
     SearchOptions,
@@ -69,16 +75,60 @@ class ProjectSearchService:
         project.__post_init__()
         request.__post_init__()
 
+        entries = tuple(
+            (None, segment.id, index, segment)
+            for index, segment in enumerate(project.segments)
+        )
+        return self._search_entries(entries, request)
+
+    def search_workspace(
+        self,
+        workspace_service: ProjectWorkspaceService,
+        request: WorkspaceSearchRequest,
+        *,
+        current_document_id: str,
+    ) -> WorkspaceSearchReport:
+        """Search one exact workspace projection using the same matcher pipeline."""
+
+        if type(workspace_service) is not ProjectWorkspaceService:
+            raise TypeError("workspace_service must be exact ProjectWorkspaceService")
+        if type(request) is not WorkspaceSearchRequest:
+            raise TypeError("request must be exact WorkspaceSearchRequest")
+        request.__post_init__()
+        documents = workspace_service.workspace.documents
+        if not any(item.document_id == current_document_id for item in documents):
+            raise ProjectSearchError("PROJECT_SEARCH.CURRENT_DOCUMENT_STALE")
+        entries = tuple(
+            (
+                flat.document_id,
+                flat.identity.local_segment_id,
+                flat.project_global_index,
+                flat.segment,
+            )
+            for flat in workspace_service.flat_segments
+            if request.scope is SearchScope.ENTIRE_PROJECT
+            or flat.document_id == current_document_id
+        )
+        return self._search_entries(entries, request)
+
+    def _search_entries(
+        self,
+        entries: tuple[
+            tuple[str | None, str, int, EditorSegment | ProjectSegment], ...
+        ],
+        request: ProjectSearchRequest | WorkspaceSearchRequest,
+    ) -> ProjectSearchReport | WorkspaceSearchReport:
         profile = (
             TextMatchProfile.BASIC_CONTIGUOUS
             if request.options == _BASIC_OPTIONS
             else TextMatchProfile.CONFIGURABLE_TEXT_V1
         )
         selected_fields = request.fields
-        hits: list[ProjectSearchHit] = []
+        project_hits: list[ProjectSearchHit] = []
+        workspace_hits: list[WorkspaceSearchHit] = []
         used_capability: TextMatcherCapability | None = None
 
-        for segment_index, segment in enumerate(project.segments):
+        for document_id, segment_id, segment_index, segment in entries:
             if (
                 request.status is not None
                 and segment_translation_status(segment) is not request.status
@@ -113,40 +163,59 @@ class ProjectSearchService:
                 for core_hit in outcome.hits:
                     if core_hit.end_index > len(text):
                         raise ProjectSearchError("MATCHER.OFFSET_OUT_OF_RANGE")
-                    hits.append(
-                        ProjectSearchHit(
-                            segment_id=segment.id,
-                            segment_index=segment_index,
-                            field=field,
-                            start_index=core_hit.start_index,
-                            end_index=core_hit.end_index,
-                            preview=text,
+                    if document_id is None:
+                        project_hits.append(
+                            ProjectSearchHit(
+                                segment_id=segment_id,
+                                segment_index=segment_index,
+                                field=field,
+                                start_index=core_hit.start_index,
+                                end_index=core_hit.end_index,
+                                preview=text,
+                            )
                         )
-                    )
+                    else:
+                        workspace_hits.append(
+                            WorkspaceSearchHit(
+                                document_id=document_id,
+                                local_segment_id=segment_id,
+                                project_global_index=segment_index,
+                                field=field,
+                                start_index=core_hit.start_index,
+                                end_index=core_hit.end_index,
+                                preview=text,
+                            )
+                        )
 
         if used_capability is None:
             used_capability = self._matcher.capability()
-        return ProjectSearchReport(
-            hits=tuple(hits),
-            capability=_display_from_core(used_capability),
-        )
+        display = _display_from_core(used_capability)
+        if type(request) is WorkspaceSearchRequest:
+            return WorkspaceSearchReport(
+                hits=tuple(workspace_hits),
+                capability=display,
+            )
+        return ProjectSearchReport(hits=tuple(project_hits), capability=display)
 
 
-def _field_text(segment: EditorSegment, field: SearchField) -> str:
+def _field_text(
+    segment: EditorSegment | ProjectSegment,
+    field: SearchField,
+) -> str:
     if field is SearchField.SOURCE:
         return segment.source
     if field is SearchField.TARGET:
         return segment.target
-    return segment.speaker
+    return segment.speaker if type(segment) is EditorSegment else segment.raw_speaker
 
 
 def segment_translation_status(
-    segment: EditorSegment,
+    segment: EditorSegment | ProjectSegment,
 ) -> SegmentTranslationStatus:
     """Derive the sole frozen translation state before matching fields."""
 
-    if type(segment) is not EditorSegment:
-        raise TypeError("segment translation status requires EditorSegment")
+    if type(segment) not in (EditorSegment, ProjectSegment):
+        raise TypeError("segment translation status requires a project segment")
     segment.__post_init__()
     if segment.confirmed:
         return SegmentTranslationStatus.TRANSLATED

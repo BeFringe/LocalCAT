@@ -133,25 +133,27 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ## Cluster 3：应用服务（brief Promotion Cluster 3）
 
-- [ ] 3.1 建立 Controller workspace session 与 issued identity
+- [x] 3.1 建立 Controller workspace session 与 issued identity
   - open/switch/edit/save/reconcile/package 操作只接受当前 session/generation 签发的 Project/Document/Segment 身份。
   - stale/forged/cross-project identity 在任何 mutation 前 fail closed。
 
-- [ ] 3.2 建立项目/文档 dirty 与保存状态投影
+- [x] 3.2 建立项目/文档 dirty 与保存状态投影
   - 文档状态聚合为项目状态但不抹平逐文档失败；保存成功只清除已证明持久化的 dirty。
   - package import/apply 与 source reconciliation 使用 Cluster 2 冻结的事务和 receipt。
 
-- [ ] 3.3 建立可扩展 search scope
+- [x] 3.3 建立可扩展 search scope
   - 首批只开放 `current_document` / `entire_project`，UI 文案为“当前章节 / 搜索全部章节”。
   - 可保留未来 `current_chunk` enum 扩展位，但不得映射成 Document、查询未实现 chunk 或暴露 chunk 控件。
 
-- [ ] 3.4 闭合应用层并发、故障与兼容矩阵
+- [x] 3.4 闭合应用层并发、故障与兼容矩阵
   - 覆盖切换章节、session 替换、reconcile/save 竞态、stale search result、部分保存与旧单 JSON controller journeys。
   - 独立 reviewer 证明 Controller 不解释 codec grammar/private member，也不拥有 provider/chunk/TM authority。
 
 ### Cluster 3 完成门
 
 - application 只消费 Cluster 1–2 已批准 contracts；失败不丢失 dirty、identity 或恢复信息。
+- 独立对抗审查已重放候选准备失败、prepared capability 回收、durable import/session 单点切换、legacy exact DTO 与旧单 JSON journeys，Tasks 3.1–3.4 全部 GO。
+- C0 runtime source digest 的预期漂移保留到 Cluster 4 final roots 后重签；不得把该后续证据门提前算作 Cluster 3 完成。
 - 独立提交：`feat(workspace): 接入多文档应用会话`。
 - Cluster 3 独立对抗 review 通过后才进入 Cluster 4。
 

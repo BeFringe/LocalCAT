@@ -41,11 +41,11 @@ Layer 1 resource / termbase / canonical TM storage
 ├── parser_tm_json_codec.py      # normalized TM JSON 单输入资源 codec
 ├── parser_termbase_codec.py     # CSV/XLSX 显式列选择资源 codec
 ├── resource_repository.py       # 资源清单和受控本地文件
-├── workspace_state.py           # 最近项目、断点、显示/TM 与设备本地预处理偏好
+├── workspace_state.py           # legacy/复合最近项目断点、显示/TM 与设备本地预处理偏好
 ├── resource_importer.py         # TMX/CSV/XLSX Application policy 与事务导入
 ├── renpy_tm_compat.py           # 严格 speaker 对话封装查询与目标解包
-├── project_search.py            # capability-gated 单项目搜索服务
-├── editor_controller.py         # Qt 项目/搜索/TM/术语/资源会话
+├── project_search.py            # legacy/workspace 双入口、单一 matcher pipeline 搜索服务
+├── editor_controller.py         # Qt 单文件与多文档 issued session/搜索/保存协调
 ├── editor_tm_adapter.py         # runtime + capability 同次 operation 投影
 ├── capability_host.py           # Matcher/Gate C/Gate D 发布与 host lifecycle
 ├── tm_application_composition.py # legacy/canonical resource resolver/runtime host
@@ -101,6 +101,7 @@ Layer 1 resource / termbase / canonical TM storage
 - `project_workspace_intake.py` 仅对用户显式选中的 JSON/TXT/PO/POT 保留单次 rooted batch binding，通过 Parser 中立 surface 取得 verified facts；不枚举目录、不导入具体 codec/parser_source、不授予 source writer。`project_workspace.py` 只消费已验证 immutable facts，拥有扁平投影、progress 与 reconciliation，不导入 Parser/intake/Qt/TM/Store/provider/chunk/resource。
 - `project_save.py` 只消费 workspace 的 canonical digest/service/contracts，拥有 carrier-neutral save candidate、真实 LKG/逐Document baseline、结构化报告与 cold-recovery 阶段协调；不导入 Parser/codec、物理 archive/carrier、Qt、TM/Store、provider、chunk 或 ResourcePackage。当前显式选择的 JSON/TXT/PO/POT 仍只保存 package overlay，不执行 source write-back。
 - `project_package.py` 是 ADR-019 批准的唯一 ProjectPackage v1 carrier owner：它拥有严格 `ZIP_STORED` envelope/manifest/member grammar、bounded stream、artifact/content digest、手工 export/validate/preview/import/apply/receipt 与物理 recovery port；不导入具体 codec/registry、Qt、TM/Store、provider、chunk 或 ResourcePackage，不 extract member，不解释 `codec_private_member`。
+- `editor_controller.py` 的多文档入口只消费 C1–C2 frozen service/receipt，以 session/generation/revision 签发 Project/Document/Segment view；source reconcile 与 active package import 使用 owner-issued prepare/discard/commit capability，候选投影完成后才单点切换 session。`project_search.py` 让 legacy 与 workspace request 共用一个 matcher pipeline；workspace 使用独立复合 hit/report，不扩宽既有单 JSON DTO。Qt 不直接取得 workspace、manifest、member、persistence binding 或 recovery authority。
 - openpyxl 只由 `parser_termbase_codec.py` 在 XLSX preflight 通过后条件导入，并固定 read-only/data-only、关闭 links/VBA；`resource_importer.py` 不拥有 active-sheet 或列选择语法。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。

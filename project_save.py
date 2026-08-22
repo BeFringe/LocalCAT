@@ -606,6 +606,23 @@ class ProjectSaveService:
         return None if self._baseline is None else self._baseline.saved_package_digest
 
     @property
+    def saved_workspace_revision(self) -> int | None:
+        return None if self._baseline is None else self._baseline.workspace_revision
+
+    def fork_for_workspace_service(
+        self,
+        workspace_service: ProjectWorkspaceService,
+    ) -> ProjectSaveService:
+        """Bind the exact immutable baseline to a prepared workspace authority."""
+
+        if type(workspace_service) is not ProjectWorkspaceService:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        return ProjectSaveService(
+            workspace_service,
+            baseline=self._baseline,
+        )
+
+    @property
     def dirty_document_ids(self) -> tuple[str, ...]:
         current = self._workspace_service.workspace
         if self._baseline is None:

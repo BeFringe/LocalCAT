@@ -15,10 +15,14 @@ from editor_contracts import (
     LiteralReplaceRule,
     PreprocessPreferences,
     RecentProject,
+    RecentWorkspaceProject,
     SegmentDensity,
     TMPreferences,
     WorkspaceMode,
 )
+
+
+_RecentEntry = RecentProject | RecentWorkspaceProject
 
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +58,25 @@ def _clone_preprocess_preferences(
     return cloned
 
 
+def _recent_payload(item: _RecentEntry) -> dict[str, object]:
+    if type(item) is RecentProject:
+        return {
+            "path": str(item.path),
+            "segment_id": item.segment_id,
+            "index": item.index,
+        }
+    if type(item) is RecentWorkspaceProject:
+        return {
+            "path": str(item.path),
+            "segment_id": item.local_segment_id,
+            "index": item.index,
+            "project_id": item.project_id,
+            "document_id": item.document_id,
+            "local_segment_id": item.local_segment_id,
+        }
+    raise TypeError("recent entry must use an exact workspace contract")
+
+
 class WorkspaceStateRepository:
     """Own recent-project positions and editor display preferences."""
 
@@ -64,7 +87,7 @@ class WorkspaceStateRepository:
             self.config_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise WorkspaceStateError(f"unable to prepare workspace directory: {exc}") from exc
-        self._recent: tuple[RecentProject, ...] = ()
+        self._recent: tuple[_RecentEntry, ...] = ()
         self._preferences = DisplayPreferences()
         self._tm_preferences = TMPreferences()
         self._preprocess_preferences = PreprocessPreferences()
@@ -82,13 +105,40 @@ class WorkspaceStateRepository:
     def recent_projects(self) -> tuple[RecentProject, ...]:
         """Return most-recent-first project locations and positions."""
 
-        return self._recent
+        return tuple(item for item in self._recent if type(item) is RecentProject)
+
+    def recent_workspace_projects(self) -> tuple[RecentWorkspaceProject, ...]:
+        return tuple(
+            item for item in self._recent if type(item) is RecentWorkspaceProject
+        )
 
     def find_project(self, path: Path) -> RecentProject | None:
         """Return one remembered project after normalizing its local path."""
 
         normalized = path.expanduser().resolve()
-        return next((item for item in self._recent if item.path == normalized), None)
+        return next(
+            (
+                item
+                for item in self._recent
+                if type(item) is RecentProject and item.path == normalized
+            ),
+            None,
+        )
+
+    def find_workspace_project(
+        self,
+        path: Path,
+    ) -> RecentWorkspaceProject | None:
+        normalized = path.expanduser().resolve()
+        return next(
+            (
+                item
+                for item in self._recent
+                if type(item) is RecentWorkspaceProject
+                and item.path == normalized
+            ),
+            None,
+        )
 
     def remember_project(self, path: Path, segment_id: str, index: int) -> RecentProject:
         """Move a project to the front and atomically persist its current position."""
@@ -96,6 +146,37 @@ class WorkspaceStateRepository:
         remembered = RecentProject(
             path=path.expanduser().resolve(),
             segment_id=segment_id,
+            index=index,
+        )
+        updated = (
+            remembered,
+            *(item for item in self._recent if item.path != remembered.path),
+        )[:MAX_RECENT_PROJECTS]
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
+        self._recent = updated
+        return remembered
+
+    def remember_workspace_project(
+        self,
+        path: Path,
+        *,
+        project_id: str,
+        document_id: str,
+        local_segment_id: str,
+        index: int,
+    ) -> RecentWorkspaceProject:
+        """Persist a composite position without weakening legacy v1 entries."""
+
+        remembered = RecentWorkspaceProject(
+            path=path.expanduser().resolve(),
+            project_id=project_id,
+            document_id=document_id,
+            local_segment_id=local_segment_id,
             index=index,
         )
         updated = (
@@ -203,7 +284,7 @@ class WorkspaceStateRepository:
     def _read_state(
         self,
     ) -> tuple[
-        tuple[RecentProject, ...],
+        tuple[_RecentEntry, ...],
         DisplayPreferences,
         TMPreferences,
         PreprocessPreferences,
@@ -218,7 +299,7 @@ class WorkspaceStateRepository:
         raw_recent = mapping.get("recent_projects", [])
         if not isinstance(raw_recent, list):
             raise ValueError("recent_projects must be an array")
-        recent: list[RecentProject] = []
+        recent: list[_RecentEntry] = []
         for index, entry in enumerate(cast(list[object], raw_recent), start=1):
             if not isinstance(entry, dict):
                 LOGGER.warning("Skipping invalid recent project entry %s", index)
@@ -228,17 +309,46 @@ class WorkspaceStateRepository:
                 path = item["path"]
                 segment_id = item["segment_id"]
                 position = item["index"]
+                project_id = item.get("project_id")
+                document_id = item.get("document_id")
+                local_segment_id = item.get("local_segment_id")
                 if not isinstance(path, str) or not isinstance(segment_id, str):
                     raise TypeError("recent project path and segment id must be strings")
                 if not isinstance(position, int) or isinstance(position, bool):
                     raise TypeError("recent project index must be an integer")
-                recent.append(
-                    RecentProject(
-                        path=Path(path),
-                        segment_id=segment_id,
-                        index=position,
+                if any(
+                    value is not None and not isinstance(value, str)
+                    for value in (project_id, document_id, local_segment_id)
+                ):
+                    raise TypeError("recent workspace identity must contain strings")
+                if any(
+                    value is not None
+                    for value in (project_id, document_id, local_segment_id)
+                ):
+                    if any(
+                        value is None
+                        for value in (project_id, document_id, local_segment_id)
+                    ):
+                        raise ValueError(
+                            "recent workspace identity must be all-or-none"
+                        )
+                    recent.append(
+                        RecentWorkspaceProject(
+                            path=Path(path),
+                            project_id=cast(str, project_id),
+                            document_id=cast(str, document_id),
+                            local_segment_id=cast(str, local_segment_id),
+                            index=position,
+                        )
                     )
-                )
+                else:
+                    recent.append(
+                        RecentProject(
+                            path=Path(path),
+                            segment_id=segment_id,
+                            index=position,
+                        )
+                    )
             except (KeyError, TypeError, ValueError) as exc:
                 LOGGER.warning("Skipping invalid recent project entry %s: %s", index, exc)
 
@@ -375,7 +485,7 @@ class WorkspaceStateRepository:
 
     def _write_state(
         self,
-        recent: tuple[RecentProject, ...],
+        recent: tuple[_RecentEntry, ...],
         preferences: DisplayPreferences,
         tm_preferences: TMPreferences,
         preprocess_preferences: PreprocessPreferences,
@@ -385,14 +495,7 @@ class WorkspaceStateRepository:
         )
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "recent_projects": [
-                {
-                    "path": str(item.path),
-                    "segment_id": item.segment_id,
-                    "index": item.index,
-                }
-                for item in recent
-            ],
+            "recent_projects": [_recent_payload(item) for item in recent],
             "display": {
                 "segment_density": preferences.segment_density.value,
                 "workspace_mode": preferences.workspace_mode.value,

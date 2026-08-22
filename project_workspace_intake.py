@@ -7,7 +7,7 @@ and then delegates all format grammar and terminal proof to the Parser surface.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import os
@@ -649,6 +649,178 @@ def stage_selected_project_documents(
         os.close(root_descriptor)
 
 
+def _workspace_rebind_document_ids(
+    root: Path,
+    selected_paths: tuple[Path, ...],
+    workspace: ProjectWorkspace,
+    rename_mappings: tuple[OriginRenameMapping, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Resolve every explicit selection to exactly one cold manifest identity."""
+
+    if type(selected_paths) is not tuple:
+        raise TypeError("selected_paths must be an exact tuple")
+    if type(workspace) is not ProjectWorkspace:
+        raise TypeError("workspace must be an exact ProjectWorkspace")
+    if workspace.persistence_kind is not ProjectPersistenceKind.PROJECT_PACKAGE:
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    if type(rename_mappings) is not tuple:
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    if any(type(item) is not OriginRenameMapping for item in rename_mappings):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+    root_path = _absolute_root(root)
+    selected_refs = tuple(
+        _selected_ref(root_path, selected_path)[0]
+        for selected_path in selected_paths
+    )
+    validate_portable_ref_collection(selected_refs, allow_exact_duplicates=False)
+
+    manifest_by_ref = {
+        document.source_ref: document
+        for document in workspace.documents
+    }
+    manifest_by_id = {
+        document.document_id: document
+        for document in workspace.documents
+    }
+    if len(manifest_by_ref) != len(workspace.documents):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    selected_ref_set = set(selected_refs)
+    old_refs: set[str] = set()
+    new_refs: set[str] = set()
+    mapped_document_ids: set[str] = set()
+    rename_by_new_ref: dict[str, str] = {}
+    for mapping in rename_mappings:
+        manifest_document = manifest_by_ref.get(mapping.old_source_ref)
+        if (
+            manifest_document is None
+            or manifest_document.document_id != mapping.document_id
+            or manifest_by_id.get(mapping.document_id) is not manifest_document
+            or mapping.old_source_ref in selected_ref_set
+            or mapping.new_source_ref not in selected_ref_set
+            or mapping.new_source_ref in manifest_by_ref
+            or mapping.old_source_ref in old_refs
+            or mapping.new_source_ref in new_refs
+            or mapping.document_id in mapped_document_ids
+        ):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        old_refs.add(mapping.old_source_ref)
+        new_refs.add(mapping.new_source_ref)
+        mapped_document_ids.add(mapping.document_id)
+        rename_by_new_ref[mapping.new_source_ref] = mapping.document_id
+
+    assigned: list[str] = []
+    for source_ref in selected_refs:
+        manifest_document = manifest_by_ref.get(source_ref)
+        document_id = (
+            manifest_document.document_id
+            if manifest_document is not None
+            else rename_by_new_ref.get(source_ref)
+        )
+        if document_id is None:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        assigned.append(document_id)
+
+    assigned_ids = tuple(assigned)
+    manifest_ids = frozenset(manifest_by_id)
+    if (
+        len(assigned_ids) != len(workspace.documents)
+        or len(set(assigned_ids)) != len(assigned_ids)
+        or frozenset(assigned_ids) != manifest_ids
+    ):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    return tuple(zip(selected_refs, assigned_ids, strict=True))
+
+
+def stage_workspace_rebind(
+    root: Path,
+    selected_paths: tuple[Path, ...],
+    workspace: ProjectWorkspace,
+    *,
+    rename_mappings: tuple[OriginRenameMapping, ...] = (),
+) -> StagedSelectedProjectDocuments:
+    """Attach explicit source selections to an unbound package workspace.
+
+    Identity authority comes only from the cold package manifest plus exact
+    source-ref matches or explicit old-to-new mappings.  Source parsing and
+    retained-root/no-follow proof remain owned by
+    :func:`stage_selected_project_documents`.
+    """
+
+    assignments = _workspace_rebind_document_ids(
+        root,
+        selected_paths,
+        workspace,
+        rename_mappings,
+    )
+    expected_refs = tuple(source_ref for source_ref, _ in assignments)
+    assigned_ids = tuple(document_id for _, document_id in assignments)
+    staged = stage_selected_project_documents(
+        root,
+        selected_paths,
+        SelectedProjectDocumentsRequest(
+            name=workspace.name,
+            source_locale=workspace.source_locale,
+            target_locale=workspace.target_locale,
+        ),
+    )
+    if (
+        tuple(document.source_ref for document in staged.workspace.documents)
+        != expected_refs
+        or tuple(document.source_ref for document in staged.origin_binding.documents)
+        != expected_refs
+    ):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+    rebound_documents = tuple(
+        replace(
+            document,
+            document_id=document_id,
+            editing_overlay=tuple(
+                replace(
+                    overlay,
+                    document_id=document_id,
+                    saved_state_digest=editing_state_digest_v1(
+                        document_id,
+                        overlay.local_segment_id,
+                        overlay.source_fingerprint,
+                        overlay.target,
+                        overlay.confirmed,
+                    ),
+                )
+                for overlay in document.editing_overlay
+            ),
+        )
+        for document, document_id in zip(
+            staged.workspace.documents,
+            assigned_ids,
+            strict=True,
+        )
+    )
+    rebound_workspace = replace(
+        staged.workspace,
+        project_id=workspace.project_id,
+        documents=rebound_documents,
+    )
+    rebound_binding = replace(
+        staged.origin_binding,
+        project_id=workspace.project_id,
+        documents=tuple(
+            replace(document, document_id=document_id)
+            for document, document_id in zip(
+                staged.origin_binding.documents,
+                assigned_ids,
+                strict=True,
+            )
+        ),
+    )
+    return _issue_staged(
+        rebound_workspace,
+        rebound_binding,
+        staged.source_identities,
+    )
+
+
 def revalidate_staged_selected_documents(
     staged: StagedSelectedProjectDocuments,
 ) -> StagedSelectedProjectDocuments:
@@ -684,4 +856,5 @@ __all__ = (
     "StagedSelectedProjectDocuments",
     "revalidate_staged_selected_documents",
     "stage_selected_project_documents",
+    "stage_workspace_rebind",
 )

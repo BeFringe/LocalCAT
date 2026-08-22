@@ -151,6 +151,177 @@ class ProjectProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceEditReceipt:
+    """One immutable overlay edit bound to an exact workspace revision."""
+
+    project_id: str
+    session_id: str
+    identity: SegmentIdentity
+    previous_revision: int
+    resulting_revision: int
+    previous_workspace_digest: str
+    resulting_workspace_digest: str
+    changed: bool
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.project_id)
+        _validate_session_id(self.session_id)
+        if type(self.identity) is not SegmentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        previous = _validate_revision(self.previous_revision)
+        resulting = _validate_revision(self.resulting_revision)
+        validate_sha256(self.previous_workspace_digest)
+        validate_sha256(self.resulting_workspace_digest)
+        if type(self.changed) is not bool:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if resulting != previous + int(self.changed):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if (self.previous_workspace_digest != self.resulting_workspace_digest) != self.changed:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedProjectIdentity:
+    project_id: str
+    session_id: str
+    generation: int
+    workspace_revision: int
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.project_id)
+        _validate_session_id(self.session_id)
+        if type(self.generation) is not int or self.generation < 0:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        _validate_revision(self.workspace_revision)
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedDocumentIdentity:
+    project: IssuedProjectIdentity
+    document_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.project) is not IssuedProjectIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        validate_document_id(self.document_id)
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedSegmentIdentity:
+    document: IssuedDocumentIdentity
+    local_segment_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.document) is not IssuedDocumentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        SegmentIdentity(self.document.document_id, self.local_segment_id)
+
+    @property
+    def segment_identity(self) -> SegmentIdentity:
+        return SegmentIdentity(self.document.document_id, self.local_segment_id)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceDocumentView:
+    identity: IssuedDocumentIdentity
+    display_name: str
+    source_ref: str
+    order: int
+    progress: DocumentProgress
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not IssuedDocumentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.display_name) is not str or type(self.source_ref) is not str:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.order) is not int or self.order < 0:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.progress) is not DocumentProgress:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if self.progress.document_id != self.identity.document_id:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSegmentView:
+    identity: IssuedSegmentIdentity
+    document_local_index: int
+    project_global_index: int
+    source: str
+    target: str
+    raw_speaker: str
+    confirmed: bool
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not IssuedSegmentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if (
+            type(self.document_local_index) is not int
+            or self.document_local_index < 0
+            or type(self.project_global_index) is not int
+            or self.project_global_index < 0
+            or type(self.source) is not str
+            or type(self.target) is not str
+            or type(self.raw_speaker) is not str
+            or type(self.confirmed) is not bool
+        ):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSaveState:
+    dirty_document_ids: tuple[str, ...]
+    manifest_dirty: bool
+    project_dirty: bool
+
+    def __post_init__(self) -> None:
+        _exact_tuple(
+            self.dirty_document_ids,
+            code="PROJECT.WORKSPACE.CONTRACT_INVALID",
+        )
+        if any(type(item) is not str for item in self.dirty_document_ids):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if len(self.dirty_document_ids) != len(set(self.dirty_document_ids)):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        for document_id in self.dirty_document_ids:
+            validate_document_id(document_id)
+        if type(self.manifest_dirty) is not bool or type(self.project_dirty) is not bool:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if self.project_dirty != bool(self.dirty_document_ids or self.manifest_dirty):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSessionView:
+    project: IssuedProjectIdentity
+    documents: tuple[WorkspaceDocumentView, ...]
+    segments: tuple[WorkspaceSegmentView, ...]
+    current_segment: IssuedSegmentIdentity
+    project_progress: ProjectProgress
+    save_state: WorkspaceSaveState
+
+    def __post_init__(self) -> None:
+        if type(self.project) is not IssuedProjectIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        _exact_tuple(self.documents, code="PROJECT.WORKSPACE.CONTRACT_INVALID")
+        _exact_tuple(self.segments, code="PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if not self.documents or not self.segments:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if any(type(item) is not WorkspaceDocumentView for item in self.documents):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if any(type(item) is not WorkspaceSegmentView for item in self.segments):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.current_segment) is not IssuedSegmentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if not any(item.identity is self.current_segment for item in self.segments):
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.project_progress) is not ProjectProgress:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(self.save_state) is not WorkspaceSaveState:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationAssociation:
     """One authenticated old identity and its admissible incoming candidates."""
 
@@ -333,6 +504,19 @@ class ReconciliationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedReconciliationToken:
+    """Opaque, service-issued capability for one prepared reconciliation."""
+
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.operation_id) is not str or _OPERATION_ID.fullmatch(
+            self.operation_id
+        ) is None:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
 class _SegmentFacts:
     document: ProjectDocument
     source: ProjectSourceSegment
@@ -383,6 +567,14 @@ class _ReconciliationPlan:
             + self.ambiguous_identities
             + self.unresolved_identities
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReconciliation:
+    token: PreparedReconciliationToken
+    plan: _ReconciliationPlan
+    candidate_service: ProjectWorkspaceService
+    receipt: ReconciliationReceipt
 
 
 def _hash_value(hasher: object, value: object) -> None:
@@ -794,6 +986,7 @@ class ProjectWorkspaceService:
         "_session_id",
         "_revision",
         "_plans",
+        "_prepared_reconciliations",
     )
 
     def __init__(
@@ -813,6 +1006,10 @@ class ProjectWorkspaceService:
         self._session_id = _validate_session_id(session_id)
         self._revision = _validate_revision(revision)
         self._plans: dict[str, _ReconciliationPlan] = {}
+        self._prepared_reconciliations: dict[
+            str,
+            _PreparedReconciliation,
+        ] = {}
 
     @property
     def workspace(self) -> ProjectWorkspace:
@@ -889,6 +1086,85 @@ class ProjectWorkspaceService:
                 return item
         _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
 
+    def update_segment_edit(
+        self,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        confirmed: bool,
+        session_id: str,
+        base_revision: int,
+    ) -> WorkspaceEditReceipt:
+        """Replace exactly one editing overlay after all stale gates pass."""
+
+        requested_session = _validate_session_id(session_id)
+        requested_revision = _validate_revision(base_revision)
+        if (
+            requested_session != self._session_id
+            or requested_revision != self._revision
+        ):
+            _fail("PROJECT.WORKSPACE.SESSION_STALE")
+        if type(identity) is not SegmentIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if type(target) is not str or type(confirmed) is not bool:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+        previous_digest = workspace_content_digest_v1(self._workspace)
+        replacement_documents: list[ProjectDocument] = []
+        matched = False
+        changed = False
+        for document in self._workspace.documents:
+            if document.document_id != identity.document_id:
+                replacement_documents.append(document)
+                continue
+            replacement_overlay: list[EditingOverlayEntry] = []
+            for overlay in document.editing_overlay:
+                if overlay.local_segment_id != identity.local_segment_id:
+                    replacement_overlay.append(overlay)
+                    continue
+                matched = True
+                next_overlay = EditingOverlayEntry(
+                    document_id=document.document_id,
+                    local_segment_id=overlay.local_segment_id,
+                    source_fingerprint=overlay.source_fingerprint,
+                    target=target,
+                    confirmed=confirmed,
+                    saved_state_digest=overlay.saved_state_digest,
+                )
+                changed = next_overlay != overlay
+                replacement_overlay.append(next_overlay)
+            replacement_documents.append(
+                document
+                if not matched or not changed
+                else replace(document, editing_overlay=tuple(replacement_overlay))
+            )
+        if not matched:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+
+        candidate = (
+            self._workspace
+            if not changed
+            else replace(self._workspace, documents=tuple(replacement_documents))
+        )
+        resulting_digest = workspace_content_digest_v1(candidate)
+        resulting_revision = self._revision + int(changed)
+        receipt = WorkspaceEditReceipt(
+            project_id=self._workspace.project_id,
+            session_id=self._session_id,
+            identity=identity,
+            previous_revision=self._revision,
+            resulting_revision=resulting_revision,
+            previous_workspace_digest=previous_digest,
+            resulting_workspace_digest=resulting_digest,
+            changed=changed,
+        )
+        self._workspace = candidate
+        self._revision = resulting_revision
+        if changed:
+            self._plans.clear()
+            self._prepared_reconciliations.clear()
+        return receipt
+
     def stage_reconciliation(
         self,
         incoming: object,
@@ -918,6 +1194,39 @@ class ProjectWorkspaceService:
             associations=associations,
             input_kind=_ReconciliationInputKind.SELECTED_SOURCE,
             current_binding=self._binding,
+            incoming_binding=incoming_binding,
+            incoming_source_identities=source_identities,
+        )
+
+    def stage_source_rebind(
+        self,
+        incoming: object,
+        *,
+        associations: tuple[ReconciliationAssociation, ...],
+        session_id: str,
+        base_revision: int,
+    ) -> ReconciliationPreview:
+        """Stage one explicit device-local binding for an unbound package session."""
+
+        requested_session = _validate_session_id(session_id)
+        requested_revision = _validate_revision(base_revision)
+        if (
+            requested_session != self._session_id
+            or requested_revision != self._revision
+        ):
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        if self._binding is not None:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        incoming_workspace, incoming_binding, source_identities = _staged_facts(
+            incoming
+        )
+        if incoming_workspace.project_id != self._workspace.project_id:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        return self._stage_exact_workspace_reconciliation(
+            incoming_workspace,
+            associations=associations,
+            input_kind=_ReconciliationInputKind.SELECTED_SOURCE,
+            current_binding=None,
             incoming_binding=incoming_binding,
             incoming_source_identities=source_identities,
         )
@@ -1031,7 +1340,34 @@ class ProjectWorkspaceService:
         base_revision: int,
         incoming_source_identities: tuple[object, ...],
     ) -> ReconciliationReceipt:
-        plan = self._take_reconciliation_plan(
+        """Compatibility path: prepare fully, then publish the issued token."""
+
+        token = self.prepare_reconciliation(
+            operation_id,
+            decisions=decisions,
+            session_id=session_id,
+            base_revision=base_revision,
+            incoming_source_identities=incoming_source_identities,
+        )
+        return self.commit_reconciliation(token)
+
+    def prepare_reconciliation(
+        self,
+        operation_id: str,
+        *,
+        decisions: tuple[ReconciliationDecision, ...],
+        session_id: str,
+        base_revision: int,
+        incoming_source_identities: tuple[object, ...],
+    ) -> PreparedReconciliationToken:
+        """Build and validate a source candidate without publishing authority.
+
+        The original preview plan is consumed only after every candidate and
+        receipt projection succeeds.  The returned token is accepted solely
+        by this service instance and solely by object identity.
+        """
+
+        plan = self._peek_reconciliation_plan(
             operation_id,
             input_kind=_ReconciliationInputKind.SELECTED_SOURCE,
         )
@@ -1056,11 +1392,82 @@ class ProjectWorkspaceService:
         )
         if type(plan.incoming_binding) is not OriginBinding:
             _fail("PROJECT.RECONCILE.PREVIEW_STALE")
-        return self._apply_staged_plan(
+        candidate, receipt = self._prepare_staged_plan(
             plan,
             decisions=decisions,
             published_binding=plan.incoming_binding,
         )
+        candidate_service = ProjectWorkspaceService(
+            candidate,
+            plan.incoming_binding,
+            session_id=self._session_id,
+            revision=receipt.published_revision,
+        )
+        token = PreparedReconciliationToken(plan.operation_id)
+        prepared = _PreparedReconciliation(
+            token=token,
+            plan=plan,
+            candidate_service=candidate_service,
+            receipt=receipt,
+        )
+        if self._plans.get(operation_id) is not plan:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        self._plans.pop(operation_id)
+        self._prepared_reconciliations[operation_id] = prepared
+        return token
+
+    def prepared_workspace_service(
+        self,
+        token: PreparedReconciliationToken,
+    ) -> ProjectWorkspaceService:
+        """Project the exact candidate authority without publishing it."""
+
+        prepared = self._require_prepared_reconciliation(token)
+        self._require_current_plan(
+            prepared.plan,
+            session_id=prepared.plan.session_id,
+            base_revision=prepared.plan.base_revision,
+            require_binding=True,
+        )
+        self._require_candidate_service_current(prepared)
+        return prepared.candidate_service
+
+    def commit_reconciliation(
+        self,
+        token: PreparedReconciliationToken,
+    ) -> ReconciliationReceipt:
+        """Consume one prepared capability and publish its facts exactly once."""
+
+        prepared = self._take_prepared_reconciliation(token)
+        self._require_current_plan(
+            prepared.plan,
+            session_id=prepared.plan.session_id,
+            base_revision=prepared.plan.base_revision,
+            require_binding=True,
+        )
+        self._require_candidate_service_current(prepared)
+
+        candidate_service = prepared.candidate_service
+        receipt = prepared.receipt
+        self._workspace = candidate_service.workspace
+        self._binding = candidate_service.origin_binding
+        self._revision = candidate_service.revision
+        return receipt
+
+    def discard_prepared_reconciliation(
+        self,
+        token: PreparedReconciliationToken,
+    ) -> None:
+        """Revoke one uncommitted prepared candidate without publishing it."""
+
+        if type(token) is not PreparedReconciliationToken:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        prepared = self._prepared_reconciliations.get(token.operation_id)
+        if prepared is None:
+            return
+        if prepared.token is not token:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        self._prepared_reconciliations.pop(token.operation_id)
 
     def apply_workspace_reconciliation(
         self,
@@ -1106,6 +1513,57 @@ class ProjectWorkspaceService:
             _fail("PROJECT.RECONCILE.PREVIEW_STALE")
         return plan
 
+    def _peek_reconciliation_plan(
+        self,
+        operation_id: str,
+        *,
+        input_kind: _ReconciliationInputKind,
+    ) -> _ReconciliationPlan:
+        if (
+            type(operation_id) is not str
+            or _OPERATION_ID.fullmatch(operation_id) is None
+        ):
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        plan = self._plans.get(operation_id)
+        if plan is None or plan.input_kind is not input_kind:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        return plan
+
+    def _require_prepared_reconciliation(
+        self,
+        token: PreparedReconciliationToken,
+    ) -> _PreparedReconciliation:
+        if type(token) is not PreparedReconciliationToken:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        prepared = self._prepared_reconciliations.get(token.operation_id)
+        if prepared is None or prepared.token is not token:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        return prepared
+
+    def _take_prepared_reconciliation(
+        self,
+        token: PreparedReconciliationToken,
+    ) -> _PreparedReconciliation:
+        prepared = self._require_prepared_reconciliation(token)
+        self._prepared_reconciliations.pop(token.operation_id)
+        return prepared
+
+    def _require_candidate_service_current(
+        self,
+        prepared: _PreparedReconciliation,
+    ) -> None:
+        candidate_service = prepared.candidate_service
+        receipt = prepared.receipt
+        if (
+            type(candidate_service) is not ProjectWorkspaceService
+            or candidate_service.session_id != self._session_id
+            or candidate_service.revision != receipt.published_revision
+            or candidate_service.origin_binding != prepared.plan.incoming_binding
+            or candidate_service.workspace_content_digest
+            != receipt.published_workspace_digest
+        ):
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+
     def _require_current_plan(
         self,
         plan: _ReconciliationPlan,
@@ -1133,6 +1591,23 @@ class ProjectWorkspaceService:
         decisions: tuple[ReconciliationDecision, ...],
         published_binding: OriginBinding | None,
     ) -> ReconciliationReceipt:
+        candidate, receipt = self._prepare_staged_plan(
+            plan,
+            decisions=decisions,
+            published_binding=published_binding,
+        )
+        self._workspace = candidate
+        self._binding = published_binding
+        self._revision = receipt.published_revision
+        return receipt
+
+    def _prepare_staged_plan(
+        self,
+        plan: _ReconciliationPlan,
+        *,
+        decisions: tuple[ReconciliationDecision, ...],
+        published_binding: OriginBinding | None,
+    ) -> tuple[ProjectWorkspace, ReconciliationReceipt]:
         decision_values = _exact_tuple(
             decisions,
             code="PROJECT.RECONCILE.INPUT_INVALID",
@@ -1222,11 +1697,12 @@ class ProjectWorkspaceService:
             removed_identities=tuple(removed),
             accepted_association_identities=tuple(accepted_current),
         )
-
-        self._workspace = candidate
-        self._binding = published_binding
-        self._revision += 1
-        return receipt
+        if (
+            plan.input_kind is _ReconciliationInputKind.SELECTED_SOURCE
+            and published_binding is not None
+        ):
+            _require_binding_matches_workspace(candidate, published_binding)
+        return candidate, receipt
 
     def _build_candidate(
         self,
@@ -1384,6 +1860,10 @@ class ProjectWorkspaceService:
 __all__ = (
     "DocumentProgress",
     "FlatProjectSegment",
+    "IssuedDocumentIdentity",
+    "IssuedProjectIdentity",
+    "IssuedSegmentIdentity",
+    "PreparedReconciliationToken",
     "ProjectProgress",
     "ProjectWorkspaceService",
     "ReconciliationAssociation",
@@ -1392,6 +1872,11 @@ __all__ = (
     "ReconciliationDisposition",
     "ReconciliationPreview",
     "ReconciliationReceipt",
+    "WorkspaceEditReceipt",
+    "WorkspaceDocumentView",
+    "WorkspaceSaveState",
+    "WorkspaceSegmentView",
+    "WorkspaceSessionView",
     "project_document_content_digest_v1",
     "workspace_content_digest_v1",
     "workspace_manifest_digest_v1",

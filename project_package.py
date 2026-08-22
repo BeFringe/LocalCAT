@@ -763,6 +763,7 @@ class ProjectPackageImportReceipt:
 class ProjectPackageExportResult:
     save_report: ProjectSaveReport
     receipt: ProjectPackageExportReceipt | None
+    persistence_binding: ProjectPackagePersistenceBinding | None = None
 
     def __post_init__(self) -> None:
         if type(self.save_report) is not ProjectSaveReport:
@@ -770,9 +771,26 @@ class ProjectPackageExportResult:
         if self.receipt is not None and type(self.receipt) is not ProjectPackageExportReceipt:
             _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
         if self.save_report.journal_state is SaveJournalState.COMMITTED:
-            if self.receipt is None or not self.receipt.durable:
+            if (
+                self.receipt is None
+                or not self.receipt.durable
+                or type(self.persistence_binding)
+                is not ProjectPackagePersistenceBinding
+            ):
                 _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
-        elif self.receipt is not None:
+        elif (
+            self.save_report.journal_state is SaveJournalState.RECOVERY_REQUIRED
+            and self.save_report.saved_count > 0
+        ):
+            if (
+                self.receipt is not None
+                or type(self.persistence_binding)
+                is not ProjectPackagePersistenceBinding
+                or self.persistence_binding.workspace_content_digest
+                != self.save_report.workspace_content_digest
+            ):
+                _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
+        elif self.receipt is not None or self.persistence_binding is not None:
             _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
         if self.receipt is not None and (
             self.receipt.operation_id != self.save_report.operation_id
@@ -788,6 +806,16 @@ class ProjectPackageExportResult:
             )
         ):
             _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
+        if self.receipt is not None:
+            assert type(self.persistence_binding) is ProjectPackagePersistenceBinding
+            if (
+                self.persistence_binding.project_id != self.receipt.project_id
+                or self.persistence_binding.artifact_digest
+                != self.receipt.artifact_digest
+                or self.persistence_binding.workspace_content_digest
+                != self.receipt.workspace_content_digest
+            ):
+                _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2012,6 +2040,35 @@ class ProjectPackageImportResult:
             _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedProjectPackageImport:
+    """Single-use, body-safe handle for one fully materialized import candidate.
+
+    The package service retains the workspace, reconciliation and carrier
+    authority privately.  Application callers may use this handle to prepare
+    their own projections before the durable publication starts, then consume
+    the same candidate through :meth:`commit_prepared_import`.
+    """
+
+    operation_id: str
+    project_id: str
+    mode: ProjectPackageImportMode
+    workspace_revision: int
+    workspace_content_digest: str
+
+    def __post_init__(self) -> None:
+        if not _operation_id(self.operation_id).startswith("package-import-"):
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        validate_project_id(self.project_id)
+        if type(self.mode) is not ProjectPackageImportMode:
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        _exact_nonnegative_int(
+            self.workspace_revision,
+            code="PROJECT.PACKAGE.PREVIEW_STALE",
+        )
+        validate_sha256(self.workspace_content_digest)
+
+
 def _validate_artifact(path: Path) -> OpenedProjectPackage:
     source_descriptor, facts = _open_regular(path, include_digest=True)
     sealed = tempfile.TemporaryFile(mode="w+b")
@@ -2911,7 +2968,13 @@ class _ProjectPackagePersistencePort:
                 candidate_workspace,
                 self._binding,
                 self._private_sources,
-                last_known_good_package=opened_lkg,
+                last_known_good_package=(
+                    opened_lkg
+                    if opened_lkg is None
+                    or opened_lkg.workspace.project_id
+                    == candidate_workspace.project_id
+                    else None
+                ),
                 additional_package_sources=self._additional_package_sources,
                 destination_parent_facts=self._parent_facts,
             )
@@ -3318,11 +3381,20 @@ class _ImportPlan:
     active_workspace_digest: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedImportPlan:
+    token: PreparedProjectPackageImport
+    plan: _ImportPlan
+    candidate_service: ProjectWorkspaceService
+    reconciliation_receipt: ReconciliationReceipt | None
+
+
 class ProjectPackageService:
     """Public Application surface for ProjectPackage v1."""
 
     def __init__(self) -> None:
         self._import_plans: dict[str, _ImportPlan] = {}
+        self._prepared_import_plans: dict[str, _PreparedImportPlan] = {}
         self._recovery_ports: dict[
             str,
             tuple[
@@ -3560,7 +3632,53 @@ class ProjectPackageService:
             port,
             operation_kind=ProjectPackageOperationKind.SAVE,
         )
-        return ProjectPackageExportResult(report, receipt)
+        binding = (
+            None
+            if port.committed_opened is None
+            else port.committed_opened.persistence_binding
+        )
+        return ProjectPackageExportResult(report, receipt, binding)
+
+    def save_document(
+        self,
+        save_service: ProjectSaveService,
+        document_id: str,
+        destination: Path,
+        *,
+        codec_private_sources: tuple[ProjectPackageBlobSource, ...] = (),
+        persistence_binding: ProjectPackagePersistenceBinding,
+    ) -> ProjectPackageExportResult:
+        """Persist one document baseline through the same package transaction."""
+
+        if type(save_service) is not ProjectSaveService:
+            raise TypeError("save_service must be exact ProjectSaveService")
+        if type(document_id) is not str:
+            raise TypeError("document_id must be exact str")
+        if not isinstance(destination, Path):
+            raise TypeError("destination must be pathlib.Path")
+        if type(persistence_binding) is not ProjectPackagePersistenceBinding:
+            raise TypeError("document save requires an exact persistence binding")
+        target = _selected_user_path(destination)
+        if persistence_binding.path != target:
+            _fail("PROJECT.PACKAGE.DESTINATION_STALE")
+        port = _ProjectPackagePersistencePort(
+            target,
+            save_service.workspace_service.origin_binding,
+            codec_private_sources,
+            persistence_binding=persistence_binding,
+        )
+        report = save_service.save_document(document_id, port)
+        receipt = self._export_receipt(
+            report,
+            port,
+            operation_kind=ProjectPackageOperationKind.SAVE,
+        )
+        binding = (
+            None
+            if port.committed_opened is None
+            else port.committed_opened.persistence_binding
+        )
+        return ProjectPackageExportResult(report, receipt, binding)
 
     def export_workspace(
         self,
@@ -3666,8 +3784,6 @@ class ProjectPackageService:
             active_session_id = workspace_service.session_id
             active_revision = workspace_service.revision
             active_workspace_digest = workspace_service.workspace_content_digest
-        elif workspace_service is not None:
-            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
         preview = ProjectPackageImportPreview(
             operation_id=operation_id,
             mode=mode,
@@ -3746,19 +3862,8 @@ class ProjectPackageService:
         )
         return preview
 
-    def apply_import(
-        self,
-        operation_id: str,
-        *,
-        decisions: tuple[ReconciliationDecision, ...] = (),
-        session_id: str | None = None,
-        base_revision: int | None = None,
-    ) -> ProjectPackageImportReceipt:
-        if type(operation_id) is not str:
-            raise TypeError("operation_id must be exact str")
-        plan = self._import_plans.pop(operation_id, None)
-        if plan is None:
-            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+    @staticmethod
+    def _require_import_plan_files_current(plan: _ImportPlan) -> None:
         _require_parent(
             plan.source,
             plan.source_parent_facts,
@@ -3783,48 +3888,153 @@ class ProjectPackageService:
             os.close(destination_descriptor)
             if destination_facts != plan.destination_facts:
                 _fail("PROJECT.PACKAGE.DESTINATION_STALE")
+
+    @staticmethod
+    def _require_active_import_plan_current(plan: _ImportPlan) -> None:
+        if plan.preview.mode is not ProjectPackageImportMode.UPDATE_SAME_PROJECT:
+            return
+        active = plan.workspace_service
+        if (
+            active is None
+            or active.session_id != plan.active_session_id
+            or active.revision != plan.active_revision
+            or active.workspace_content_digest != plan.active_workspace_digest
+        ):
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+
+    def prepare_import(
+        self,
+        operation_id: str,
+        *,
+        decisions: tuple[ReconciliationDecision, ...] = (),
+        session_id: str | None = None,
+        base_revision: int | None = None,
+    ) -> PreparedProjectPackageImport:
+        """Materialize one exact candidate without publishing package bytes."""
+
+        if type(operation_id) is not str:
+            raise TypeError("operation_id must be exact str")
+        plan = self._import_plans.pop(operation_id, None)
+        if plan is None:
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        self._require_import_plan_files_current(plan)
+        self._require_active_import_plan_current(plan)
+
+        reconciliation_receipt = None
+        if plan.preview.mode is ProjectPackageImportMode.UPDATE_SAME_PROJECT:
+            reconciliation_service = plan.reconciliation_service
+            if (
+                reconciliation_service is None
+                or plan.reconciliation_operation_id is None
+                or session_id != plan.active_session_id
+                or base_revision != plan.active_revision
+            ):
+                _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+            reconciliation_receipt = (
+                reconciliation_service.apply_workspace_reconciliation(
+                    plan.reconciliation_operation_id,
+                    incoming=plan.opened.workspace,
+                    decisions=decisions,
+                    session_id=session_id,
+                    base_revision=base_revision,
+                )
+            )
+            candidate_service = reconciliation_service
+        else:
+            if decisions or session_id is not None or base_revision is not None:
+                _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+            candidate_service = plan.opened.create_workspace_service(
+                session_id="package-import-candidate",
+                revision=0,
+            )
+
+        token = PreparedProjectPackageImport(
+            operation_id=operation_id,
+            project_id=candidate_service.workspace.project_id,
+            mode=plan.preview.mode,
+            workspace_revision=candidate_service.revision,
+            workspace_content_digest=candidate_service.workspace_content_digest,
+        )
+        self._prepared_import_plans[operation_id] = _PreparedImportPlan(
+            token,
+            plan,
+            candidate_service,
+            reconciliation_receipt,
+        )
+        return token
+
+    def create_prepared_import_save_service(
+        self,
+        prepared: PreparedProjectPackageImport,
+        *,
+        session_id: str,
+    ) -> ProjectSaveService:
+        """Build the C3 candidate session from package-owned prepared facts."""
+
+        if type(prepared) is not PreparedProjectPackageImport:
+            raise TypeError("prepared import must be exact")
+        retained = self._prepared_import_plans.get(prepared.operation_id)
+        if retained is None or retained.token is not prepared:
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        candidate = retained.candidate_service
+        service = ProjectWorkspaceService(
+            candidate.workspace,
+            candidate.origin_binding,
+            session_id=session_id,
+            revision=candidate.revision,
+        )
+        baseline = WorkspaceSaveBaseline.from_workspace(
+            service.workspace,
+            workspace_revision=service.revision,
+        )
+        return ProjectSaveService(service, baseline=baseline)
+
+    def discard_prepared_import(
+        self,
+        prepared: PreparedProjectPackageImport,
+    ) -> None:
+        """Revoke one uncommitted candidate while leaving artifacts untouched."""
+
+        if type(prepared) is not PreparedProjectPackageImport:
+            raise TypeError("prepared import must be exact")
+        retained = self._prepared_import_plans.get(prepared.operation_id)
+        if retained is None:
+            return
+        if retained.token is not prepared:
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        del self._prepared_import_plans[prepared.operation_id]
+
+    def commit_prepared_import(
+        self,
+        prepared: PreparedProjectPackageImport,
+    ) -> ProjectPackageImportResult:
+        """Publish exactly one previously materialized package candidate."""
+
+        if type(prepared) is not PreparedProjectPackageImport:
+            raise TypeError("prepared import must be exact")
+        retained = self._prepared_import_plans.get(prepared.operation_id)
+        if retained is None or retained.token is not prepared:
+            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+        del self._prepared_import_plans[prepared.operation_id]
+        plan = retained.plan
+        candidate_service = retained.candidate_service
+        reconciliation_receipt = retained.reconciliation_receipt
+        self._require_import_plan_files_current(plan)
+        self._require_active_import_plan_current(plan)
+
         if plan.preview.mode in {
             ProjectPackageImportMode.NEW,
             ProjectPackageImportMode.UPDATE_SAME_PROJECT,
         }:
-            reconciliation_receipt = None
             if plan.preview.mode is ProjectPackageImportMode.UPDATE_SAME_PROJECT:
-                active = plan.workspace_service
-                reconciliation_service = plan.reconciliation_service
-                if (
-                    active is None
-                    or reconciliation_service is None
-                    or plan.reconciliation_operation_id is None
-                    or session_id != plan.active_session_id
-                    or base_revision != plan.active_revision
-                    or active.session_id != plan.active_session_id
-                    or active.revision != plan.active_revision
-                    or active.workspace_content_digest != plan.active_workspace_digest
-                ):
-                    _fail("PROJECT.PACKAGE.PREVIEW_STALE")
-                reconciliation_receipt = (
-                    reconciliation_service.apply_workspace_reconciliation(
-                        plan.reconciliation_operation_id,
-                        incoming=plan.opened.workspace,
-                        decisions=decisions,
-                        session_id=session_id,
-                        base_revision=base_revision,
-                    )
-                )
-                candidate_service = reconciliation_service
                 assert plan.destination_opened is not None
+                assert plan.active_revision is not None
                 baseline = WorkspaceSaveBaseline.from_workspace(
                     plan.destination_opened.workspace,
-                    workspace_revision=base_revision,
+                    workspace_revision=plan.active_revision,
                 )
                 persistence_binding = plan.destination_opened.persistence_binding
             else:
-                if decisions or session_id is not None or base_revision is not None:
-                    _fail("PROJECT.PACKAGE.PREVIEW_STALE")
-                candidate_service = plan.opened.create_workspace_service(
-                    session_id="package-import-session",
-                    revision=0,
-                )
                 baseline = None
                 persistence_binding = None
             save_service = ProjectSaveService(candidate_service, baseline=baseline)
@@ -3847,9 +4057,9 @@ class ProjectPackageService:
                 _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
             validation = installed.validation
             mode = plan.preview.mode
-            return ProjectPackageImportReceipt(
+            receipt = ProjectPackageImportReceipt(
                 receipt_schema=PROJECT_PACKAGE_RECEIPT_SCHEMA,
-                operation_id=operation_id,
+                operation_id=prepared.operation_id,
                 project_id=installed.workspace.project_id,
                 carrier_profile=PROJECT_PACKAGE_CARRIER_PROFILE,
                 manifest_schema=PROJECT_PACKAGE_MANIFEST_SCHEMA,
@@ -3888,8 +4098,8 @@ class ProjectPackageService:
                 ),
                 reconciliation=reconciliation_receipt,
             )
-        if decisions or session_id is not None or base_revision is not None:
-            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
+            return ProjectPackageImportResult(installed, receipt)
+
         if plan.destination_opened is None:
             _fail("PROJECT.PACKAGE.DESTINATION_STALE")
         port = _ProjectPackagePersistencePort(
@@ -3903,7 +4113,7 @@ class ProjectPackageService:
         handle = None
         try:
             handle = port.stage_candidate(
-                operation_id=operation_id,
+                operation_id=prepared.operation_id,
                 candidate_workspace=plan.opened.workspace,
                 last_known_good_workspace=plan.destination_opened.workspace,
                 requested_document_ids=tuple(
@@ -3940,9 +4150,9 @@ class ProjectPackageService:
         if installed is None:
             _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
         validation = installed.validation
-        return ProjectPackageImportReceipt(
+        receipt = ProjectPackageImportReceipt(
             receipt_schema=PROJECT_PACKAGE_RECEIPT_SCHEMA,
-            operation_id=operation_id,
+            operation_id=prepared.operation_id,
             project_id=installed.workspace.project_id,
             carrier_profile=PROJECT_PACKAGE_CARRIER_PROFILE,
             manifest_schema=PROJECT_PACKAGE_MANIFEST_SCHEMA,
@@ -3969,6 +4179,23 @@ class ProjectPackageService:
                 for document in installed.workspace.documents
             ),
         )
+        return ProjectPackageImportResult(installed, receipt)
+
+    def apply_import(
+        self,
+        operation_id: str,
+        *,
+        decisions: tuple[ReconciliationDecision, ...] = (),
+        session_id: str | None = None,
+        base_revision: int | None = None,
+    ) -> ProjectPackageImportReceipt:
+        prepared = self.prepare_import(
+            operation_id,
+            decisions=decisions,
+            session_id=session_id,
+            base_revision=base_revision,
+        )
+        return self.commit_prepared_import(prepared).receipt
 
     def apply_import_result(
         self,
@@ -3982,18 +4209,13 @@ class ProjectPackageService:
 
         if type(operation_id) is not str:
             raise TypeError("operation_id must be exact str")
-        plan = self._import_plans.get(operation_id)
-        if plan is None:
-            _fail("PROJECT.PACKAGE.PREVIEW_STALE")
-        destination = plan.destination
-        receipt = self.apply_import(
+        prepared = self.prepare_import(
             operation_id,
             decisions=decisions,
             session_id=session_id,
             base_revision=base_revision,
         )
-        installed = self.open(destination)
-        return ProjectPackageImportResult(installed, receipt)
+        return self.commit_prepared_import(prepared)
 
 
 __all__ = (
@@ -4020,4 +4242,5 @@ __all__ = (
     "ProjectPackageRecoveryPreview",
     "ProjectPackageService",
     "ProjectPackageValidationReport",
+    "PreparedProjectPackageImport",
 )

@@ -17,6 +17,11 @@ from tm_contracts import (
     TextMatcherState as TextMatcherState,
     TextMatchProfile,
 )
+from project_workspace_identity import (
+    validate_document_id,
+    validate_local_segment_id,
+    validate_project_id,
+)
 
 
 DEFAULT_EDITOR_FONT_SIZE = 15
@@ -62,6 +67,13 @@ class SearchField(str, Enum):
     SOURCE = "source"
     TARGET = "target"
     SPEAKER = "speaker"
+
+
+class SearchScope(str, Enum):
+    """Closed multi-document search scope; chunk is intentionally absent."""
+
+    CURRENT_DOCUMENT = "current_document"
+    ENTIRE_PROJECT = "entire_project"
 
 
 class SegmentTranslationStatus(str, Enum):
@@ -206,6 +218,26 @@ class RecentProject:
             raise ValueError("recent project segment id must not be empty")
         if self.index < 0:
             raise ValueError("recent project index must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class RecentWorkspaceProject:
+    """Device-local composite position for one ProjectPackage session."""
+
+    path: Path
+    project_id: str
+    document_id: str
+    local_segment_id: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if not self.path.is_absolute():
+            raise ValueError("recent workspace path must be absolute")
+        validate_project_id(self.project_id)
+        validate_document_id(self.document_id)
+        validate_local_segment_id(self.local_segment_id)
+        if type(self.index) is not int or self.index < 0:
+            raise ValueError("recent workspace index must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1509,27 @@ class ProjectSearchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceSearchRequest:
+    """Workspace-only field selection plus a closed document scope."""
+
+    query: str
+    fields: tuple[SearchField, ...]
+    options: SearchOptions
+    status: SegmentTranslationStatus | None = None
+    scope: SearchScope = SearchScope.ENTIRE_PROJECT
+
+    def __post_init__(self) -> None:
+        ProjectSearchRequest(
+            query=self.query,
+            fields=self.fields,
+            options=self.options,
+            status=self.status,
+        )
+        if type(self.scope) is not SearchScope:
+            raise TypeError("workspace search scope must be SearchScope")
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectSearchHit:
     """One half-open match range bound to stable project navigation identity."""
 
@@ -1515,6 +1568,42 @@ class ProjectSearchHit:
             raise ValueError(
                 "project search hit end index must not exceed preview length"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSearchHit:
+    """One workspace match bound to document and local segment identity."""
+
+    document_id: str
+    local_segment_id: str
+    project_global_index: int
+    field: SearchField
+    start_index: int
+    end_index: int
+    preview: str
+
+    def __post_init__(self) -> None:
+        validate_document_id(self.document_id)
+        validate_local_segment_id(self.local_segment_id)
+        _validate_exact_nonnegative_int(
+            self.project_global_index,
+            "workspace search hit global index",
+        )
+        if type(self.field) is not SearchField:
+            raise TypeError("workspace search hit field must be SearchField")
+        _validate_exact_nonnegative_int(
+            self.start_index,
+            "workspace search hit start index",
+        )
+        _validate_exact_nonnegative_int(
+            self.end_index,
+            "workspace search hit end index",
+        )
+        if self.end_index <= self.start_index:
+            raise ValueError("workspace search hit range must be nonempty")
+        _validate_exact_raw_text(self.preview, "workspace search hit preview")
+        if self.end_index > len(self.preview):
+            raise ValueError("workspace search hit range exceeds preview")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1596,6 +1685,70 @@ class ProjectSearchReport:
     def total(self) -> int:
         """Return the derived result count without duplicating report state."""
 
+        return len(self.hits)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSearchReport:
+    """Stable composite workspace hits plus the shared matcher projection."""
+
+    hits: tuple[WorkspaceSearchHit, ...]
+    capability: TextMatcherDisplayState
+
+    def __post_init__(self) -> None:
+        if type(self.hits) is not tuple or any(
+            type(hit) is not WorkspaceSearchHit for hit in self.hits
+        ):
+            raise TypeError(
+                "workspace search hits must be exact WorkspaceSearchHit values"
+            )
+        for hit in self.hits:
+            hit.__post_init__()
+        if type(self.capability) is not TextMatcherDisplayState:
+            raise TypeError("workspace search capability must be exact")
+        self.capability.__post_init__()
+        if self.capability.state is TextMatcherState.UNAVAILABLE and self.hits:
+            raise ValueError("unavailable workspace search cannot contain hits")
+        identity_by_index: dict[int, tuple[str, str]] = {}
+        index_by_identity: dict[tuple[str, str], int] = {}
+        identities: list[tuple[str, str, SearchField, int, int]] = []
+        sort_keys: list[tuple[int, int, int, int]] = []
+        for hit in self.hits:
+            identity = (hit.document_id, hit.local_segment_id)
+            if identity_by_index.setdefault(
+                hit.project_global_index,
+                identity,
+            ) != identity:
+                raise ValueError("workspace global index changed identity")
+            if index_by_identity.setdefault(
+                identity,
+                hit.project_global_index,
+            ) != hit.project_global_index:
+                raise ValueError("workspace identity changed global index")
+            identities.append(
+                (
+                    hit.document_id,
+                    hit.local_segment_id,
+                    hit.field,
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+            sort_keys.append(
+                (
+                    hit.project_global_index,
+                    _SEARCH_FIELD_ORDER[hit.field],
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+        if len(identities) != len(set(identities)):
+            raise ValueError("workspace search report contains duplicate hits")
+        if sort_keys != sorted(sort_keys):
+            raise ValueError("workspace search hits must use stable project order")
+
+    @property
+    def total(self) -> int:
         return len(self.hits)
 
 

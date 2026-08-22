@@ -699,6 +699,7 @@ receipt不包含正文、private bytes、absolute path、credential、device key
 Controller在现有`project_session_id`之外维护exact workspace revision、current document id和current composite segment identity：
 
 - open/set/import成功后才切换session；失败保留旧project/current index/dirty/TM query epoch；
+- source reconciliation 与 active package import 先由 C2 owner 签发 exact prepared capability；Controller只为候选 service 预构建 issued view、save baseline fork 与 TM signature，候选准备失败时调用 owner discard，durable/semantic commit 后只做不可失败的字段单点切换；Controller不复制 classifier、manifest 或 carrier authority；
 - navigation API接受复合identity或validated global index；recent position持久为project id + document id + local segment id，旧path/index继续兼容读取；
 - Document reorder/display rename不使current segment失效；identity消失时按reconciliation receipt显式选择最近可用项，不按旧index重关联；
 - TM query继续使用current segment source，project/document identity不进入TM source key；speaker display profile仍独立。
@@ -713,9 +714,9 @@ class SearchScope(Enum):
     ENTIRE_PROJECT = "entire_project"
 ```
 
-UI文案为“当前章节 / 搜索全部章节”。`ProjectSearchRequest`增加exact scope，默认兼容当前行为；同一matcher pipeline按scope选择segment view，不复制match-case/whole-word算法。
+UI文案为“当前章节 / 搜索全部章节”。为保持既有单 JSON public contract exact-compatible，`ProjectSearchRequest` / `ProjectSearchHit` / `ProjectSearchReport` 不增加字段；新增独立 `WorkspaceSearchRequest` / `WorkspaceSearchHit` / `WorkspaceSearchReport` 承载 scope 与复合identity。两条入口进入同一个matcher pipeline，不复制match-case/whole-word算法。
 
-`ProjectSearchHit`绑定`document_id + local_segment_id + field + offsets`并可附global index作为一次性导航projection。apply/navigation前重新验证session/revision/identity/field text；order变化不能通过旧global index误跳。v1不声明`CURRENT_CHUNK` enum值或UI；协作规格以后可发布新contract version并复用同一search service。
+`WorkspaceSearchHit`绑定`document_id + local_segment_id + field + offsets`并附global index作为一次性导航projection。apply/navigation前重新验证session/generation/revision/identity/field text；order变化不能通过旧global index误跳。设备本地 recent state 同样使用独立 `RecentWorkspaceProject`，既有 `RecentProject(path, segment_id, index)` 的字段与JSON投影保持不变。v1不声明`CURRENT_CHUNK` enum值或UI；协作规格以后可发布新contract version并复用同一search service。
 
 ## C4：Qt 产品表面
 

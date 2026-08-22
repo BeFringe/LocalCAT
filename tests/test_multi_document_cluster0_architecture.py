@@ -156,6 +156,57 @@ _CONCRETE_CODEC_OR_ARCHIVE_PREFIXES = (
 _APPLICATION_PARSER_FACADES = frozenset(
     {"parser_composition", "parser_contracts"}
 )
+_APPLICATION_WORKSPACE_IMPORT_ALLOWLIST = {
+    "editor_contracts": frozenset(
+        {
+            "project_workspace_identity.validate_document_id",
+            "project_workspace_identity.validate_local_segment_id",
+            "project_workspace_identity.validate_project_id",
+        }
+    ),
+    "editor_controller": frozenset(
+        {
+            "project_package.OpenedProjectPackage",
+            "project_package.ProjectPackageExportReceipt",
+            "project_package.ProjectPackageImportPreview",
+            "project_package.ProjectPackageImportMode",
+            "project_package.ProjectPackageImportReceipt",
+            "project_package.ProjectPackagePersistenceBinding",
+            "project_package.ProjectPackageService",
+            "project_save.ProjectSaveService",
+            "project_save.ProjectSaveReport",
+            "project_workspace.DocumentProgress",
+            "project_workspace.FlatProjectSegment",
+            "project_workspace.IssuedDocumentIdentity",
+            "project_workspace.IssuedProjectIdentity",
+            "project_workspace.IssuedSegmentIdentity",
+            "project_workspace.ProjectProgress",
+            "project_workspace.ProjectWorkspaceService",
+            "project_workspace.ReconciliationAssociation",
+            "project_workspace.ReconciliationDecision",
+            "project_workspace.ReconciliationPreview",
+            "project_workspace.ReconciliationReceipt",
+            "project_workspace.WorkspaceDocumentView",
+            "project_workspace.WorkspaceSaveState",
+            "project_workspace.WorkspaceSegmentView",
+            "project_workspace.WorkspaceSessionView",
+            "project_workspace_contracts.ProjectSegment",
+            "project_workspace_contracts.ProjectWorkspace",
+            "project_workspace_contracts.SegmentIdentity",
+            "project_workspace_contracts.StagedSelectedProjectDocuments",
+            "project_workspace_identity.ProjectWorkspaceError",
+            "project_workspace_intake.OriginRenameMapping",
+            "project_workspace_intake.revalidate_staged_selected_documents",
+            "project_workspace_intake.stage_workspace_rebind",
+        }
+    ),
+    "project_search": frozenset(
+        {
+            "project_workspace.ProjectWorkspaceService",
+            "project_workspace_contracts.ProjectSegment",
+        }
+    ),
+}
 _CURRENT_WORKSPACE_PRODUCTION_MODULES = frozenset(
     {
         "editor_project_workspace_adapter",
@@ -591,7 +642,10 @@ def _boundary_violations(
         rules: list[tuple[str, tuple[str, ...]]] = []
         if _is_parser_or_codec(name):
             rules.append(("parser-no-future-workspace", _ALL_FUTURE_MODULE_PREFIXES))
-        if _is_editor_or_application(name) and name != _WORKSPACE_ADAPTER_MODULE:
+        if (
+            _is_editor_or_application(name)
+            or name in _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST
+        ) and name != _WORKSPACE_ADAPTER_MODULE:
             rules.append(
                 (
                     "application-no-codec-or-future-authority",
@@ -749,6 +803,16 @@ def _boundary_violations(
                     and parser_segment is not None
                 ):
                     matches_rule_prefix = True
+                if (
+                    rule == "application-no-codec-or-future-authority"
+                    and matches_rule_prefix
+                    and target
+                    in _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST.get(
+                        name,
+                        frozenset(),
+                    )
+                ):
+                    matches_rule_prefix = False
                 if matches_rule_prefix:
                     violations.add(_ImportViolation(rule, name, target))
     return tuple(sorted(violations, key=lambda item: (item.rule, item.importer, item.imported)))
@@ -1227,6 +1291,59 @@ class MultiDocumentCluster1GuardSelfTests(unittest.TestCase):
             frozenset({"ProjectDocument", "codec_private_member"}),
         )
 
+    def test_c3_application_consumers_are_exact_and_do_not_open_a_reverse_lane(
+        self,
+    ) -> None:
+        approved = {
+            "editor_controller": _SourceModule(
+                "editor_controller",
+                "from project_package import ProjectPackageService\n",
+            ),
+            "project_search": _SourceModule(
+                "project_search",
+                "from project_workspace import ProjectWorkspaceService\n",
+            ),
+        }
+        hostile = {
+            "editor_controller": _SourceModule(
+                "editor_controller",
+                "from project_package import FuturePackageAuthority\n",
+            ),
+            "project_search": _SourceModule(
+                "project_search",
+                "import project_save\n",
+            ),
+            "editor_future_controller": _SourceModule(
+                "editor_future_controller",
+                "from project_package import ProjectPackageService\n",
+            ),
+        }
+
+        self.assertEqual(_boundary_violations(approved), ())
+        self.assertEqual(
+            {
+                (item.rule, item.importer, item.imported)
+                for item in _boundary_violations(hostile)
+            },
+            {
+                (
+                    "application-no-codec-or-future-authority",
+                    "editor_controller",
+                    "project_package.FuturePackageAuthority",
+                ),
+                (
+                    "application-no-codec-or-future-authority",
+                    "project_search",
+                    "project_save",
+                ),
+                (
+                    "application-no-codec-or-future-authority",
+                    "editor_future_controller",
+                    "project_package.ProjectPackageService",
+                ),
+            },
+        )
+
 
 class MultiDocumentCluster1ProductionArchitectureTests(unittest.TestCase):
     @classmethod
@@ -1308,6 +1425,16 @@ class MultiDocumentCluster1ProductionArchitectureTests(unittest.TestCase):
             ),
             (),
         )
+
+    def test_c3_application_workspace_import_surface_is_exact(self) -> None:
+        for module_name, expected in _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST.items():
+            with self.subTest(module=module_name):
+                observed = frozenset(
+                    target
+                    for target in _collect_import_targets(self.modules[module_name])
+                    if _matches_future_prefix(target)
+                )
+                self.assertEqual(observed, expected)
 
     def test_qt_does_not_import_parser_manifest_or_package_authorities(self) -> None:
         self.assertEqual(

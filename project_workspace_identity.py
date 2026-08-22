@@ -40,6 +40,7 @@ _WORKSPACE_ERROR_CODES = frozenset(
         "PROJECT.WORKSPACE.IDENTITY_DUPLICATE",
         "PROJECT.WORKSPACE.PATH_INVALID",
         "PROJECT.WORKSPACE.LIMIT_EXCEEDED",
+        "PROJECT.WORKSPACE.SESSION_STALE",
         "PROJECT.INTAKE.INPUT_INVALID",
         "PROJECT.INTAKE.SOURCE_UNSAFE",
         "PROJECT.INTAKE.SOURCE_STALE",
@@ -95,7 +96,15 @@ class ProjectWorkspaceError(RuntimeError):
         return self._retryable
 
     def __setattr__(self, name: str, value: object) -> None:
-        del name, value
+        if name in {
+            "__traceback__",
+            "__context__",
+            "__cause__",
+            "__suppress_context__",
+            "__notes__",
+        }:
+            BaseException.__setattr__(self, name, value)
+            return
         if getattr(self, "_frozen", False):
             raise AttributeError("workspace error is immutable")
         raise AttributeError("workspace error state is constructor-owned")
