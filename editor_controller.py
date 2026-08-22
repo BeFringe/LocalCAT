@@ -40,6 +40,7 @@ from editor_contracts import (
     ResourceConfig,
     ResourceKind,
     RecentProject,
+    RecentWorkspaceProject,
     RetrievalDisplayState,
     LegacyExactTMSuggestion,
     SuggestionBundle,
@@ -142,7 +143,9 @@ from project_workspace_contracts import (
 from project_workspace_identity import ProjectWorkspaceError
 from project_workspace_intake import (
     OriginRenameMapping,
+    SelectedProjectDocumentsRequest,
     revalidate_staged_selected_documents,
+    stage_selected_project_documents,
     stage_workspace_rebind,
 )
 
@@ -214,6 +217,22 @@ class ControllerWorkspaceSaveResult:
             raise ValueError("workspace save result requires artifact digest")
         if self.receipt is not None and self.receipt.artifact_digest != self.package_artifact_digest:
             raise ValueError("workspace save receipt artifact changed")
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceCreationResult:
+    """One newly exported package and the issued session opened from it."""
+
+    receipt: ProjectPackageExportReceipt
+    session: WorkspaceSessionView
+
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not ProjectPackageExportReceipt:
+            raise TypeError("workspace creation requires exact package receipt")
+        if type(self.session) is not WorkspaceSessionView:
+            raise TypeError("workspace creation requires exact issued session")
+        if self.receipt.project_id != self.session.project.project_id:
+            raise ValueError("workspace creation project identity changed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1291,6 +1310,7 @@ class EditorController:
             int,
             str,
             bool,
+            bool,
         ] | None = None
         self._current_index = 0
         self._dirty = False
@@ -1348,6 +1368,18 @@ class EditorController:
     @property
     def has_workspace(self) -> bool:
         return self._workspace_service is not None
+
+    @property
+    def has_active_project(self) -> bool:
+        """Return whether either the legacy or workspace session is active."""
+
+        return self._project is not None or self._workspace_service is not None
+
+    @property
+    def active_project_dirty(self) -> bool:
+        if self._workspace_service is not None:
+            return self.workspace_save_state.project_dirty
+        return self._dirty
 
     @property
     def workspace_global_index(self) -> int:
@@ -1872,6 +1904,99 @@ class EditorController:
             )
             return self.workspace_view
 
+    def create_workspace_package(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        destination: Path,
+        *,
+        name: str,
+        source_locale: str,
+        target_locale: str,
+    ) -> ControllerWorkspaceCreationResult:
+        """Create one ProjectPackage from an explicit ordered file selection.
+
+        Qt supplies only user selections and display metadata.  Root binding,
+        Parser selection, format validation, identity issuance and package
+        publication stay in the already-approved C2 owners.
+        """
+
+        if not isinstance(root, Path) or not isinstance(destination, Path):
+            raise TypeError("workspace creation paths must be pathlib.Path")
+        if type(selected_paths) is not tuple or any(
+            not isinstance(path, Path) for path in selected_paths
+        ):
+            raise TypeError("workspace creation selection must be a Path tuple")
+        with self._tm_query_lock:
+            try:
+                staged = stage_selected_project_documents(
+                    root,
+                    selected_paths,
+                    SelectedProjectDocumentsRequest(
+                        name=name,
+                        source_locale=source_locale,
+                        target_locale=target_locale,
+                    ),
+                )
+                staging_service = ProjectWorkspaceService(
+                    staged.workspace,
+                    staged.origin_binding,
+                    session_id=uuid4().hex,
+                    revision=0,
+                )
+                receipt = self._workspace_package_service.export_copy(
+                    staging_service,
+                    destination,
+                )
+                opened = self._workspace_package_service.open(destination)
+                if (
+                    opened.validation.artifact_digest != receipt.artifact_digest
+                    or opened.validation.workspace_content_digest
+                    != receipt.workspace_content_digest
+                    or opened.workspace.project_id != receipt.project_id
+                ):
+                    raise ProjectWorkspaceError(
+                        "PROJECT.PACKAGE.DESTINATION_STALE"
+                    )
+                session_id = uuid4().hex
+                save_service = opened.create_save_service(
+                    session_id=session_id,
+                    revision=0,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            self._install_opened_workspace(
+                opened,
+                save_service,
+                session_id=session_id,
+            )
+            return ControllerWorkspaceCreationResult(
+                receipt=receipt,
+                session=self.workspace_view,
+            )
+
+    def create_workspace_project_from_selected_files(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        request: SelectedProjectDocumentsRequest,
+        destination: Path,
+    ) -> ControllerWorkspaceCreationResult:
+        """Accept the frozen C2 intake request without exposing it to Qt imports."""
+
+        if type(request) is not SelectedProjectDocumentsRequest:
+            raise TypeError(
+                "workspace creation requires SelectedProjectDocumentsRequest"
+            )
+        return self.create_workspace_package(
+            root,
+            selected_paths,
+            destination,
+            name=request.name,
+            source_locale=request.source_locale,
+            target_locale=request.target_locale,
+        )
+
     def go_to_workspace_index(
         self,
         index: int,
@@ -2061,6 +2186,12 @@ class EditorController:
                 private_request.scope,
             )
             return public_report
+
+    def clear_workspace_search(self) -> None:
+        """Revoke only workspace-search reports and issued hit membership."""
+
+        with self._tm_query_lock:
+            self._clear_workspace_search_state()
 
     def go_to_workspace_search_hit(
         self,
@@ -2396,11 +2527,34 @@ class EditorController:
         associations: tuple[ReconciliationAssociation, ...] = (),
         destination: Path | None = None,
     ) -> ProjectPackageImportPreview:
-        """Preview one package transaction against the current binding."""
+        """Preview one package transaction against the active session.
+
+        A workspace defaults to its current package binding.  A legacy project
+        must supply a distinct package destination; importing there replaces
+        the active session only after apply and never rewrites the legacy file.
+        """
 
         with self._tm_query_lock:
-            service, _save_service, binding = self._require_workspace_save_session()
-            target = binding.path if destination is None else destination
+            legacy_session = not self.has_workspace
+            if legacy_session:
+                if self._project is None:
+                    raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
+                if destination is None:
+                    raise EditorControllerError(
+                        "PROJECT.PACKAGE.DESTINATION_REQUIRED"
+                    )
+                service = None
+                save_service = None
+                binding_path = None
+                target = destination
+                content_digest = _project_content_digest(self._project)
+            else:
+                service, save_service, binding = (
+                    self._require_workspace_save_session()
+                )
+                binding_path = binding.path
+                target = binding.path if destination is None else destination
+                content_digest = service.workspace_content_digest
             try:
                 preview = self._workspace_package_service.preview_import(
                     source,
@@ -2410,11 +2564,12 @@ class EditorController:
                 )
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
-            swap_active = target == binding.path
+            swap_active = legacy_session or target == binding_path
             if (
-                swap_active
+                save_service is not None
+                and swap_active
                 and preview.mode is ProjectPackageImportMode.REPLACE
-                and _save_service.project_dirty
+                and save_service.project_dirty
             ):
                 raise EditorControllerError(
                     "PROJECT.PACKAGE.ACTIVE_WORKSPACE_DIRTY"
@@ -2424,8 +2579,9 @@ class EditorController:
                 self._project_session_id,
                 self._workspace_generation,
                 self._project_revision,
-                service.workspace_content_digest,
+                content_digest,
                 swap_active,
+                legacy_session,
             )
             return preview
 
@@ -2440,15 +2596,24 @@ class EditorController:
         if type(preview) is not ProjectPackageImportPreview:
             raise TypeError("package import preview must be exact")
         with self._tm_query_lock:
-            service = self._require_workspace_session()
             issued = self._issued_workspace_package_import
             if issued is None or preview is not issued[0]:
                 raise EditorControllerError("PROJECT.PACKAGE.PREVIEW_STALE")
+            legacy_session = issued[6]
+            if legacy_session:
+                current_content_digest = (
+                    None
+                    if self._project is None or self.has_workspace
+                    else _project_content_digest(self._project)
+                )
+            else:
+                service = self._require_workspace_session()
+                current_content_digest = service.workspace_content_digest
             if (
                 issued[1] != self._project_session_id
                 or issued[2] != self._workspace_generation
                 or issued[3] != self._project_revision
-                or issued[4] != service.workspace_content_digest
+                or issued[4] != current_content_digest
             ):
                 raise EditorControllerError("PROJECT.PACKAGE.PREVIEW_STALE")
             self._issued_workspace_package_import = None
@@ -2937,6 +3102,11 @@ class EditorController:
         """Return locally remembered projects in most-recent-first order."""
 
         return self.workspace_state.recent_projects()
+
+    def recent_workspace_projects(self) -> tuple[RecentWorkspaceProject, ...]:
+        """Return device-local composite ProjectPackage positions."""
+
+        return self.workspace_state.recent_workspace_projects()
 
     def remove_recent_project(self, path: Path) -> None:
         """Forget a stale recent-project entry without touching its file."""
@@ -4305,6 +4475,9 @@ class EditorController:
         )
         return WorkspaceSessionView(
             project=project_identity,
+            name=service.workspace.name,
+            source_locale=service.workspace.source_locale,
+            target_locale=service.workspace.target_locale,
             documents=documents,
             segments=segments,
             current_segment=segments[current_index].identity,

@@ -43,10 +43,15 @@ from editor_contracts import (
     EditorSegment,
     ResourceKind,
     TMResourceDisplayMode,
+    TMResourceStatus,
 )
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
-from qt_settings_dialog import DEFAULT_VISIBLE_RESOURCE_ROWS, QtSettingsDialog
+from qt_settings_dialog import (
+    DEFAULT_VISIBLE_RESOURCE_ROWS,
+    QtSettingsDialog,
+    _tm_status_safe_reason,
+)
 from resource_repository import ResourceRepository
 from tm_application_composition import (
     TMResourceResolver,
@@ -150,6 +155,51 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(capabilities)
         assert capabilities is not None
         return capabilities
+
+    def test_activation_prompt_and_aggregate_fuzzy_reason_are_localized(self) -> None:
+        status = TMResourceStatus(
+            resource_id="tm-1",
+            resource_name="TM 1",
+            mode=TMResourceDisplayMode.CANONICAL_ACTIVE,
+            exact_available=True,
+            context_available=True,
+            fuzzy_available=True,
+            safe_codes=("RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED",),
+            retryable=False,
+        )
+        reason = _tm_status_safe_reason(status, status.safe_codes[0])
+        self.assertEqual(
+            reason,
+            "另一 Fuzzy 路径性能证据未通过（当前 Fuzzy 可用）",
+        )
+        self.assertNotIn("状态信息不可用", reason)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, (resource_id,) = _controller(Path(temporary))
+            dialog = QtSettingsDialog(controller)
+            button_texts: list[str] = []
+
+            def cancel_prompt() -> None:
+                for widget in QApplication.topLevelWidgets():
+                    if not isinstance(widget, QMessageBox):
+                        continue
+                    accept = widget.button(QMessageBox.StandardButton.Yes)
+                    cancel = widget.button(QMessageBox.StandardButton.Cancel)
+                    if accept is None or cancel is None:
+                        continue
+                    button_texts.extend((accept.text(), cancel.text()))
+                    self.assertEqual(
+                        widget.defaultButton(),
+                        cancel,
+                    )
+                    cancel.click()
+                    return
+
+            QTimer.singleShot(25, cancel_prompt)
+            self._action(dialog, resource_id).trigger()
+            self.assertEqual(button_texts, ["激活", "取消"])
+            self.assertIsNone(controller.tm_activation_operation())
+            dialog.close()
 
     def _assert_app_owned_more_indicator(self, button: QToolButton) -> None:
         image = button.grab().toImage()
@@ -294,9 +344,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self.assertEqual(action.text(), "重新验证 canonical")
             self.assertTrue(action.isEnabled())
             with (
-                patch.object(
-                    QMessageBox,
-                    "question",
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
                     return_value=QMessageBox.StandardButton.Yes,
                 ),
                 patch.object(
@@ -530,9 +579,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             dialog = QtSettingsDialog(controller)
 
             with (
-                patch.object(
-                    QMessageBox,
-                    "question",
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
                     return_value=QMessageBox.StandardButton.Cancel,
                 ) as question,
                 patch.object(
@@ -576,9 +624,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
 
             dialog = QtSettingsDialog(controller)
             with (
-                patch.object(
-                    QMessageBox,
-                    "question",
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
                     return_value=QMessageBox.StandardButton.Yes,
                 ),
                 patch.object(
@@ -625,7 +672,10 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 prompts.append(message)
                 return QMessageBox.StandardButton.Yes
 
-            with patch.object(QMessageBox, "question", side_effect=confirm):
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
+                side_effect=confirm,
+            ):
                 self._action(dialog, resource_id).trigger()
                 self._complete_operation(dialog, controller)
 
@@ -762,9 +812,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             controller, resource_ids = _controller(Path(temporary), resources=3)
             canonical_id, legacy_id, missing_id = resource_ids
             activation_dialog = QtSettingsDialog(controller)
-            with patch.object(
-                QMessageBox,
-                "question",
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
                 return_value=QMessageBox.StandardButton.Yes,
             ):
                 self._action(activation_dialog, canonical_id).trigger()

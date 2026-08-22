@@ -50,7 +50,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── capability_host.py           # Matcher/Gate C/Gate D 发布与 host lifecycle
 ├── tm_application_composition.py # legacy/canonical resource resolver/runtime host
 ├── qt_editor.py                 # stdlib composition/bootstrap 与 desktop install CLI
-├── qt_editor_window.py          # Layer 4 主编辑器、TM 与项目搜索
+├── qt_editor_window.py          # Layer 4 主编辑器、多文档章节/保存反馈、TM 与项目搜索
 ├── qt_settings_dialog.py        # Layer 4 语言资源设置
 ├── qt_termbase_dialog.py        # Layer 4 集中式术语管理
 ├── qt_control_styles.py         # Layer 4 共享 popup/menu 视觉合同
@@ -79,6 +79,8 @@ Layer 1 resource / termbase / canonical TM storage
 ├── macos_app_launcher.py        # user-local .app atomic builder/validator
 ├── macos/LocalCATLauncher.c     # native execv bootstrap source
 ├── LocalCAT-launcher             # universal arm64/x86_64 Mach-O asset
+├── tools/generate_multi_document_current_source_evidence.py # Multi-Document final-roots evidence owner
+├── multi_document_current_source_evidence.json # 17-root canonical current-source evidence
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实
 └── .kiro/steering/              # 当前项目级产品、技术与结构约束

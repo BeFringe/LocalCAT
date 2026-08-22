@@ -196,7 +196,9 @@ _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST = {
             "project_workspace_contracts.StagedSelectedProjectDocuments",
             "project_workspace_identity.ProjectWorkspaceError",
             "project_workspace_intake.OriginRenameMapping",
+            "project_workspace_intake.SelectedProjectDocumentsRequest",
             "project_workspace_intake.revalidate_staged_selected_documents",
+            "project_workspace_intake.stage_selected_project_documents",
             "project_workspace_intake.stage_workspace_rebind",
         }
     ),
@@ -1426,7 +1428,7 @@ class MultiDocumentCluster1ProductionArchitectureTests(unittest.TestCase):
             (),
         )
 
-    def test_c3_application_workspace_import_surface_is_exact(self) -> None:
+    def test_c4_application_workspace_import_surface_is_exact(self) -> None:
         for module_name, expected in _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST.items():
             with self.subTest(module=module_name):
                 observed = frozenset(

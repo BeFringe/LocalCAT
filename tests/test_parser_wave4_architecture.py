@@ -166,6 +166,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "tools.validate_tm_fault_matrix",
         "tools.validate_tm_release_criteria",
         "tools.validate_tm_release_evidence",
+        "tools.generate_multi_document_current_source_evidence",
         "validate_benchmark_contract",
         "validate_decision_memo",
         "workspace_state",

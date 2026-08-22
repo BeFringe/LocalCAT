@@ -294,6 +294,9 @@ class WorkspaceSaveState:
 @dataclass(frozen=True, slots=True)
 class WorkspaceSessionView:
     project: IssuedProjectIdentity
+    name: str
+    source_locale: str
+    target_locale: str
     documents: tuple[WorkspaceDocumentView, ...]
     segments: tuple[WorkspaceSegmentView, ...]
     current_segment: IssuedSegmentIdentity
@@ -302,6 +305,11 @@ class WorkspaceSessionView:
 
     def __post_init__(self) -> None:
         if type(self.project) is not IssuedProjectIdentity:
+            _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
+        if any(
+            type(value) is not str or not value.strip()
+            for value in (self.name, self.source_locale, self.target_locale)
+        ):
             _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
         _exact_tuple(self.documents, code="PROJECT.WORKSPACE.CONTRACT_INVALID")
         _exact_tuple(self.segments, code="PROJECT.WORKSPACE.CONTRACT_INVALID")

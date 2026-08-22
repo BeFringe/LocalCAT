@@ -56,6 +56,14 @@ from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
 from tm_contracts import SearchOptions
+from tools.generate_multi_document_current_source_evidence import (
+    EvidenceValidationError,
+    KEY_AUTHORITY_CALLS,
+    KEY_CONSTRUCTORS,
+    KEY_SERIALIZATION_CALLS,
+    load_evidence,
+    parse_evidence_bytes,
+)
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +72,7 @@ _GENERATED_AT = datetime(2030, 1, 1, tzinfo=timezone.utc)
 _VALID_UNTIL = datetime(2030, 1, 2, tzinfo=timezone.utc)
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
-_CURRENT_SOURCE_ROOTS = (
+_LEGACY_SOURCE_ROOTS = (
     "editor_project",
     "editor_controller",
     "project_search",
@@ -76,6 +84,16 @@ _CURRENT_SOURCE_ROOTS = (
     "parser_contracts",
     "parser_composition",
 )
+_WORKSPACE_SOURCE_ROOTS = (
+    "project_workspace_identity",
+    "project_workspace_contracts",
+    "editor_project_workspace_adapter",
+    "project_workspace_intake",
+    "project_workspace",
+    "project_save",
+    "project_package",
+)
+_CURRENT_SOURCE_ROOTS = (*_LEGACY_SOURCE_ROOTS, *_WORKSPACE_SOURCE_ROOTS)
 _CURRENT_SOURCE_FILES = tuple(f"{module}.py" for module in _CURRENT_SOURCE_ROOTS)
 
 _EXPECTED_PARSER_DOCUMENT_FACTS = {
@@ -172,33 +190,6 @@ _EXPECTED_PARSER_DOCUMENT_FACTS = {
     },
 }
 
-_RUNTIME_SOURCE_DIGESTS = {
-    "editor_project.py": "a9ebff92b352e3db7d2d68098937215e92d40e2f7984a5d3a64451bb5782798a",
-    "editor_controller.py": "5861c52affc8cac37038e585756e59b8de1d15bce9479251f94e0ef86500b841",
-    "project_search.py": "8dba7726eb5c5438bbd37b66d58650cf83daac30d823f5f32e117ecda9f4d673",
-    "workspace_state.py": "efa66ddaf73bbcd9dc13729777041805804ddc11e0cec300279129962f0585cb",
-    "parser_source.py": "db6e94ff8424d57212eaf901b2b8c1eb6cc321b62cf8767498859f04d5121783",
-    "qt_editor.py": "dff5462184491cd0525e4efb4979ec9189ed32c9a04c53db5e2125b698ebc7d5",
-    "qt_editor_window.py": "83878e5fe4c2e9cb9ce291f8a29c6443cbaeb33c28cf3862b44a8c3c9c67ae4e",
-    "editor_contracts.py": "7ade4ad624b372fb02881ab6807deadf10c649092c1f00e34933f83859e7dca9",
-    "parser_contracts.py": "36bdbbe30b111034ac3a73889b7b897de1d2086fe494ff562d20c0b88116a600",
-    "parser_composition.py": "afa777612e8149acec0ee68c8f8e689a1dc1eab376668419a63a1ac71d673e7e",
-}
-
-_PYTHON_SOURCE_ENTRY_COUNT = 270
-_PYTHON_SOURCE_PATH_DIGEST = (
-    "f2a640126aa1c548acc3f32ebb081c818ffe353f426d9ae09cd20a545196d4b0"
-)
-_PRODUCTION_IMPORT_ENTRY_COUNT = 571
-_PRODUCTION_IMPORT_CALL_COUNT = 571
-_PRODUCTION_IMPORT_DIGEST = (
-    "fb8e39137453dbe0e4c8a2b929650e6640e43f98f23a8aef71c6ab8fa9d51ad7"
-)
-_TEST_IMPORT_ENTRY_COUNT = 879
-_TEST_IMPORT_CALL_COUNT = 1065
-_TEST_IMPORT_DIGEST = (
-    "6cf504b21420337e2dce6c6cecaf4b0deb622a0895b8c2a61c51242d07aa4771"
-)
 _CRITICAL_PRODUCTION_IMPORTS = frozenset(
     {
         ("editor_project.py", "editor_contracts", "EditorProject", None),
@@ -323,162 +314,55 @@ _CRITICAL_PRODUCTION_IMPORTS = frozenset(
     }
 )
 
-_KEY_CONSTRUCTORS = frozenset(
-    {
-        "CanonicalDocumentWrite",
-        "CanonicalSegmentWrite",
-        "CanonicalSerializeRequest",
-        "EditorController",
-        "EditorProject",
-        "EditorSegment",
-        "ProjectSearchRequest",
-        "ProjectSearchService",
-        "ParserApplicationSurface",
-        "OpenedParserInput",
-        "PreparedCanonicalWrite",
-        "QtEditorWindow",
-        "ReadRequest",
-        "SelectionRequest",
-        "SourceReference",
-        "TargetReference",
-        "WorkspaceStateRepository",
-    }
-)
-_EXPECTED_CONSTRUCTOR_CALLS = Counter(
-    {
-        ("editor_controller.py", "EditorController"): 1,
-        ("editor_controller.py", "ProjectSearchRequest"): 1,
-        ("editor_controller.py", "ProjectSearchService"): 1,
-        ("editor_controller.py", "WorkspaceStateRepository"): 1,
-        ("editor_project.py", "CanonicalDocumentWrite"): 1,
-        ("editor_project.py", "CanonicalSegmentWrite"): 1,
-        ("editor_project.py", "CanonicalSerializeRequest"): 1,
-        ("editor_project.py", "EditorProject"): 2,
-        ("editor_project.py", "EditorSegment"): 4,
-        ("editor_project.py", "ReadRequest"): 1,
-        ("editor_project.py", "SelectionRequest"): 1,
-        ("editor_project.py", "SourceReference"): 1,
-        ("editor_project.py", "TargetReference"): 1,
-        ("parser_composition.py", "OpenedParserInput"): 1,
-        ("parser_composition.py", "ParserApplicationSurface"): 1,
-        ("parser_composition.py", "PreparedCanonicalWrite"): 1,
-        ("parser_composition.py", "SelectionRequest"): 1,
-        ("qt_editor.py", "EditorController"): 1,
-        ("qt_editor.py", "QtEditorWindow"): 1,
-        ("qt_editor_window.py", "ProjectSearchRequest"): 1,
-    }
-)
-_KEY_AUTHORITY_CALLS = frozenset(
-    {
-        "create_parser_application_surface",
-        "find_project",
-        "_atomic_write_bytes",
-        "_create_sealed_snapshot",
-        "_materialize",
-        "_validate",
-        "create_canonical_serializer",
-        "create_reader",
-        "create_sealed_snapshot",
-        "load_project",
-        "open_input",
-        "open_project",
-        "prepare_canonical",
-        "remember_project",
-        "save_project",
-        "save_project_file",
-        "search",
-        "serialize_canonical",
-        "stream",
-        "update_target",
-        "verified_terminal",
-        "write",
-    }
-)
-_EXPECTED_AUTHORITY_CALLS = Counter(
-    {
-        ("editor_controller.py", "load_project"): 1,
-        ("editor_controller.py", "save_project_file"): 1,
-        ("editor_controller.py", "search"): 1,
-        ("editor_controller.py", "self.update_target"): 3,
-        ("editor_controller.py", "self.workspace_state.find_project"): 1,
-        ("editor_controller.py", "self.workspace_state.remember_project"): 1,
-        ("editor_project.py", "create_parser_application_surface"): 2,
-        ("editor_project.py", "opened.stream"): 1,
-        ("editor_project.py", "prepared.write"): 1,
-        ("editor_project.py", "session.verified_terminal"): 1,
-        ("editor_project.py", "surface.open_input"): 1,
-        ("editor_project.py", "surface.prepare_canonical"): 1,
-        ("parser_composition.py", "_atomic_write_bytes"): 1,
-        ("parser_composition.py", "_create_sealed_snapshot"): 2,
-        ("parser_composition.py", "_materialize"): 1,
-        ("parser_composition.py", "_validate"): 1,
-        (
-            "parser_composition.py",
-            "self._registry.create_canonical_serializer",
-        ): 1,
-        ("parser_composition.py", "self._registry.create_reader"): 3,
-        ("parser_composition.py", "self.prepare_canonical"): 1,
-        ("parser_composition.py", "serializer.serialize_canonical"): 1,
-        ("parser_composition.py", "write"): 1,
-        ("parser_source.py", "create_sealed_snapshot"): 1,
-        ("parser_source.py", "os.write"): 1,
-        ("parser_source.py", "session.verified_terminal"): 2,
-        ("qt_editor.py", "controller.open_project"): 1,
-        ("qt_editor_window.py", "self.controller.open_project"): 1,
-        ("qt_editor_window.py", "self.controller.save_project"): 1,
-        ("qt_editor_window.py", "self.controller.update_target"): 1,
-        ("workspace_state.py", "handle.write"): 1,
-    }
-)
-_KEY_SERIALIZATION_CALLS = frozenset(
-    {
-        "_read_state",
-        "_write_state",
-        "dumps",
-        "loads",
-        "read_bytes",
-        "read_text",
-        "write_bytes",
-        "write_text",
-    }
-)
-_EXPECTED_SERIALIZATION_CALLS = Counter(
-    {
-        ("editor_contracts.py", "json.dumps"): 1,
-        ("editor_contracts.py", "json.loads"): 1,
-        ("editor_controller.py", "json.dumps"): 2,
-        ("editor_controller.py", "json.loads"): 1,
-        ("editor_controller.py", "path.read_text"): 1,
-        ("qt_editor.py", "json.dumps"): 1,
-        ("qt_editor.py", "temporary.write_text"): 1,
-        ("qt_editor.py", "temporary_path.write_text"): 1,
-        ("workspace_state.py", "json.dumps"): 1,
-        ("workspace_state.py", "json.loads"): 1,
-        ("workspace_state.py", "self._read_state"): 1,
-        ("workspace_state.py", "self._write_state"): 5,
-        ("workspace_state.py", "self.state_path.read_text"): 1,
-    }
-)
-_PATCH_ENTRY_COUNT = 46
-_PATCH_CALL_COUNT = 63
-_PATCH_INVENTORY_DIGEST = (
-    "75bb093ee19d32ed251397d33c5d16337cf0f466dace4971afa7c92973a836d5"
-)
+_KEY_CONSTRUCTORS = KEY_CONSTRUCTORS
+_KEY_AUTHORITY_CALLS = KEY_AUTHORITY_CALLS
+_KEY_SERIALIZATION_CALLS = KEY_SERIALIZATION_CALLS
 
 _INVENTORY_MODULES = frozenset(_CURRENT_SOURCE_ROOTS)
-_WORKSPACE_CONSUMER_MODULES = frozenset(
-    {
-        "project_workspace_contracts",
-        "project_workspace_identity",
-        "editor_project_workspace_adapter",
-        "project_workspace_intake",
-        "project_workspace",
-        "project_save",
-        "project_package",
-    }
-)
-_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES | _WORKSPACE_CONSUMER_MODULES
+_LEGACY_CONSUMER_MODULES = frozenset(_LEGACY_SOURCE_ROOTS)
+_WORKSPACE_CONSUMER_MODULES = frozenset(_WORKSPACE_SOURCE_ROOTS)
+_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES
 _SEMANTIC_SOURCE_FILES = _CURRENT_SOURCE_FILES
+
+
+_EVIDENCE = load_evidence()
+
+
+def _object(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
+def _inventory_counter(value: object) -> Counter[tuple[str, str]]:
+    inventory = _object(value)
+    return Counter(
+        {
+            (cast(str, record["path"]), cast(str, record["symbol"])): cast(
+                int, record["count"]
+            )
+            for record in cast(list[dict[str, object]], inventory["records"])
+        }
+    )
+
+
+_RUNTIME_SOURCE_DIGESTS = {
+    cast(str, record["path"]): cast(str, record["sha256"])
+    for record in cast(list[dict[str, object]], _EVIDENCE["runtime_sources"])
+}
+_PYTHON_SOURCES_EVIDENCE = _object(_EVIDENCE["python_sources"])
+_PYTHON_SOURCE_ENTRY_COUNT = cast(int, _PYTHON_SOURCES_EVIDENCE["entry_count"])
+_PYTHON_SOURCE_PATH_DIGEST = cast(str, _PYTHON_SOURCES_EVIDENCE["path_digest"])
+_IMPORT_EVIDENCE = _object(_EVIDENCE["closed_consumer_imports"])
+_PRODUCTION_IMPORT_EVIDENCE = _object(_IMPORT_EVIDENCE["production"])
+_TEST_IMPORT_EVIDENCE = _object(_IMPORT_EVIDENCE["tests"])
+_SEMANTIC_EVIDENCE = _object(_EVIDENCE["semantic_calls"])
+_EXPECTED_CONSTRUCTOR_CALLS = _inventory_counter(
+    _SEMANTIC_EVIDENCE["constructors"]
+)
+_EXPECTED_AUTHORITY_CALLS = _inventory_counter(_SEMANTIC_EVIDENCE["authority"])
+_EXPECTED_SERIALIZATION_CALLS = _inventory_counter(
+    _SEMANTIC_EVIDENCE["serialization"]
+)
+_EXPECTED_PATCH_CALLS = _inventory_counter(_EVIDENCE["patches"])
 
 
 def _tree(relative: str, *, source: str | None = None) -> ast.Module:
@@ -721,18 +605,81 @@ def _search_request(query: str) -> ProjectSearchRequest:
 
 
 class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
+    def test_strict_owner_evidence_rejects_open_or_noncanonical_documents(
+        self,
+    ) -> None:
+        canonical_raw = (
+            json.dumps(
+                _EVIDENCE,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.assertEqual(parse_evidence_bytes(canonical_raw), _EVIDENCE)
+
+        duplicate_key = canonical_raw.replace(
+            b'"schema":',
+            b'"schema":"duplicate","schema":',
+            1,
+        )
+        extra = json.loads(canonical_raw)
+        extra["unexpected"] = None
+        missing = json.loads(canonical_raw)
+        del missing["patches"]
+        wrong_type = json.loads(canonical_raw)
+        wrong_type["schema_version"] = True
+        noncanonical_digest = json.loads(canonical_raw)
+        noncanonical_digest["evidence_digest"] = cast(
+            str, noncanonical_digest["evidence_digest"]
+        ).upper()
+        pretty_printed = json.dumps(
+            _EVIDENCE,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ).encode("utf-8")
+
+        def encoded(value: object) -> bytes:
+            return (
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+
+        for label, raw in (
+            ("duplicate", duplicate_key),
+            ("extra", encoded(extra)),
+            ("missing", encoded(missing)),
+            ("wrong-type", encoded(wrong_type)),
+            ("noncanonical-digest", encoded(noncanonical_digest)),
+            ("noncanonical-json", pretty_printed),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(EvidenceValidationError):
+                    parse_evidence_bytes(raw)
+
     def test_current_runtime_roots_imports_calls_patches_and_serializers_are_closed(
         self,
     ) -> None:
+        self.assertEqual(_EVIDENCE["production_roots"], list(_CURRENT_SOURCE_ROOTS))
+        self.assertEqual(len(_CURRENT_SOURCE_ROOTS), 17)
         self.assertEqual(
             tuple(_RUNTIME_SOURCE_DIGESTS),
             _CURRENT_SOURCE_FILES,
         )
         self.assertEqual(_INVENTORY_MODULES, frozenset(_CURRENT_SOURCE_ROOTS))
-        self.assertTrue(_INVENTORY_MODULES.isdisjoint(_WORKSPACE_CONSUMER_MODULES))
+        self.assertTrue(
+            _LEGACY_CONSUMER_MODULES.isdisjoint(_WORKSPACE_CONSUMER_MODULES)
+        )
         self.assertEqual(
             _CLOSED_CONSUMER_MODULES,
-            _INVENTORY_MODULES | _WORKSPACE_CONSUMER_MODULES,
+            _LEGACY_CONSUMER_MODULES | _WORKSPACE_CONSUMER_MODULES,
         )
         observed_digests = {
             relative: hashlib.sha256((_ROOT / relative).read_bytes()).hexdigest()
@@ -755,24 +702,30 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
         )
         production_imports = _import_consumers(production_sources)
         test_imports = _import_consumers(test_sources)
-        self.assertEqual(len(production_imports), _PRODUCTION_IMPORT_ENTRY_COUNT)
+        self.assertEqual(
+            len(production_imports),
+            _PRODUCTION_IMPORT_EVIDENCE["entry_count"],
+        )
         self.assertEqual(
             sum(production_imports.values()),
-            _PRODUCTION_IMPORT_CALL_COUNT,
+            _PRODUCTION_IMPORT_EVIDENCE["call_count"],
         )
         self.assertEqual(
             _import_counter_digest(production_imports),
-            _PRODUCTION_IMPORT_DIGEST,
+            _PRODUCTION_IMPORT_EVIDENCE["digest"],
         )
         self.assertTrue(
             _CRITICAL_PRODUCTION_IMPORTS.issubset(production_imports),
             _CRITICAL_PRODUCTION_IMPORTS.difference(production_imports),
         )
-        self.assertEqual(len(test_imports), _TEST_IMPORT_ENTRY_COUNT)
-        self.assertEqual(sum(test_imports.values()), _TEST_IMPORT_CALL_COUNT)
+        self.assertEqual(len(test_imports), _TEST_IMPORT_EVIDENCE["entry_count"])
+        self.assertEqual(
+            sum(test_imports.values()),
+            _TEST_IMPORT_EVIDENCE["call_count"],
+        )
         self.assertEqual(
             _import_counter_digest(test_imports),
-            _TEST_IMPORT_DIGEST,
+            _TEST_IMPORT_EVIDENCE["digest"],
         )
         constructors, authority, serialization = _semantic_call_inventory()
         self.assertEqual(constructors, _EXPECTED_CONSTRUCTOR_CALLS)
@@ -780,9 +733,7 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
         self.assertEqual(serialization, _EXPECTED_SERIALIZATION_CALLS)
 
         patches = _patch_inventory()
-        self.assertEqual(len(patches), _PATCH_ENTRY_COUNT)
-        self.assertEqual(sum(patches.values()), _PATCH_CALL_COUNT)
-        self.assertEqual(_counter_digest(patches), _PATCH_INVENTORY_DIGEST)
+        self.assertEqual(patches, _EXPECTED_PATCH_CALLS)
         for seam in (
             (
                 "tests/test_parser_project_facade_characterization.py",

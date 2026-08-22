@@ -159,23 +159,26 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ## Cluster 4：Qt 与 Current-source Acceptance（brief Promotion Cluster 4）
 
-- [ ] 4.1 实现章节导航与连续段落体验
+- [x] 4.1 实现章节导航与连续段落体验
   - 显示章节名/当前位置，支持跳到章节首段；重命名/重排只改变投影，不改变持久身份。
-  - 编辑/浏览模式均保留明确章节分隔；窄宽布局不隐藏当前章节或保存失败状态。
-  - “新建多文档项目”只消费 Cluster 2A 的显式选择入口，展示选中文档和顺序；不在 Qt 复制 suffix/Parser grammar 或递归目录发现。
+  - 顶栏无下拉箭头的文件夹菜单是唯一文档导航 authority；菜单条目使用文件图标和文档名，不添加序号前缀。编辑左栏和浏览/校对标题只投影当前文档，列表使用带文件图标的跨列文档标题分隔段落；浏览行变化必须同步当前文档与菜单选中态。
+  - 窄宽布局不隐藏文件夹导航、项目命令或保存失败状态；ProjectPackage 打开/导入只保留在“项目”菜单，不占用文件夹或独立顶栏。
+  - 首页、项目主按钮、项目菜单唯一的“打开本地项目”和 `Ctrl+O` 不拆分单/多文档入口：单选直接打开，Shift 多选进入排序/语言/保存确认；文件直接拖到首页时按相同规则分流。项目菜单不得另列“新建多文档项目”。多选只消费 Cluster 2A 的有序显式文件集，不在 Qt 复制 suffix/Parser grammar、扫描目录或自动包含相邻文件。
+  - ProjectPackage `open` 直接冷打开所选artifact；`preview+import`绑定source/destination，以LocalCAT对话框显示模式、当前→incoming、单行可复制ID、计数/调和/阻断，Cancel默认且Apply后才发布。Legacy会话要求另选package destination，preview不创建目标、不改原文件、不切换会话，Apply才以`NEW`/`REPLACE`导入并切换，不把Legacy内容冒充为merge/promotion。
 
-- [ ] 4.2 接入搜索范围、dirty 与保存/recovery 反馈
+- [x] 4.2 接入搜索范围、dirty 与保存/recovery 反馈
   - UI 只通过 Controller 消费 `current_document` / `entire_project`、逐文档保存报告和 reconciliation/receipt。
   - 不在 Qt 复制 manifest、codec、reconciliation、package 或 identity authority。
 
-- [ ] 4.3 使用真实 ProjectPackage substrate 完成 current-source acceptance
+- [x] 4.3 使用真实 ProjectPackage substrate 完成 current-source acceptance
   - acceptance 从 Cluster 2 正式 exporter 生成真实 ProjectPackage，经 validate/preview/import/apply 后冷重开，再运行章节导航、编辑、搜索、保存与恢复 journeys。
   - 不得用内存伪 package、手写 manifest 或 fixture-only controller 注入代替真实 substrate。
 
-- [ ] 4.4 重签 current-source evidence 并完成治理收尾
+- [x] 4.4 重签 current-source evidence 并完成治理收尾
   - 在 final runtime roots 冻结后运行全量 identity/reconciliation/save/package/controller/Qt/fault/acceptance 与单 JSON/TXT compatibility suites。
   - owner 工具生成并由 strict consumer 复读 evidence；随后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实结构/技术事实并由 Cluster 4 独立 reviewer 给出 Feature GO/NO-GO。
+  - final evidence digest `099cd7bde20d760c8b7f0a0985474afa0565784dbd804e8a772e1a43591f0034`，17 个 production roots；owner strict check 在 characterization 9/9 前后均为 current。
 
 ### Cluster 4 完成门
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import html
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QMimeData,
     QObject,
     QEvent,
     QPoint,
@@ -15,6 +17,7 @@ from PySide6.QtCore import (
     QRect,
     QSignalBlocker,
     QSize,
+    Signal,
     Qt,
     QTimer,
 )
@@ -22,6 +25,10 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QCloseEvent,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QFontMetrics,
     QKeyEvent,
     QKeySequence,
@@ -42,6 +49,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -84,6 +92,7 @@ from editor_contracts import (
     ProjectSearchRequest,
     ResourceKind,
     SearchField,
+    SearchScope,
     SearchOptions,
     SegmentDensity,
     SegmentTranslationStatus,
@@ -94,6 +103,8 @@ from editor_contracts import (
     TMSuggestion,
     TMSuggestionReport,
     TextMatcherState,
+    WorkspaceSearchReport,
+    WorkspaceSearchRequest,
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
@@ -315,6 +326,378 @@ class _InlineMenuButton(QToolButton):
             painter.end()
 
 
+class _WorkspaceDropPage(QWidget):
+    """Accept only an explicit, ordered selection of local files."""
+
+    explicitFilesDropped = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def explicit_local_file_paths(
+        mime_data: QMimeData,
+    ) -> tuple[Path, ...] | None:
+        if not mime_data.hasUrls():
+            return None
+        paths: list[Path] = []
+        identities: set[str] = set()
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                return None
+            path = Path(url.toLocalFile()).expanduser()
+            if not path.is_absolute() or not path.is_file():
+                return None
+            identity = os.path.normcase(os.path.abspath(str(path)))
+            if identity in identities:
+                return None
+            identities.add(identity)
+            paths.append(path)
+        return tuple(paths) if paths else None
+
+    def _set_drag_active(self, active: bool) -> None:
+        self.setProperty("dragActive", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self.explicit_local_file_paths(event.mimeData()) is None:
+            event.ignore()
+            return
+        self._set_drag_active(True)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if self.explicit_local_file_paths(event.mimeData()) is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self._set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = self.explicit_local_file_paths(event.mimeData())
+        self._set_drag_active(False)
+        if paths is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self.explicitFilesDropped.emit(paths)
+
+
+class QtWorkspaceCreationDialog(QDialog):
+    """Review and reorder one explicit file selection before C2 intake."""
+
+    def __init__(
+        self,
+        selected_paths: tuple[Path, ...],
+        *,
+        default_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if type(selected_paths) is not tuple or len(selected_paths) < 2:
+            raise ValueError("workspace creation requires at least two selected paths")
+        if any(not isinstance(path, Path) for path in selected_paths):
+            raise TypeError("workspace creation selection must contain Paths")
+        self.setObjectName("workspaceCreationDialog")
+        self.setWindowTitle("确认多文档项目")
+        self.resize(680, 480)
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "仅导入下列显式选择的文件。列表顺序将成为初始章节顺序；"
+            "不会扫描目录或自动包含相邻文件。"
+        )
+        hint.setObjectName("workspaceCreationHint")
+        hint.setTextFormat(Qt.TextFormat.PlainText)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.selected_files = QListWidget()
+        self.selected_files.setObjectName("workspaceSelectedFiles")
+        self.selected_files.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        for path in selected_paths:
+            item = QListWidgetItem(str(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(str(path))
+            self.selected_files.addItem(item)
+        self.selected_files.setCurrentRow(0)
+        layout.addWidget(self.selected_files, 1)
+
+        order_row = QHBoxLayout()
+        self.move_up_button = QPushButton("上移")
+        self.move_up_button.setObjectName("workspaceMoveSelectedUp")
+        self.move_down_button = QPushButton("下移")
+        self.move_down_button.setObjectName("workspaceMoveSelectedDown")
+        self.move_up_button.clicked.connect(lambda: self.move_selected(-1))
+        self.move_down_button.clicked.connect(lambda: self.move_selected(1))
+        order_row.addWidget(self.move_up_button)
+        order_row.addWidget(self.move_down_button)
+        order_row.addStretch()
+        layout.addLayout(order_row)
+
+        metadata = QHBoxLayout()
+        metadata.addWidget(QLabel("项目名"))
+        self.project_name_input = QLineEdit(default_name)
+        self.project_name_input.setObjectName("workspaceProjectName")
+        metadata.addWidget(self.project_name_input, 1)
+        metadata.addWidget(QLabel("源语言"))
+        self.source_locale_input = QLineEdit()
+        self.source_locale_input.setObjectName("workspaceSourceLocale")
+        self.source_locale_input.setPlaceholderText("默认 en")
+        metadata.addWidget(self.source_locale_input)
+        metadata.addWidget(QLabel("目标语言"))
+        self.target_locale_input = QLineEdit()
+        self.target_locale_input.setObjectName("workspaceTargetLocale")
+        self.target_locale_input.setPlaceholderText("默认 zh-CN")
+        metadata.addWidget(self.target_locale_input)
+        layout.addLayout(metadata)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        self.buttons.setObjectName("workspaceCreationButtons")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "开始导入"
+        )
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def move_selected(self, direction: int) -> None:
+        if direction not in (-1, 1):
+            raise ValueError("workspace reorder direction must be -1 or 1")
+        row = self.selected_files.currentRow()
+        destination = row + direction
+        if row < 0 or destination < 0 or destination >= self.selected_files.count():
+            return
+        item = self.selected_files.takeItem(row)
+        self.selected_files.insertItem(destination, item)
+        self.selected_files.setCurrentRow(destination)
+
+    @property
+    def ordered_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            self.selected_files.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self.selected_files.count())
+        )
+
+    def _accept_if_valid(self) -> None:
+        if self.project_name_input.text().strip():
+            self.accept()
+
+    @property
+    def source_locale(self) -> str:
+        return self.source_locale_input.text().strip() or "en"
+
+    @property
+    def target_locale(self) -> str:
+        return self.target_locale_input.text().strip() or "zh-CN"
+
+
+class QtWorkspacePackageImportDialog(QDialog):
+    """Show one receipt-safe package preview without wrapping its identity."""
+
+    _MODE_COPY = {
+        "new": (
+            "NEW · 导入为新项目",
+            "Apply 后把 incoming 包发布到新位置，并切换为该项目。",
+        ),
+        "replace": (
+            "REPLACE · 替换当前项目",
+            "project ID 不同；Apply 后 incoming 项目将替换当前项目。",
+        ),
+        "update_same_project": (
+            "UPDATE · 更新同一项目",
+            "project ID 相同；Apply 后按稳定身份调和并发布更新。",
+        ),
+    }
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        current_project_name: str,
+        incoming_project_name: str,
+        incoming_project_id: str,
+        document_count: int,
+        segment_count: int,
+        reconciliation_counts: tuple[int, int, int, int, int, int],
+        warnings: tuple[str, ...],
+        blocking_reasons: tuple[str, ...],
+        required_decision_count: int,
+        can_apply: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if mode not in self._MODE_COPY:
+            raise ValueError("unsupported package import preview mode")
+        if any(
+            type(value) is not str
+            for value in (
+                current_project_name,
+                incoming_project_name,
+                incoming_project_id,
+            )
+        ):
+            raise TypeError("package import preview text must be exact str")
+        counts = (document_count, segment_count, *reconciliation_counts)
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("package import preview counts must be non-negative")
+        if (
+            type(warnings) is not tuple
+            or type(blocking_reasons) is not tuple
+            or any(type(value) is not str for value in (*warnings, *blocking_reasons))
+            or type(required_decision_count) is not int
+            or required_decision_count < 0
+            or type(can_apply) is not bool
+        ):
+            raise TypeError("package import preview safety facts are invalid")
+
+        self.setObjectName("workspacePackageImportDialog")
+        self.setWindowTitle("预览并导入 ProjectPackage")
+        self.setModal(True)
+        self.setMinimumWidth(720)
+        self.resize(760, 500)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 22)
+        layout.setSpacing(14)
+
+        heading = QHBoxLayout()
+        title = QLabel("预览并导入 ProjectPackage")
+        title.setObjectName("packageImportTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        heading.addWidget(title)
+        heading.addStretch()
+        mode_title, mode_explanation = self._MODE_COPY[mode]
+        self.mode_label = QLabel(mode_title)
+        self.mode_label.setObjectName("packageImportMode")
+        self.mode_label.setProperty("mode", mode)
+        self.mode_label.setTextFormat(Qt.TextFormat.PlainText)
+        heading.addWidget(self.mode_label)
+        layout.addLayout(heading)
+
+        self.transition_label = QLabel(
+            f"{current_project_name}  →  {incoming_project_name}"
+        )
+        self.transition_label.setObjectName("packageImportTransition")
+        self.transition_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.transition_label.setWordWrap(True)
+        layout.addWidget(self.transition_label)
+
+        explanation = QLabel(mode_explanation)
+        explanation.setObjectName("packageImportExplanation")
+        explanation.setTextFormat(Qt.TextFormat.PlainText)
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        summary = QFrame()
+        summary.setObjectName("packageImportSummary")
+        summary_layout = QGridLayout(summary)
+        summary_layout.setContentsMargins(16, 14, 16, 14)
+        summary_layout.setHorizontalSpacing(14)
+        summary_layout.setVerticalSpacing(10)
+        id_label = QLabel("导入项目 ID（可复制）")
+        id_label.setObjectName("packageImportIdLabel")
+        self.project_id_input = QLineEdit(incoming_project_id)
+        self.project_id_input.setObjectName("packageImportProjectId")
+        self.project_id_input.setReadOnly(True)
+        self.project_id_input.setCursorPosition(0)
+        self.project_id_input.setToolTip(incoming_project_id)
+        summary_layout.addWidget(id_label, 0, 0)
+        summary_layout.addWidget(self.project_id_input, 0, 1, 1, 3)
+        document_label = QLabel(f"文档  {document_count}")
+        document_label.setObjectName("packageImportDocumentCount")
+        segment_label = QLabel(f"段落  {segment_count}")
+        segment_label.setObjectName("packageImportSegmentCount")
+        summary_layout.addWidget(document_label, 1, 1)
+        summary_layout.addWidget(segment_label, 1, 2)
+        summary_layout.setColumnStretch(3, 1)
+        layout.addWidget(summary)
+
+        unchanged, source_changed, added, removed, ambiguous, unresolved = (
+            reconciliation_counts
+        )
+        reconciliation_text = (
+            "reconciliation  ·  "
+            f"未变 {unchanged}   源变化 {source_changed}   新增 {added}   "
+            f"移除 {removed}   歧义 {ambiguous}   未解决 {unresolved}"
+            if mode == "update_same_project"
+            else "reconciliation  ·  不适用（跨项目导入不会合并文档）"
+        )
+        self.reconciliation_label = QLabel(reconciliation_text)
+        self.reconciliation_label.setObjectName("packageImportReconciliation")
+        self.reconciliation_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.reconciliation_label.setWordWrap(True)
+        layout.addWidget(self.reconciliation_label)
+
+        safety = QFrame()
+        safety.setObjectName("packageImportSafety")
+        safety.setProperty(
+            "state",
+            "blocked" if not can_apply else ("warning" if warnings else "ready"),
+        )
+        safety_layout = QVBoxLayout(safety)
+        safety_layout.setContentsMargins(14, 11, 14, 11)
+        if not can_apply:
+            safety_text = "阻断 · " + (
+                "、".join(blocking_reasons) or "需要完成调和决策"
+            )
+            if required_decision_count:
+                safety_text += f" · 待决身份 {required_decision_count}"
+        elif warnings:
+            safety_text = "警告 · " + "、".join(warnings)
+        else:
+            safety_text = "检查通过 · 没有阻断或警告"
+        self.safety_label = QLabel(safety_text)
+        self.safety_label.setObjectName("packageImportSafetyText")
+        self.safety_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.safety_label.setWordWrap(True)
+        safety_layout.addWidget(self.safety_label)
+        layout.addWidget(safety)
+
+        note = QLabel("只有点击“应用导入”后才会发布；取消不会修改任何项目文件。")
+        note.setObjectName("packageImportNote")
+        note.setTextFormat(Qt.TextFormat.PlainText)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch()
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Apply
+        )
+        self.buttons.setObjectName("packageImportButtons")
+        self.cancel_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        self.apply_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Apply
+        )
+        self.cancel_button.setText("取消")
+        self.apply_button.setText("应用导入")
+        self.cancel_button.setObjectName("packageImportCancel")
+        self.apply_button.setObjectName("packageImportApply")
+        self.cancel_button.setDefault(True)
+        self.cancel_button.setAutoDefault(True)
+        self.apply_button.setDefault(False)
+        self.apply_button.setAutoDefault(False)
+        self.apply_button.setEnabled(can_apply)
+        self.cancel_button.clicked.connect(self.reject)
+        self.apply_button.clicked.connect(self.accept)
+        layout.addWidget(self.buttons)
+
+
 class ResponsiveSplitter(QSplitter):
     """QSplitter with inspectable stretch metadata for layout verification."""
 
@@ -380,6 +763,11 @@ class QtEditorWindow(QMainWindow):
         self.shortcuts: dict[str, QShortcut]
         self.target_editor_shortcuts: dict[str, QShortcut]
         self.project_search_shortcut: QShortcut
+        self.top_bar: QFrame
+        self.top_bar_layout: QHBoxLayout
+        self.brand_name_label: QLabel
+        self.brand_tagline_label: QLabel
+        self.top_separator: QFrame
         self.project_name_label: QLabel
         self.language_label: QLabel
         self.progress_bar: QProgressBar
@@ -387,6 +775,9 @@ class QtEditorWindow(QMainWindow):
         self.open_button: QToolButton
         self.project_menu: QMenu
         self.open_project_action: QAction
+        self.open_workspace_package_action: QAction
+        self.import_workspace_package_action: QAction
+        self.save_workspace_document_action: QAction
         self.recent_projects_menu: QMenu
         self.speaker_inventory_action: QAction
         self.preprocess_action: QAction
@@ -395,18 +786,28 @@ class QtEditorWindow(QMainWindow):
         self.save_button: QToolButton
         self.settings_button: QToolButton
         self.project_search_toggle: QToolButton
+        self.workspace_documents_button: QToolButton
+        self.workspace_documents_menu: QMenu
         self.editor_page: QWidget
+        self.empty_page: _WorkspaceDropPage
         self.empty_open_button: QPushButton
         self.sample_button: QPushButton
         self.main_splitter: ResponsiveSplitter
         self.workspace_pages: QStackedWidget
         self.segment_count_label: QLabel
+        self.workspace_chapter_title: QLabel
+        self.workspace_browse_chapter_title: QLabel
+        self.chapter_progress_label: QLabel
+        self.workspace_save_feedback: QLabel
+        self.workspace_browse_save_feedback: QLabel
         self.segment_density_combo: QComboBox
         self.unconfirmed_filter: QCheckBox
         self.segment_list: QListWidget
         self.project_search_input: QLineEdit
         self.project_search_panel: QFrame
         self.project_search_status: QComboBox
+        self.workspace_search_scope: QComboBox
+        self.project_search_scope: QComboBox
         self.project_search_clear: QPushButton
         self.project_search_source: QCheckBox
         self.project_search_target: QCheckBox
@@ -456,7 +857,14 @@ class QtEditorWindow(QMainWindow):
         )
         self.current_suggestions = SuggestionBundle()
         self.current_tm_report: TMSuggestionReport | None = None
-        self.current_project_search_report: ProjectSearchReport | None = None
+        self.current_project_search_report: (
+            ProjectSearchReport | WorkspaceSearchReport | None
+        ) = None
+        self.current_workspace_search_report: WorkspaceSearchReport | None = None
+        self._workspace_package_import_preview: object | None = None
+        self._workspace_package_import_source: tuple[Path, Path | None] | None = None
+        self._workspace_package_preview_text = "尚未预览导入包。"
+        self._workspace_package_import_can_apply = False
         self._project_search_ordinal: int | None = None
         self._project_search_expanded = False
         self.setObjectName("editorWindow")
@@ -464,6 +872,7 @@ class QtEditorWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
+        self._apply_top_bar_responsiveness(self.width())
         self.setTabOrder(self.settings_button, self.project_search_toggle)
         self.setTabOrder(self.project_search_toggle, self.project_search_input)
         self.setTabOrder(self.project_search_input, self.project_search_source)
@@ -494,7 +903,7 @@ class QtEditorWindow(QMainWindow):
         self._install_shortcuts()
         self.set_segment_density(self.segment_density, persist=False)
         self.refresh_recent_projects()
-        if controller.has_project:
+        if controller.has_active_project:
             self._render_project()
         else:
             self._show_empty_state()
@@ -523,7 +932,9 @@ class QtEditorWindow(QMainWindow):
     def _build_top_bar(self) -> QWidget:
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
+        self.top_bar = top_bar
         layout = QHBoxLayout(top_bar)
+        self.top_bar_layout = layout
         layout.setContentsMargins(22, 12, 20, 12)
         layout.setSpacing(12)
 
@@ -534,18 +945,18 @@ class QtEditorWindow(QMainWindow):
         layout.addWidget(mark)
         brand = QVBoxLayout()
         brand.setSpacing(0)
-        name = QLabel("LocalCAT")
-        name.setObjectName("brandName")
-        tagline = QLabel("LOCAL TRANSLATION WORKSPACE")
-        tagline.setObjectName("brandTagline")
-        brand.addWidget(name)
-        brand.addWidget(tagline)
+        self.brand_name_label = QLabel("LocalCAT")
+        self.brand_name_label.setObjectName("brandName")
+        self.brand_tagline_label = QLabel("LOCAL TRANSLATION WORKSPACE")
+        self.brand_tagline_label.setObjectName("brandTagline")
+        brand.addWidget(self.brand_name_label)
+        brand.addWidget(self.brand_tagline_label)
         layout.addLayout(brand)
 
-        separator = QFrame()
-        separator.setObjectName("topSeparator")
-        separator.setFrameShape(QFrame.Shape.VLine)
-        layout.addWidget(separator)
+        self.top_separator = QFrame()
+        self.top_separator.setObjectName("topSeparator")
+        self.top_separator.setFrameShape(QFrame.Shape.VLine)
+        layout.addWidget(self.top_separator)
 
         project_info = QVBoxLayout()
         project_info.setSpacing(1)
@@ -577,6 +988,27 @@ class QtEditorWindow(QMainWindow):
         self.project_search_toggle.setToolTip("项目搜索 (Ctrl+F)")
         layout.addWidget(self.project_search_toggle)
 
+        self.workspace_documents_button = QToolButton()
+        self.workspace_documents_button.setObjectName("workspaceDocumentsButton")
+        self.workspace_documents_button.setEnabled(False)
+        self.workspace_documents_button.setFixedSize(QSize(34, 34))
+        self.workspace_documents_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+        )
+        self.workspace_documents_button.setAccessibleName(
+            "显示项目内文档"
+        )
+        self.workspace_documents_button.setToolTip("项目内文档")
+        self.workspace_documents_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.workspace_documents_menu = QMenu(self.workspace_documents_button)
+        self.workspace_documents_menu.setObjectName("workspaceDocumentsMenu")
+        self.workspace_documents_menu.setAccessibleName("项目内文档列表")
+        configure_menu(self.workspace_documents_menu)
+        self.workspace_documents_button.setMenu(self.workspace_documents_menu)
+        layout.addWidget(self.workspace_documents_button)
+
         self.workspace_mode_combo = _TopBarModeCombo()
         self.workspace_mode_combo.setObjectName("workspaceModeCombo")
         self.workspace_mode_combo.setAccessibleName("工作区模式")
@@ -605,7 +1037,36 @@ class QtEditorWindow(QMainWindow):
         self.project_menu = QMenu(self)
         self.project_menu.setObjectName("projectMenu")
         configure_menu(self.project_menu)
-        self.open_project_action = self.project_menu.addAction("打开项目…")
+        self.open_project_action = self.project_menu.addAction("打开本地项目")
+        self.open_project_action.setObjectName("openLocalProjectAction")
+        self.open_project_action.setToolTip(
+            "选择一个文件直接打开；按住 Shift 多选时创建多文档项目"
+        )
+        self.open_workspace_package_action = self.project_menu.addAction(
+            "打开 ProjectPackage"
+        )
+        self.open_workspace_package_action.setObjectName(
+            "openWorkspacePackageAction"
+        )
+        self.open_workspace_package_action.setToolTip(
+            "直接打开一个 ProjectPackage 作为当前项目"
+        )
+        self.import_workspace_package_action = self.project_menu.addAction(
+            "预览并导入 ProjectPackage"
+        )
+        self.import_workspace_package_action.setObjectName(
+            "importWorkspacePackageAction"
+        )
+        self.import_workspace_package_action.setToolTip(
+            "预览并显式应用项目包；Legacy 会先选择导入目标位置，原文件不变"
+        )
+        self.save_workspace_document_action = self.project_menu.addAction(
+            "保存当前章节"
+        )
+        self.save_workspace_document_action.setObjectName(
+            "saveWorkspaceDocumentAction"
+        )
+        self.save_workspace_document_action.setEnabled(False)
         self.recent_projects_menu = self.project_menu.addMenu("最近项目")
         self.recent_projects_menu.setObjectName("recentProjectsMenu")
         configure_menu(self.recent_projects_menu)
@@ -645,13 +1106,17 @@ class QtEditorWindow(QMainWindow):
         return top_bar
 
     def _build_empty_page(self) -> QWidget:
-        page = QWidget()
+        page = _WorkspaceDropPage()
         page.setObjectName("emptyPage")
+        page.setAccessibleName("多文档项目文件拖放区")
+        page.explicitFilesDropped.connect(self._queue_workspace_drop_selection)
+        self.empty_page = page
         layout = QVBoxLayout(page)
         layout.setContentsMargins(80, 60, 80, 80)
         layout.addStretch()
         card = QFrame()
         card.setObjectName("emptyCard")
+        card.setMinimumWidth(620)
         card.setMaximumWidth(680)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(48, 42, 48, 42)
@@ -664,11 +1129,13 @@ class QtEditorWindow(QMainWindow):
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint = QLabel(
-            "打开 JSON/TXT 项目，或载入内置示例体验双栏编辑、翻译记忆与术语建议。"
+            "打开或拖入本地文件；按住 Shift 可多选创建项目。\n"
+            "只导入所选文件，不扫描文件夹或相邻文件。"
         )
         hint.setObjectName("emptyHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setWordWrap(True)
+        hint.setMinimumHeight(48)
         actions = QHBoxLayout()
         actions.addStretch()
         self.empty_open_button = QPushButton("打开本地项目")
@@ -809,6 +1276,24 @@ class QtEditorWindow(QMainWindow):
             object_name="projectSearchStatusPopup",
             accessible_name="段翻译状态选项",
         )
+        self.workspace_search_scope = QComboBox()
+        self.workspace_search_scope.setObjectName("workspaceSearchScope")
+        self.workspace_search_scope.setAccessibleName("多文档搜索范围")
+        self.workspace_search_scope.addItem(
+            "当前章节",
+            SearchScope.CURRENT_DOCUMENT,
+        )
+        self.workspace_search_scope.addItem(
+            "搜索全部章节",
+            SearchScope.ENTIRE_PROJECT,
+        )
+        self.workspace_search_scope.setVisible(False)
+        self.project_search_scope = self.workspace_search_scope
+        configure_combo_popup(
+            self.workspace_search_scope,
+            object_name="workspaceSearchScopePopup",
+            accessible_name="多文档搜索范围选项",
+        )
         self.project_search_match_case = self._project_search_checkbox(
             "Match Case",
             "projectSearchMatchCase",
@@ -838,6 +1323,7 @@ class QtEditorWindow(QMainWindow):
         options_row.addSpacing(8)
         options_row.addWidget(status_label)
         options_row.addWidget(self.project_search_status)
+        options_row.addWidget(self.project_search_scope)
         options_row.addSpacing(8)
         options_row.addWidget(self.project_search_match_case)
         options_row.addWidget(self.project_search_whole_word)
@@ -925,9 +1411,22 @@ class QtEditorWindow(QMainWindow):
         )
         header.addWidget(self.segment_density_combo)
         layout.addLayout(header)
+
+        self.workspace_chapter_title = QLabel("—")
+        self.workspace_chapter_title.setObjectName("workspaceChapterTitle")
+        self.workspace_chapter_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.workspace_chapter_title.setVisible(False)
+        self.chapter_progress_label = self.workspace_chapter_title
+        layout.addWidget(self.workspace_chapter_title)
         self.unconfirmed_filter = QCheckBox("仅显示未确认")
         self.unconfirmed_filter.setObjectName("unconfirmedFilter")
         layout.addWidget(self.unconfirmed_filter)
+        self.workspace_save_feedback = QLabel("项目包尚未保存。")
+        self.workspace_save_feedback.setObjectName("workspaceSaveFeedback")
+        self.workspace_save_feedback.setTextFormat(Qt.TextFormat.PlainText)
+        self.workspace_save_feedback.setWordWrap(True)
+        self.workspace_save_feedback.setVisible(False)
+        layout.addWidget(self.workspace_save_feedback)
         self.segment_list = QListWidget()
         self.segment_list.setObjectName("segmentList")
         self.segment_list.setSpacing(3)
@@ -950,7 +1449,23 @@ class QtEditorWindow(QMainWindow):
         header.addSpacing(10)
         header.addWidget(hint)
         header.addStretch()
+        self.workspace_browse_chapter_title = QLabel("—")
+        self.workspace_browse_chapter_title.setObjectName(
+            "workspaceBrowseChapterTitle"
+        )
+        self.workspace_browse_chapter_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.workspace_browse_chapter_title.setVisible(False)
+        header.addWidget(self.workspace_browse_chapter_title)
         layout.addLayout(header)
+
+        self.workspace_browse_save_feedback = QLabel("项目包尚未保存。")
+        self.workspace_browse_save_feedback.setObjectName(
+            "workspaceBrowseSaveFeedback"
+        )
+        self.workspace_browse_save_feedback.setTextFormat(Qt.TextFormat.PlainText)
+        self.workspace_browse_save_feedback.setWordWrap(True)
+        self.workspace_browse_save_feedback.setVisible(False)
+        layout.addWidget(self.workspace_browse_save_feedback)
 
         self.browse_table = QTableWidget(0, 5)
         self.browse_table.setObjectName("browseTable")
@@ -1136,15 +1651,27 @@ class QtEditorWindow(QMainWindow):
         return panel
 
     def _wire_actions(self) -> None:
-        self.open_button.clicked.connect(self._choose_open)
-        self.open_project_action.triggered.connect(self._choose_open)
+        self.open_button.clicked.connect(self._choose_open_home)
+        self.open_project_action.triggered.connect(self._choose_open_home)
+        self.open_workspace_package_action.triggered.connect(
+            self._choose_open_workspace_package
+        )
+        self.import_workspace_package_action.triggered.connect(
+            self._choose_import_workspace_package
+        )
+        self.save_workspace_document_action.triggered.connect(
+            self.save_workspace_current_document
+        )
+        self.workspace_documents_menu.triggered.connect(
+            self._workspace_document_action_triggered
+        )
         self.speaker_inventory_action.triggered.connect(
             self._open_speaker_inventory_dialog
         )
         self.preprocess_action.triggered.connect(self._open_preprocess_dialog)
         self.close_project_action.triggered.connect(self.close_current_project)
         self.quit_action.triggered.connect(self.close)
-        self.empty_open_button.clicked.connect(self._choose_open)
+        self.empty_open_button.clicked.connect(self._choose_open_home)
         self.sample_button.clicked.connect(self.load_sample)
         self.save_button.clicked.connect(self._choose_save)
         self.settings_button.clicked.connect(self._open_settings)
@@ -1165,6 +1692,9 @@ class QtEditorWindow(QMainWindow):
             self._workspace_mode_changed
         )
         self.browse_table.cellDoubleClicked.connect(self._activate_browse_row)
+        self.browse_table.currentCellChanged.connect(
+            self._browse_current_cell_changed
+        )
         self.project_search_input.returnPressed.connect(
             self._submit_project_search
         )
@@ -1188,6 +1718,9 @@ class QtEditorWindow(QMainWindow):
         self.project_search_status.currentIndexChanged.connect(
             self._project_search_criteria_changed
         )
+        self.project_search_scope.currentIndexChanged.connect(
+            self._project_search_criteria_changed
+        )
         self.project_search_previous.clicked.connect(
             lambda: self._navigate_project_search(-1)
         )
@@ -1202,7 +1735,7 @@ class QtEditorWindow(QMainWindow):
         # remain platform-primary Command+1/2 through portable ``Ctrl``.
         physical_control = "Meta" if sys.platform == "darwin" else "Ctrl"
         bindings = (
-            ("open", ("Ctrl+O",), self._choose_open),
+            ("open", ("Ctrl+O",), self._choose_open_home),
             ("save", ("Ctrl+S",), self._choose_save),
             (
                 "confirm",
@@ -1261,7 +1794,7 @@ class QtEditorWindow(QMainWindow):
         self._update_shortcut_tooltips()
 
     def _cycle_suggestion_tab(self, direction: int) -> None:
-        if not self.controller.has_project or not self.suggestion_tabs.isEnabled():
+        if not self._has_active_project() or not self.suggestion_tabs.isEnabled():
             return
         count = self.suggestion_tabs.count()
         if count > 1:
@@ -1270,12 +1803,12 @@ class QtEditorWindow(QMainWindow):
             )
 
     def _set_workspace_mode_from_shortcut(self, mode: WorkspaceMode) -> None:
-        if not self.controller.has_project or not self.workspace_mode_combo.isEnabled():
+        if not self._has_active_project() or not self.workspace_mode_combo.isEnabled():
             return
         self.set_workspace_mode(mode)
 
     def _toggle_segment_density_from_shortcut(self) -> None:
-        if not self.controller.has_project or not self.segment_density_combo.isEnabled():
+        if not self._has_active_project() or not self.segment_density_combo.isEnabled():
             return
         target = (
             SegmentDensity.WRAPPED
@@ -1340,6 +1873,7 @@ class QtEditorWindow(QMainWindow):
         self.project_search_toggle.setToolTip(
             f"展开或收起项目搜索 ({project_search_shortcut})"
         )
+        self.workspace_documents_button.setToolTip("显示项目内文档")
         self.project_search_input.setToolTip(
             f"输入非空关键词并按 Enter 搜索当前 JSON 项目 ({project_search_shortcut})"
         )
@@ -1348,7 +1882,7 @@ class QtEditorWindow(QMainWindow):
         )
 
     def _toggle_project_search_shortcut(self) -> None:
-        if not self.controller.has_project:
+        if not self._has_active_project():
             return
         if self.project_search_panel.isVisible():
             self._set_project_search_expanded(False)
@@ -1372,7 +1906,7 @@ class QtEditorWindow(QMainWindow):
         *,
         focus: bool = False,
     ) -> None:
-        visible = bool(expanded and self.controller.has_project)
+        visible = bool(expanded and self._has_active_project())
         self._project_search_expanded = visible
         self.source_display.setMinimumHeight(96 if visible else 155)
         self.target_editor.setMinimumHeight(100 if visible else 190)
@@ -1392,14 +1926,20 @@ class QtEditorWindow(QMainWindow):
         if self._refreshing:
             return
         if self.current_project_search_report is None:
-            self.controller.clear_project_search()
+            if self.controller.has_workspace:
+                self.controller.clear_workspace_search()
+            else:
+                self.controller.clear_project_search()
             return
         self._clear_project_search_results(
             "搜索条件已变化；请重新搜索。"
         )
 
     def _clear_project_search(self) -> None:
-        self.controller.clear_project_search()
+        if self.controller.has_workspace:
+            self.controller.clear_workspace_search()
+        else:
+            self.controller.clear_project_search()
         blocker = QSignalBlocker(self.project_search_input)
         try:
             self.project_search_input.clear()
@@ -1524,6 +2064,85 @@ class QtEditorWindow(QMainWindow):
         self._display_preferences = saved_preferences
         return True
 
+    def _has_active_project(self) -> bool:
+        return self.controller.has_active_project
+
+    def _active_index(self) -> int:
+        return (
+            self.controller.workspace_global_index
+            if self.controller.has_workspace
+            else self.controller.current_index
+        )
+
+    def _active_segments(self) -> tuple[EditorSegment, ...]:
+        if not self.controller.has_workspace:
+            return self.controller.project.segments
+        return tuple(
+            EditorSegment(
+                id=item.identity.local_segment_id,
+                source=item.source,
+                target=item.target,
+                speaker=item.raw_speaker,
+                confirmed=item.confirmed,
+            )
+            for item in self.controller.workspace_view.segments
+        )
+
+    def _active_project_name(self) -> str:
+        return (
+            self.controller.workspace_view.name
+            if self.controller.has_workspace
+            else self.controller.project.name
+        )
+
+    def _active_locales(self) -> tuple[str, str]:
+        if self.controller.has_workspace:
+            view = self.controller.workspace_view
+            return view.source_locale, view.target_locale
+        project = self.controller.project
+        return project.source_locale, project.target_locale
+
+    def _active_dirty(self) -> bool:
+        return self.controller.active_project_dirty
+
+    def _active_confirmed_count(self) -> int:
+        if self.controller.has_workspace:
+            return self.controller.workspace_project_progress.confirmed_segments
+        return self.controller.confirmed_count
+
+    def _workspace_current_document(self):
+        view = self.controller.workspace_view
+        current = view.current_segment.document
+        return next(item for item in view.documents if item.identity is current)
+
+    def _set_workspace_save_feedback(self, text: str) -> None:
+        """Keep the edit and browse feedback projections identical."""
+
+        self.workspace_save_feedback.setText(text)
+        self.workspace_browse_save_feedback.setText(text)
+
+    @staticmethod
+    def _workspace_error_text(error: EditorControllerError | OSError) -> str:
+        """Render only frozen Controller codes or a body-free I/O fallback."""
+
+        if isinstance(error, EditorControllerError):
+            candidate = str(error)
+            parts = candidate.split(".")
+            if (
+                1 < len(parts) <= 8
+                and parts[0] == "PROJECT"
+                and len(candidate) <= 128
+                and all(
+                    part
+                    and part.isascii()
+                    and part == part.upper()
+                    and part.replace("_", "").isalnum()
+                    for part in parts
+                )
+            ):
+                return candidate
+        return "本地 I/O 操作失败；为保护项目正文，未显示底层错误内容"
+
     def _show_empty_state(self) -> None:
         self._set_project_search_expanded(False)
         self.pages.setCurrentIndex(0)
@@ -1537,6 +2156,19 @@ class QtEditorWindow(QMainWindow):
         self.preprocess_action.setEnabled(False)
         self.workspace_mode_combo.setEnabled(False)
         self.segment_density_combo.setEnabled(False)
+        self.chapter_progress_label.setVisible(False)
+        self.workspace_browse_chapter_title.setVisible(False)
+        self.workspace_save_feedback.setVisible(False)
+        self.workspace_browse_save_feedback.setVisible(False)
+        self.project_search_scope.setVisible(False)
+        self.workspace_documents_button.setEnabled(False)
+        self.workspace_documents_menu.clear()
+        self.import_workspace_package_action.setEnabled(False)
+        self.save_workspace_document_action.setEnabled(False)
+        self._workspace_package_import_preview = None
+        self._workspace_package_import_source = None
+        self._workspace_package_import_can_apply = False
+        self._workspace_package_preview_text = "尚未预览导入包。"
         self._clear_project_search_results("打开 JSON 项目后可搜索。")
         self._refresh_project_search_controls()
         self.statusBar().showMessage("打开本地项目或载入示例以开始。")
@@ -1563,6 +2195,238 @@ class QtEditorWindow(QMainWindow):
         self.statusBar().showMessage(f"已打开：{path}", 5000)
         return True
 
+    def open_workspace_package_path(self, path: Path) -> bool:
+        """Cold-open a real ProjectPackage through the Controller surface."""
+
+        if not self._confirm_unsaved():
+            return False
+        try:
+            self.controller.open_project_package(path)
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            self._show_error("无法打开项目包", safe_error)
+            self.statusBar().showMessage(
+                "ProjectPackage 打开失败；当前会话保持不变。",
+                7000,
+            )
+            return False
+        self._render_project()
+        self.refresh_recent_projects()
+        self._set_workspace_save_feedback(
+            "LocalCAT项目包已打开 · 源文件只读。"
+        )
+        self.statusBar().showMessage(f"已打开项目包：{path}", 5000)
+        return True
+
+    def open_project_package_path(self, path: Path) -> bool:
+        """Stable C4 command name for opening a ProjectPackage."""
+
+        return self.open_workspace_package_path(path)
+
+    def create_workspace_from_selected_files(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        destination: Path,
+        *,
+        name: str,
+        source_locale: str,
+        target_locale: str,
+    ) -> bool:
+        """Create one package from an explicit ordered selection, never a folder scan."""
+
+        if not self._confirm_unsaved():
+            return False
+        try:
+            result = self.controller.create_workspace_package(
+                root,
+                selected_paths,
+                destination,
+                name=name,
+                source_locale=source_locale,
+                target_locale=target_locale,
+            )
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            self._show_error("无法新建多文档项目", safe_error)
+            self.statusBar().showMessage(
+                "多文档项目未创建；当前会话和所选源文件保持不变。",
+                7000,
+            )
+            return False
+        self._render_project()
+        self.refresh_recent_projects()
+        self._set_workspace_save_feedback(
+            f"LocalCAT项目包已保存 · {result.receipt.document_count} 个章节 · "
+            "源文件只读。"
+        )
+        self.statusBar().showMessage(
+            f"已创建 ProjectPackage · {result.receipt.document_count} 个章节 · "
+            f"{result.receipt.segment_count} 个段落。",
+            7000,
+        )
+        return True
+
+    def create_workspace_project_from_selected_files(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        request: object,
+        destination: Path,
+    ) -> bool:
+        """Forward a C2 intake request through Controller without scanning root."""
+
+        if not self._confirm_unsaved():
+            return False
+        try:
+            result = self.controller.create_workspace_project_from_selected_files(
+                root,
+                selected_paths,
+                request,
+                destination,
+            )
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            self._show_error("无法新建多文档项目", safe_error)
+            self.statusBar().showMessage(
+                "多文档项目未创建；当前会话和所选源文件保持不变。",
+                7000,
+            )
+            return False
+        self._render_project()
+        self.refresh_recent_projects()
+        self._set_workspace_save_feedback(
+            f"LocalCAT项目包已保存 · {result.receipt.document_count} 个章节 · "
+            "源文件只读。"
+        )
+        self.statusBar().showMessage(
+            f"已创建 ProjectPackage · {result.receipt.document_count} 个章节。",
+            7000,
+        )
+        return True
+
+    def import_workspace_package_path(
+        self,
+        source: Path,
+        *,
+        destination: Path | None = None,
+    ) -> bool:
+        """Preview through the Project menu; apply remains explicit."""
+
+        if not self.controller.has_active_project:
+            self._set_workspace_save_feedback(
+                "PROJECT.PACKAGE.NO_ACTIVE_WORKSPACE · 未导入，可重试。"
+            )
+            return False
+        return self.preview_workspace_package_import_path(
+            source,
+            destination=destination,
+        )
+
+    def preview_workspace_package_import_path(
+        self,
+        source: Path,
+        *,
+        destination: Path | None = None,
+    ) -> bool:
+        """Render only receipt-safe package metadata before explicit apply."""
+
+        if not self.controller.has_active_project:
+            self._set_workspace_save_feedback(
+                "PROJECT.PACKAGE.NO_ACTIVE_WORKSPACE · 未导入，可重试。"
+            )
+            return False
+        if not self.controller.has_workspace and destination is None:
+            self._set_workspace_save_feedback(
+                "PROJECT.PACKAGE.DESTINATION_REQUIRED · Legacy 原文件未修改。"
+            )
+            return False
+        try:
+            preview = self.controller.preview_workspace_package_import(
+                source,
+                destination=destination,
+            )
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            self._workspace_package_import_preview = None
+            self._workspace_package_import_can_apply = False
+            self._workspace_package_preview_text = "预览失败；未应用任何更改。"
+            self._set_workspace_save_feedback(
+                f"{safe_error} · 项目包未导入，可重试。"
+            )
+            self._show_error("无法预览项目包", safe_error)
+            return False
+        self._workspace_package_import_preview = preview
+        self._workspace_package_import_source = (source, destination)
+        blockers = len(preview.blocking_reasons) + len(
+            preview.required_decision_identities
+        )
+        warnings = "、".join(preview.safe_warnings) or "无"
+        blocking_reasons = "、".join(preview.blocking_reasons) or "无"
+        self._workspace_package_preview_text = (
+            f"项目：{preview.project_name} · ID：{preview.project_id} · "
+            f"文档：{preview.document_count} · 段落：{preview.segment_count}\n"
+            f"reconciliation：未变 {preview.unchanged_count} · "
+            f"源变化 {preview.source_changed_count} · 新增 {preview.new_count} · "
+            f"移除 {preview.removed_count} · 歧义 {preview.ambiguous_count} · "
+            f"未解决 {preview.unresolved_count}\n"
+            f"警告：{len(preview.safe_warnings)}（{warnings}） · "
+            f"阻断：{blockers}（{blocking_reasons}）。"
+            "只有显式应用后才会发布。"
+        )
+        self._workspace_package_import_can_apply = blockers == 0
+        self.statusBar().showMessage("ProjectPackage preview 已就绪。", 5000)
+        return True
+
+    def apply_workspace_package_import(self) -> bool:
+        """Apply only the currently issued preview and keep it retryable on failure."""
+
+        preview = self._workspace_package_import_preview
+        if preview is None:
+            retry = self._workspace_package_import_source
+            if retry is None:
+                self._set_workspace_save_feedback(
+                    "请先选择并预览 ProjectPackage，再显式应用。"
+                )
+                return False
+            if not self.preview_workspace_package_import_path(
+                retry[0],
+                destination=retry[1],
+            ):
+                return False
+            preview = self._workspace_package_import_preview
+        if preview is None or not self._workspace_package_import_can_apply:
+            return False
+        try:
+            result = self.controller.apply_workspace_package_import(preview)
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            self._workspace_package_import_preview = None
+            self._set_workspace_save_feedback(
+                f"{safe_error} · 项目包未导入，未保存更改仍在；"
+                "下次应用将先重新预览，可重试。"
+            )
+            self._workspace_package_import_can_apply = (
+                self._workspace_package_import_source is not None
+            )
+            self._show_error("项目包应用失败", safe_error)
+            return False
+        self._workspace_package_import_preview = None
+        self._workspace_package_import_source = None
+        self._workspace_package_import_can_apply = False
+        if result.active_session_changed:
+            self._render_project()
+        self._workspace_package_preview_text = "导入已应用；如需继续请重新预览。"
+        self._set_workspace_save_feedback(
+            f"ProjectPackage 导入 receipt 已持久化 · "
+            f"{result.receipt.document_count} 个文档 · 源文件只读。"
+        )
+        self.statusBar().showMessage(
+            "ProjectPackage 已验证、发布并冷重开。",
+            7000,
+        )
+        return True
+
     def save_project_path(self, path: Path) -> bool:
         try:
             self.controller.save_project(path)
@@ -1576,27 +2440,156 @@ class QtEditorWindow(QMainWindow):
         self.statusBar().showMessage(f"已保存：{path}", 7000)
         return True
 
+    def save_workspace_package(self) -> bool:
+        """Persist the current package and project its structured outcome."""
+
+        try:
+            result = self.controller.save_workspace_package()
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            affected = self._dirty_workspace_display_names()
+            self._set_workspace_save_feedback(
+                f"{safe_error} · 受影响章节：{affected} · 项目包未保存，"
+                "当前会话保留，可重试。"
+            )
+            self._show_error("无法保存项目包", safe_error)
+            self.statusBar().showMessage(
+                "项目包保存失败；未证明持久化的章节仍保持未保存状态。",
+                7000,
+            )
+            return False
+        return self._finish_workspace_save(result)
+
+    def save_workspace_project_package(self) -> bool:
+        """Stable C4 command for a full ProjectPackage save."""
+
+        return self.save_workspace_package()
+
+    def save_workspace_current_document(self) -> bool:
+        """Persist only the active issued document into the package overlay."""
+
+        if not self.controller.has_workspace:
+            return False
+        document = self.controller.current_workspace_identity.document
+        try:
+            result = self.controller.save_workspace_document(document)
+        except (EditorControllerError, OSError) as exc:
+            safe_error = self._workspace_error_text(exc)
+            current_name = self._workspace_current_document().display_name
+            self._set_workspace_save_feedback(
+                f"{safe_error} · 受影响章节：{current_name} · 当前章节未保存，"
+                "当前会话保留，可重试。"
+            )
+            self._show_error("无法保存当前章节", safe_error)
+            return False
+        return self._finish_workspace_save(result)
+
+    def _dirty_workspace_display_names(self) -> str:
+        dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
+        names = tuple(
+            document.display_name
+            for document in self.controller.workspace_view.documents
+            if document.identity.document_id in dirty_ids
+        )
+        return "、".join(names) or "项目级元数据"
+
+    def _finish_workspace_save(self, result: object) -> bool:
+        report = result.save_report
+        document_names = {
+            document.identity.document_id: document.display_name
+            for document in self.controller.workspace_view.documents
+        }
+        dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
+        document_summary = "、".join(
+            f"{document_names.get(item.document_id, item.document_id)}:"
+            f"{item.status.value}"
+            + (f"({item.safe_code})" if item.safe_code is not None else "")
+            + ("·仍未保存" if item.document_id in dirty_ids else "")
+            for item in report.document_results
+        )
+        if report.recovery_required:
+            code = report.safe_code or "PROJECT.SAVE.RECOVERY_REQUIRED"
+            self._set_workspace_save_feedback(
+                f"{code} · {document_summary} · 项目包未证明已保存，"
+                "请执行恢复后重试。"
+            )
+            self._show_error("项目包需要恢复", code)
+            self.statusBar().showMessage(
+                f"项目包发布状态需恢复：{code}。",
+                7000,
+            )
+            self._render_project()
+            return False
+        noncommitted = tuple(
+            item
+            for item in report.document_results
+            if item.status.value in {"failed", "rolled_back"}
+        )
+        if noncommitted or report.retryable or report.safe_code is not None:
+            code = report.safe_code or "PROJECT.SAVE.COMMIT_FAILED"
+            self._set_workspace_save_feedback(
+                f"{code} · {document_summary} · "
+                "项目包未完全保存，可重试。"
+            )
+            self._show_error("部分章节未保存", code)
+            self._render_project()
+            return False
+        self._render_project()
+        self.refresh_recent_projects()
+        self._set_workspace_save_feedback(
+            f"LocalCAT项目包已保存 · {report.requested_count} 个章节 · "
+            f"源文件只读。{document_summary}"
+        )
+        self.statusBar().showMessage(
+            f"ProjectPackage 已保存 · {report.requested_count} 个请求章节。",
+            7000,
+        )
+        return True
+
     def refresh_recent_projects(self) -> None:
         """Rebuild the project menu from controller-owned local workspace state."""
 
         self.recent_projects_menu.clear()
-        recent = self.controller.recent_projects()
-        if not recent:
+        legacy = self.controller.recent_projects()
+        workspaces = self.controller.recent_workspace_projects()
+        if not legacy and not workspaces:
             empty = self.recent_projects_menu.addAction("暂无最近项目")
             empty.setEnabled(False)
             return
-        for project in recent:
+        for project, is_workspace in (
+            *((project, True) for project in workspaces),
+            *((project, False) for project in legacy),
+        ):
             action = self.recent_projects_menu.addAction(
                 f"{project.path.name}  —  {project.path.parent}"
             )
             action.setData(str(project.path))
             action.setToolTip(str(project.path))
             action.triggered.connect(
-                lambda _checked=False, path=project.path: self.open_recent_project(path)
+                lambda _checked=False, path=project.path, workspace=is_workspace: (
+                    self._open_recent_project_by_kind(path, workspace=workspace)
+                )
             )
 
     def open_recent_project(self, path: Path) -> bool:
-        """Open a remembered project, pruning entries that no longer exist."""
+        """Open a remembered project by its persisted kind, never by suffix."""
+
+        normalized = path.expanduser().resolve()
+        workspace_paths = {
+            project.path for project in self.controller.recent_workspace_projects()
+        }
+        return self._open_recent_project_by_kind(
+            normalized,
+            workspace=normalized in workspace_paths,
+        )
+
+    def _open_recent_project_by_kind(
+        self,
+        path: Path,
+        *,
+        workspace: bool,
+    ) -> bool:
+        """Dispatch one typed recent entry and prune it when its file vanished."""
 
         normalized = path.expanduser().resolve()
         if not normalized.is_file():
@@ -1607,12 +2600,14 @@ class QtEditorWindow(QMainWindow):
             self.refresh_recent_projects()
             self._show_error("最近项目不可用", f"项目文件不存在：{normalized}")
             return False
+        if workspace:
+            return self.open_workspace_package_path(normalized)
         return self.open_project_path(normalized)
 
     def close_current_project(self) -> bool:
         """Return to the empty workspace after applying the unsaved guard."""
 
-        if not self.controller.has_project:
+        if not self._has_active_project():
             return True
         if not self._confirm_unsaved():
             return False
@@ -1641,7 +2636,185 @@ class QtEditorWindow(QMainWindow):
         )
         return bool(selected) and self.open_project_path(Path(selected))
 
+    def _choose_open_home(self) -> bool:
+        selected, _ = QFileDialog.getOpenFileNames(
+            self,
+            "打开本地项目（Shift 可多选）",
+            "",
+            "Local project documents (*)",
+        )
+        selected_paths = tuple(Path(path).expanduser() for path in selected)
+        if len(selected_paths) == 1:
+            return self.open_project_path(selected_paths[0])
+        return self._review_and_create_workspace_from_selected_paths(
+            selected_paths
+        )
+
+    def _choose_open_workspace_package(self) -> bool:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "打开 LocalCAT ProjectPackage",
+            "",
+            "LocalCAT ProjectPackage (*.localcat-project *.zip)",
+        )
+        return bool(selected) and self.open_workspace_package_path(Path(selected))
+
+    def _choose_create_workspace(self) -> bool:
+        selected, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Shift 多选项目文档",
+            "",
+            "Project documents (*)",
+        )
+        return self._review_and_create_workspace_from_selected_paths(
+            tuple(Path(path).expanduser() for path in selected)
+        )
+
+    def _queue_workspace_drop_selection(self, selected: object) -> None:
+        """Leave the native drop event before opening or reviewing files."""
+
+        if self._has_active_project() or type(selected) is not tuple:
+            return
+        selected_paths = tuple(
+            path for path in selected if isinstance(path, Path)
+        )
+        if len(selected_paths) != len(selected):
+            return
+        QTimer.singleShot(
+            0,
+            lambda paths=selected_paths: self._open_or_review_home_selection(
+                paths
+            ),
+        )
+
+    def _open_or_review_home_selection(
+        self,
+        selected_paths: tuple[Path, ...],
+    ) -> bool:
+        if self._has_active_project() or not selected_paths:
+            return False
+        if len(selected_paths) == 1:
+            return self.open_project_path(selected_paths[0])
+        return self._review_and_create_workspace_from_selected_paths(
+            selected_paths
+        )
+
+    def _review_and_create_workspace_from_selected_paths(
+        self,
+        selected_paths: tuple[Path, ...],
+    ) -> bool:
+        """Run the one review/save workflow shared by picker and drop."""
+
+        if len(selected_paths) < 2:
+            self.statusBar().showMessage("多文档项目至少需要显式选择两个文件。", 6000)
+            return False
+        if type(selected_paths) is not tuple or any(
+            not isinstance(path, Path) for path in selected_paths
+        ):
+            self.statusBar().showMessage("多文档选择无效。", 6000)
+            return False
+        path_identities = tuple(
+            os.path.normcase(os.path.abspath(str(path)))
+            for path in selected_paths
+        )
+        if len(set(path_identities)) != len(path_identities):
+            self.statusBar().showMessage("多文档选择不能包含重复文件。", 6000)
+            return False
+        root = Path(
+            os.path.commonpath(
+                tuple(str(path.parent) for path in selected_paths)
+            )
+        )
+        review = QtWorkspaceCreationDialog(
+            selected_paths,
+            default_name="project",
+            parent=self,
+        )
+        if review.exec() != QDialog.DialogCode.Accepted:
+            return False
+        project_name = review.project_name_input.text().strip()
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存 LocalCAT ProjectPackage",
+            str(root / f"{project_name}.localcat-project"),
+            "LocalCAT ProjectPackage (*.localcat-project)",
+        )
+        if not destination:
+            return False
+        target = Path(destination)
+        return self.create_workspace_from_selected_files(
+            root,
+            review.ordered_paths,
+            target,
+            name=project_name,
+            source_locale=review.source_locale,
+            target_locale=review.target_locale,
+        )
+
+    def _choose_import_workspace_package(self) -> bool:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 LocalCAT ProjectPackage",
+            "",
+            "LocalCAT ProjectPackage (*.localcat-project *.zip)",
+        )
+        if not selected:
+            return False
+        destination = None
+        if not self.controller.has_workspace:
+            if not self._confirm_unsaved():
+                return False
+            legacy_path = self.controller.project.path
+            suggested = (
+                str(legacy_path.with_suffix(".localcat-project"))
+                if legacy_path is not None
+                else f"{self.controller.project.name}.localcat-project"
+            )
+            destination_text, _ = QFileDialog.getSaveFileName(
+                self,
+                "导入 ProjectPackage 保存为",
+                suggested,
+                "LocalCAT ProjectPackage (*.localcat-project)",
+            )
+            if not destination_text:
+                return False
+            destination = Path(destination_text)
+        if not self.import_workspace_package_path(
+            Path(selected),
+            destination=destination,
+        ):
+            return False
+        preview = self._workspace_package_import_preview
+        if preview is None:
+            return False
+        dialog = QtWorkspacePackageImportDialog(
+            mode=preview.mode.value,
+            current_project_name=self._active_project_name(),
+            incoming_project_name=preview.project_name,
+            incoming_project_id=preview.project_id,
+            document_count=preview.document_count,
+            segment_count=preview.segment_count,
+            reconciliation_counts=(
+                preview.unchanged_count,
+                preview.source_changed_count,
+                preview.new_count,
+                preview.removed_count,
+                preview.ambiguous_count,
+                preview.unresolved_count,
+            ),
+            warnings=preview.safe_warnings,
+            blocking_reasons=preview.blocking_reasons,
+            required_decision_count=len(preview.required_decision_identities),
+            can_apply=self._workspace_package_import_can_apply,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return self.apply_workspace_package_import()
+
     def _choose_save(self) -> bool:
+        if self.controller.has_workspace:
+            return self.save_workspace_package()
         if not self.controller.has_project:
             return False
         current_path = self.controller.project.path
@@ -1667,16 +2840,23 @@ class QtEditorWindow(QMainWindow):
         self.close_project_action.setEnabled(True)
         self.workspace_mode_combo.setEnabled(True)
         self.segment_density_combo.setEnabled(True)
+        self.workspace_documents_button.setEnabled(self.controller.has_workspace)
+        self.import_workspace_package_action.setEnabled(
+            self.controller.has_active_project
+        )
+        self.save_workspace_document_action.setEnabled(
+            self.controller.has_workspace
+        )
         self._clear_project_search_results()
         self._refresh_project_tool_actions()
         self._refreshing = True
         try:
-            project = self.controller.project
-            self.project_name_label.setText(project.name)
-            self.language_label.setText(
-                f"{project.source_locale}  →  {project.target_locale}"
-            )
-            self.segment_count_label.setText(str(len(project.segments)))
+            source_locale, target_locale = self._active_locales()
+            self.project_name_label.setText(self._active_project_name())
+            self.language_label.setText(f"{source_locale}  →  {target_locale}")
+            self.segment_count_label.setText(str(len(self._active_segments())))
+            self._refresh_workspace_documents_menu()
+            self.project_search_scope.setVisible(self.controller.has_workspace)
             self._populate_segment_list()
             self._render_current_segment()
         finally:
@@ -1684,9 +2864,79 @@ class QtEditorWindow(QMainWindow):
         self.set_workspace_mode(self.workspace_mode, persist=False)
         self._update_title()
 
+    def _refresh_workspace_documents_menu(self) -> None:
+        self.workspace_documents_menu.clear()
+        if not self.controller.has_workspace:
+            self.workspace_documents_button.setEnabled(False)
+            self.chapter_progress_label.setVisible(False)
+            self.workspace_browse_chapter_title.setVisible(False)
+            self.workspace_save_feedback.setVisible(False)
+            self.workspace_browse_save_feedback.setVisible(False)
+            return
+        view = self.controller.workspace_view
+        current = self.controller.current_workspace_identity.document
+        dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
+        file_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        display_name_counts = {
+            document.display_name: sum(
+                candidate.display_name == document.display_name
+                for candidate in view.documents
+            )
+            for document in view.documents
+        }
+        for document in view.documents:
+            dirty = (
+                " · 未保存"
+                if document.identity.document_id in dirty_ids
+                else ""
+            )
+            is_current = document.identity is current
+            visible_name = document.display_name
+            if display_name_counts[document.display_name] > 1:
+                visible_name = (
+                    f"{document.display_name} — {document.source_ref}"
+                )
+            action = self.workspace_documents_menu.addAction(
+                file_icon,
+                f"{visible_name}{dirty}"
+                f"{'    ✓' if is_current else ''}",
+            )
+            action.setData(document.identity)
+            action.setCheckable(True)
+            action.setChecked(is_current)
+            action.setToolTip(
+                f"{document.source_ref} · "
+                f"{document.progress.confirmed_segments} / "
+                f"{document.progress.total_segments} 已确认"
+            )
+        self.workspace_documents_button.setEnabled(True)
+        self.chapter_progress_label.setVisible(True)
+        self.workspace_browse_chapter_title.setVisible(True)
+        self.workspace_save_feedback.setVisible(True)
+        self.workspace_browse_save_feedback.setVisible(True)
+
+    def _workspace_document_action_triggered(self, action: QAction) -> None:
+        if self._refreshing or not self.controller.has_workspace:
+            return
+        identity = action.data()
+        try:
+            self.controller.select_workspace_document(identity)
+        except (TypeError, EditorControllerError) as exc:
+            self._show_error("无法切换文档", str(exc))
+            self._refresh_workspace_documents_menu()
+            return
+        self._refreshing = True
+        try:
+            self._select_project_index(self.controller.workspace_global_index)
+            self._render_current_segment()
+            if self.workspace_mode is WorkspaceMode.BROWSE:
+                self._refresh_browse_table()
+        finally:
+            self._refreshing = False
+
     def _render_current_segment(self, *, reset_target_history: bool = True) -> None:
         segment = self.controller.current_segment
-        project = self.controller.project
+        segments = self._active_segments()
         speaker_text = segment.speaker or "无 speaker"
         self.speaker_display.setText(speaker_text)
         self.speaker_display.setAccessibleName(f"当前段 raw speaker：{speaker_text}")
@@ -1696,21 +2946,44 @@ class QtEditorWindow(QMainWindow):
         self.source_display.setPlainText(segment.source)
         if reset_target_history:
             self._replace_target_text(segment.target)
-        self.segment_position_label.setText(
-            f"{self.controller.current_index + 1} / {len(project.segments)}"
-        )
+        if self.controller.has_workspace:
+            current_document = self._workspace_current_document()
+            current_view = self.controller.workspace_view.segments[
+                self.controller.workspace_global_index
+            ]
+            self.segment_position_label.setText(
+                f"文档内 {current_view.document_local_index + 1} / "
+                f"{current_document.progress.total_segments} · 全项目 "
+                f"{current_view.project_global_index + 1} / {len(segments)}"
+            )
+            self.chapter_progress_label.setText(
+                f"{current_document.display_name} · "
+                f"{current_document.progress.confirmed_segments} / "
+                f"{current_document.progress.total_segments} 已确认"
+            )
+            self.workspace_browse_chapter_title.setText(
+                f"当前文档 · {current_document.display_name}"
+            )
+            self._refresh_workspace_documents_menu()
+        else:
+            self.segment_position_label.setText(
+                f"{self.controller.current_index + 1} / {len(segments)}"
+            )
         self.confirmation_label.setText("已确认" if segment.confirmed else "待确认")
         self.confirmation_label.setProperty("confirmed", segment.confirmed)
         self.confirmation_label.style().unpolish(self.confirmation_label)
         self.confirmation_label.style().polish(self.confirmation_label)
-        self.progress_bar.setRange(0, len(project.segments))
-        self.progress_bar.setValue(self.controller.confirmed_count)
+        self.progress_bar.setRange(0, len(segments))
+        self.progress_bar.setValue(self._active_confirmed_count())
         self.refresh_suggestions()
 
     def _target_changed(self) -> None:
-        if self._refreshing or not self.controller.has_project:
+        if self._refreshing or not self._has_active_project():
             return
-        self.controller.update_target(self.target_editor.toPlainText())
+        if self.controller.has_workspace:
+            self.controller.update_workspace_target(self.target_editor.toPlainText())
+        else:
+            self.controller.update_target(self.target_editor.toPlainText())
         if self.current_project_search_report is not None:
             self._clear_project_search_results(
                 "搜索结果已过期；请按当前项目内容重新搜索。"
@@ -1722,7 +2995,7 @@ class QtEditorWindow(QMainWindow):
             finally:
                 self._refreshing = False
         else:
-            self._update_segment_item(self.controller.current_index)
+            self._update_segment_item(self._active_index())
         self._render_progress_state()
         self._update_title()
 
@@ -1732,32 +3005,86 @@ class QtEditorWindow(QMainWindow):
         self.confirmation_label.setProperty("confirmed", segment.confirmed)
         self.confirmation_label.style().unpolish(self.confirmation_label)
         self.confirmation_label.style().polish(self.confirmation_label)
-        self.progress_bar.setValue(self.controller.confirmed_count)
+        self.progress_bar.setValue(self._active_confirmed_count())
+        if self.controller.has_workspace:
+            self._refresh_workspace_documents_menu()
 
     def _update_segment_item(self, project_index: int) -> None:
+        issued_identity = (
+            self.controller.workspace_view.segments[project_index].identity
+            if self.controller.has_workspace
+            else project_index
+        )
         for row in range(self.segment_list.count()):
             item = self.segment_list.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) != project_index:
+            item_identity = item.data(Qt.ItemDataRole.UserRole)
+            if (
+                item_identity is not issued_identity
+                if self.controller.has_workspace
+                else item_identity != issued_identity
+            ):
                 continue
-            segment = self.controller.project.segments[project_index]
+            segment = self._active_segments()[project_index]
             item.setText(self._segment_item_text(project_index, segment))
             item.setSizeHint(self._segment_item_size_hint(item.text()))
             break
 
     def _populate_segment_list(self) -> None:
         self.segment_list.clear()
-        project = self.controller.project
+        segments = self._active_segments()
         unconfirmed_only = self.unconfirmed_filter.isChecked()
         selected_row = -1
-        for index, segment in enumerate(project.segments):
+        workspace_view = (
+            self.controller.workspace_view if self.controller.has_workspace else None
+        )
+        if workspace_view is not None:
+            file_icon = self.style().standardIcon(
+                QStyle.StandardPixmap.SP_FileIcon
+            )
+            for document in workspace_view.documents:
+                document_segments = tuple(
+                    item
+                    for item in workspace_view.segments
+                    if item.identity.document is document.identity
+                    and (not unconfirmed_only or not item.confirmed)
+                )
+                if not document_segments:
+                    continue
+                divider = QListWidgetItem(file_icon, document.display_name)
+                divider.setFlags(
+                    divider.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                )
+                divider.setData(Qt.ItemDataRole.UserRole, None)
+                divider.setBackground(QColor("#dcecf5"))
+                divider.setForeground(QColor("#0b5e80"))
+                divider_font = divider.font()
+                divider_font.setBold(True)
+                divider.setFont(divider_font)
+                divider.setToolTip(document.display_name)
+                divider.setSizeHint(QSize(0, 44))
+                self.segment_list.addItem(divider)
+                for item_view in document_segments:
+                    index = item_view.project_global_index
+                    segment = segments[index]
+                    item = QListWidgetItem(self._segment_item_text(index, segment))
+                    item.setData(Qt.ItemDataRole.UserRole, item_view.identity)
+                    item.setToolTip(segment.source)
+                    item.setSizeHint(self._segment_item_size_hint(item.text()))
+                    self.segment_list.addItem(item)
+                    if index == self._active_index():
+                        selected_row = self.segment_list.count() - 1
+            self.segment_list.setCurrentRow(selected_row)
+            return
+        for index, segment in enumerate(segments):
             if unconfirmed_only and segment.confirmed:
                 continue
-            item = QListWidgetItem(self._segment_item_text(index, segment))
+            text = self._segment_item_text(index, segment)
+            item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, index)
             item.setToolTip(segment.source)
             item.setSizeHint(self._segment_item_size_hint(item.text()))
             self.segment_list.addItem(item)
-            if index == self.controller.current_index:
+            if index == self._active_index():
                 selected_row = self.segment_list.count() - 1
         self.segment_list.setCurrentRow(selected_row)
 
@@ -1773,7 +3100,7 @@ class QtEditorWindow(QMainWindow):
 
     def _segment_item_size_hint(self, text: str) -> QSize:
         if self.segment_density is SegmentDensity.COMPACT:
-            return QSize(0, 44)
+            return QSize(0, 66 if "\n" in text else 44)
         available_width = max(150, self.segment_list.viewport().width() - 28)
         metrics = QFontMetrics(self.segment_list.font())
         bounds = metrics.boundingRect(
@@ -1785,7 +3112,7 @@ class QtEditorWindow(QMainWindow):
 
     def _refresh_segment_item_sizes(self) -> None:
         if (
-            not self.controller.has_project
+            not self._has_active_project()
             or self.segment_density is SegmentDensity.COMPACT
         ):
             return
@@ -1843,7 +3170,7 @@ class QtEditorWindow(QMainWindow):
                 if normalized is SegmentDensity.COMPACT
                 else Qt.TextElideMode.ElideNone
             )
-            if self.controller.has_project:
+            if self._has_active_project():
                 self._populate_segment_list()
         finally:
             self._refreshing = False
@@ -1886,30 +3213,76 @@ class QtEditorWindow(QMainWindow):
             self.workspace_mode_combo.setCurrentIndex(
                 0 if normalized is WorkspaceMode.EDIT else 1
             )
-            if self.controller.has_project:
+            if self._has_active_project():
                 if normalized is WorkspaceMode.BROWSE:
                     self._refresh_browse_table()
                     self.workspace_pages.setCurrentIndex(1)
                 else:
                     self.workspace_pages.setCurrentIndex(0)
-                    self._select_project_index(self.controller.current_index)
+                    self._select_project_index(self._active_index())
         finally:
             self._refreshing = False
         return True
 
     def _refresh_browse_table(self) -> None:
-        if not self.controller.has_project:
+        if not self._has_active_project():
             self.browse_table.clearContents()
             self.browse_table.setRowCount(0)
             return
-        project = self.controller.project
+        segments = self._active_segments()
+        workspace_view = (
+            self.controller.workspace_view if self.controller.has_workspace else None
+        )
         self.browse_table.setUpdatesEnabled(False)
         try:
             self.browse_table.clearContents()
-            self.browse_table.setRowCount(len(project.segments))
-            for index, segment in enumerate(project.segments):
+            row_specs: list[tuple[str, int | None]] = []
+            if workspace_view is not None:
+                for document in workspace_view.documents:
+                    row_specs.append(
+                        (document.display_name, None)
+                    )
+                    row_specs.extend(
+                        ("", item.project_global_index)
+                        for item in workspace_view.segments
+                        if item.identity.document is document.identity
+                    )
+            else:
+                row_specs.extend(("", index) for index in range(len(segments)))
+            self.browse_table.setRowCount(len(row_specs))
+            current_row = 0
+            for row, (document_title, index) in enumerate(row_specs):
+                if index is None:
+                    for column, value in enumerate(
+                        (document_title, "", "", "", "")
+                    ):
+                        item = QTableWidgetItem(value)
+                        item.setFlags(
+                            item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                        )
+                        item.setData(Qt.ItemDataRole.UserRole, None)
+                        item.setBackground(QColor("#dcecf5"))
+                        item.setForeground(QColor("#0b5e80"))
+                        divider_font = item.font()
+                        divider_font.setBold(True)
+                        item.setFont(divider_font)
+                        if column == 0:
+                            item.setIcon(
+                                self.style().standardIcon(
+                                    QStyle.StandardPixmap.SP_FileIcon
+                                )
+                            )
+                        self.browse_table.setItem(row, column, item)
+                    continue
+                segment = segments[index]
+                position = f"{index + 1:03d}"
+                identity: object = index
+                if workspace_view is not None:
+                    view_segment = workspace_view.segments[index]
+                    position = f"{view_segment.document_local_index + 1:03d}"
+                    identity = view_segment.identity
                 values = (
-                    f"{index + 1:03d}",
+                    position,
                     segment.source,
                     segment.target or "—",
                     segment.speaker or "无 speaker",
@@ -1917,27 +3290,70 @@ class QtEditorWindow(QMainWindow):
                 )
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
-                    item.setData(Qt.ItemDataRole.UserRole, index)
+                    item.setData(Qt.ItemDataRole.UserRole, identity)
                     item.setToolTip(value)
-                    self.browse_table.setItem(index, column, item)
+                    self.browse_table.setItem(row, column, item)
+                if index == self._active_index():
+                    current_row = row
         finally:
             self.browse_table.setUpdatesEnabled(True)
         self.browse_table.resizeRowsToContents()
-        self.browse_table.setCurrentCell(self.controller.current_index, 1)
-        current = self.browse_table.item(self.controller.current_index, 1)
+        self.browse_table.setCurrentCell(current_row, 1)
+        current = self.browse_table.item(current_row, 1)
         if current is not None:
             self.browse_table.scrollToItem(
                 current,
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
 
+    def _browse_current_cell_changed(
+        self,
+        current_row: int,
+        _current_column: int,
+        _previous_row: int,
+        _previous_column: int,
+    ) -> None:
+        """Make the selected browse row the current document projection."""
+
+        if self._refreshing or current_row < 0 or not self._has_active_project():
+            return
+        item = self.browse_table.item(current_row, 0)
+        if item is None:
+            return
+        issued = item.data(Qt.ItemDataRole.UserRole)
+        if issued is None:
+            return
+        previous_index = self._active_index()
+        try:
+            if self.controller.has_workspace:
+                self.controller.go_to_workspace_segment(issued)
+            else:
+                self.controller.go_to(int(issued))
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self._show_error("无法选择浏览段落", str(exc))
+            return
+        self._refreshing = True
+        try:
+            self._select_project_index(self._active_index())
+            self._render_current_segment(
+                reset_target_history=(self._active_index() != previous_index)
+            )
+        finally:
+            self._refreshing = False
+
     def _activate_browse_row(self, row: int, _column: int) -> None:
         item = self.browse_table.item(row, 0)
         if item is None:
             return
-        previous_index = self.controller.current_index
+        previous_index = self._active_index()
         try:
-            self.controller.go_to(int(item.data(Qt.ItemDataRole.UserRole)))
+            issued = item.data(Qt.ItemDataRole.UserRole)
+            if issued is None:
+                return
+            if self.controller.has_workspace:
+                self.controller.go_to_workspace_segment(issued)
+            else:
+                self.controller.go_to(int(issued))
         except (TypeError, ValueError, EditorControllerError) as exc:
             self._show_error("无法打开浏览段落", str(exc))
             return
@@ -1945,10 +3361,10 @@ class QtEditorWindow(QMainWindow):
             return
         self._refreshing = True
         try:
-            self._select_project_index(self.controller.current_index)
+            self._select_project_index(self._active_index())
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
         finally:
@@ -1958,7 +3374,7 @@ class QtEditorWindow(QMainWindow):
         if self.segment_density is SegmentDensity.WRAPPED:
             QTimer.singleShot(0, self._refresh_segment_item_sizes)
         if (
-            self.controller.has_project
+            self._has_active_project()
             and self.workspace_mode is WorkspaceMode.BROWSE
         ):
             QTimer.singleShot(0, self.browse_table.resizeRowsToContents)
@@ -1969,68 +3385,99 @@ class QtEditorWindow(QMainWindow):
         item = self.segment_list.item(row)
         if item is None:
             return
-        index = int(item.data(Qt.ItemDataRole.UserRole))
-        previous_index = self.controller.current_index
+        issued = item.data(Qt.ItemDataRole.UserRole)
+        if issued is None:
+            return
+        previous_index = self._active_index()
         try:
-            self.controller.go_to(index)
-        except EditorControllerError as exc:
+            if self.controller.has_workspace:
+                self.controller.go_to_workspace_segment(issued)
+            else:
+                self.controller.go_to(int(issued))
+        except (TypeError, ValueError, EditorControllerError) as exc:
             self._show_error("无法切换段落", str(exc))
             return
         self._refreshing = True
         try:
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
         finally:
             self._refreshing = False
 
     def _navigate(self, direction: int) -> None:
-        if not self.controller.has_project:
+        if not self._has_active_project():
             return
-        previous_index = self.controller.current_index
-        self.controller.move(direction, unconfirmed_only=self.unconfirmed_filter.isChecked())
+        previous_index = self._active_index()
+        if self.controller.has_workspace:
+            self.controller.move_workspace(
+                direction,
+                unconfirmed_only=self.unconfirmed_filter.isChecked(),
+            )
+        else:
+            self.controller.move(
+                direction,
+                unconfirmed_only=self.unconfirmed_filter.isChecked(),
+            )
         self._refreshing = True
         try:
-            self._select_project_index(self.controller.current_index)
+            self._select_project_index(self._active_index())
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
         finally:
             self._refreshing = False
 
     def _select_project_index(self, project_index: int) -> None:
+        issued_identity = (
+            self.controller.workspace_view.segments[project_index].identity
+            if self.controller.has_workspace
+            else project_index
+        )
         for row in range(self.segment_list.count()):
             item = self.segment_list.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) == project_index:
+            item_identity = item.data(Qt.ItemDataRole.UserRole)
+            matches = (
+                item_identity is issued_identity
+                if self.controller.has_workspace
+                else item_identity == issued_identity
+            )
+            if matches:
                 self.segment_list.setCurrentRow(row)
                 return
         self.segment_list.setCurrentRow(-1)
 
     def _filter_changed(self, enabled: bool) -> None:
-        if self._refreshing or not self.controller.has_project:
+        if self._refreshing or not self._has_active_project():
             return
-        previous_index = self.controller.current_index
+        previous_index = self._active_index()
         if enabled and self.controller.current_segment.confirmed:
             next_unconfirmed = next(
                 (
                     index
-                    for index, segment in enumerate(self.controller.project.segments)
+                    for index, segment in enumerate(self._active_segments())
                     if not segment.confirmed
                 ),
                 None,
             )
             if next_unconfirmed is not None:
-                self.controller.go_to(next_unconfirmed)
+                if self.controller.has_workspace:
+                    self.controller.go_to_workspace_index(
+                        next_unconfirmed,
+                        project=self.controller.workspace_view.project,
+                    )
+                else:
+                    self.controller.go_to(next_unconfirmed)
         self._refreshing = True
         try:
             self._populate_segment_list()
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
         finally:
@@ -2039,13 +3486,17 @@ class QtEditorWindow(QMainWindow):
     def _refresh_project_search_controls(self) -> None:
         """Project the current JSON and matcher gates without executing search."""
 
-        project_capability = self.controller.project_tool_capability()
-        self.project_search_toggle.setEnabled(self.controller.has_project)
-        self.project_search_clear.setEnabled(self.controller.has_project)
+        self.project_search_toggle.setEnabled(self._has_active_project())
+        self.project_search_clear.setEnabled(self._has_active_project())
+        self.project_search_scope.setVisible(self.controller.has_workspace)
         display = None
         search_available = False
         advanced_available = False
-        if not project_capability.single_json_tools_available:
+        project_capability = self.controller.project_tool_capability()
+        if (
+            not self.controller.has_workspace
+            and not project_capability.single_json_tools_available
+        ):
             code = project_capability.unavailable_reason or (
                 "PROJECT_SEARCH.PROJECT_GATE_INVALID"
             )
@@ -2081,6 +3532,9 @@ class QtEditorWindow(QMainWindow):
         ):
             checkbox.setEnabled(search_available)
         self.project_search_status.setEnabled(search_available)
+        self.project_search_scope.setEnabled(
+            search_available and self.controller.has_workspace
+        )
         self.project_search_match_case.setEnabled(advanced_available)
         self.project_search_whole_word.setEnabled(advanced_available)
         self.project_search_capability.setText(message)
@@ -2150,14 +3604,28 @@ class QtEditorWindow(QMainWindow):
             self._clear_project_search_results("请至少选择一个搜索字段。")
             self.statusBar().showMessage("请至少选择一个搜索字段。", 5000)
             return
-        request = ProjectSearchRequest(
-            query=query,
-            fields=fields,
-            options=self._project_search_options(),
-            status=self._project_search_status_filter(),
-        )
         try:
-            report = self.controller.search_project(request)
+            if self.controller.has_workspace:
+                scope = self.workspace_search_scope.currentData()
+                if not isinstance(scope, SearchScope):
+                    scope = SearchScope(str(scope))
+                request = WorkspaceSearchRequest(
+                    query=query,
+                    fields=fields,
+                    options=self._project_search_options(),
+                    status=self._project_search_status_filter(),
+                    scope=scope,
+                )
+                report = self.controller.search_workspace(request)
+                self.current_workspace_search_report = report
+            else:
+                request = ProjectSearchRequest(
+                    query=query,
+                    fields=fields,
+                    options=self._project_search_options(),
+                    status=self._project_search_status_filter(),
+                )
+                report = self.controller.search_project(request)
         except EditorControllerError as exc:
             self._clear_project_search_results(f"搜索失败：{exc}。")
             self.statusBar().showMessage(f"项目搜索失败：{exc}", 7000)
@@ -2198,9 +3666,12 @@ class QtEditorWindow(QMainWindow):
         report = self.current_project_search_report
         if report is None or not 0 <= ordinal < report.total:
             return False
-        previous_index = self.controller.current_index
+        previous_index = self._active_index()
         try:
-            _ = self.controller.go_to_search_hit(report.hits[ordinal])
+            if self.controller.has_workspace:
+                _ = self.controller.go_to_workspace_search_hit(report.hits[ordinal])
+            else:
+                _ = self.controller.go_to_search_hit(report.hits[ordinal])
         except EditorControllerError as exc:
             self._clear_project_search_results(
                 f"搜索结果已过期：{exc}；请重新搜索。"
@@ -2214,10 +3685,10 @@ class QtEditorWindow(QMainWindow):
         self._project_search_ordinal = ordinal
         self._refreshing = True
         try:
-            self._select_project_index(self.controller.current_index)
+            self._select_project_index(self._active_index())
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
             if self.workspace_mode is WorkspaceMode.BROWSE:
@@ -2234,9 +3705,14 @@ class QtEditorWindow(QMainWindow):
             return
         hit = report.hits[ordinal]
         field = hit.field.value.upper()
+        position = (
+            f"章节段落 {hit.local_segment_id}"
+            if self.controller.has_workspace
+            else f"段落 {hit.segment_index + 1}"
+        )
         result = (
             f"共 {report.total} 个结果 · 第 {ordinal + 1} 个 · "
-            f"{field} · 段落 {hit.segment_index + 1}"
+            f"{field} · {position}"
         )
         preview = f"预览（{field}）：{hit.preview}"
         self.project_search_result.setText(result)
@@ -2259,8 +3735,12 @@ class QtEditorWindow(QMainWindow):
         clear_controller: bool = True,
     ) -> None:
         if clear_controller:
-            self.controller.clear_project_search()
+            if self.controller.has_workspace:
+                self.controller.clear_workspace_search()
+            else:
+                self.controller.clear_project_search()
         self.current_project_search_report = None
+        self.current_workspace_search_report = None
         self._project_search_ordinal = None
         self.project_search_result.setText(message)
         self.project_search_result.setAccessibleName(
@@ -2273,9 +3753,9 @@ class QtEditorWindow(QMainWindow):
         self.project_search_next.setEnabled(False)
 
     def confirm_current(self) -> bool:
-        if not self.controller.has_project:
+        if not self._has_active_project():
             return False
-        previous_index = self.controller.current_index
+        previous_index = self._active_index()
         try:
             result = self.controller.confirm_current()
         except EditorControllerError as exc:
@@ -2291,7 +3771,7 @@ class QtEditorWindow(QMainWindow):
             self._populate_segment_list()
             self._render_current_segment(
                 reset_target_history=(
-                    self.controller.current_index != previous_index
+                    self._active_index() != previous_index
                 )
             )
         finally:
@@ -2384,7 +3864,7 @@ class QtEditorWindow(QMainWindow):
     def _refresh_from_controller(self) -> None:
         """Re-render edit, browse, progress/dirty and suggestions from one snapshot."""
 
-        if not self.controller.has_project:
+        if not self._has_active_project():
             self._show_empty_state()
             self._update_title()
             return
@@ -2394,12 +3874,11 @@ class QtEditorWindow(QMainWindow):
             )
         self._refreshing = True
         try:
-            project = self.controller.project
-            self.project_name_label.setText(project.name)
-            self.language_label.setText(
-                f"{project.source_locale}  →  {project.target_locale}"
-            )
-            self.segment_count_label.setText(str(len(project.segments)))
+            source_locale, target_locale = self._active_locales()
+            self.project_name_label.setText(self._active_project_name())
+            self.language_label.setText(f"{source_locale}  →  {target_locale}")
+            self.segment_count_label.setText(str(len(self._active_segments())))
+            self._refresh_workspace_documents_menu()
             self._populate_segment_list()
             self._render_current_segment()
             self._refresh_browse_table()
@@ -2435,12 +3914,12 @@ class QtEditorWindow(QMainWindow):
             self.settings_dialog = None
 
     def _resources_changed(self) -> None:
-        if self.controller.has_project:
+        if self._has_active_project():
             self.refresh_suggestions()
         self.statusBar().showMessage("语言资源已更新，当前段建议已刷新。", 6000)
 
     def _term_suggestions_changed(self) -> None:
-        if self.controller.has_project:
+        if self._has_active_project():
             self.refresh_suggestions()
         self.statusBar().showMessage("术语已更新，当前段建议已刷新。", 6000)
 
@@ -2508,7 +3987,7 @@ class QtEditorWindow(QMainWindow):
 
         self._refresh_project_search_controls()
         self._refresh_manage_terms_menu()
-        if not self.controller.has_project:
+        if not self._has_active_project():
             self.current_suggestions = SuggestionBundle()
             self.current_tm_report = None
             self._refresh_tm_threshold_entry()
@@ -2597,7 +4076,7 @@ class QtEditorWindow(QMainWindow):
                 7000,
             )
             return
-        if outcome.succeeded and self.controller.has_project:
+        if outcome.succeeded and self._has_active_project():
             self.refresh_suggestions()
         else:
             self._refresh_tm_threshold_entry()
@@ -2614,7 +4093,7 @@ class QtEditorWindow(QMainWindow):
         if type(outcome) is not TMThresholdUpdateOutcome:
             raise TypeError("settings TM threshold outcome is invalid")
         outcome.__post_init__()
-        if self.controller.has_project:
+        if self._has_active_project():
             self.refresh_suggestions()
         else:
             self._refresh_tm_threshold_entry()
@@ -2633,7 +4112,7 @@ class QtEditorWindow(QMainWindow):
             self.statusBar().showMessage("Fuzzy 性能验证中。", 5000)
             return
         self._fuzzy_validation_timer.stop()
-        if self.controller.has_project:
+        if self._has_active_project():
             self.refresh_suggestions()
         else:
             self._refresh_tm_threshold_entry()
@@ -2908,7 +4387,7 @@ class QtEditorWindow(QMainWindow):
             self._replace_target_text(self.controller.current_segment.target)
         finally:
             self._refreshing = False
-        self._update_segment_item(self.controller.current_index)
+        self._update_segment_item(self._active_index())
         self._render_progress_state()
         self._update_title()
 
@@ -2954,34 +4433,60 @@ class QtEditorWindow(QMainWindow):
             self.add_term(source_input.text(), target_input.text())
 
     def _confirm_unsaved(self) -> bool:
-        if not self.controller.has_project or not self.controller.dirty:
+        if not self._has_active_project() or not self._active_dirty():
             return True
-        decision = QMessageBox.question(
-            self,
+        prompt = QMessageBox(
+            QMessageBox.Icon.Warning,
             "存在未保存修改",
             "当前项目有未保存修改。保存后继续吗？",
             QMessageBox.StandardButton.Save
             | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Save,
+            self,
         )
+        prompt.setDefaultButton(QMessageBox.StandardButton.Save)
+        prompt.button(QMessageBox.StandardButton.Save).setText("保存并继续")
+        prompt.button(QMessageBox.StandardButton.Discard).setText("放弃修改")
+        prompt.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        decision = QMessageBox.StandardButton(prompt.exec())
         if decision == QMessageBox.StandardButton.Save:
             return self._choose_save()
         return decision == QMessageBox.StandardButton.Discard
 
     def _update_title(self) -> None:
-        if not self.controller.has_project:
+        if not self._has_active_project():
             self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
             return
-        dirty = " *" if self.controller.dirty else ""
-        self.setWindowTitle(f"{self.controller.project.name}{dirty} · LocalCAT")
+        dirty = " *" if self._active_dirty() else ""
+        self.setWindowTitle(f"{self._active_project_name()}{dirty} · LocalCAT")
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "top_bar_layout"):
+            self._apply_top_bar_responsiveness(event.size().width())
         self._schedule_layout_refresh()
+
+    def _apply_top_bar_responsiveness(self, width: int) -> None:
+        """Keep every project command inspectable at the 1080px minimum."""
+
+        compact = width < 1220
+        self.brand_name_label.setVisible(not compact)
+        self.brand_tagline_label.setVisible(not compact)
+        self.top_separator.setVisible(not compact)
+        self.language_label.setVisible(not compact)
+        if compact:
+            self.top_bar_layout.setContentsMargins(12, 10, 12, 10)
+            self.top_bar_layout.setSpacing(6)
+            self.project_name_label.setMaximumWidth(135)
+            self.progress_bar.setFixedWidth(125)
+        else:
+            self.top_bar_layout.setContentsMargins(22, 12, 20, 12)
+            self.top_bar_layout.setSpacing(12)
+            self.project_name_label.setMaximumWidth(16777215)
+            self.progress_bar.setFixedWidth(180)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._confirm_unsaved():
@@ -3104,8 +4609,112 @@ QProgressBar#projectProgress::chunk {
     border-radius: 7px;
     background: #0aa4cd;
 }
+QDialog#workspacePackageImportDialog {
+    background: #f4f7fb;
+    color: #18314a;
+}
+QLabel#packageImportTitle {
+    color: #102943;
+    font-size: 21px;
+    font-weight: 750;
+}
+QLabel#packageImportMode {
+    color: #176344;
+    background: #e4f4eb;
+    border: 1px solid #b9ddc9;
+    border-radius: 10px;
+    padding: 5px 10px;
+    font-size: 11px;
+    font-weight: 750;
+}
+QLabel#packageImportMode[mode="replace"] {
+    color: #8a4d12;
+    background: #fff1d9;
+    border-color: #edcd98;
+}
+QLabel#packageImportTransition {
+    color: #0a6f91;
+    font-size: 18px;
+    font-weight: 750;
+}
+QLabel#packageImportExplanation,
+QLabel#packageImportNote {
+    color: #60768a;
+}
+QFrame#packageImportSummary {
+    background: #ffffff;
+    border: 1px solid #d4dfe9;
+    border-radius: 9px;
+}
+QLabel#packageImportIdLabel {
+    color: #5e7489;
+    font-size: 11px;
+    font-weight: 650;
+}
+QLineEdit#packageImportProjectId {
+    min-height: 30px;
+    padding: 2px 9px;
+    color: #29445d;
+    background: #f7f9fc;
+    border: 1px solid #d5dfe8;
+    border-radius: 5px;
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 11px;
+}
+QLabel#packageImportDocumentCount,
+QLabel#packageImportSegmentCount {
+    color: #163d5b;
+    background: #eaf4f8;
+    border-radius: 8px;
+    padding: 7px 11px;
+    font-weight: 700;
+}
+QLabel#packageImportReconciliation {
+    color: #405c73;
+    background: #edf2f7;
+    border-radius: 7px;
+    padding: 9px 11px;
+}
+QFrame#packageImportSafety {
+    background: #e8f5ed;
+    border: 1px solid #c2e1ce;
+    border-radius: 8px;
+}
+QFrame#packageImportSafety[state="warning"] {
+    background: #fff4df;
+    border-color: #efd39e;
+}
+QFrame#packageImportSafety[state="blocked"] {
+    background: #fdebec;
+    border-color: #efbdc1;
+}
+QLabel#packageImportSafetyText {
+    color: #285d42;
+    font-weight: 650;
+}
+QPushButton#packageImportApply {
+    color: #ffffff;
+    background: #079fc9;
+    border-color: #079fc9;
+    min-width: 98px;
+}
+QPushButton#packageImportApply:hover {
+    background: #0787ad;
+    border-color: #0787ad;
+}
+QPushButton#packageImportApply:disabled {
+    color: #91a7b8;
+    background: #e3e9ef;
+    border-color: #d2dce5;
+}
+QPushButton#packageImportCancel {
+    min-width: 82px;
+}
 QWidget#emptyPage {
     background: #eef2f7;
+}
+QWidget#emptyPage[dragActive="true"] {
+    background: #dff3f9;
 }
 QFrame#emptyCard {
     background: white;
@@ -3143,7 +4752,8 @@ QFrame#projectSearchPanel {
     border: 1px solid #d6e0ea;
     border-radius: 8px;
 }
-QToolButton#projectSearchToggle {
+QToolButton#projectSearchToggle,
+QToolButton#workspaceDocumentsButton {
     color: #d6e7f4;
     background: #0b3e6a;
     border: 1px solid #1e5c87;
@@ -3151,21 +4761,46 @@ QToolButton#projectSearchToggle {
     font-size: 20px;
     font-weight: 700;
 }
+QToolButton#workspaceDocumentsButton {
+    min-width: 34px;
+    max-width: 34px;
+    padding: 0;
+}
 QToolButton#projectSearchToggle:hover,
-QToolButton#projectSearchToggle:checked {
+QToolButton#projectSearchToggle:checked,
+QToolButton#workspaceDocumentsButton:hover {
     color: #ffffff;
     background: #087da2;
     border-color: #20a9ce;
 }
-QToolButton#projectSearchToggle:disabled {
+QToolButton#projectSearchToggle:disabled,
+QToolButton#workspaceDocumentsButton:disabled {
     color: #7895aa;
     background: #154568;
     border-color: #315b79;
+}
+QToolButton#workspaceDocumentsButton::menu-indicator {
+    image: none;
+    width: 0px;
 }
 QLabel#projectSearchTitle {
     color: #17314b;
     font-size: 13px;
     font-weight: 750;
+}
+QLabel#workspaceChapterTitle,
+QLabel#workspaceBrowseChapterTitle {
+    color: #0b5e80;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#workspaceSaveFeedback,
+QLabel#workspaceBrowseSaveFeedback {
+    color: #506a7d;
+    background: #eef5f8;
+    border-radius: 4px;
+    padding: 5px 7px;
+    font-size: 10px;
 }
 QLabel#projectSearchScopeLabel {
     color: #64778b;

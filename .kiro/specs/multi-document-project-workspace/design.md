@@ -720,12 +720,12 @@ UI文案为“当前章节 / 搜索全部章节”。为保持既有单 JSON pub
 
 ## C4：Qt 产品表面
 
-- 章节selector显示display name与progress，选择后跳到章节首段；同名章节用稳定序号/安全source hint区分，但不暴露ID为主要文案。
-- “新建多文档项目”只允许选择portable root与其中的显式 JSON/TXT/PO/POT 文件列表；UI显示选择顺序并允许重排后提交，不提供递归目录扫描或“自动导入全部文件”。
-- 编辑和浏览模式都保留明确章节header/divider；默认连续导航跨Document边界。
+- 原顶栏布局只增加一个无下拉箭头的文件夹按钮；点击后菜单按 manifest 顺序以文件图标+display name 列出当前 workspace Documents，当前项显示勾选，不使用 `1.` / `[1]` 等数字序号前缀。选择后跳到该 Document 首段；同名display name用安全source hint辅助区分，不暴露持久ID为主要文案。
+- 首页只保留一个“打开本地项目”控件，不显示独立单/多文档按钮或drop-zone。首页控件、项目主按钮、项目菜单唯一的“打开本地项目”和`Ctrl+O`复用同一suffix-neutral文件选择：单选直接打开，Shift多选进入显式列表review；项目菜单不得另列“新建多文档项目”。文件直接拖入首页时按同一规则分流。review显示顺序并允许重排后提交，不提供递归目录扫描或“自动导入全部文件”。
+- 编辑左栏和浏览表都使用文件图标+display name的跨列header/divider，不叠加“章节 N”文案；默认连续导航跨Document边界。浏览模式的current row、Controller current Segment_Identity、当前文档标题和文件夹菜单勾选始终同步；双击再返回同段编辑。
 - 搜索scope显示“当前章节 / 搜索全部章节”；不显示chunk、sync或provider控件。
 - dirty/save反馈区分“LocalCAT项目包已保存”与“源文件已写回/只读/部分失败”，并按当前 ProjectPackage 的逐 Document report 展示状态。`explicit-selected-files-v1` 当前统一显示“源文件只读；仅保存项目包”；未来 directory/workbook write-back profile 获批后才可投影其逐文件/单文件报告，C4 不预装未启用入口。
-- import preview只显示body-safe metadata/counts；用户确认后才apply。失败不清空当前session。
+- ProjectPackage `open` / `preview+import` 都保留在“项目”菜单，文件夹不承担package命令。`open`直接以所选artifact作为当前canonical package冷打开；`preview+import`先绑定source/destination，并在LocalCAT自有对话框明确显示`NEW`/`REPLACE`/`UPDATE`、当前项目→incoming项目、单行只读可复制完整project ID、body-safe counts/reconciliation/warning/blocker；Cancel为默认，用户显式点击“应用导入”后才发布到destination。当前为Legacy项目时，Qt先要求选择新的package destination；preview不创建目标、不修改Legacy原文件、不切换session，apply才以`NEW`/`REPLACE`发布incoming包并冷切换，不能把它描述成Legacy内容合并或promotion。失败不清空当前session。
 - 窄/宽布局与键盘导航必须在真实ProjectPackage fixture上验收；Qt不得直接读physical carrier、manifest或private member。
 
 ## 安全与限制
@@ -810,7 +810,7 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 
 ### Cluster 4：Qt / Current-source acceptance
 
-- 章节selector/divider/continuous navigation/search scope/save与package preview。
+- 文件夹文档菜单、文件图标divider、continuous navigation、search scope、save与package preview；不得恢复独立章节selector。
 - 窄宽布局、keyboard、真实package cold reopen与逐Document save/recovery report projection。
 - 在final roots上重签受影响current-source evidence；未受影响的TM Gate C/D不得机械刷新。
 

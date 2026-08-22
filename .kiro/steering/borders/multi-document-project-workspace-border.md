@@ -30,7 +30,7 @@ Cluster 0 人工批准
 | Parser/Codec 与 workspace 聚合分权 | Parser 只产单文档；workspace 不复制 grammar/writer；architecture closed-world |
 | 首个多文档入口不偷渡目录扫描 | 显式 JSON/TXT/PO/POT 选择列表；每文件 verified terminal；未知/未选文件零消费 |
 | `codec_private_member` 始终 opaque | workspace/Controller/Qt/chunk/sync 不解析、不改写、不提升为第二权威 |
-| save/recovery 与未来 origin 原子性诚实 | carrier-neutral candidate/LKG/report 闭合；directory/workbook 只冻结后续 profile 红线，不启用产品入口；failure 保留 dirty |
+| save/recovery 与未来 origin 原子性诚实 | carrier-neutral candidate/LKG/report 闭合；未证明持久化的 failure 保留 dirty，已双 readback 的 terminal-cleanup recovery 采纳已证明 baseline 并保留 recovery journal；directory/workbook 仍不启用产品入口 |
 | 2C 实现前批准物理 carrier | owner 决策记录先于任何 archive/directory carrier production diff |
 | ProjectPackage preview/apply 同一事务 | digest/version/path/identity 重验；preview 后 tamper 拒绝；失败保留旧项目/旧包 |
 | Cluster 4 使用真实 ProjectPackage | 正式 export→validate→preview→import/apply→cold reopen 完整 journey |
@@ -65,13 +65,13 @@ Cluster 0 人工批准
 
 ## 当前状态与归档门
 
-> 当前状态：Cluster 0 已取得项目 owner 人工批准；Cluster 1 identity/origin 实施 GO。
+> 当前状态：Cluster 0–4 已按顺序闭合。Cluster 4 真实 UI 冒烟暴露的多文件入口、章节分层、ProjectPackage 语义与 Legacy import 事务偏差已修复；final current-source evidence 已在冻结 tree 重签。
 
 - [x] Requirements / Design / Tasks / ADR-018 / review clustering / border 一致并获人工批准
 - [x] current-source characterization fresh 通过，Cluster 0 production 零变化
-- [ ] Cluster 1 identity/origin 与单 JSON 兼容通过
-- [ ] Cluster 2A 聚合调和、2B 保存恢复、2C carrier 决策与真实 ProjectPackage 冷重开通过
-- [ ] Cluster 3 Controller session/dirty/search scope 通过
-- [ ] Cluster 4 Qt、fault、acceptance 与 current-source evidence 通过
-- [ ] 每 Cluster 独立提交与独立对抗 review 可追踪
-- [ ] Chunk/Sync/ResourcePackage/TMX/RPY/PO writer/CONTEXT 等相邻线无越界
+- [x] Cluster 1 identity/origin 与单 JSON 兼容通过
+- [x] Cluster 2A 聚合调和、2B 保存恢复、2C carrier 决策与真实 ProjectPackage 冷重开通过
+- [x] Cluster 3 Controller session/dirty/search scope 通过
+- [x] Cluster 4 Qt、fault、acceptance 与 current-source evidence 通过（digest `099cd7bde20d760c8b7f0a0985474afa0565784dbd804e8a772e1a43591f0034`）
+- [x] 每 Cluster 独立提交与独立对抗 review 可追踪
+- [x] Chunk/Sync/ResourcePackage/TMX/RPY/PO writer/CONTEXT 等相邻线无越界

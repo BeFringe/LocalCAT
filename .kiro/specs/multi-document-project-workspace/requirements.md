@@ -189,13 +189,15 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 
 #### 验收标准
 
-1. When 多文档项目可见时, the Qt 编辑器 shall 显示当前章节、章节顺序和可键盘操作的章节切换/跳转入口。
-2. Where 连续段落列表跨越 Document 边界, the Qt 编辑器 shall 显示明确章节分隔和当前章节状态，不得把所有段落显示为无边界的单文件。
+1. When 多文档项目可见时, the Qt 编辑器 shall 在原顶栏布局中只新增无下拉箭头的文件夹入口，用文件图标+display name、无数字序号前缀的菜单显示当前文档、顺序和可键盘操作的切换/跳转入口。
+2. Where 连续段落列表跨越 Document 边界, the Qt 编辑器 shall 用文件图标+display name 显示明确文档分隔和当前文档状态，不得添加“章节 N”干扰文案或把所有段落显示为无边界的单文件。
 3. When 切换 Edit/Browse 模式、宽窄布局或章节时, the Qt 编辑器 shall 保持同一 Controller workspace 与 Segment_Identity，不得复制或覆盖未保存 target。
-4. When 手工导入前 preview 可用时, the Qt 编辑器 shall 显示包/项目身份、文档/段落数、reconciliation 类别、warning 和阻断原因，并要求用户显式批准 apply。
+4. When 用户在“项目”菜单选择 ProjectPackage 导入且 preview 可用时, the Qt 编辑器 shall 用 LocalCAT 自有对话框显示 `NEW`/`REPLACE`/`UPDATE` 模式、当前项目→incoming 项目、单行可复制完整 project ID、文档/段落数、reconciliation 类别、warning 和阻断原因，并要求用户显式批准 apply，默认焦点/动作必须为取消；该能力不得占用文件夹导航入口或另建常驻顶栏。Where 当前会话仍是 Legacy 项目, Qt shall 先要求选择新的 ProjectPackage destination，preview 前后保持 Legacy 会话与原文件不变，apply 成功后才发布 incoming 包并切换为 workspace；该跨项目 import 是 `NEW`/`REPLACE`，不得伪装成把 Legacy 内容合并或提升进 incoming 包。
 5. If 导入、保存或恢复失败, the Qt 编辑器 shall 指明受影响的文档、安全原因、dirty 保留与可重试/恢复状态，不得仅显示“保存完成”或吞掉失败。
 6. When 导出或导入完整成功时, the Qt 编辑器 shall 提供不含 source/target 正文的结构化数量摘要和 receipt 状态。
 7. The Qt 编辑器 shall 只消费 Controller 的 frozen projection，不得直接读写 manifest、member、Parser codec、source snapshot 或 recovery journal。
+8. When 浏览/校对的当前 segment 行变化时, the Qt 编辑器 shall 同步 Controller current Segment_Identity、当前文档标题与文件夹菜单选中态，不得保留上一文档的投影。
+9. When 用户通过首页、项目主按钮、项目菜单或 `Ctrl+O` 打开或拖入本地文件时, the Qt 编辑器 shall 使用同一入口按单选/多选分流；单选直接打开，Shift 多选进入有序显式选择 review，不得显示独立“单文档/多文档”控件、独立菜单项或可见 drop-zone 控件。
 
 ### Requirement 12：兼容性、本地性与边界验收
 

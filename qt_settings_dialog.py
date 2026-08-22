@@ -148,8 +148,17 @@ _TM_SAFE_REASON_LABELS = {
     "MIGRATION.SOURCE_UNREADABLE": "本地来源不可读",
     "MIGRATION.SOURCE_CHANGED": "本地来源已变更",
     "RETRIEVAL.CONTEXT_EVIDENCE_MISSING": "Context 尚未开放",
+    "RETRIEVAL.CONTEXT_IDENTITY_INVALID": "Context 证据身份无法验证",
+    "RETRIEVAL.CONTEXT_EVIDENCE_FAILED": "Context 正确性证据未通过",
+    "RETRIEVAL.CONTEXT_EVIDENCE_EXPIRED": "Context 证据已过期",
     "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_MISSING": "Fuzzy 正确性尚未开放",
+    "RETRIEVAL.FUZZY_CORRECTNESS_IDENTITY_INVALID": "Fuzzy 正确性证据身份无法验证",
+    "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_FAILED": "Fuzzy 正确性证据未通过",
+    "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_EXPIRED": "Fuzzy 正确性证据已过期",
     "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING": "Fuzzy 性能尚未开放",
+    "RETRIEVAL.FUZZY_BENCHMARK_IDENTITY_INVALID": "Fuzzy 性能证据身份无法验证",
+    "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED": "Fuzzy 性能证据未通过",
+    "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_EXPIRED": "Fuzzy 性能证据已过期",
 }
 _TM_ACTION_EXCEPTION_SAFE_CODES = frozenset(_TM_SAFE_REASON_LABELS)
 _TM_KIND_LEGACY_COLOR = "#d59a00"
@@ -164,6 +173,42 @@ def _tm_safe_reason(code: str | None) -> str:
         code,
         f"状态信息不可用（{code}）",
     )
+
+
+def _tm_status_safe_reason(status: TMResourceStatus, code: str) -> str:
+    """Explain aggregate evidence without contradicting an open gate."""
+
+    if (
+        code == "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED"
+        and status.fuzzy_available
+    ):
+        return "另一 Fuzzy 路径性能证据未通过（当前 Fuzzy 可用）"
+    return _tm_safe_reason(code)
+
+
+def _ask_localized_question(
+    parent: QWidget,
+    title: str,
+    message: str,
+    buttons: QMessageBox.StandardButton,
+    default_button: QMessageBox.StandardButton,
+    button_labels: dict[QMessageBox.StandardButton, str],
+) -> QMessageBox.StandardButton:
+    """Show one native question box with explicit LocalCAT button text."""
+
+    prompt = QMessageBox(
+        QMessageBox.Icon.Question,
+        title,
+        message,
+        buttons,
+        parent,
+    )
+    prompt.setDefaultButton(default_button)
+    for standard_button, label in button_labels.items():
+        button = prompt.button(standard_button)
+        if button is not None:
+            button.setText(label)
+    return QMessageBox.StandardButton(prompt.exec())
 
 
 class _ResourceMoreButton(QToolButton):
@@ -613,16 +658,16 @@ class QtSettingsDialog(QDialog):
         section_hint = QLabel("选择资源的可见性与读写权限，或创建新的本地资源。")
         section_hint.setObjectName("resourceSectionHint")
         storage_hint = QLabel(
-            "导入文件会转换并合并到列表所示的内部 JSONL/CSV；这里显示的是 "
-            "LocalCAT 实际查询的本地存储路径。"
+            "导入文件会转换并合并至内部 JSONL/CSV。"
+            "列表中的路径就是 LocalCAT 实际查询的本地存储位置。"
         )
         storage_hint.setObjectName("resourceStorageHint")
         storage_hint.setWordWrap(True)
         intro.addWidget(section_title)
         intro.addWidget(section_hint)
         intro.addWidget(storage_hint)
-        intro_row.addLayout(intro)
-        intro_row.addStretch()
+        intro_row.addLayout(intro, 1)
+        intro_row.addSpacing(24)
         new_button = QPushButton("＋ 新建资源")
         new_button.setObjectName("newResourceButton")
         new_button.clicked.connect(self._prompt_create_resource)
@@ -1254,7 +1299,7 @@ class QtSettingsDialog(QDialog):
             safe_codes = status.safe_codes
             text = _TM_MODE_LABELS[mode]
             if safe_codes:
-                text += f" · {_tm_safe_reason(safe_codes[0])}"
+                text += f" · {_tm_status_safe_reason(status, safe_codes[0])}"
         status_label.setText(text)
         status_label.setProperty("tm_mode", mode.value)
         status_label.setProperty("tmMode", mode.value)
@@ -1297,7 +1342,7 @@ class QtSettingsDialog(QDialog):
                 and status.safe_codes
                 == ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",)
             ):
-                answer = QMessageBox.question(
+                answer = _ask_localized_question(
                     self,
                     "重新验证 canonical TM",
                     (
@@ -1308,6 +1353,10 @@ class QtSettingsDialog(QDialog):
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "重新验证",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.status_label.setText(
@@ -1325,13 +1374,17 @@ class QtSettingsDialog(QDialog):
                     "预期变化：Legacy exact-only → Canonical active。\n"
                     "Context / fuzzy 仍只按当前已验证能力开放。"
                 )
-                answer = QMessageBox.question(
+                answer = _ask_localized_question(
                     self,
                     "激活 canonical TM",
                     prompt,
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "激活",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.controller.cancel_tm_activation(preflight)
@@ -1346,7 +1399,7 @@ class QtSettingsDialog(QDialog):
                 TMResourceDisplayMode.SOURCE_DIVERGED,
                 TMResourceDisplayMode.DEGRADED,
             ) and status.exact_available:
-                answer = QMessageBox.question(
+                answer = _ask_localized_question(
                     self,
                     "重建 canonical TM",
                     (
@@ -1357,6 +1410,10 @@ class QtSettingsDialog(QDialog):
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "重建",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.status_label.setText(
@@ -1454,7 +1511,7 @@ class QtSettingsDialog(QDialog):
         return resource
 
     def _confirm_delete_resource(self, resource: ResourceConfig) -> None:
-        answer = QMessageBox.question(
+        answer = _ask_localized_question(
             self,
             "删除语言资源",
             (
@@ -1464,6 +1521,10 @@ class QtSettingsDialog(QDialog):
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
+            {
+                QMessageBox.StandardButton.Yes: "删除",
+                QMessageBox.StandardButton.Cancel: "取消",
+            },
         )
         if answer != QMessageBox.StandardButton.Yes:
             return

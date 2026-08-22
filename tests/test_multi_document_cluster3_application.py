@@ -1241,6 +1241,124 @@ class Cluster3ApplicationTests(unittest.TestCase):
         reopened = self.controller.open_project(legacy)
         self.assertEqual(reopened.segments[0].target, "legacy target")
 
+    def test_legacy_package_import_is_preview_stale_safe_and_preserves_json(
+        self,
+    ) -> None:
+        legacy = self.root / "legacy-import.json"
+        destination = self.root / "legacy-import.localcat-project"
+        incoming = self._export_foreign_package()
+        _write_source(
+            legacy,
+            name="Legacy import source",
+            segments=(("legacy", "legacy source", "legacy target", True),),
+        )
+        original = legacy.read_bytes()
+        self.controller.open_project(legacy)
+
+        preview = self.controller.preview_workspace_package_import(
+            incoming,
+            destination=destination,
+        )
+        self.assertIs(preview.mode, ProjectPackageImportMode.NEW)
+        self.assertFalse(destination.exists())
+        self.assertEqual(legacy.read_bytes(), original)
+        self.controller.update_target("changed after preview")
+        with self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT\\.PACKAGE\\.PREVIEW_STALE$",
+        ):
+            self.controller.apply_workspace_package_import(preview)
+        self.assertTrue(self.controller.has_project)
+        self.assertFalse(destination.exists())
+        self.assertEqual(legacy.read_bytes(), original)
+
+        self.controller.open_project(legacy)
+        fresh = self.controller.preview_workspace_package_import(
+            incoming,
+            destination=destination,
+        )
+        result = self.controller.apply_workspace_package_import(fresh)
+        self.assertTrue(result.active_session_changed)
+        self.assertIs(result.receipt.mode, ProjectPackageImportMode.NEW)
+        self.assertTrue(destination.is_file())
+        self.assertTrue(self.controller.has_workspace)
+        self.assertEqual(legacy.read_bytes(), original)
+
+    def test_legacy_package_import_commit_fault_keeps_session_and_files(self) -> None:
+        legacy = self.root / "legacy-import-fault.json"
+        destination = self.root / "legacy-import-fault.localcat-project"
+        destination.write_bytes(self.package_path.read_bytes())
+        incoming = self._export_foreign_package()
+        _write_source(
+            legacy,
+            name="Legacy import fault source",
+            segments=(("legacy", "legacy source", "legacy target", True),),
+        )
+        original = legacy.read_bytes()
+        destination_before = destination.read_bytes()
+        self.controller.open_project(legacy)
+        before_session = self.controller.project_session_id
+        preview = self.controller.preview_workspace_package_import(
+            incoming,
+            destination=destination,
+        )
+        self.assertIs(preview.mode, ProjectPackageImportMode.REPLACE)
+
+        with mock.patch.object(
+            self.controller._workspace_package_service,
+            "commit_prepared_import",
+            side_effect=ProjectWorkspaceError("PROJECT.PACKAGE.APPLY_FAILED"),
+        ), self.assertRaisesRegex(
+            EditorControllerError,
+            "^PROJECT\\.PACKAGE\\.APPLY_FAILED$",
+        ):
+            self.controller.apply_workspace_package_import(preview)
+
+        self.assertTrue(self.controller.has_project)
+        self.assertFalse(self.controller.has_workspace)
+        self.assertEqual(self.controller.project_session_id, before_session)
+        self.assertEqual(destination.read_bytes(), destination_before)
+        self.assertEqual(legacy.read_bytes(), original)
+
+    def test_legacy_package_import_replaces_existing_destination_only_on_apply(
+        self,
+    ) -> None:
+        legacy = self.root / "legacy-import-replace.json"
+        destination = self.root / "legacy-import-replace.localcat-project"
+        destination.write_bytes(self.package_path.read_bytes())
+        incoming = self._export_foreign_package()
+        incoming_workspace = self.package_service.open(incoming).workspace
+        _write_source(
+            legacy,
+            name="Legacy replace source",
+            segments=(("legacy", "legacy source", "legacy target", True),),
+        )
+        legacy_before = legacy.read_bytes()
+        destination_before = destination.read_bytes()
+        self.controller.open_project(legacy)
+        session_before = self.controller.project_session_id
+
+        preview = self.controller.preview_workspace_package_import(
+            incoming,
+            destination=destination,
+        )
+        self.assertIs(preview.mode, ProjectPackageImportMode.REPLACE)
+        self.assertEqual(destination.read_bytes(), destination_before)
+        self.assertEqual(legacy.read_bytes(), legacy_before)
+        self.assertTrue(self.controller.has_project)
+        self.assertEqual(self.controller.project_session_id, session_before)
+
+        result = self.controller.apply_workspace_package_import(preview)
+        self.assertIs(result.receipt.mode, ProjectPackageImportMode.REPLACE)
+        self.assertTrue(result.active_session_changed)
+        self.assertNotEqual(destination.read_bytes(), destination_before)
+        self.assertEqual(
+            self.package_service.open(destination).workspace.project_id,
+            incoming_workspace.project_id,
+        )
+        self.assertEqual(legacy.read_bytes(), legacy_before)
+        self.assertTrue(self.controller.has_workspace)
+
 
 if __name__ == "__main__":
     unittest.main()
