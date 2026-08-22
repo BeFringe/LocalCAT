@@ -32,6 +32,8 @@ LEGACY_SOURCE_ROOTS = (
     "parser_source",
     "qt_editor",
     "qt_editor_window",
+    "qt_browse_group_dialog",
+    "qt_localized_message_box",
     "editor_contracts",
     "parser_contracts",
     "parser_composition",
@@ -52,7 +54,7 @@ CLOSED_CONSUMER_MODULES = frozenset(CURRENT_SOURCE_ROOTS)
 # These categories intentionally retain the original current-source meaning:
 # exact calls to selected contract constructors, authority seams and
 # serialization seams.  The roots scanned by those categories are now the
-# complete 17-file runtime set.
+# complete 19-file runtime set.
 KEY_CONSTRUCTORS = frozenset(
     {
         "CanonicalDocumentWrite",

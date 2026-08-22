@@ -26,6 +26,7 @@ from editor_contracts import (
     PreprocessPreview,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_localized_message_box import ask_localized_question
 
 
 _ERROR_MESSAGES = {
@@ -519,12 +520,19 @@ class QtPreprocessDialog(QDialog):
             )
         else:
             prompt = f"确定修改 {affected_count} 个草稿段落的 target 吗？"
-        decision = QMessageBox.question(
+        decision = ask_localized_question(
             self,
-            "应用文字预处理",
-            prompt,
-            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            title="应用文字预处理",
+            text=prompt,
+            buttons=(
+                QMessageBox.StandardButton.Apply
+                | QMessageBox.StandardButton.Cancel
+            ),
+            default_button=QMessageBox.StandardButton.Cancel,
+            button_labels={
+                QMessageBox.StandardButton.Apply: "应用",
+                QMessageBox.StandardButton.Cancel: "取消",
+            },
         )
         return decision == QMessageBox.StandardButton.Apply
 

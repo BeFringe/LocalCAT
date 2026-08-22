@@ -28,6 +28,11 @@ DEFAULT_EDITOR_FONT_SIZE = 15
 MIN_EDITOR_FONT_SIZE = 10
 MAX_EDITOR_FONT_SIZE = 28
 EDITOR_FONT_SIZE_STEP = 1
+MIN_BROWSE_GROUP_SIZE = 20
+MAX_BROWSE_GROUP_SIZE = 200
+BROWSE_GROUP_SIZE_STEP = 10
+DEFAULT_BROWSE_GROUP_THRESHOLD = 5
+DEFAULT_BROWSE_SEGMENT_THRESHOLD = 100
 EDITOR_TM_CONTRACT_CODEC_VERSION = 1
 
 _SAFE_DIAGNOSTIC_CODE = re.compile(
@@ -59,6 +64,13 @@ class WorkspaceMode(str, Enum):
 
     EDIT = "edit"
     BROWSE = "browse"
+
+
+class BrowseGroupDisplayMode(str, Enum):
+    """Presentation choices for the Browse/Review group navigator."""
+
+    AUTO_COLLAPSE = "auto_collapse"
+    FIXED = "fixed"
 
 
 class SearchField(str, Enum):
@@ -241,12 +253,75 @@ class RecentWorkspaceProject:
 
 
 @dataclass(frozen=True)
+class BrowseGroupPreferences:
+    """Device-local browse grouping without changing segment identity."""
+
+    enabled: bool = True
+    segments_per_group: int = MIN_BROWSE_GROUP_SIZE
+    activation_group_threshold: int = DEFAULT_BROWSE_GROUP_THRESHOLD
+    activation_segment_threshold: int = DEFAULT_BROWSE_SEGMENT_THRESHOLD
+    display_mode: BrowseGroupDisplayMode = BrowseGroupDisplayMode.AUTO_COLLAPSE
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise TypeError("browse grouping enabled state must be an exact bool")
+        if type(self.display_mode) is not BrowseGroupDisplayMode:
+            raise TypeError(
+                "browse group display mode must be exact BrowseGroupDisplayMode"
+            )
+        if type(self.segments_per_group) is not int:
+            raise TypeError("browse group size must be an exact integer")
+        if not MIN_BROWSE_GROUP_SIZE <= self.segments_per_group <= MAX_BROWSE_GROUP_SIZE:
+            raise ValueError(
+                "browse group size must be between "
+                f"{MIN_BROWSE_GROUP_SIZE} and {MAX_BROWSE_GROUP_SIZE}"
+            )
+        if self.segments_per_group % BROWSE_GROUP_SIZE_STEP:
+            raise ValueError(
+                "browse group size must use "
+                f"{BROWSE_GROUP_SIZE_STEP}-segment increments"
+            )
+        if (
+            type(self.activation_group_threshold) is not int
+            or self.activation_group_threshold < 1
+        ):
+            raise ValueError(
+                "browse activation group threshold must be a positive integer"
+            )
+        if (
+            type(self.activation_segment_threshold) is not int
+            or self.activation_segment_threshold < MIN_BROWSE_GROUP_SIZE
+        ):
+            raise ValueError(
+                "browse activation segment threshold must be at least "
+                f"{MIN_BROWSE_GROUP_SIZE}"
+            )
+
+    def group_count(self, segment_count: int) -> int:
+        if type(segment_count) is not int or segment_count < 0:
+            raise ValueError("browse segment count must be a non-negative integer")
+        if segment_count == 0:
+            return 0
+        return (
+            segment_count + self.segments_per_group - 1
+        ) // self.segments_per_group
+
+    def should_show(self, segment_count: int) -> bool:
+        group_count = self.group_count(segment_count)
+        return self.enabled and (
+            group_count > self.activation_group_threshold
+            or segment_count > self.activation_segment_threshold
+        )
+
+
+@dataclass(frozen=True)
 class DisplayPreferences:
     """Persistent local display preferences for the editor workspace."""
 
     segment_density: SegmentDensity = SegmentDensity.COMPACT
     workspace_mode: WorkspaceMode = WorkspaceMode.EDIT
     editor_font_size: int = DEFAULT_EDITOR_FONT_SIZE
+    browse_grouping: BrowseGroupPreferences = BrowseGroupPreferences()
 
     def __post_init__(self) -> None:
         if not isinstance(self.segment_density, SegmentDensity):
@@ -263,6 +338,11 @@ class DisplayPreferences:
                 "editor font size must be between "
                 f"{MIN_EDITOR_FONT_SIZE} and {MAX_EDITOR_FONT_SIZE}"
             )
+        if type(self.browse_grouping) is not BrowseGroupPreferences:
+            raise TypeError(
+                "display browse grouping must be exact BrowseGroupPreferences"
+            )
+        self.browse_grouping.__post_init__()
 
 
 @dataclass(frozen=True)

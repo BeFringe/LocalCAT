@@ -51,9 +51,11 @@ Layer 1 resource / termbase / canonical TM storage
 ├── tm_application_composition.py # legacy/canonical resource resolver/runtime host
 ├── qt_editor.py                 # stdlib composition/bootstrap 与 desktop install CLI
 ├── qt_editor_window.py          # Layer 4 主编辑器、多文档章节/保存反馈、TM 与项目搜索
+├── qt_browse_group_dialog.py    # Layer 4 浏览/校对单文档分组轮次投影与设备本地设置
 ├── qt_settings_dialog.py        # Layer 4 语言资源设置
 ├── qt_termbase_dialog.py        # Layer 4 集中式术语管理
 ├── qt_control_styles.py         # Layer 4 共享 popup/menu 视觉合同
+├── qt_localized_message_box.py # Layer 4 显式中文标准弹窗按钮边界
 ├── qt_tm_threshold.py           # 双入口 fuzzy threshold 共享控件
 ├── logic_controller.py          # 旧 Excel 无状态三态入口
 ├── excel_adapter*.py            # Excel Layer 4
@@ -91,6 +93,8 @@ Layer 1 resource / termbase / canonical TM storage
 ## 导入规则
 
 - `qt_editor_window.py`、`qt_settings_dialog.py`、`qt_termbase_dialog.py` 只可导入 `EditorController` 与 frozen contracts，不可导入 repository/store/retrieval/matcher/capability owner。
+- `qt_browse_group_dialog.py` 只保持按当前 Document 投影的自动收起式轮次指示条/固定式滚动预览与设备本地显示偏好；两种显示方式共享 projection，分组不成为 Document、Segment、保存或 TM identity，跳转只回传该组首段的 Controller-issued identity。
+- `qt_localized_message_box.py` 只拥有 Qt 标准弹窗的显式中文按钮文案，不解释业务错误、不更改接受/取消语义。
 - `editor_controller.py` 可协调项目编解码、资源仓储、application adapters 和既有引擎，不导入 PySide6。
 - `editor_tm_adapter.py` 只消费 host-issued runtime/capability snapshot 和 ports，不成为新的存储、scorer 或 capability authority。
 - `capability_host.py` 协调 Matcher/Gate C/Gate D owner 与 application handoff；不把 evidence/receipt 暴露给 Controller 或 Qt。

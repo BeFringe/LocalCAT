@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QLabel,
@@ -480,6 +481,12 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
                 "默认 zh-CN",
             )
             self.assertEqual(dialog.target_locale, "zh-CN")
+            self.assertEqual(
+                dialog.buttons.button(
+                    QDialogButtonBox.StandardButton.Cancel
+                ).text(),
+                "取消",
+            )
             with self.assertRaises(ValueError):
                 dialog.move_selected(0)
         finally:
@@ -1445,6 +1452,78 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self.assertIs(self.window.workspace_mode, WorkspaceMode.EDIT)
         self.assertEqual(self.controller.workspace_global_index, 2)
         self.assertTrue(self._document_actions()[1].isChecked())
+
+    def test_browse_grouping_is_per_document_and_jumps_by_issued_identity(
+        self,
+    ) -> None:
+        sources = self.root / "group-sources"
+        first = sources / "long-a.json"
+        second = sources / "boundary-b.json"
+        _write_json(
+            first,
+            name="Long A",
+            segments=tuple(
+                (
+                    f"a-{index + 1}",
+                    f"Long A source {index + 1}",
+                    f"Long A target {index + 1}" if index % 2 else "",
+                    False,
+                )
+                for index in range(101)
+            ),
+        )
+        _write_json(
+            second,
+            name="Boundary B",
+            segments=tuple(
+                (
+                    f"b-{index + 1}",
+                    f"Boundary B source {index + 1}",
+                    "",
+                    False,
+                )
+                for index in range(121)
+            ),
+        )
+        package = self.root / "browse-groups.localcat-project"
+        _export_package(
+            sources,
+            (first, second),
+            package,
+            name="Browse groups",
+        )
+        self.assertTrue(self.window.open_project_package_path(package))
+        self.assertTrue(
+            self.window.set_workspace_mode(WorkspaceMode.BROWSE, persist=False)
+        )
+        self._events()
+
+        self.assertEqual(self.window.browse_group_button.text(), "轮次 1 / 6")
+        self.assertEqual(
+            self.window.browse_group_turn_bar.document_label.toolTip(),
+            "Long A",
+        )
+        self._document_actions()[1].trigger()
+        self._events()
+        self.assertEqual(self.window.browse_group_button.text(), "轮次 1 / 7")
+        self.assertEqual(
+            self.window.browse_group_turn_bar.document_label.toolTip(),
+            "Boundary B",
+        )
+
+        self._document_actions()[0].trigger()
+        self._events()
+
+        self.assertTrue(self.window.browse_group_turn_bar.isVisible())
+        self.window.browse_group_turn_bar.ticks[5].click()
+        self._events()
+
+        self.assertEqual(
+            self.controller.current_workspace_identity.local_segment_id,
+            "a-101",
+        )
+        self.assertEqual(self.window.browse_group_button.text(), "轮次 6 / 6")
+        self.assertIs(self.window.workspace_mode, WorkspaceMode.BROWSE)
 
     def test_legacy_single_json_qt_journey_remains_exactly_flat(self) -> None:
         legacy = self.root / "legacy.json"

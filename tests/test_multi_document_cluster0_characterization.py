@@ -80,6 +80,8 @@ _LEGACY_SOURCE_ROOTS = (
     "parser_source",
     "qt_editor",
     "qt_editor_window",
+    "qt_browse_group_dialog",
+    "qt_localized_message_box",
     "editor_contracts",
     "parser_contracts",
     "parser_composition",
@@ -668,7 +670,7 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
         self,
     ) -> None:
         self.assertEqual(_EVIDENCE["production_roots"], list(_CURRENT_SOURCE_ROOTS))
-        self.assertEqual(len(_CURRENT_SOURCE_ROOTS), 17)
+        self.assertEqual(len(_CURRENT_SOURCE_ROOTS), 19)
         self.assertEqual(
             tuple(_RUNTIME_SOURCE_DIGESTS),
             _CURRENT_SOURCE_FILES,

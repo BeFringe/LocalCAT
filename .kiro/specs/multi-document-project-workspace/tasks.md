@@ -178,7 +178,13 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
   - 在 final runtime roots 冻结后运行全量 identity/reconciliation/save/package/controller/Qt/fault/acceptance 与单 JSON/TXT compatibility suites。
   - owner 工具生成并由 strict consumer 复读 evidence；随后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实结构/技术事实并由 Cluster 4 独立 reviewer 给出 Feature GO/NO-GO。
-  - final evidence digest `099cd7bde20d760c8b7f0a0985474afa0565784dbd804e8a772e1a43591f0034`，17 个 production roots；owner strict check 在 characterization 9/9 前后均为 current。
+  - final evidence digest `b95f5e7b6a4813e25744c77ebd81b540737efa98aa49ca6fe6ac96d0a56b2474`，19 个 production roots；owner strict check 在 characterization 9/9 前后均为 current。
+
+- [x] 4.5 完成 Browse/Review 分组轮次 UI increment
+  - 在 Browse/Review 主页表格左侧嵌入当前文件的可滚动轮次导航，同时压缩“段落”列；默认使用自动收起式窄指示条，设置中可切换为固定式预览列表，标题行按钮只打开设置。默认每组 20 段，严格“超过 5 组或 100 段”显示，尺寸只允许 20–200/步长 10。
+  - 两种显示方式共享同一 projection 与 current group；自动收起式 hover/focus 后显示组首段预览，固定式常驻预览。使用 1+3 行或 source-only 4 行规则，点击只按 issued Segment identity 跳转，不引入分组持久化 authority。
+  - 用高对比应用自有文件图标替换平台白色图标，并清除所有已知 Qt 标准弹窗的英文默认按钮。
+  - 执行 contract/state/Qt 键盘跳转/滚动/视觉/中文按钮回归，重签 final-tree current-source evidence 并做独立对抗复核。
 
 ### Cluster 4 完成门
 

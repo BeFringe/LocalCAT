@@ -70,6 +70,7 @@ from editor_contracts import (
 from editor_controller import EditorController, EditorControllerError
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
+from qt_localized_message_box import show_localized_critical
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -1495,7 +1496,7 @@ class QtSettingsDialog(QDialog):
             updated = replace(resource, **{field: checked})
             self.controller.update_resource(updated)
         except (StopIteration, EditorControllerError, ValueError) as exc:
-            QMessageBox.critical(self, "无法更新资源", str(exc))
+            show_localized_critical(self, title="无法更新资源", text=str(exc))
             self.refresh_resources()
             return
         self.resources_changed.emit()
@@ -1531,7 +1532,7 @@ class QtSettingsDialog(QDialog):
         try:
             self.controller.delete_resource(resource.id)
         except EditorControllerError as exc:
-            QMessageBox.critical(self, "无法删除资源", str(exc))
+            show_localized_critical(self, title="无法删除资源", text=str(exc))
             return
         self.refresh_resources()
         self.resources_changed.emit()
@@ -1572,7 +1573,7 @@ class QtSettingsDialog(QDialog):
         try:
             self.create_resource(name_input.text(), kind_input.currentData())
         except EditorControllerError as exc:
-            QMessageBox.critical(self, "无法创建资源", str(exc))
+            show_localized_critical(self, title="无法创建资源", text=str(exc))
 
     @property
     def is_importing(self) -> bool:

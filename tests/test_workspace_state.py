@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from editor_contracts import (
+    BrowseGroupDisplayMode,
+    BrowseGroupPreferences,
     DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
     LiteralReplaceRule,
@@ -53,6 +55,13 @@ class WorkspaceStateRepositoryTest(unittest.TestCase):
                 segment_density=SegmentDensity.WRAPPED,
                 workspace_mode=WorkspaceMode.BROWSE,
                 editor_font_size=22,
+                browse_grouping=BrowseGroupPreferences(
+                    enabled=False,
+                    segments_per_group=40,
+                    activation_group_threshold=8,
+                    activation_segment_threshold=240,
+                    display_mode=BrowseGroupDisplayMode.FIXED,
+                ),
             )
             repository.update_display_preferences(preferences)
             restored = WorkspaceStateRepository(config_dir)
@@ -63,6 +72,91 @@ class WorkspaceStateRepositoryTest(unittest.TestCase):
             self.assertEqual(payload["display"]["segment_density"], "wrapped")
             self.assertEqual(payload["display"]["workspace_mode"], "browse")
             self.assertEqual(payload["display"]["editor_font_size"], 22)
+            self.assertEqual(
+                payload["display"]["browse_grouping"],
+                {
+                    "enabled": False,
+                    "segments_per_group": 40,
+                    "activation_group_threshold": 8,
+                    "activation_segment_threshold": 240,
+                    "display_mode": "fixed",
+                },
+            )
+
+    def test_invalid_browse_grouping_falls_back_without_losing_display(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            config_dir.mkdir()
+            state_path = config_dir / "workspace.json"
+            payload = {
+                "schema_version": 1,
+                "recent_projects": [],
+                "display": {
+                    "segment_density": "wrapped",
+                    "workspace_mode": "browse",
+                    "editor_font_size": 20,
+                    "browse_grouping": {
+                        "enabled": True,
+                        "segments_per_group": 25,
+                        "activation_group_threshold": 5,
+                        "activation_segment_threshold": 100,
+                    },
+                },
+            }
+            rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            state_path.write_text(rendered, encoding="utf-8")
+
+            with self.assertLogs("workspace_state", level="WARNING"):
+                preferences = WorkspaceStateRepository(
+                    config_dir
+                ).display_preferences()
+
+            self.assertIs(preferences.segment_density, SegmentDensity.WRAPPED)
+            self.assertIs(preferences.workspace_mode, WorkspaceMode.BROWSE)
+            self.assertEqual(preferences.editor_font_size, 20)
+            self.assertEqual(
+                preferences.browse_grouping,
+                BrowseGroupPreferences(),
+            )
+            self.assertEqual(state_path.read_text(encoding="utf-8"), rendered)
+
+    def test_valid_legacy_browse_grouping_without_mode_preserves_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            config_dir.mkdir()
+            state_path = config_dir / "workspace.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "recent_projects": [],
+                        "display": {
+                            "browse_grouping": {
+                                "enabled": False,
+                                "segments_per_group": 60,
+                                "activation_group_threshold": 9,
+                                "activation_segment_threshold": 300,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            preferences = WorkspaceStateRepository(
+                config_dir
+            ).display_preferences().browse_grouping
+
+            self.assertEqual(
+                preferences,
+                BrowseGroupPreferences(
+                    enabled=False,
+                    segments_per_group=60,
+                    activation_group_threshold=9,
+                    activation_segment_threshold=300,
+                    display_mode=BrowseGroupDisplayMode.AUTO_COLLAPSE,
+                ),
+            )
 
     def test_invalid_font_size_falls_back_without_losing_other_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

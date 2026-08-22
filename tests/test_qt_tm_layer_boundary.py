@@ -34,7 +34,9 @@ from tests.test_qt_settings_tm_lifecycle import _controller as _lifecycle_contro
 
 ROOT = Path(__file__).resolve().parents[1]
 QT_LAYER_FILES = (
+    "qt_browse_group_dialog.py",
     "qt_editor_window.py",
+    "qt_localized_message_box.py",
     "qt_settings_dialog.py",
     "qt_tm_threshold.py",
 )
@@ -262,9 +264,8 @@ class QtTMLayerBoundaryTests(unittest.TestCase):
                 menu.setActiveAction(action)
                 QTest.keyClick(menu, Qt.Key.Key_Return)
 
-            with patch.object(
-                QMessageBox,
-                "question",
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
                 return_value=QMessageBox.StandardButton.Cancel,
             ) as confirm:
                 for key in (Qt.Key.Key_Return, Qt.Key.Key_Space):

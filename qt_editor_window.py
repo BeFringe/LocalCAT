@@ -30,12 +30,14 @@ from PySide6.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QFontMetrics,
+    QIcon,
     QKeyEvent,
     QKeySequence,
     QPaintEvent,
     QPainter,
     QPen,
     QPolygonF,
+    QPixmap,
     QResizeEvent,
     QShortcut,
     QTextCursor,
@@ -108,11 +110,17 @@ from editor_contracts import (
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_browse_group_dialog import (
+    BrowseGroupPreview,
+    BrowseGroupTurnBar,
+    QtBrowseGroupDialog,
+)
 from qt_preprocess_dialog import QtPreprocessDialog
 from qt_settings_dialog import QtSettingsDialog
 from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
+from qt_localized_message_box import show_localized_critical
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -163,6 +171,52 @@ def _paint_top_bar_chevron(
         )
     finally:
         painter.end()
+
+
+def _localcat_document_icon(size: int = 18) -> QIcon:
+    """Return an application-owned document icon with light-background contrast."""
+
+    if type(size) is not int or size < 12:
+        raise ValueError("document icon size must be an integer of at least 12")
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    scale = size / 18.0
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        body = QPolygonF(
+            (
+                QPointF(3 * scale, 1 * scale),
+                QPointF(11 * scale, 1 * scale),
+                QPointF(16 * scale, 6 * scale),
+                QPointF(16 * scale, 17 * scale),
+                QPointF(3 * scale, 17 * scale),
+            )
+        )
+        painter.setPen(QPen(QColor("#082f4d"), max(1.0, 1.0 * scale)))
+        painter.setBrush(QColor("#176887"))
+        painter.drawPolygon(body)
+        fold = QPolygonF(
+            (
+                QPointF(11 * scale, 1 * scale),
+                QPointF(11 * scale, 6 * scale),
+                QPointF(16 * scale, 6 * scale),
+            )
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#2cc0d9"))
+        painter.drawPolygon(fold)
+        line_pen = QPen(QColor("#f5fbff"), max(1.0, 1.2 * scale))
+        line_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(line_pen)
+        for y, end_x in ((9.0, 13.0), (12.0, 13.0), (15.0, 10.5)):
+            painter.drawLine(
+                QPointF(6 * scale, y * scale),
+                QPointF(end_x * scale, y * scale),
+            )
+    finally:
+        painter.end()
+    return QIcon(pixmap)
 
 
 class _TopBarModeCombo(QComboBox):
@@ -469,6 +523,9 @@ class QtWorkspaceCreationDialog(QDialog):
         self.buttons.setObjectName("workspaceCreationButtons")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
             "开始导入"
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(
+            "取消"
         )
         self.buttons.accepted.connect(self._accept_if_valid)
         self.buttons.rejected.connect(self.reject)
@@ -821,6 +878,8 @@ class QtEditorWindow(QMainWindow):
         self.project_search_result: QLabel
         self.project_search_preview: QLabel
         self.browse_table: QTableWidget
+        self.browse_group_button: QPushButton
+        self.browse_group_turn_bar: BrowseGroupTurnBar
         self.segment_position_label: QLabel
         self.speaker_display: QLabel
         self.source_display: QTextBrowser
@@ -1449,6 +1508,11 @@ class QtEditorWindow(QMainWindow):
         header.addSpacing(10)
         header.addWidget(hint)
         header.addStretch()
+        self.browse_group_button = QPushButton("分组轮次")
+        self.browse_group_button.setObjectName("browseGroupNavigatorButton")
+        self.browse_group_button.setAccessibleName("浏览分组轮次")
+        self.browse_group_button.setEnabled(False)
+        header.addWidget(self.browse_group_button)
         self.workspace_browse_chapter_title = QLabel("—")
         self.workspace_browse_chapter_title.setObjectName(
             "workspaceBrowseChapterTitle"
@@ -1486,13 +1550,20 @@ class QtEditorWindow(QMainWindow):
         )
         self.browse_table.verticalHeader().setVisible(False)
         browse_header = self.browse_table.horizontalHeader()
-        browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        browse_header.resizeSection(0, 58)
         browse_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         browse_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         browse_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         browse_header.resizeSection(3, 140)
         browse_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.browse_table, 1)
+        browse_body = QHBoxLayout()
+        browse_body.setContentsMargins(0, 0, 0, 0)
+        browse_body.setSpacing(8)
+        self.browse_group_turn_bar = BrowseGroupTurnBar()
+        browse_body.addWidget(self.browse_group_turn_bar)
+        browse_body.addWidget(self.browse_table, 1)
+        layout.addLayout(browse_body, 1)
         return panel
 
     def _build_edit_panel(self) -> QWidget:
@@ -1690,6 +1761,12 @@ class QtEditorWindow(QMainWindow):
         )
         self.workspace_mode_combo.currentIndexChanged.connect(
             self._workspace_mode_changed
+        )
+        self.browse_group_button.clicked.connect(
+            self._open_browse_group_dialog
+        )
+        self.browse_group_turn_bar.groupSelected.connect(
+            self._navigate_browse_group
         )
         self.browse_table.cellDoubleClicked.connect(self._activate_browse_row)
         self.browse_table.currentCellChanged.connect(
@@ -2163,6 +2240,7 @@ class QtEditorWindow(QMainWindow):
         self.project_search_scope.setVisible(False)
         self.workspace_documents_button.setEnabled(False)
         self.workspace_documents_menu.clear()
+        self._refresh_browse_group_button()
         self.import_workspace_package_action.setEnabled(False)
         self.save_workspace_document_action.setEnabled(False)
         self._workspace_package_import_preview = None
@@ -2876,7 +2954,7 @@ class QtEditorWindow(QMainWindow):
         view = self.controller.workspace_view
         current = self.controller.current_workspace_identity.document
         dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
-        file_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        file_icon = _localcat_document_icon()
         display_name_counts = {
             document.display_name: sum(
                 candidate.display_name == document.display_name
@@ -2975,6 +3053,7 @@ class QtEditorWindow(QMainWindow):
         self.confirmation_label.style().polish(self.confirmation_label)
         self.progress_bar.setRange(0, len(segments))
         self.progress_bar.setValue(self._active_confirmed_count())
+        self._refresh_browse_group_button()
         self.refresh_suggestions()
 
     def _target_changed(self) -> None:
@@ -3038,9 +3117,7 @@ class QtEditorWindow(QMainWindow):
             self.controller.workspace_view if self.controller.has_workspace else None
         )
         if workspace_view is not None:
-            file_icon = self.style().standardIcon(
-                QStyle.StandardPixmap.SP_FileIcon
-            )
+            file_icon = _localcat_document_icon()
             for document in workspace_view.documents:
                 document_segments = tuple(
                     item
@@ -3228,6 +3305,7 @@ class QtEditorWindow(QMainWindow):
         if not self._has_active_project():
             self.browse_table.clearContents()
             self.browse_table.setRowCount(0)
+            self._refresh_browse_group_button()
             return
         segments = self._active_segments()
         workspace_view = (
@@ -3235,6 +3313,7 @@ class QtEditorWindow(QMainWindow):
         )
         self.browse_table.setUpdatesEnabled(False)
         try:
+            self.browse_table.clearSpans()
             self.browse_table.clearContents()
             row_specs: list[tuple[str, int | None]] = []
             if workspace_view is not None:
@@ -3267,12 +3346,9 @@ class QtEditorWindow(QMainWindow):
                         divider_font.setBold(True)
                         item.setFont(divider_font)
                         if column == 0:
-                            item.setIcon(
-                                self.style().standardIcon(
-                                    QStyle.StandardPixmap.SP_FileIcon
-                                )
-                            )
+                            item.setIcon(_localcat_document_icon())
                         self.browse_table.setItem(row, column, item)
+                    self.browse_table.setSpan(row, 0, 1, 5)
                     continue
                 segment = segments[index]
                 position = f"{index + 1:03d}"
@@ -3305,6 +3381,179 @@ class QtEditorWindow(QMainWindow):
                 current,
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
+        self._refresh_browse_group_button()
+
+    def _browse_document_projection(
+        self,
+    ) -> tuple[str, tuple[tuple[int, str, str, object], ...]]:
+        """Project the current document without creating a second authority."""
+
+        if not self._has_active_project():
+            return "", ()
+        if not self.controller.has_workspace:
+            return (
+                self.controller.project.name,
+                tuple(
+                    (index, segment.source, segment.target, index)
+                    for index, segment in enumerate(self.controller.project.segments)
+                ),
+            )
+        view = self.controller.workspace_view
+        document_identity = self.controller.current_workspace_identity.document
+        document = next(
+            item for item in view.documents if item.identity is document_identity
+        )
+        return (
+            document.display_name,
+            tuple(
+                (
+                    item.document_local_index,
+                    item.source,
+                    item.target,
+                    item.identity,
+                )
+                for item in view.segments
+                if item.identity.document is document_identity
+            ),
+        )
+
+    def _browse_group_previews(self) -> tuple[BrowseGroupPreview, ...]:
+        """Build per-document turn previews bound to first segment identities."""
+
+        _document_name, entries = self._browse_document_projection()
+        if not entries:
+            return ()
+        preferences = self._display_preferences.browse_grouping
+        group_size = preferences.segments_per_group
+        total_groups = preferences.group_count(len(entries))
+        current_identity: object = (
+            self.controller.current_workspace_identity
+            if self.controller.has_workspace
+            else self.controller.current_index
+        )
+        previews: list[BrowseGroupPreview] = []
+        for start in range(0, len(entries), group_size):
+            chunk = entries[start : start + group_size]
+            first = chunk[0]
+            previews.append(
+                BrowseGroupPreview(
+                    ordinal=len(previews) + 1,
+                    total_groups=total_groups,
+                    start_index=first[0],
+                    end_index=chunk[-1][0] + 1,
+                    source=first[1],
+                    target=first[2],
+                    issued_identity=first[3],
+                    selected=any(
+                        issued is current_identity
+                        if self.controller.has_workspace
+                        else issued == current_identity
+                        for _local, _source, _target, issued in chunk
+                    ),
+                )
+            )
+        return tuple(previews)
+
+    def _refresh_browse_group_button(self) -> None:
+        """Refresh the single browse-header entry from current document state."""
+
+        if not self._has_active_project():
+            self.browse_group_button.setText("分组轮次")
+            self.browse_group_button.setEnabled(False)
+            self.browse_group_button.setProperty("groupActive", False)
+            self.browse_group_button.setToolTip("打开项目后可配置浏览分组。")
+            self.browse_group_turn_bar.set_previews((), document_name="")
+            self.browse_group_button.style().unpolish(self.browse_group_button)
+            self.browse_group_button.style().polish(self.browse_group_button)
+            return
+        document_name, entries = self._browse_document_projection()
+        preferences = self._display_preferences.browse_grouping
+        group_count = preferences.group_count(len(entries))
+        active = preferences.should_show(len(entries))
+        previews = self._browse_group_previews() if active else ()
+        self.browse_group_turn_bar.set_display_mode(
+            preferences.display_mode
+        )
+        self.browse_group_turn_bar.set_previews(
+            previews,
+            document_name=document_name,
+        )
+        self.browse_group_button.setEnabled(True)
+        self.browse_group_button.setProperty("groupActive", active)
+        if not preferences.enabled:
+            self.browse_group_button.setText("分组轮次 · 不显示")
+            tooltip = "分组轮次当前不显示；点击修改设置。"
+        elif active:
+            selected = next(
+                (preview.ordinal for preview in previews if preview.selected),
+                1,
+            )
+            self.browse_group_button.setText(
+                f"轮次 {selected} / {group_count}"
+            )
+            tooltip = "当前文档轮次导航已显示；点击修改分组设置。"
+        else:
+            self.browse_group_button.setText("分组轮次")
+            tooltip = (
+                f"当前 {len(entries)} 段、{group_count} 组；超过 "
+                f"{preferences.activation_group_threshold} 组或 "
+                f"{preferences.activation_segment_threshold} 段时显示。"
+            )
+        self.browse_group_button.setToolTip(tooltip)
+        self.browse_group_button.style().unpolish(self.browse_group_button)
+        self.browse_group_button.style().polish(self.browse_group_button)
+
+    def _open_browse_group_dialog(self) -> None:
+        """Open the settings-only dialog for the embedded turn bar."""
+
+        if not self._has_active_project():
+            return
+        document_name, entries = self._browse_document_projection()
+        preferences = self._display_preferences.browse_grouping
+        dialog = QtBrowseGroupDialog(
+            preferences=preferences,
+            document_name=document_name,
+            segment_count=len(entries),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.saved_preferences is not None:
+            try:
+                saved = self.controller.update_display_preferences(
+                    replace(
+                        self._display_preferences,
+                        browse_grouping=dialog.saved_preferences,
+                    )
+                )
+            except (TypeError, ValueError, EditorControllerError) as exc:
+                self._show_error("分组设置未保存", str(exc))
+                return
+            self._display_preferences = saved
+            self._refresh_browse_group_button()
+            self.statusBar().showMessage("已保存浏览分组设置。", 5000)
+        return
+
+    def _navigate_browse_group(self, issued_identity: object) -> None:
+        """Jump from the embedded turn bar to its group-first segment."""
+
+        if not self._has_active_project():
+            return
+        try:
+            if self.controller.has_workspace:
+                self.controller.go_to_workspace_segment(issued_identity)
+            else:
+                self.controller.go_to(int(issued_identity))
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self._show_error("无法打开分组首段", str(exc))
+            return
+        self._refreshing = True
+        try:
+            self._select_project_index(self._active_index())
+            self._render_current_segment()
+            self._refresh_browse_table()
+        finally:
+            self._refreshing = False
 
     def _browse_current_cell_changed(
         self,
@@ -4461,7 +4710,7 @@ class QtEditorWindow(QMainWindow):
         self.setWindowTitle(f"{self._active_project_name()}{dirty} · LocalCAT")
 
     def _show_error(self, title: str, message: str) -> None:
-        QMessageBox.critical(self, title, message)
+        show_localized_critical(self, title=title, text=message)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -4889,6 +5138,33 @@ QFrame#browsePanel {
 QLabel#browseHint {
     color: #74869a;
     font-size: 11px;
+}
+QPushButton#browseGroupNavigatorButton {
+    min-height: 28px;
+    min-width: 92px;
+    padding: 0 11px;
+    color: #315269;
+    background: #f4f8fb;
+    border: 1px solid #c5d4df;
+    border-radius: 14px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#browseGroupNavigatorButton:hover,
+QPushButton#browseGroupNavigatorButton:focus {
+    color: #075f7b;
+    background: #e9f7fb;
+    border-color: #58b8cf;
+}
+QPushButton#browseGroupNavigatorButton[groupActive="true"] {
+    color: #ffffff;
+    background: #078caf;
+    border-color: #078caf;
+}
+QPushButton#browseGroupNavigatorButton:disabled {
+    color: #95a5b2;
+    background: #edf1f4;
+    border-color: #dce3e9;
 }
 QComboBox#segmentDensityCombo {
     min-height: 26px;

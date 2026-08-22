@@ -320,17 +320,16 @@ class QtPreprocessingTests(unittest.TestCase):
     def test_confirmed_preview_keeps_warning_and_draft_only_stays_explicit(
         self,
     ) -> None:
-        with patch.object(
-            QMessageBox,
-            "question",
+        with patch(
+            "qt_preprocess_dialog.ask_localized_question",
             return_value=QMessageBox.StandardButton.Cancel,
         ) as question:
             self.assertFalse(self.dialog._confirm_apply(2, True))
-            confirmed_prompt = question.call_args.args[2]
+            confirmed_prompt = question.call_args.kwargs["text"]
             self.assertIn("设为待确认", confirmed_prompt)
 
             self.assertFalse(self.dialog._confirm_apply(1, False))
-            draft_prompt = question.call_args.args[2]
+            draft_prompt = question.call_args.kwargs["text"]
             self.assertIn("草稿", draft_prompt)
             self.assertNotIn("设为待确认", draft_prompt)
 

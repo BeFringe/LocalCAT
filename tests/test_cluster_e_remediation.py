@@ -20,7 +20,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, Qt
-from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QPushButton, QWidget
 
 import capability_host as capability_host_module
 from capability_host import CapabilityHostComposition
@@ -858,8 +858,12 @@ class ClusterERemediationTests(unittest.TestCase):
 
             with (
                 patch(
-                    "qt_tm_threshold.QInputDialog.getDouble",
-                    return_value=(80, True),
+                    "qt_tm_threshold.QInputDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "qt_tm_threshold.QInputDialog.doubleValue",
+                    return_value=80,
                 ),
                 patch.object(
                     controller,

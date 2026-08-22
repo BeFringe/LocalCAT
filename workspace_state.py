@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import cast
 
 from editor_contracts import (
+    BrowseGroupDisplayMode,
+    BrowseGroupPreferences,
     DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
     LiteralReplaceRule,
@@ -388,10 +390,68 @@ class WorkspaceStateRepository:
                         LOGGER.warning(
                             "Using default editor font size from invalid workspace state"
                         )
+                browse_defaults = BrowseGroupPreferences()
+                browse_grouping = browse_defaults
+                raw_browse_grouping = display.get("browse_grouping")
+                if raw_browse_grouping is not None:
+                    if not isinstance(raw_browse_grouping, dict):
+                        LOGGER.warning(
+                            "Using default browse grouping from invalid workspace state"
+                        )
+                    else:
+                        browse_mapping = cast(
+                            dict[str, object],
+                            raw_browse_grouping,
+                        )
+                        try:
+                            browse_grouping = BrowseGroupPreferences(
+                                enabled=cast(
+                                    bool,
+                                    browse_mapping.get(
+                                        "enabled",
+                                        browse_defaults.enabled,
+                                    ),
+                                ),
+                                segments_per_group=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "segments_per_group",
+                                        browse_defaults.segments_per_group,
+                                    ),
+                                ),
+                                activation_group_threshold=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "activation_group_threshold",
+                                        browse_defaults.activation_group_threshold,
+                                    ),
+                                ),
+                                activation_segment_threshold=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "activation_segment_threshold",
+                                        browse_defaults.activation_segment_threshold,
+                                    ),
+                                ),
+                                display_mode=BrowseGroupDisplayMode(
+                                    cast(
+                                        str,
+                                        browse_mapping.get(
+                                            "display_mode",
+                                            browse_defaults.display_mode.value,
+                                        ),
+                                    )
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            LOGGER.warning(
+                                "Using default browse grouping from invalid workspace state"
+                            )
                 preferences = DisplayPreferences(
                     segment_density=segment_density,
                     workspace_mode=workspace_mode,
                     editor_font_size=editor_font_size,
+                    browse_grouping=browse_grouping,
                 )
 
         tm_preferences = TMPreferences()
@@ -500,6 +560,19 @@ class WorkspaceStateRepository:
                 "segment_density": preferences.segment_density.value,
                 "workspace_mode": preferences.workspace_mode.value,
                 "editor_font_size": preferences.editor_font_size,
+                "browse_grouping": {
+                    "enabled": preferences.browse_grouping.enabled,
+                    "segments_per_group": (
+                        preferences.browse_grouping.segments_per_group
+                    ),
+                    "activation_group_threshold": (
+                        preferences.browse_grouping.activation_group_threshold
+                    ),
+                    "activation_segment_threshold": (
+                        preferences.browse_grouping.activation_segment_threshold
+                    ),
+                    "display_mode": preferences.browse_grouping.display_mode.value,
+                },
             },
             "tm_preferences": {
                 "minimum_similarity": tm_preferences.minimum_similarity,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QLabel, QInputDialog, QPushButton, QWidget
+from PySide6.QtWidgets import QDialog, QLabel, QInputDialog, QPushButton, QWidget
 
 from editor_contracts import (
     FuzzyValidationDisplay,
@@ -112,19 +112,20 @@ def prompt_tm_threshold(
     """Ask for one constrained percentage; cancellation has no side effect."""
 
     preferences.__post_init__()
-    percentage, accepted = QInputDialog.getDouble(
-        parent,
-        "调整 Fuzzy 阈值",
-        "最低相似度（60%～100%）",
-        preferences.minimum_similarity * 100.0,
-        60.0,
-        100.0,
-        2,
-        step=1.0,
-    )
-    if not accepted:
+    dialog = QInputDialog(parent)
+    dialog.setObjectName("tmThresholdDialog")
+    dialog.setWindowTitle("调整 Fuzzy 阈值")
+    dialog.setLabelText("最低相似度（60%～100%）")
+    dialog.setInputMode(QInputDialog.InputMode.DoubleInput)
+    dialog.setDoubleRange(60.0, 100.0)
+    dialog.setDoubleDecimals(2)
+    dialog.setDoubleStep(1.0)
+    dialog.setDoubleValue(preferences.minimum_similarity * 100.0)
+    dialog.setOkButtonText("确定")
+    dialog.setCancelButtonText("取消")
+    if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
-    return float(percentage / 100.0)
+    return float(dialog.doubleValue() / 100.0)
 
 
 def tm_threshold_feedback(outcome: TMThresholdUpdateOutcome) -> str:

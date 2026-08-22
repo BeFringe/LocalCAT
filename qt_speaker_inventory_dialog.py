@@ -112,6 +112,7 @@ class QtSpeakerInventoryDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         buttons.setObjectName("speakerInventoryButtons")
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
