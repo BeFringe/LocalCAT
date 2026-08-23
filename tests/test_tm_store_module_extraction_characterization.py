@@ -148,10 +148,10 @@ _FULL_MODULE_PATCH_CALL_COUNT = 306
 _FULL_MODULE_PATCH_DIGEST = (
     "ce059addd6233cf8ae9f2d455606ef49167964001d307dd2da309f885e4f035a"
 )
-_FULL_INSTANCE_PATCH_ENTRY_COUNT = 35
-_FULL_INSTANCE_PATCH_CALL_COUNT = 82
+_FULL_INSTANCE_PATCH_ENTRY_COUNT = 36
+_FULL_INSTANCE_PATCH_CALL_COUNT = 83
 _FULL_INSTANCE_PATCH_DIGEST = (
-    "0d8e587f9c8e4501f8f9f06b84fe36289fc6960b45c1329b98eb99c35924411a"
+    "ac027645e9edf0089bf01e238859b71316502a8899a4d61a7b57dc50e09e1f59"
 )
 
 _SQL_TOKENS = (
@@ -874,7 +874,7 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             acceptance["source_fingerprint"],
-            "c752ebb8ec763c73cbc7219df4eaa208f1abe6a7aa72ce08ce708d975a72d75d",
+            "20b2d02fa150945bf4b61e2ef3bff2720489df6542539adc11997b850be031c3",
         )
         self.assertEqual(
             fault["source_fingerprint"],
@@ -886,7 +886,7 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             release["source_fingerprint"],
-            "4607a7b40afeb723dc88262016c44fdd99f3a70c5b2c20176b133a37418ea575",
+            "0a4020933de958b78be7117e223da222a1661f400e1b68f085ecb1aadfdc92f4",
         )
         self.assertTrue(benchmark["suite_report"]["passed"])
         self.assertEqual(benchmark["suite_report"]["failed_paths"], [])
