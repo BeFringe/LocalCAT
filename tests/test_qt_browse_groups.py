@@ -209,7 +209,16 @@ class QtBrowseGroupTests(unittest.TestCase):
             self._events()
 
             self.assertEqual(window.browse_group_button.text(), "轮次 1 / 7")
-            self.assertLessEqual(window.browse_table.columnWidth(0), 60)
+            position_item = window.browse_table.item(37, 0)
+            self.assertIsNotNone(position_item)
+            assert position_item is not None
+            self.assertEqual(position_item.text(), "038")
+            self.assertGreaterEqual(
+                window.browse_table.columnWidth(0),
+                window.browse_table.fontMetrics().horizontalAdvance("038")
+                + 40,
+            )
+            self.assertLessEqual(window.browse_table.columnWidth(0), 90)
             self.assertTrue(window.browse_group_turn_bar.isVisible())
             self.assertEqual(
                 len(window.browse_group_turn_bar.ticks),

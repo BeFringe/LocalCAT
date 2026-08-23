@@ -1551,7 +1551,7 @@ class QtEditorWindow(QMainWindow):
         self.browse_table.verticalHeader().setVisible(False)
         browse_header = self.browse_table.horizontalHeader()
         browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        browse_header.resizeSection(0, 58)
+        browse_header.resizeSection(0, 72)
         browse_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         browse_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         browse_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
@@ -3328,6 +3328,16 @@ class QtEditorWindow(QMainWindow):
                     )
             else:
                 row_specs.extend(("", index) for index in range(len(segments)))
+            maximum_position = len(segments)
+            if workspace_view is not None:
+                maximum_position = max(
+                    (
+                        item.document_local_index + 1
+                        for item in workspace_view.segments
+                    ),
+                    default=0,
+                )
+            self._resize_browse_position_column(maximum_position)
             self.browse_table.setRowCount(len(row_specs))
             current_row = 0
             for row, (document_title, index) in enumerate(row_specs):
@@ -3382,6 +3392,27 @@ class QtEditorWindow(QMainWindow):
                 QAbstractItemView.ScrollHint.PositionAtCenter,
             )
         self._refresh_browse_group_button()
+
+    def _resize_browse_position_column(self, maximum_position: int) -> None:
+        """Keep the compact paragraph identifier visible without elision."""
+
+        if type(maximum_position) is not int or maximum_position < 0:
+            raise ValueError("browse maximum position must be non-negative")
+        widest_position = f"{max(1, maximum_position):03d}"
+        body_width = (
+            self.browse_table.fontMetrics().horizontalAdvance(widest_position)
+            + 40
+        )
+        header_width = (
+            self.browse_table.horizontalHeader()
+            .fontMetrics()
+            .horizontalAdvance("段落")
+            + 32
+        )
+        self.browse_table.horizontalHeader().resizeSection(
+            0,
+            max(72, body_width, header_width),
+        )
 
     def _browse_document_projection(
         self,

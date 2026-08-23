@@ -365,8 +365,8 @@ class BrowseGroupIndicatorTick(QAbstractButton):
 class _BrowseGroupPreviewPopup(QFrame):
     """Non-activating preview floated beside one indicator tick."""
 
-    def __init__(self) -> None:
-        super().__init__(None, Qt.WindowType.ToolTip)
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.ToolTip)
         self.setObjectName("browseGroupPreviewPopup")
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -474,7 +474,7 @@ class BrowseGroupTurnBar(QFrame):
         self.cards: tuple[BrowseGroupCard, ...] = ()
         self.ticks: tuple[BrowseGroupIndicatorTick, ...] = ()
         self._previews: tuple[BrowseGroupPreview, ...] = ()
-        self._preview_popup = _BrowseGroupPreviewPopup()
+        self._preview_popup = _BrowseGroupPreviewPopup(self)
         self._preview_hide_timer = QTimer(self)
         self._preview_hide_timer.setSingleShot(True)
         self._preview_hide_timer.setInterval(140)

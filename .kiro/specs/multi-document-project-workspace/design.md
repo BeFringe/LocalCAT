@@ -870,6 +870,7 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 
 - `BrowseGroupPreferences` 是 `workspace_state.py` 保存的设备本地 display member，默认启用、`20` 段/组、超过 `5` 组或 `100` 段显示，显示方式默认 `AUTO_COLLAPSE`，也可显式选择 `FIXED`；比较使用严格 `>` 和 OR 语义。
 - `qt_editor_window.py` 只从当前 Controller projection 中切出当前 Document，按 20–200/步长 10 建立临时预览；`qt_browse_group_dialog.py` 的 `BrowseGroupTurnBar` 嵌入 Browse/Review 主页表格左侧，同一 projection 可在窄轮次指示条与固定预览列表之间切换，两种页面各自垂直滚动，设置弹窗不容纳轮次预览。
+- Browse 表的“段落”列保持 Fixed resize mode，但宽度由当前 projection 的最大文档内编号、表格/表头字体度量和单元格 padding 下限共同计算；三位及更多位编号不得因压缩列而 elide。
 - target 非空时固定 source 1 行 + target 最多 3 行；target 为空时 source 最多 4 行。最后可见行用字体度量后省略，不以字符数猜测宽度。
 - 每组只携带首段的 issued identity；点击后回到 Controller 现有 `go_to` / `go_to_workspace_segment` 入口。分组顺序、命名和大小都不参与 Project/Document/Segment identity、dirty、save、TM 或 chunk membership。
 - Browse/Review 标题行不展开显示方式、分组大小、阈值或启用复选框；只放置单一设置入口按钮。自动收起式仅在主页保留 Codex 风格的窄刻度轨道，并在标记 hover/focus 时浮出四行预览；固定式则在主页常驻同一四行预览列表。全部设置归属弹窗；跨 Document 浏览或文件夹选择只重建当前 Document 的轮次投影。
