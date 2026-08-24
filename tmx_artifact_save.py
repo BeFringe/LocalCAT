@@ -107,6 +107,56 @@ def _write_all(fd: int, data: bytes) -> None:
         offset += written
 
 
+def _sidecar_name(
+    destination_name: str,
+    operation_id: str,
+    role: str,
+    name_max: int,
+) -> str:
+    """Keep safe-save siblings related to the user-selected destination."""
+
+    suffix = f".localcat-{operation_id}.{role}.tmx"
+    suffix_bytes = suffix.encode("utf-8")
+    available = name_max - len(suffix_bytes)
+    if available < 1:
+        raise TmxContextError(
+            "TMX.DESTINATION_NAME_TOO_LONG",
+            "destination does not leave room for a safe publication sidecar",
+        )
+    prefix_bytes = destination_name.encode("utf-8")[:available]
+    while prefix_bytes:
+        try:
+            prefix = prefix_bytes.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            prefix_bytes = prefix_bytes[:-1]
+    else:
+        prefix = "t"
+    return f"{prefix}{suffix}"
+
+
+def _candidate_create_error(error: OSError) -> TmxContextError:
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return TmxContextError(
+            "TMX.DESTINATION_PERMISSION_DENIED",
+            "destination directory does not allow the safe TMX candidate",
+        )
+    if error.errno == errno.EROFS:
+        return TmxContextError(
+            "TMX.DESTINATION_READ_ONLY",
+            "destination directory is read-only",
+        )
+    if error.errno == errno.ENAMETOOLONG:
+        return TmxContextError(
+            "TMX.DESTINATION_NAME_TOO_LONG",
+            "destination name is too long for safe TMX publication",
+        )
+    return TmxContextError(
+        "TMX.CANDIDATE_CREATE_FAILED",
+        "exclusive TMX candidate could not be created",
+    )
+
+
 class TmxDirectArtifactSaver:
     """Issue private plans and publish only after owner and Parser revalidation."""
 
@@ -228,13 +278,24 @@ class TmxDirectArtifactSaver:
             raise TmxContextError("TMX.SCOPE_REVALIDATION_FAILED", "source scope no longer matches preview") from exc
 
         parent_fd = _open_parent(fact.parent)
-        candidate_name = f".localcat-tmx-{preview.operation_id}.candidate"
-        lkg_name = f".localcat-tmx-{preview.operation_id}.lkg"
         candidate_created = False
         lkg_created = False
         published = False
         candidate_fact: _RegularFact | None = None
         try:
+            name_max = int(os.fpathconf(parent_fd, "PC_NAME_MAX"))
+            candidate_name = _sidecar_name(
+                fact.name,
+                preview.operation_id,
+                "candidate",
+                name_max,
+            )
+            lkg_name = _sidecar_name(
+                fact.name,
+                preview.operation_id,
+                "lkg",
+                name_max,
+            )
             parent_now = os.fstat(parent_fd)
             if (parent_now.st_dev, parent_now.st_ino) != (fact.parent_device, fact.parent_inode):
                 raise TmxContextError("TMX.DESTINATION_PARENT_STALE", "destination parent changed after preview")
@@ -246,7 +307,7 @@ class TmxDirectArtifactSaver:
             try:
                 candidate_fd = os.open(candidate_name, flags, 0o600, dir_fd=parent_fd)
             except OSError as exc:
-                raise TmxContextError("TMX.CANDIDATE_CREATE_FAILED", "exclusive TMX candidate could not be created") from exc
+                raise _candidate_create_error(exc) from exc
             candidate_created = True
             try:
                 _write_all(candidate_fd, payload.data)

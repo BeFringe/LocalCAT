@@ -140,6 +140,7 @@ def _inventory_effective_locales(data: bytes) -> TmxEffectiveLocales:
             required = {
                 "creationtool": "LocalCAT",
                 "segtype": "sentence",
+                "o-tmf": "LocalCAT",
                 "adminlang": "en",
                 "datatype": "PlainText",
             }
@@ -436,7 +437,8 @@ def prepare_tmx_payload(
         '<tmx version="1.4">',
         (
             '  <header creationtool="LocalCAT" creationtoolversion="1" '
-            f'segtype="sentence" adminlang="en" srclang={quoteattr(source_locale)} '
+            f'segtype="sentence" o-tmf="LocalCAT" adminlang="en" '
+            f'srclang={quoteattr(source_locale)} '
             'datatype="PlainText"/>'
         ),
         "  <body>",

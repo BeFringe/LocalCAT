@@ -56,6 +56,7 @@ class TmxContextInterchangeTests(unittest.TestCase):
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.proof.payload_digest, second.proof.payload_digest)
         text = first.data.decode("utf-8")
+        self.assertIn('o-tmf="LocalCAT"', text)
         self.assertTrue(text.endswith("\n"))
         self.assertNotIn("\r", text)
         self.assertNotIn("<!DOCTYPE", text)
@@ -167,6 +168,17 @@ class TmxContextInterchangeTests(unittest.TestCase):
             self.assertEqual(inspected.payload_digest, payload.proof.payload_digest)
             self.assertEqual(inspected.parser_content_digest, payload.proof.parser_content_digest)
             self.assertEqual(inspected.loss_report, payload.proof.loss_report)
+
+            missing_original_format = root / "missing-o-tmf.tmx"
+            missing_original_format.write_bytes(
+                payload.data.replace(b' o-tmf="LocalCAT"', b"")
+            )
+            with self.assertRaises(TmxContextError) as missing_format:
+                inspect_tmx_payload(missing_original_format)
+            self.assertEqual(
+                missing_format.exception.code,
+                "TMX.COLD_PROFILE_INVALID",
+            )
 
             unsafe = root / "unsafe.tmx"
             unsafe.write_bytes(

@@ -59,6 +59,11 @@ _TMX_ERROR_MESSAGES = {
         "当前范围没有可导出的双语段落；空译文不会写入 TMX。"
     ),
     "TMX.DESTINATION_EXTENSION": "目标文件名必须以 .tmx 结尾。",
+    "TMX.DESTINATION_PERMISSION_DENIED": (
+        "没有权限在目标位置创建安全候选文件；请重新选择可写目录。"
+    ),
+    "TMX.DESTINATION_READ_ONLY": "目标位置为只读；请重新选择可写目录。",
+    "TMX.DESTINATION_NAME_TOO_LONG": "目标文件名过长；请使用更短的 TMX 名称。",
     "TMX.LOCALE.INVALID": "请填写有效的源语言和目标语言。",
 }
 
@@ -285,6 +290,7 @@ class TmxExportDialog(QDialog):
             self.destination.setText(str(destination))
         if not destination.is_absolute():
             destination = destination.absolute()
+            self.destination.setText(str(destination))
         source, target = self._effective_locales()
         token = str(self.scope_combo.currentData())
         self._set_busy(True)

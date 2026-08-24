@@ -75,7 +75,7 @@ translation_memory × localcat-tmx-level1-context-v1 × direct|resource-package-
 
 ## TMX mapping
 
-- Header：creationtool=`LocalCAT`，segtype=`sentence`，adminlang=`en`，srclang=effective source locale，datatype=`PlainText`。
+- Header：creationtool=`LocalCAT`，creationtoolversion=`1`，segtype=`sentence`，o-tmf=`LocalCAT`，adminlang=`en`，srclang=effective source locale，datatype=`PlainText`。
 - TU identity：scope kind + stable source identity 的确定性摘要，不使用显示名或路径。
 - TUV：exact source/target locale；`<seg>` 仅文本。
 - LocalCAT props：speaker、context-prev、context-next、file-source、confirmed/status、provenance key/value；未知 imported props 按原顺序追加并保留 duplicates。

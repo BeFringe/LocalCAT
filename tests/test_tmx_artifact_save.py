@@ -81,6 +81,24 @@ class TmxArtifactSaveTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), replacement.data)
         self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("resource.tmx",))
 
+    def test_candidate_is_related_to_new_destination_name(self) -> None:
+        destination = self.root / "新建项目.tmx"
+        observed: list[str] = []
+
+        def validate(path, proof):
+            observed.append(path.name)
+            ParserTmxColdValidator()(path, proof)
+
+        saver = self.saver(validator=validate)
+        _preview, plan = saver.preview(self.binding, self.payload, destination)
+        saver.apply(plan)
+
+        self.assertEqual(len(observed), 2)
+        self.assertTrue(observed[0].startswith(destination.name))
+        self.assertTrue(observed[0].endswith(".candidate.tmx"))
+        self.assertEqual(observed[1], destination.name)
+        self.assertEqual(tuple(path.name for path in self.root.iterdir()), (destination.name,))
+
     def test_stale_destination_and_scope_fail_before_candidate(self) -> None:
         destination = self.root / "stale.tmx"
         destination.write_bytes(b"prior")

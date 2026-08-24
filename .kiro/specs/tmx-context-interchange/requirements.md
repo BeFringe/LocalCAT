@@ -41,7 +41,7 @@ LocalCAT 已有拒绝 DTD/ENTITY、限额流式读取和语言对选择的 TMX L
 
 ### Requirement 3：确定性 TMX payload
 
-1. The writer shall 生成 UTF-8、LF、无 DTD/ENTITY 的 TMX 1.4 Level 1 文本，并以稳定 TU/TUV/prop/attribute 顺序输出。
+1. The writer shall 生成 UTF-8、LF、无 DTD/ENTITY 的 TMX 1.4 Level 1 文本，Header 明确携带 `creationtool`、`creationtoolversion`、`segtype`、`o-tmf`、`adminlang`、`srclang` 与 `datatype`，并以稳定 TU/TUV/prop/attribute 顺序输出。
 2. Each exported unit shall 有稳定 scope-derived TU identity；重复 source/target 单元不得去重或合并。
 3. The writer shall 使用 preview 绑定的 exact source/target effective locale，不从文本或系统 locale 猜测。
 4. The writer shall 转义 XML 文本并拒绝无法在 profile 中无损表示的控制字符或 inline XML。
