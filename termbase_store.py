@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import hashlib
 import io
 import os
@@ -29,6 +30,42 @@ from editor_contracts import (
 _V1_MARKER = TermRowKind.V1.value
 _BOOLEAN_VALUES = {"false": False, "true": True}
 _MutationCounts = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class TermbasePortableSnapshot:
+    """Owner-issued facts for one canonical mixed legacy/v1 CSV snapshot."""
+
+    payload_digest: str
+    source_baseline_digest: str
+    payload_byte_count: int
+    record_count: int
+    legacy_record_count: int
+    v1_record_count: int
+
+    def __post_init__(self) -> None:
+        for name, digest in (
+            ("payload", self.payload_digest),
+            ("source baseline", self.source_baseline_digest),
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise TypeError(
+                    f"termbase snapshot {name} digest must be lowercase SHA-256"
+                )
+        for name, value in (
+            ("payload byte count", self.payload_byte_count),
+            ("record count", self.record_count),
+            ("legacy record count", self.legacy_record_count),
+            ("v1 record count", self.v1_record_count),
+        ):
+            if type(value) is not int or value < 0:
+                raise TypeError(f"termbase snapshot {name} must be nonnegative int")
+        if self.legacy_record_count + self.v1_record_count != self.record_count:
+            raise ValueError("termbase snapshot row counts must close")
 
 
 class TermbaseValidationError(ValueError):
@@ -563,6 +600,90 @@ class TermbaseStore:
         )
         return prepared
 
+    def validate_portable_snapshot(self, source: Path) -> TermbasePortableSnapshot:
+        """Validate one exact owner-canonical CSV/v1 snapshot without mutation."""
+
+        source = _absolute_resource_path(source)
+        payload = source.read_bytes()
+        records = self._records_from_bytes(payload)
+        canonical = _serialize_rows(_rows_from_records(records))
+        if payload != canonical:
+            raise TermbaseValidationError("NON_CANONICAL_SNAPSHOT")
+        return _portable_snapshot_facts(
+            payload,
+            records,
+            source_baseline_digest=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def export_portable_snapshot(
+        self,
+        source: Path,
+        destination: Path,
+    ) -> TermbasePortableSnapshot:
+        """Publish exact canonical snapshot bytes to a new private destination.
+
+        The caller owns final user-destination publication.  Requiring an absent
+        destination keeps this owner port from silently replacing unrelated data.
+        """
+
+        source = _absolute_resource_path(source)
+        destination = _absolute_resource_path(destination)
+        if source == destination:
+            raise ValueError("portable snapshot destination must differ from source")
+        if destination.exists():
+            raise FileExistsError(destination)
+        original, source_digest, records = self._read_snapshot(source)
+        payload = _serialize_rows(_rows_from_records(records))
+        if hashlib.sha256(original).hexdigest() != source_digest:
+            raise AssertionError("termbase snapshot digest changed in memory")
+        facts = _portable_snapshot_facts(
+            payload,
+            records,
+            source_baseline_digest=source_digest,
+        )
+        try:
+            _write_new_durable_file(destination, payload)
+            if _digest_path(source) != source_digest:
+                raise TermbaseValidationError("SOURCE_CHANGED")
+            validated = self.validate_portable_snapshot(destination)
+            if (
+                validated.payload_digest != facts.payload_digest
+                or validated.payload_byte_count != facts.payload_byte_count
+                or validated.record_count != facts.record_count
+                or validated.legacy_record_count != facts.legacy_record_count
+                or validated.v1_record_count != facts.v1_record_count
+            ):
+                raise TermbaseValidationError("SNAPSHOT_VERIFY_FAILED")
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            _best_effort_fsync_directory(destination.parent)
+            raise
+        return facts
+
+    def prepare_snapshot_replace(
+        self,
+        path: Path,
+        source: Path,
+    ) -> PreparedTermMutation:
+        """Prepare a full snapshot replacement through the existing commit owner."""
+
+        path = _absolute_resource_path(path)
+        source = _absolute_resource_path(source)
+        source_payload = source.read_bytes()
+        source_records = self._records_from_bytes(source_payload)
+        if source_payload != _serialize_rows(_rows_from_records(source_records)):
+            raise TermbaseValidationError("NON_CANONICAL_SNAPSHOT")
+        original, base_digest, _current = self._read_snapshot(path)
+        prepared = self._prepare_artifacts(
+            action="snapshot_replace",
+            path=path,
+            original=original,
+            base_digest=base_digest,
+            candidate_rows=_rows_from_records(source_records),
+        )
+        self._prepared_counts[prepared] = (0, 0, 0, len(source_records), 0)
+        return prepared
+
     def list_records(self, path: Path) -> tuple[TermRecord, ...]:
         """Return a fully validated immutable snapshot in file order."""
 
@@ -823,6 +944,8 @@ def _derive_mutation_counts(
             for record in committed_records
         )
         return (0, 0, 0, imported, overwritten)
+    if action == "snapshot_replace":
+        return (0, 0, 0, len(committed_records), 0)
     raise ValueError("unsupported prepared term mutation action")
 
 
@@ -893,6 +1016,45 @@ def _serialize_rows(rows: list[list[str]]) -> bytes:
     writer = csv.writer(stream, lineterminator="\n")
     writer.writerows(rows)
     return b"\xef\xbb\xbf" + stream.getvalue().encode("utf-8")
+
+
+def _portable_snapshot_facts(
+    payload: bytes,
+    records: tuple[TermRecord, ...],
+    *,
+    source_baseline_digest: str,
+) -> TermbasePortableSnapshot:
+    legacy_count = sum(
+        record.locator.row_kind is TermRowKind.LEGACY for record in records
+    )
+    return TermbasePortableSnapshot(
+        payload_digest=hashlib.sha256(payload).hexdigest(),
+        source_baseline_digest=source_baseline_digest,
+        payload_byte_count=len(payload),
+        record_count=len(records),
+        legacy_record_count=legacy_count,
+        v1_record_count=len(records) - legacy_count,
+    )
+
+
+def _write_new_durable_file(path: Path, payload: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    _fsync_directory(path.parent)
 
 
 def _write_durable_temp(directory: Path, prefix: str, data: bytes) -> Path:

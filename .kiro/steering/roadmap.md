@@ -128,7 +128,7 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 - [ ] `editor-search-preprocessing` -- 启用项目搜索 Match Case / Whole Word、扩展结果语义与大项目优化。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `speaker-display-profiles` -- 每项目 speaker 显示名/留空/头像。Dependencies: `qt-editor-json-mvp-increment`
 - [x] `multi-document-project-workspace` -- Project/Document/Segment、章节导航、稳定复合 ID、ProjectPackage 事务、多文档保存/恢复报告与 final current-source evidence。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
-- [ ] `language-resource-portability` -- TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/receipt 与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
+- [x] `language-resource-portability` -- 已落地 TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/apply/receipt、受管恢复与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
 - [ ] `tmx-context-interchange` -- ResourcePackage 未来可增加的 TMX export profile、context/provenance 与有损取舍；不拥有 ResourcePackage container/apply authority。Dependencies: `tm-storage-retrieval-index`, `language-resource-portability`
 - [x] `collaborative-job-chunks` -- 已在不改变 Document 身份的前提下落地 exact segment membership、动态拆分/合并、单 assignee、Controller 权限、progress/rebase、namespaced metadata 与 Project 菜单分工切面。Dependencies: `multi-document-project-workspace`
 - [ ] `cross-device-sync-plugin` -- 本地优先的可选同步插件边界、远程 provider、冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`

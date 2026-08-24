@@ -36,7 +36,7 @@ LocalCAT 为 TM 和术语资源提供可验证、可冷重开、原子发布的�
 
 ## Promotion Timing
 
-本 Brief 现在只记录同步前的资源可移植性交接，不立即提升 Requirements/Design/Tasks。待 `multi-document-project-workspace` Cluster 2 冻结 `ProjectPackage` 的 manifest、preview、receipt 与 failure semantics 后，再借鉴其已验证的实现原语起草独立 `ResourcePackage` R/D/T；不继承 ProjectPackage 身份或 schema authority。
+`multi-document-project-workspace` Cluster 2 已冻结可借鉴的 manifest、preview、receipt 与 failure-semantics 实现经验。本规格的独立 Requirements/Design/Tasks 已冻结，可进入实现；后续只借鉴 ProjectPackage 已验证的无语义实现原语，不继承其身份、manifest 或 schema authority。
 
 该闭环必须在 `cross-device-sync-plugin` 开始传输 TM/术语资源之前完成，但不阻塞 Multi-Document 本身实施。
 

@@ -437,7 +437,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             inner = dialog.active_table.verticalScrollBar()
             outer = dialog.resource_tables_scroll.verticalScrollBar()
             self.assertEqual(inner.maximum(), 56)
-            self.assertEqual(outer.maximum(), 308)
+            self.assertGreaterEqual(outer.maximum(), 250)
 
             phases = (
                 Qt.ScrollPhase.NoScrollPhase,

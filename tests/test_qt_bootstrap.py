@@ -103,20 +103,28 @@ class QtBootstrapTest(unittest.TestCase):
             # missing-openpyxl branch it names.
             source.write_bytes(_archive_bytes())
             target = root / "terms.csv"
-            target.write_bytes(b"keep")
-            original_import = builtins.__import__
+            prior = b"keep,value\n"
+            target.write_bytes(prior)
+            import parser_termbase_codec
 
-            def guarded_import(name, *args, **kwargs):
+            original_import_module = (
+                parser_termbase_codec.importlib.import_module
+            )
+
+            def guarded_import_module(name, *args, **kwargs):
                 if name == "openpyxl":
                     raise ImportError("openpyxl unavailable")
-                return original_import(name, *args, **kwargs)
+                return original_import_module(name, *args, **kwargs)
 
-            with patch("builtins.__import__", side_effect=guarded_import):
+            with patch(
+                "parser_termbase_codec.importlib.import_module",
+                side_effect=guarded_import_module,
+            ):
                 report = import_termbase(source, target)
 
             self.assertTrue(report.errors)
             self.assertIn("openpyxl", report.errors[0])
-            self.assertEqual(target.read_bytes(), b"keep")
+            self.assertEqual(target.read_bytes(), prior)
 
     def test_installs_linux_desktop_launcher_without_loading_qt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

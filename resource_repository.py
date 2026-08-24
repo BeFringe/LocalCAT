@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
+import stat
 import tempfile
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -21,6 +24,20 @@ SCHEMA_VERSION = 1
 
 class ResourceError(RuntimeError):
     """Raised when the resource registry cannot be handled safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedResourceCreate:
+    """Repository-issued unpublished local identity for one create operation."""
+
+    operation_id: str
+    resource: ResourceConfig
+
+    def __post_init__(self) -> None:
+        if type(self.operation_id) is not str or not self.operation_id:
+            raise TypeError("prepared resource operation id must be nonempty str")
+        if type(self.resource) is not ResourceConfig:
+            raise TypeError("prepared resource must be exact ResourceConfig")
 
 
 class ResourceRepository:
@@ -46,6 +63,10 @@ class ResourceRepository:
         else:
             self._resources = self._bootstrap(default_tm_path, default_termbase_path)
             self._write_registry(self._resources)
+        self._prepared_creates: dict[
+            str,
+            tuple[PreparedResourceCreate, tuple[ResourceConfig, ...]],
+        ] = {}
 
     def list_resources(self) -> tuple[ResourceConfig, ...]:
         """Return configured resources in their persistent display order."""
@@ -102,6 +123,152 @@ class ResourceRepository:
             raise
         self._resources = updated
         LOGGER.info("Created managed %s resource %s", normalized_kind.value, resource_id)
+        return resource
+
+    def prepare_resource_create(
+        self,
+        name: str,
+        kind: ResourceKind | str,
+    ) -> PreparedResourceCreate:
+        """Issue an unpublished managed identity without creating a public row."""
+
+        clean_name = name.strip()
+        if not clean_name:
+            raise ResourceError("resource name must not be empty")
+        try:
+            normalized_kind = kind if isinstance(kind, ResourceKind) else ResourceKind(kind)
+        except (TypeError, ValueError) as exc:
+            raise ResourceError(f"unsupported resource kind: {kind}") from exc
+        resource_id = uuid4().hex
+        suffix = ".jsonl" if normalized_kind is ResourceKind.TRANSLATION_MEMORY else ".csv"
+        stem = _safe_stem(clean_name) or normalized_kind.value
+        path = (self.managed_dir / f"{stem}-{resource_id[:8]}{suffix}").resolve()
+        if not path.is_relative_to(self.managed_dir) or path.exists():
+            raise ResourceError("managed resource create path is unavailable")
+        resource = ResourceConfig(
+            id=resource_id,
+            name=clean_name,
+            kind=normalized_kind,
+            path=path,
+        )
+        prepared = PreparedResourceCreate(uuid4().hex, resource)
+        self._prepared_creates[prepared.operation_id] = (
+            prepared,
+            tuple(self._resources),
+        )
+        return prepared
+
+    def publish_prepared_create(
+        self,
+        prepared: PreparedResourceCreate,
+    ) -> ResourceConfig:
+        """Publish one issued identity after its owner-created file is proven."""
+
+        if type(prepared) is not PreparedResourceCreate:
+            raise TypeError("prepared resource create must be exact")
+        issued = self._prepared_creates.get(prepared.operation_id)
+        if issued is None or issued[0] is not prepared:
+            raise ResourceError("prepared resource create is stale")
+        if tuple(self._resources) != issued[1]:
+            raise ResourceError("resource registry changed after create preview")
+        resource = prepared.resource
+        try:
+            observed = os.lstat(resource.path)
+        except OSError as error:
+            raise ResourceError("prepared resource file is unavailable") from error
+        if not resource.path.is_relative_to(self.managed_dir) or not (
+            stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1
+        ):
+            raise ResourceError("prepared resource file is unsafe")
+        updated = [*self._resources, resource]
+        self._write_registry(updated)
+        self._resources = updated
+        del self._prepared_creates[prepared.operation_id]
+        return resource
+
+    def cancel_prepared_create(
+        self,
+        prepared: PreparedResourceCreate,
+        *,
+        remove_owned_file: bool = False,
+    ) -> None:
+        """Cancel one unpublished identity and optionally remove its exact path."""
+
+        if type(prepared) is not PreparedResourceCreate:
+            raise TypeError("prepared resource create must be exact")
+        issued = self._prepared_creates.get(prepared.operation_id)
+        if issued is None or issued[0] is not prepared:
+            raise ResourceError("prepared resource create is stale")
+        if remove_owned_file and prepared.resource.path.exists():
+            observed = os.lstat(prepared.resource.path)
+            if (
+                not prepared.resource.path.is_relative_to(self.managed_dir)
+                or not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink != 1
+            ):
+                raise ResourceError("prepared resource file is unsafe")
+            prepared.resource.path.unlink()
+        del self._prepared_creates[prepared.operation_id]
+
+    def recover_resource_create(
+        self,
+        *,
+        resource_id: str,
+        name: str,
+        kind: ResourceKind,
+        relative_path: str,
+        expected_digest: str,
+    ) -> ResourceConfig:
+        """Cold-publish one owner-proven managed file after a registry fault."""
+
+        if type(kind) is not ResourceKind:
+            raise TypeError("recovered resource kind must be exact")
+        if (
+            type(relative_path) is not str
+            or not relative_path
+            or Path(relative_path).is_absolute()
+            or len(Path(relative_path).parts) != 1
+        ):
+            raise ResourceError("recovered resource path is unsafe")
+        if (
+            type(expected_digest) is not str
+            or len(expected_digest) != 64
+            or any(character not in "0123456789abcdef" for character in expected_digest)
+        ):
+            raise ResourceError("recovered resource digest is invalid")
+        path = (self.managed_dir / relative_path).resolve()
+        if not path.is_relative_to(self.managed_dir):
+            raise ResourceError("recovered resource path escaped the managed directory")
+        resource = ResourceConfig(
+            id=resource_id,
+            name=name,
+            kind=kind,
+            path=path,
+        )
+        existing_id = next(
+            (configured for configured in self._resources if configured.id == resource_id),
+            None,
+        )
+        if existing_id is not None:
+            if existing_id != resource:
+                raise ResourceError("recovered resource id is already claimed")
+            return existing_id
+        if any(configured.path == path for configured in self._resources):
+            raise ResourceError("recovered resource path is already claimed")
+        try:
+            observed = os.lstat(path)
+            actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ResourceError("recovered resource file is unavailable") from error
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or actual_digest != expected_digest
+        ):
+            raise ResourceError("recovered resource file is not owner-proven")
+        updated = [*self._resources, resource]
+        self._write_registry(updated)
+        self._resources = updated
         return resource
 
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 from pathlib import Path
@@ -67,7 +68,20 @@ from editor_contracts import (
     TMResourceDisplayMode,
     TMResourceStatus,
 )
-from editor_controller import EditorController, EditorControllerError
+from editor_controller import (
+    EditorController,
+    EditorControllerError,
+    PortableResourceKind,
+    ResourceExportOutcome,
+    ResourceImportMode,
+    ResourcePackageImportPreview,
+    ResourcePackageImportResult,
+    ResourcePackageValidationReport,
+    ResourceRecoveryAction,
+    ResourceRecoveryDisposition,
+    ResourceRecoveryOutcome,
+    ResourceRecoveryPreview,
+)
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
 from qt_localized_message_box import show_localized_critical
@@ -81,6 +95,7 @@ from qt_tm_threshold import (
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
 TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+RESOURCE_PACKAGE_FILE_FILTER = "LocalCAT ResourcePackage (*.localcat-resource)"
 DEFAULT_VISIBLE_RESOURCE_ROWS = 3
 _EMPTY_RESOURCE_TABLE_BODY_HEIGHT = 36
 _RESOURCE_MORE_BUTTON_STYLE = """
@@ -112,6 +127,73 @@ _RESOURCE_KIND_COMBO_STYLE = """
 QComboBox#newResourceKind {
     color: #1f3850;
     background-color: #ffffff;
+}
+"""
+_RESOURCE_PACKAGE_DIALOG_STYLE = """
+QDialog#resourcePackageImportOptionsDialog,
+QDialog#resourcePackageApplyDialog {
+    background: #f2f7fb;
+    color: #17344f;
+    font-family: "Inter", "Noto Sans CJK SC", sans-serif;
+    font-size: 13px;
+}
+QLabel#resourcePackageDialogTitle {
+    color: #082f5b;
+    font-size: 24px;
+    font-weight: 700;
+}
+QLabel#resourcePackageDialogSummary,
+QLabel#resourcePackageDestinationSummary {
+    color: #087da3;
+    font-size: 17px;
+    font-weight: 700;
+}
+QFrame#resourcePackageSummaryCard {
+    background: #ffffff;
+    border: 1px solid #c6dceb;
+    border-radius: 10px;
+}
+QLabel#resourcePackageModeBadge {
+    color: #965008;
+    background: #fff2dc;
+    border: 1px solid #efbf73;
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-weight: 700;
+}
+QLabel#resourcePackageCheckPassed {
+    color: #08704f;
+    background: #e2f5eb;
+    border: 1px solid #a8ddc3;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-weight: 600;
+}
+QLabel#resourcePackageDialogNote {
+    color: #55738c;
+}
+QComboBox, QLineEdit {
+    background: #ffffff;
+    border: 1px solid #bfd3e2;
+    border-radius: 7px;
+    padding: 7px 9px;
+    min-height: 22px;
+}
+QPushButton {
+    background: #ffffff;
+    color: #173f5f;
+    border: 1px solid #b8cfdf;
+    border-radius: 7px;
+    padding: 8px 18px;
+    min-width: 86px;
+}
+QPushButton:hover, QPushButton:focus {
+    border-color: #08a4cd;
+}
+QPushButton:default {
+    color: #ffffff;
+    background: #08a4cd;
+    border-color: #08a4cd;
 }
 """
 _TM_MODE_LABELS = {
@@ -364,6 +446,231 @@ class PreviewWorker(QThread):
             self.error_message = "术语表列预览未能安全完成。"
 
 
+class ResourcePortabilityWorker(QThread):
+    """Run one ResourcePackage/direct-export Controller operation off-thread."""
+
+    def __init__(
+        self,
+        operation: Callable[[], object],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if not callable(operation):
+            raise TypeError("resource portability operation must be callable")
+        self.operation = operation
+        self.result: object | None = None
+        self.error_message: str | None = None
+
+    def run(self) -> None:
+        try:
+            self.result = self.operation()
+        except EditorControllerError as error:
+            self.error_message = str(error)
+        except Exception:
+            self.error_message = "RESOURCE.PORTABILITY.OPERATION_FAILED"
+
+
+class ResourcePackageImportOptionsDialog(QDialog):
+    """Choose create/replace after a package has passed cold validation."""
+
+    def __init__(
+        self,
+        report: ResourcePackageValidationReport,
+        resources: tuple[ResourceConfig, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.report = report
+        self.setObjectName("resourcePackageImportOptionsDialog")
+        self.setWindowTitle("导入 ResourcePackage")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 26, 30, 24)
+        layout.setSpacing(13)
+        title = QLabel("导入 ResourcePackage")
+        title.setObjectName("resourcePackageDialogTitle")
+        layout.addWidget(title)
+        kind_label = (
+            "翻译记忆库"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "术语表"
+        )
+        summary = QLabel(
+            f"{kind_label} · {report.record_count} 条记录 · "
+            f"{report.payload_profile.value}"
+        )
+        summary.setObjectName("resourcePackageDialogSummary")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        card = QFrame()
+        card.setObjectName("resourcePackageSummaryCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.addWidget(QLabel(f"包大小：{report.artifact_byte_count} bytes"))
+        card_layout.addWidget(QLabel(f"Payload：{report.payload_byte_count} bytes"))
+        if report.resource_kind is PortableResourceKind.TERMBASE:
+            card_layout.addWidget(
+                QLabel(
+                    f"Legacy {report.legacy_record_count} · v1 {report.v1_record_count}"
+                )
+            )
+        layout.addWidget(card)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("导入方式"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("resourcePackageImportMode")
+        self.mode_combo.addItem("新建本地资源", ResourceImportMode.CREATE_NEW)
+        self.mode_combo.addItem("替换明选资源", ResourceImportMode.REPLACE_SELECTED)
+        configure_combo_popup(
+            self.mode_combo,
+            object_name="resourcePackageImportModePopup",
+            accessible_name="ResourcePackage 导入方式",
+        )
+        mode_row.addWidget(self.mode_combo, 1)
+        layout.addLayout(mode_row)
+
+        self.name_label = QLabel("新资源名称")
+        layout.addWidget(self.name_label)
+        self.name_input = QLineEdit(
+            "Imported translation memory"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "Imported termbase"
+        )
+        self.name_input.setObjectName("resourcePackageNewResourceName")
+        layout.addWidget(self.name_input)
+
+        self.destination_label = QLabel("替换目标")
+        layout.addWidget(self.destination_label)
+        self.destination_combo = QComboBox()
+        self.destination_combo.setObjectName("resourcePackageDestination")
+        expected = (
+            ResourceKind.TRANSLATION_MEMORY
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else ResourceKind.TERMBASE
+        )
+        for resource in resources:
+            if resource.kind is expected:
+                self.destination_combo.addItem(resource.name, resource.id)
+        configure_combo_popup(
+            self.destination_combo,
+            object_name="resourcePackageDestinationPopup",
+            accessible_name="ResourcePackage 替换目标",
+        )
+        layout.addWidget(self.destination_combo)
+
+        note = QLabel("继续后会生成一次性预览；取消不会修改任何资源文件。")
+        note.setObjectName("resourcePackageDialogNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("继续预览")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._accept_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.mode_combo.currentIndexChanged.connect(self._refresh_mode)
+        self.name_input.textChanged.connect(self._refresh_mode)
+        self._refresh_mode()
+
+    def _refresh_mode(self, _index: int = -1) -> None:
+        create = (
+            ResourceImportMode(self.mode_combo.currentData())
+            is ResourceImportMode.CREATE_NEW
+        )
+        self.name_label.setVisible(create)
+        self.name_input.setVisible(create)
+        self.destination_label.setVisible(not create)
+        self.destination_combo.setVisible(not create)
+        self._accept_button.setEnabled(
+            bool(self.name_input.text().strip())
+            if create
+            else self.destination_combo.count() > 0
+        )
+
+    def selection(self) -> tuple[ResourceImportMode, str | None, str | None]:
+        mode = ResourceImportMode(self.mode_combo.currentData())
+        if mode is ResourceImportMode.CREATE_NEW:
+            return mode, None, self.name_input.text().strip()
+        return mode, self.destination_combo.currentData(), None
+
+
+class ResourcePackageApplyDialog(QDialog):
+    """Display the sealed import plan before its one allowed apply."""
+
+    def __init__(
+        self,
+        preview: ResourcePackageImportPreview,
+        destination_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("resourcePackageApplyDialog")
+        self.setWindowTitle("预览并导入 ResourcePackage")
+        self.setModal(True)
+        self.setMinimumWidth(680)
+        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 26, 30, 24)
+        layout.setSpacing(14)
+        title = QLabel("预览并导入 ResourcePackage")
+        title.setObjectName("resourcePackageDialogTitle")
+        layout.addWidget(title)
+        badge = QLabel(
+            "REPLACE · 替换明选资源"
+            if preview.mode is ResourceImportMode.REPLACE_SELECTED
+            else "CREATE · 新建本地资源"
+        )
+        badge.setObjectName("resourcePackageModeBadge")
+        layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignRight)
+        report = preview.validation
+        kind = (
+            "翻译记忆库"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "术语表"
+        )
+        destination = QLabel(f"{kind}  →  {destination_name}")
+        destination.setObjectName("resourcePackageDestinationSummary")
+        destination.setWordWrap(True)
+        layout.addWidget(destination)
+        facts = QFrame()
+        facts.setObjectName("resourcePackageSummaryCard")
+        facts_layout = QHBoxLayout(facts)
+        facts_layout.addWidget(QLabel(f"记录 {report.record_count}"))
+        facts_layout.addWidget(QLabel(f"Payload {report.payload_byte_count} bytes"))
+        if report.resource_kind is PortableResourceKind.TERMBASE:
+            facts_layout.addWidget(
+                QLabel(
+                    f"Legacy {report.legacy_record_count} · v1 {report.v1_record_count}"
+                )
+            )
+        facts_layout.addStretch()
+        layout.addWidget(facts)
+        status = QLabel("检查通过 · 来源与目标会在应用前再次验证")
+        status.setObjectName("resourcePackageCheckPassed")
+        layout.addWidget(status)
+        warning = QLabel(
+            "替换会完整取代所选资源快照，不执行逐条合并。"
+            if preview.mode is ResourceImportMode.REPLACE_SELECTED
+            else "新资源在快照冷重开成功前不会出现在资源列表。"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用导入")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class TermbaseColumnSelectionDialog(QDialog):
     """Select two physical columns from one Controller-issued preview."""
 
@@ -514,7 +821,9 @@ class QtSettingsDialog(QDialog):
         self.setModal(True)
         self.import_worker: ImportWorker | None = None
         self.preview_worker: PreviewWorker | None = None
+        self.portability_worker: ResourcePortabilityWorker | None = None
         self._import_busy = False
+        self._portability_busy = False
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
         self._tm_operation_id: str | None = None
@@ -674,7 +983,21 @@ class QtSettingsDialog(QDialog):
         new_button.clicked.connect(self._prompt_create_resource)
         self.new_resource_button = new_button
         intro_row.addWidget(new_button)
+        package_button = QPushButton("导入资源包")
+        package_button.setObjectName("importResourcePackageButton")
+        package_button.setToolTip("验证 ResourcePackage 后新建或替换一个本地资源")
+        package_button.clicked.connect(self._prompt_resource_package_import)
+        self.resource_package_button = package_button
+        intro_row.addWidget(package_button)
         content_layout.addLayout(intro_row)
+
+        self.resource_recovery_panel = QFrame()
+        self.resource_recovery_panel.setObjectName("resourceRecoveryPanel")
+        self.resource_recovery_layout = QVBoxLayout(self.resource_recovery_panel)
+        self.resource_recovery_layout.setContentsMargins(12, 10, 12, 10)
+        self.resource_recovery_layout.setSpacing(8)
+        self.resource_recovery_panel.hide()
+        content_layout.addWidget(self.resource_recovery_panel)
 
         threshold_panel = QFrame()
         threshold_panel.setObjectName("settingsTmThresholdPanel")
@@ -821,6 +1144,7 @@ class QtSettingsDialog(QDialog):
             if type(status) is TMResourceStatus
         }
         self._refresh_tm_threshold_entry()
+        self._refresh_resource_recovery()
         try:
             operation = self.controller.tm_activation_operation()
         except Exception:
@@ -853,6 +1177,88 @@ class QtSettingsDialog(QDialog):
             self.status_label.setText(
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
             )
+
+    def _refresh_resource_recovery(self) -> None:
+        layout = self.resource_recovery_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        try:
+            recoveries = self.controller.inspect_resource_portability_recovery()
+        except EditorControllerError:
+            recoveries = ()
+        self.resource_recovery_panel.setVisible(bool(recoveries))
+        if not recoveries:
+            return
+        title = QLabel(f"有 {len(recoveries)} 项资源操作需要收尾")
+        title.setObjectName("resourceRecoveryTitle")
+        layout.addWidget(title)
+        for recovery in recoveries:
+            row = QFrame()
+            row.setObjectName(f"resourceRecovery_{recovery.operation_id}")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            summary = QLabel(self._resource_recovery_summary(recovery))
+            summary.setWordWrap(True)
+            row_layout.addWidget(summary, 1)
+            if recovery.disposition is ResourceRecoveryDisposition.COMPLETE_AVAILABLE:
+                action = ResourceRecoveryAction.COMPLETE
+                button = QPushButton("完成恢复")
+            elif recovery.disposition is ResourceRecoveryDisposition.ROLLBACK_AVAILABLE:
+                action = ResourceRecoveryAction.ROLLBACK
+                button = QPushButton("确认回退")
+            else:
+                button = None
+            if button is not None:
+                button.setObjectName(f"recoverResource_{recovery.operation_id}")
+                button.clicked.connect(
+                    lambda _checked=False, current=recovery, decision=action: self._run_resource_recovery(
+                        current,
+                        decision,
+                    )
+                )
+                row_layout.addWidget(button)
+            layout.addWidget(row)
+
+    @staticmethod
+    def _resource_recovery_summary(recovery: ResourceRecoveryPreview) -> str:
+        if recovery.disposition is ResourceRecoveryDisposition.COMPLETE_AVAILABLE:
+            state = "本地资源已发布，可完成登记与回执"
+        elif recovery.disposition is ResourceRecoveryDisposition.ROLLBACK_AVAILABLE:
+            state = "原资源保持不变，可清理未完成操作"
+        else:
+            state = "目标状态无法自动证明，需要人工检查"
+        return f"{recovery.operation_kind.value} · {state}"
+
+    def _run_resource_recovery(
+        self,
+        recovery: ResourceRecoveryPreview,
+        action: ResourceRecoveryAction,
+    ) -> None:
+        self._start_portability_operation(
+            lambda: self.controller.recover_resource_portability(recovery, action),
+            "正在核对并收尾资源操作…",
+            self._finish_resource_recovery,
+        )
+
+    def _finish_resource_recovery(
+        self,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourceRecoveryOutcome:
+            self._show_import_feedback(
+                f"资源恢复未完成：{error or 'RESOURCE.RECOVERY.RESULT_INVALID'}",
+                failed=True,
+            )
+            self._refresh_resource_recovery()
+            return
+        self.refresh_resources()
+        self.resources_changed.emit()
+        label = "恢复已完成" if result.receipt is not None else "未完成操作已清理"
+        self._show_import_feedback(label, failed=False)
 
     def _refresh_resource_menu_tab_order(
         self,
@@ -1064,6 +1470,29 @@ class QtSettingsDialog(QDialog):
                     )
                 )
                 menu.addSeparator()
+            direct_export_action = menu.addAction(
+                "导出兼容 JSONL…"
+                if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                else "导出 CSV/v1…"
+            )
+            direct_export_action.setObjectName(f"exportDirect_{resource.id}")
+            direct_export_action.setToolTip("导出此资源的完整兼容快照")
+            direct_export_action.triggered.connect(
+                lambda _checked=False, configured=resource: self._prompt_export_direct(
+                    configured
+                )
+            )
+            package_export_action = menu.addAction("导出资源包…")
+            package_export_action.setObjectName(f"exportPackage_{resource.id}")
+            package_export_action.setToolTip(
+                "将此资源的完整快照封装为可验证 ResourcePackage"
+            )
+            package_export_action.triggered.connect(
+                lambda _checked=False, configured=resource: self._prompt_export_package(
+                    configured
+                )
+            )
+            menu.addSeparator()
             delete_action = menu.addAction("删除资源")
             delete_action.setObjectName(f"delete_{resource.id}")
             delete_action.triggered.connect(
@@ -1575,9 +2004,243 @@ class QtSettingsDialog(QDialog):
         except EditorControllerError as exc:
             show_localized_critical(self, title="无法创建资源", text=str(exc))
 
+    def _prompt_export_direct(self, resource: ResourceConfig) -> None:
+        file_filter = (
+            "JSONL snapshot (*.jsonl)"
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY
+            else "CSV/v1 snapshot (*.csv)"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出兼容快照",
+            "",
+            file_filter,
+        )
+        if not selected:
+            return
+        self._start_portability_operation(
+            lambda: self.controller.export_resource_direct(
+                resource.id,
+                Path(selected),
+            ),
+            f"正在导出 {resource.name}…",
+            lambda result, error: self._finish_resource_export(
+                result,
+                error,
+                package=False,
+            ),
+        )
+
+    def _prompt_export_package(self, resource: ResourceConfig) -> None:
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 ResourcePackage",
+            "",
+            RESOURCE_PACKAGE_FILE_FILTER,
+        )
+        if not selected:
+            return
+        destination = Path(selected)
+        if destination.suffix != ".localcat-resource":
+            destination = destination.with_name(
+                f"{destination.name}.localcat-resource"
+            )
+        self._start_portability_operation(
+            lambda: self.controller.export_resource_package(
+                resource.id,
+                destination,
+            ),
+            f"正在封装 {resource.name}…",
+            lambda result, error: self._finish_resource_export(
+                result,
+                error,
+                package=True,
+            ),
+        )
+
+    def _finish_resource_export(
+        self,
+        result: object | None,
+        error: str | None,
+        *,
+        package: bool,
+    ) -> None:
+        if error is not None or type(result) is not ResourceExportOutcome:
+            self._show_import_feedback(
+                f"导出未完成：{error or 'RESOURCE.EXPORT.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        receipt = result.receipt
+        label = "ResourcePackage" if package else "兼容快照"
+        self._show_import_feedback(
+            f"{label}已导出 · {receipt.record_count} 条记录。",
+            failed=False,
+        )
+
+    def _prompt_resource_package_import(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 ResourcePackage",
+            "",
+            RESOURCE_PACKAGE_FILE_FILTER,
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        self._start_portability_operation(
+            lambda: self.controller.validate_resource_package(source),
+            "正在验证 ResourcePackage…",
+            lambda result, error: self._after_resource_package_validation(
+                source,
+                result,
+                error,
+            ),
+        )
+
+    def _after_resource_package_validation(
+        self,
+        source: Path,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageValidationReport:
+            self._show_import_feedback(
+                f"资源包检查未通过：{error or 'RESOURCE.PACKAGE.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        options = ResourcePackageImportOptionsDialog(
+            result,
+            self.controller.list_resources(),
+            self,
+        )
+        try:
+            if options.exec() != QDialog.DialogCode.Accepted:
+                self._show_import_feedback("已取消资源包导入。", failed=False)
+                return
+            mode, destination_resource_id, new_resource_name = options.selection()
+        finally:
+            options.deleteLater()
+        self._start_portability_operation(
+            lambda: self.controller.preview_resource_package_import(
+                source,
+                mode,
+                destination_resource_id=destination_resource_id,
+                new_resource_name=new_resource_name,
+            ),
+            "正在生成一次性导入预览…",
+            lambda preview, preview_error: self._after_resource_package_preview(
+                preview,
+                preview_error,
+                new_resource_name,
+            ),
+        )
+
+    def _after_resource_package_preview(
+        self,
+        result: object | None,
+        error: str | None,
+        new_resource_name: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageImportPreview:
+            self._show_import_feedback(
+                f"无法生成导入预览：{error or 'RESOURCE.IMPORT.PREVIEW_INVALID'}",
+                failed=True,
+            )
+            return
+        preview = result
+        if preview.destination_resource_id is None:
+            destination_name = new_resource_name or "新本地资源"
+        else:
+            destination_name = next(
+                (
+                    resource.name
+                    for resource in self.controller.list_resources()
+                    if resource.id == preview.destination_resource_id
+                ),
+                preview.destination_resource_id,
+            )
+        confirmation = ResourcePackageApplyDialog(
+            preview,
+            destination_name,
+            self,
+        )
+        try:
+            if confirmation.exec() != QDialog.DialogCode.Accepted:
+                try:
+                    self.controller.cancel_resource_package_import(preview)
+                except EditorControllerError:
+                    pass
+                self._show_import_feedback("已取消资源包导入。", failed=False)
+                return
+        finally:
+            confirmation.deleteLater()
+        self._start_portability_operation(
+            lambda: self.controller.apply_resource_package_import(preview),
+            "正在应用 ResourcePackage 并冷重开资源…",
+            self._finish_resource_package_apply,
+        )
+
+    def _finish_resource_package_apply(
+        self,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageImportResult:
+            self._show_import_feedback(
+                f"资源包导入未完成：{error or 'RESOURCE.IMPORT.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        self.refresh_resources()
+        self.resources_changed.emit()
+        self._show_import_feedback(
+            f"资源包已应用 · {result.receipt.record_count} 条记录。",
+            failed=False,
+        )
+
+    def _start_portability_operation(
+        self,
+        operation: Callable[[], object],
+        message: str,
+        callback: Callable[[object | None, str | None], None],
+    ) -> bool:
+        if self.is_importing:
+            self._show_import_feedback("已有资源操作正在运行，请等待完成。", failed=True)
+            return False
+        self._portability_busy = True
+        self._set_import_busy(True, message)
+        worker = ResourcePortabilityWorker(operation, self)
+        self.portability_worker = worker
+        worker.finished.connect(
+            lambda current=worker, done=callback: self._finish_portability_worker(
+                current,
+                done,
+            )
+        )
+        worker.start()
+        return True
+
+    def _finish_portability_worker(
+        self,
+        worker: ResourcePortabilityWorker,
+        callback: Callable[[object | None, str | None], None],
+    ) -> None:
+        if self.portability_worker is not worker:
+            worker.deleteLater()
+            return
+        self.portability_worker = None
+        result = worker.result
+        error = worker.error_message
+        worker.deleteLater()
+        self._portability_busy = False
+        self._set_import_busy(False)
+        callback(result, error)
+
     @property
     def is_importing(self) -> bool:
-        return self._import_busy
+        return self._import_busy or self._portability_busy
 
     def _prompt_import(self, resource: ResourceConfig) -> None:
         file_filter = (
@@ -1794,6 +2457,7 @@ class QtSettingsDialog(QDialog):
         self.active_table.setEnabled(not busy)
         self.inactive_table.setEnabled(not busy)
         self.new_resource_button.setEnabled(not busy)
+        self.resource_package_button.setEnabled(not busy)
         self.close_button.setEnabled(not busy)
         self.import_progress.setVisible(busy)
         if message:

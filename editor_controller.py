@@ -85,6 +85,20 @@ from resource_importer import (
     read_legacy_termbase_import,
 )
 from resource_repository import ResourceError, ResourceRepository
+from resource_package_contracts import (
+    PortableResourceKind,
+    ResourceExportOutcome,
+    ResourceImportMode,
+    ResourcePackageImportPreview,
+    ResourcePackageImportResult,
+    ResourcePackageValidationReport,
+    ResourcePortabilityError,
+    ResourceRecoveryAction,
+    ResourceRecoveryDisposition,
+    ResourceRecoveryOutcome,
+    ResourceRecoveryPreview,
+)
+from resource_portability import ResourcePortabilityService
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from project_search import (
     ProjectSearchError,
@@ -1324,6 +1338,10 @@ class EditorController:
         self._term_quarantines: dict[str, TermCommitOutcome] = {}
         self._term_matcher_handoff: MatcherHandoffSnapshot | None = None
         self._term_store = TermbaseStore()
+        self._resource_portability = ResourcePortabilityService(
+            repository,
+            termbase_store=self._term_store,
+        )
         self.reload_resources(_refresh_runtime=False)
 
     @property
@@ -5595,6 +5613,135 @@ class EditorController:
         """Return the current persistent resource configuration."""
 
         return self.repository.list_resources()
+
+    def export_resource_direct(
+        self,
+        resource_id: str,
+        destination: Path,
+    ) -> ResourceExportOutcome:
+        """Export one owner snapshot as its direct JSONL/CSV profile."""
+
+        with self._tm_query_lock:
+            try:
+                return self._resource_portability.export_direct(
+                    resource_id,
+                    destination,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
+    def export_resource_package(
+        self,
+        resource_id: str,
+        destination: Path,
+    ) -> ResourceExportOutcome:
+        """Export one configured resource as ResourcePackage."""
+
+        with self._tm_query_lock:
+            try:
+                return self._resource_portability.export_package(
+                    resource_id,
+                    destination,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
+    def validate_resource_package(
+        self,
+        source: Path,
+    ) -> ResourcePackageValidationReport:
+        try:
+            return self._resource_portability.validate_resource_package(source)
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def preview_resource_package_import(
+        self,
+        source: Path,
+        mode: ResourceImportMode,
+        *,
+        destination_resource_id: str | None = None,
+        new_resource_name: str | None = None,
+    ) -> ResourcePackageImportPreview:
+        try:
+            return self._resource_portability.preview_resource_package_import(
+                source,
+                mode,
+                destination_resource_id=destination_resource_id,
+                new_resource_name=new_resource_name,
+            )
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def cancel_resource_package_import(
+        self,
+        preview: ResourcePackageImportPreview,
+    ) -> None:
+        try:
+            self._resource_portability.cancel_resource_package_import(preview)
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def apply_resource_package_import(
+        self,
+        preview: ResourcePackageImportPreview,
+    ) -> ResourcePackageImportResult:
+        """Consume one preview and reload exactly the resulting resource graph."""
+
+        with self._tm_query_lock:
+            try:
+                result = self._resource_portability.apply_resource_package_import(
+                    preview
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+            try:
+                self._reload_resources_after_persisted_mutation()
+            except EditorControllerError as error:
+                try:
+                    self._resource_portability.retain_runtime_recovery(result.receipt)
+                except ResourcePortabilityError:
+                    pass
+                raise EditorControllerError(
+                    "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                ) from error
+            return result
+
+    def inspect_resource_portability_recovery(
+        self,
+    ) -> tuple[ResourceRecoveryPreview, ...]:
+        try:
+            return self._resource_portability.inspect_resource_portability_recovery()
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def recover_resource_portability(
+        self,
+        preview: ResourceRecoveryPreview,
+        action: ResourceRecoveryAction,
+    ) -> ResourceRecoveryOutcome:
+        with self._tm_query_lock:
+            try:
+                outcome = self._resource_portability.recover_resource_portability(
+                    preview,
+                    action,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+            if outcome.receipt is not None:
+                try:
+                    self._reload_resources_after_persisted_mutation()
+                except EditorControllerError as error:
+                    try:
+                        self._resource_portability.retain_runtime_recovery(
+                            outcome.receipt
+                        )
+                    except ResourcePortabilityError:
+                        pass
+                    raise EditorControllerError(
+                        "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                    ) from error
+            return outcome
 
     def preview_termbase_import(
         self,

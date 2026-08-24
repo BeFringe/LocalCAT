@@ -874,7 +874,7 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             acceptance["source_fingerprint"],
-            "20b2d02fa150945bf4b61e2ef3bff2720489df6542539adc11997b850be031c3",
+            "70a5be2229ea19de7d9cfd7f58256048b5ac445e302368b54ccbf60ae61ca50e",
         )
         self.assertEqual(
             fault["source_fingerprint"],
@@ -886,7 +886,7 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             release["source_fingerprint"],
-            "0a4020933de958b78be7117e223da222a1661f400e1b68f085ecb1aadfdc92f4",
+            "b3d355043606d6b2ed8002a99d1c347d490169c289529419e48af5b0837ec883",
         )
         self.assertTrue(benchmark["suite_report"]["passed"])
         self.assertEqual(benchmark["suite_report"]["failed_paths"], [])

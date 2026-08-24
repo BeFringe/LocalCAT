@@ -55,7 +55,11 @@ _FUTURE_MODULE_PREFIXES_BY_OWNER = {
     ),
     "language-resource-portability": (
         "language_resource_portability",
+        "resource_artifact_save",
         "resource_package",
+        "resource_portability",
+        "resource_receipt_ledger",
+        "tm_resource_port",
     ),
 }
 _EXPECTED_FUTURE_MODULE_PREFIXES_BY_OWNER = {
@@ -83,7 +87,11 @@ _EXPECTED_FUTURE_MODULE_PREFIXES_BY_OWNER = {
     ),
     "language-resource-portability": (
         "language_resource_portability",
+        "resource_artifact_save",
         "resource_package",
+        "resource_portability",
+        "resource_receipt_ledger",
+        "tm_resource_port",
     ),
 }
 _WORKSPACE_MODULE_PREFIXES = (
@@ -200,6 +208,18 @@ _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST = {
             "project_workspace_intake.revalidate_staged_selected_documents",
             "project_workspace_intake.stage_selected_project_documents",
             "project_workspace_intake.stage_workspace_rebind",
+            "resource_package_contracts.ResourceExportOutcome",
+            "resource_package_contracts.PortableResourceKind",
+            "resource_package_contracts.ResourceImportMode",
+            "resource_package_contracts.ResourcePackageImportPreview",
+            "resource_package_contracts.ResourcePackageImportResult",
+            "resource_package_contracts.ResourcePackageValidationReport",
+            "resource_package_contracts.ResourcePortabilityError",
+            "resource_package_contracts.ResourceRecoveryAction",
+            "resource_package_contracts.ResourceRecoveryDisposition",
+            "resource_package_contracts.ResourceRecoveryOutcome",
+            "resource_package_contracts.ResourceRecoveryPreview",
+            "resource_portability.ResourcePortabilityService",
         }
     ),
     "project_search": frozenset(
@@ -218,6 +238,12 @@ _CURRENT_WORKSPACE_PRODUCTION_MODULES = frozenset(
         "project_workspace_contracts",
         "project_workspace_identity",
         "project_workspace_intake",
+        "resource_artifact_save",
+        "resource_package",
+        "resource_package_contracts",
+        "resource_portability",
+        "resource_receipt_ledger",
+        "tm_resource_port",
     }
 )
 _WORKSPACE_ADAPTER_MODULE = "editor_project_workspace_adapter"
