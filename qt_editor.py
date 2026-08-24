@@ -580,6 +580,31 @@ def _compose_chunk_controller(controller: object, repository: object):
     )
 
 
+def _compose_tmx_export_service(
+    controller: object,
+    repository: object,
+    chunk_controller: object,
+):
+    """Connect exact owner projections to the TMX application boundary."""
+
+    from chunk_controller_adapter import ChunkControllerAdapter
+    from editor_controller import EditorController
+    from resource_repository import ResourceRepository
+    from tmx_application import TmxExportApplicationService
+
+    if type(controller) is not EditorController:
+        raise TypeError("TMX composition requires one EditorController")
+    if type(repository) is not ResourceRepository:
+        raise TypeError("TMX composition requires one ResourceRepository")
+    if type(chunk_controller) is not ChunkControllerAdapter:
+        raise TypeError("TMX composition requires one ChunkControllerAdapter")
+    return TmxExportApplicationService(
+        controller,
+        repository,
+        chunk_controller=chunk_controller,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     launch_argv = tuple(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(launch_argv)
@@ -631,6 +656,11 @@ def main(argv: list[str] | None = None) -> int:
             repository
         )
         chunk_controller = _compose_chunk_controller(controller, repository)
+        tmx_export_service = _compose_tmx_export_service(
+            controller,
+            repository,
+            chunk_controller,
+        )
         # Retain the owner-only validation ports for the complete QApplication
         # lifetime; the Controller receives only the host read boundary.
         _ = capability_composition
@@ -666,6 +696,10 @@ def main(argv: list[str] | None = None) -> int:
             controller,
             chunk_controller=chunk_controller,
         )
+        # Keep the long-standing window construction seam compatible with
+        # bootstrap probes while still installing the run-owned TMX service
+        # before the window is shown or any project menu can open.
+        window.tmx_export_coordinator = tmx_export_service
         window.show()
         validation_worker = _start_capability_validation(
             capability_composition,

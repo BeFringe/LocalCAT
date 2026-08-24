@@ -246,7 +246,7 @@ class TmxLocaleAndMappingTests(_CodecFixture):
         self.assertEqual(issues, ())
         self.assertEqual([(item.source, item.target) for item in records], [("last exact", "last target")])
 
-    def test_trim_is_only_at_seg_edges_and_no_context_or_prop_is_inferred(self) -> None:
+    def test_trim_is_only_at_seg_edges_and_prop_is_preserved_without_inference(self) -> None:
         payload = _tmx(
             '<tu><prop type="x-context">secret-context</prop>'
             '<tuv xml:lang="en-US"><seg>  A  B\nC  </seg></tuv>'
@@ -256,7 +256,50 @@ class TmxLocaleAndMappingTests(_CodecFixture):
         self.assertEqual(issues, ())
         self.assertEqual(records[0].source, "A  B\nC")
         self.assertEqual(records[0].target, "甲  乙\n丙")
-        self.assertEqual(records[0].format_metadata, ())
+        self.assertEqual(
+            tuple((entry.key, entry.value) for entry in records[0].format_metadata),
+            (("tmx.props", (("tu", "x-context", "", "secret-context"),)),),
+        )
+
+    def test_tu_and_tuv_props_preserve_order_language_and_duplicate_types(self) -> None:
+        payload = _tmx(
+            '<tu><prop type="x-note" xml:lang="en-US">first</prop>'
+            '<prop type="x-note">second</prop>'
+            '<tuv xml:lang="en-US"><prop type="x-status">draft</prop>'
+            '<seg>Source</seg></tuv>'
+            '<tuv xml:lang="zh-CN"><prop type="x-status">translated</prop>'
+            '<seg>译文</seg></tuv></tu>'
+        )
+        records, issues, _terminal = self.consume(self.session(payload))
+        self.assertEqual(issues, ())
+        self.assertEqual(
+            records[0].format_metadata[0].value,
+            (
+                ("tu", "x-note", "en-us", "first"),
+                ("tu", "x-note", "", "second"),
+                ("source_tuv", "x-status", "", "draft"),
+                ("target_tuv", "x-status", "", "translated"),
+            ),
+        )
+
+    def test_props_from_unselected_tuv_variants_are_not_attached_to_selected_pair(self) -> None:
+        payload = _tmx(
+            '<tu><tuv xml:lang="fr"><prop type="x-private">wrong</prop>'
+            '<seg>Bonjour</seg></tuv>'
+            '<tuv xml:lang="en-US"><prop type="x-note">source</prop>'
+            '<seg>Hello</seg></tuv>'
+            '<tuv xml:lang="zh-CN"><prop type="x-note">target</prop>'
+            '<seg>你好</seg></tuv></tu>'
+        )
+        records, issues, _terminal = self.consume(self.session(payload))
+        self.assertEqual(issues, ())
+        self.assertEqual(
+            records[0].format_metadata[0].value,
+            (
+                ("source_tuv", "x-note", "", "source"),
+                ("target_tuv", "x-note", "", "target"),
+            ),
+        )
 
     def test_empty_selected_seg_is_a_missing_pair_warning(self) -> None:
         payload = _tmx(_unit(("en-US", "   "), ("zh-CN", "译文")))

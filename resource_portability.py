@@ -16,13 +16,9 @@ from resource_artifact_save import ResourceArtifactSaveService
 from resource_package import (
     SealedResourcePackage,
     open_resource_package,
-    validate_resource_package as validate_carrier,
     write_resource_package,
 )
 from resource_package_contracts import (
-    CARRIER_PROFILE,
-    MANIFEST_SCHEMA,
-    PAYLOAD_PROFILE_SET,
     RECEIPT_SCHEMA,
     PortableResourceKind,
     PortableResourceSnapshot,
@@ -34,6 +30,7 @@ from resource_package_contracts import (
     ResourcePackageImportPreview,
     ResourcePackageImportResult,
     ResourcePackageManifest,
+    ResourcePackageSourceScope,
     ResourcePackageValidationReport,
     ResourcePayloadDescriptor,
     ResourcePayloadProfile,
@@ -43,7 +40,12 @@ from resource_package_contracts import (
     ResourceRecoveryDisposition,
     ResourceRecoveryOutcome,
     ResourceRecoveryPreview,
+    package_profile_triple_for_payload,
+    payload_path_for_profile,
+    profile_for_kind,
+    resource_package_capability,
 )
+from resource_payload_port import ResourcePackagePayloadHandler
 from resource_receipt_ledger import (
     ResourcePendingOperation,
     ResourcePendingPhase,
@@ -84,6 +86,7 @@ class ResourcePortabilityService:
         tm_port: TMResourceSnapshotPort | None = None,
         ledger: ResourceReceiptLedger | None = None,
         artifact_save: ResourceArtifactSaveService | None = None,
+        tmx_payload_handler: ResourcePackagePayloadHandler | None = None,
     ) -> None:
         if type(repository) is not ResourceRepository:
             raise TypeError("resource portability repository must be exact")
@@ -92,8 +95,25 @@ class ResourcePortabilityService:
         self._tm = tm_port or TMResourceSnapshotPort()
         self._ledger = ledger or ResourceReceiptLedger(repository.config_dir)
         self._artifact_save = artifact_save or ResourceArtifactSaveService()
+        if tmx_payload_handler is not None:
+            if not isinstance(tmx_payload_handler, ResourcePackagePayloadHandler):
+                raise TypeError("TMX package payload handler must satisfy its port")
+            if (
+                tmx_payload_handler.profile
+                is not ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
+            ):
+                raise TypeError("TMX package payload handler profile must be exact")
+        self._tmx_payload_handler = tmx_payload_handler
         self._prepared_imports: dict[str, _PreparedResourceImport] = {}
         self._recovery_previews: dict[str, ResourceRecoveryPreview] = {}
+
+    @staticmethod
+    def import_supported(report: ResourcePackageValidationReport) -> bool:
+        """Return whether the validated payload profile has an apply contract."""
+
+        if type(report) is not ResourcePackageValidationReport:
+            raise TypeError("resource package validation report must be exact")
+        return report.payload_profile is not ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
 
     def export_direct(
         self,
@@ -170,19 +190,52 @@ class ResourcePortabilityService:
         self,
         resource_id: str,
         destination: Path,
+        *,
+        payload_profile: ResourcePayloadProfile | None = None,
     ) -> ResourceExportOutcome:
         resource = self._resource(resource_id)
+        portable_kind = (
+            PortableResourceKind.TRANSLATION_MEMORY
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY
+            else PortableResourceKind.TERMBASE
+        )
+        profile = (
+            profile_for_kind(portable_kind)
+            if payload_profile is None
+            else payload_profile
+        )
+        if type(profile) is not ResourcePayloadProfile:
+            raise TypeError("package payload profile must be exact")
+        if not resource_package_capability(
+            ResourcePackageSourceScope.MANAGED_RESOURCE,
+            portable_kind,
+            profile,
+            importing=False,
+        ):
+            raise ResourcePortabilityError("RESOURCE.PORTABILITY.PROFILE_UNSUPPORTED")
         destination = _absolute_destination(destination)
         operation_id = uuid4().hex
         payload = _candidate_path(
             destination,
-            "jsonl" if resource.kind is ResourceKind.TRANSLATION_MEMORY else "csv",
+            (
+                "tmx"
+                if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
+                else (
+                    "jsonl"
+                    if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                    else "csv"
+                )
+            ),
         )
         package_candidate = _candidate_path(destination, "resource-package")
         companion: Path | None = None
         armed = False
         try:
-            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+            if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+                handler = self._require_tmx_payload_handler()
+                snapshot = handler.export_snapshot(resource, payload)
+                self._validate_handler_snapshot(snapshot, payload)
+            elif resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 snapshot = self._tm.export_snapshot(resource, payload)
                 companion = self._tm.companion_path(payload)
             else:
@@ -193,11 +246,12 @@ class ResourcePortabilityService:
                 snapshot = _portable_term_snapshot(term_snapshot)
             self._reprove_source(resource, snapshot)
             manifest = _manifest_for_snapshot(snapshot)
-            candidate_report = write_resource_package(
+            write_resource_package(
                 package_candidate,
                 manifest,
                 payload,
             )
+            candidate_report = self.validate_resource_package(package_candidate)
             expected = self._receipt(
                 operation_id=operation_id,
                 operation_kind=ResourceOperationKind.EXPORT_PACKAGE,
@@ -213,15 +267,16 @@ class ResourcePortabilityService:
             publication, carrier_report = self._artifact_save.publish(
                 package_candidate,
                 destination,
-                validate_carrier,
+                self.validate_resource_package,
             )
             if carrier_report != candidate_report:
                 raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
-            report = self.validate_resource_package(destination)
+            report = carrier_report
             if (
                 report.artifact_digest != publication.destination_after_digest
                 or report.payload_digest != snapshot.payload_digest
                 or report.record_count != snapshot.record_count
+                or report.safe_issues != snapshot.safe_issues
             ):
                 raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
             receipt = self._receipt(
@@ -269,6 +324,15 @@ class ResourcePortabilityService:
         source = _absolute_destination(source)
         sealed = open_resource_package(source)
         try:
+            if not resource_package_capability(
+                ResourcePackageSourceScope.MANAGED_RESOURCE,
+                sealed.validation.resource_kind,
+                sealed.validation.payload_profile,
+                importing=True,
+            ):
+                raise ResourcePortabilityError(
+                    "RESOURCE.IMPORT.PROFILE_UNSUPPORTED"
+                )
             report, _owner = self._validate_sealed(sealed)
             target: ResourceConfig | None = None
             target_digest: str | None = None
@@ -704,14 +768,18 @@ class ResourcePortabilityService:
             dir=self.repository.config_dir,
             prefix=".resource-package-validate-",
         ) as raw:
-            suffix = (
-                ".jsonl"
-                if report.payload_profile is ResourcePayloadProfile.TM_JSONL_V1
-                else ".csv"
-            )
+            suffix = {
+                ResourcePayloadProfile.TM_JSONL_V1: ".jsonl",
+                ResourcePayloadProfile.TERMBASE_CSV_V1: ".csv",
+                ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1: ".tmx",
+            }[report.payload_profile]
             payload = Path(raw) / f"payload{suffix}"
             sealed.copy_payload_to(payload)
-            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY:
+            if report.payload_profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+                owner = self._require_tmx_payload_handler().validate_snapshot(payload)
+                self._validate_handler_snapshot(owner, payload)
+                counts = (0, 0)
+            elif report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY:
                 owner = self._tm.validate_snapshot(payload)
                 counts = (0, 0)
             else:
@@ -726,7 +794,7 @@ class ResourcePortabilityService:
             ):
                 raise ResourcePortabilityError("RESOURCE.PACKAGE.COUNT_MISMATCH")
             sealed.reprove()
-            return report, owner
+            return replace(report, safe_issues=owner.safe_issues), owner
 
     def _apply_owner_snapshot(
         self,
@@ -736,6 +804,8 @@ class ResourcePortabilityService:
         *,
         create: bool,
     ) -> PortableResourceSnapshot:
+        if owner.profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.PROFILE_UNSUPPORTED")
         if destination.kind is ResourceKind.TRANSLATION_MEMORY:
             return (
                 self._tm.create_snapshot(destination, payload, owner)
@@ -785,6 +855,9 @@ class ResourcePortabilityService:
         resource: ResourceConfig,
         snapshot: PortableResourceSnapshot,
     ) -> None:
+        if snapshot.profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+            self._require_tmx_payload_handler().reprove_snapshot(resource, snapshot)
+            return
         if resource.kind is ResourceKind.TRANSLATION_MEMORY:
             self._tm.reprove_snapshot(resource, snapshot)
             return
@@ -794,6 +867,43 @@ class ResourcePortabilityService:
             raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE") from error
         if current_digest != snapshot.source_baseline_digest:
             raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE")
+
+    def _require_tmx_payload_handler(self) -> ResourcePackagePayloadHandler:
+        handler = self._tmx_payload_handler
+        if handler is None:
+            raise ResourcePortabilityError(
+                "RESOURCE.PORTABILITY.PAYLOAD_HANDLER_UNAVAILABLE"
+            )
+        return handler
+
+    @staticmethod
+    def _validate_handler_snapshot(
+        snapshot: PortableResourceSnapshot,
+        payload: Path,
+    ) -> None:
+        if type(snapshot) is not PortableResourceSnapshot:
+            raise TypeError("package payload handler snapshot must be exact")
+        if (
+            snapshot.kind is not PortableResourceKind.TRANSLATION_MEMORY
+            or snapshot.profile
+            is not ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
+        ):
+            raise ResourcePortabilityError(
+                "RESOURCE.PORTABILITY.PAYLOAD_HANDLER_INVALID"
+            )
+        try:
+            payload_bytes = payload.read_bytes()
+        except OSError as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.EXPORT.VALIDATION_FAILED"
+            ) from error
+        if (
+            hashlib.sha256(payload_bytes).hexdigest() != snapshot.payload_digest
+            or len(payload_bytes) != snapshot.payload_byte_count
+        ):
+            raise ResourcePortabilityError(
+                "RESOURCE.PORTABILITY.PAYLOAD_HANDLER_INVALID"
+            )
 
     def _arm_after_owner_publication(
         self,
@@ -896,7 +1006,7 @@ class ResourcePortabilityService:
             legacy_record_count=snapshot.legacy_record_count,
             v1_record_count=snapshot.v1_record_count,
             skipped_count=0,
-            safe_warnings=(),
+            safe_warnings=snapshot.safe_issues,
             durable_state=ResourceDurableState.COMMITTED,
             owner_generation=snapshot.owner_generation,
             owner_revision=snapshot.owner_revision,
@@ -989,18 +1099,17 @@ def _is_recovery_required(error: BaseException) -> bool:
 
 
 def _manifest_for_snapshot(snapshot: PortableResourceSnapshot) -> ResourcePackageManifest:
+    schema, carrier, profile_set = package_profile_triple_for_payload(
+        snapshot.profile
+    )
     return ResourcePackageManifest(
-        schema=MANIFEST_SCHEMA,
-        carrier_profile=CARRIER_PROFILE,
-        payload_profile_set=PAYLOAD_PROFILE_SET,
+        schema=schema,
+        carrier_profile=carrier,
+        payload_profile_set=profile_set,
         resource_kind=snapshot.kind,
         payload_profile=snapshot.profile,
         payload=ResourcePayloadDescriptor(
-            path=(
-                "payload/tm.jsonl"
-                if snapshot.profile is ResourcePayloadProfile.TM_JSONL_V1
-                else "payload/termbase.csv"
-            ),
+            path=payload_path_for_profile(snapshot.profile),
             sha256=snapshot.payload_digest,
             byte_count=snapshot.payload_byte_count,
             record_count=snapshot.record_count,

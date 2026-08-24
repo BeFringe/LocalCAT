@@ -771,6 +771,7 @@ APPLICATION_FACADE_PREFIXES = (
     "editor_project",
     "resource_importer",
     "tm_json_importer",
+    "tmx_context_interchange",
     "logic_controller",
     "translation_runner",
     "stress_runner",

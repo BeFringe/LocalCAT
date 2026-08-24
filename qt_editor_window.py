@@ -137,6 +137,11 @@ from qt_tm_threshold import (
     prompt_tm_threshold,
     tm_threshold_feedback,
 )
+from qt_tmx_export_dialog import (
+    TmxExportDialog,
+    TmxExportDialogPreview,
+    TmxExportScopeChoice,
+)
 
 
 class _TMApplyButton(QPushButton):
@@ -845,6 +850,7 @@ class QtEditorWindow(QMainWindow):
         controller: EditorController,
         *,
         chunk_controller: object | None = None,
+        tmx_export_coordinator: object | None = None,
     ) -> None:
         super().__init__()
         # The UI is assembled by small builder methods.  Keep the resulting
@@ -949,6 +955,7 @@ class QtEditorWindow(QMainWindow):
         self.term_cards_layout: QVBoxLayout
         self.controller = controller
         self.chunk_controller = chunk_controller
+        self.tmx_export_coordinator = tmx_export_coordinator
         self._chunk_view: ChunkApplicationProjectView | None = None
         self._chunk_view_error_code: str | None = None
         self._chunk_scope_cache_key: tuple[str, int, str] | None = None
@@ -1219,6 +1226,12 @@ class QtEditorWindow(QMainWindow):
         self.chunk_manage_action.setToolTip(
             "创建、拆分、合并或调整当前项目的协作分工"
         )
+        self.export_project_action = self.project_menu.addAction("导出项目")
+        self.export_project_action.setObjectName("exportProjectTmxAction")
+        self.export_project_action.setToolTip(
+            "将整个项目或一个明选分工导出为 TMX"
+        )
+        self.export_project_action.setEnabled(False)
         self.project_menu.addSeparator()
         self.speaker_inventory_action = self.project_menu.addAction(
             "Raw speaker 盘点"
@@ -1896,6 +1909,9 @@ class QtEditorWindow(QMainWindow):
         )
         self.chunk_manage_action.triggered.connect(
             self._open_chunk_manager
+        )
+        self.export_project_action.triggered.connect(
+            self._open_tmx_project_export_dialog
         )
         self.project_menu.aboutToShow.connect(
             self._refresh_project_chunk_menu
@@ -3366,6 +3382,11 @@ class QtEditorWindow(QMainWindow):
     def _refresh_project_chunk_menu(self) -> None:
         """Refresh only after a cheap Chunk session-version comparison."""
 
+        self.export_project_action.setEnabled(
+            self.controller.has_workspace
+            and self.tmx_export_coordinator is not None
+        )
+
         if self.chunk_controller is not None and self.controller.has_workspace:
             try:
                 session = self.chunk_controller.session_view
@@ -3543,6 +3564,92 @@ class QtEditorWindow(QMainWindow):
                 self._refresh_browse_table()
         finally:
             self._refreshing = False
+
+    def _open_tmx_project_export_dialog(self) -> None:
+        """Open the exact-scope project/chunk TMX export surface."""
+
+        service = self.tmx_export_coordinator
+        if not self.controller.has_workspace or service is None:
+            self.statusBar().showMessage("TMX 项目导出当前不可用。", 5000)
+            return
+        try:
+            available = service.available_project_scopes()
+            scopes = tuple(
+                TmxExportScopeChoice(
+                    token,
+                    "整个项目" if token == "project" else f"分工 · {label}",
+                )
+                for token, label in available
+            )
+        except Exception as error:
+            self.statusBar().showMessage(
+                f"TMX 导出范围不可用：{getattr(error, 'code', 'TMX.SCOPE.UNAVAILABLE')}",
+                7000,
+            )
+            return
+        if not scopes:
+            self.statusBar().showMessage("TMX 项目导出当前不可用。", 5000)
+            return
+        source_locale, target_locale = self._active_locales()
+
+        def prepare(
+            token: str,
+            source: str,
+            target: str,
+            destination: Path,
+        ) -> TmxExportDialogPreview:
+            application_preparation = service.prepare_project_export(
+                token,
+                source,
+                target,
+                destination,
+            )
+            preview = application_preparation.preview
+            chunk_label = next(
+                (choice.label for choice in scopes if choice.token == token),
+                "分工",
+            )
+            if token == "project":
+                badge = "PROJECT · 整个项目"
+                title = self._active_project_name()
+            else:
+                badge = "CHUNK · 明选分工"
+                title = chunk_label
+            return TmxExportDialogPreview(
+                domain_preparation=application_preparation,
+                badge=badge,
+                title=title,
+                binding=(
+                    f"{preview.scope_kind.value} · {preview.scope_id} · "
+                    f"{application_preparation.preview.operation_id[:12]}"
+                ),
+                document_count=preview.document_count,
+                attached_count=preview.attached_count,
+                included_count=preview.included_count,
+                excluded_count=preview.excluded_count,
+                warning_count=preview.warning_count,
+                profile_id=preview.profile_id,
+            )
+
+        dialog = TmxExportDialog(
+            title="导出项目 TMX",
+            scopes=scopes,
+            source_locale=source_locale,
+            target_locale=target_locale,
+            prepare=prepare,
+            publish=service.publish,
+            parent=self,
+        )
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                receipt = dialog.receipt
+                included = getattr(receipt, "included_count", 0)
+                self.statusBar().showMessage(
+                    f"TMX 已导出 · {included} 个翻译单元。",
+                    7000,
+                )
+        finally:
+            dialog.deleteLater()
 
     def _open_chunk_manager(self) -> None:
         if (
@@ -5404,7 +5511,11 @@ class QtEditorWindow(QMainWindow):
     def create_settings_dialog(self) -> QtSettingsDialog:
         """Create the controller-only settings seam and connect resource refresh."""
 
-        dialog = QtSettingsDialog(self.controller, self)
+        dialog = QtSettingsDialog(
+            self.controller,
+            self,
+            tmx_export_service=self.tmx_export_coordinator,
+        )
         dialog.resources_changed.connect(self._resources_changed)
         dialog.tm_threshold_changed.connect(self._settings_tm_threshold_changed)
         dialog.fuzzy_validation_changed.connect(

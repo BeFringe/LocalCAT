@@ -52,15 +52,44 @@ class ResourcePortabilityArchitectureTests(unittest.TestCase):
             }
         )
 
-    def test_initial_profile_modules_do_not_implement_or_advertise_tmx(self) -> None:
-        for name in (
-            "resource_package_contracts.py",
-            "resource_package.py",
-            "resource_portability.py",
-            "tm_resource_port.py",
-        ):
-            source = (ROOT / name).read_text(encoding="utf-8").lower()
-            self.assertNotIn("tmx", source, name)
+    def test_package_owner_does_not_implement_tmx_or_import_its_grammar(self) -> None:
+        carrier_imports = _imports(ROOT / "resource_package.py")
+        orchestration_imports = _imports(ROOT / "resource_portability.py")
+        self.assertFalse(
+            carrier_imports
+            & {
+                "parser_tmx_codec",
+                "resource_importer",
+                "tmx_context_interchange",
+                "xml",
+                "xml.etree.ElementTree",
+            }
+        )
+        self.assertFalse(
+            orchestration_imports
+            & {
+                "parser_tmx_codec",
+                "resource_importer",
+                "tmx_context_interchange",
+                "xml",
+                "xml.etree.ElementTree",
+            }
+        )
+        port_source = (ROOT / "resource_payload_port.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("class ResourcePackagePayloadHandler", port_source)
+        self.assertNotIn("ElementTree", port_source)
+        self.assertFalse(
+            _imports(ROOT / "resource_payload_port.py")
+            & {
+                "resource_package",
+                "resource_portability",
+                "parser_tmx_codec",
+                "resource_importer",
+                "tmx_context_interchange",
+            }
+        )
 
 
 if __name__ == "__main__":

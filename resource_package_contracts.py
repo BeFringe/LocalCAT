@@ -1,4 +1,4 @@
-"""Leaf contracts for LocalCAT resource snapshots and ResourcePackage v1."""
+"""Leaf contracts for versioned LocalCAT resource snapshots and packages."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ MANIFEST_SCHEMA = "localcat-resource-package-manifest-v1"
 CARRIER_PROFILE = "localcat-resource-package-zip-v1"
 PAYLOAD_PROFILE_SET = "localcat-resource-payload-set-v1"
 LIMIT_PROFILE = "localcat-resource-package-limits-v1"
+MANIFEST_SCHEMA_V2 = "localcat-resource-package-manifest-v2"
+CARRIER_PROFILE_V2 = "localcat-resource-package-zip-v2"
+PAYLOAD_PROFILE_SET_V2 = "localcat-resource-payload-set-v2"
+LIMIT_PROFILE_V2 = "localcat-resource-package-limits-v2"
 RECEIPT_SCHEMA = "localcat-resource-operation-receipt-v1"
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
@@ -31,6 +35,15 @@ class PortableResourceKind(str, Enum):
 class ResourcePayloadProfile(str, Enum):
     TM_JSONL_V1 = "localcat-tm-jsonl-v1"
     TERMBASE_CSV_V1 = "localcat-termbase-csv-v1"
+    TMX_LEVEL1_CONTEXT_V1 = "localcat-tmx-level1-context-v1"
+
+
+class ResourcePackageSourceScope(str, Enum):
+    """Source-scope axis used only by the package capability matrix."""
+
+    MANAGED_RESOURCE = "managed_resource"
+    ENTIRE_PROJECT = "entire_project"
+    SELECTED_CHUNK = "selected_chunk"
 
 
 class ResourceImportMode(str, Enum):
@@ -86,7 +99,7 @@ class ResourcePackageLimitProfile:
     json_depth: int = MAX_JSON_DEPTH
 
     def __post_init__(self) -> None:
-        if self.profile != LIMIT_PROFILE:
+        if self.profile not in (LIMIT_PROFILE, LIMIT_PROFILE_V2):
             raise ValueError("RESOURCE.PORTABILITY.LIMIT_PROFILE_UNSUPPORTED")
         for name, value in (
             ("artifact bytes", self.artifact_bytes),
@@ -138,11 +151,12 @@ class ResourcePackageManifest:
     profile_counts: ResourceProfileCounts
 
     def __post_init__(self) -> None:
-        if self.schema != MANIFEST_SCHEMA:
+        expected_triple = package_profile_triple_for_payload(self.payload_profile)
+        if self.schema != expected_triple[0]:
             raise ValueError("RESOURCE.PACKAGE.MANIFEST_INVALID")
-        if self.carrier_profile != CARRIER_PROFILE:
+        if self.carrier_profile != expected_triple[1]:
             raise ValueError("RESOURCE.PACKAGE.FORMAT_UNSUPPORTED")
-        if self.payload_profile_set != PAYLOAD_PROFILE_SET:
+        if self.payload_profile_set != expected_triple[2]:
             raise ValueError("RESOURCE.PORTABILITY.PROFILE_UNSUPPORTED")
         if type(self.resource_kind) is not PortableResourceKind:
             raise TypeError("resource kind must be exact PortableResourceKind")
@@ -154,8 +168,10 @@ class ResourcePackageManifest:
             raise TypeError("profile counts must be exact")
         self.payload.__post_init__()
         self.profile_counts.__post_init__()
-        expected = profile_for_kind(self.resource_kind)
-        if self.payload_profile is not expected:
+        if not payload_profile_supports_kind(
+            self.payload_profile,
+            self.resource_kind,
+        ):
             raise ValueError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         if self.payload.path != payload_path_for_profile(self.payload_profile):
             raise ValueError("RESOURCE.PACKAGE.MANIFEST_INVALID")
@@ -183,13 +199,14 @@ class PortableResourceSnapshot:
     owner_receipt_digest: str | None
     owner_generation: int | None = None
     owner_revision: int | None = None
+    safe_issues: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.kind) is not PortableResourceKind:
             raise TypeError("snapshot kind must be exact")
         if type(self.profile) is not ResourcePayloadProfile:
             raise TypeError("snapshot profile must be exact")
-        if self.profile is not profile_for_kind(self.kind):
+        if not payload_profile_supports_kind(self.profile, self.kind):
             raise ValueError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         _require_digest(self.payload_digest, "snapshot payload digest")
         _require_digest(self.source_baseline_digest, "snapshot baseline digest")
@@ -205,6 +222,7 @@ class PortableResourceSnapshot:
             raise ValueError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
         _require_optional_int(self.owner_generation, "owner generation")
         _require_optional_int(self.owner_revision, "owner revision")
+        _require_safe_codes(self.safe_issues)
         if self.kind is PortableResourceKind.TRANSLATION_MEMORY:
             if self.legacy_record_count or self.v1_record_count:
                 raise ValueError("RESOURCE.PACKAGE.COUNT_MISMATCH")
@@ -247,15 +265,19 @@ class ResourcePackageValidationReport:
             raise ValueError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
         if self.payload_byte_count > MAX_PAYLOAD_BYTES:
             raise ValueError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-        if self.carrier_profile != CARRIER_PROFILE:
+        expected_triple = package_profile_triple_for_payload(self.payload_profile)
+        if self.carrier_profile != expected_triple[1]:
             raise ValueError("RESOURCE.PACKAGE.FORMAT_UNSUPPORTED")
-        if self.payload_profile_set != PAYLOAD_PROFILE_SET:
+        if self.payload_profile_set != expected_triple[2]:
             raise ValueError("RESOURCE.PORTABILITY.PROFILE_UNSUPPORTED")
         if type(self.resource_kind) is not PortableResourceKind:
             raise TypeError("validation resource kind must be exact")
         if type(self.payload_profile) is not ResourcePayloadProfile:
             raise TypeError("validation payload profile must be exact")
-        if self.payload_profile is not profile_for_kind(self.resource_kind):
+        if not payload_profile_supports_kind(
+            self.payload_profile,
+            self.resource_kind,
+        ):
             raise ValueError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         if self.resource_kind is PortableResourceKind.TRANSLATION_MEMORY:
             if self.legacy_record_count or self.v1_record_count:
@@ -330,7 +352,10 @@ class ResourceOperationReceipt:
             raise TypeError("receipt resource kind must be exact")
         if type(self.payload_profile) is not ResourcePayloadProfile:
             raise TypeError("receipt profile must be exact")
-        if self.payload_profile is not profile_for_kind(self.resource_kind):
+        if not payload_profile_supports_kind(
+            self.payload_profile,
+            self.resource_kind,
+        ):
             raise ValueError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         _require_optional_nonempty(self.source_resource_id, "source resource id")
         _require_optional_nonempty(
@@ -482,21 +507,27 @@ class ResourcePackageTransferMetadata:
         _require_digest(self.payload_sha256, "transfer payload digest")
         _require_int(self.artifact_byte_count, "transfer artifact bytes", minimum=0)
         _require_int(self.record_count, "transfer record count", minimum=0)
-        if self.manifest_schema != MANIFEST_SCHEMA:
+        expected_triple = package_profile_triple_for_payload(self.payload_profile)
+        if self.manifest_schema != expected_triple[0]:
             raise ValueError("RESOURCE.PACKAGE.MANIFEST_INVALID")
-        if self.carrier_profile != CARRIER_PROFILE:
+        if self.carrier_profile != expected_triple[1]:
             raise ValueError("RESOURCE.PACKAGE.FORMAT_UNSUPPORTED")
-        if self.payload_profile_set != PAYLOAD_PROFILE_SET:
+        if self.payload_profile_set != expected_triple[2]:
             raise ValueError("RESOURCE.PORTABILITY.PROFILE_UNSUPPORTED")
         if type(self.resource_kind) is not PortableResourceKind:
             raise TypeError("transfer resource kind must be exact")
         if type(self.payload_profile) is not ResourcePayloadProfile:
             raise TypeError("transfer payload profile must be exact")
-        if self.payload_profile is not profile_for_kind(self.resource_kind):
+        if not payload_profile_supports_kind(
+            self.payload_profile,
+            self.resource_kind,
+        ):
             raise ValueError("RESOURCE.PORTABILITY.KIND_MISMATCH")
 
 
 def profile_for_kind(kind: PortableResourceKind) -> ResourcePayloadProfile:
+    """Return the unchanged v1 default profile for existing callers."""
+
     if type(kind) is not PortableResourceKind:
         raise TypeError("resource kind must be exact")
     return (
@@ -509,11 +540,73 @@ def profile_for_kind(kind: PortableResourceKind) -> ResourcePayloadProfile:
 def payload_path_for_profile(profile: ResourcePayloadProfile) -> str:
     if type(profile) is not ResourcePayloadProfile:
         raise TypeError("payload profile must be exact")
-    return (
-        "payload/tm.jsonl"
-        if profile is ResourcePayloadProfile.TM_JSONL_V1
-        else "payload/termbase.csv"
+    if profile is ResourcePayloadProfile.TM_JSONL_V1:
+        return "payload/tm.jsonl"
+    if profile is ResourcePayloadProfile.TERMBASE_CSV_V1:
+        return "payload/termbase.csv"
+    return "payload/resource.tmx"
+
+
+def payload_profile_supports_kind(
+    profile: ResourcePayloadProfile,
+    kind: PortableResourceKind,
+) -> bool:
+    if type(profile) is not ResourcePayloadProfile:
+        raise TypeError("payload profile must be exact")
+    if type(kind) is not PortableResourceKind:
+        raise TypeError("resource kind must be exact")
+    if kind is PortableResourceKind.TERMBASE:
+        return profile is ResourcePayloadProfile.TERMBASE_CSV_V1
+    return profile in (
+        ResourcePayloadProfile.TM_JSONL_V1,
+        ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1,
     )
+
+
+def package_profile_triple_for_payload(
+    profile: ResourcePayloadProfile,
+) -> tuple[str, str, str]:
+    if type(profile) is not ResourcePayloadProfile:
+        raise TypeError("payload profile must be exact")
+    if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+        return (MANIFEST_SCHEMA_V2, CARRIER_PROFILE_V2, PAYLOAD_PROFILE_SET_V2)
+    return (MANIFEST_SCHEMA, CARRIER_PROFILE, PAYLOAD_PROFILE_SET)
+
+
+def limit_profile_for_payload(profile: ResourcePayloadProfile) -> str:
+    if type(profile) is not ResourcePayloadProfile:
+        raise TypeError("payload profile must be exact")
+    return (
+        LIMIT_PROFILE_V2
+        if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
+        else LIMIT_PROFILE
+    )
+
+
+def resource_package_capability(
+    scope: ResourcePackageSourceScope,
+    kind: PortableResourceKind,
+    profile: ResourcePayloadProfile,
+    *,
+    importing: bool,
+) -> bool:
+    """Return the exact scope/kind/profile capability without inferring scope."""
+
+    if type(scope) is not ResourcePackageSourceScope:
+        raise TypeError("package source scope must be exact")
+    if type(kind) is not PortableResourceKind:
+        raise TypeError("resource kind must be exact")
+    if type(profile) is not ResourcePayloadProfile:
+        raise TypeError("payload profile must be exact")
+    if type(importing) is not bool:
+        raise TypeError("package importing flag must be exact")
+    if scope is not ResourcePackageSourceScope.MANAGED_RESOURCE:
+        return False
+    if not payload_profile_supports_kind(profile, kind):
+        return False
+    if importing and profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
+        return False
+    return True
 
 
 def manifest_to_bytes(manifest: ResourcePackageManifest) -> bytes:
@@ -851,12 +944,16 @@ def _require_safe_codes(values: object) -> None:
 
 __all__ = [
     "CARRIER_PROFILE",
+    "CARRIER_PROFILE_V2",
     "LIMIT_PROFILE",
+    "LIMIT_PROFILE_V2",
     "MANIFEST_SCHEMA",
+    "MANIFEST_SCHEMA_V2",
     "MAX_ARTIFACT_BYTES",
     "MAX_MANIFEST_BYTES",
     "MAX_PAYLOAD_BYTES",
     "PAYLOAD_PROFILE_SET",
+    "PAYLOAD_PROFILE_SET_V2",
     "RECEIPT_SCHEMA",
     "PortableResourceKind",
     "PortableResourceSnapshot",
@@ -869,6 +966,7 @@ __all__ = [
     "ResourcePackageImportResult",
     "ResourcePackageLimitProfile",
     "ResourcePackageManifest",
+    "ResourcePackageSourceScope",
     "ResourceRecoveryAction",
     "ResourceRecoveryDisposition",
     "ResourceRecoveryOutcome",
@@ -881,8 +979,12 @@ __all__ = [
     "ResourceProfileCounts",
     "manifest_from_bytes",
     "manifest_to_bytes",
+    "limit_profile_for_payload",
+    "package_profile_triple_for_payload",
     "payload_path_for_profile",
+    "payload_profile_supports_kind",
     "profile_for_kind",
+    "resource_package_capability",
     "receipt_digest",
     "receipt_from_bytes",
     "receipt_to_bytes",

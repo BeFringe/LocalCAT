@@ -148,6 +148,46 @@ class CanonicalImportSeamTests(unittest.TestCase):
             )
             self.assertEqual(target.read_bytes(), original)
 
+    def test_activated_import_maps_localcat_context_and_preserves_unknown_props(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _activate_resource(root)
+            source = root / "props.tmx"
+            self._write_tmx(
+                source,
+                '<tu><prop type="x-LocalCAT-context-prev">Before</prop>'
+                '<prop type="x-LocalCAT-context-next">After</prop>'
+                '<prop type="x-LocalCAT-speaker">Narrator</prop>'
+                '<prop type="x-MateCAT-status">translated</prop>'
+                '<prop type="x-vendor-note" xml:lang="en-US">one</prop>'
+                '<prop type="x-vendor-note">two</prop>'
+                '<tuv xml:lang="en-US"><seg>Alpha</seg></tuv>'
+                '<tuv xml:lang="zh-CN"><seg>甲</seg></tuv></tu>',
+            )
+
+            report = import_tmx(source, target, "en-US", "zh-CN")
+            record = _store_for(target).exact_records("Alpha")[0]
+
+        self.assertTrue(report.succeeded)
+        self.assertEqual(record.speaker_raw, "Narrator")
+        self.assertEqual(record.context_prev_raw, "Before")
+        self.assertEqual(record.context_next_raw, "After")
+        self.assertIn(("tmx.status", "translated"), record.provenance)
+        raw_props = [
+            json.loads(value)
+            for key, value in record.provenance
+            if key == "tmx.prop"
+        ]
+        self.assertEqual(
+            raw_props[-2:],
+            [
+                ["tu", "x-vendor-note", "en-us", "one"],
+                ["tu", "x-vendor-note", "", "two"],
+            ],
+        )
+
     def test_identical_digest_reimport_fails_closed_without_duplicates(
         self,
     ) -> None:

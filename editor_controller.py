@@ -1338,9 +1338,12 @@ class EditorController:
         self._term_quarantines: dict[str, TermCommitOutcome] = {}
         self._term_matcher_handoff: MatcherHandoffSnapshot | None = None
         self._term_store = TermbaseStore()
+        from tmx_resource_package_handler import TmxResourcePackagePayloadHandler
+
         self._resource_portability = ResourcePortabilityService(
             repository,
             termbase_store=self._term_store,
+            tmx_payload_handler=TmxResourcePackagePayloadHandler(),
         )
         self.reload_resources(_refresh_runtime=False)
 
@@ -1420,6 +1423,38 @@ class EditorController:
     @property
     def workspace_segment_identities(self) -> tuple[IssuedSegmentIdentity, ...]:
         return tuple(item.identity for item in self.workspace_view.segments)
+
+    def issue_tmx_workspace_scope(
+        self,
+    ) -> tuple[WorkspaceSessionView, object]:
+        """Issue the exact Workspace facts consumed by TMX export.
+
+        The content/order view and body-free presence projection remain
+        Workspace-owned.  The TMX coordinator may join them by stable segment
+        identity but cannot derive either fact itself.
+        """
+
+        service = self._require_workspace_session()
+        return self.workspace_view, service.capture_workspace_universe()
+
+    def revalidate_tmx_workspace_scope(
+        self,
+        session: WorkspaceSessionView,
+        universe: object,
+    ) -> tuple[WorkspaceSessionView, object]:
+        """Reprove one previously issued TMX Workspace scope before publish."""
+
+        if type(session) is not WorkspaceSessionView:
+            raise EditorControllerError("TMX.SCOPE.CONTRACT_INVALID")
+        service = self._require_workspace_session()
+        try:
+            validated_universe = service.validate_workspace_universe(universe)
+        except ProjectWorkspaceError as error:
+            raise EditorControllerError("TMX.SCOPE.STALE") from error
+        current = self.workspace_view
+        if current != session:
+            raise EditorControllerError("TMX.SCOPE.STALE")
+        return current, validated_universe
 
     @property
     def current_workspace_document_id(self) -> str:
@@ -5646,6 +5681,42 @@ class EditorController:
             except ResourcePortabilityError as error:
                 raise EditorControllerError(error.code) from error
 
+    def export_tmx_resource_package(
+        self,
+        resource_id: str,
+        destination: Path,
+        source_locale: str,
+        target_locale: str,
+    ) -> ResourceExportOutcome:
+        """Export one managed TM through the ResourcePackage TMX profile.
+
+        The TMX handler only supplies deterministic payload and cold proof;
+        ResourcePortabilityService remains the package/receipt/recovery owner.
+        """
+
+        from tmx_context_contracts import TmxEffectiveLocales
+        from tmx_resource_package_handler import TmxResourcePackagePayloadHandler
+
+        try:
+            locales = TmxEffectiveLocales(source_locale, target_locale)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError("TMX.LOCALE.INVALID") from error
+        handler = TmxResourcePackagePayloadHandler(locales)
+        service = ResourcePortabilityService(
+            self.repository,
+            termbase_store=self._term_store,
+            tmx_payload_handler=handler,
+        )
+        with self._tm_query_lock:
+            try:
+                return service.export_package(
+                    resource_id,
+                    destination,
+                    payload_profile=handler.profile,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
     def validate_resource_package(
         self,
         source: Path,
@@ -5654,6 +5725,16 @@ class EditorController:
             return self._resource_portability.validate_resource_package(source)
         except ResourcePortabilityError as error:
             raise EditorControllerError(error.code) from error
+
+    @staticmethod
+    def resource_package_import_supported(
+        report: ResourcePackageValidationReport,
+    ) -> bool:
+        """Project the package owner's import capability without leaking its enum."""
+
+        if type(report) is not ResourcePackageValidationReport:
+            raise TypeError("resource package validation report must be exact")
+        return ResourcePortabilityService.import_supported(report)
 
     def preview_resource_package_import(
         self,

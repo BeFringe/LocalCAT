@@ -60,6 +60,7 @@ _EXPECTED_MIGRATED_APPLICATION_FACADES = frozenset(
         "editor_project",
         "resource_importer",
         "tm_json_importer",
+        "tmx_context_interchange",
         "logic_controller",
         "translation_runner",
         "stress_runner",
@@ -72,6 +73,7 @@ _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
         "project_workspace_intake",
         "resource_importer",
         "tm_json_importer",
+        "tmx_context_interchange",
         "logic_controller",
     }
 )
@@ -112,9 +114,14 @@ _FACADE_CALL_INVENTORY = {
     "editor_project": (),
     # Existing target-side JSONL merge/render policy remains Application-owned;
     # it is not TMX input grammar.
-    "resource_importer": (("json.dumps", 1), ("json.loads", 1)),
+    "resource_importer": (("json.dumps", 2), ("json.loads", 2)),
     # JSONL rendering remains the CLI's output policy, not single-input parsing.
     "tm_json_importer": (("json.dumps", 1),),
+    # TMX provenance props use canonical JSON values; XML input remains Parser-owned.
+    "tmx_context_interchange": (
+        ("json.dumps", 3),
+        ("xml.parsers.expat.ParserCreate", 1),
+    ),
     "logic_controller": (),
     "translation_runner": (),
     "stress_runner": (),
@@ -166,6 +173,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "tm_sqlite_candidate_projection",
         "tm_sqlite_store",
         "tm_stage_sealer",
+        "tmx_export_coordinator",
         "tools.validate_tm_acceptance_matrix",
         "tools.validate_tm_fault_matrix",
         "tools.validate_tm_release_criteria",
@@ -173,6 +181,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "tools.generate_multi_document_current_source_evidence",
         "tools.generate_collaborative_chunks_current_source_evidence",
         "tools.generate_language_resource_portability_current_source_evidence",
+        "tools.generate_tmx_context_interchange_current_source_evidence",
         "validate_benchmark_contract",
         "validate_decision_memo",
         "workspace_state",

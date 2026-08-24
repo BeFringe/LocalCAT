@@ -85,6 +85,11 @@ from editor_controller import (
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
 from qt_localized_message_box import show_localized_critical
+from qt_tmx_export_dialog import (
+    TmxExportDialog,
+    TmxExportDialogPreview,
+    TmxExportScopeChoice,
+)
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -806,7 +811,13 @@ class QtSettingsDialog(QDialog):
     fuzzy_validation_changed = Signal(object)
     term_suggestions_changed = Signal()
 
-    def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        controller: EditorController,
+        parent: QWidget | None = None,
+        *,
+        tmx_export_service: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self.new_resource_button: QPushButton
         self.tm_threshold_chip: QPushButton
@@ -814,6 +825,7 @@ class QtSettingsDialog(QDialog):
         self._resource_row_resize_pending = False
         self._resource_row_layout_signature: tuple[object, ...] | None = None
         self.controller = controller
+        self.tmx_export_service = tmx_export_service
         self.setObjectName("settingsDialog")
         self.setWindowTitle("LocalCAT · 语言资源设置")
         self.setMinimumSize(860, 560)
@@ -1471,9 +1483,9 @@ class QtSettingsDialog(QDialog):
                 )
                 menu.addSeparator()
             direct_export_action = menu.addAction(
-                "导出兼容 JSONL…"
+                "导出兼容 JSONL"
                 if resource.kind is ResourceKind.TRANSLATION_MEMORY
-                else "导出 CSV/v1…"
+                else "导出 CSV/v1"
             )
             direct_export_action.setObjectName(f"exportDirect_{resource.id}")
             direct_export_action.setToolTip("导出此资源的完整兼容快照")
@@ -1482,11 +1494,37 @@ class QtSettingsDialog(QDialog):
                     configured
                 )
             )
-            package_export_action = menu.addAction("导出资源包…")
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                tmx_ready = (
+                    status_by_resource_id.get(resource.id) is not None
+                    and status_by_resource_id[resource.id].mode
+                    is TMResourceDisplayMode.CANONICAL_ACTIVE
+                )
+                tmx_export_action = menu.addAction("导出 TMX")
+                tmx_export_action.setObjectName(f"exportTmx_{resource.id}")
+                tmx_export_action.setToolTip(
+                    "将此 managed TM 的完整 canonical snapshot 导出为 TMX"
+                )
+                tmx_export_action.setEnabled(
+                    self.tmx_export_service is not None and tmx_ready
+                )
+                tmx_export_action.triggered.connect(
+                    lambda _checked=False, configured=resource: self._prompt_export_tmx(
+                        configured
+                    )
+                )
+            package_export_action = menu.addAction("导出资源包")
             package_export_action.setObjectName(f"exportPackage_{resource.id}")
             package_export_action.setToolTip(
-                "将此资源的完整快照封装为可验证 ResourcePackage"
+                (
+                    "将此 managed TM 的完整 canonical snapshot "
+                    "以 TMX payload 封装为 ResourcePackage"
+                    if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                    else "将此资源的完整快照封装为可验证 ResourcePackage"
+                )
             )
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                package_export_action.setEnabled(tmx_ready)
             package_export_action.triggered.connect(
                 lambda _checked=False, configured=resource: self._prompt_export_package(
                     configured
@@ -2032,6 +2070,11 @@ class QtSettingsDialog(QDialog):
         )
 
     def _prompt_export_package(self, resource: ResourceConfig) -> None:
+        locales: tuple[str, str] | None = None
+        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+            locales = self._prompt_tmx_package_locales(resource)
+            if locales is None:
+                return
         selected, _ = QFileDialog.getSaveFileName(
             self,
             "导出 ResourcePackage",
@@ -2045,11 +2088,20 @@ class QtSettingsDialog(QDialog):
             destination = destination.with_name(
                 f"{destination.name}.localcat-resource"
             )
-        self._start_portability_operation(
-            lambda: self.controller.export_resource_package(
+        if locales is not None:
+            operation = lambda: self.controller.export_tmx_resource_package(
                 resource.id,
                 destination,
-            ),
+                locales[0],
+                locales[1],
+            )
+        else:
+            operation = lambda: self.controller.export_resource_package(
+                resource.id,
+                destination,
+            )
+        self._start_portability_operation(
+            operation,
             f"正在封装 {resource.name}…",
             lambda result, error: self._finish_resource_export(
                 result,
@@ -2057,6 +2109,109 @@ class QtSettingsDialog(QDialog):
                 package=True,
             ),
         )
+
+    def _prompt_export_tmx(self, resource: ResourceConfig) -> None:
+        service = self.tmx_export_service
+        if service is None:
+            self._show_import_feedback("TMX 导出当前不可用。", failed=True)
+            return
+
+        def prepare(
+            _token: str,
+            source: str,
+            target: str,
+            destination: Path,
+        ) -> TmxExportDialogPreview:
+            application_preparation = service.prepare_resource_export(
+                resource.id,
+                source,
+                target,
+                destination,
+            )
+            preview = application_preparation.preview
+            return TmxExportDialogPreview(
+                domain_preparation=application_preparation,
+                badge="RESOURCE · MANAGED TM",
+                title=resource.name,
+                binding=(
+                    f"managed_resource · {resource.id} · "
+                    f"{preview.operation_id[:12]}"
+                ),
+                document_count=0,
+                attached_count=preview.attached_count,
+                included_count=preview.included_count,
+                excluded_count=preview.excluded_count,
+                warning_count=preview.warning_count,
+                profile_id=preview.profile_id,
+            )
+
+        dialog = TmxExportDialog(
+            title="导出翻译记忆 TMX",
+            scopes=(TmxExportScopeChoice(resource.id, resource.name),),
+            source_locale="und",
+            target_locale="und",
+            prepare=prepare,
+            publish=service.publish,
+            parent=self,
+        )
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                receipt = dialog.receipt
+                self._show_import_feedback(
+                    f"TMX 已导出 · {getattr(receipt, 'included_count', 0)} 条记录。",
+                    failed=False,
+                )
+        finally:
+            dialog.deleteLater()
+
+    def _prompt_tmx_package_locales(
+        self,
+        resource: ResourceConfig,
+    ) -> tuple[str, str] | None:
+        dialog = QDialog(self)
+        dialog.setObjectName("tmxPackageLocaleDialog")
+        dialog.setWindowTitle("导出 TMX 资源包")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        title = QLabel(f"将“{resource.name}”封装为 TMX ResourcePackage")
+        title.setStyleSheet("font-size: 18px; font-weight: 750; color: #083b5c;")
+        layout.addWidget(title)
+        hint = QLabel(
+            "资源范围固定为该 managed TM 的完整 canonical snapshot；"
+            "请确认 TMX 语言对。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        row = QHBoxLayout()
+        source = QLineEdit()
+        source.setObjectName("tmxPackageSourceLocale")
+        source.setPlaceholderText("默认 en")
+        target = QLineEdit()
+        target.setObjectName("tmxPackageTargetLocale")
+        target.setPlaceholderText("默认 zh-CN")
+        row.addWidget(QLabel("源语言"))
+        row.addWidget(source)
+        row.addWidget(QLabel("目标语言"))
+        row.addWidget(target)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("继续")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return (
+                source.text().strip() or "en",
+                target.text().strip() or "zh-CN",
+            )
+        finally:
+            dialog.deleteLater()
 
     def _finish_resource_export(
         self,
@@ -2107,6 +2262,13 @@ class QtSettingsDialog(QDialog):
         if error is not None or type(result) is not ResourcePackageValidationReport:
             self._show_import_feedback(
                 f"资源包检查未通过：{error or 'RESOURCE.PACKAGE.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        if not self.controller.resource_package_import_supported(result):
+            self._show_import_feedback(
+                "该 TMX ResourcePackage 是互操作导出包；"
+                "当前导入仅支持 TM JSONL/v1 与术语 CSV/v1 ResourcePackage。",
                 failed=True,
             )
             return

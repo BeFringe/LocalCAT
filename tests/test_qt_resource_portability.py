@@ -18,6 +18,10 @@ from qt_settings_dialog import (
     ResourcePackageImportOptionsDialog,
 )
 from resource_package_contracts import ResourceImportMode
+from resource_package_contracts import (
+    ResourcePackageValidationReport,
+    ResourcePayloadProfile,
+)
 from resource_repository import ResourceRepository
 
 
@@ -36,9 +40,10 @@ class QtResourcePortabilityTests(unittest.TestCase):
             dialog = QtSettingsDialog(EditorController(repository))
             tm_menu = dialog.findChild(QToolButton, f"more_{tm.id}").menu()
             term_menu = dialog.findChild(QToolButton, f"more_{terms.id}").menu()
-            self.assertIn("导出兼容 JSONL…", [action.text() for action in tm_menu.actions()])
-            self.assertIn("导出 CSV/v1…", [action.text() for action in term_menu.actions()])
-            self.assertIn("导出资源包…", [action.text() for action in tm_menu.actions()])
+            self.assertIn("导出兼容 JSONL", [action.text() for action in tm_menu.actions()])
+            self.assertIn("导出 TMX", [action.text() for action in tm_menu.actions()])
+            self.assertIn("导出 CSV/v1", [action.text() for action in term_menu.actions()])
+            self.assertIn("导出资源包", [action.text() for action in tm_menu.actions()])
             self.assertTrue(dialog.resource_package_button.isEnabled())
             self.assertEqual(dialog.resource_package_button.text(), "导入资源包")
             dialog.close()
@@ -115,6 +120,53 @@ class QtResourcePortabilityTests(unittest.TestCase):
             ]
             self.assertEqual(len(buttons), 1)
             self.assertEqual(buttons[0].text(), "完成恢复")
+            dialog.close()
+
+    def test_termbase_package_export_executes_operation_not_nested_lambda(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repository = ResourceRepository(root / "app")
+            terms = repository.create_resource("Terms", ResourceKind.TERMBASE)
+            terms.path.write_bytes(b"\xef\xbb\xbfhello,world\n")
+            controller = EditorController(repository)
+            dialog = QtSettingsDialog(controller)
+            destination = root / "terms-export"
+            with (
+                patch(
+                    "qt_settings_dialog.QFileDialog.getSaveFileName",
+                    return_value=(str(destination), ""),
+                ),
+                patch.object(dialog, "_start_portability_operation") as start,
+            ):
+                dialog._prompt_export_package(terms)
+            operation = start.call_args.args[0]
+            outcome = operation()
+            self.assertEqual(outcome.receipt.record_count, 1)
+            self.assertTrue(
+                destination.with_name(
+                    f"{destination.name}.localcat-resource"
+                ).is_file()
+            )
+            dialog.close()
+
+    def test_tmx_resource_package_validation_explains_export_only_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            dialog = QtSettingsDialog(EditorController(ResourceRepository(root / "app")))
+            report = object.__new__(ResourcePackageValidationReport)
+            object.__setattr__(
+                report,
+                "payload_profile",
+                ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1,
+            )
+            with patch.object(dialog, "_show_import_feedback") as feedback:
+                dialog._after_resource_package_validation(
+                    root / "tm.localcat-resource",
+                    report,
+                    None,
+                )
+            self.assertIn("互操作导出包", feedback.call_args.args[0])
+            self.assertTrue(feedback.call_args.kwargs["failed"])
             dialog.close()
 
 

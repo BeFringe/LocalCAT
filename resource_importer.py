@@ -435,12 +435,12 @@ def import_tmx(
                 "TMX contains no valid units for "
                 f"{source_locale.strip()} → {target_locale.strip()}"
             )
-        ordered_units = tuple(
-            (record.source, record.target) for record in staged.records
-        )
+        ordered_units = tuple(staged.records)
         incoming: dict[str, dict[str, object]] = {}
         duplicate_count = 0
-        for source_text, target_text in ordered_units:
+        for record in ordered_units:
+            source_text = record.source
+            target_text = record.target
             if source_text in incoming:
                 duplicate_count += 1
             incoming[source_text] = {
@@ -452,8 +452,8 @@ def import_tmx(
         canonical = open_canonical_tm_store(target)
         if canonical is not None:
             drafts = tuple(
-                _tmx_import_draft(source_text, target_text, receipt_source.name)
-                for source_text, target_text in ordered_units
+                _tmx_import_draft(record, receipt_source.name)
+                for record in ordered_units
             )
             try:
                 canonical.append_batch(
@@ -580,21 +580,84 @@ def _validate_input(input_path: Path, suffixes: set[str]) -> Path:
 
 
 def _tmx_import_draft(
-    source_text: str,
-    target_text: str,
+    record: ResourceRecord,
     file_name: str,
 ) -> TMRecordDraft:
-    """One private exact import draft in validated input order."""
+    """One exact import draft with lossless TMX prop provenance.
+
+    Parser owns XML safety and the ordered prop grammar.  This adapter only
+    recognizes LocalCAT-owned semantic props plus the verified MateCAT status
+    prop; every prop is also retained in canonical JSON form so unknown and
+    duplicate properties survive a later TMX export.
+    """
+
+    speaker: str | None = None
+    context_prev: str | None = None
+    context_next: str | None = None
+    file_source: str | None = file_name
+    provenance: list[tuple[str, str]] = [
+        ("source", "tmx-import"),
+        ("file", file_name),
+    ]
+    for scope, prop_type, language, value in _tmx_record_props(record):
+        raw_prop = json.dumps(
+            (scope, prop_type, language, value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        provenance.append(("tmx.prop", raw_prop))
+        normalized_type = prop_type.casefold()
+        if scope == "tu" and normalized_type == "x-localcat-context-prev":
+            context_prev = value or None
+        elif scope == "tu" and normalized_type == "x-localcat-context-next":
+            context_next = value or None
+        elif scope == "tu" and normalized_type == "x-localcat-speaker":
+            speaker = value or None
+        elif scope == "tu" and normalized_type == "x-localcat-file-source":
+            file_source = value or None
+        elif normalized_type in {"x-localcat-status", "x-matecat-status"}:
+            provenance.append(("tmx.status", value))
+        elif scope == "tu" and normalized_type == "x-localcat-provenance":
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if (
+                type(decoded) is list
+                and len(decoded) == 2
+                and all(type(item) is str and item for item in decoded)
+            ):
+                provenance.append((decoded[0], decoded[1]))
 
     return TMRecordDraft(
-        source_raw=source_text,
-        target_raw=target_text,
-        speaker_raw=None,
-        context_prev_raw=None,
-        context_next_raw=None,
-        file_source=file_name,
-        provenance=(("source", "tmx-import"), ("file", file_name)),
+        source_raw=record.source,
+        target_raw=record.target,
+        speaker_raw=speaker,
+        context_prev_raw=context_prev,
+        context_next_raw=context_next,
+        file_source=file_source,
+        provenance=tuple(provenance),
     )
+
+
+def _tmx_record_props(record: ResourceRecord) -> tuple[tuple[str, str, str, str], ...]:
+    for metadata in record.format_metadata:
+        if metadata.key != "tmx.props":
+            continue
+        if type(metadata.value) is not tuple:
+            raise ImportFailure("TMX property metadata has an invalid shape")
+        props: list[tuple[str, str, str, str]] = []
+        for item in metadata.value:
+            if (
+                type(item) is not tuple
+                or len(item) != 4
+                or any(type(part) is not str for part in item)
+            ):
+                raise ImportFailure("TMX property metadata has an invalid entry")
+            props.append((item[0], item[1], item[2], item[3]))
+        return tuple(props)
+    return ()
 
 
 def _is_identical_import_constraint(error: sqlite3.IntegrityError) -> bool:

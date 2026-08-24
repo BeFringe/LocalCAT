@@ -782,6 +782,21 @@ class ChunkControllerAdapter:
             raise ChunkError("CHUNK.OUTSIDE_CURRENT")
         return scope.issue_scope_projection(self._current_chunk_id, plan)
 
+    def issue_scope_projection(self, explicit_chunk_id: str) -> ChunkScopeProjection:
+        """Issue one explicitly selected active chunk for downstream export."""
+
+        _authority, _permission, scope, _workspace, plan = self._active_services()
+        return scope.issue_scope_projection(explicit_chunk_id, plan)
+
+    def revalidate_scope_projection(
+        self,
+        projection: ChunkScopeProjection,
+    ) -> ChunkScopeProjection:
+        """Reprove a TMX/downstream scope without exposing Chunk internals."""
+
+        _authority, _permission, scope, _workspace, _plan = self._active_services()
+        return scope.revalidate_scope_projection(projection)
+
     @staticmethod
     def _segment_ref(project_id: str, identity: SegmentIdentity) -> ChunkSegmentRef:
         return ChunkSegmentRef(project_id=project_id, identity=identity)

@@ -21,6 +21,7 @@ from parser_contracts import (
     InputConsumptionPolicy,
     IssueSeverity,
     LimitProfile,
+    MetadataEntry,
     ParseIssue,
     RawParseEvent,
     RawSpeaker,
@@ -105,33 +106,43 @@ class _TmxAbort(Exception):
 class _LocaleChoice:
     requested: str
     exact_text: str | None = None
+    exact_props: tuple[tuple[str, str, str], ...] = ()
     fallback_locale: str | None = None
     fallback_text: str | None = None
+    fallback_props: tuple[tuple[str, str, str], ...] = ()
     fallback_ambiguous: bool = False
 
-    def observe(self, locale: str, text: str) -> None:
+    def observe(
+        self,
+        locale: str,
+        text: str,
+        props: tuple[tuple[str, str, str], ...],
+    ) -> None:
         if locale == self.requested:
             self.exact_text = text
+            self.exact_props = props
             return
         if _locale_base(locale) != _locale_base(self.requested):
             return
         if self.fallback_locale is None:
             self.fallback_locale = locale
             self.fallback_text = text
+            self.fallback_props = props
             return
         if locale == self.fallback_locale:
             self.fallback_text = text
+            self.fallback_props = props
             return
         self.fallback_ambiguous = True
 
-    def select(self) -> tuple[str | None, str]:
+    def select(self) -> tuple[str | None, str, tuple[tuple[str, str, str], ...]]:
         if self.exact_text is not None:
-            return self.exact_text, "exact"
+            return self.exact_text, "exact", self.exact_props
         if self.fallback_ambiguous:
-            return None, "ambiguous"
+            return None, "ambiguous", ()
         if self.fallback_text is not None:
-            return self.fallback_text, "fallback"
-        return None, "missing"
+            return self.fallback_text, "fallback", self.fallback_props
+        return None, "missing", ()
 
 
 @dataclass(slots=True)
@@ -140,6 +151,9 @@ class _UnitState:
     depth: int
     source_choice: _LocaleChoice
     target_choice: _LocaleChoice
+    props: list[tuple[str, str, str, str]] = field(default_factory=list)
+    metadata_entries: int = 0
+    metadata_chars: int = 0
     inline_xml: bool = False
     segment_oversized: bool = False
 
@@ -153,6 +167,17 @@ class _TuvState:
     decoded_chars: int = 0
     text_chunks: list[str] = field(default_factory=list)
     text: str | None = None
+    props: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _PropState:
+    depth: int
+    scope: str
+    prop_type: str
+    language: str
+    decoded_chars: int = 0
+    text_chunks: list[str] = field(default_factory=list)
 
 
 def _local_name(name: str) -> str:
@@ -240,6 +265,7 @@ class _TmxEventParser:
         "physical_units",
         "unit",
         "tuv",
+        "prop",
         "events",
     )
 
@@ -257,6 +283,7 @@ class _TmxEventParser:
         self.physical_units = 0
         self.unit: _UnitState | None = None
         self.tuv: _TuvState | None = None
+        self.prop: _PropState | None = None
         self.events: list[RawParseEvent] = []
         parser = expat.ParserCreate(namespace_separator=_XML_NAMESPACE_SEPARATOR)
         parser.buffer_text = True
@@ -314,6 +341,11 @@ class _TmxEventParser:
             )
 
         local = _local_name(name)
+        if self.prop is not None:
+            if self.depth > self.prop.depth:
+                assert self.unit is not None
+                self.unit.inline_xml = True
+            return
         if self.tuv is not None and self.tuv.segment_depth is not None:
             if self.depth > self.tuv.segment_depth:
                 assert self.unit is not None
@@ -338,6 +370,25 @@ class _TmxEventParser:
         unit = self.unit
         if unit is None:
             return
+        if local == "prop" and self.prop is None:
+            tuv = self.tuv
+            is_tu_prop = self.depth == unit.depth + 1 and tuv is None
+            is_tuv_prop = tuv is not None and self.depth == tuv.depth + 1
+            if is_tu_prop or is_tuv_prop:
+                if unit.metadata_entries >= self.profile.max_metadata_entries_per_container:
+                    raise _TmxAbort(
+                        "PARSER.LIMIT.METADATA",
+                        "TMX unit metadata exceeds the active entry limit",
+                    )
+                raw_locale = attributes.get(_XML_LANG) or attributes.get("lang") or ""
+                normalized_locale = _normalize_locale(raw_locale) if raw_locale else ""
+                self.prop = _PropState(
+                    depth=self.depth,
+                    scope="tu" if tuv is None else "tuv",
+                    prop_type=attributes.get("type", ""),
+                    language=normalized_locale or "",
+                )
+                return
         if local == "tuv" and self.depth == unit.depth + 1 and self.tuv is None:
             raw_locale = attributes.get(_XML_LANG) or attributes.get("lang")
             self.tuv = _TuvState(
@@ -356,8 +407,22 @@ class _TmxEventParser:
             tuv.segment_depth = self.depth
 
     def _character_data(self, data: str) -> None:
-        tuv = self.tuv
+        prop = self.prop
         unit = self.unit
+        if data and prop is not None and unit is not None:
+            maximum = self.profile.max_decoded_field_chars
+            remaining = maximum + 1 - prop.decoded_chars
+            accepted = data[:remaining]
+            if accepted:
+                prop.text_chunks.append(accepted)
+                prop.decoded_chars += len(accepted)
+            if len(data) > remaining or prop.decoded_chars > maximum:
+                raise _TmxAbort(
+                    "PARSER.LIMIT.METADATA",
+                    "TMX property exceeds the active decoded-character limit",
+                )
+            return
+        tuv = self.tuv
         if (
             not data
             or tuv is None
@@ -380,7 +445,33 @@ class _TmxEventParser:
         local = _local_name(name)
         unit = self.unit
         tuv = self.tuv
-        if (
+        prop = self.prop
+        if prop is not None and local == "prop" and prop.depth == self.depth:
+            assert unit is not None
+            value = "".join(prop.text_chunks)
+            metadata_chars = (
+                len(prop.scope)
+                + len(prop.prop_type)
+                + len(prop.language)
+                + len(value)
+            )
+            if (
+                unit.metadata_chars + metadata_chars
+                > self.profile.max_metadata_decoded_chars_per_container
+            ):
+                raise _TmxAbort(
+                    "PARSER.LIMIT.METADATA",
+                    "TMX unit metadata exceeds the active decoded-character limit",
+                )
+            if prop.scope == "tu":
+                unit.props.append(("tu", prop.prop_type, prop.language, value))
+            else:
+                assert tuv is not None
+                tuv.props.append((prop.prop_type, prop.language, value))
+            unit.metadata_entries += 1
+            unit.metadata_chars += metadata_chars
+            self.prop = None
+        elif (
             unit is not None
             and tuv is not None
             and local == "seg"
@@ -402,8 +493,9 @@ class _TmxEventParser:
                 and not unit.inline_xml
                 and not unit.segment_oversized
             ):
-                unit.source_choice.observe(tuv.locale, tuv.text)
-                unit.target_choice.observe(tuv.locale, tuv.text)
+                selected_props = tuple(tuv.props)
+                unit.source_choice.observe(tuv.locale, tuv.text, selected_props)
+                unit.target_choice.observe(tuv.locale, tuv.text, selected_props)
             self.tuv = None
         elif unit is not None and local == "tu" and unit.depth == self.depth:
             self._finish_unit(unit)
@@ -430,8 +522,8 @@ class _TmxEventParser:
                 )
             )
             return
-        source, source_result = unit.source_choice.select()
-        target, target_result = unit.target_choice.select()
+        source, source_result, source_props = unit.source_choice.select()
+        target, target_result, target_props = unit.target_choice.select()
         if source_result == "ambiguous" or target_result == "ambiguous":
             self.events.append(
                 _warning(
@@ -450,13 +542,25 @@ class _TmxEventParser:
                 )
             )
             return
+        metadata_props = tuple(unit.props) + tuple(
+            ("source_tuv", prop_type, language, value)
+            for prop_type, language, value in source_props
+        ) + tuple(
+            ("target_tuv", prop_type, language, value)
+            for prop_type, language, value in target_props
+        )
         self.events.append(
             ResourceRecord(
                 local_id=f"tu-{unit.ordinal}",
                 source=source,
                 target=target,
                 speaker=RawSpeaker(""),
-                format_metadata=(),
+                format_metadata=(
+                    MetadataEntry(
+                        key="tmx.props",
+                        value=metadata_props,
+                    ),
+                ) if metadata_props else (),
             )
         )
 
