@@ -60,7 +60,7 @@
 ### C4P — Qt Product Surface
 
 - 审查 Document 与 Chunk 控件、名称和导航不混同。
-- 审查首页不存在 Chunk 控件，Project 下拉是管理/选择分工入口，且选定分工后编辑、浏览/校对与 Document 文件夹使用同一 exact membership 投影；高级选段由 manager 签发一次性 exact-identity 请求并复用浏览/校对全项目双语表，完成/取消恢复 mode/document/segment/search/current chunk，浏览页不获得 topology preview/apply authority。
+- 审查首页不存在 Chunk 控件，Project 下拉是管理/选择分工入口，未选分工时 Workspace 整项目仍可编辑，选定分工后编辑、浏览/校对与 Document 文件夹使用同一 exact membership 投影；高级选段由 manager 签发一次性 exact-identity 请求并复用浏览/校对全项目双语表，完成/取消恢复 mode/document/segment/search/current chunk，浏览页不获得 topology preview/apply authority。
 - 审查“拆分项目 / 拆分分工 / 合并分工”主路径可直接完成动态 2–N 原子 publication，assigned child/result 决策显式且高级操作不挤占主路径。
 - 审查 preview/apply、只读 reason、Unallocated/detached/progress 与 local/reference 标签的可访问反馈。
 - 审查 Qt 不直接访问 store、metadata JSON、provider、ResourcePackage 或 TMX export。

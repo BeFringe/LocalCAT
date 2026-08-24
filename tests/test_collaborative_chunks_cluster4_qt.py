@@ -696,8 +696,16 @@ class CollaborativeChunkCluster4QtAcceptanceTests(unittest.TestCase):
                 )
             )
             self.assertIsNone(reopened.current_chunk_id)
-            self.assertTrue(cold_window.target_editor.isReadOnly())
-            self.assertEqual(cold_window.workspace_search_scope.count(), 3)
+            self.assertFalse(cold_window.target_editor.isReadOnly())
+            self.assertEqual(
+                [
+                    cold_window.workspace_search_scope.itemText(index)
+                    for index in range(
+                        cold_window.workspace_search_scope.count()
+                    )
+                ],
+                ["当前章节", "搜索全部章节"],
+            )
             self.assertEqual(self.package_path.read_bytes(), self.package_bytes)
         finally:
             cold_window._confirm_unsaved = lambda: True

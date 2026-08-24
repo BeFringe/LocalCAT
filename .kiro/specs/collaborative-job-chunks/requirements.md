@@ -114,10 +114,10 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 #### 验收标准
 
 1. While 项目没有 active Chunk_Plan, the chunk integration shall 不得改变既有个人编辑、保存、搜索或确认行为。
-2. When actor 打开分配给自己的 active current chunk 时, the permission service shall 只对该 chunk 内仍为 attached 的 exact Segment_Ref 授权 target 编辑和 confirmed 变更。
+2. When actor 打开分配给自己的 active current chunk 时, the permission service shall 只对该 chunk 内仍为 attached 的 exact Segment_Ref 授权 target 编辑和 confirmed 变更；When Project 下拉保持“全部章节（未选择分工）”时, the Controller shall 保留 Workspace 整项目编辑语义，不把 active plan 自动解释为已进入 chunk 权限切面。
 3. When 导航、搜索或浏览进入 current chunk 之外、Unallocated、他人 chunk 或 detached member 时, the Controller/Qt shall 保持内容可见但明确只读，并返回稳定原因码。
-4. The chunk-manager capability shall 授权 chunk topology/assignment 操作，但不自动授权 target/source 编辑；管理者需要编辑时仍必须被显式分配并选中该 chunk。
-5. The Controller shall 在所有可改变 target/confirmed 的入口重新验证 actor/session、plan revision、current chunk 和 Segment_Ref；不得只在 Qt 禁用控件后允许直接命令绕过。
+4. The chunk-manager capability shall 授权 chunk topology/assignment 操作，但不自动授权 target/source 编辑；进入具体 chunk 切面后，管理者需要编辑时仍必须被显式分配并选中该 chunk。
+5. The Controller shall 在 chunk 切面的所有 target/confirmed 入口重新验证 actor/session、plan revision、current chunk 和 Segment_Ref；整项目切面仍在 mutation 前复验 Workspace session/revision 与 active plan binding，不得只靠 Qt 控件状态。
 6. The chunk permission shall 不得授权 source 改写、Document/Segment identity 变更、ProjectPackage 保存/安装、codec-private 读取、TM 写入或 provider 操作。
 
 ### Requirement 7：Chunk progress
@@ -180,7 +180,7 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 3. When 当前 segment 不可编辑时, the Qt UI shall 禁用 target/confirmed mutation 并显示“当前 chunk 外”、“未分配”、“分配给他人”、“已分离”或“计划已过期”之一稳定语义，不得仅吞掉输入。
 4. When split/merge/rebase/undo 失败时, the Qt UI shall 保留当前 workspace、navigation、target/dirty 和 chunk plan，显示 safe code 与重试/重新 preview 入口。
 5. The Qt UI shall 不得提供账号注册、provider、实时协作、ProjectPackage extension 或 TM/Fuzzy 控件；也不得直接读写 chunk metadata carrier。
-6. The editor home shall 不显示 Chunk 状态条、selector 或收起控件。Project 下拉 shall 提供“协作分工管理”入口和“当前分工”选择；选定 chunk 后，编辑与浏览/校对均只投影该 chunk 的跨文档 exact members，Document 文件夹只展示这些 members 所在文档并仍负责文档导航。
+6. The editor home shall 不显示 Chunk 状态条、selector 或收起控件。Project 下拉 shall 提供“协作分工管理”入口和“当前分工”选择；“全部章节（未选择分工）”保持 Workspace 整项目可编辑，选定 chunk 后编辑与浏览/校对均只投影该 chunk 的跨文档 exact members，Document 文件夹只展示这些 members 所在文档并仍负责文档导航。
 7. When create/move/release/精确拆分需要高级选段时, the manager UI shall 签发一次性 body-safe 选择请求并暂时隐藏，复用浏览/校对页的全宽双语表显示完整项目上下文。该会话只能选择请求允许的 exact identities，支持起点/终点连续范围、Shift/Command 离散多选、清除，以及在 create 中显式“选择全部尚未分工”；“尚未分工”只表示未归入 chunk，与未翻译或未确认无关。浏览/校对不得在该会话中改变 current document/segment、搜索条件、current chunk 或调用 topology preview/apply；完成或取消后须恢复进入前状态，完成时仅按项目顺序把 exact identities 返回 manager。该范围不得成为“拆分项目 / 拆分分工”的前置条件。
 8. The manager UI shall 将“拆分项目 / 拆分分工 / 合并分工”作为直接主路径：动态 2–N 分组、完整源 membership 与 assignment 决策由同一操作页完成；合并支持一次选中全部可见分工，结果名称留空时由 Application 路由稳定默认名。高级原子操作可保留，但不得迫使用户先创建临时 chunk 才能拆分项目。操作字段应使用紧凑布局，发布预览紧随必要字段并利用剩余空间。
 

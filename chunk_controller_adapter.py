@@ -125,6 +125,7 @@ class _PreparedWorkspaceEdit:
     plan_binding: ChunkPlanBinding | None
     segment: ChunkSegmentRef | None
     capability: ChunkActorCapability | None
+    selection_generation: int | None
     consumed: bool = False
 
 
@@ -827,6 +828,32 @@ class ChunkControllerAdapter:
                 None,
                 None,
                 None,
+                None,
+            )
+            self._pending[id(prepared)] = prepared
+            return prepared
+        if (
+            self._mode is ChunkControllerSessionMode.ACTIVE
+            and self._current_chunk_id is None
+        ):
+            try:
+                _authority, _permission, _scope, workspace, plan = (
+                    self._active_services()
+                )
+            except ChunkError as error:
+                raise EditorControllerError(error.code) from error
+            prepared = _PreparedWorkspaceEdit(
+                service,
+                identity,
+                target,
+                confirmed,
+                session_id,
+                base_revision,
+                workspace,
+                plan,
+                None,
+                None,
+                self._selection_generation,
             )
             self._pending[id(prepared)] = prepared
             return prepared
@@ -862,6 +889,7 @@ class ChunkControllerAdapter:
             plan,
             segment,
             capability,
+            self._selection_generation,
         )
         self._pending[id(prepared)] = prepared
         return prepared
@@ -887,8 +915,7 @@ class ChunkControllerAdapter:
             base_revision=base_revision,
         )
         if prepared.capability is None:
-            if self._mode is not ChunkControllerSessionMode.NO_PLAN:
-                raise EditorControllerError("CHUNK.PERMISSION_STALE")
+            self._revalidate_direct_workspace_edit(prepared)
             try:
                 return service.update_segment_edit(
                     identity,
@@ -929,6 +956,43 @@ class ChunkControllerAdapter:
         if type(result) is not WorkspaceEditReceipt or port.calls != 1:
             raise EditorControllerError("CHUNK.COMMIT_FAILED")
         return result
+
+    def _revalidate_direct_workspace_edit(
+        self,
+        prepared: _PreparedWorkspaceEdit,
+    ) -> None:
+        """Revalidate the Workspace-owned whole-project edit seam."""
+
+        if self._mode is ChunkControllerSessionMode.NO_PLAN:
+            if any(
+                value is not None
+                for value in (
+                    prepared.workspace_binding,
+                    prepared.plan_binding,
+                    prepared.segment,
+                    prepared.selection_generation,
+                )
+            ):
+                raise EditorControllerError("CHUNK.PERMISSION_STALE")
+            return
+        if (
+            self._mode is not ChunkControllerSessionMode.ACTIVE
+            or self._current_chunk_id is not None
+            or prepared.segment is not None
+            or prepared.selection_generation != self._selection_generation
+        ):
+            raise EditorControllerError("CHUNK.PERMISSION_STALE")
+        try:
+            _authority, _permission, _scope, workspace, plan = (
+                self._active_services()
+            )
+        except ChunkError as error:
+            raise EditorControllerError(error.code) from error
+        if (
+            prepared.workspace_binding != workspace
+            or prepared.plan_binding != plan
+        ):
+            raise EditorControllerError("CHUNK.PERMISSION_STALE")
 
     def _take_prepared(
         self,
@@ -980,8 +1044,7 @@ class ChunkControllerAdapter:
             base_revision=base_revision,
         )
         if prepared.capability is None:
-            if self._mode is not ChunkControllerSessionMode.NO_PLAN:
-                raise EditorControllerError("CHUNK.PERMISSION_STALE")
+            self._revalidate_direct_workspace_edit(prepared)
             report = publish_resources()
             if not bool(getattr(report, "succeeded", False)):
                 return report, None
@@ -1357,13 +1420,29 @@ class ChunkControllerAdapter:
                     is_current=chunk.chunk_id == self._current_chunk_id,
                 )
             )
-        decision = permission.decide_access(
-            self._actor_port,
-            self._actor_handle,
-            workspace_binding=live.binding,
-            expected_plan_binding=binding,
-            segment=self._segment_ref(self._project_id, identity),
-        )
+        if self._current_chunk_id is None:
+            current_access = ChunkApplicationAccessView(
+                identity=identity,
+                access="workspace_editable_no_chunk",
+                may_edit_target=True,
+                may_change_confirmed=True,
+                safe_codes=(),
+            )
+        else:
+            decision = permission.decide_access(
+                self._actor_port,
+                self._actor_handle,
+                workspace_binding=live.binding,
+                expected_plan_binding=binding,
+                segment=self._segment_ref(self._project_id, identity),
+            )
+            current_access = ChunkApplicationAccessView(
+                identity=identity,
+                access=decision.access.value,
+                may_edit_target=decision.may_edit_target,
+                may_change_confirmed=decision.may_change_confirmed,
+                safe_codes=decision.safe_codes,
+            )
         return ChunkApplicationProjectView(
             mode=ChunkApplicationMode.ACTIVE,
             project_id=self._project_id,
@@ -1377,13 +1456,7 @@ class ChunkControllerAdapter:
                 and entry.segment.identity not in allocated
                 for entry in live.entries
             ),
-            current_segment_access=ChunkApplicationAccessView(
-                identity=identity,
-                access=decision.access.value,
-                may_edit_target=decision.may_edit_target,
-                may_change_confirmed=decision.may_change_confirmed,
-                safe_codes=decision.safe_codes,
-            ),
+            current_segment_access=current_access,
             safe_code=None,
         )
 

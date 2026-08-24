@@ -3258,6 +3258,7 @@ class QtEditorWindow(QMainWindow):
     def _chunk_access_text(access: str, safe_code: str | None = None) -> str:
         labels = {
             "legacy_editable_no_plan": "个人编辑模式",
+            "workspace_editable_no_chunk": "全部章节可编辑",
             "editable_assigned_current": "当前分工可编辑",
             "read_only_no_current_chunk": "请选择当前分工",
             "read_only_unallocated": "未分配 · 只读",
@@ -3485,7 +3486,10 @@ class QtEditorWindow(QMainWindow):
         previous = self.workspace_search_scope.currentData()
         blocker = QSignalBlocker(self.workspace_search_scope)
         self.workspace_search_scope.clear()
-        if view.mode is ChunkApplicationMode.ACTIVE:
+        if (
+            view.mode is ChunkApplicationMode.ACTIVE
+            and view.current_chunk_id is not None
+        ):
             entries = (
                 ("当前章节", CollaborativeSearchScopeV2.CURRENT_DOCUMENT),
                 ("当前分工", CollaborativeSearchScopeV2.CURRENT_CHUNK),
@@ -5188,6 +5192,7 @@ class QtEditorWindow(QMainWindow):
                 if (
                     self._chunk_view is not None
                     and self._chunk_view.mode is ChunkApplicationMode.ACTIVE
+                    and self._chunk_view.current_chunk_id is not None
                     and self.chunk_controller is not None
                 ):
                     if not isinstance(scope, CollaborativeSearchScopeV2):

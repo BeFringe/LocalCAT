@@ -34,8 +34,8 @@ Multi-Document C2 complete
 | C1 不激活 assignment | create/decode/preview/persist/cold-reopen 全部 active chunks `assignee=None`、assignment counts `0`；split children/merge result 强制 `None`；non-null/count `> 0`/assign-reassign-unassign 在 candidate/publication 前零 mutation 拒绝；parent 预填/选择只在 C2 |
 | Rebase 不接管 source reconciliation | unchanged/source_changed 保留，detached 只读，missing 显式 release/cancel，new Unallocated；无 index/text 猜测 |
 | Assignment 不是账号系统 | metadata 只存 opaque authority/subject；无 credential；local/reference actor 诚实标签 |
-| Permission 在 Controller mutation boundary 复验 | 只有 assigned + current + attached 可写；manager 不默认编辑；UI disabled 不代替 command denial |
-| Chunk 是 Project 切面，不是首页固定区 | 首页无 Chunk 控件；Project 下拉管理/选择当前分工；编辑、浏览/校对和 Document 文件夹共用 exact membership 投影 |
+| Permission 在 Controller mutation boundary 复验 | 明选 chunk 后只有 assigned + current + attached 可写；未选分工时保持 Workspace 整项目编辑；UI disabled 不代替 command denial |
+| Chunk 是 Project 切面，不是首页固定区 | 首页无 Chunk 控件；Project 下拉的“全部章节”保持 Workspace 切面，选定分工后编辑、浏览/校对和 Document 文件夹共用 exact membership 投影 |
 | 主拆分不依赖段落预选 | 无 plan 对整项目 2–N 均分，已有 plan 对完整源 chunk 2–N 均分；高级选段用一次性 exact-identity 请求复用浏览/校对全项目双语表，完成/取消恢复 mode/document/segment/search/current chunk，且浏览页无 topology preview/apply authority |
 | Progress 只从 current workspace 派生 | attached total/unfilled/draft/confirmed/detached；detached 不进分母；无持久 counter authority |
 | Chunk 只签发/复验 scope，不决定 export payload/carrier | owner issue/revalidate seam + 最小 `ChunkScopeProjection` 完整 exact membership；Workspace join presence/content/order；无 TMX/profile/carrier/destination/loss 字段 |

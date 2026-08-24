@@ -477,13 +477,13 @@ class ChunkAccessDecision:
 具体规则：
 
 1. 没有 active plan 时，chunk integration 完全 bypass，不改变既有 EditorController 权限。`READ_ONLY_NO_PLAN` 只用于显式请求 chunk-gated mode 但 plan 不可用的失败投影，不能误用来回归既有个人模式。
-2. active plan 中，只有 exact current chunk 的 exact assignee、对应 attached member 获得 target/confirmed edit。
+2. 明选 active current chunk 并进入 chunk 切面后，只有该 chunk 的 exact assignee、对应 attached member 获得 target/confirmed edit；未选分工的“全部章节”由 Workspace 保持整项目编辑权威。
 3. 一个 actor 有多个 assigned chunks 时，也只能编辑 session 当前选中的那一个；切换 chunk 换 capability epoch。
 4. manager capability 只管 topology/assignment/rebase/undo，不自动越过 assignee/current-chunk 门编辑项目。
 5. detached 总是只读；Unallocated、其他 chunk 或他人 chunk 可见但只读。
 6. permission service 不得授权 source/identity/package/TM/provider/private-member 操作。
 
-判定优先级固定为：无 active plan → stale plan/workspace → 无 current chunk → Unallocated → current chunk 外 → 非 assignee → detached → editable。这样同一状态组合不会因查询顺序泄漏更多事实，也不会把“尚未选择 current chunk”误报为成员归属问题。无 active plan 时 Controller 必须 bypass chunk gate；`READ_ONLY_NO_PLAN` 只表示调用者显式进入了 chunk-gated 查询但没有可用 plan。
+在 chunk-gated 查询内，判定优先级固定为：无 active plan → stale plan/workspace → 无 current chunk → Unallocated → current chunk 外 → 非 assignee → detached → editable。这样同一状态组合不会因查询顺序泄漏更多事实。无 active plan 或 Project 处于“全部章节（未选择分工）”时 Controller 必须 bypass chunk permission service；`READ_ONLY_NO_PLAN` / `READ_ONLY_NO_CURRENT_CHUNK` 只表示调用者显式进入 chunk-gated 查询却缺少对应 plan/current chunk。
 
 每次 permission 签发或执行只允许 identity owner 做一次 actor revalidation，并让同一个 exact `AssigneeRef` 贯穿 selection、assignment 和 access 判定；不得把两次可变 resolver 结果拼成一个 capability。current-chunk selection 绑定 workspace session 而不绑定每次 target/confirmed 编辑都会推进的 revision：同一 session 内编辑后保持选择，一旦观察到 authoritative session ID 变化，permission service 必须全局清除 session selections 并消费旧 capabilities；即使之后回到原 session ID 也不得恢复，冷开/切换 session 必须重新选择。`ChunkActorCapability` 是 opaque、不可复制/序列化、每 actor 至多一个 active、绑定 exact workspace revision/plan/current-chunk epoch/segment/operation 的一次性能力。选择 current chunk、清除选择、assignment/plan/workspace 漂移或签发新能力都会使旧能力失效。
 
@@ -599,7 +599,7 @@ v1 只对 `identical`/verified `fast_forward` 允许无语义合并的 apply。`
 
 ## C4：Qt 产品表面
 
-- 编辑首页不放置 Chunk 状态条、selector 或收起入口。Project 下拉拥有“协作分工管理”和“当前分工”；选定 chunk 后，编辑段落列表、浏览/校对表与 Document 文件夹都由同一 exact membership 投影，文件夹仍只负责该切面内的文档导航。
+- 编辑首页不放置 Chunk 状态条、selector 或收起入口。Project 下拉拥有“协作分工管理”和“当前分工”；“全部章节（未选择分工）”保持 Workspace 整项目可编辑与原 search scope，选定 chunk 后编辑段落列表、浏览/校对表与 Document 文件夹都由同一 exact membership 投影，文件夹仍只负责该切面内的文档导航。
 - chunk 列表显示 name/order、assignee safe label、confirmed/attached progress、detached 和 member count；Unallocated 是独立汇总，不伪造 ID。
 - manager 仍是 topology preview/apply 的唯一 Qt surface。create/move/release/精确拆分需要高级选段时，它根据 action 与源 chunk 从 Application project-order choices 签发一次性 `ChunkApplicationSegmentSelectionRequest`，其中只包含 allowed/selected/bulk exact identities、最小选择数与安全标签；请求不携带正文，也不授予 publication authority。
 - 选段期间 manager 暂时隐藏，浏览/校对页进入非持久的 selection session：忽略 current-chunk 显示过滤以呈现全项目 document divider、source、target、speaker 与状态，但只有 allowed identities 可选。起点/终点选择两点间允许的项目顺序，ExtendedSelection 保留 Shift/Command 离散多选；create 可显式选择全部“尚未分工”成员。该页不调用 chunk preview/apply、不写 range/index，也不把当前浏览行变成 current segment。完成只按表格顺序返回 exact identities；取消或完成均恢复进入前的 workspace mode、current document/segment、搜索状态和 current chunk，再显示 manager。“拆分项目 / 拆分分工”继续直接使用完整项目/源 chunk，不依赖高级预选。
@@ -608,7 +608,7 @@ v1 只对 `identical`/verified `fast_forward` 允许无语义合并的 apply。`
 - split/merge/move/rebase/assign/dissolve/undo 都先显示 counts、新旧 chunks、assignment 变化、detached/missing 和 blockers，显式确认后 apply。
 - 当前 segment 的编辑区持续投影 access decision。禁用只是视觉反馈；Controller mutation gate 才是权威。
 - local/reference actor port 必须标注“本机工作流身份，非账号认证”；没有获批 identity adapter 时不显示跨设备安全协作承诺。
-- search scope 为“当前章节 / 当前分工 / 搜索全部章节”；整项目命中可导航，chunk 外继续只读。
+- 选定 chunk 时 search scope 为“当前章节 / 当前分工 / 搜索全部章节”，整项目命中可导航但 chunk 外只读；未选分工时恢复“当前章节 / 搜索全部章节”的 Workspace 语义。
 - Qt 不提供 provider、remote conflict、密钥、账号注册、实时 presence、TM/Fuzzy 或 ProjectPackage extension 控件。
 
 ## 安全与限制

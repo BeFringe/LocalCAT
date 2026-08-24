@@ -97,7 +97,7 @@ Multi-Document C2 complete
   - 提供诚实标签的 local/reference actor port 作为 current-source harness，不实现或宣称 account/auth/provider。
 
 - [x] 2.2 建立 chunk permission service
-  - 只有 exact assignee + active current chunk + attached member 可编辑 target/confirmed。
+  - 进入明选 chunk 切面后，只有 exact assignee + active current chunk + attached member 可编辑 target/confirmed；“全部章节（未选择分工）”保持 Workspace 整项目编辑。
   - outside current、Unallocated、not-assignee、detached、stale 返回明确 read-only decision/safe code。
   - manager 只管 topology/assignment/rebase/undo，不默认编辑；无 active plan 时不改既有个人模式。
 
@@ -165,7 +165,7 @@ Multi-Document C2 complete
 
 - [x] 4.2 实现 chunk selector、manager 与 progress 投影
   - 显示 active chunks、current chunk、assignee safe label、membership/progress/detached/Unallocated counts。
-  - 首页不放 Chunk 控件；Project 下拉提供“协作分工管理 / 当前分工”，选定分工后编辑、浏览/校对与 Document 文件夹均只投影其跨文档 exact members。
+  - 首页不放 Chunk 控件；Project 下拉提供“协作分工管理 / 当前分工”，未选分工时保持整项目可编辑，选定分工后编辑、浏览/校对与 Document 文件夹均只投影其跨文档 exact members。
   - 高级 create/move/release/精确拆分由 manager 签发一次性 body-safe exact-identity 请求，暂时复用浏览/校对全宽双语表完成起点/终点、离散多选、清除和“选择全部尚未分工”；会话不导航、不发布，返回后恢复原 mode/document/segment/search/current chunk。直接拆分项目/源分工不依赖该预选。
   - 将原子 create/split/merge 收束为直接的“拆分项目 / 拆分分工 / 合并分工”主路径：动态 2–N 分组在单次 publication 中闭合，并显式处理 child/result assignment；其余 rename/reorder/move/dissolve/assign/rebase/undo 仍通过 Controller preview/apply。
   - 所有高影响变更在 apply 前显示 exact counts/assignment/blockers 并要求显式确认。

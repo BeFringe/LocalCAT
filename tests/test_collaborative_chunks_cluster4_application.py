@@ -161,6 +161,27 @@ class CollaborativeChunkCluster4ApplicationTests(unittest.TestCase):
         self.assertEqual(len(cold_view.chunks), 1)
         self.assertEqual(cold_view.chunks[0].name, "Cross document")
 
+    def test_active_plan_without_selected_chunk_keeps_workspace_editable(self) -> None:
+        self.adapter.apply_mutation(
+            self.adapter.preview_create_chunk(
+                "Unselected slice",
+                (self._identity(0, "001"), self._identity(1, "001")),
+            )
+        )
+        view = self.adapter.project_view()
+        self.assertIs(view.mode, ChunkApplicationMode.ACTIVE)
+        self.assertIsNone(view.current_chunk_id)
+        self.assertEqual(
+            view.current_segment_access.access,
+            "workspace_editable_no_chunk",
+        )
+        self.assertTrue(view.current_segment_access.may_edit_target)
+        self.controller.update_workspace_target("whole-project edit")
+        self.assertEqual(
+            self.controller.current_segment.target,
+            "whole-project edit",
+        )
+
     def test_dynamic_project_partition_and_even_split_do_not_depend_on_editor_selection(self) -> None:
         self.assertEqual(
             self.adapter._balanced_groups(tuple(range(27)), 4),

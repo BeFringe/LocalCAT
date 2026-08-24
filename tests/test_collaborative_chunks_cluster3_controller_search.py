@@ -406,9 +406,11 @@ class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
             before_generation + 1,
         )
         self._rename_plan("Alpha restored", 900)
-        with self.assertRaises(EditorControllerError) as revived:
-            self.controller.update_workspace_target("must reselect")
-        self.assertEqual(revived.exception.args[0], "CHUNK.OUTSIDE_CURRENT")
+        self.controller.update_workspace_target("whole project after revoke")
+        self.assertEqual(
+            self.controller.current_segment.target,
+            "whole project after revoke",
+        )
         with self.assertRaises(ChunkError) as caught:
             self._search(CollaborativeSearchScopeV2.CURRENT_CHUNK)
         self.assertEqual(caught.exception.code, "CHUNK.OUTSIDE_CURRENT")
