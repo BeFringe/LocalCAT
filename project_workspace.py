@@ -512,6 +512,221 @@ class ReconciliationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceSegmentUniverseEntry:
+    """One body-free member of the workspace-owned Segment Universe."""
+
+    identity: SegmentIdentity
+    source_presence: SourcePresence
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not SegmentIdentity:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        self.identity.__post_init__()
+        if type(self.source_presence) is not SourcePresence:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+
+def _universe_entry_sort_key(
+    entry: WorkspaceSegmentUniverseEntry,
+) -> tuple[bytes, bytes]:
+    local = entry.identity.local_segment_id.encode("utf-8", errors="strict")
+    return (
+        entry.identity.document_id.encode("ascii", errors="strict"),
+        len(local).to_bytes(8, "big", signed=False) + local,
+    )
+
+
+def _canonical_workspace_universe_entries(
+    entries: object,
+) -> tuple[WorkspaceSegmentUniverseEntry, ...]:
+    values = _exact_tuple(entries, code="PROJECT.RECONCILE.INPUT_INVALID")
+    if any(type(entry) is not WorkspaceSegmentUniverseEntry for entry in values):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    typed = tuple(values)
+    for entry in typed:
+        entry.__post_init__()
+    if len({entry.identity for entry in typed}) != len(typed):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    return tuple(sorted(typed, key=_universe_entry_sort_key))
+
+
+def workspace_segment_universe_digest_v1(
+    project_id: object,
+    entries: object,
+) -> str:
+    """Digest identity/presence only, compatible with the Chunk v1 seam.
+
+    Workspace owns the source facts and signs no body, path, display order or
+    editing state into this digest.  The domain and length-prefix grammar are
+    intentionally identical to the downstream Chunk Segment Universe digest.
+    """
+
+    project = validate_project_id(project_id)
+    canonical = _canonical_workspace_universe_entries(entries)
+    digest = hashlib.sha256()
+    digest.update(b"localcat.chunk.segment-universe.v1\0")
+
+    def length_prefixed(value: str) -> bytes:
+        encoded = value.encode("utf-8", errors="strict")
+        return len(encoded).to_bytes(8, "big", signed=False) + encoded
+
+    digest.update(length_prefixed(project))
+    for entry in canonical:
+        digest.update(length_prefixed(entry.identity.document_id))
+        digest.update(length_prefixed(entry.identity.local_segment_id))
+        digest.update(
+            b"\x01"
+            if entry.source_presence is SourcePresence.ATTACHED
+            else b"\x02"
+        )
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceUniverseBinding:
+    """Exact published workspace state to which one universe belongs."""
+
+    project_id: str
+    workspace_session_id: str
+    workspace_revision: int
+    workspace_composition_revision: int
+    workspace_digest: str
+    segment_universe_digest: str
+
+    def __post_init__(self) -> None:
+        validate_project_id(self.project_id)
+        _validate_session_id(self.workspace_session_id)
+        _validate_revision(self.workspace_revision)
+        _validate_revision(self.workspace_composition_revision)
+        validate_sha256(self.workspace_digest)
+        validate_sha256(self.segment_universe_digest)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceUniverseProjection:
+    """Complete body-free universe facts for one published workspace state."""
+
+    binding: WorkspaceUniverseBinding
+    entries: tuple[WorkspaceSegmentUniverseEntry, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not WorkspaceUniverseBinding:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        self.binding.__post_init__()
+        canonical = _canonical_workspace_universe_entries(self.entries)
+        if self.entries != canonical:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        if (
+            workspace_segment_universe_digest_v1(
+                self.binding.project_id,
+                canonical,
+            )
+            != self.binding.segment_universe_digest
+        ):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+
+def published_workspace_transition_digest_v1(
+    operation_id: object,
+    previous: object,
+    current: object,
+    source_changed_identities: object,
+) -> str:
+    """Bind all body-free facts in one owner-published transition."""
+
+    if type(operation_id) is not str or _OPERATION_ID.fullmatch(operation_id) is None:
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    if (
+        type(previous) is not WorkspaceUniverseProjection
+        or type(current) is not WorkspaceUniverseProjection
+    ):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    previous.__post_init__()
+    current.__post_init__()
+    changed = _exact_tuple(
+        source_changed_identities,
+        code="PROJECT.RECONCILE.INPUT_INVALID",
+    )
+    if any(type(identity) is not SegmentIdentity for identity in changed):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    for identity in changed:
+        identity.__post_init__()
+    if len(changed) != len(set(changed)) or changed != tuple(
+        sorted(
+            changed,
+            key=lambda identity: _universe_entry_sort_key(
+                WorkspaceSegmentUniverseEntry(identity, SourcePresence.ATTACHED)
+            ),
+        )
+    ):
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    return _digest_value(
+        b"localcat.project-workspace-transition.v1\0",
+        (operation_id, previous, current, changed),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedWorkspaceTransitionProjection:
+    """Owner-issued facts for one reconciliation that has actually published.
+
+    Unlike :class:`ReconciliationPreview`, this projection is created only at
+    the mutation publication point.  It carries the complete old and current
+    identity/presence universes so a cold downstream rebase can distinguish a
+    previously unallocated segment from a genuinely new segment.
+    """
+
+    operation_id: str
+    previous: WorkspaceUniverseProjection
+    current: WorkspaceUniverseProjection
+    source_changed_identities: tuple[SegmentIdentity, ...]
+    transition_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.previous) is not WorkspaceUniverseProjection
+            or type(self.current) is not WorkspaceUniverseProjection
+        ):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        self.previous.__post_init__()
+        self.current.__post_init__()
+        previous_binding = self.previous.binding
+        current_binding = self.current.binding
+        if (
+            previous_binding.project_id != current_binding.project_id
+            or previous_binding.workspace_session_id
+            != current_binding.workspace_session_id
+            or current_binding.workspace_revision
+            != previous_binding.workspace_revision + 1
+            or current_binding.workspace_composition_revision
+            != previous_binding.workspace_composition_revision + 1
+        ):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        previous_ids = {entry.identity for entry in self.previous.entries}
+        current_ids = {entry.identity for entry in self.current.entries}
+        changed = _exact_tuple(
+            self.source_changed_identities,
+            code="PROJECT.RECONCILE.INPUT_INVALID",
+        )
+        if any(type(identity) is not SegmentIdentity for identity in changed):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        if any(
+            identity not in previous_ids or identity not in current_ids
+            for identity in changed
+        ):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        expected = published_workspace_transition_digest_v1(
+            self.operation_id,
+            self.previous,
+            self.current,
+            changed,
+        )
+        validate_sha256(self.transition_digest)
+        if self.transition_digest != expected:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedReconciliationToken:
     """Opaque, service-issued capability for one prepared reconciliation."""
 
@@ -583,6 +798,7 @@ class _PreparedReconciliation:
     plan: _ReconciliationPlan
     candidate_service: ProjectWorkspaceService
     receipt: ReconciliationReceipt
+    transition: PublishedWorkspaceTransitionProjection
 
 
 def _hash_value(hasher: object, value: object) -> None:
@@ -748,6 +964,93 @@ def _workspace_identity_order(workspace: ProjectWorkspace) -> tuple[SegmentIdent
         SegmentIdentity(document.document_id, source.local_segment_id)
         for document in workspace.documents
         for source in document.source_segments
+    )
+
+
+def _workspace_universe_entries(
+    workspace: ProjectWorkspace,
+) -> tuple[WorkspaceSegmentUniverseEntry, ...]:
+    if type(workspace) is not ProjectWorkspace:
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    entries = tuple(
+        WorkspaceSegmentUniverseEntry(
+            identity=SegmentIdentity(document.document_id, source.local_segment_id),
+            source_presence=source.source_presence,
+        )
+        for document in workspace.documents
+        for source in document.source_segments
+    )
+    return tuple(sorted(entries, key=_universe_entry_sort_key))
+
+
+def _workspace_universe_projection(
+    workspace: ProjectWorkspace,
+    *,
+    session_id: str,
+    revision: int,
+    composition_revision: int,
+) -> WorkspaceUniverseProjection:
+    entries = _workspace_universe_entries(workspace)
+    return WorkspaceUniverseProjection(
+        binding=WorkspaceUniverseBinding(
+            project_id=workspace.project_id,
+            workspace_session_id=session_id,
+            workspace_revision=revision,
+            workspace_composition_revision=composition_revision,
+            workspace_digest=workspace_content_digest_v1(workspace),
+            segment_universe_digest=workspace_segment_universe_digest_v1(
+                workspace.project_id,
+                entries,
+            ),
+        ),
+        entries=entries,
+    )
+
+
+def _published_workspace_transition_projection(
+    *,
+    operation_id: str,
+    previous_workspace: ProjectWorkspace,
+    current_workspace: ProjectWorkspace,
+    session_id: str,
+    previous_revision: int,
+    current_revision: int,
+    previous_composition_revision: int,
+    current_composition_revision: int,
+    source_changed_identities: tuple[SegmentIdentity, ...],
+) -> PublishedWorkspaceTransitionProjection:
+    previous = _workspace_universe_projection(
+        previous_workspace,
+        session_id=session_id,
+        revision=previous_revision,
+        composition_revision=previous_composition_revision,
+    )
+    current = _workspace_universe_projection(
+        current_workspace,
+        session_id=session_id,
+        revision=current_revision,
+        composition_revision=current_composition_revision,
+    )
+    changed = tuple(
+        sorted(
+            source_changed_identities,
+            key=lambda identity: _universe_entry_sort_key(
+                WorkspaceSegmentUniverseEntry(identity, SourcePresence.ATTACHED)
+            ),
+        )
+    )
+    digest = published_workspace_transition_digest_v1(
+        operation_id,
+        previous,
+        current,
+        changed,
+    )
+    return PublishedWorkspaceTransitionProjection(
+        operation_id=operation_id,
+        previous=previous,
+        current=current,
+        source_changed_identities=changed,
+        transition_digest=digest,
     )
 
 
@@ -993,8 +1296,11 @@ class ProjectWorkspaceService:
         "_binding",
         "_session_id",
         "_revision",
+        "_composition_revision",
         "_plans",
         "_prepared_reconciliations",
+        "_published_transition",
+        "_workspace_universe_cache",
     )
 
     def __init__(
@@ -1004,6 +1310,7 @@ class ProjectWorkspaceService:
         *,
         session_id: str,
         revision: int,
+        composition_revision: int = 0,
     ) -> None:
         if type(current) is not ProjectWorkspace:
             _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
@@ -1013,11 +1320,17 @@ class ProjectWorkspaceService:
         self._binding = binding
         self._session_id = _validate_session_id(session_id)
         self._revision = _validate_revision(revision)
+        self._composition_revision = _validate_revision(composition_revision)
         self._plans: dict[str, _ReconciliationPlan] = {}
         self._prepared_reconciliations: dict[
             str,
             _PreparedReconciliation,
         ] = {}
+        self._published_transition: tuple[
+            ReconciliationReceipt,
+            PublishedWorkspaceTransitionProjection,
+        ] | None = None
+        self._workspace_universe_cache: WorkspaceUniverseProjection | None = None
 
     @property
     def workspace(self) -> ProjectWorkspace:
@@ -1034,6 +1347,12 @@ class ProjectWorkspaceService:
     @property
     def revision(self) -> int:
         return self._revision
+
+    @property
+    def composition_revision(self) -> int:
+        """Live-session lineage that advances only on composition changes."""
+
+        return self._composition_revision
 
     @property
     def workspace_digest(self) -> str:
@@ -1169,9 +1488,113 @@ class ProjectWorkspaceService:
         self._workspace = candidate
         self._revision = resulting_revision
         if changed:
+            self._workspace_universe_cache = None
             self._plans.clear()
             self._prepared_reconciliations.clear()
         return receipt
+
+    def published_workspace_transition(
+        self,
+        receipt: ReconciliationReceipt,
+    ) -> PublishedWorkspaceTransitionProjection:
+        """Return the exact transition emitted by this service publication.
+
+        A public reconciliation preview is deliberately not accepted here.
+        The projection remains retrievable only while its published workspace
+        is this service's current state; cold consumers carry the projection
+        itself and revalidate it against a freshly opened service.
+        """
+
+        if type(receipt) is not ReconciliationReceipt:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        published = self._published_transition
+        if published is None or published[0] != receipt:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        return self.validate_published_workspace_transition(published[1])
+
+    def validate_published_workspace_transition(
+        self,
+        projection: PublishedWorkspaceTransitionProjection,
+    ) -> PublishedWorkspaceTransitionProjection:
+        """Revalidate this owner's exact published transition against live state.
+
+        A recomputable digest proves structural integrity, not issuance.  A
+        freshly opened service therefore cannot promote an arbitrary carried
+        DTO to owner authority.  Cold resumption belongs to a downstream
+        durable rebase intent captured while this exact owner was live.
+        """
+
+        if type(projection) is not PublishedWorkspaceTransitionProjection:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        registered = self._published_transition
+        if registered is None or registered[1] is not projection:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        try:
+            projection.__post_init__()
+            live = _workspace_universe_projection(
+                self._workspace,
+                session_id=self._session_id,
+                revision=self._revision,
+                composition_revision=self._composition_revision,
+            )
+        except ProjectWorkspaceError:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        published = projection.current
+        if (
+            published.binding.project_id != live.binding.project_id
+            or published.binding.workspace_session_id
+            != live.binding.workspace_session_id
+            or published.binding.workspace_composition_revision
+            != live.binding.workspace_composition_revision
+            or published.binding.segment_universe_digest
+            != live.binding.segment_universe_digest
+            or published.entries != live.entries
+            or (
+                published.binding.workspace_revision == self._revision
+                and published.binding.workspace_digest != live.binding.workspace_digest
+            )
+        ):
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        return projection
+
+    def capture_workspace_universe(self) -> WorkspaceUniverseProjection:
+        """Issue the exact current body-free Workspace universe.
+
+        This additive handoff lets downstream reference domains bind to the
+        live Workspace owner without reading ProjectPackage or editor-private
+        state.  Content bodies remain behind the Workspace service.
+        """
+
+        cached = self._workspace_universe_cache
+        if cached is not None:
+            return cached
+        issued = _workspace_universe_projection(
+            self._workspace,
+            session_id=self._session_id,
+            revision=self._revision,
+            composition_revision=self._composition_revision,
+        )
+        self._workspace_universe_cache = issued
+        return issued
+
+    def validate_workspace_universe(
+        self,
+        projection: WorkspaceUniverseProjection,
+    ) -> WorkspaceUniverseProjection:
+        """Revalidate one current-universe projection against this owner."""
+
+        if type(projection) is not WorkspaceUniverseProjection:
+            _fail("PROJECT.WORKSPACE.SESSION_STALE")
+        if projection is self._workspace_universe_cache:
+            return projection
+        try:
+            projection.__post_init__()
+            live = self.capture_workspace_universe()
+        except ProjectWorkspaceError:
+            _fail("PROJECT.WORKSPACE.SESSION_STALE")
+        if projection != live:
+            _fail("PROJECT.WORKSPACE.SESSION_STALE")
+        return projection
 
     def stage_reconciliation(
         self,
@@ -1400,7 +1823,7 @@ class ProjectWorkspaceService:
         )
         if type(plan.incoming_binding) is not OriginBinding:
             _fail("PROJECT.RECONCILE.PREVIEW_STALE")
-        candidate, receipt = self._prepare_staged_plan(
+        candidate, receipt, transition = self._prepare_staged_plan(
             plan,
             decisions=decisions,
             published_binding=plan.incoming_binding,
@@ -1410,6 +1833,7 @@ class ProjectWorkspaceService:
             plan.incoming_binding,
             session_id=self._session_id,
             revision=receipt.published_revision,
+            composition_revision=self._composition_revision + 1,
         )
         token = PreparedReconciliationToken(plan.operation_id)
         prepared = _PreparedReconciliation(
@@ -1417,6 +1841,7 @@ class ProjectWorkspaceService:
             plan=plan,
             candidate_service=candidate_service,
             receipt=receipt,
+            transition=transition,
         )
         if self._plans.get(operation_id) is not plan:
             _fail("PROJECT.RECONCILE.PREVIEW_STALE")
@@ -1460,6 +1885,9 @@ class ProjectWorkspaceService:
         self._workspace = candidate_service.workspace
         self._binding = candidate_service.origin_binding
         self._revision = candidate_service.revision
+        self._composition_revision = candidate_service.composition_revision
+        self._workspace_universe_cache = None
+        self._published_transition = (receipt, prepared.transition)
         return receipt
 
     def discard_prepared_reconciliation(
@@ -1566,6 +1994,8 @@ class ProjectWorkspaceService:
             type(candidate_service) is not ProjectWorkspaceService
             or candidate_service.session_id != self._session_id
             or candidate_service.revision != receipt.published_revision
+            or candidate_service.composition_revision
+            != self._composition_revision + 1
             or candidate_service.origin_binding != prepared.plan.incoming_binding
             or candidate_service.workspace_content_digest
             != receipt.published_workspace_digest
@@ -1599,7 +2029,7 @@ class ProjectWorkspaceService:
         decisions: tuple[ReconciliationDecision, ...],
         published_binding: OriginBinding | None,
     ) -> ReconciliationReceipt:
-        candidate, receipt = self._prepare_staged_plan(
+        candidate, receipt, transition = self._prepare_staged_plan(
             plan,
             decisions=decisions,
             published_binding=published_binding,
@@ -1607,6 +2037,9 @@ class ProjectWorkspaceService:
         self._workspace = candidate
         self._binding = published_binding
         self._revision = receipt.published_revision
+        self._composition_revision += 1
+        self._workspace_universe_cache = None
+        self._published_transition = (receipt, transition)
         return receipt
 
     def _prepare_staged_plan(
@@ -1615,7 +2048,11 @@ class ProjectWorkspaceService:
         *,
         decisions: tuple[ReconciliationDecision, ...],
         published_binding: OriginBinding | None,
-    ) -> tuple[ProjectWorkspace, ReconciliationReceipt]:
+    ) -> tuple[
+        ProjectWorkspace,
+        ReconciliationReceipt,
+        PublishedWorkspaceTransitionProjection,
+    ]:
         decision_values = _exact_tuple(
             decisions,
             code="PROJECT.RECONCILE.INPUT_INVALID",
@@ -1710,7 +2147,18 @@ class ProjectWorkspaceService:
             and published_binding is not None
         ):
             _require_binding_matches_workspace(candidate, published_binding)
-        return candidate, receipt
+        transition = _published_workspace_transition_projection(
+            operation_id=plan.operation_id,
+            previous_workspace=self._workspace,
+            current_workspace=candidate,
+            session_id=self._session_id,
+            previous_revision=self._revision,
+            current_revision=receipt.published_revision,
+            previous_composition_revision=self._composition_revision,
+            current_composition_revision=self._composition_revision + 1,
+            source_changed_identities=plan.source_changed_identities,
+        )
+        return candidate, receipt, transition
 
     def _build_candidate(
         self,
@@ -1874,6 +2322,7 @@ __all__ = (
     "PreparedReconciliationToken",
     "ProjectProgress",
     "ProjectWorkspaceService",
+    "PublishedWorkspaceTransitionProjection",
     "ReconciliationAssociation",
     "ReconciliationCategory",
     "ReconciliationDecision",
@@ -1883,9 +2332,14 @@ __all__ = (
     "WorkspaceEditReceipt",
     "WorkspaceDocumentView",
     "WorkspaceSaveState",
+    "WorkspaceSegmentUniverseEntry",
     "WorkspaceSegmentView",
     "WorkspaceSessionView",
+    "WorkspaceUniverseBinding",
+    "WorkspaceUniverseProjection",
     "project_document_content_digest_v1",
+    "published_workspace_transition_digest_v1",
     "workspace_content_digest_v1",
     "workspace_manifest_digest_v1",
+    "workspace_segment_universe_digest_v1",
 )

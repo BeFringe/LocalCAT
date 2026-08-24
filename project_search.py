@@ -111,6 +111,59 @@ class ProjectSearchService:
         )
         return self._search_entries(entries, request)
 
+    def search_workspace_selection(
+        self,
+        workspace_service: ProjectWorkspaceService,
+        request: WorkspaceSearchRequest,
+        *,
+        members: tuple[object, ...],
+    ) -> WorkspaceSearchReport:
+        """Search only an exact composite-identity selection in Workspace order.
+
+        The selection is intentionally chunk-neutral.  Downstream reference
+        domains own issuance; this service only verifies membership against the
+        live Workspace graph before entering the existing matcher pipeline.
+        """
+
+        if type(workspace_service) is not ProjectWorkspaceService:
+            raise TypeError("workspace_service must be exact ProjectWorkspaceService")
+        if type(request) is not WorkspaceSearchRequest:
+            raise TypeError("request must be exact WorkspaceSearchRequest")
+        request.__post_init__()
+        flat_segments = workspace_service.flat_segments
+        if not flat_segments:
+            raise ProjectSearchError("PROJECT_SEARCH.SELECTION_STALE")
+        identity_type = type(flat_segments[0].identity)
+        if type(members) is not tuple or any(
+            type(member) is not identity_type for member in members
+        ):
+            raise TypeError("workspace selection members must be exact identities")
+        for member in members:
+            member.__post_init__()
+        if len(members) != len(set(members)):
+            raise ProjectSearchError("PROJECT_SEARCH.SELECTION_INVALID")
+        selected = set(members)
+        live = {
+            flat.identity
+            for flat in flat_segments
+        }
+        if not selected.issubset(live):
+            raise ProjectSearchError("PROJECT_SEARCH.SELECTION_STALE")
+        entries = tuple(
+            (
+                flat.document_id,
+                flat.identity.local_segment_id,
+                flat.project_global_index,
+                flat.segment,
+            )
+            for flat in flat_segments
+            if flat.identity in selected
+        )
+        report = self._search_entries(entries, request)
+        if type(report) is not WorkspaceSearchReport:
+            raise TypeError("workspace selection search returned wrong report")
+        return report
+
     def _search_entries(
         self,
         entries: tuple[

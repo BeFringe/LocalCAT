@@ -130,7 +130,7 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 - [x] `multi-document-project-workspace` -- Project/Document/Segment、章节导航、稳定复合 ID、ProjectPackage 事务、多文档保存/恢复报告与 final current-source evidence。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [ ] `language-resource-portability` -- TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/receipt 与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
 - [ ] `tmx-context-interchange` -- ResourcePackage 未来可增加的 TMX export profile、context/provenance 与有损取舍；不拥有 ResourcePackage container/apply authority。Dependencies: `tm-storage-retrieval-index`, `language-resource-portability`
-- [ ] `collaborative-job-chunks` -- 在不改变 Document 身份的前提下按稳定 segment 集合划分、合并和分配协作 chunk。Dependencies: `multi-document-project-workspace`
+- [x] `collaborative-job-chunks` -- 已在不改变 Document 身份的前提下落地 exact segment membership、动态拆分/合并、单 assignee、Controller 权限、progress/rebase、namespaced metadata 与 Project 菜单分工切面。Dependencies: `multi-document-project-workspace`
 - [ ] `cross-device-sync-plugin` -- 本地优先的可选同步插件边界、远程 provider、冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`
 - [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；目录多文件项目另依赖 workspace，产品排期在同步之后。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `cross-device-sync-plugin`
 - [ ] `xliff-project-codec` -- XLIFF 2.x Core 最小项目 codec。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`
@@ -141,8 +141,8 @@ Parser 重新基线已经完成；常见多文档输入仍是同一项目中的�
 - **特殊多 Sheet XLSX**：单个 workbook 可作为复合 origin，由每个受支持 Sheet 对应一章 / Document。`File_ID` 是候选稳定身份，Sheet 名只作显示。2026-08-20 复核的 `CAT_Working_File.xlsx` 样本有 33 个 Sheet、17,221 条数据行，全部使用 `File_ID/Location/Speaker/Source_Text/Target_Text` 五列；它是 RPY 工作任务表参考，不改变术语表仅消费前两列的现行合同。
 - **RPY plugin / folder**：单个 translation script 的 tokenization、段落映射、token/sidecar、占位符保护与可选回填/导出属于独立 `rpy-project-codec` plugin/ACL，只依赖 Parser Foundation 的格式中立端口；LocalCAT Core 不解释 RPY token、不直接写 `.rpy`。当多个 script 组成 folder project 时，每个 script 才作为 Document 接入 multi-document workspace。
 - **XLIFF**：通过真实 fixture、inline-code 和 Writer capability gate 后实施。
-- **多文档 UI（已落地）**：Document 按导入/manifest 顺序连续导航，顶栏文件夹菜单只以文件图标+名称列出文档，编辑和浏览/校对使用带文件图标的跨列标题投影文档边界，浏览行、当前文档和菜单选中态同步。首页、项目主按钮、项目菜单唯一的本地打开命令和 `Ctrl+O` 按单选/Shift 多选分流，并接受文件直接拖放；不另列多文档入口，多选复用显式选择确认流且不扫描目录或相邻文件。ProjectPackage 打开/导入仍属“项目”菜单。项目搜索提供“当前章节 / 搜索全部章节”，内部的可扩展 `SearchScope` 仍不把未实现 chunk 当成章节身份。
-- **协作 chunk**：可按稳定 segment 集合或连续范围跨文档任意划分、合并和分配；它是协作视图，不改变 Project/Document/Segment 的规范身份。
+- **多文档 UI（已落地）**：Document 按导入/manifest 顺序连续导航，顶栏文件夹菜单只以文件图标+名称列出文档，编辑和浏览/校对使用带文件图标的跨列标题投影文档边界，浏览行、当前文档和菜单选中态同步。首页、项目主按钮、项目菜单唯一的本地打开命令和 `Ctrl+O` 按单选/Shift 多选分流，并接受文件直接拖放；不另列多文档入口，多选复用显式选择确认流且不扫描目录或相邻文件。ProjectPackage 打开/导入仍属“项目”菜单。无 active Chunk plan 时项目搜索保持“当前章节 / 搜索全部章节”；激活当前分工后增加“当前分工”范围，仍不把 Chunk 重命名为章节。
+- **协作 chunk（已落地）**：可按稳定 exact segment 集合跨文档划分、合并和分配；它是从 Project 菜单选择的协作切面，编辑、浏览/校对与文档文件夹共用同一 membership，不改变 Project/Document/Segment 规范身份。直接拆分按整项目或源分工动态均分；起点/终点和离散选段只在管理器高级操作中生效。
 - **跨端同步**：独立可选插件，只同步经批准的项目包/资源及 chunk metadata；不把远程副本变成项目权威，也不把文件同步冒充实时协作。
 
 ## Merge Contract

@@ -129,6 +129,8 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "backend_scaling_gate",
         "backend_throughput_harness",
         "capability_host",
+        "collaborative_chunk_contracts",
+        "collaborative_chunk_store",
         "deterministic_workload",
         "editor_contracts",
         "editor_controller",

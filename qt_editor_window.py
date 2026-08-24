@@ -5,13 +5,14 @@ from __future__ import annotations
 import html
 import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import (
     QMimeData,
     QObject,
     QEvent,
+    QItemSelectionModel,
     QPoint,
     QPointF,
     QRect,
@@ -110,6 +111,15 @@ from editor_contracts import (
     WorkspaceMode,
 )
 from editor_controller import EditorController, EditorControllerError
+from chunk_controller_contracts import (
+    ChunkApplicationMode,
+    ChunkApplicationProjectView,
+    ChunkApplicationSegmentSelectionRequest,
+    CollaborativeSearchScopeV2,
+    CollaborativeWorkspaceSearchHitV2,
+    CollaborativeWorkspaceSearchReportV2,
+    CollaborativeWorkspaceSearchRequestV2,
+)
 from qt_browse_group_dialog import (
     BrowseGroupPreview,
     BrowseGroupTurnBar,
@@ -809,10 +819,33 @@ def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> s
     )
 
 
+@dataclass(slots=True)
+class _ChunkSegmentSelectionSession:
+    manager: object
+    request: ChunkApplicationSegmentSelectionRequest
+    previous_mode: WorkspaceMode
+    previous_identity: object
+    previous_chunk_id: str | None
+    previous_search_state: tuple[object, ...]
+    enabled_widgets: tuple[tuple[QWidget, bool], ...]
+    enabled_shortcuts: tuple[tuple[object, bool], ...]
+    browse_hint_text: str
+    browse_group_button_visible: bool
+    browse_group_turn_bar_visible: bool
+    range_start_row: int | None = None
+    range_end_row: int | None = None
+    selection_anchor_row: int | None = None
+
+
 class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
-    def __init__(self, controller: EditorController) -> None:
+    def __init__(
+        self,
+        controller: EditorController,
+        *,
+        chunk_controller: object | None = None,
+    ) -> None:
         super().__init__()
         # The UI is assembled by small builder methods.  Keep the resulting
         # widget contract explicit here so static analysis sees the same
@@ -857,6 +890,7 @@ class QtEditorWindow(QMainWindow):
         self.chapter_progress_label: QLabel
         self.workspace_save_feedback: QLabel
         self.workspace_browse_save_feedback: QLabel
+        self.browse_hint: QLabel
         self.segment_density_combo: QComboBox
         self.unconfirmed_filter: QCheckBox
         self.segment_list: QListWidget
@@ -877,9 +911,20 @@ class QtEditorWindow(QMainWindow):
         self.project_search_capability: QLabel
         self.project_search_result: QLabel
         self.project_search_preview: QLabel
+        self.chunk_scope_menu: QMenu
+        self.chunk_manage_action: QAction
         self.browse_table: QTableWidget
         self.browse_group_button: QPushButton
         self.browse_group_turn_bar: BrowseGroupTurnBar
+        self.chunk_segment_selection_bar: QFrame
+        self.chunk_segment_selection_title: QLabel
+        self.chunk_segment_selection_status: QLabel
+        self.chunk_segment_range_start: QPushButton
+        self.chunk_segment_range_end: QPushButton
+        self.chunk_segment_bulk_select: QPushButton
+        self.chunk_segment_clear: QPushButton
+        self.chunk_segment_cancel: QPushButton
+        self.chunk_segment_done: QPushButton
         self.segment_position_label: QLabel
         self.speaker_display: QLabel
         self.source_display: QTextBrowser
@@ -903,6 +948,15 @@ class QtEditorWindow(QMainWindow):
         self.term_container: QWidget
         self.term_cards_layout: QVBoxLayout
         self.controller = controller
+        self.chunk_controller = chunk_controller
+        self._chunk_view: ChunkApplicationProjectView | None = None
+        self._chunk_view_error_code: str | None = None
+        self._chunk_scope_cache_key: tuple[str, int, str] | None = None
+        self._chunk_identity_keys_cache: set[tuple[str, str]] | None = None
+        self._chunk_manager_dialog: object | None = None
+        self._chunk_segment_selection_session: (
+            _ChunkSegmentSelectionSession | None
+        ) = None
         self._refreshing = False
         self._display_preferences: DisplayPreferences = controller.display_preferences()
         self.segment_density = self._display_preferences.segment_density
@@ -917,9 +971,14 @@ class QtEditorWindow(QMainWindow):
         self.current_suggestions = SuggestionBundle()
         self.current_tm_report: TMSuggestionReport | None = None
         self.current_project_search_report: (
-            ProjectSearchReport | WorkspaceSearchReport | None
+            ProjectSearchReport
+            | WorkspaceSearchReport
+            | CollaborativeWorkspaceSearchReportV2
+            | None
         ) = None
-        self.current_workspace_search_report: WorkspaceSearchReport | None = None
+        self.current_workspace_search_report: (
+            WorkspaceSearchReport | CollaborativeWorkspaceSearchReportV2 | None
+        ) = None
         self._workspace_package_import_preview: object | None = None
         self._workspace_package_import_source: tuple[Path, Path | None] | None = None
         self._workspace_package_preview_text = "尚未预览导入包。"
@@ -966,6 +1025,24 @@ class QtEditorWindow(QMainWindow):
             self._render_project()
         else:
             self._show_empty_state()
+
+    def install_chunk_controller(self, chunk_controller: object) -> None:
+        """Install the optional collaboration façade after shell construction."""
+
+        if chunk_controller is None:
+            raise TypeError("chunk controller must not be None")
+        if self.chunk_controller is not None and self.chunk_controller is not chunk_controller:
+            raise RuntimeError("chunk controller is already installed")
+        if self.chunk_controller is chunk_controller:
+            return
+        self.chunk_controller = chunk_controller
+        if self.controller.has_active_project:
+            self._refreshing = True
+            try:
+                self._refresh_chunk_view()
+                self._render_current_segment(reset_target_history=False)
+            finally:
+                self._refreshing = False
 
     def _build_ui(self) -> None:
         shell = QWidget()
@@ -1129,6 +1206,19 @@ class QtEditorWindow(QMainWindow):
         self.recent_projects_menu = self.project_menu.addMenu("最近项目")
         self.recent_projects_menu.setObjectName("recentProjectsMenu")
         configure_menu(self.recent_projects_menu)
+        self.project_menu.addSeparator()
+        self.chunk_scope_menu = self.project_menu.addMenu("当前分工")
+        self.chunk_scope_menu.setObjectName("chunkScopeMenu")
+        configure_menu(self.chunk_scope_menu)
+        self.chunk_scope_menu.aboutToShow.connect(
+            self._populate_chunk_scope_menu
+        )
+        self.chunk_manage_action = self.project_menu.addAction("协作分工管理")
+        self.chunk_manage_action.setObjectName("chunkManageProjectAction")
+        self.chunk_manage_action.setEnabled(False)
+        self.chunk_manage_action.setToolTip(
+            "创建、拆分、合并或调整当前项目的协作分工"
+        )
         self.project_menu.addSeparator()
         self.speaker_inventory_action = self.project_menu.addAction(
             "Raw speaker 盘点"
@@ -1502,11 +1592,11 @@ class QtEditorWindow(QMainWindow):
         header = QHBoxLayout()
         title = QLabel("浏览 / 校对")
         title.setObjectName("panelTitle")
-        hint = QLabel("双语全文只读浏览 · 双击任一行返回同段编辑")
-        hint.setObjectName("browseHint")
+        self.browse_hint = QLabel("双语全文只读浏览 · 双击任一行返回同段编辑")
+        self.browse_hint.setObjectName("browseHint")
         header.addWidget(title)
         header.addSpacing(10)
-        header.addWidget(hint)
+        header.addWidget(self.browse_hint)
         header.addStretch()
         self.browse_group_button = QPushButton("分组轮次")
         self.browse_group_button.setObjectName("browseGroupNavigatorButton")
@@ -1531,6 +1621,70 @@ class QtEditorWindow(QMainWindow):
         self.workspace_browse_save_feedback.setVisible(False)
         layout.addWidget(self.workspace_browse_save_feedback)
 
+        self.chunk_segment_selection_bar = QFrame()
+        self.chunk_segment_selection_bar.setObjectName(
+            "chunkSegmentSelectionBar"
+        )
+        self.chunk_segment_selection_bar.setAccessibleName(
+            "高级分工段落选择"
+        )
+        selection_layout = QVBoxLayout(self.chunk_segment_selection_bar)
+        selection_layout.setContentsMargins(14, 10, 14, 10)
+        selection_layout.setSpacing(8)
+        selection_heading = QHBoxLayout()
+        self.chunk_segment_selection_title = QLabel("选择分工段落")
+        self.chunk_segment_selection_title.setObjectName(
+            "chunkSegmentSelectionTitle"
+        )
+        self.chunk_segment_selection_status = QLabel("未选择段落")
+        self.chunk_segment_selection_status.setObjectName(
+            "chunkSegmentSelectionStatus"
+        )
+        self.chunk_segment_selection_status.setWordWrap(True)
+        selection_heading.addWidget(self.chunk_segment_selection_title)
+        selection_heading.addSpacing(12)
+        selection_heading.addWidget(self.chunk_segment_selection_status, 1)
+        selection_layout.addLayout(selection_heading)
+        selection_actions = QHBoxLayout()
+        self.chunk_segment_range_start = QPushButton("设为起点")
+        self.chunk_segment_range_start.setObjectName("chunkBrowseRangeStart")
+        self.chunk_segment_range_start.setAccessibleName(
+            "将当前浏览段落设为选择起点"
+        )
+        self.chunk_segment_range_end = QPushButton("设为终点")
+        self.chunk_segment_range_end.setObjectName("chunkBrowseRangeEnd")
+        self.chunk_segment_range_end.setAccessibleName(
+            "将当前浏览段落设为选择终点"
+        )
+        self.chunk_segment_bulk_select = QPushButton("选择全部尚未分工")
+        self.chunk_segment_bulk_select.setObjectName("chunkBrowseBulkSelect")
+        self.chunk_segment_bulk_select.setAccessibleName(
+            "选择全部尚未归入分工的段落"
+        )
+        self.chunk_segment_bulk_select.setToolTip(
+            "选择尚未归入任何分工、且仍存在于当前项目的段落；"
+            "与未翻译或未确认状态无关"
+        )
+        self.chunk_segment_clear = QPushButton("清除")
+        self.chunk_segment_clear.setObjectName("chunkBrowseSelectionClear")
+        self.chunk_segment_clear.setAccessibleName("清除高级分工段落选择")
+        self.chunk_segment_cancel = QPushButton("取消")
+        self.chunk_segment_cancel.setObjectName("chunkBrowseSelectionCancel")
+        self.chunk_segment_cancel.setAccessibleName("取消高级分工段落选择")
+        self.chunk_segment_done = QPushButton("使用所选段落")
+        self.chunk_segment_done.setObjectName("chunkBrowseSelectionDone")
+        self.chunk_segment_done.setAccessibleName("返回所选高级分工段落")
+        selection_actions.addWidget(self.chunk_segment_range_start)
+        selection_actions.addWidget(self.chunk_segment_range_end)
+        selection_actions.addWidget(self.chunk_segment_bulk_select)
+        selection_actions.addWidget(self.chunk_segment_clear)
+        selection_actions.addStretch(1)
+        selection_actions.addWidget(self.chunk_segment_cancel)
+        selection_actions.addWidget(self.chunk_segment_done)
+        selection_layout.addLayout(selection_actions)
+        self.chunk_segment_selection_bar.hide()
+        layout.addWidget(self.chunk_segment_selection_bar)
+
         self.browse_table = QTableWidget(0, 5)
         self.browse_table.setObjectName("browseTable")
         self.browse_table.setHorizontalHeaderLabels(
@@ -1548,6 +1702,7 @@ class QtEditorWindow(QMainWindow):
         self.browse_table.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.browse_table.viewport().installEventFilter(self)
         self.browse_table.verticalHeader().setVisible(False)
         browse_header = self.browse_table.horizontalHeader()
         browse_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -1736,6 +1891,15 @@ class QtEditorWindow(QMainWindow):
         self.workspace_documents_menu.triggered.connect(
             self._workspace_document_action_triggered
         )
+        self.chunk_scope_menu.triggered.connect(
+            self._chunk_scope_action_triggered
+        )
+        self.chunk_manage_action.triggered.connect(
+            self._open_chunk_manager
+        )
+        self.project_menu.aboutToShow.connect(
+            self._refresh_project_chunk_menu
+        )
         self.speaker_inventory_action.triggered.connect(
             self._open_speaker_inventory_dialog
         )
@@ -1771,6 +1935,27 @@ class QtEditorWindow(QMainWindow):
         self.browse_table.cellDoubleClicked.connect(self._activate_browse_row)
         self.browse_table.currentCellChanged.connect(
             self._browse_current_cell_changed
+        )
+        self.browse_table.itemSelectionChanged.connect(
+            self._chunk_segment_browse_selection_changed
+        )
+        self.chunk_segment_range_start.clicked.connect(
+            lambda: self._set_chunk_segment_range_endpoint("start")
+        )
+        self.chunk_segment_range_end.clicked.connect(
+            lambda: self._set_chunk_segment_range_endpoint("end")
+        )
+        self.chunk_segment_bulk_select.clicked.connect(
+            self._select_chunk_segment_bulk_scope
+        )
+        self.chunk_segment_clear.clicked.connect(
+            self._clear_chunk_segment_browse_selection
+        )
+        self.chunk_segment_cancel.clicked.connect(
+            lambda: self._finish_chunk_segment_selection(False)
+        )
+        self.chunk_segment_done.clicked.connect(
+            lambda: self._finish_chunk_segment_selection(True)
         )
         self.project_search_input.returnPressed.connect(
             self._submit_project_search
@@ -2000,6 +2185,8 @@ class QtEditorWindow(QMainWindow):
             self.project_search_input.selectAll()
 
     def _project_search_criteria_changed(self, _value: object) -> None:
+        if self._chunk_segment_selection_session is not None:
+            return
         if self._refreshing:
             return
         if self.current_project_search_report is None:
@@ -2013,6 +2200,8 @@ class QtEditorWindow(QMainWindow):
         )
 
     def _clear_project_search(self) -> None:
+        if self._chunk_segment_selection_session is not None:
+            return
         if self.controller.has_workspace:
             self.controller.clear_workspace_search()
         else:
@@ -2070,7 +2259,45 @@ class QtEditorWindow(QMainWindow):
                 self.target_editor_shortcuts[object_name] = shortcut
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        """Handle Ctrl+wheel only for the two editor viewports."""
+        """Handle editor zoom and deterministic Browse/Review range selection."""
+
+        session = self._chunk_segment_selection_session
+        if (
+            session is not None
+            and watched is self.browse_table.viewport()
+            and event.type() is QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            index = self.browse_table.indexAt(event.position().toPoint())
+            if index.isValid() and self._chunk_segment_identity_for_row(
+                index.row()
+            ) is not None:
+                row = index.row()
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    anchor = session.selection_anchor_row
+                    if anchor is None:
+                        current = self.browse_table.currentRow()
+                        anchor = row if current < 0 else current
+                    first, last = sorted((anchor, row))
+                    selection = self.browse_table.selectionModel()
+                    selection.clearSelection()
+                    flags = (
+                        QItemSelectionModel.SelectionFlag.Select
+                        | QItemSelectionModel.SelectionFlag.Rows
+                    )
+                    for candidate in range(first, last + 1):
+                        if self._chunk_segment_identity_for_row(candidate) is None:
+                            continue
+                        selection.select(
+                            self.browse_table.model().index(candidate, 0),
+                            flags,
+                        )
+                    selection.setCurrentIndex(
+                        self.browse_table.model().index(row, 0),
+                        QItemSelectionModel.SelectionFlag.NoUpdate,
+                    )
+                    return True
+                session.selection_anchor_row = row
 
         editor_viewports = (
             self.source_display.viewport(),
@@ -2238,6 +2465,13 @@ class QtEditorWindow(QMainWindow):
         self.workspace_save_feedback.setVisible(False)
         self.workspace_browse_save_feedback.setVisible(False)
         self.project_search_scope.setVisible(False)
+        self._chunk_view = None
+        self._chunk_view_error_code = None
+        self._chunk_scope_cache_key = None
+        self._chunk_identity_keys_cache = None
+        self.chunk_scope_menu.clear()
+        self.chunk_scope_menu.setEnabled(False)
+        self.chunk_manage_action.setEnabled(False)
         self.workspace_documents_button.setEnabled(False)
         self.workspace_documents_menu.clear()
         self._refresh_browse_group_button()
@@ -2933,10 +3167,10 @@ class QtEditorWindow(QMainWindow):
             self.project_name_label.setText(self._active_project_name())
             self.language_label.setText(f"{source_locale}  →  {target_locale}")
             self.segment_count_label.setText(str(len(self._active_segments())))
-            self._refresh_workspace_documents_menu()
+            self._refresh_chunk_view()
             self.project_search_scope.setVisible(self.controller.has_workspace)
             self._populate_segment_list()
-            self._render_current_segment()
+            self._render_current_segment(refresh_chunk_view=False)
         finally:
             self._refreshing = False
         self.set_workspace_mode(self.workspace_mode, persist=False)
@@ -2954,6 +3188,12 @@ class QtEditorWindow(QMainWindow):
         view = self.controller.workspace_view
         current = self.controller.current_workspace_identity.document
         dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
+        chunk_keys = self._current_chunk_identity_keys()
+        chunk_document_ids = (
+            None
+            if chunk_keys is None
+            else {document_id for document_id, _segment_id in chunk_keys}
+        )
         file_icon = _localcat_document_icon()
         display_name_counts = {
             document.display_name: sum(
@@ -2963,6 +3203,11 @@ class QtEditorWindow(QMainWindow):
             for document in view.documents
         }
         for document in view.documents:
+            if (
+                chunk_document_ids is not None
+                and document.identity.document_id not in chunk_document_ids
+            ):
+                continue
             dirty = (
                 " · 未保存"
                 if document.identity.document_id in dirty_ids
@@ -2993,8 +3238,834 @@ class QtEditorWindow(QMainWindow):
         self.workspace_save_feedback.setVisible(True)
         self.workspace_browse_save_feedback.setVisible(True)
 
+    @staticmethod
+    def _chunk_access_text(access: str, safe_code: str | None = None) -> str:
+        labels = {
+            "legacy_editable_no_plan": "个人编辑模式",
+            "editable_assigned_current": "当前分工可编辑",
+            "read_only_no_current_chunk": "请选择当前分工",
+            "read_only_unallocated": "未分配 · 只读",
+            "read_only_outside_current": "当前分工外 · 只读",
+            "read_only_not_assignee": "分配给其他身份 · 只读",
+            "read_only_detached": "已分离 · 只读",
+            "read_only_stale": "计划已过期 · 只读",
+        }
+        return labels.get(access, f"协作状态不可用 · {safe_code or access}")
+
+    def _refresh_chunk_view(self) -> None:
+        """Refresh the frozen Chunk product view without reading its owners."""
+
+        available = (
+            self.controller.has_workspace and self.chunk_controller is not None
+        )
+        self.chunk_scope_menu.setEnabled(available)
+        if not available:
+            self._chunk_view = None
+            self._chunk_view_error_code = None
+            self._chunk_scope_cache_key = None
+            self._chunk_identity_keys_cache = None
+            if self._has_active_project():
+                self.segment_count_label.setText(str(len(self._active_segments())))
+            self.chunk_manage_action.setEnabled(False)
+            self.segment_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._apply_chunk_access_to_editor()
+            return
+        try:
+            view = self.chunk_controller.project_view()
+        except Exception as exc:
+            self._chunk_view = None
+            self.segment_count_label.setText(str(len(self._active_segments())))
+            code = str(getattr(exc, "code", "CHUNK.RECOVERY_REQUIRED"))
+            self._chunk_view_error_code = code
+            self._chunk_scope_cache_key = None
+            self._chunk_identity_keys_cache = None
+            self.chunk_manage_action.setEnabled(False)
+            self.segment_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._apply_chunk_access_to_editor()
+            return
+        if type(view) is not ChunkApplicationProjectView:
+            raise TypeError("chunk façade returned an invalid project view")
+        view.__post_init__()
+        self._chunk_view = view
+        self._chunk_view_error_code = None
+        if view.mode is ChunkApplicationMode.ACTIVE:
+            self.chunk_manage_action.setEnabled(True)
+            self.segment_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+        elif view.mode is ChunkApplicationMode.NO_PLAN:
+            self.chunk_manage_action.setEnabled(True)
+            self.segment_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+        else:
+            self.chunk_manage_action.setEnabled(
+                view.safe_code == "CHUNK.REBASE_REQUIRED"
+            )
+            self.segment_list.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+        self._refresh_chunk_identity_cache(view)
+        chunk_keys = self._current_chunk_identity_keys()
+        self.segment_count_label.setText(
+            str(len(self._active_segments()) if chunk_keys is None else len(chunk_keys))
+        )
+        self._refresh_chunk_search_scopes(view)
+        self._apply_chunk_access_to_editor()
+
+    def _populate_chunk_scope_menu(self) -> None:
+        """Build the project submenu only when the user opens it."""
+
+        self.chunk_scope_menu.clear()
+        if not (
+            self.controller.has_workspace and self.chunk_controller is not None
+        ):
+            placeholder = self.chunk_scope_menu.addAction("仅多文档项目可用")
+            placeholder.setEnabled(False)
+            return
+        view = self._chunk_view
+        if view is None:
+            code = self._chunk_view_error_code or "CHUNK.RECOVERY_REQUIRED"
+            placeholder = self.chunk_scope_menu.addAction(
+                f"分工状态不可用 · {code}"
+            )
+            placeholder.setEnabled(False)
+            return
+        if view.mode is ChunkApplicationMode.ACTIVE:
+            whole = self.chunk_scope_menu.addAction("全部章节（未选择分工）")
+            whole.setData(None)
+            whole.setCheckable(True)
+            whole.setChecked(view.current_chunk_id is None)
+            for chunk in view.chunks:
+                progress = chunk.progress
+                action = self.chunk_scope_menu.addAction(
+                    f"{chunk.name} · {progress.confirmed}/"
+                    f"{progress.attached_total} 已确认 · {chunk.member_count} 段"
+                )
+                action.setData(chunk.chunk_id)
+                action.setCheckable(True)
+                action.setChecked(chunk.chunk_id == view.current_chunk_id)
+                action.setToolTip(
+                    f"跨文档显示“{chunk.name}”的全部 exact members"
+                )
+            return
+        if view.mode is ChunkApplicationMode.NO_PLAN:
+            placeholder = self.chunk_scope_menu.addAction(
+                f"尚未建立分工 · {view.unallocated_count} 段"
+            )
+        else:
+            placeholder = self.chunk_scope_menu.addAction(
+                f"分工需处理 · {view.safe_code or 'CHUNK.PERMISSION_STALE'}"
+            )
+        placeholder.setEnabled(False)
+
+    def _refresh_project_chunk_menu(self) -> None:
+        """Refresh only after a cheap Chunk session-version comparison."""
+
+        if self.chunk_controller is not None and self.controller.has_workspace:
+            try:
+                session = self.chunk_controller.session_view
+            except Exception:
+                session = None
+            view = self._chunk_view
+            if session is None or view is None or (
+                view.project_id != session.project_id
+                or view.plan_revision != session.plan_revision
+                or view.current_chunk_id != session.current_chunk_id
+                or view.safe_code != session.safe_code
+            ):
+                self._refresh_chunk_view()
+        self._populate_chunk_scope_menu()
+
+    def _refresh_chunk_identity_cache(
+        self,
+        view: ChunkApplicationProjectView,
+    ) -> None:
+        if (
+            view.mode is not ChunkApplicationMode.ACTIVE
+            or view.chunk_plan_id is None
+            or view.plan_revision is None
+            or view.current_chunk_id is None
+            or self.chunk_controller is None
+        ):
+            self._chunk_scope_cache_key = None
+            self._chunk_identity_keys_cache = None
+            return
+        cache_key = (
+            view.chunk_plan_id,
+            view.plan_revision,
+            view.current_chunk_id,
+        )
+        if self._chunk_scope_cache_key == cache_key:
+            return
+        try:
+            choices = self.chunk_controller.segment_choices()
+        except Exception:
+            self._chunk_scope_cache_key = cache_key
+            self._chunk_identity_keys_cache = set()
+            return
+        self._chunk_scope_cache_key = cache_key
+        self._chunk_identity_keys_cache = {
+            (choice.identity.document_id, choice.identity.local_segment_id)
+            for choice in choices
+            if choice.chunk_id == view.current_chunk_id and choice.attached
+        }
+
+    def _current_chunk_identity_keys(self) -> set[tuple[str, str]] | None:
+        view = self._chunk_view
+        if (
+            view is None
+            or view.mode is not ChunkApplicationMode.ACTIVE
+            or view.current_chunk_id is None
+            or self.chunk_controller is None
+        ):
+            return None
+        return self._chunk_identity_keys_cache or set()
+
+    def _apply_chunk_access_to_editor(self) -> None:
+        view = self._chunk_view
+        if view is None:
+            editable = not (
+                self.controller.has_workspace and self.chunk_controller is not None
+            )
+            confirmable = editable
+            reason = "计划已过期 · 只读"
+        else:
+            editable = view.current_segment_access.may_edit_target
+            confirmable = view.current_segment_access.may_change_confirmed
+            reason = self._chunk_access_text(
+                view.current_segment_access.access,
+                (
+                    view.current_segment_access.safe_codes[0]
+                    if view.current_segment_access.safe_codes
+                    else view.safe_code
+                ),
+            )
+        self.target_editor.setReadOnly(not editable)
+        self.confirm_button.setEnabled(confirmable)
+        self.target_editor.setToolTip("" if editable else reason)
+        self.confirm_button.setToolTip(
+            (
+                "确认译文并前往下一未确认段 "
+                f"({self._native_shortcut_text(self.shortcuts['confirm'])})"
+            )
+            if confirmable
+            else reason
+        )
+
+    def _refresh_chunk_search_scopes(
+        self,
+        view: ChunkApplicationProjectView,
+    ) -> None:
+        previous = self.workspace_search_scope.currentData()
+        blocker = QSignalBlocker(self.workspace_search_scope)
+        self.workspace_search_scope.clear()
+        if view.mode is ChunkApplicationMode.ACTIVE:
+            entries = (
+                ("当前章节", CollaborativeSearchScopeV2.CURRENT_DOCUMENT),
+                ("当前分工", CollaborativeSearchScopeV2.CURRENT_CHUNK),
+                ("搜索全部章节", CollaborativeSearchScopeV2.ENTIRE_PROJECT),
+            )
+        else:
+            entries = (
+                ("当前章节", SearchScope.CURRENT_DOCUMENT),
+                ("搜索全部章节", SearchScope.ENTIRE_PROJECT),
+            )
+        for label, value in entries:
+            self.workspace_search_scope.addItem(label, value)
+        selected = next(
+            (
+                index
+                for index in range(self.workspace_search_scope.count())
+                if self.workspace_search_scope.itemData(index) == previous
+            ),
+            0,
+        )
+        self.workspace_search_scope.setCurrentIndex(selected)
+        del blocker
+
+    def _chunk_scope_action_triggered(self, action: QAction) -> None:
+        if (
+            self._refreshing
+            or self._chunk_view is None
+            or self._chunk_segment_selection_session is not None
+        ):
+            return
+        if self._chunk_view.mode is not ChunkApplicationMode.ACTIVE:
+            return
+        chunk_id = action.data()
+        try:
+            if chunk_id is None:
+                self.chunk_controller.clear_current_chunk()
+            else:
+                self.chunk_controller.select_current_chunk(str(chunk_id))
+                choices = self.chunk_controller.segment_choices()
+                selected = next(
+                    (
+                        choice.identity
+                        for choice in choices
+                        if choice.chunk_id == str(chunk_id)
+                    ),
+                    None,
+                )
+                if selected is not None:
+                    issued = next(
+                        (
+                            item.identity
+                            for item in self.controller.workspace_view.segments
+                            if item.identity.document.document_id
+                            == selected.document_id
+                            and item.identity.local_segment_id
+                            == selected.local_segment_id
+                        ),
+                        None,
+                    )
+                    if issued is not None:
+                        self.controller.go_to_workspace_segment(issued)
+        except Exception as exc:
+            self.statusBar().showMessage(
+                f"无法切换分工：{getattr(exc, 'code', exc)}",
+                7000,
+            )
+        self._refreshing = True
+        try:
+            self._refresh_chunk_view()
+            self._populate_segment_list()
+            self._render_current_segment(
+                reset_target_history=False,
+                refresh_chunk_view=False,
+            )
+            if self.workspace_mode is WorkspaceMode.BROWSE:
+                self._refresh_browse_table()
+        finally:
+            self._refreshing = False
+
+    def _open_chunk_manager(self) -> None:
+        if (
+            self.chunk_controller is None
+            or self._chunk_view is None
+            or self._chunk_segment_selection_session is not None
+        ):
+            return
+        existing = self._chunk_manager_dialog
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                self._chunk_manager_dialog = None
+        try:
+            from qt_chunk_manager_dialog import QtChunkManagerDialog
+
+            dialog = QtChunkManagerDialog(
+                self.chunk_controller,
+                self._chunk_view,
+                parent=self,
+            )
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self._chunk_manager_dialog = dialog
+            dialog.segmentSelectionRequested.connect(
+                self._begin_chunk_segment_selection
+            )
+            dialog.viewRefreshRequested.connect(
+                self._refresh_after_chunk_manager_change
+            )
+            dialog.finished.connect(
+                lambda _result, issued=dialog: self._chunk_manager_finished(
+                    issued
+                )
+            )
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as exc:
+            self._chunk_manager_dialog = None
+            self._show_error(
+                "无法管理分工",
+                str(getattr(exc, "code", exc)),
+            )
+
+    def _refresh_after_chunk_manager_change(self) -> None:
+        if not self._has_active_project():
+            return
+        self._refreshing = True
+        try:
+            self._refresh_chunk_view()
+            self._populate_segment_list()
+            self._render_current_segment(
+                reset_target_history=False,
+                refresh_chunk_view=False,
+            )
+            if self.workspace_mode is WorkspaceMode.BROWSE:
+                self._refresh_browse_table()
+        finally:
+            self._refreshing = False
+
+    def _chunk_manager_finished(self, dialog: object) -> None:
+        session = self._chunk_segment_selection_session
+        if session is not None and session.manager is dialog:
+            self._finish_chunk_segment_selection(False, restore_manager=False)
+        if self._chunk_manager_dialog is dialog:
+            self._chunk_manager_dialog = None
+        self._refresh_after_chunk_manager_change()
+        try:
+            dialog.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _capture_chunk_selection_search_state(self) -> tuple[object, ...]:
+        return (
+            self.project_search_input.text(),
+            self.project_search_status.currentData(),
+            self.workspace_search_scope.currentData(),
+            self.project_search_scope.currentData(),
+            self.project_search_source.isChecked(),
+            self.project_search_target.isChecked(),
+            self.project_search_speaker.isChecked(),
+            self.project_search_match_case.isChecked(),
+            self.project_search_whole_word.isChecked(),
+            self._project_search_expanded,
+        )
+
+    def _restore_chunk_selection_search_state(
+        self,
+        state: tuple[object, ...],
+    ) -> None:
+        if type(state) is not tuple or len(state) != 10:
+            raise ValueError("CHUNK.SEGMENT_SELECTION_SEARCH_STATE_INVALID")
+        controls = (
+            self.project_search_input,
+            self.project_search_status,
+            self.workspace_search_scope,
+            self.project_search_scope,
+            self.project_search_source,
+            self.project_search_target,
+            self.project_search_speaker,
+            self.project_search_match_case,
+            self.project_search_whole_word,
+        )
+        blockers = [QSignalBlocker(control) for control in controls]
+        try:
+            self.project_search_input.setText(str(state[0]))
+            for combo, value in (
+                (self.project_search_status, state[1]),
+                (self.workspace_search_scope, state[2]),
+                (self.project_search_scope, state[3]),
+            ):
+                index = combo.findData(value)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            for checkbox, checked in (
+                (self.project_search_source, state[4]),
+                (self.project_search_target, state[5]),
+                (self.project_search_speaker, state[6]),
+                (self.project_search_match_case, state[7]),
+                (self.project_search_whole_word, state[8]),
+            ):
+                checkbox.setChecked(bool(checked))
+        finally:
+            del blockers
+        self._set_project_search_expanded(bool(state[9]))
+
+    @staticmethod
+    def _chunk_segment_identity_key(value: object) -> tuple[str, str] | None:
+        nested = getattr(value, "segment_identity", None)
+        if nested is not None:
+            value = nested
+        document_id = getattr(value, "document_id", None)
+        local_segment_id = getattr(value, "local_segment_id", None)
+        if (
+            type(document_id) is not str
+            or not document_id
+            or type(local_segment_id) is not str
+            or not local_segment_id
+        ):
+            return None
+        return document_id, local_segment_id
+
+    def _chunk_segment_allowed_map(self) -> dict[tuple[str, str], object]:
+        session = self._chunk_segment_selection_session
+        if session is None:
+            return {}
+        return {
+            self._chunk_segment_identity_key(identity): identity
+            for identity in session.request.allowed_identities
+        }
+
+    def _chunk_segment_identity_for_row(self, row: int) -> object | None:
+        session = self._chunk_segment_selection_session
+        if session is None or row < 0:
+            return None
+        item = self.browse_table.item(row, 0)
+        if item is None:
+            return None
+        key = self._chunk_segment_identity_key(
+            item.data(Qt.ItemDataRole.UserRole)
+        )
+        if key is None:
+            return None
+        return self._chunk_segment_allowed_map().get(key)
+
+    def _chunk_segment_row_label(self, row: int) -> str:
+        position = self.browse_table.item(row, 0)
+        document_label = ""
+        for candidate in range(row - 1, -1, -1):
+            item = self.browse_table.item(candidate, 0)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole) is None and item.text():
+                document_label = item.text()
+                break
+        return (
+            f"{document_label} · {position.text()}"
+            if document_label and position is not None
+            else (position.text() if position is not None else "—")
+        )
+
+    def _selected_chunk_segment_identities(self) -> tuple[object, ...]:
+        session = self._chunk_segment_selection_session
+        model = self.browse_table.selectionModel()
+        if session is None or model is None:
+            return ()
+        return tuple(
+            identity
+            for index in sorted(model.selectedRows(), key=lambda item: item.row())
+            if (identity := self._chunk_segment_identity_for_row(index.row()))
+            is not None
+        )
+
+    def _select_chunk_segment_identities(self, identities: tuple[object, ...]) -> None:
+        if self._chunk_segment_selection_session is None:
+            return
+        wanted = {
+            key
+            for identity in identities
+            if (key := self._chunk_segment_identity_key(identity)) is not None
+        }
+        selection = self.browse_table.selectionModel()
+        if selection is None:
+            return
+        blocker = QSignalBlocker(self.browse_table)
+        first_row = None
+        try:
+            selection.clearSelection()
+            flags = (
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows
+            )
+            for row in range(self.browse_table.rowCount()):
+                identity = self._chunk_segment_identity_for_row(row)
+                key = self._chunk_segment_identity_key(identity)
+                if key not in wanted:
+                    continue
+                selection.select(
+                    self.browse_table.model().index(row, 0),
+                    flags,
+                )
+                if first_row is None:
+                    first_row = row
+            if first_row is not None:
+                selection.setCurrentIndex(
+                    self.browse_table.model().index(first_row, 0),
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+        finally:
+            del blocker
+        self._chunk_segment_browse_selection_changed()
+
+    def _begin_chunk_segment_selection(self, request: object) -> None:
+        if type(request) is not ChunkApplicationSegmentSelectionRequest:
+            self._show_error(
+                "无法选择分工段落",
+                "CHUNK.SEGMENT_SELECTION_REQUEST_INVALID",
+            )
+            return
+        request.__post_init__()
+        manager = self.sender() or self._chunk_manager_dialog
+        if (
+            manager is None
+            or not callable(getattr(manager, "accept_segment_selection", None))
+            or not callable(getattr(manager, "cancel_segment_selection", None))
+            or not self.controller.has_workspace
+            or self._chunk_segment_selection_session is not None
+        ):
+            try:
+                manager.cancel_segment_selection(request)
+            except (AttributeError, RuntimeError):
+                pass
+            self._show_error(
+                "无法选择分工段落",
+                "CHUNK.SEGMENT_SELECTION_SESSION_UNAVAILABLE",
+            )
+            return
+        workspace_keys = {
+            self._chunk_segment_identity_key(item.identity)
+            for item in self.controller.workspace_view.segments
+        }
+        requested_keys = {
+            self._chunk_segment_identity_key(identity)
+            for identity in request.allowed_identities
+        }
+        if None in requested_keys or not requested_keys.issubset(workspace_keys):
+            manager.cancel_segment_selection(request)
+            self._show_error(
+                "无法选择分工段落",
+                "CHUNK.SEGMENT_SELECTION_SCOPE_STALE",
+            )
+            return
+        widgets = (
+            self.workspace_mode_combo,
+            self.open_button,
+            self.save_button,
+            self.settings_button,
+            self.workspace_documents_button,
+            self.project_search_toggle,
+            self.project_search_input,
+            self.project_search_status,
+            self.workspace_search_scope,
+            self.project_search_scope,
+            self.project_search_clear,
+            self.project_search_source,
+            self.project_search_target,
+            self.project_search_speaker,
+            self.project_search_match_case,
+            self.project_search_whole_word,
+            self.project_search_button,
+            self.project_search_previous,
+            self.project_search_next,
+            self.browse_group_button,
+        )
+        shortcuts = tuple(self.shortcuts.values()) + (self.project_search_shortcut,)
+        session = _ChunkSegmentSelectionSession(
+            manager=manager,
+            request=request,
+            previous_mode=self.workspace_mode,
+            previous_identity=self.controller.current_workspace_identity,
+            previous_chunk_id=(
+                self._chunk_view.current_chunk_id
+                if self._chunk_view is not None
+                else None
+            ),
+            previous_search_state=self._capture_chunk_selection_search_state(),
+            enabled_widgets=tuple(
+                (widget, widget.isEnabled()) for widget in widgets
+            ),
+            enabled_shortcuts=tuple(
+                (shortcut, shortcut.isEnabled()) for shortcut in shortcuts
+            ),
+            browse_hint_text=self.browse_hint.text(),
+            browse_group_button_visible=self.browse_group_button.isVisible(),
+            browse_group_turn_bar_visible=self.browse_group_turn_bar.isVisible(),
+        )
+        self._chunk_segment_selection_session = session
+        manager.hide()
+        for widget, _enabled in session.enabled_widgets:
+            widget.setEnabled(False)
+        for shortcut, _enabled in session.enabled_shortcuts:
+            shortcut.setEnabled(False)
+        self.browse_hint.setText(
+            "临时选择分工段落 · source / target 仅用于核对，不会导航或发布"
+        )
+        self.browse_group_button.hide()
+        self.browse_group_turn_bar.setVisible(
+            session.browse_group_turn_bar_visible
+        )
+        self.chunk_segment_selection_title.setText(request.action_label)
+        self.chunk_segment_bulk_select.setVisible(
+            request.bulk_select_label is not None
+        )
+        if request.bulk_select_label is not None:
+            self.chunk_segment_bulk_select.setText(request.bulk_select_label)
+        self.chunk_segment_range_start.setText("设为起点")
+        self.chunk_segment_range_end.setText("设为终点")
+        self.chunk_segment_selection_bar.show()
+        self.browse_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        if not self.set_workspace_mode(WorkspaceMode.BROWSE, persist=False):
+            self._finish_chunk_segment_selection(False)
+            return
+        self._select_chunk_segment_identities(request.selected_identities)
+        self.browse_table.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _chunk_segment_browse_selection_changed(self) -> None:
+        session = self._chunk_segment_selection_session
+        if session is None:
+            return
+        count = len(self._selected_chunk_segment_identities())
+        minimum = session.request.minimum_selection
+        if count == 0:
+            status = (
+                f"未选择段落 · 可清空返回；此操作通常至少需要 {minimum} 段"
+            )
+        elif count < minimum:
+            status = f"已选择 {count} 段 · 此操作至少需要 {minimum} 段"
+        else:
+            status = (
+                f"已选择 {count} / {len(session.request.allowed_identities)} 段 · "
+                "按项目与文档顺序返回"
+            )
+        self.chunk_segment_selection_status.setText(status)
+        self.chunk_segment_done.setEnabled(count == 0 or count >= minimum)
+
+    def _clear_chunk_segment_browse_selection(self) -> None:
+        if self._chunk_segment_selection_session is None:
+            return
+        self.browse_table.clearSelection()
+        session = self._chunk_segment_selection_session
+        session.range_start_row = None
+        session.range_end_row = None
+        session.selection_anchor_row = None
+        self.chunk_segment_range_start.setText("设为起点")
+        self.chunk_segment_range_end.setText("设为终点")
+        self._chunk_segment_browse_selection_changed()
+
+    def _select_chunk_segment_bulk_scope(self) -> None:
+        session = self._chunk_segment_selection_session
+        if session is None or not session.request.bulk_select_identities:
+            return
+        self._select_chunk_segment_identities(
+            session.request.bulk_select_identities
+        )
+
+    def _set_chunk_segment_range_endpoint(self, endpoint: str) -> None:
+        session = self._chunk_segment_selection_session
+        if session is None:
+            return
+        row = self.browse_table.currentRow()
+        identity = self._chunk_segment_identity_for_row(row)
+        if identity is None:
+            self.chunk_segment_selection_status.setText(
+                "请先选择一个可用于当前操作的段落。"
+            )
+            return
+        label = self._chunk_segment_row_label(row)
+        if endpoint == "start":
+            session.range_start_row = row
+            self.chunk_segment_range_start.setText(f"起点：{label}")
+        elif endpoint == "end":
+            session.range_end_row = row
+            self.chunk_segment_range_end.setText(f"终点：{label}")
+        else:
+            raise ValueError("CHUNK.RANGE_ENDPOINT_INVALID")
+        if session.range_start_row is None or session.range_end_row is None:
+            return
+        start, end = sorted(
+            (session.range_start_row, session.range_end_row)
+        )
+        identities = tuple(
+            identity
+            for candidate in range(start, end + 1)
+            if (
+                identity := self._chunk_segment_identity_for_row(candidate)
+            )
+            is not None
+        )
+        self._select_chunk_segment_identities(identities)
+
+    def _restore_chunk_selection_current_scope(
+        self,
+        session: _ChunkSegmentSelectionSession,
+    ) -> None:
+        if self.chunk_controller is not None:
+            try:
+                current = self.chunk_controller.project_view().current_chunk_id
+                if current != session.previous_chunk_id:
+                    if session.previous_chunk_id is None:
+                        self.chunk_controller.clear_current_chunk()
+                    else:
+                        self.chunk_controller.select_current_chunk(
+                            session.previous_chunk_id
+                        )
+            except Exception as exc:
+                self.statusBar().showMessage(
+                    f"当前分工恢复失败：{getattr(exc, 'code', exc)}",
+                    7000,
+                )
+        try:
+            self.controller.go_to_workspace_segment(session.previous_identity)
+        except (TypeError, ValueError, EditorControllerError) as exc:
+            self.statusBar().showMessage(
+                f"原段落位置恢复失败：{exc}",
+                7000,
+            )
+
+    def _finish_chunk_segment_selection(
+        self,
+        accepted: bool,
+        *,
+        restore_manager: bool = True,
+    ) -> None:
+        session = self._chunk_segment_selection_session
+        if session is None:
+            return
+        manager = session.manager
+        if accepted:
+            identities = self._selected_chunk_segment_identities()
+            try:
+                manager.accept_segment_selection(session.request, identities)
+            except Exception as exc:
+                self.chunk_segment_selection_status.setText(
+                    f"无法返回所选段落：{getattr(exc, 'code', exc)}"
+                )
+                return
+        else:
+            try:
+                manager.cancel_segment_selection(session.request)
+            except RuntimeError:
+                restore_manager = False
+        self._chunk_segment_selection_session = None
+        self.chunk_segment_selection_bar.hide()
+        self.chunk_segment_bulk_select.hide()
+        self.browse_hint.setText(session.browse_hint_text)
+        self.browse_group_button.setVisible(
+            session.browse_group_button_visible
+        )
+        self.browse_group_turn_bar.setVisible(
+            session.browse_group_turn_bar_visible
+        )
+        self.browse_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        for widget, enabled in session.enabled_widgets:
+            widget.setEnabled(enabled)
+        for shortcut, enabled in session.enabled_shortcuts:
+            shortcut.setEnabled(enabled)
+        self._restore_chunk_selection_search_state(
+            session.previous_search_state
+        )
+        self._restore_chunk_selection_current_scope(session)
+        self._refreshing = True
+        try:
+            self._refresh_chunk_view()
+            self._populate_segment_list()
+            self._render_current_segment(
+                reset_target_history=False,
+                refresh_chunk_view=False,
+            )
+        finally:
+            self._refreshing = False
+        self.set_workspace_mode(session.previous_mode, persist=False)
+        if restore_manager:
+            try:
+                manager.show()
+                manager.raise_()
+                manager.activateWindow()
+            except RuntimeError:
+                pass
+
     def _workspace_document_action_triggered(self, action: QAction) -> None:
-        if self._refreshing or not self.controller.has_workspace:
+        if (
+            self._refreshing
+            or not self.controller.has_workspace
+            or self._chunk_segment_selection_session is not None
+        ):
             return
         identity = action.data()
         try:
@@ -3012,7 +4083,12 @@ class QtEditorWindow(QMainWindow):
         finally:
             self._refreshing = False
 
-    def _render_current_segment(self, *, reset_target_history: bool = True) -> None:
+    def _render_current_segment(
+        self,
+        *,
+        reset_target_history: bool = True,
+        refresh_chunk_view: bool = True,
+    ) -> None:
         segment = self.controller.current_segment
         segments = self._active_segments()
         speaker_text = segment.speaker or "无 speaker"
@@ -3053,16 +4129,29 @@ class QtEditorWindow(QMainWindow):
         self.confirmation_label.style().polish(self.confirmation_label)
         self.progress_bar.setRange(0, len(segments))
         self.progress_bar.setValue(self._active_confirmed_count())
+        if refresh_chunk_view:
+            self._refresh_chunk_view()
         self._refresh_browse_group_button()
         self.refresh_suggestions()
 
     def _target_changed(self) -> None:
         if self._refreshing or not self._has_active_project():
             return
-        if self.controller.has_workspace:
-            self.controller.update_workspace_target(self.target_editor.toPlainText())
-        else:
-            self.controller.update_target(self.target_editor.toPlainText())
+        try:
+            if self.controller.has_workspace:
+                self.controller.update_workspace_target(
+                    self.target_editor.toPlainText()
+                )
+            else:
+                self.controller.update_target(self.target_editor.toPlainText())
+        except EditorControllerError as exc:
+            self._refresh_target_from_controller()
+            self._refresh_chunk_view()
+            self.statusBar().showMessage(
+                f"当前段只读，未保存输入：{exc}",
+                7000,
+            )
+            return
         if self.current_project_search_report is not None:
             self._clear_project_search_results(
                 "搜索结果已过期；请按当前项目内容重新搜索。"
@@ -3076,6 +4165,7 @@ class QtEditorWindow(QMainWindow):
         else:
             self._update_segment_item(self._active_index())
         self._render_progress_state()
+        self._refresh_chunk_view()
         self._update_title()
 
     def _render_progress_state(self) -> None:
@@ -3117,12 +4207,21 @@ class QtEditorWindow(QMainWindow):
             self.controller.workspace_view if self.controller.has_workspace else None
         )
         if workspace_view is not None:
+            chunk_keys = self._current_chunk_identity_keys()
             file_icon = _localcat_document_icon()
             for document in workspace_view.documents:
                 document_segments = tuple(
                     item
                     for item in workspace_view.segments
                     if item.identity.document is document.identity
+                    and (
+                        chunk_keys is None
+                        or (
+                            item.identity.document.document_id,
+                            item.identity.local_segment_id,
+                        )
+                        in chunk_keys
+                    )
                     and (not unconfirmed_only or not item.confirmed)
                 )
                 if not document_segments:
@@ -3274,6 +4373,11 @@ class QtEditorWindow(QMainWindow):
             normalized = (
                 mode if isinstance(mode, WorkspaceMode) else WorkspaceMode(mode)
             )
+            if (
+                self._chunk_segment_selection_session is not None
+                and normalized is not WorkspaceMode.BROWSE
+            ):
+                return False
             preferences = replace(
                 self._display_preferences,
                 workspace_mode=normalized,
@@ -3308,6 +4412,13 @@ class QtEditorWindow(QMainWindow):
             self._refresh_browse_group_button()
             return
         segments = self._active_segments()
+        selection_session = self._chunk_segment_selection_session
+        selected_before = (
+            self._selected_chunk_segment_identities()
+            if selection_session is not None
+            else ()
+        )
+        allowed_keys = set(self._chunk_segment_allowed_map())
         workspace_view = (
             self.controller.workspace_view if self.controller.has_workspace else None
         )
@@ -3317,15 +4428,28 @@ class QtEditorWindow(QMainWindow):
             self.browse_table.clearContents()
             row_specs: list[tuple[str, int | None]] = []
             if workspace_view is not None:
+                chunk_keys = (
+                    None
+                    if selection_session is not None
+                    else self._current_chunk_identity_keys()
+                )
                 for document in workspace_view.documents:
-                    row_specs.append(
-                        (document.display_name, None)
-                    )
-                    row_specs.extend(
-                        ("", item.project_global_index)
+                    document_rows = tuple(
+                        item.project_global_index
                         for item in workspace_view.segments
                         if item.identity.document is document.identity
+                        and (
+                            chunk_keys is None
+                            or (
+                                item.identity.document.document_id,
+                                item.identity.local_segment_id,
+                            )
+                            in chunk_keys
+                        )
                     )
+                    if document_rows:
+                        row_specs.append((document.display_name, None))
+                        row_specs.extend(("", index) for index in document_rows)
             else:
                 row_specs.extend(("", index) for index in range(len(segments)))
             maximum_position = len(segments)
@@ -3378,13 +4502,34 @@ class QtEditorWindow(QMainWindow):
                     item = QTableWidgetItem(value)
                     item.setData(Qt.ItemDataRole.UserRole, identity)
                     item.setToolTip(value)
+                    if (
+                        selection_session is not None
+                        and self._chunk_segment_identity_key(identity)
+                        not in allowed_keys
+                    ):
+                        item.setFlags(
+                            item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                        )
+                        item.setForeground(QColor("#8b9cab"))
+                        item.setToolTip(
+                            "当前高级操作不可选择此段落 · " + value
+                        )
                     self.browse_table.setItem(row, column, item)
                 if index == self._active_index():
                     current_row = row
         finally:
             self.browse_table.setUpdatesEnabled(True)
         self.browse_table.resizeRowsToContents()
-        self.browse_table.setCurrentCell(current_row, 1)
+        if selection_session is None:
+            self.browse_table.setCurrentCell(current_row, 1)
+        else:
+            selection = self.browse_table.selectionModel()
+            if selection is not None and self.browse_table.rowCount():
+                selection.setCurrentIndex(
+                    self.browse_table.model().index(current_row, 1),
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+            self._select_chunk_segment_identities(selected_before)
         current = self.browse_table.item(current_row, 1)
         if current is not None:
             self.browse_table.scrollToItem(
@@ -3434,6 +4579,12 @@ class QtEditorWindow(QMainWindow):
         document = next(
             item for item in view.documents if item.identity is document_identity
         )
+        selection_session = self._chunk_segment_selection_session
+        chunk_keys = (
+            set(self._chunk_segment_allowed_map())
+            if selection_session is not None
+            else self._current_chunk_identity_keys()
+        )
         return (
             document.display_name,
             tuple(
@@ -3445,6 +4596,14 @@ class QtEditorWindow(QMainWindow):
                 )
                 for item in view.segments
                 if item.identity.document is document_identity
+                and (
+                    chunk_keys is None
+                    or (
+                        item.identity.document.document_id,
+                        item.identity.local_segment_id,
+                    )
+                    in chunk_keys
+                )
             ),
         )
 
@@ -3570,6 +4729,30 @@ class QtEditorWindow(QMainWindow):
 
         if not self._has_active_project():
             return
+        if self._chunk_segment_selection_session is not None:
+            wanted = self._chunk_segment_identity_key(issued_identity)
+            if wanted is None:
+                return
+            for row in range(self.browse_table.rowCount()):
+                item = self.browse_table.item(row, 0)
+                if item is None:
+                    continue
+                if self._chunk_segment_identity_key(
+                    item.data(Qt.ItemDataRole.UserRole)
+                ) != wanted:
+                    continue
+                selection = self.browse_table.selectionModel()
+                if selection is not None:
+                    selection.setCurrentIndex(
+                        self.browse_table.model().index(row, 1),
+                        QItemSelectionModel.SelectionFlag.NoUpdate,
+                    )
+                self.browse_table.scrollToItem(
+                    item,
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
+                return
+            return
         try:
             if self.controller.has_workspace:
                 self.controller.go_to_workspace_segment(issued_identity)
@@ -3597,6 +4780,9 @@ class QtEditorWindow(QMainWindow):
 
         if self._refreshing or current_row < 0 or not self._has_active_project():
             return
+        if self._chunk_segment_selection_session is not None:
+            self._chunk_segment_browse_selection_changed()
+            return
         item = self.browse_table.item(current_row, 0)
         if item is None:
             return
@@ -3622,6 +4808,9 @@ class QtEditorWindow(QMainWindow):
             self._refreshing = False
 
     def _activate_browse_row(self, row: int, _column: int) -> None:
+        if self._chunk_segment_selection_session is not None:
+            self._chunk_segment_browse_selection_changed()
+            return
         item = self.browse_table.item(row, 0)
         if item is None:
             return
@@ -3867,6 +5056,8 @@ class QtEditorWindow(QMainWindow):
         return SegmentTranslationStatus(str(value))
 
     def _submit_project_search(self) -> None:
+        if self._chunk_segment_selection_session is not None:
+            return
         """Issue one Controller search and activate its first issued hit."""
 
         if not self.project_search_button.isEnabled():
@@ -3887,16 +5078,32 @@ class QtEditorWindow(QMainWindow):
         try:
             if self.controller.has_workspace:
                 scope = self.workspace_search_scope.currentData()
-                if not isinstance(scope, SearchScope):
-                    scope = SearchScope(str(scope))
-                request = WorkspaceSearchRequest(
-                    query=query,
-                    fields=fields,
-                    options=self._project_search_options(),
-                    status=self._project_search_status_filter(),
-                    scope=scope,
-                )
-                report = self.controller.search_workspace(request)
+                if (
+                    self._chunk_view is not None
+                    and self._chunk_view.mode is ChunkApplicationMode.ACTIVE
+                    and self.chunk_controller is not None
+                ):
+                    if not isinstance(scope, CollaborativeSearchScopeV2):
+                        scope = CollaborativeSearchScopeV2(str(scope))
+                    request = CollaborativeWorkspaceSearchRequestV2(
+                        query=query,
+                        fields=fields,
+                        options=self._project_search_options(),
+                        status=self._project_search_status_filter(),
+                        scope=scope,
+                    )
+                    report = self.chunk_controller.search_workspace(request)
+                else:
+                    if not isinstance(scope, SearchScope):
+                        scope = SearchScope(str(scope))
+                    request = WorkspaceSearchRequest(
+                        query=query,
+                        fields=fields,
+                        options=self._project_search_options(),
+                        status=self._project_search_status_filter(),
+                        scope=scope,
+                    )
+                    report = self.controller.search_workspace(request)
                 self.current_workspace_search_report = report
             else:
                 request = ProjectSearchRequest(
@@ -3906,7 +5113,7 @@ class QtEditorWindow(QMainWindow):
                     status=self._project_search_status_filter(),
                 )
                 report = self.controller.search_project(request)
-        except EditorControllerError as exc:
+        except Exception as exc:
             self._clear_project_search_results(f"搜索失败：{exc}。")
             self.statusBar().showMessage(f"项目搜索失败：{exc}", 7000)
             return
@@ -3934,6 +5141,8 @@ class QtEditorWindow(QMainWindow):
             )
 
     def _navigate_project_search(self, direction: int) -> None:
+        if self._chunk_segment_selection_session is not None:
+            return
         report = self.current_project_search_report
         ordinal = self._project_search_ordinal
         if report is None or ordinal is None or direction not in (-1, 1):
@@ -3949,10 +5158,19 @@ class QtEditorWindow(QMainWindow):
         previous_index = self._active_index()
         try:
             if self.controller.has_workspace:
-                _ = self.controller.go_to_workspace_search_hit(report.hits[ordinal])
+                if type(report) is CollaborativeWorkspaceSearchReportV2:
+                    if self.chunk_controller is None:
+                        raise EditorControllerError("CHUNK.PERMISSION_STALE")
+                    _ = self.chunk_controller.go_to_search_hit(
+                        report.hits[ordinal]
+                    )
+                else:
+                    _ = self.controller.go_to_workspace_search_hit(
+                        report.hits[ordinal]
+                    )
             else:
                 _ = self.controller.go_to_search_hit(report.hits[ordinal])
-        except EditorControllerError as exc:
+        except Exception as exc:
             self._clear_project_search_results(
                 f"搜索结果已过期：{exc}；请重新搜索。"
             )
@@ -3983,7 +5201,17 @@ class QtEditorWindow(QMainWindow):
         ordinal = self._project_search_ordinal
         if report is None or ordinal is None or not 0 <= ordinal < report.total:
             return
-        hit = report.hits[ordinal]
+        issued_hit = report.hits[ordinal]
+        access_text = ""
+        if type(issued_hit) is CollaborativeWorkspaceSearchHitV2:
+            hit = issued_hit.workspace_hit
+            access_text = (
+                " · 可编辑"
+                if issued_hit.access.may_edit_target
+                else " · 只读"
+            )
+        else:
+            hit = issued_hit
         field = hit.field.value.upper()
         position = (
             f"章节段落 {hit.local_segment_id}"
@@ -3992,7 +5220,7 @@ class QtEditorWindow(QMainWindow):
         )
         result = (
             f"共 {report.total} 个结果 · 第 {ordinal + 1} 个 · "
-            f"{field} · {position}"
+            f"{field} · {position}{access_text}"
         )
         preview = f"预览（{field}）：{hit.preview}"
         self.project_search_result.setText(result)
@@ -4056,6 +5284,7 @@ class QtEditorWindow(QMainWindow):
             )
         finally:
             self._refreshing = False
+        self._refresh_chunk_view()
         self._update_title()
         self.statusBar().showMessage(
             f"译文已确认 · 已写入 {len(result.write_report.written_resource_ids)} 个记忆库",
@@ -4158,6 +5387,7 @@ class QtEditorWindow(QMainWindow):
             self.project_name_label.setText(self._active_project_name())
             self.language_label.setText(f"{source_locale}  →  {target_locale}")
             self.segment_count_label.setText(str(len(self._active_segments())))
+            self._refresh_chunk_view()
             self._refresh_workspace_documents_menu()
             self._populate_segment_list()
             self._render_current_segment()
@@ -4472,6 +5702,17 @@ class QtEditorWindow(QMainWindow):
             label.setObjectName(object_name)
         return label
 
+    def _chunk_target_editable(self) -> bool:
+        return (
+            self._chunk_view is None
+            and not (
+                self.controller.has_workspace and self.chunk_controller is not None
+            )
+        ) or (
+            self._chunk_view is not None
+            and self._chunk_view.current_segment_access.may_edit_target
+        )
+
     def _tm_card(
         self,
         index: int,
@@ -4530,6 +5771,7 @@ class QtEditorWindow(QMainWindow):
                 f"{apply_accessible_name}；不会自动确认或跳转段落"
             )
             apply_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            apply_button.setEnabled(self._chunk_target_editable())
             apply_button.clicked.connect(
                 lambda _checked=False, current=suggestion: self.apply_tm_suggestion(
                     current
@@ -4565,6 +5807,7 @@ class QtEditorWindow(QMainWindow):
             f"{apply_accessible_name}；不会自动确认或跳转段落"
         )
         apply_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        apply_button.setEnabled(self._chunk_target_editable())
         apply_button.clicked.connect(
             lambda _checked=False, current=suggestion: self.apply_tm_suggestion(current)
         )
@@ -4593,6 +5836,7 @@ class QtEditorWindow(QMainWindow):
         provenance = self._plain_label(suggestion.resource_name, "suggestionProvenance")
         insert_button = QPushButton("插入译文")
         insert_button.setObjectName(f"insertTerm_{index}")
+        insert_button.setEnabled(self._chunk_target_editable())
         insert_button.clicked.connect(
             lambda _checked=False, current=suggestion: self.insert_term_suggestion(current)
         )
@@ -4634,6 +5878,7 @@ class QtEditorWindow(QMainWindow):
         finally:
             cursor.endEditBlock()
         self.target_editor.setTextCursor(cursor)
+        self._refresh_chunk_view()
         if type(suggestion) is TMSuggestion:
             resource_name = suggestion.provenance.resource_name
         elif type(suggestion) is LegacyExactTMSuggestion:
@@ -4658,6 +5903,7 @@ class QtEditorWindow(QMainWindow):
         finally:
             cursor.endEditBlock()
         self.target_editor.setTextCursor(cursor)
+        self._refresh_chunk_view()
         self.statusBar().showMessage(f"已插入术语：{suggestion.target_term}", 5000)
         return True
 
@@ -4770,6 +6016,17 @@ class QtEditorWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._confirm_unsaved():
+            if self._chunk_segment_selection_session is not None:
+                self._finish_chunk_segment_selection(
+                    False,
+                    restore_manager=False,
+                )
+            manager = self._chunk_manager_dialog
+            if manager is not None:
+                try:
+                    manager.close()
+                except RuntimeError:
+                    pass
             event.accept()
         else:
             event.ignore()
@@ -5169,6 +6426,25 @@ QFrame#browsePanel {
 QLabel#browseHint {
     color: #74869a;
     font-size: 11px;
+}
+QFrame#chunkSegmentSelectionBar {
+    background: #eef8fb;
+    border: 1px solid #9ed7e5;
+    border-radius: 8px;
+}
+QLabel#chunkSegmentSelectionTitle {
+    color: #075f7b;
+    font-size: 13px;
+    font-weight: 800;
+}
+QLabel#chunkSegmentSelectionStatus {
+    color: #4c7083;
+    font-size: 11px;
+}
+QPushButton#chunkBrowseSelectionDone {
+    color: #ffffff;
+    background: #079fc9;
+    border-color: #079fc9;
 }
 QPushButton#browseGroupNavigatorButton {
     min-height: 28px;

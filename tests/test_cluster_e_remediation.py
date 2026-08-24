@@ -135,9 +135,15 @@ class ClusterERemediationTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class CapturingWindow(QWidget):
-            def __init__(self, controller: object) -> None:
+            def __init__(
+                self,
+                controller: object,
+                *,
+                chunk_controller: object | None = None,
+            ) -> None:
                 super().__init__()
                 captured["controller"] = controller
+                captured["chunk_controller"] = chunk_controller
                 self.pages = types.SimpleNamespace(
                     currentWidget=lambda: types.SimpleNamespace(
                         objectName=lambda: "editorPage"
@@ -172,6 +178,7 @@ class ClusterERemediationTests(unittest.TestCase):
             self.assertEqual(compose.call_count, 1)
             self.assertEqual(start_validation.call_count, 1)
             controller = cast(EditorController, captured["controller"])
+            self.assertIsNotNone(captured["chunk_controller"])
             self.assertTrue(controller.tm_suggestion_reports_enabled)
             report = controller.tm_suggestion_report()
             report.__post_init__()

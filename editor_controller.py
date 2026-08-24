@@ -1280,6 +1280,7 @@ class EditorController:
         self._workspace_global_index = 0
         self._workspace_generation = 0
         self._workspace_session_view: WorkspaceSessionView | None = None
+        self._workspace_chunk_edit_gate: object | None = None
         self._current_workspace_search_report: WorkspaceSearchReport | None = None
         self._issued_workspace_search_hits: tuple[WorkspaceSearchHit, ...] = ()
         self._issued_workspace_search_public_hits: tuple[WorkspaceSearchHit, ...] = ()
@@ -2117,13 +2118,19 @@ class EditorController:
         with self._tm_query_lock:
             service = self._require_workspace_session()
             current_identity = self.current_workspace_identity.segment_identity
+            preparation = self._prepare_workspace_chunk_edit(
+                service,
+                current_identity,
+                target=target,
+                confirmed=False,
+            )
             try:
-                receipt = service.update_segment_edit(
+                receipt = self._commit_workspace_chunk_edit(
+                    preparation,
+                    service,
                     current_identity,
                     target=target,
                     confirmed=False,
-                    session_id=self._project_session_id,
-                    base_revision=self._project_revision,
                 )
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
@@ -2153,6 +2160,64 @@ class EditorController:
                     service,
                     private_request,
                     current_document_id=self.current_workspace_document_id,
+                )
+                private_report = _clone_workspace_search_report(report)
+                _validate_workspace_search_report(
+                    private_report,
+                    service,
+                    private_request,
+                    current_document_id=self.current_workspace_document_id,
+                )
+            except ProjectSearchError as error:
+                raise EditorControllerError(error.code) from error
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_INVALID"
+                ) from error
+            if private_report.capability != handoff.display:
+                raise EditorControllerError("PROJECT_SEARCH.REPORT_MISMATCH")
+            issued_hits = tuple(replace(hit) for hit in private_report.hits)
+            public_report = _clone_workspace_search_report(private_report)
+            self._current_workspace_search_report = private_report
+            self._issued_workspace_search_hits = issued_hits
+            self._issued_workspace_search_public_hits = public_report.hits
+            self._issued_workspace_search_context = (
+                self._project_session_id,
+                self._workspace_generation,
+                service.revision,
+                service.workspace_content_digest,
+                handoff.generation,
+                self.current_workspace_document_id,
+                tuple(private_request.fields),
+                private_request.status,
+                private_request.scope,
+            )
+            return public_report
+
+    def _search_workspace_selection_for_chunk_controller(
+        self,
+        request: WorkspaceSearchRequest,
+        members: tuple[SegmentIdentity, ...],
+    ) -> WorkspaceSearchReport:
+        """Run the normal matcher over one exact, chunk-neutral selection."""
+
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            private_request = _clone_workspace_search_request(request)
+            if private_request.scope is not SearchScope.ENTIRE_PROJECT:
+                raise EditorControllerError("PROJECT_SEARCH.SELECTION_INVALID")
+            handoff = self._capture_project_search_handoff()
+            self._authorize_project_search_request(handoff, private_request)
+            matcher = handoff.matcher
+            if matcher is None:
+                raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+            try:
+                report = ProjectSearchService(
+                    matcher
+                ).search_workspace_selection(
+                    service,
+                    private_request,
+                    members=members,
                 )
                 private_report = _clone_workspace_search_report(report)
                 _validate_workspace_search_report(
@@ -2486,6 +2551,23 @@ class EditorController:
                     )
                     raise
                 receipt = reconciliation_service.commit_reconciliation(token)
+                try:
+                    published_transition = (
+                        reconciliation_service.published_workspace_transition(
+                            receipt
+                        )
+                    )
+                    self._capture_workspace_chunk_transition(
+                        reconciliation_service,
+                        published_transition,
+                    )
+                except BaseException:
+                    # Reconciliation is already published and cannot be
+                    # rolled back.  Preserve the mandatory Workspace swap and
+                    # let the optional Chunk layer rebind in a blocked state.
+                    self._mark_workspace_chunk_transition_capture_failed(
+                        reconciliation_service
+                    )
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
             self._project = None
@@ -2518,6 +2600,7 @@ class EditorController:
             self._current_tm_report = None
             self._tm_query_epoch += 1
             self._observed_tm_signature = candidate_install.observed_tm_signature
+            self._notify_workspace_chunk_opened()
             return receipt
 
     def preview_workspace_package_import(
@@ -2660,6 +2743,9 @@ class EditorController:
                         generation=self._workspace_generation + 1,
                         current_index=0,
                     )
+                    self._validate_workspace_chunk_replacement(
+                        candidate_install.service
+                    )
                 except BaseException:
                     self._workspace_package_service.discard_prepared_import(
                         prepared_import
@@ -2701,6 +2787,7 @@ class EditorController:
             self._current_tm_report = None
             self._tm_query_epoch += 1
             self._observed_tm_signature = candidate_install.observed_tm_signature
+            self._notify_workspace_chunk_opened()
             return ControllerWorkspaceImportResult(
                 receipt=result.receipt,
                 session=self.workspace_view,
@@ -2745,6 +2832,8 @@ class EditorController:
             raise EditorControllerError("project contains no segments")
         with self._tm_query_lock:
             self._remember_current_workspace_position()
+            if self._workspace_service is not None:
+                self._notify_workspace_chunk_closed()
             self._workspace_service = None
             self._workspace_save_service = None
             self._workspace_persistence_binding = None
@@ -3078,6 +3167,8 @@ class EditorController:
                 self._remember_current_position()
             else:
                 self._remember_current_workspace_position()
+                if self._workspace_service is not None:
+                    self._notify_workspace_chunk_closed()
             self._project = None
             self._workspace_service = None
             self._workspace_save_service = None
@@ -3571,26 +3662,42 @@ class EditorController:
                     "target text must not be empty before confirmation"
                 )
             workspace_mode = self._workspace_service is not None
+            workspace_edit_preparation: object | None = None
+            workspace_identity: SegmentIdentity | None = None
+            workspace_service: ProjectWorkspaceService | None = None
+            if workspace_mode:
+                workspace_service = self._require_workspace_session()
+                workspace_identity = (
+                    self.current_workspace_identity.segment_identity
+                )
+                workspace_edit_preparation = self._prepare_workspace_chunk_edit(
+                    workspace_service,
+                    workspace_identity,
+                    target=current.target,
+                    confirmed=True,
+                )
             file_source = (
                 self._workspace_contract.name if workspace_mode else self.project.name
             )
             adapter = self._tm_adapter
-            if adapter is not None:
-                report = adapter.append_confirmed(
-                    segment=current,
-                    target=current.target,
-                    file_source=file_source,
-                )
-                if type(report) is not WriteReport:
-                    raise TypeError("TM adapter must return WriteReport")
-                report.__post_init__()
-                if not report.outcomes and (
-                    report.written_resource_ids or report.errors
-                ):
-                    raise ValueError(
-                        "TM adapter write report must retain structured outcomes"
+
+            def publish_resources() -> WriteReport:
+                if adapter is not None:
+                    published = adapter.append_confirmed(
+                        segment=current,
+                        target=current.target,
+                        file_source=file_source,
                     )
-            else:
+                    if type(published) is not WriteReport:
+                        raise TypeError("TM adapter must return WriteReport")
+                    published.__post_init__()
+                    if not published.outcomes and (
+                        published.written_resource_ids or published.errors
+                    ):
+                        raise ValueError(
+                            "TM adapter write report must retain structured outcomes"
+                        )
+                    return published
                 unit = SourceUnit(
                     id=current.id,
                     text=current.source,
@@ -3617,12 +3724,33 @@ class EditorController:
                         errors.append(
                             f"{resource.name}: unable to write translation memory"
                         )
-                report = WriteReport(
+                return WriteReport(
                     written_resource_ids=tuple(written),
                     errors=tuple(errors),
                 )
 
+            workspace_receipt: object | None = None
+            try:
+                if workspace_mode:
+                    assert workspace_service is not None
+                    assert workspace_identity is not None
+                    report, workspace_receipt = (
+                        self._commit_workspace_chunk_confirmed_edit(
+                            workspace_edit_preparation,
+                            workspace_service,
+                            workspace_identity,
+                            target=current.target,
+                            publish_resources=publish_resources,
+                        )
+                    )
+                else:
+                    report = publish_resources()
+            except BaseException:
+                self._cancel_workspace_chunk_edit(workspace_edit_preparation)
+                raise
+
             if not report.succeeded:
+                self._cancel_workspace_chunk_edit(workspace_edit_preparation)
                 if workspace_mode:
                     return ControllerWorkspaceConfirmResult(
                         session=self.workspace_view,
@@ -3637,21 +3765,14 @@ class EditorController:
                 )
 
             if workspace_mode:
-                service = self._require_workspace_session()
-                identity = self.current_workspace_identity.segment_identity
-                try:
-                    receipt = service.update_segment_edit(
-                        identity,
-                        target=current.target,
-                        confirmed=True,
-                        session_id=self._project_session_id,
-                        base_revision=self._project_revision,
-                    )
-                except ProjectWorkspaceError as error:
-                    raise EditorControllerError(error.code) from error
+                assert workspace_service is not None
+                assert workspace_identity is not None
+                receipt = workspace_receipt
+                if receipt is None:
+                    raise EditorControllerError("CHUNK.COMMIT_FAILED")
                 if receipt.changed:
                     self._project_revision = receipt.resulting_revision
-                    self._refresh_workspace_projection(identity)
+                    self._refresh_workspace_projection(workspace_identity)
                 next_index = next(
                     (
                         index
@@ -4402,6 +4523,210 @@ class EditorController:
             raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
         return service
 
+    def _workspace_owner_for_chunk_controller(self) -> ProjectWorkspaceService:
+        """Return the exact live owner to the installed composition adapter."""
+
+        return self._require_workspace_session()
+
+    def _install_workspace_chunk_edit_gate(self, gate: object) -> None:
+        """Install one private prepare/commit gate without importing Chunk."""
+
+        if not all(
+            callable(getattr(gate, name, None))
+            for name in (
+                "prepare_segment_edit",
+                "commit_segment_edit",
+                "commit_confirmed_edit",
+                "cancel_segment_edit",
+            )
+        ):
+            raise TypeError("workspace chunk edit gate is incomplete")
+        current = self._workspace_chunk_edit_gate
+        if current is not None and current is not gate:
+            raise EditorControllerError("CHUNK.CONTROLLER_GATE_ALREADY_INSTALLED")
+        self._workspace_chunk_edit_gate = gate
+
+    def _notify_workspace_chunk_opened(self) -> object | None:
+        """Notify an optional application gate after a Workspace is installed."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = None if gate is None else getattr(gate, "workspace_opened", None)
+        if callable(callback):
+            try:
+                return callback()
+            except BaseException:
+                recovery = getattr(gate, "workspace_open_failed", None)
+                if callable(recovery):
+                    try:
+                        recovery()
+                    except BaseException:
+                        pass
+        return None
+
+    def _notify_workspace_chunk_closed(self) -> None:
+        """Revoke optional Chunk application state before dropping its owner."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = None if gate is None else getattr(gate, "workspace_closed", None)
+        if callable(callback):
+            callback()
+
+    def _capture_workspace_chunk_transition(
+        self,
+        workspace_owner: ProjectWorkspaceService,
+        projection: object,
+    ) -> object | None:
+        """Pass one owner-issued transition through the optional Chunk seam."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "capture_workspace_transition", None)
+        )
+        if callable(callback):
+            return callback(workspace_owner, projection)
+        return None
+
+    def _mark_workspace_chunk_transition_capture_failed(
+        self,
+        workspace_owner: ProjectWorkspaceService,
+    ) -> None:
+        """Tell the optional Chunk gate to fail closed after publication."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "workspace_transition_capture_failed", None)
+        )
+        if callable(callback):
+            try:
+                callback(workspace_owner)
+            except BaseException:
+                # Workspace publication is already durable and cannot be rolled
+                # back.  Candidate installation below remains mandatory.
+                pass
+
+    def _validate_workspace_chunk_replacement(
+        self,
+        candidate_owner: ProjectWorkspaceService,
+    ) -> None:
+        """Let the optional Chunk gate reject a swap before package publish."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "validate_workspace_replacement", None)
+        )
+        if not callable(callback):
+            return
+        try:
+            callback(candidate_owner)
+        except EditorControllerError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", None)
+            raise EditorControllerError(
+                code if type(code) is str and code else "CHUNK.RECOVERY_REQUIRED"
+            ) from error
+
+    def _prepare_workspace_chunk_edit(
+        self,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        confirmed: bool,
+    ) -> object | None:
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            return None
+        return gate.prepare_segment_edit(
+            service,
+            identity,
+            target=target,
+            confirmed=confirmed,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+        )
+
+    def _commit_workspace_chunk_edit(
+        self,
+        preparation: object | None,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        confirmed: bool,
+    ) -> object:
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            return service.update_segment_edit(
+                identity,
+                target=target,
+                confirmed=confirmed,
+                session_id=self._project_session_id,
+                base_revision=self._project_revision,
+            )
+        receipt = gate.commit_segment_edit(
+            preparation,
+            service,
+            identity,
+            target=target,
+            confirmed=confirmed,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+        )
+        return receipt
+
+    def _cancel_workspace_chunk_edit(self, preparation: object | None) -> None:
+        gate = self._workspace_chunk_edit_gate
+        if gate is not None:
+            gate.cancel_segment_edit(preparation)
+
+    def _commit_workspace_chunk_confirmed_edit(
+        self,
+        preparation: object | None,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        publish_resources: Callable[[], WriteReport],
+    ) -> tuple[WriteReport, object | None]:
+        """Run resource publication only after the final Chunk revalidation."""
+
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            report = publish_resources()
+            if not report.succeeded:
+                return report, None
+            receipt = service.update_segment_edit(
+                identity,
+                target=target,
+                confirmed=True,
+                session_id=self._project_session_id,
+                base_revision=self._project_revision,
+            )
+            return report, receipt
+        result = gate.commit_confirmed_edit(
+            preparation,
+            service,
+            identity,
+            target=target,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+            publish_resources=publish_resources,
+        )
+        if (
+            type(result) is not tuple
+            or len(result) != 2
+            or type(result[0]) is not WriteReport
+        ):
+            raise EditorControllerError("CHUNK.COMMIT_FAILED")
+        return result
+
     def _require_workspace_save_session(
         self,
     ) -> tuple[
@@ -4630,6 +4955,7 @@ class EditorController:
             self._restore_workspace_position(opened.persistence_binding.path)
             self._reissue_workspace_session_view()
             self._remember_current_workspace_position()
+            self._notify_workspace_chunk_opened()
         except BaseException:
             self.__dict__.clear()
             self.__dict__.update(previous_state)

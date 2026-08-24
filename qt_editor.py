@@ -549,6 +549,37 @@ def _compose_editor_controller(repository: object):
     return controller, capability_composition
 
 
+def _compose_chunk_controller(controller: object, repository: object):
+    """Build the device-local Chunk application boundary for one app run."""
+
+    from chunk_controller_adapter import (
+        ChunkControllerAdapter,
+        create_chunk_metadata_binding_resolver,
+    )
+    from collaborative_chunks import LocalReferenceActorPort
+    from editor_controller import EditorController
+    from resource_repository import ResourceRepository
+
+    if type(controller) is not EditorController:
+        raise TypeError("chunk composition requires one EditorController")
+    if type(repository) is not ResourceRepository:
+        raise TypeError("chunk composition requires one ResourceRepository")
+    metadata_root = (repository.config_dir / "collaborative-chunks").resolve()
+    actor_port = LocalReferenceActorPort(
+        "localcat-local-reference",
+        "device-workflow",
+    )
+
+    return ChunkControllerAdapter(
+        controller,
+        actor_port,
+        actor_port.current_actor(),
+        metadata_binding_resolver=create_chunk_metadata_binding_resolver(
+            metadata_root
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     launch_argv = tuple(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(launch_argv)
@@ -599,11 +630,15 @@ def main(argv: list[str] | None = None) -> int:
         controller, capability_composition = _compose_editor_controller(
             repository
         )
+        chunk_controller = _compose_chunk_controller(controller, repository)
         # Retain the owner-only validation ports for the complete QApplication
         # lifetime; the Controller receives only the host read boundary.
         _ = capability_composition
         if args.project is not None:
-            controller.open_project(args.project)
+            if args.project.suffix.lower() == ".localcat-project":
+                controller.open_project_package(args.project)
+            else:
+                controller.open_project(args.project)
         elif args.sample or args.smoke_test:
             controller.load_sample()
 
@@ -627,7 +662,10 @@ def main(argv: list[str] | None = None) -> int:
         logo_path = application_icon_path(root)
         if logo_path.is_file():
             app.setWindowIcon(QIcon(str(logo_path)))
-        window = QtEditorWindow(controller)
+        window = QtEditorWindow(
+            controller,
+            chunk_controller=chunk_controller,
+        )
         window.show()
         validation_worker = _start_capability_validation(
             capability_composition,
@@ -646,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.smoke_test:
             if (
-                not controller.has_project
+                not controller.has_active_project
                 or window.pages.currentWidget().objectName() != "editorPage"
                 or window.segment_list.count() == 0
             ):

@@ -29,6 +29,13 @@ Layer 1 resource / termbase / canonical TM storage
 ├── project_workspace.py       # carrier-neutral workspace 聚合、progress 与 reconciliation
 ├── project_save.py            # carrier-neutral candidate/LKG、baseline、save report 与 cold recovery
 ├── project_package.py         # deterministic ZIP v1 ProjectPackage、严格验证与手工导入导出事务
+├── collaborative_chunk_contracts.py # Chunk identity/membership/topology/permission frozen contracts
+├── collaborative_chunks.py  # Chunk topology、assignment、permission、progress/rebase 领域服务
+├── collaborative_chunk_store.py # namespaced Chunk metadata/audit/LKG 事务 owner
+├── collaborative_chunk_conflict.py # metadata conflict 与 current-head undo
+├── collaborative_chunk_workspace_adapter.py # Workspace transition/progress 窄投影
+├── chunk_controller_contracts.py # Qt/Application 专用 body-safe frozen projections
+├── chunk_controller_adapter.py # Workspace + Chunk 唯一 Application composition boundary
 ├── parser_contracts.py          # stdlib-only 中立合同、capability 与 limit profile
 ├── parser_source.py             # rooted source/snapshot/terminal 与 canonical 原子写
 ├── parser_registry.py           # purpose-aware 不可变 registry，不导入具体 codec
@@ -52,6 +59,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── qt_editor.py                 # stdlib composition/bootstrap 与 desktop install CLI
 ├── qt_editor_window.py          # Layer 4 主编辑器、多文档章节/保存反馈、TM 与项目搜索
 ├── qt_browse_group_dialog.py    # Layer 4 浏览/校对单文档分组轮次投影与设备本地设置
+├── qt_chunk_manager_dialog.py  # Layer 4 协作分工 preview/apply 与高级范围选择
 ├── qt_settings_dialog.py        # Layer 4 语言资源设置
 ├── qt_termbase_dialog.py        # Layer 4 集中式术语管理
 ├── qt_control_styles.py         # Layer 4 共享 popup/menu 视觉合同
@@ -82,7 +90,9 @@ Layer 1 resource / termbase / canonical TM storage
 ├── macos/LocalCATLauncher.c     # native execv bootstrap source
 ├── LocalCAT-launcher             # universal arm64/x86_64 Mach-O asset
 ├── tools/generate_multi_document_current_source_evidence.py # Multi-Document final-roots evidence owner
-├── multi_document_current_source_evidence.json # 17-root canonical current-source evidence
+├── multi_document_current_source_evidence.json # 19-root canonical current-source evidence
+├── tools/generate_collaborative_chunks_current_source_evidence.py # Chunk overlay evidence owner
+├── collaborative_chunks_current_source_evidence.json # 8-root Chunk current-source overlay
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实
 └── .kiro/steering/              # 当前项目级产品、技术与结构约束
@@ -108,6 +118,8 @@ Layer 1 resource / termbase / canonical TM storage
 - `project_save.py` 只消费 workspace 的 canonical digest/service/contracts，拥有 carrier-neutral save candidate、真实 LKG/逐Document baseline、结构化报告与 cold-recovery 阶段协调；不导入 Parser/codec、物理 archive/carrier、Qt、TM/Store、provider、chunk 或 ResourcePackage。当前显式选择的 JSON/TXT/PO/POT 仍只保存 package overlay，不执行 source write-back。
 - `project_package.py` 是 ADR-019 批准的唯一 ProjectPackage v1 carrier owner：它拥有严格 `ZIP_STORED` envelope/manifest/member grammar、bounded stream、artifact/content digest、手工 export/validate/preview/import/apply/receipt 与物理 recovery port；不导入具体 codec/registry、Qt、TM/Store、provider、chunk 或 ResourcePackage，不 extract member，不解释 `codec_private_member`。
 - `editor_controller.py` 的多文档入口只消费 C1–C2 frozen service/receipt，以 session/generation/revision 签发 Project/Document/Segment view；source reconcile 与 active package import 使用 owner-issued prepare/discard/commit capability，候选投影完成后才单点切换 session。`project_search.py` 让 legacy 与 workspace request 共用一个 matcher pipeline；workspace 使用独立复合 hit/report，不扩宽既有单 JSON DTO。Qt 不直接取得 workspace、manifest、member、persistence binding 或 recovery authority。
+- `chunk_controller_adapter.py` 是同时持有 Workspace 与 Chunk owner 窄端口的唯一 Application boundary；Qt 只消费 `chunk_controller_contracts.py` 的 body-safe view/preview/receipt。Chunk 只引用 exact Segment identity，独立 store 不修改 ProjectPackage，`ChunkScopeProjection` 不是 ResourcePackage/TMX payload authority。
+- `qt_editor_window.py` 不放置固定 Chunk 首页区；Project 下拉负责管理/选择当前分工，编辑、浏览/校对与 Document 文件夹使用同一 exact membership 投影。`qt_chunk_manager_dialog.py` 的段落起止/离散选择只服务高级操作，直接拆分按整项目或完整源分工均分。
 - openpyxl 只由 `parser_termbase_codec.py` 在 XLSX preflight 通过后条件导入，并固定 read-only/data-only、关闭 links/VBA；`resource_importer.py` 不拥有 active-sheet 或列选择语法。
 - `renpy_tm_compat.py` 是 Qt 无关纯函数兼容桥，不解析 `.rpy`、不依赖 Engine/Repository；它只服务 legacy exact lane，canonical TM 不经该桥。
 - `tm_schema_upgrade.py` 只消费 frozen contracts、activation 共用错误与 owner 注入的窄 plan/callback；不反向导入 `tm_sqlite_store.py` 或 `tm_migration.py`，不拥有 coordinator 状态。
@@ -130,6 +142,7 @@ Layer 1 resource / termbase / canonical TM storage
 
 - `tests/test_editor_*`：纯逻辑、项目和资源协调。
 - `tests/test_multi_document_cluster*`：多文档 workspace 的 current-source characterization、分 Cluster 架构边界、identity/origin/package/session 与最终验收。
+- `tests/test_collaborative_chunks_cluster*`：Chunk contract/store/topology、assignment/permission/progress/rebase、Controller/search/conflict/undo 与真实 Qt/ProjectPackage 验收。
 - `tests/test_project_search*`、`tests/test_qt_project_search*`：单 JSON 搜索 contracts/service/Controller/Qt 与 current-source acceptance。
 - `tests/test_feature5_ui_*`：真实 canonical activation/retrieval、mixed merge、failure 与 apply/write 跨层验收。
 - `tests/test_capability_host*`、`tests/test_tm_retrieval*`：capability publication、in-flight generation 与 Core query 语义。

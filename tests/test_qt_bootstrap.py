@@ -203,8 +203,14 @@ class QtBootstrapTest(unittest.TestCase):
         captured_identity: dict[str, str] = {}
 
         class CapturingWindow(QWidget):
-            def __init__(self, _controller: object) -> None:
+            def __init__(
+                self,
+                _controller: object,
+                *,
+                chunk_controller: object | None = None,
+            ) -> None:
                 super().__init__()
+                self.chunk_controller = chunk_controller
                 self.pages = SimpleNamespace(
                     currentWidget=lambda: SimpleNamespace(
                         objectName=lambda: "editorPage"
