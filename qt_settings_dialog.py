@@ -2267,8 +2267,8 @@ class QtSettingsDialog(QDialog):
             return
         if not self.controller.resource_package_import_supported(result):
             self._show_import_feedback(
-                "该 TMX ResourcePackage 是互操作导出包；"
-                "当前导入仅支持 TM JSONL/v1 与术语 CSV/v1 ResourcePackage。",
+                "TMX ResourcePackage 当前仅支持导出，不能导入 LocalCAT；"
+                "当前可导入 TM JSONL/v1 与术语 CSV/v1 ResourcePackage。",
                 failed=True,
             )
             return

@@ -165,7 +165,8 @@ class QtResourcePortabilityTests(unittest.TestCase):
                     report,
                     None,
                 )
-            self.assertIn("互操作导出包", feedback.call_args.args[0])
+            self.assertIn("仅支持导出", feedback.call_args.args[0])
+            self.assertIn("不能导入 LocalCAT", feedback.call_args.args[0])
             self.assertTrue(feedback.call_args.kwargs["failed"])
             dialog.close()
 
