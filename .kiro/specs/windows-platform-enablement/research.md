@@ -8,8 +8,8 @@
   - UI 依赖、PySide6/Qt、`qwindows.dll`、真实 Qt 窗口和 SQLite FTS5/trigram 均已通过；当前阻塞不是依赖安装或 Qt 插件。
   - 源码启动被 `collaborative_chunk_store.py` 顶层 `import fcntl` 阻断；Parser 之后又会按合同返回 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE`。静态扫描命中 43 个源码/测试文件，说明这不是单文件兼容补丁。
   - Windows 的 share mode 本身是协议一部分：缺少 `FILE_SHARE_DELETE` 会阻止 rename/delete；这既能固定 rooted ancestor，也会在错误的 handle lifetime 下阻塞合法原子发布。
-  - Windows 的 `VolumeSerialNumber + 128-bit FileId` 只适合比较同时存活的 handles；FileId 删除后可能复用，跨重启 receipt 必须另绑定 exact digest、phase/generation、private proof 与 device secret。reparse、ACL/SID、write-through 和 naming durability 的等价合同会改变跨 Spec 身份/持久化表示，满足 ADR 候选门槛。
-  - PyInstaller 官方支持把指定模块以真实 `.py` 形式外置收集；这使保留现有 `SourceFileLoader` 身份合同成为首选，而不是发明弱化的 frozen boolean 或仅复制 data。
+  - Windows 的 `VolumeSerialNumber + 128-bit FileId` 只适合比较同时存活的 handles；FileId 删除后可能复用。W2只提供nested `WindowsPrivateProof`，Gate D compatibility与canonical phase/generation继续由各自owner envelope绑定；reparse、ACL/SID、write-through和naming durability会改变跨Spec身份/持久化表示，满足ADR候选门槛。
+  - PyInstaller可把指定模块以真实`.py`外置收集，但`SourceFileLoader` metadata仍可能对应bytecode cache；W3必须用retained-handle exact-byte loader/direct compile证明实际执行bytes，并完整列出bootstrap TCB，不能只复制data或检查origin/co_filename。
 
 ## 现场失败/通过矩阵
 
@@ -36,7 +36,7 @@
 - `parser_source.py:97-115` 已集中定义 rooted capability fail-closed 入口，公共 `SourceReference`、sealed snapshot 和稳定错误映射可保留。
 - `project_package.py`、`tm_snapshot_artifacts.py` 等已经采用“绑定 parent、校验 identity、candidate、replace、fsync、LKG/recovery”的协议形状；业务状态机和错误码应复用，而不是重写。
 - `tm_migration.py:4895-5214` 已定义 persistent per-resource reservation 的 payload、单链接约束、reprove、崩溃释放意图；只需把具体 POSIX lock/identity 操作下沉到共享能力。
-- `capability_host.py` 已把 `__file__`、`ModuleSpec`、`SourceFileLoader.path`、代码对象和 fixture digest 绑定成 fail-closed 图；优先满足现有合同。
+- `capability_host.py` 已把 `__file__`、`ModuleSpec`、loader path、代码对象和fixture digest绑定成fail-closed图；Windows frozen amendment必须在不弱化Gate的前提下把metadata proof升级为retained-handle source digest + loader attestation + exact-byte compile proof。
 - `requirements-ui.txt`、`tm.jsonl`、`terms.csv`、`LocalCAT-logo-silver.png`、`benchmark_tm_contract.json` 和 Gate A/C fixtures 均在源码树中；Windows `.ico` 和受版本控制 PyInstaller spec 当前不存在。Qt avatar catalog 的 Windows 功能探针已确认匹配头像能够索引、解码并按 UI 尺寸渲染。
 
 ### 需要迁移的代码簇
@@ -100,7 +100,8 @@
   - `msvcrt.locking` 只暴露 CRT byte-range 锁，阻塞模式固定重试十次、每次一秒；不利于精确映射稳定 timeout/competition 结果。
 - **Implications**:
   - 共享 Windows backend 直接封装 `LockFileEx/UnlockFileEx`，并将 handle identity、byte range、等待策略和错误映射纳入合同。
-  - 锁文件持久存在且不 unlink；创建、private ACL、payload 和 single-link proof 与 lock ownership 分离。
+  - 锁文件持久存在且不unlink；W1自行拥有protocol-control integrity ACL、payload和single-link proof，W2只拥有attestation/device-secret private representation，从而避免`W1 lock → W2 private proof → W1 rooted/publish`循环。
+  - 首次creator必须以share-none init handle写入可重算versioned payload并flush/readback；并发loser重试。creator crash后只允许在exact ACL/root/single-link复证与exclusive init open下恢复空/expected strict-prefix/完整expected bytes，未知payload永不自动unlink/replace。
 
 ### Windows private storage、owner 与 attestation identity
 - **Context**: ADR-013 当前以 `0700` directory、`0600` files、uid、mode、nlink、dev/inode 和 directory fsync 表达 device-local attestation；这些值不能原样搬到 Windows。
@@ -126,13 +127,13 @@
   - [PyInstaller Runtime Information](https://pyinstaller.org/en/stable/runtime-information.html)
 - **Findings**:
   - spec 的 `datas` 是显式数据收集入口；普通 pure modules 默认进入 PYZ。
-  - hook 的 `module_collection_mode='py'` 会把指定模块作为外部源 `.py` 收集且不收集 bytecode；`pyz+py` 则可能造成运行来源与外置源不一致。
-  - bundled `__file__` 会指向 bundle 内路径，但这不自动保证 loader、spec.origin、digest 和递归 fixture 闭包；现有 capability host 仍须实际 revalidate。
-  - 当前 capability host 使用 `Path.resolve/lstat/st_dev/st_ino`，Windows 的 `O_NOFOLLOW` fallback 为 0；仅收集真实 `.py` 不能证明 bundle ancestor/source/fixture 不经 reparse。需要一个不依赖待验证 adapter 的最小 embedded bootstrap trust root。
+  - hook 的`module_collection_mode='py'`会把指定模块作为外部源`.py`收集且不收集对应PyInstaller bytecode；`pyz+py`会造成运行来源与外置源不一致。
+  - bundled `__file__`/`spec.origin`/`co_filename`即使一致也不证明实际执行bytes来自该`.py`：CPython `SourceLoader`可消费bytecode cache，filename仍报告source path。critical source必须拒绝`.pyc`/`__pycache__`/PYZ duplicate，并由trusted loader从retained verified handle读取exact bytes后直接编译。
+  - PyInstaller bootloader在Python-level项目bootstrap前已加载Python DLL、设置runtime环境并执行runtime hooks；因此DLL policy必须由release-owned native entry在首次Python DLL/非KnownDLL load前建立，Python bootstrap不能追溯保护这些load。完整TCB还包含必要stdlib/ctypes/hash/manifest/loader和native DLL，必须区分“唯一项目级bootstrap authority”与“完整Boot TCB”。
 - **Implications**:
-  - 从 Gate roots 和 frozen owner manifest 生成 module/data closure，关键模块使用 `py` collection mode，避免手写易漂移列表。
-  - 构建后运行 probe，逐个断言 `.py`、loader、origin、fixture digest、资源路径和 repository-path absence。
-  - W3 批准后的第一个实现证据必须是最小 frozen spike，验证 exact `SourceFileLoader/spec.origin/co_filename`、无 PYZ duplicate、bootstrap handle-read 和 reparse/swap fail-closed；失败先重开 W3，不拖到完整打包阶段。
+  - 从Gate roots和frozen owner manifest生成module/data/Boot-TCB closure；production build只接受clean tracked tree，并对spec/hooks/generator/bootstrap/roots、locked wheels、release-owned native bootloader/Python/native runtime逐项内容寻址；审计entry前PE imports/delay-load并保存native DLL load attestation。
+  - 构建后probe逐个断言`.py` retained-handle digest、`TrustedSourceLoader` direct-compile attestation、origin/co_filename、fixture digest、DLL inventory、资源路径和repository-path absence。
+  - W3批准后的第一个实现证据必须是最小frozen spike，验证exact executed-source bytes、无`.pyc`/`__pycache__`/PYZ duplicate、bootstrap handle-read、DLL path injection和reparse/swap fail-closed；失败先重开W3。
 
 ### Qt 与 SQLite 发行运行时
 - **Context**: venv 已通过，但 frozen 产物必须在无仓库/无 Qt 环境独立验证。
@@ -170,7 +171,7 @@
 
 | Option | Description | Strengths | Risks / Limitations | Disposition |
 |---|---|---|---|---|
-| external source via `module_collection_mode='py'` | 关键模块只以 bundle 中真实 `.py` 加载 | 可建立明确 loader/source identity | 需由 W3 新建合同、bootstrap root并实测 loader | **Proposed** |
+| external source + retained-handle trusted loader | `module_collection_mode='py'`收集真实`.py`，bootstrap loader从已验证handle读取并直接编译 | 绑定被验证与被执行bytes | 需W3冻结完整TCB、loader attestation和bytecode拒绝 | **Proposed** |
 | `pyz+py` 双份 | PYZ 执行 + data 中另有 `.py` | 便于查阅 | 运行来源可能不是被验证文件 | Rejected unless proof shows exact binding |
 | 新 frozen manifest 信任 | 改为摘要/signature manifest | 可减少裸源码 | 改变现有 source identity 与信任根 | Deferred; requires separate ADR/counterexamples |
 | 禁用 Gate | frozen 直接可启动 | 无 | 明确违反能力合同 | Prohibited |
@@ -190,18 +191,18 @@
 - **Follow-up**: junction、symlink、mount-point、ancestor swap、hardlink、FileId reuse/restart 反例必须先通过；失败则评估 `NtCreateFile` fallback 并重新审 ADR。
 
 ### Decision 3：锁与发布保持 handle-bound
-- **Selected Approach**: `LockFileEx` 保护 persistent single-link lock file；candidate 用 `CREATE_NEW`、private ACL、file flush，随后从 candidate handle 相对 bound parent rename/replace，capture facts 后关闭 candidate 再 readback；replace 只在 owner-defined 排他资源 lock 下允许，恢复继续由既有 journal/LKG 状态机决定。
+- **Selected Approach**: `LockFileEx`保护W1 integrity-ACL persistent single-link lock file；candidate用`CREATE_NEW`与请求的security profile创建，rename后关闭candidate再reopen/readback，并保留no-write/no-delete destination handle到owner durable commit与terminal reproof；replace只在owner-defined排他资源lock下允许。
 - **Rationale**: 崩溃释放、跨进程互斥、source identity 与 destination parent 都能绑定 handle。
 - **Trade-offs**: 平台层不提供 expected-target CAS；不合作同用户进程仍可能竞态。需要更强保护的 owner 使用 immutable generation + journal/pointer。naming durability success boundary 需要 Windows 专属 ADR 与真实 power-cut/reboot 证明；不承诺 lock fairness。
 
 ### Decision 4：由 W3 建立 frozen-source/bootstrap 合同
-- **Selected Approach**: PyInstaller `--onedir --windowed` + generated spec/hook；关键模块 `module_collection_mode='py'`，fixtures/data/assets 按生成 manifest 保持相对布局；embedded minimal bootstrap 在外置源码导入前绑定 bundle/source/fixture handles并铸造 `TrustedSourceAuthority`。
+- **Selected Approach**: PyInstaller `--onedir --windowed` + release-owned native bootloader/generated spec/hook；native entry在首次Python DLL/非KnownDLL load前固定搜索、绑定bundle并移交attestation，关键模块`module_collection_mode='py'`且无bytecode/PYZ duplicate；Python bootstrap闭合其余Boot TCB/source/fixture handles，`TrustedSourceLoader`从retained handle读取、摘要、直接编译exact bytes，再铸造`TrustedSourceAuthority`。W3治理可与W1并行，bootstrap实现必须满足已采纳W1 invariants。
 - **Rationale**: ADR-011 只拥有 Feature 5/UI DTO 与 composition，不是 source-loader trust authority；W3 必须明确建立 loader、bootstrap、manifest 和长期 build ownership 合同，不能把现状误称为 ADR-011 已批准。
 - **Trade-offs**: 发行物包含可读源码且体积增加；这是当前能力合同的显式成本。
 
 ### Decision 5：按阻塞依赖分簇交付
 1. Governance/ADR/ownership closure。
-2. 最小 frozen bootstrap/SourceFileLoader feasibility spike；失败回到 W3。
+2. 最小 frozen Boot TCB/TrustedSourceLoader exact-byte feasibility spike；失败回到 W3。
 3. 平台合同、Windows native primitives、POSIX adapter parity、power-cut 与反例 harness。
 4. Parser + collaborative startup vertical slice。
 5. 项目/资源/TMX persistence vertical slice。
@@ -215,16 +216,16 @@
 
 1. **ADR candidate W1 — Cross-platform rooted file authority, lock and durable publish boundary**
    - 改变共享 dependency/layer/composition boundary。
-   - 定义 Windows live-handle identity、reparse、share mode、LockFileEx、candidate close/reopen lifecycle、非 CAS threat scope、handle-relative rename、NTFS power-cut durability success boundary 与稳定错误族。
+   - 定义Windows live-handle identity、reparse/share mode、W1 lock integrity ACL、retained readback→owner commit→terminal reproof、非CAS threat scope、版本化`DurabilityProfile`与稳定错误族。
    - 与 ADR-008/009/018/019 的 authority/atomicity/fail-closed 决策相交。
 2. **ADR candidate W2 — Windows device-local private attestation representation**
-   - 将 ADR-013/016 的 POSIX uid/mode/dev/inode 表示扩展为 TokenUser/owner SID、精确 DACL/AccessCheck、live VolumeSerial/FileId，并定义绑定 digest/phase/private/device-secret 的 cross-restart re-attestation 与 FileId reuse 反例。
+   - 在Windows物理表示范围部分取代ADR-013/016的POSIX uid/mode/dev/inode谓词，冻结exact `windows-private-v1` SID/DACL/AccessCheck与nested `WindowsPrivateProof`；Gate D/canonical owner envelopes保持正交。
    - 改变 frozen/persistent identity 与安全恢复边界。
 3. **ADR candidate W3 — Windows frozen distribution ownership and source closure**
-   - 新建 onedir/windowed build owner、embedded bootstrap trust root、`TrustedSourceAuthority`、generated source/fixture closure、bundle-root/loader contract 及发行门。
+   - 新建onedir/windowed build owner、native-entry pre-Python DLL policy、完整Boot TCB、retained-handle exact-byte `TrustedSourceLoader`、`TrustedSourceAuthority`、clean/content-addressed source/fixture closure及发行门。
    - ADR-011 仍只拥有 Feature 5/UI DTO 与 composition；W3 是新的跨 Spec frozen/source-loader contract 与长期所有权，满足候选门槛。
 
-用户已在 2026-08-25 将 W1/W2/W3 批准为 `APPROVED_FOR_BASELINE_NAMING`，因此本 Spec、依赖图和 amendment dispatch 可以稳定引用这些临时标签。正式 ADR 文档、编号、相交/取代关系和 Steering merge 仍由 Task 0.1/0.2 闭合；在此之前 design validation 与实现保持 **NO-GO**。
+用户已在 2026-08-25 将 W1/W2/W3 批准为 `APPROVED_FOR_BASELINE_NAMING`，因此本 Spec、依赖图和 amendment dispatch 可以稳定引用这些临时标签；治理分支已形成唯一映射的 ADR-020/W1、ADR-021/W2、ADR-022/W3 草案。草案的人工采纳、取代关系落账和 Steering merge 仍由 Task 0.1/0.2 闭合；在此之前 design validation 与实现保持 **NO-GO**。
 
 ## Risks & Mitigations
 - **Windows share mask 自阻塞** — 为 root/intermediate/source/target/candidate/lock 定义不同 handle profiles；运行占用目标、同进程二次打开和跨进程 replace 矩阵。
@@ -234,7 +235,9 @@
 - **FileId reuse 被误当永久身份** — FileId 只比较 live handles；receipt 绑定 digest/phase/private/device-secret并在重启后重新证明，覆盖 delete/recreate reuse。
 - **process fault 被误当 durability** — W1 固定 NTFS success boundary，并用批准的 disposable VM/VHD/物理 lab 执行 forced power-off/reboot；缺证据保持 NOT_VERIFIED。
 - **Windows ACL 与 POSIX mode 不等价** — ADR 固定 SID/DACL 规则，按 handle 重验 owner、DACL、inheritance、nlink；不使用 `chmod(0600)` 假通过。
-- **同名 source 的 bundle 双份执行** — 关键模块使用 source-only collection；构建后检查 module loader/spec/origin 和不允许的 PYZ duplicate。
+- **W2 proof 形成 self-MAC 或吞并业务 envelope** — business owner先对不含proof的canonical private-context取摘要，W2只对domain-separated unsigned proof projection做HMAC；Gate D/canonical envelope仍由原owner解释和发布。
+- **Python bootstrap被误写成最早DLL authority** — native bootloader已先加载Python DLL；W3必须在native entry/首次非KnownDLL load前固定搜索、绑定bundle并以受限绝对路径加载，Python层只消费handoff attestation。
+- **同名source或bytecode抢先执行** — 关键模块source-only collection且拒绝`.pyc`/`__pycache__`/PYZ duplicate；bootstrap loader只编译retained verified handle的exact bytes，CapabilityHost核对loader attestation与source digest。
 - **手写 manifest 漂移** — 从 Gate roots 与 owner manifest 生成闭包并在 CI diff/check；任何未声明动态 import 使 build gate 失败。
 - **GUI windowed 无 stderr** — 提供受合同约束的 marker/log/exit probe；发布 E2E 同时运行真实 visible window 与 failure diagnostics。
 - **范围过大导致半完成发布** — 每簇有 observable matrix，但只有最后 packaged clean-user matrix 全绿才将状态从 NOT_VERIFIED 改为 VERIFIED。

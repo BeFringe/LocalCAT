@@ -46,15 +46,16 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. If 锁对象、锁范围或底层文件身份不能被证明与目标资源一致, the 锁请求 shall fail closed，且不得进入受保护的发布或迁移区段。
 4. While 锁已持有, the 文件打开共享语义 shall 允许协议要求的读取、flush 与原子发布，同时拒绝会破坏互斥和身份证明的冲突操作。
 5. The Windows 锁合同 shall 不对公平性或排队顺序作超出操作系统可证明范围的承诺，并 shall 为竞争、超时、身份不匹配与平台不可用提供稳定结果。
+6. When persistent lock file 首次由两个进程并发创建或 creator 在 payload durable 前退出, the 锁能力 shall 通过独占初始化 profile 区分初始化进行中、可证明的空/严格前缀残留与未知 tamper；后继只能恢复可证明残留，未知 bytes shall fail closed，且不得 unlink/replace 该载体。
 
 ### Requirement 4：原子发布、durability 与恢复
 **目标：** 作为项目和 TM 数据的所有者，我希望 Windows 上的保存与发布在成功返回后满足已声明的持久化合同，并在中断后恢复到有效状态，以便不会出现静默丢失或半发布。
 
 #### 验收标准
 1. When 内容被提交到 canonical path, the 发布能力 shall 在同一授权 parent 中准备完整候选、完成内容 flush，并按 `CREATE_IF_ABSENT` 或持有 owner-defined 排他资源锁的 `REPLACE_UNDER_LOCK` 模式执行协议允许的原子命名操作；平台层不得把 pre-snapshot 宣称为 expected-target 原子 CAS。
-2. If Windows 在 arm 之前无法证明获批文件系统的命名持久性边界, the 发布能力 shall 返回 `PLATFORM.FS.DURABILITY_UNAVAILABLE` 且不发布；If arm 之后命名结果或重启持久性无法确定, the 发布能力 shall 返回 `PLATFORM.FS.RECOVERY_REQUIRED`，不得返回成功。
+2. If Windows 在 arm 之前无法证明 runtime host/volume/storage-cache facts 精确匹配 W1 批准的版本化 `DurabilityProfile` 及其 forced-power-loss evidence family, the 发布能力 shall 返回 `PLATFORM.FS.DURABILITY_UNAVAILABLE` 且不发布；If arm 之后命名结果或重启持久性无法确定, the 发布能力 shall 返回 `PLATFORM.FS.RECOVERY_REQUIRED`，不得返回成功。
 3. If 进程在 prepare、replace、metadata commit 或 cleanup 任一边界中断, the 恢复流程 shall 只选择完整且可验证的旧版本或新版本，不得消费部分文件。
-4. While 读取句柄、锁句柄、临时文件或发布句柄仍存活, the 发布能力 shall 使用与原子替换协议一致的共享方式和生命周期，避免自身句柄阻塞合法 commit。
+4. While 读取句柄、锁句柄、临时文件或发布句柄仍存活, the 发布能力 shall 使用与原子替换协议一致的共享方式和生命周期；replace 后的 destination readback handle shall 保持禁止 write/delete 的共享约束，直到 owner durable metadata commit 与 terminal identity/digest/state reproof 完成，且不得自身阻塞合法 commit。
 5. When replace、flush 或 recovery 失败, the 调用方 shall 收到稳定错误，现有 canonical authority shall 保持可识别，且失败候选不得伪装成已发布状态。
 
 ### Requirement 5：共享平台边界与现有消费者接入
@@ -94,7 +95,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. If 两个进程并发尝试首次激活同一 TM, the TM 系统 shall 最多发布一个 canonical authority；失败方 shall 获得稳定竞争/现有 authority 结果。
 4. If activation 在 reservation、migration、seal、publish 或 cleanup 边界中断, the TM 系统 shall 按 ADR-012/013/016 分类残留与重新证明，不得把未知残留当作成功 authority。
 5. If volume/file identity 或 device-local attestation 在 Windows 上不能被证明, the TM 系统 shall fail closed，并不得用弱于现有 POSIX 合同的路径字符串或可复制 token 替代。
-6. When Windows TM authority 跨重启恢复, the TM 系统 shall 重新证明当前对象、exact content digest、generation/phase、private access 与 device secret binding；持久 receipt shall 不把历史 Volume/FileId 本身当作永久身份。
+6. When Windows TM authority 跨重启恢复, the TM 系统 shall 由 Gate D 或 canonical owner 在各自版本化 envelope 中重新证明当前对象、exact content digest、compatibility 或 generation/phase，并重验嵌套的 `WindowsPrivateProof` 与 device-secret binding；共享平台层 shall 不合并业务 envelope，持久 proof shall 不把历史 Volume/FileId 本身当作永久身份。
 
 ### Requirement 9：TMX 导入、SQLite FTS5 与持久检索
 **目标：** 作为译者，我希望在 Windows 导入 TMX 并通过 FTS5 使用已激活 TM，以便核心翻译记忆流程完整可用。
@@ -110,18 +111,18 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 **目标：** 作为能力 Gate 的维护者，我希望 frozen EXE 能证明它执行的安全关键源码和 fixtures 与受审版本一致，以便 PyInstaller 冻结不会绕过 source identity 契约。
 
 #### 验收标准
-1. When frozen LocalCAT 初始化 capability host, the frozen-source 合同 shall 为所有能力关键模块提供真实、严格存在且可按获批 loader/manifest 身份验证的 `.py` 来源。
+1. When frozen LocalCAT 初始化 capability host, the frozen-source 合同 shall 为所有能力关键模块提供真实、严格存在的 `.py` 来源，并由获批 `TrustedSourceLoader` 从 retained verified handle 读取、摘要和直接编译 exact source bytes；loader metadata alone shall 不构成 executed-byte proof。
 2. When Gate A/C 或其他能力图解析 root manifest, the frozen 产物 shall 包含递归闭包中的源码、JSON/TXT fixtures、摘要和相对路径，并执行与源码环境相同的 Gate。
-3. If frozen 模块的运行来源、文件摘要、manifest 闭包或 fixture 身份不一致, the capability host shall fail closed，且应用不得宣称相关能力可用。
-4. While 构建 frozen 产物, the 构建流程 shall 不以仅把 `.py` 复制为 data、隐藏导入或跳过 validation 的方式假定 source identity 已满足。
+3. If frozen 模块的运行来源、executed-source digest、loader attestation、manifest 闭包或 fixture 身份不一致，或关键模块存在 `.pyc`、`__pycache__`、未声明 PYZ duplicate, the capability host shall fail closed，且应用不得宣称相关能力可用。
+4. While 构建 frozen 产物, the 构建流程 shall 不以仅把 `.py` 复制为 data、检查 `origin`/`co_filename`、隐藏导入或跳过 validation 的方式假定 source identity 已满足。
 5. The frozen-source 合同 shall 同时说明源码运行与 frozen 布局的 bundle root 解析，并不得依赖构建机当前工作目录。
-6. When frozen capability host 导入任何能力关键模块或读取 fixture, the bootstrap shall 先以不依赖待验证 Python adapter 的最小原生可信根绑定 bundle，证明 ancestor/final reparse、live-handle identity、manifest digest 和 handle-read；不得先信任 capability host 再用其证明自身。
+6. When frozen capability host 导入任何能力关键模块或读取 fixture, the release-owned native bootloader shall 审计 entry 前 PE import、在首次非 KnownDLL/Python DLL load 前固定 DLL 搜索并绑定 bundle/native directory，随后移交不可伪造 attestation；Python bootstrap 再闭合版本化 Boot TCB（含 bootloader、Python DLL、pre-authority hooks、必要 stdlib/ctypes/hash/manifest/loader 与 native/system DLL allowlist），以不依赖待验证 Python adapter 的原生可信根证明 ancestor/final reparse、live-handle identity、manifest digest 和 handle-read。不得先信任 capability host 再用其证明自身，也不得声称 Python-level policy 能追溯保护 entry 前加载。
 
 ### Requirement 11：Windows onedir/windowed 发行物与资源
 **目标：** 作为 Windows 用户，我希望获得可解压运行的 LocalCAT EXE，以便无需 Python 环境即可使用经过验证的功能。
 
 #### 验收标准
-1. When 构建首个 Windows 发行候选, the 构建流程 shall 使用 PyInstaller `--onedir --windowed`，并在该形态全部通过前不切换到 `--onefile`。
+1. When 构建首个 Windows 发行候选, the 构建流程 shall 使用 PyInstaller `--onedir --windowed`；切换到 `--onefile` shall 视为改变 frozen trust/recovery boundary，并须另立 ADR 后方可实施。
 2. When 检查发行目录, the 产物 shall 包含 `qwindows.dll`、获批 frozen-source 闭包、Gate fixtures、`tm.jsonl`、`terms.csv`、`LocalCAT-logo-silver.png` 和 `benchmark_tm_contract.json`。
 3. When 从非仓库当前目录启动 EXE, the 应用 shall 通过 bundle root 解析并加载所需数据和资源。
 4. The Windows 发行物 shall 使用受版本控制的 `.ico`、产品名称和版本元数据，并 shall 不从构建机仓库路径读取运行时依赖。
@@ -133,6 +134,6 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 #### 验收标准
 1. When Windows 发行候选进入验收, the 验证流程 shall 从干净用户配置执行依赖/构建、Qt 启动、项目保存/重开、TM 激活/重启恢复、TMX 导入、SQLite FTS5、qwindows、全部能力 Gate、锁竞争、崩溃恢复和资源可见性测试。
 2. When 运行安全反例矩阵, the 验证流程 shall 覆盖 symlink/junction/reparse、hardlink、ancestor swap、目标占用、进程终止、双进程竞争、替换失败和恢复边界。
-3. If 任一发布阻塞项失败、跳过或只在源码环境通过, the Windows 发行状态 shall 保持 NOT_VERIFIED，且不得发布为可用版本。
+3. If 任一发布阻塞项失败、跳过、只在源码环境通过，或 production build 不能证明 clean tracked tree 与全部实际构建输入的 content-addressed provenance, the Windows 发行状态 shall 保持 NOT_VERIFIED，且不得发布为可用版本。
 4. The 验证交付物 shall 包含可复现 PowerShell 命令、环境与版本清单、完整日志、通过/失败矩阵、Windows 文件系统/锁适配清单和 frozen-source/打包清单。
 5. The 验证流程 shall 在同一提交上运行 Windows 与既有 macOS/Linux 回归，并明确记录平台专属预期差异。
