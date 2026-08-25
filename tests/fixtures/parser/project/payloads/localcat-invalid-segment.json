@@ -1,0 +1,6 @@
+{
+  "segments": [
+    {"id": "same", "source": "First"},
+    {"id": " same ", "source": "Second"}
+  ]
+}

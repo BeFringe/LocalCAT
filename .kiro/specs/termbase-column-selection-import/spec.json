@@ -1,0 +1,22 @@
+{
+  "feature_name": "termbase-column-selection-import",
+  "created_at": "2026-08-21T12:25:42Z",
+  "updated_at": "2026-08-21T13:04:28Z",
+  "language": "zh-CN",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}

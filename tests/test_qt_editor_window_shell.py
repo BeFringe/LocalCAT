@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionComboBox,
     QStyleOptionToolButton,
+    QToolButton,
 )
 
 from editor_contracts import ResourceKind, SegmentDensity, WorkspaceMode
@@ -277,8 +278,8 @@ class QtEditorWindowShellTest(unittest.TestCase):
 
             with patch.object(
                 QFileDialog,
-                "getOpenFileName",
-                return_value=("", ""),
+                "getOpenFileNames",
+                return_value=([], ""),
             ) as choose:
                 QTest.mouseClick(
                     button,
@@ -289,20 +290,19 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 QTest.keyClick(button, Qt.Key.Key_Space)
             self.assertEqual(choose.call_count, 2)
 
-            opened: list[bool] = []
-
-            def close_existing_menu() -> None:
-                opened.append(True)
-                QTimer.singleShot(0, window.project_menu.close)
-
-            window.project_menu.aboutToShow.connect(close_existing_menu)
-            QTest.mouseClick(
-                button,
-                Qt.MouseButton.LeftButton,
-                pos=menu_rect.center(),
+            self.assertIs(button.menu(), window.project_menu)
+            self.assertEqual(
+                button.popupMode(),
+                QToolButton.ToolButtonPopupMode.MenuButtonPopup,
             )
-            self._events()
-            self.assertEqual(opened, [True])
+            self.assertEqual(
+                tuple(action.text() for action in window.project_menu.actions()[:3]),
+                (
+                    "打开本地项目",
+                    "打开 ProjectPackage",
+                    "预览并导入 ProjectPackage",
+                ),
+            )
             window.close()
 
     def test_resource_and_workspace_shortcuts_are_scoped_and_fail_closed(self) -> None:
@@ -536,7 +536,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertTrue(window.close())
             self._events()
 
-            self.assertEqual(len(clicked), 2)
+            self.assertEqual(clicked, ["放弃修改", "放弃修改"])
             self.assertFalse(window.isVisible())
 
     def test_three_columns_keep_usable_sizes_after_resize(self) -> None:

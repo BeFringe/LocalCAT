@@ -28,6 +28,7 @@ from tm_content_attestation import (
     LOGICAL_CLOSURE_VERSION,
     _capture_content_file,
     _create_active_content_attestation,
+    _create_sealed_content_attestation,
 )
 from tm_contracts import (
     CanonicalResourceIdentity,
@@ -2391,6 +2392,260 @@ def _revalidate_recovered_active_set(
             retryable=False,
         ) from error
     return snapshot
+
+
+def _device_only_rebound_completed_record(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> _ActivationJournalRecord:
+    """Re-prove and rebind one completed authority after ``st_dev`` drift.
+
+    Some local filesystems assign a new device number after a machine
+    restart while retaining the same mounted volume, inode namespace, and
+    bytes.  The ordinary cold-open path intentionally continues to reject
+    that identity change.  This explicit maintenance path is narrower: all
+    three adjacent authority files must move from one common persisted
+    device number to one common live device number while retaining their
+    exact inode, size, and SHA-256.  It then rebuilds both attestations and
+    the journal identity pairs as one immutable record and runs the normal
+    active-set integrity proof before any durable write.
+
+    No missing file, mixed-device move, inode replacement, byte drift,
+    pending phase, or stage residue is repairable through this seam.
+    """
+
+    if record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED:
+        raise ActivationPreparationError(
+            "ACTIVATION.REATTESTATION_NOT_APPLICABLE",
+            retryable=False,
+        )
+    active = _require_bound_active_content_attestation(
+        record,
+        canonical_store_id=record.canonical_store_id,
+        next_generation=(
+            0
+            if record.expected_prior_generation is None
+            else record.expected_prior_generation + 1
+        ),
+        activation_digest=_activation_publication_digest(
+            record,
+            next_generation=(
+                0
+                if record.expected_prior_generation is None
+                else record.expected_prior_generation + 1
+            ),
+        ),
+    )
+    if (
+        _lstat_any_entry(record.candidate_stage_db_path)
+        or _lstat_any_entry(record.candidate_manifest_temp_path)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.REATTESTATION_NOT_APPLICABLE",
+            retryable=False,
+        )
+    identity = port.resource_identity
+    try:
+        database = _capture_content_file(identity.canonical_sidecar_path)
+        manifest = _capture_content_file(identity.snapshot_manifest_path)
+        source = _capture_content_file(identity.configured_jsonl_path)
+    except ContentAttestationError as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.REATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        ) from error
+
+    persisted_proofs = (
+        active.database,
+        active.manifest,
+        active.source,
+    )
+    observed_proofs = (database, manifest, source)
+    persisted_devices = {proof.device for proof in persisted_proofs}
+    observed_devices = {proof.device for proof in observed_proofs}
+    if (
+        len(persisted_devices) != 1
+        or len(observed_devices) != 1
+        or persisted_devices == observed_devices
+        or any(
+            (
+                observed.inode,
+                observed.size,
+                observed.sha256,
+            )
+            != (
+                persisted.inode,
+                persisted.size,
+                persisted.sha256,
+            )
+            for observed, persisted in zip(
+                observed_proofs,
+                persisted_proofs,
+                strict=True,
+            )
+        )
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.REATTESTATION_IDENTITY_INVALID",
+            retryable=False,
+        )
+
+    sealed = record.sealed_content_attestation
+    rebound_sealed = _create_sealed_content_attestation(
+        resource_id=sealed.resource_id,
+        target_identity=sealed.target_identity,
+        canonical_store_id=sealed.canonical_store_id,
+        snapshot_receipt_digest=sealed.snapshot_receipt_digest,
+        expected_prior_generation=sealed.expected_prior_generation,
+        evidence_digest=sealed.evidence_digest,
+        # Publication legitimately changes receipt/meta bytes after sealing.
+        # Preserve the historical sealed digest/size while rebinding only
+        # the filesystem device component; the inode is already proven
+        # identical to the live active database above.
+        database=replace(sealed.database, device=database.device),
+        manifest=manifest,
+        source=source,
+        semantic_facts=sealed.semantic_facts,
+    )
+    rebound_active = _create_active_content_attestation(
+        sealed_attestation_digest=rebound_sealed.attestation_digest,
+        journal_id=active.journal_id,
+        resource_id=active.resource_id,
+        target_identity=active.target_identity,
+        canonical_store_id=active.canonical_store_id,
+        snapshot_receipt_digest=active.snapshot_receipt_digest,
+        generation=active.generation,
+        activation_digest=active.activation_digest,
+        database=database,
+        manifest=manifest,
+        source=source,
+        semantic_facts=active.semantic_facts,
+    )
+    rebound = replace(
+        record,
+        candidate_stage_db_identity=(database.device, database.inode),
+        candidate_manifest_temp_identity=(manifest.device, manifest.inode),
+        source_jsonl_identity=(source.device, source.inode),
+        sealed_content_attestation=rebound_sealed,
+        active_content_attestation=rebound_active,
+    )
+    _revalidate_recovery_authority(port, rebound)
+    next_generation = rebound_active.generation
+    _ = _revalidate_recovered_active_set(
+        port,
+        rebound,
+        identity=identity,
+        canonical_store_id=rebound.canonical_store_id,
+        next_generation=next_generation,
+        activation_digest=rebound_active.activation_digest,
+        require_manifest_published=True,
+    )
+    return rebound
+
+
+def reattest_completed_authority(
+    port: _StoreValidationPort,
+) -> ActivationRecoveryReport:
+    """Explicitly re-attest one device-number-only completed authority.
+
+    The caller owns the cross-process resource reservation.  This Core
+    transition drains local leases, authenticates the sole completed main
+    journal, proves the exact device-only drift without mutation, atomically
+    replaces that journal through the existing fsync protocol, and only then
+    hydrates the same store id and generation.  A terminal-only or coexisting
+    authority remains fail-closed because replacing those recovery states is
+    not this maintenance operation.
+    """
+
+    if (
+        port.state not in {"READY", "ACTIVATING"}
+        or port.preparation is not None
+        or port.cleanup_reservation is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.REATTESTATION_STATE_INVALID",
+            retryable=True,
+        )
+    if port.state == "READY":
+        port.drain_for_transition()
+    try:
+        identity = port.resource_identity
+        journal_path = _activation_journal_path(identity)
+        terminal_path = _activation_terminal_path(identity)
+        journal_identity = _lstat_activation_journal_identity(journal_path)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+        if (
+            journal_identity is None
+            or terminal_identity is not None
+            or _lstat_any_entry(_activation_journal_temp_path(journal_path))
+            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.REATTESTATION_NOT_APPLICABLE",
+                retryable=False,
+            )
+        record = _load_recovery_journal(
+            port,
+            journal_path,
+            journal_identity,
+        )
+        _revalidate_recovery_authority(port, record)
+        rebound = _device_only_rebound_completed_record(port, record)
+        handle = port.write_journal(
+            rebound,
+            journal_path,
+            expected_final_identity=journal_identity,
+        )
+        report = _replay_terminal_recovery(
+            port,
+            rebound,
+            handle.file_identity,
+        )
+        port.preparation = None
+        port.cleanup_reservation = None
+        port.state = "READY"
+        port.notify_all()
+        return report
+    except BaseException:
+        port.notify_all()
+        raise
+
+
+def completed_authority_requires_reattestation(
+    port: _StoreValidationPort,
+) -> bool:
+    """Return true only for the exact device-number-only repair class.
+
+    This is a read-only display/classification probe.  It never grants or
+    hydrates authority; the explicit re-attestation transition repeats every
+    proof under the cross-process resource reservation before publishing.
+    """
+
+    if port.preparation is not None or port.cleanup_reservation is not None:
+        return False
+    identity = port.resource_identity
+    journal_path = _activation_journal_path(identity)
+    terminal_path = _activation_terminal_path(identity)
+    try:
+        journal_identity = _lstat_activation_journal_identity(journal_path)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+        if (
+            journal_identity is None
+            or terminal_identity is not None
+            or _lstat_any_entry(_activation_journal_temp_path(journal_path))
+            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+        ):
+            return False
+        record = _load_recovery_journal(
+            port,
+            journal_path,
+            journal_identity,
+        )
+        _revalidate_recovery_authority(port, record)
+        _ = _device_only_rebound_completed_record(port, record)
+    except ActivationPreparationError:
+        return False
+    return True
 
 
 def _revalidate_discovered_active_set(

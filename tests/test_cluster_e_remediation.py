@@ -20,7 +20,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, Qt
-from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QPushButton, QWidget
 
 import capability_host as capability_host_module
 from capability_host import CapabilityHostComposition
@@ -135,9 +135,15 @@ class ClusterERemediationTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class CapturingWindow(QWidget):
-            def __init__(self, controller: object) -> None:
+            def __init__(
+                self,
+                controller: object,
+                *,
+                chunk_controller: object | None = None,
+            ) -> None:
                 super().__init__()
                 captured["controller"] = controller
+                captured["chunk_controller"] = chunk_controller
                 self.pages = types.SimpleNamespace(
                     currentWidget=lambda: types.SimpleNamespace(
                         objectName=lambda: "editorPage"
@@ -172,6 +178,7 @@ class ClusterERemediationTests(unittest.TestCase):
             self.assertEqual(compose.call_count, 1)
             self.assertEqual(start_validation.call_count, 1)
             controller = cast(EditorController, captured["controller"])
+            self.assertIsNotNone(captured["chunk_controller"])
             self.assertTrue(controller.tm_suggestion_reports_enabled)
             report = controller.tm_suggestion_report()
             report.__post_init__()
@@ -858,8 +865,12 @@ class ClusterERemediationTests(unittest.TestCase):
 
             with (
                 patch(
-                    "qt_tm_threshold.QInputDialog.getDouble",
-                    return_value=(80, True),
+                    "qt_tm_threshold.QInputDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "qt_tm_threshold.QInputDialog.doubleValue",
+                    return_value=80,
                 ),
                 patch.object(
                     controller,

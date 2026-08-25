@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tmx version="1.4">
+  <header srclang="en-US"/>
+  <body>
+    <tu>
+      <tuv xml:lang="en-GB"><seg>Wrong exact source</seg></tuv>
+      <tuv xml:lang="en_US"><seg>Exact</seg></tuv>
+      <tuv xml:lang="zh-Hans"><seg>错误的精确译文</seg></tuv>
+      <tuv xml:lang="zh_CN"><seg>精确译文</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-GB"><seg>Fallback</seg></tuv>
+      <tuv xml:lang="zh-Hans"><seg>回退译文</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Variant</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>变体一</seg></tuv>
+    </tu>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Variant</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>变体二</seg></tuv>
+    </tu>
+  </body>
+</tmx>

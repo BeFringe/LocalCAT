@@ -1100,6 +1100,10 @@ def fault_matrix_source_paths(
     rows: tuple[FaultMatrixRow, ...] = FAULT_MATRIX_ROWS,
 ) -> tuple[str, ...]:
     paths = {
+        "tm_candidate_index.py",
+        "tm_candidate_store_contracts.py",
+        "tm_sqlite_candidate_projection.py",
+        "tm_sqlite_store.py",
         "tests/fault_matrix_registry.py",
         "tests/test_tm_fault_matrix.py",
         "tools/validate_tm_fault_matrix.py",

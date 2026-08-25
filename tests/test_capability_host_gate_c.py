@@ -921,12 +921,14 @@ def recompute_retrieval_validation(
     ) -> None:
         required_paths = (
             "tm_candidate_index.py",
+            "tm_candidate_store_contracts.py",
             "tm_contracts.py",
             "tm_gate_a.py",
             "tm_retrieval.py",
             "tm_retrieval_capability.py",
             "tm_retrieval_validation.py",
             "tm_similarity.py",
+            "tm_sqlite_candidate_projection.py",
             "tm_sqlite_store.py",
             "tests/fixtures/retrieval_gate_c_vectors_v1.json",
         )

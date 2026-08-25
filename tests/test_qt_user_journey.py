@@ -113,12 +113,25 @@ class QtUserJourneyTest(unittest.TestCase):
 
     def test_qt_layer_import_boundary_is_ast_guarded(self) -> None:
         forbidden = {
+            "editor_project",
             "resource_repository",
+            "speaker_inventory",
+            "target_preprocessor",
+            "termbase_store",
+            "project_search",
+            "text_matcher",
             "tm_engine",
             "glossary_engine",
             "logic_controller",
         }
-        for filename in ("qt_editor_window.py", "qt_settings_dialog.py"):
+        for filename in (
+            "qt_editor_window.py",
+            "qt_settings_dialog.py",
+            "qt_speaker_inventory_dialog.py",
+            "qt_speaker_avatar.py",
+            "qt_preprocess_dialog.py",
+            "qt_termbase_dialog.py",
+        ):
             with self.subTest(filename=filename):
                 tree = ast.parse((ROOT / filename).read_text(encoding="utf-8"))
                 imported: set[str] = set()

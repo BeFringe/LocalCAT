@@ -10,13 +10,21 @@ from pathlib import Path
 from typing import cast
 
 from editor_contracts import (
+    BrowseGroupDisplayMode,
+    BrowseGroupPreferences,
     DEFAULT_EDITOR_FONT_SIZE,
     DisplayPreferences,
+    LiteralReplaceRule,
+    PreprocessPreferences,
     RecentProject,
+    RecentWorkspaceProject,
     SegmentDensity,
     TMPreferences,
     WorkspaceMode,
 )
+
+
+_RecentEntry = RecentProject | RecentWorkspaceProject
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +34,49 @@ MAX_RECENT_PROJECTS = 10
 
 class WorkspaceStateError(RuntimeError):
     """Raised when local workspace state cannot be written safely."""
+
+
+def _clone_preprocess_preferences(
+    preferences: PreprocessPreferences,
+) -> PreprocessPreferences:
+    """Validate and detach the complete device-local preprocessing graph."""
+
+    if type(preferences) is not PreprocessPreferences:
+        raise TypeError("preprocess preferences contract is required")
+    preferences.__post_init__()
+    cloned = PreprocessPreferences(
+        rules=tuple(
+            LiteralReplaceRule(
+                find=rule.find,
+                replacement=rule.replacement,
+                enabled=rule.enabled,
+            )
+            for rule in preferences.rules
+        ),
+        include_draft=preferences.include_draft,
+        include_confirmed=preferences.include_confirmed,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _recent_payload(item: _RecentEntry) -> dict[str, object]:
+    if type(item) is RecentProject:
+        return {
+            "path": str(item.path),
+            "segment_id": item.segment_id,
+            "index": item.index,
+        }
+    if type(item) is RecentWorkspaceProject:
+        return {
+            "path": str(item.path),
+            "segment_id": item.local_segment_id,
+            "index": item.index,
+            "project_id": item.project_id,
+            "document_id": item.document_id,
+            "local_segment_id": item.local_segment_id,
+        }
+    raise TypeError("recent entry must use an exact workspace contract")
 
 
 class WorkspaceStateRepository:
@@ -38,15 +89,17 @@ class WorkspaceStateRepository:
             self.config_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise WorkspaceStateError(f"unable to prepare workspace directory: {exc}") from exc
-        self._recent: tuple[RecentProject, ...] = ()
+        self._recent: tuple[_RecentEntry, ...] = ()
         self._preferences = DisplayPreferences()
         self._tm_preferences = TMPreferences()
+        self._preprocess_preferences = PreprocessPreferences()
         if self.state_path.exists():
             try:
                 (
                     self._recent,
                     self._preferences,
                     self._tm_preferences,
+                    self._preprocess_preferences,
                 ) = self._read_state()
             except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 LOGGER.warning("Ignoring invalid workspace state: %s", exc)
@@ -54,13 +107,40 @@ class WorkspaceStateRepository:
     def recent_projects(self) -> tuple[RecentProject, ...]:
         """Return most-recent-first project locations and positions."""
 
-        return self._recent
+        return tuple(item for item in self._recent if type(item) is RecentProject)
+
+    def recent_workspace_projects(self) -> tuple[RecentWorkspaceProject, ...]:
+        return tuple(
+            item for item in self._recent if type(item) is RecentWorkspaceProject
+        )
 
     def find_project(self, path: Path) -> RecentProject | None:
         """Return one remembered project after normalizing its local path."""
 
         normalized = path.expanduser().resolve()
-        return next((item for item in self._recent if item.path == normalized), None)
+        return next(
+            (
+                item
+                for item in self._recent
+                if type(item) is RecentProject and item.path == normalized
+            ),
+            None,
+        )
+
+    def find_workspace_project(
+        self,
+        path: Path,
+    ) -> RecentWorkspaceProject | None:
+        normalized = path.expanduser().resolve()
+        return next(
+            (
+                item
+                for item in self._recent
+                if type(item) is RecentWorkspaceProject
+                and item.path == normalized
+            ),
+            None,
+        )
 
     def remember_project(self, path: Path, segment_id: str, index: int) -> RecentProject:
         """Move a project to the front and atomically persist its current position."""
@@ -74,7 +154,43 @@ class WorkspaceStateRepository:
             remembered,
             *(item for item in self._recent if item.path != remembered.path),
         )[:MAX_RECENT_PROJECTS]
-        self._write_state(updated, self._preferences, self._tm_preferences)
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
+        self._recent = updated
+        return remembered
+
+    def remember_workspace_project(
+        self,
+        path: Path,
+        *,
+        project_id: str,
+        document_id: str,
+        local_segment_id: str,
+        index: int,
+    ) -> RecentWorkspaceProject:
+        """Persist a composite position without weakening legacy v1 entries."""
+
+        remembered = RecentWorkspaceProject(
+            path=path.expanduser().resolve(),
+            project_id=project_id,
+            document_id=document_id,
+            local_segment_id=local_segment_id,
+            index=index,
+        )
+        updated = (
+            remembered,
+            *(item for item in self._recent if item.path != remembered.path),
+        )[:MAX_RECENT_PROJECTS]
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._recent = updated
         return remembered
 
@@ -85,7 +201,12 @@ class WorkspaceStateRepository:
         updated = tuple(item for item in self._recent if item.path != normalized)
         if updated == self._recent:
             return
-        self._write_state(updated, self._preferences, self._tm_preferences)
+        self._write_state(
+            updated,
+            self._preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._recent = updated
 
     def display_preferences(self) -> DisplayPreferences:
@@ -101,7 +222,12 @@ class WorkspaceStateRepository:
 
         if not isinstance(preferences, DisplayPreferences):
             raise WorkspaceStateError("display preferences contract is required")
-        self._write_state(self._recent, preferences, self._tm_preferences)
+        self._write_state(
+            self._recent,
+            preferences,
+            self._tm_preferences,
+            self._preprocess_preferences,
+        )
         self._preferences = preferences
         return preferences
 
@@ -122,13 +248,49 @@ class WorkspaceStateRepository:
             )
         except (TypeError, ValueError) as exc:
             raise WorkspaceStateError(f"invalid TM preferences: {exc}") from exc
-        self._write_state(self._recent, self._preferences, validated)
+        self._write_state(
+            self._recent,
+            self._preferences,
+            validated,
+            self._preprocess_preferences,
+        )
         self._tm_preferences = validated
         return validated
 
+    def preprocess_preferences(self) -> PreprocessPreferences:
+        """Return a detached device-local preprocessing preference graph."""
+
+        return _clone_preprocess_preferences(self._preprocess_preferences)
+
+    def update_preprocess_preferences(
+        self,
+        preferences: PreprocessPreferences,
+    ) -> PreprocessPreferences:
+        """Atomically replace preprocessing preferences after full validation."""
+
+        try:
+            validated = _clone_preprocess_preferences(preferences)
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceStateError(
+                f"invalid preprocess preferences: {exc}"
+            ) from exc
+        self._write_state(
+            self._recent,
+            self._preferences,
+            self._tm_preferences,
+            validated,
+        )
+        self._preprocess_preferences = validated
+        return _clone_preprocess_preferences(validated)
+
     def _read_state(
         self,
-    ) -> tuple[tuple[RecentProject, ...], DisplayPreferences, TMPreferences]:
+    ) -> tuple[
+        tuple[_RecentEntry, ...],
+        DisplayPreferences,
+        TMPreferences,
+        PreprocessPreferences,
+    ]:
         payload = cast(object, json.loads(self.state_path.read_text(encoding="utf-8")))
         if not isinstance(payload, dict):
             raise ValueError("workspace state root must be an object")
@@ -139,7 +301,7 @@ class WorkspaceStateRepository:
         raw_recent = mapping.get("recent_projects", [])
         if not isinstance(raw_recent, list):
             raise ValueError("recent_projects must be an array")
-        recent: list[RecentProject] = []
+        recent: list[_RecentEntry] = []
         for index, entry in enumerate(cast(list[object], raw_recent), start=1):
             if not isinstance(entry, dict):
                 LOGGER.warning("Skipping invalid recent project entry %s", index)
@@ -149,17 +311,46 @@ class WorkspaceStateRepository:
                 path = item["path"]
                 segment_id = item["segment_id"]
                 position = item["index"]
+                project_id = item.get("project_id")
+                document_id = item.get("document_id")
+                local_segment_id = item.get("local_segment_id")
                 if not isinstance(path, str) or not isinstance(segment_id, str):
                     raise TypeError("recent project path and segment id must be strings")
                 if not isinstance(position, int) or isinstance(position, bool):
                     raise TypeError("recent project index must be an integer")
-                recent.append(
-                    RecentProject(
-                        path=Path(path),
-                        segment_id=segment_id,
-                        index=position,
+                if any(
+                    value is not None and not isinstance(value, str)
+                    for value in (project_id, document_id, local_segment_id)
+                ):
+                    raise TypeError("recent workspace identity must contain strings")
+                if any(
+                    value is not None
+                    for value in (project_id, document_id, local_segment_id)
+                ):
+                    if any(
+                        value is None
+                        for value in (project_id, document_id, local_segment_id)
+                    ):
+                        raise ValueError(
+                            "recent workspace identity must be all-or-none"
+                        )
+                    recent.append(
+                        RecentWorkspaceProject(
+                            path=Path(path),
+                            project_id=cast(str, project_id),
+                            document_id=cast(str, document_id),
+                            local_segment_id=cast(str, local_segment_id),
+                            index=position,
+                        )
                     )
-                )
+                else:
+                    recent.append(
+                        RecentProject(
+                            path=Path(path),
+                            segment_id=segment_id,
+                            index=position,
+                        )
+                    )
             except (KeyError, TypeError, ValueError) as exc:
                 LOGGER.warning("Skipping invalid recent project entry %s: %s", index, exc)
 
@@ -199,10 +390,68 @@ class WorkspaceStateRepository:
                         LOGGER.warning(
                             "Using default editor font size from invalid workspace state"
                         )
+                browse_defaults = BrowseGroupPreferences()
+                browse_grouping = browse_defaults
+                raw_browse_grouping = display.get("browse_grouping")
+                if raw_browse_grouping is not None:
+                    if not isinstance(raw_browse_grouping, dict):
+                        LOGGER.warning(
+                            "Using default browse grouping from invalid workspace state"
+                        )
+                    else:
+                        browse_mapping = cast(
+                            dict[str, object],
+                            raw_browse_grouping,
+                        )
+                        try:
+                            browse_grouping = BrowseGroupPreferences(
+                                enabled=cast(
+                                    bool,
+                                    browse_mapping.get(
+                                        "enabled",
+                                        browse_defaults.enabled,
+                                    ),
+                                ),
+                                segments_per_group=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "segments_per_group",
+                                        browse_defaults.segments_per_group,
+                                    ),
+                                ),
+                                activation_group_threshold=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "activation_group_threshold",
+                                        browse_defaults.activation_group_threshold,
+                                    ),
+                                ),
+                                activation_segment_threshold=cast(
+                                    int,
+                                    browse_mapping.get(
+                                        "activation_segment_threshold",
+                                        browse_defaults.activation_segment_threshold,
+                                    ),
+                                ),
+                                display_mode=BrowseGroupDisplayMode(
+                                    cast(
+                                        str,
+                                        browse_mapping.get(
+                                            "display_mode",
+                                            browse_defaults.display_mode.value,
+                                        ),
+                                    )
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            LOGGER.warning(
+                                "Using default browse grouping from invalid workspace state"
+                            )
                 preferences = DisplayPreferences(
                     segment_density=segment_density,
                     workspace_mode=workspace_mode,
                     editor_font_size=editor_font_size,
+                    browse_grouping=browse_grouping,
                 )
 
         tm_preferences = TMPreferences()
@@ -224,35 +473,121 @@ class WorkspaceStateRepository:
                         "Using default TM preferences from invalid workspace state"
                     )
 
+        preprocess_preferences = PreprocessPreferences()
+        raw_preprocessing = mapping.get("preprocessing")
+        if raw_preprocessing is not None:
+            try:
+                if not isinstance(raw_preprocessing, dict):
+                    raise TypeError("preprocessing must be an object")
+                preprocessing = cast(dict[str, object], raw_preprocessing)
+                if set(preprocessing) != {
+                    "rules",
+                    "include_draft",
+                    "include_confirmed",
+                }:
+                    raise ValueError(
+                        "preprocessing must contain the complete preference graph"
+                    )
+                raw_rules = preprocessing["rules"]
+                include_draft = preprocessing["include_draft"]
+                include_confirmed = preprocessing["include_confirmed"]
+                if not isinstance(raw_rules, list):
+                    raise TypeError("preprocessing rules must be an array")
+                if type(include_draft) is not bool:
+                    raise TypeError("preprocessing include_draft must be a boolean")
+                if type(include_confirmed) is not bool:
+                    raise TypeError(
+                        "preprocessing include_confirmed must be a boolean"
+                    )
+                rules: list[LiteralReplaceRule] = []
+                for raw_rule in cast(list[object], raw_rules):
+                    if not isinstance(raw_rule, dict):
+                        raise TypeError("preprocessing rule must be an object")
+                    rule = cast(dict[str, object], raw_rule)
+                    if set(rule) != {"find", "replacement", "enabled"}:
+                        raise ValueError(
+                            "preprocessing rule must contain find, replacement and enabled"
+                        )
+                    find = rule["find"]
+                    replacement = rule["replacement"]
+                    enabled = rule["enabled"]
+                    if type(find) is not str or type(replacement) is not str:
+                        raise TypeError(
+                            "preprocessing rule text values must be strings"
+                        )
+                    if type(enabled) is not bool:
+                        raise TypeError(
+                            "preprocessing rule enabled must be a boolean"
+                        )
+                    rules.append(
+                        LiteralReplaceRule(
+                            find=find,
+                            replacement=replacement,
+                            enabled=enabled,
+                        )
+                    )
+                preprocess_preferences = PreprocessPreferences(
+                    rules=tuple(rules),
+                    include_draft=include_draft,
+                    include_confirmed=include_confirmed,
+                )
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning(
+                    "Using default preprocess preferences from invalid workspace state"
+                )
+
         return (
             tuple(recent[:MAX_RECENT_PROJECTS]),
             preferences,
             tm_preferences,
+            preprocess_preferences,
         )
 
     def _write_state(
         self,
-        recent: tuple[RecentProject, ...],
+        recent: tuple[_RecentEntry, ...],
         preferences: DisplayPreferences,
         tm_preferences: TMPreferences,
+        preprocess_preferences: PreprocessPreferences,
     ) -> None:
+        preprocess_preferences = _clone_preprocess_preferences(
+            preprocess_preferences
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "recent_projects": [
-                {
-                    "path": str(item.path),
-                    "segment_id": item.segment_id,
-                    "index": item.index,
-                }
-                for item in recent
-            ],
+            "recent_projects": [_recent_payload(item) for item in recent],
             "display": {
                 "segment_density": preferences.segment_density.value,
                 "workspace_mode": preferences.workspace_mode.value,
                 "editor_font_size": preferences.editor_font_size,
+                "browse_grouping": {
+                    "enabled": preferences.browse_grouping.enabled,
+                    "segments_per_group": (
+                        preferences.browse_grouping.segments_per_group
+                    ),
+                    "activation_group_threshold": (
+                        preferences.browse_grouping.activation_group_threshold
+                    ),
+                    "activation_segment_threshold": (
+                        preferences.browse_grouping.activation_segment_threshold
+                    ),
+                    "display_mode": preferences.browse_grouping.display_mode.value,
+                },
             },
             "tm_preferences": {
                 "minimum_similarity": tm_preferences.minimum_similarity,
+            },
+            "preprocessing": {
+                "rules": [
+                    {
+                        "find": rule.find,
+                        "replacement": rule.replacement,
+                        "enabled": rule.enabled,
+                    }
+                    for rule in preprocess_preferences.rules
+                ],
+                "include_draft": preprocess_preferences.include_draft,
+                "include_confirmed": preprocess_preferences.include_confirmed,
             },
         }
         temp_path: Path | None = None

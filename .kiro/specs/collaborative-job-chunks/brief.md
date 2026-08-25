@@ -6,7 +6,7 @@
 
 ## Current State
 
-LocalCAT 当前是单机个人编辑器，没有多文档 workspace、chunk、用户身份、权限或实时协作。规划中的 `Project → Document → Segment` 将提供稳定复合段落身份，但只负责内容结构。MateCat 的 split/merge job 行为证明 chunk 可以独立于项目多文件结构随意划分与整合。
+本 Brief 初拟时，LocalCAT 仍是没有多文档 workspace、chunk、用户身份、权限或实时协作的单机个人编辑器；这是历史基线。现在 `multi-document-project-workspace` 已完成 C2，`Project → Document → Segment` 已提供稳定复合段落身份与 ProjectPackage 手工闭环，但仍只负责内容结构。LocalCAT 仍没有 chunk 产品面或账号/实时协作系统。MateCat 的 split/merge job 行为证明 chunk 可以独立于项目多文件结构随意划分与整合。
 
 ## Desired Outcome
 
@@ -57,4 +57,4 @@ LocalCAT 当前是单机个人编辑器，没有多文档 workspace、chunk、�
 3. Controller scope、搜索 `current_chunk` 与冲突/撤销；
 4. Qt 与 current-source acceptance。
 
-该规格必须在多文档 identity/reconciliation/save clusters 完成后启动。跨端同步只有在本规格批准 namespaced chunk metadata 后才可搬运该 metadata；同步插件不得解释成员资格或权限。
+该规格必须在 Multi-Document 完整 Cluster 2（C2A aggregation/reconciliation、C2B save/recovery 与 C2C ProjectPackage 手工闭环）完成后启动。跨端同步只有在本规格批准 namespaced chunk metadata 且后续 ProjectPackage schema/version 或明确 extension 同步获批后，才可搬运该 metadata；同步插件不得解释成员资格或权限。

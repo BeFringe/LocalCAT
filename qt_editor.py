@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +21,8 @@ APPLICATION_ICON_NAME = "localcat"
 # 512x512; resources installed into an undeclared 1024x1024/apps directory are
 # ignored by GTK menu lookup.
 APPLICATION_ICON_SIZE = 512
+LOCALCAT_NATIVE_LAUNCH_ENV = "LOCALCAT_NATIVE_LAUNCH"
+LOCALCAT_DIRECT_HANDOFF_VERSION = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,6 +213,85 @@ def install_macos_app(target_dir: Path | None = None) -> Path:
         applications_dir / "LocalCAT.app",
         Path(sys.executable).resolve(),
         Path(__file__).resolve(),
+    )
+
+
+def _macos_bundle_candidates() -> tuple[Path, ...]:
+    """Return deterministic installed-bundle candidates without following links."""
+
+    return (
+        Path.home() / "Applications" / "LocalCAT.app",
+        Path("/Applications/LocalCAT.app"),
+    )
+
+
+def _compatible_macos_native_launcher(bundle: Path) -> Path | None:
+    if not isinstance(bundle, Path) or bundle.is_symlink() or not bundle.is_dir():
+        return None
+    contents = bundle / "Contents"
+    plist_path = contents / "Info.plist"
+    executable = contents / "MacOS" / "LocalCAT"
+    if plist_path.is_symlink() or executable.is_symlink():
+        return None
+    try:
+        plist_metadata = plist_path.stat()
+        executable_metadata = executable.stat()
+        with plist_path.open("rb") as stream:
+            info = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException):
+        return None
+    if (
+        not stat.S_ISREG(plist_metadata.st_mode)
+        or not stat.S_ISREG(executable_metadata.st_mode)
+        or not executable_metadata.st_mode & 0o111
+        or type(info) is not dict
+        or info.get("CFBundleDisplayName") != "LocalCAT"
+        or info.get("CFBundleExecutable") != "LocalCAT"
+        or info.get("CFBundleIdentifier") != "app.localcat.desktop"
+        or info.get("LocalCATDirectHandoffVersion")
+        != LOCALCAT_DIRECT_HANDOFF_VERSION
+    ):
+        return None
+    return executable
+
+
+def _handoff_to_macos_native_launcher(argv: tuple[str, ...]) -> None:
+    """Let LaunchServices start the signed bundle against this checkout."""
+
+    if sys.platform != "darwin" or os.environ.get(LOCALCAT_NATIVE_LAUNCH_ENV) == "1":
+        return
+    executable = next(
+        (
+            candidate
+            for bundle in _macos_bundle_candidates()
+            if (candidate := _compatible_macos_native_launcher(bundle)) is not None
+        ),
+        None,
+    )
+    if executable is None:
+        return
+    bundle = executable.parents[2]
+    open_command = Path("/usr/bin/open")
+    try:
+        open_metadata = open_command.stat()
+    except OSError:
+        return
+    if not stat.S_ISREG(open_metadata.st_mode) or not open_metadata.st_mode & 0o111:
+        return
+    os.execve(
+        str(open_command),
+        [
+            str(open_command),
+            "-W",
+            str(bundle),
+            "--args",
+            "--localcat-direct-python",
+            str(Path(sys.executable).resolve()),
+            "--localcat-direct-bootstrap",
+            str(Path(__file__).resolve()),
+            *argv,
+        ],
+        os.environ.copy(),
     )
 
 
@@ -466,8 +549,65 @@ def _compose_editor_controller(repository: object):
     return controller, capability_composition
 
 
+def _compose_chunk_controller(controller: object, repository: object):
+    """Build the device-local Chunk application boundary for one app run."""
+
+    from chunk_controller_adapter import (
+        ChunkControllerAdapter,
+        create_chunk_metadata_binding_resolver,
+    )
+    from collaborative_chunks import LocalReferenceActorPort
+    from editor_controller import EditorController
+    from resource_repository import ResourceRepository
+
+    if type(controller) is not EditorController:
+        raise TypeError("chunk composition requires one EditorController")
+    if type(repository) is not ResourceRepository:
+        raise TypeError("chunk composition requires one ResourceRepository")
+    metadata_root = (repository.config_dir / "collaborative-chunks").resolve()
+    actor_port = LocalReferenceActorPort(
+        "localcat-local-reference",
+        "device-workflow",
+    )
+
+    return ChunkControllerAdapter(
+        controller,
+        actor_port,
+        actor_port.current_actor(),
+        metadata_binding_resolver=create_chunk_metadata_binding_resolver(
+            metadata_root
+        ),
+    )
+
+
+def _compose_tmx_export_service(
+    controller: object,
+    repository: object,
+    chunk_controller: object,
+):
+    """Connect exact owner projections to the TMX application boundary."""
+
+    from chunk_controller_adapter import ChunkControllerAdapter
+    from editor_controller import EditorController
+    from resource_repository import ResourceRepository
+    from tmx_application import TmxExportApplicationService
+
+    if type(controller) is not EditorController:
+        raise TypeError("TMX composition requires one EditorController")
+    if type(repository) is not ResourceRepository:
+        raise TypeError("TMX composition requires one ResourceRepository")
+    if type(chunk_controller) is not ChunkControllerAdapter:
+        raise TypeError("TMX composition requires one ChunkControllerAdapter")
+    return TmxExportApplicationService(
+        controller,
+        repository,
+        chunk_controller=chunk_controller,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    launch_argv = tuple(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(launch_argv)
     if args.install_desktop_launcher:
         try:
             launcher = install_desktop_launcher()
@@ -484,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Installed LocalCAT.app: {bundle}")
         return 0
+    if not args.smoke_test and args.bundle_smoke_marker is None:
+        _handoff_to_macos_native_launcher(launch_argv)
     try:
         from typing import cast
 
@@ -513,14 +655,30 @@ def main(argv: list[str] | None = None) -> int:
         controller, capability_composition = _compose_editor_controller(
             repository
         )
+        chunk_controller = _compose_chunk_controller(controller, repository)
+        tmx_export_service = _compose_tmx_export_service(
+            controller,
+            repository,
+            chunk_controller,
+        )
         # Retain the owner-only validation ports for the complete QApplication
         # lifetime; the Controller receives only the host read boundary.
         _ = capability_composition
         if args.project is not None:
-            controller.open_project(args.project)
+            if args.project.suffix.lower() == ".localcat-project":
+                controller.open_project_package(args.project)
+            else:
+                controller.open_project(args.project)
         elif args.sample or args.smoke_test:
             controller.load_sample()
 
+        # Set the Qt process identity before constructing QApplication.  On
+        # macOS a script launched through the Python interpreter otherwise
+        # lets the application menu adopt the interpreter's display name
+        # (for example, "Python 3.14") before LocalCAT can replace it.
+        QApplication.setApplicationName("LocalCAT")
+        QApplication.setApplicationDisplayName("LocalCAT")
+        QApplication.setOrganizationName("LocalCAT")
         existing_app = QApplication.instance()
         app = (
             QApplication([sys.argv[0]])
@@ -528,12 +686,20 @@ def main(argv: list[str] | None = None) -> int:
             else cast(QApplication, existing_app)
         )
         app.setApplicationName("LocalCAT")
+        app.setApplicationDisplayName("LocalCAT")
         app.setOrganizationName("LocalCAT")
         app.setDesktopFileName("localcat")
         logo_path = application_icon_path(root)
         if logo_path.is_file():
             app.setWindowIcon(QIcon(str(logo_path)))
-        window = QtEditorWindow(controller)
+        window = QtEditorWindow(
+            controller,
+            chunk_controller=chunk_controller,
+        )
+        # Keep the long-standing window construction seam compatible with
+        # bootstrap probes while still installing the run-owned TMX service
+        # before the window is shown or any project menu can open.
+        window.tmx_export_coordinator = tmx_export_service
         window.show()
         validation_worker = _start_capability_validation(
             capability_composition,
@@ -552,7 +718,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.smoke_test:
             if (
-                not controller.has_project
+                not controller.has_active_project
                 or window.pages.currentWidget().objectName() != "editorPage"
                 or window.segment_list.count() == 0
             ):

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+import editor_project
 
 from editor_contracts import EditorProject, EditorSegment
 from editor_project import ProjectError, load_project, sample_project, save_project
@@ -33,7 +34,7 @@ class EditorProjectCodecTest(unittest.TestCase):
             project = load_project(path)
 
         self.assertEqual(project.name, "chapter")
-        self.assertEqual(project.path, path.resolve())
+        self.assertEqual(project.path, path.absolute())
         self.assertEqual(project.segments[0].id, "line-a")
         self.assertTrue(project.segments[0].confirmed)
         self.assertEqual(project.segments[1].id, "segment-2")
@@ -86,7 +87,7 @@ class EditorProjectCodecTest(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             loaded = load_project(path)
 
-        self.assertEqual(result, path.resolve())
+        self.assertEqual(result, path.absolute())
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["segments"][0]["target"], "你好")
         self.assertEqual(loaded.segments, project.segments)
@@ -116,6 +117,17 @@ class EditorProjectCodecTest(unittest.TestCase):
         self.assertGreaterEqual(len(project.segments), 3)
         self.assertTrue(all(segment.source for segment in project.segments))
         self.assertIsNone(project.path)
+
+    def test_facade_no_longer_exposes_private_localcat_grammar_or_writer_helpers(self) -> None:
+        for name in (
+            "_clean_string",
+            "_segment_from_mapping",
+            "_load_json_project",
+            "_load_text_project",
+            "_project_payload",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(editor_project, name))
 
 
 if __name__ == "__main__":

@@ -8,15 +8,15 @@
 
 ### 目标
 
-- 在不修改 source、speaker 与 TM identity 的前提下完成 raw speaker inventory 和双模式显示。
-- 提供可预览、可拒绝 stale apply、可撤销最近一次应用的 target-only 预处理。
+- 在不修改 source、speaker 与 TM identity 的前提下完成 raw speaker inventory、盘点表本地头像缩略图和双模式 raw speaker 显示。
+- 提供可保存设备本地规则、按草稿/已确认筛选、可预览、可拒绝 stale apply、可撤销最近一次应用的 target-only 预处理。
 - 通过版本化单文件术语存储完成 CRUD，同时保持 legacy 两列语义。
 - 保持 Qt → Controller → Domain/Storage 的单向依赖与既有回归。
 
 ### 非目标
 
 - 新项目格式、多文档/章节、目录搜索或 source reconciliation。
-- speaker alias、留空 profile、头像和导出变换。
+- speaker alias、留空 profile、编辑/浏览段落头像、头像配置或持久化和导出变换。
 - Qt 自己实现 Match Case、Whole Word、Unicode 边界或 fuzzy。
 - 正则、脚本、Replace All、项目级无限 undo history。
 - SQLite TM、context/fuzzy 检索或 Parser 重构。
@@ -25,9 +25,10 @@
 
 ### This Spec Owns
 
-- 单 JSON `EditorSegment.speaker` 的只读 inventory 与编辑/浏览显示。
+- 单 JSON `EditorSegment.speaker` 的只读 inventory、inventory-only 内置头像投影与编辑/浏览 raw speaker 显示。
 - 项目级 search request/report、字段遍历、结果导航与 matcher capability 展示。
 - target-only literal preprocessing、revision 校验和最近一次批量应用撤销。
+- 设备本地 preprocessing rule/status preferences 的原子保存与恢复。
 - 译文框本地 undo/redo 的焦点与会话同步。
 - legacy/v1 mixed termbase 的 CRUD、原子保存、冲突反馈和 Trie 热重载。
 - silver logo、紧凑 ellipsis 与相关可访问性/QtTest。
@@ -37,7 +38,7 @@
 - 项目 codec、source 更新重关联和多章节 `SearchScope`。
 - Feature 5 `TextMatcher` 的字符语义、offset 计算和 capability 判定实现。
 - 术语 fuzzy、云端资源、同步与协作 chunk。
-- speaker display profile 的持久化。
+- speaker display profile、头像配置/持久化及编辑/浏览头像。
 - 旧 `LogicController` 与 Excel 三态的扩展。
 
 ### Allowed Dependencies
@@ -60,10 +61,12 @@
 ## Governance Impact
 
 - **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`spec-ownership.md`。
-- **Applicable ADRs**：ADR-009、ADR-011；项目搜索继续只消费 Feature 5 的中立 matcher handoff。
-- **ADR disposition**：None。可折叠表面、清除已签发结果与由现有 `target/confirmed` 派生的状态筛选不改变 authority、持久格式、发布协议、依赖方向或跨 Spec matcher contract。
+- **Applicable ADRs**：ADR-009、ADR-011、ADR-014；项目搜索继续只消费 Feature 5 的中立 matcher handoff。
+- **ADR disposition**：既有搜索表面、speaker avatar 与草稿/已确认 preview 筛选为 None；设备本地预处理规则/状态偏好已由项目 owner 采纳 ADR-014，冻结 `workspace.json.preprocessing` 的格式、失败原子性与 authority 排除边界；Feature GO 为 `GO`。
 - **Scope amendment**：Approved，对应 Requirements Scope Lineage 中 2026-08-19 Requirement 3 表面 amendment。
-- **Steering sync**：Not required。产品定位、架构层级与技术栈不变；Feature GO 只核对最终实际 delta。
+- **Speaker avatar amendment**：Approved；只增加 Requirement 1 / Task 4.2a 的 Qt presentation 投影，不新增 authority、持久字段或跨 Spec frozen contract。
+- **Project-tool usability amendment**：Approved；修复 inventory 表头裁切，并将预处理规则/状态选择作为 device-local workspace preference，不改变项目格式、segment identity 或 batch apply 事务。
+- **Steering sync**：搜索表面与 avatar 不需要；ADR-014 已同步 `tech.md` 和 `structure.md` 中 `workspace.json` / `WorkspaceStateRepository` 的持久范围，最终 delta 已按五类语义门复核。
 - **Downstream revalidation**：Feature 5 Matcher Gate generation invalidation、JSON/TXT/sample capability、Qt search keyboard/accessibility 及 current-source Requirement 3 acceptance。
 
 ## 架构
@@ -73,7 +76,7 @@
 - `EditorController` 已拥有唯一项目会话、导航、dirty、资源热重载和建议协调。
 - `EditorProject`/`EditorSegment` 是 frozen dataclass，适合纯扫描和批量 immutable replace。
 - `GlossaryEngine` 是运行时 Trie，不适合作为 CRUD 仓储；现有 importer 只保留两列。
-- 主窗口已有编辑/浏览共享会话；raw speaker 显示、speaker 搜索、项目搜索与集中式术语 CRUD 已闭合。尚未完成的是 1.1b/2.1/3.2b/4.2 的独立 speaker inventory 合同、服务与对话框，不得把它误记为 speaker profile 已实施。
+- 主窗口已有编辑/浏览共享会话；raw speaker 显示、speaker 搜索、独立 speaker inventory、项目搜索与集中式术语 CRUD 均已闭合。inventory 只读计数与内置头像投影不得被误记为 speaker profile、alias 或编辑/浏览头像已实施。
 - `qt_editor_window.py` 直接依赖 `ProjectError` 是现有边界漂移，本增量一并收口。
 
 ### 架构模式与边界图
@@ -121,10 +124,12 @@ graph LR
 ├── target_preprocessor.py            # literal rule preview/apply 纯逻辑
 ├── termbase_store.py                 # mixed CSV parser、CRUD 与原子写
 ├── editor_controller.py              # use case 门面、revision、batch undo、异常归一化
+├── workspace_state.py                # device-local preprocess rule/status preferences
 ├── resource_importer.py              # 术语 import 改经 TermbaseStore merge
 ├── glossary_engine.py                # legacy Trie 与 configured TextMatcher adapter
 ├── qt_editor_window.py               # speaker、search bar、editor undo、入口
 ├── qt_speaker_inventory_dialog.py    # inventory 只读表
+├── speaker_avatars/                   # 随应用分发的固定 [speaker]Half.png 展示资产
 ├── qt_preprocess_dialog.py           # rule、preview、apply、batch undo
 ├── qt_termbase_dialog.py             # term list/CRUD/disabled capability
 ├── qt_settings_dialog.py             # 管理入口与紧凑 ellipsis
@@ -221,7 +226,8 @@ flowchart LR
 
 | 需求 | 摘要 | 组件 / 接口 |
 |------|------|-------------|
-| 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7 | raw speaker 扫描、顺序、计数与只读 | SpeakerInventoryService, `speaker_inventory()` |
+| 1.1–1.7 | raw speaker 扫描、顺序、计数与只读 | SpeakerInventoryService, `speaker_inventory()` |
+| 1.8, 1.9, 1.10, 1.11 | inventory-only 内置头像安全投影与“出现次数”列可读宽度 | QtSpeakerInventoryDialog, bundled speaker assets |
 | 2.1, 2.2, 2.3, 2.4, 2.5 | 编辑/浏览 raw speaker | QtEditorWindow, browse table |
 | 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10 | 搜索、导航、capability、CJK | ProjectSearchService, TextMatcher port, search bar |
 | 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11 | target-only preview/apply | TargetPreprocessor, revision flow |
@@ -272,6 +278,12 @@ class SpeakerInventory:
     items: tuple[SpeakerInventoryItem, ...]
     empty_count: int
     segment_count: int
+
+@dataclass(frozen=True)
+class PreprocessPreferences:
+    rules: tuple[LiteralReplaceRule, ...] = ()
+    include_draft: bool = True
+    include_confirmed: bool = True
 
 @dataclass(frozen=True)
 class ProjectToolCapability:
@@ -443,6 +455,15 @@ def build_speaker_inventory(project: EditorProject) -> SpeakerInventory: ...
 - 仅消费该 `EditorSegment.speaker`；空值不进入 items。
 - 顺序由首次出现 index 决定，重复调用确定性相同。
 - 无 I/O、无缓存、无 project mutation。
+- `SpeakerInventory` 及其 item 不携带头像、路径、alias 或 profile 字段；头像解析属于 Qt presentation。
+
+### Inventory-only speaker avatar projection
+
+- `qt_speaker_inventory_dialog.py` 在固定的应用资产目录中预索引实际文件名，只接受 `[speaker]Half.png` 后缀，并以文件名 speaker 部分的 Unicode casefold 作为展示匹配键。
+- raw speaker 只能用于查询预建索引，不得直接拼接或解析为文件路径；同一规范化键出现多个文件时 fail closed，不选择任意一个。
+- 唯一匹配文件仍须由 Qt 图片解码器成功载入；缺失、歧义或无效资源显示稳定的“无头像”退化状态，不阻止 inventory 文本与计数呈现。
+- 图片缩放只发生在 presentation，保持宽高比并提供可访问文本；不缓存到 Controller，不进入 JSON/workspace、搜索、TM identity、术语或 speaker profile。
+- Task 4.1 的编辑与浏览视图继续只显示 raw speaker 文本；4.2a 不修改该表面。
 
 ### ProjectSearchService
 
@@ -479,6 +500,14 @@ def preview_preprocessing(
 - 每条规则采用 Python 字符串的区分大小写、从左到右、非重叠 literal replace；不做 Unicode normalization、正则或递归重跑。
 - change 保存 segment id/index、before/after target 与 before confirmed。
 - 纯函数不写 project；Controller apply 时复核 revision、segment id 与 before target。
+- preview 在 literal replace 前以两个独立 boolean 过滤：`include_draft` 对应 `confirmed=false`，`include_confirmed` 对应 `confirmed=true`；两者都为 false 时拒绝，不创建空 preview。
+
+### PreprocessPreferences persistence
+
+- `PreprocessPreferences` 只保存有序 `LiteralReplaceRule` tuple 与两个状态复选框；不保存 preview、batch undo、project/session/revision 或正文。
+- `WorkspaceStateRepository` 在现有 schema v1 的可选 `preprocessing` member 中原子保存偏好；旧 workspace 缺少该 member 时恢复默认空规则与两个状态全选。
+- 整个 preference graph 在读取/写入时验证；无效 member 退回默认，写失败保留旧文件和内存 last-known-good。
+- Controller 暴露 defensive read/update；Qt 不直接读取 `workspace.json`。保存偏好不修改 project、dirty、revision、search issuance 或 undo point，也不自动 preview/apply。
 
 ### TermbaseStore
 
@@ -571,7 +600,7 @@ class EditorController:
 - Replace/Replace All 不是 search surface 直接 mutation；如未来纳入，必须经 Task 4.4 target-only preview/apply/undo 事务并另行 scope amendment。
 - Translation Matches/Termbase 页签使用实体 `Control+Tab` / `Control+Shift+Tab`。由于 Qt 在 macOS 将 portable `Ctrl` 映射为 Command，实现仅对这两个页签快捷键使用 portable `Meta` 以接收并显示 `⌃`；不得注册 `Command+Tab`。编辑/校对仍使用 portable `Ctrl+1/2`，在 macOS 原生显示为 `Command+1/2`。
 - 工作区模式使用应用自有的两项 action menu，从顶栏当前值下方展开；不得打开或事后搬移平台 combo popup，避免 macOS 以选中项对齐并从下向上遮住“编辑”。段落密度另以 portable `Ctrl+Shift+L`切换紧凑/自动换行，macOS 原生显示为 `Command+Shift+L`。
-- inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。集中式术语管理从主窗口 Termbase 页和语言资源设置资源菜单提供两个入口；两者打开同一个 `QtTermbaseDialog`，只投影当前 Active+Update 术语表并复用同一 committed refresh 信号。
+- inventory/preprocess/termbase 使用三个独立对话框，均只调用 Controller。inventory 对话框固定“出现次数”列的可读最小宽度，并可从固定应用资产目录投影头像，但 inventory 数据仍只来自 Controller。preprocess 对话框使用“草稿 / 已确认”两个复选框，展示 preview 状态分布并通过 Controller 保存规则偏好；包含已确认变化时沿用既有待确认警告。集中式术语管理从主窗口 Termbase 页和语言资源设置资源菜单提供两个入口；两者打开同一个 `QtTermbaseDialog`，只投影当前 Active+Update 术语表并复用同一 committed refresh 信号。
 - `Ctrl+Z`、`Ctrl+Y`、`Ctrl+Shift+Z` 仅在 target editor 聚焦时调用 native undo/redo；`textChanged` 继续同步 Controller。
 - 同段 suggestion 插入使用 `QTextCursor.beginEditBlock()`；切段/换项目时 signal-blocked `setPlainText()` 并明确清空 editor undo。
 - 所有项目/术语 mutation 都通过主窗口 `_refresh_from_controller()` 更新 edit、browse、progress 与 suggestions；dialogs 不直接修改这些 widgets。
@@ -583,7 +612,7 @@ class EditorController:
 
 - 当前单 JSON 的 segment id 对后续 workspace 视为 opaque local identity；多文档规格负责把它提升为 `(document_id, local_segment_id)`，当前 UI 不预埋 document/chunk 字段，也不按显示顺序重铸身份。
 - 当前项目搜索 request/hit/report 不另造第二套多源查询模型。多文档迁移通过扩展 `SearchScope(current_document, entire_project, current_chunk)` 选择同一个 matcher pipeline；`current_chunk` 只有在协作规格批准稳定成员引用后才可出现。
-- raw speaker 显示和 speaker 字段搜索已经可用；1.1b speaker inventory 仍未完成。`speaker-display-profiles` 后续只增加显示名、显式留空与头像，不能改写 raw speaker、搜索字段、项目保存或 TM identity。
+- raw speaker 显示、speaker 字段搜索与 1.1b speaker inventory 已完成；本增量 4.2a 只在 inventory 表面投影固定内置头像。`speaker-display-profiles` 后续仍拥有显示名、显式留空、可配置头像及编辑/浏览投影，且不能改写 raw speaker、搜索字段、项目保存或 TM identity。
 - 集中式术语管理对话框及主窗口/资源设置两级入口已由 4.5(P)/4.7a 闭合；`glossary-management` 后续只扩展批量、检索、注释/来源和互操作，不重建现有 Store/Controller/Qt 事务 authority。
 - ADR-013 的 Fuzzy device attestation 不进入项目、workspace package、TM 导出或未来跨端同步；跨设备恢复项目不能携带另一设备的 Fuzzy 授权。
 
@@ -605,7 +634,7 @@ stateDiagram-v2
     BatchApplied --> NoProject: close clears undo
 ```
 
-`project_revision`、project session id、saved baseline digest 与 batch undo 只存在于 Controller session，不进入 JSON project 或 `workspace.json`。project-content digest 使用固定字段顺序覆盖 locales 与每段 id/source/target/speaker/confirmed，不记录或输出正文。
+`project_revision`、project session id、saved baseline digest、preview 与 batch undo 只存在于 Controller session，不进入 JSON project 或 `workspace.json`。`workspace.json` 只可保存 device-local `PreprocessPreferences`（规则文本、启用状态、两个筛选 boolean），不能保存项目正文或执行状态。project-content digest 使用固定字段顺序覆盖 locales 与每段 id/source/target/speaker/confirmed，不记录或输出正文。
 
 ### Termbase 物理模型
 
@@ -666,7 +695,7 @@ mixed CSV 保持一个资源文件和一个提交边界。v1 id 只属于术语�
 - 搜索与 inventory 为 O(segments × selected fields) orchestration；字符匹配成本由 Core contract 管理。
 - preview 只保存 changed rows；batch undo 只保存最近批次，避免无限内存增长。
 - mixed CSV 写入限制在单资源，先完整解析和验证再替换。
-- 项目文本进入 rich text 前继续 HTML escape；speaker/search preview 同样不得直接注入 HTML。
+- 项目文本进入 rich text 前继续 HTML escape；speaker/search preview 同样不得直接注入 HTML。raw speaker 不参与路径拼接；头像只从固定目录的预索引 allowlist 解析，歧义或解码失败均 fail closed。
 
 ## 实施顺序约束
 

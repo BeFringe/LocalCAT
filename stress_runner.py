@@ -5,9 +5,14 @@ Strip UI Shadow: No TermHighlighter, raw data output only.
 """
 
 import os
-import sys
-from glossary_engine import GlossaryEngine, GlossaryLoader
-from tm_engine import TMEngine, POHandler, SourceUnit
+from glossary_engine import GlossaryEngine
+from logic_controller import (
+    GlossaryLoadError,
+    ProjectSourceLoadError,
+    load_gettext_source_units,
+    load_glossary_file,
+)
+from tm_engine import TMEngine
 
 # =============================================================================
 # Configuration / Paths
@@ -17,25 +22,32 @@ GLOSSARY_FILE = os.path.join(BASE_DIR, "terms_stress.csv")
 TM_FILE = os.path.join(BASE_DIR, "tm_stress.jsonl")
 PO_FILE = os.path.join(BASE_DIR, "stress_test.po")
 
-def main():
+def main() -> int:
     print("=== LocalCAT Phase 2 Structural Integrity Test ===\n")
 
     # 1. Initialize Engines
     print("[1] Initializing Engines...")
     glossary_engine = GlossaryEngine()
-    glossary_loader = GlossaryLoader(glossary_engine)
     if os.path.exists(GLOSSARY_FILE):
-        glossary_loader.load_file(GLOSSARY_FILE)
+        try:
+            load_glossary_file(glossary_engine, GLOSSARY_FILE)
+        except GlossaryLoadError as exc:
+            print(f"ERROR: {exc.code}")
+            return 1
     
     tm_engine = TMEngine(TM_FILE)
 
     # 2. Load Source Content
     print("[2] Loading Source Content...")
     if os.path.exists(PO_FILE):
-        units = POHandler.parse_file(PO_FILE)
+        try:
+            units = load_gettext_source_units(PO_FILE)
+        except ProjectSourceLoadError as exc:
+            print(f"ERROR: {exc.code}")
+            return 1
     else:
         print("ERROR: PO file not found")
-        return
+        return 1
 
     # 3. Process Units (Raw Data Output)
     print("\n[3] Processing Units (Raw Data Output)...")
@@ -76,6 +88,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("Structural Integrity Test Complete.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -6,7 +6,7 @@ LocalCAT 当前把一个项目等同于一个文件和一条扁平段落序列�
 
 ## Current State
 
-当前 `EditorProject` 只有单个绝对 `path` 与项目内唯一的 `segments`，`editor_project.py` 只打开 JSON/TXT 并统一保存为 LocalCAT JSON。这个模型足以继续服务现有单 JSON 项目，不要求本规格先落地。Parser 重新基线正在定义 purpose-aware codec、中立 `ParsedSegment` 与格式 metadata，但不应同时拥有跨文档工作区聚合。
+当前 `EditorProject` 只有单个绝对 `path` 与项目内唯一的 `segments`，`editor_project.py` 只打开 JSON/TXT 并统一保存为 LocalCAT JSON。这个模型足以继续服务现有单 JSON 项目，不要求本规格先落地。Parser 重新基线已完成 purpose-aware codec、中立 `ParsedSegment` 与格式 metadata；跨文档工作区聚合仍不归 Parser 拥有。
 
 ## Desired Outcome
 
@@ -14,13 +14,13 @@ LocalCAT 以稳定的 `Project → Document → Segment` 层级打开和导航�
 
 ## Approach
 
-在 Parser/Codec 与 EditorController 之间增加格式中立的多文档工作区聚合。`ProjectOrigin` 描述 `single_file`、`directory` 或 `workbook` 来源；`ProjectDocument` 保存稳定文档身份、来源引用、显示信息、codec 能力和段落；项目内段落身份由稳定的 `(document_id, local_segment_id)` 复合键形成。格式专属 token、原始字节映射和 writer sidecar 留在 codec 边界，不进入通用 UI 契约。
+在 Parser/Codec 与 EditorController 之间增加格式中立的多文档工作区聚合。`ProjectOrigin` 描述 `single_file`、`directory` 或 `workbook` 来源；`ProjectDocument` 保存稳定文档身份、来源引用、显示信息、codec 能力和段落；项目内段落身份由稳定的 `(document_id, local_segment_id)` 复合键形成。格式专属 token、原始字节映射和 writer sidecar 以统一名称 `codec_private_member` 留在 codec 边界，通用 manifest/UI 只把它当作不可解释的 member 引用。
 
 MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；MateCat 的 chunk 是可拆分、合并并分配给译者的 job 范围，不是文件或章节。本规格只借鉴“多文件按导入顺序连续导航、可跳到文件首段”的交互；协作 chunk 与权限由 `collaborative-job-chunks` 独立拥有。
 
 ## Scope
 
-- **In**: `Project → Document → Segment` immutable contracts；三类 origin；稳定复合 ID；章节显示名、导入/manifest 顺序、章节切换与扁平导航适配；编辑/浏览模式的章节分隔；“当前章节 / 全部章节”搜索范围；可扩展搜索 scope；项目/文档 dirty 状态；source 更新 reconciliation；单文档与批量保存报告；目录多文件的 staging/失败恢复语义；workbook 单文件原子替换语义。
+- **In**: `Project → Document → Segment` immutable contracts；三类 origin；稳定复合 ID；版本化 `ProjectPackageManifest`、document members 与 opaque `codec_private_member`；手工 export/validate/preview/import/receipt；章节显示名、导入/manifest 顺序、章节切换与扁平导航适配；编辑/浏览模式的章节分隔；“当前章节 / 全部章节”搜索范围；可扩展搜索 scope；项目/文档 dirty 状态；source 更新 reconciliation；单文档与批量保存报告；目录多文件的 staging/失败恢复语义；workbook 单文件原子替换语义。
 - **Out**: 重写当前单 JSON codec；具体 JSON/XLSX/RPY 语法解析与 round-trip writer；TM 存储/检索；speaker 显示 profile；把 TMX 打开为编辑项目；任意 Office workbook 支持；MateCat 式协作 job/chunk 分配与只读权限。
 
 ## Boundary Candidates
@@ -33,7 +33,7 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 - 搜索范围首批使用 `current_document` 或 `entire_project`，UI 文案为“当前章节 / 搜索全部章节”；内部 scope 允许未来增加 `current_chunk`，但当前不得把 chunk 映射成 Document 或把未实现的 chunk 控件暴露给用户；
 - 重新导入或应用源项目更新时，workspace 按稳定复合 ID 与 source fingerprint 报告 `unchanged`、`source_changed`、`new`、`removed`；`source_changed` 默认保留已有 target 但撤销确认，任何无法重关联的段落都必须显式交给用户处理；
 - codec/parser 产生单文档内容和诊断，workspace 负责把多个文档组合成项目；
-- codec-private token/sidecar 负责源格式保真，通用项目模型不解释格式 metadata。
+- `codec_private_member` 负责源格式保真，通用项目模型、chunk 与 sync provider 都不解释其内容或将其提升为第二权威。
 
 ## Out of Boundary
 
@@ -65,7 +65,7 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 ## Promotion Clusters
 
 1. 身份与 origin：Project/Document/Segment、复合 segment identity、单 JSON 兼容适配。
-2. 聚合与持久化：document ordering、reconciliation、逐文档保存报告和失败恢复。
+2. 聚合、持久化与手工包闭环：document ordering、reconciliation、逐文档保存报告与失败恢复；版本化 `ProjectPackageManifest`、member digest、opaque `codec_private_member`、export/validate/preview/import/receipt 和同一 import/apply 事务。先冻结逻辑 manifest 与失败语义，不在本簇过早决定目录或单文件容器形态。
 3. 应用服务：Controller session、dirty/issued identity、`current_document` / `entire_project` search scope。
 4. Qt 与 current-source acceptance：章节导航、连续段落体验、窄宽布局和真实格式重开。
 

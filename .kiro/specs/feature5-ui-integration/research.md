@@ -55,6 +55,13 @@
   - 精确 `dd7c9f…` 没有把首次 build→seal→durable publication→recovery 包成公开 `MigrationOutcome` 的方法。
 - **Implications**：精确 dd7 merge 后，Core 层先完成既有 Requirement 2 的 public contract：`TMMigrationService.activate_initial(source, resource_id) -> MigrationOutcome`。未通过既有 frozen/tamper/seal/publication/recovery tests 前，阻断 Controller 与当前段 TM UI；Integration/Qt 不得导入私有 sealer/registry 补洞。这是 public-contract completion，不是新增 Feature 5 产品需求或 scope amendment。
 
+### macOS 重启后的 canonical device identity 漂移
+
+- **Context**：一个已完整发布的 canonical TM 在本机重启后进入 `ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID`；同机新激活资源正常，ordinary open 必须继续 fail closed。
+- **Sources Consulted**：ADR-007/008、activation journal/attestation、manifest/SQLite/source no-follow facts、`tm_activation_recovery.py`、`tm_engine.py`、resource lifecycle 与 Qt settings projection。
+- **Findings**：旧资源的 source/manifest/SQLite SHA-256、inode、size、resource/store identity、schema 与 publication phase 均闭合；三份 persisted attestation 共享旧 `st_dev`，三份 observed facts 共享新 `st_dev`，只有 device number 整组变化。直接忽略 `st_dev` 会削弱文件替换反例；重建 generation 会虚构内容迁移；回落 legacy 违反 ADR-007。
+- **Implications**：按 ADR-016 增加显式 maintenance transition。普通 resolver 只投影 resource-local re-attestation-required safe code；Core 在持久锁内对任意 completed generation 重验 old-common/new-common device 与所有内容/身份/阶段 proof，成功只原子改写 device attestation并重开同一 generation。该路径不接触 Gate D/Fuzzy，其他 mismatch 继续 fail closed。
+
 ### Existing UI session、资源与偏好
 
 - **Context**：集成必须保持唯一编辑会话、Active/Lookup/Update 与 device-local preference。

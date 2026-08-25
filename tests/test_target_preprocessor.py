@@ -193,6 +193,93 @@ class TargetPreprocessorTests(unittest.TestCase):
             (True, False),
         )
 
+    def test_status_selection_filters_before_literal_replacement(self) -> None:
+        project = EditorProject(
+            name="Status filter",
+            segments=(
+                EditorSegment(
+                    id="draft",
+                    source="Draft source",
+                    target="foo draft",
+                    confirmed=False,
+                ),
+                EditorSegment(
+                    id="confirmed",
+                    source="Confirmed source",
+                    target="foo confirmed",
+                    confirmed=True,
+                ),
+            ),
+        )
+        rules = (
+            LiteralReplaceRule(find="foo", replacement="bar", enabled=True),
+        )
+
+        draft_only = preview_preprocessing(
+            project,
+            "session-draft",
+            2,
+            rules,
+            include_draft=True,
+            include_confirmed=False,
+        )
+        confirmed_only = preview_preprocessing(
+            project,
+            "session-confirmed",
+            2,
+            rules,
+            include_draft=False,
+            include_confirmed=True,
+        )
+
+        self.assertEqual(
+            tuple(change.segment_id for change in draft_only.changes),
+            ("draft",),
+        )
+        self.assertFalse(draft_only.changes[0].before_confirmed)
+        self.assertEqual(
+            tuple(change.segment_id for change in confirmed_only.changes),
+            ("confirmed",),
+        )
+        self.assertTrue(confirmed_only.changes[0].before_confirmed)
+        self.assertIs(project.segments[0].confirmed, False)
+        self.assertIs(project.segments[1].confirmed, True)
+
+    def test_no_selected_status_and_foreign_boolean_are_structured_errors(self) -> None:
+        project = EditorProject(
+            name="Invalid status",
+            segments=(EditorSegment(id="seg", source="Source", target="foo"),),
+        )
+        rules = (
+            LiteralReplaceRule(find="foo", replacement="bar", enabled=True),
+        )
+
+        with self.assertRaises(PreprocessValidationError) as no_status:
+            preview_preprocessing(
+                project,
+                "session-none",
+                0,
+                rules,
+                include_draft=False,
+                include_confirmed=False,
+            )
+        self.assertEqual(no_status.exception.code, "NO_SELECTED_STATUS")
+
+        with self.assertRaises(PreprocessValidationError) as invalid_status:
+            preview_preprocessing(
+                project,
+                "session-invalid",
+                0,
+                rules,
+                include_draft=1,  # type: ignore[arg-type]
+                include_confirmed=True,
+            )
+        self.assertEqual(
+            invalid_status.exception.code,
+            "INVALID_STATUS_SELECTION",
+        )
+        self.assertEqual(project.segments[0].target, "foo")
+
 
 if __name__ == "__main__":
     unittest.main()

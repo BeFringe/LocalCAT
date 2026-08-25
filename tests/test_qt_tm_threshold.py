@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton
 
 from editor_contracts import (
     EditorProject,
@@ -163,8 +163,11 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             self.assertTrue(settings_chip.hasFocus())
 
             with patch(
-                "qt_tm_threshold.QInputDialog.getDouble",
-                return_value=(78, True),
+                "qt_tm_threshold.QInputDialog.exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ), patch(
+                "qt_tm_threshold.QInputDialog.doubleValue",
+                return_value=78,
             ):
                 settings_chip.setFocus()
                 QTest.keyClick(settings_chip, Qt.Key.Key_Space)
@@ -179,8 +182,11 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             dialog.close()
             self._events()
             with patch(
-                "qt_tm_threshold.QInputDialog.getDouble",
-                return_value=(82, True),
+                "qt_tm_threshold.QInputDialog.exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ), patch(
+                "qt_tm_threshold.QInputDialog.doubleValue",
+                return_value=82,
             ):
                 window_chip.setFocus()
                 QTest.keyClick(window_chip, Qt.Key.Key_Return)
@@ -260,7 +266,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
 
             with (
                 patch(
-                    "qt_tm_threshold.QInputDialog.getDouble",
+                    "qt_tm_threshold.QInputDialog.exec",
                     side_effect=AssertionError(
                         "unavailable threshold must not open the prompt"
                     ),
@@ -320,8 +326,12 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
 
             with (
                 patch(
-                    "qt_tm_threshold.QInputDialog.getDouble",
-                    return_value=(84, True),
+                    "qt_tm_threshold.QInputDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "qt_tm_threshold.QInputDialog.doubleValue",
+                    return_value=84,
                 ),
                 patch(
                     "workspace_state.os.replace",
@@ -337,8 +347,12 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
 
             with (
                 patch(
-                    "qt_tm_threshold.QInputDialog.getDouble",
-                    return_value=(86, True),
+                    "qt_tm_threshold.QInputDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
+                ),
+                patch(
+                    "qt_tm_threshold.QInputDialog.doubleValue",
+                    return_value=86,
                 ),
                 patch(
                     "workspace_state.os.replace",

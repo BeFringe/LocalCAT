@@ -1,0 +1,30 @@
+[
+  {
+    "source": "Accepted",
+    "speaker": " Narrator ",
+    "target": "接受"
+  },
+  "not an object",
+  {
+    "source": "   ",
+    "target": "empty source"
+  },
+  {
+    "source": "Invalid target",
+    "target": 4
+  },
+  {
+    "source": "Invalid speaker",
+    "speaker": 42,
+    "target": "拒绝"
+  },
+  {
+    "source": "Duplicate",
+    "speaker": null,
+    "target": "一"
+  },
+  {
+    "source": "Duplicate",
+    "target": "二"
+  }
+]

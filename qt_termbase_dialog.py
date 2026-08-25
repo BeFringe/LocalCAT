@@ -32,6 +32,7 @@ from editor_contracts import (
     TextMatcherState,
 )
 from editor_controller import EditorController, EditorControllerError
+from qt_localized_message_box import ask_localized_question
 
 
 _TERM_ERROR_MESSAGES = {
@@ -500,13 +501,19 @@ class QtTermbaseDialog(QDialog):
         self._handle_outcome(outcome, preferred_row=previous_row)
 
     def _confirm_delete(self, record: TermRecord) -> bool:
-        answer = QMessageBox.question(
+        answer = ask_localized_question(
             self,
-            "删除术语",
-            f"确定删除“{record.source} → {record.target}”吗？",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            title="删除术语",
+            text=f"确定删除“{record.source} → {record.target}”吗？",
+            buttons=(
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel
+            ),
+            default_button=QMessageBox.StandardButton.Cancel,
+            button_labels={
+                QMessageBox.StandardButton.Yes: "删除",
+                QMessageBox.StandardButton.Cancel: "取消",
+            },
         )
         return answer == QMessageBox.StandardButton.Yes
 

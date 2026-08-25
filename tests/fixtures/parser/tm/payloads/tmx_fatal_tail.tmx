@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tmx version="1.4">
+  <header srclang="en-US"/>
+  <body>
+    <tu>
+      <tuv xml:lang="en-US"><seg>Provisional</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>临时记录</seg></tuv>
+    </tu>
+    <tu><tuv xml:lang="en-US"><seg>Broken tail

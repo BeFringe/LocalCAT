@@ -8,7 +8,7 @@
 
 > **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
 
-- [ ] 1. 建立冻结契约与能力边界
+- [x] 1. 建立冻结契约与能力边界
 
 - [x] 1.1a 建立单 JSON 搜索与 matcher 能力契约
   - 覆盖项目工具可用性、搜索字段、命中、报告和三态 matcher readiness
@@ -22,7 +22,7 @@
   - 完成时，合法状态可稳定往返，foreign enum、错型和 status-only 伪命中在契约边界失败
   - _Requirements: 3.1, 3.5, 3.14, 3.15, 3.16, 9.1, 9.7_
 
-- [ ] 1.1b 建立 speaker inventory 能力契约
+- [x] 1.1b 建立 speaker inventory 能力契约
   - 覆盖项目工具可用性、speaker inventory item、空 speaker 计数和稳定顺序
   - 完成时，合法 inventory 可稳定构造，非法计数、重复身份或顺序组合会在边界测试中失败
   - _Requirements: 1.1, 1.3, 9.1, 9.7_
@@ -33,15 +33,20 @@
   - 完成时，preview、apply report 和单批次 undo state 能完整表达正常、无变化和 stale 场景
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 5.2, 5.3, 5.5_
 
+- [x] 1.2a 建立设备本地预处理规则偏好契约
+  - 冻结有序 literal rules、启用状态与 include_draft/include_confirmed；两个状态不得同时为 false
+  - 不携带 preview、project/session/revision、batch undo 或项目正文
+  - _Requirements: 4.12, 4.14, 4.17, 4.18_
+
 - [x] 1.3 建立 mixed termbase 与提交结果契约
   - 覆盖 legacy/v1 row kind、稳定 locator、term draft、prepared mutation、commit outcome 和 cleanup report
   - 明确 committed、not committed、rolled back、indeterminate、recovery 和 quarantine 的组合不变量
   - 完成时，legacy flags 只能为空，v1 locator 必须带稳定 ID，失败 outcome 能携带可操作 recovery 信息
   - _Requirements: 7.1, 7.5, 7.6, 7.7, 7.9, 7.10, 7.13_
 
-- [ ] 2. 实现纯领域能力与本地术语存储
+- [x] 2. 实现纯领域能力与本地术语存储
 
-- [ ] 2.1 (P) 实现确定性的 raw speaker inventory
+- [x] 2.1 (P) 实现确定性的 raw speaker inventory
   - 仅扫描规范化后的独立 speaker 字段，按首次出现顺序去重和计数
   - 空 speaker 单独计数，不读取、解析或回填 source
   - 完成时，重复扫描结果一致，扫描前后项目全部字段、顺序和身份保持不变
@@ -55,6 +60,11 @@
   - 拒绝空 find、无启用规则和无实际变化，不加入 regex、脚本、Unicode normalization 或递归重跑
   - 完成时，规则顺序、no-op、空 target 和 confirmed 保持均由纯函数测试证明
   - _Requirements: 4.1, 4.2, 4.3, 4.6, 4.7, 4.9, 4.10, 4.11_
+
+- [x] 2.2b 在 preview 前按草稿/已确认状态筛选
+  - 以 confirmed boolean 为唯一状态事实，两个独立 boolean 可同时选择；都未选时整体拒绝
+  - preview changes 继续携带 before_confirmed，以便 Qt 展示受影响状态分布
+  - _Requirements: 4.12, 4.13, 4.14, 4.15_
   - _Boundary: TargetPreprocessor_
   - _Depends: 1.2_
 
@@ -111,7 +121,7 @@
   - _Boundary: ConfiguredTermAdapter, GlossaryEngine_
   - _Depends: 1.1a, 1.3, 2.3_
 
-- [ ] 3. 在 EditorController 中闭合会话与事务
+- [x] 3. 在 EditorController 中闭合会话与事务
 
 - [x] 3.1a 建立项目 session 与单 JSON capability
   - 在成功安装、打开、切换或关闭项目时维护 session identity
@@ -120,7 +130,7 @@
   - 完成时，JSON、大小写变体 JSON、TXT、sample、失败打开和 session 切换测试均返回正确 capability 且不破坏现有会话
   - _Requirements: 9.1, 9.7_
 
-- [ ] 3.1b 建立 revision、saved baseline 与 batch 状态生命周期
+- [x] 3.1b 建立 revision、saved baseline 与 batch 状态生命周期
   - 项目内容变化时递增 revision，成功打开/保存时更新 canonical saved baseline
   - 关闭或切换项目时只清除本规格的 batch undo/preview 状态，不扩展到历史 Close-without-Saving 修复
   - 完成时，编辑、保存、关闭和 session 切换测试得到一致 revision/baseline，且不破坏现有会话
@@ -141,18 +151,23 @@
   - _Boundary: EditorController Project Search Issuance_
   - _Depends: 2.6a, 3.1a, 3.2a_
 
-- [ ] 3.2b 接入 speaker inventory
+- [x] 3.2b 接入 speaker inventory
   - 入口先通过单 JSON gate，再调用纯 inventory 能力
   - 完成时，Controller 重复读取 inventory 一致，失败保持原项目和当前位置
   - _Requirements: 1.1, 1.5, 9.1, 9.4_
 
-- [ ] 3.3 闭合预处理 preview、apply 与最近批次 undo
+- [x] 3.3 闭合预处理 preview、apply 与最近批次 undo
   - preview 绑定 session/revision；apply 复核 revision、segment identity 和 before target，stale 时整体拒绝
   - apply 只替换实际变化的 target，将变化段落设为未确认，并创建唯一 batch undo point
   - 新批次覆盖旧撤销点；相关段落后来被编辑时拒绝整批 undo，无关段落编辑继续保留
   - undo 按当前 saved baseline 重算 dirty，恢复涉及段落的 target/confirmed 且不改变 source、speaker、ID 或顺序
   - 完成时，clean、already-dirty、save-after-apply、跨项目、stale preview 和 stale undo 测试均得到一致 report
   - _Requirements: 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.2, 5.3, 5.4, 5.5, 5.6, 9.4_
+
+- [x] 3.3a 持久化并 defensive 投影预处理规则偏好
+  - 在 workspace schema v1 可选 member 中原子保存/恢复规则与状态筛选，旧文件默认兼容
+  - 保存失败保留旧文件、旧内存偏好与当前项目；保存不改变 dirty/revision/search/undo
+  - _Requirements: 4.17, 4.18, 9.3, 9.4_
 
 - [x] 3.4 闭合术语 prepare、候选 Engine、commit 与发布事务
   - 对可写 termbase 执行 prepare，并在 commit 前从 candidate records 构建完整候选 Engine 集合
@@ -168,7 +183,7 @@
   - 完成时，导入前后的 v1 metadata 无损，重启恢复一致，当前段建议即时反映 committed 术语变化
   - _Requirements: 7.2, 7.3, 7.4, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 9.6_
 
-- [ ] 4. 实现 Qt 项目工具、编辑体验与桌面呈现
+- [x] 4. 实现 Qt 项目工具、编辑体验与桌面呈现
 
 - [x] 4.1 在编辑与浏览视图显示 raw speaker
   - 当前段显示规范化 raw speaker；空值使用稳定“无 speaker”状态
@@ -177,12 +192,28 @@
   - 完成时，同一段在编辑与浏览中显示一致 speaker，切段和浏览不会修改项目或 TM identity
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 
-- [ ] 4.2 增加只读 speaker inventory 对话框
+- [x] 4.2 增加只读 speaker inventory 对话框
   - 展示首次出现顺序、每个非空 speaker 次数和独立空 speaker 计数
   - 无非空 speaker 时显示空 inventory，不从 source 创建角色
   - TXT/sample 中入口禁用并展示 capability 原因
   - 完成时，用户可重复打开对话框得到相同结果，关闭对话框前后项目和 dirty 状态不变
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 9.1_
+
+- [x] 4.2a 在 speaker inventory 中增加安全的内置头像投影
+  - 将批准的 `[speaker]Half.png` 作为随应用分发的只读展示资产，只在 inventory 行显示等比缩略图
+  - 以实际文件名建立 Unicode casefold 索引；raw speaker 只查询索引，不直接拼接路径，重复键、缺失或解码失败均显示无头像
+  - 不给 `SpeakerInventory` 合同增加头像/路径/profile 字段，不写入 JSON、workspace、搜索、术语或 TM identity
+  - 保持 Task 4.1 编辑与浏览视图无头像；不创建 alias、显式空白 profile、配置入口或推测名称
+  - 完成时，命中、大小写匹配、缺失、重复键、无效图片、可访问文本和项目完全只读均由 QtTest/边界测试证明
+  - _Requirements: 1.5, 1.8, 1.9, 1.10, 2.5, 9.3, 9.4_
+  - _Boundary: QtSpeakerInventoryDialog Presentation Assets_
+  - _Depends: 4.2_
+
+- [x] 4.2b 修复 speaker inventory“出现次数”列裁切
+  - 使用满足完整中文表头、计数与最小对话框尺寸的固定可读宽度
+  - 不压缩 raw speaker 文本权威、头像或首次出现列
+  - _Requirements: 1.11_
+  - _Depends: 4.2a_
 
 - [x] 4.3 增加项目搜索条、结果反馈与导航
   - 提供 query、source/target/speaker 范围、总数、字段、预览和前后导航
@@ -219,13 +250,20 @@
   - _Boundary: Requirement 3 Search Surface Amendment Acceptance_
   - _Depends: 1.1c, 2.6a, 3.2c, 4.3b_
 
-- [ ] 4.4 增加预处理规则、preview、apply 与 batch undo 对话框
+- [x] 4.4 增加预处理规则、preview、apply 与 batch undo 对话框
   - 支持规则增删、启停和可见顺序；只呈现普通 literal 能力
   - preview 展示受影响段落数和逐段 before/after；取消不修改项目
   - 只有用户明确确认才 apply；成功后提供可发现的“撤销最近一次应用”
   - invalid/no-op/stale/no-undo 都显示原因且不创建虚假修改
   - 完成时，QtTest 覆盖 preview→cancel、preview→apply、apply→undo、新批次覆盖和跨项目隔离
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
+
+- [x] 4.4a 增加规则保存与草稿/已确认复选筛选
+  - 恢复已保存规则/顺序/启用状态与两个复选框，提供显式“保存规则”操作
+  - preview 展示总数与草稿/已确认分布；无状态选择、无变化、保存失败均明确反馈
+  - draft-only 仍显式确认；只要包含已确认变化，应用对话框保留既有“变化段落设为待确认”警告
+  - _Requirements: 4.12, 4.13, 4.14, 4.15, 4.16, 4.17, 4.18_
+  - _Depends: 2.2b, 3.3a, 4.4_
 
 - [x] 4.5 (P) 增加集中式术语管理对话框
   - 从主窗口 Termbase 页和设置资源菜单提供两个“管理术语”入口；两者列出当前 Active+Update resource 并打开同一个对话框
@@ -263,7 +301,7 @@
   - _Boundary: QtTermbaseDialog, QtEditorWindow Refresh_
   - _Depends: 3.4, 3.5, 4.5_
 
-- [ ] 4.7b 建立预处理的主窗口四视图刷新协调
+- [x] 4.7b 建立预处理的主窗口四视图刷新协调
   - preprocess apply/undo 成功后从同一 Controller snapshot 刷新 edit、browse、progress/dirty 和 suggestions
   - 对话框不直接维护项目副本，失败操作不得渲染部分状态
   - 完成时，apply/undo 后四个视图一致，切换编辑/浏览不会显示旧 target 或 confirmed
@@ -298,17 +336,17 @@
   - portable `Ctrl+Shift+L`在紧凑/自动换行间切换，并在 tooltip 中显示平台原生文本
   - _Requirements: 8.8, 8.9_
 
-- [ ] 5. 完成集成验收与回归保护
+- [x] 5. 完成集成验收与回归保护
 
-- [ ] 5.1 验证领域与 Controller 的失败原子性
+- [x] 5.1 验证领域与 Controller 的失败原子性
   - 覆盖 JSON/TXT/sample capability、inventory/search 只读性和失败时当前位置保持
   - 覆盖 stale preview、single undo、saved baseline dirty 以及相关/无关段落后续编辑
   - 对术语 prepare、candidate build、replace、fsync、rollback、quarantine 和 cleanup 执行故障注入
   - 完成时，所有普通失败保持之前的项目/资源状态，indeterminate 明确 fail-stop，测试无部分成功
   - _Requirements: 1.5, 3.4, 4.3, 4.8, 5.2, 5.3, 5.4, 5.5, 5.6, 7.5, 7.6, 9.1, 9.4, 9.7_
 
-- [ ] 5.2 (P) 验证完整 Qt 项目工具旅程
-  - 使用真实 JSON fixture 验证 inventory、编辑/browse speaker、搜索导航和 capability gate
+- [x] 5.2 (P) 验证完整 Qt 项目工具旅程
+  - 使用真实 JSON fixture 验证 inventory、inventory-only 头像/退化状态、编辑/browse raw speaker、搜索导航和 capability gate
   - 验证预处理 cancel/apply/undo、target editor undo/redo、term CRUD 与四视图刷新
   - 断言空状态、stale 状态和失败 outcome 均不修改可见项目或资源
   - 完成时，offscreen Qt journeys 覆盖所有新增入口和关键失败路径并稳定通过
@@ -316,8 +354,8 @@
   - _Boundary: Qt Project Tool Tests_
   - _Depends: 4.7a, 4.7b_
 
-- [ ] 5.3 (P) 验证 UI polish、可访问性与导入边界
-  - 验证 silver logo、ellipsis 尺寸、resize、tooltip、accessible name 和键盘菜单
+- [x] 5.3 (P) 验证 UI polish、可访问性与导入边界
+  - 验证 silver logo、speaker inventory 头像等比缩放/退化状态、ellipsis 尺寸、resize、tooltip、accessible name 和键盘菜单
   - AST guard 覆盖主窗口、设置和三个新对话框，禁止 codec/store/domain/Core implementation 越层导入
   - composition root 仅构造依赖，不承载领域规则
   - 完成时，图标/布局/accessibility 测试和 Layer 4 boundary guard 全部通过
@@ -325,10 +363,18 @@
   - _Boundary: Qt Bootstrap, Settings and Boundary Tests_
   - _Depends: 4.8, 4.9_
 
-- [ ] 5.4 执行全量回归与本地性验收
+- [x] 5.4 执行全量回归与本地性验收
   - 运行 canonical 单元、集成、offscreen smoke 和 Excel 相关测试，只修复本规格引入的回归
   - 验证 JSON/TXT 打开、JSON 保存、精确 TM 优先、raw speaker TM identity、Trie 建议、资源导入/删除和 Excel 三态
   - 证明没有新增 PO、RPY、XLIFF、多文件夹、多项目、网络、SQLite、云端或 fuzzy 入口
   - 不把历史 Close-without-Saving 缺陷作为本规格新能力或完成条件
   - 完成时，全量测试绿色，新能力仅在单 JSON gate 内可用，所有数据处理保持本地
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
+
+- [x] 5.5 完成 project-tool usability amendment 验收
+  - QtTest 证明 inventory 表头完整、规则保存/重开/重启、两个复选筛选、状态计数和两类确认提示
+  - workspace 故障注入证明写失败原子，项目/dirty/revision/search/undo 不变
+  - 刷新受影响 acceptance/release evidence，并运行全量 suite
+  - 项目 owner 已人工采纳 ADR-014；Steering 已同步，并已复核最终五类语义门
+  - _Requirements: 1.11, 4.12, 4.13, 4.14, 4.15, 4.16, 4.17, 4.18, 9.3, 9.4_
+  - _Depends: 4.2b, 4.4a_

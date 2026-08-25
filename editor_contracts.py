@@ -17,12 +17,22 @@ from tm_contracts import (
     TextMatcherState as TextMatcherState,
     TextMatchProfile,
 )
+from project_workspace_identity import (
+    validate_document_id,
+    validate_local_segment_id,
+    validate_project_id,
+)
 
 
 DEFAULT_EDITOR_FONT_SIZE = 15
 MIN_EDITOR_FONT_SIZE = 10
 MAX_EDITOR_FONT_SIZE = 28
 EDITOR_FONT_SIZE_STEP = 1
+MIN_BROWSE_GROUP_SIZE = 20
+MAX_BROWSE_GROUP_SIZE = 200
+BROWSE_GROUP_SIZE_STEP = 10
+DEFAULT_BROWSE_GROUP_THRESHOLD = 5
+DEFAULT_BROWSE_SEGMENT_THRESHOLD = 100
 EDITOR_TM_CONTRACT_CODEC_VERSION = 1
 
 _SAFE_DIAGNOSTIC_CODE = re.compile(
@@ -56,12 +66,26 @@ class WorkspaceMode(str, Enum):
     BROWSE = "browse"
 
 
+class BrowseGroupDisplayMode(str, Enum):
+    """Presentation choices for the Browse/Review group navigator."""
+
+    AUTO_COLLAPSE = "auto_collapse"
+    FIXED = "fixed"
+
+
 class SearchField(str, Enum):
     """Searchable raw fields in one JSON project segment."""
 
     SOURCE = "source"
     TARGET = "target"
     SPEAKER = "speaker"
+
+
+class SearchScope(str, Enum):
+    """Closed multi-document search scope; chunk is intentionally absent."""
+
+    CURRENT_DOCUMENT = "current_document"
+    ENTIRE_PROJECT = "entire_project"
 
 
 class SegmentTranslationStatus(str, Enum):
@@ -93,6 +117,13 @@ class TermCommitState(str, Enum):
     NOT_COMMITTED = "not_committed"
     ROLLED_BACK = "rolled_back"
     INDETERMINATE = "indeterminate"
+
+
+class TermbaseImportHeaderMode(str, Enum):
+    """How a confirmed physical column selection treats the first row."""
+
+    FIRST_ROW = "first_row"
+    NO_HEADER = "no_header"
 
 
 class TMResourceDisplayMode(str, Enum):
@@ -201,6 +232,88 @@ class RecentProject:
             raise ValueError("recent project index must not be negative")
 
 
+@dataclass(frozen=True, slots=True)
+class RecentWorkspaceProject:
+    """Device-local composite position for one ProjectPackage session."""
+
+    path: Path
+    project_id: str
+    document_id: str
+    local_segment_id: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if not self.path.is_absolute():
+            raise ValueError("recent workspace path must be absolute")
+        validate_project_id(self.project_id)
+        validate_document_id(self.document_id)
+        validate_local_segment_id(self.local_segment_id)
+        if type(self.index) is not int or self.index < 0:
+            raise ValueError("recent workspace index must be nonnegative")
+
+
+@dataclass(frozen=True)
+class BrowseGroupPreferences:
+    """Device-local browse grouping without changing segment identity."""
+
+    enabled: bool = True
+    segments_per_group: int = MIN_BROWSE_GROUP_SIZE
+    activation_group_threshold: int = DEFAULT_BROWSE_GROUP_THRESHOLD
+    activation_segment_threshold: int = DEFAULT_BROWSE_SEGMENT_THRESHOLD
+    display_mode: BrowseGroupDisplayMode = BrowseGroupDisplayMode.AUTO_COLLAPSE
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise TypeError("browse grouping enabled state must be an exact bool")
+        if type(self.display_mode) is not BrowseGroupDisplayMode:
+            raise TypeError(
+                "browse group display mode must be exact BrowseGroupDisplayMode"
+            )
+        if type(self.segments_per_group) is not int:
+            raise TypeError("browse group size must be an exact integer")
+        if not MIN_BROWSE_GROUP_SIZE <= self.segments_per_group <= MAX_BROWSE_GROUP_SIZE:
+            raise ValueError(
+                "browse group size must be between "
+                f"{MIN_BROWSE_GROUP_SIZE} and {MAX_BROWSE_GROUP_SIZE}"
+            )
+        if self.segments_per_group % BROWSE_GROUP_SIZE_STEP:
+            raise ValueError(
+                "browse group size must use "
+                f"{BROWSE_GROUP_SIZE_STEP}-segment increments"
+            )
+        if (
+            type(self.activation_group_threshold) is not int
+            or self.activation_group_threshold < 1
+        ):
+            raise ValueError(
+                "browse activation group threshold must be a positive integer"
+            )
+        if (
+            type(self.activation_segment_threshold) is not int
+            or self.activation_segment_threshold < MIN_BROWSE_GROUP_SIZE
+        ):
+            raise ValueError(
+                "browse activation segment threshold must be at least "
+                f"{MIN_BROWSE_GROUP_SIZE}"
+            )
+
+    def group_count(self, segment_count: int) -> int:
+        if type(segment_count) is not int or segment_count < 0:
+            raise ValueError("browse segment count must be a non-negative integer")
+        if segment_count == 0:
+            return 0
+        return (
+            segment_count + self.segments_per_group - 1
+        ) // self.segments_per_group
+
+    def should_show(self, segment_count: int) -> bool:
+        group_count = self.group_count(segment_count)
+        return self.enabled and (
+            group_count > self.activation_group_threshold
+            or segment_count > self.activation_segment_threshold
+        )
+
+
 @dataclass(frozen=True)
 class DisplayPreferences:
     """Persistent local display preferences for the editor workspace."""
@@ -208,6 +321,7 @@ class DisplayPreferences:
     segment_density: SegmentDensity = SegmentDensity.COMPACT
     workspace_mode: WorkspaceMode = WorkspaceMode.EDIT
     editor_font_size: int = DEFAULT_EDITOR_FONT_SIZE
+    browse_grouping: BrowseGroupPreferences = BrowseGroupPreferences()
 
     def __post_init__(self) -> None:
         if not isinstance(self.segment_density, SegmentDensity):
@@ -224,6 +338,11 @@ class DisplayPreferences:
                 "editor font size must be between "
                 f"{MIN_EDITOR_FONT_SIZE} and {MAX_EDITOR_FONT_SIZE}"
             )
+        if type(self.browse_grouping) is not BrowseGroupPreferences:
+            raise TypeError(
+                "display browse grouping must be exact BrowseGroupPreferences"
+            )
+        self.browse_grouping.__post_init__()
 
 
 @dataclass(frozen=True)
@@ -390,6 +509,72 @@ class EditorProject:
 
 
 @dataclass(frozen=True)
+class SpeakerInventoryItem:
+    """One non-empty raw speaker in first-occurrence order."""
+
+    raw_speaker: str
+    count: int
+    first_segment_id: str
+    first_index: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw_speaker, str):
+            raise TypeError("inventory raw speaker must be a string")
+        if not self.raw_speaker:
+            raise ValueError("inventory raw speaker must not be empty")
+        if not isinstance(self.count, int) or isinstance(self.count, bool):
+            raise TypeError("inventory count must be an integer")
+        if self.count <= 0:
+            raise ValueError("inventory count must be positive")
+        if not isinstance(self.first_segment_id, str):
+            raise TypeError("inventory first segment id must be a string")
+        if not self.first_segment_id.strip():
+            raise ValueError("inventory first segment id must not be empty")
+        if not isinstance(self.first_index, int) or isinstance(
+            self.first_index,
+            bool,
+        ):
+            raise TypeError("inventory first index must be an integer")
+        if self.first_index < 0:
+            raise ValueError("inventory first index must not be negative")
+
+
+@dataclass(frozen=True)
+class SpeakerInventory:
+    """Deterministic, read-only projection of project raw speakers."""
+
+    items: tuple[SpeakerInventoryItem, ...]
+    empty_count: int
+    segment_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("inventory items must be a tuple")
+        if not all(isinstance(item, SpeakerInventoryItem) for item in self.items):
+            raise TypeError("inventory items must contain SpeakerInventoryItem values")
+        for name, value in (
+            ("empty count", self.empty_count),
+            ("segment count", self.segment_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"inventory {name} must be an integer")
+            if value < 0:
+                raise ValueError(f"inventory {name} must not be negative")
+        raw_speakers = tuple(item.raw_speaker for item in self.items)
+        if len(raw_speakers) != len(set(raw_speakers)):
+            raise ValueError("inventory raw speakers must be unique")
+        first_indices = tuple(item.first_index for item in self.items)
+        if first_indices != tuple(sorted(first_indices)):
+            raise ValueError("inventory items must follow first-occurrence order")
+        if len(first_indices) != len(set(first_indices)):
+            raise ValueError("inventory first indices must be unique")
+        if any(index >= self.segment_count for index in first_indices):
+            raise ValueError("inventory first index must reference a project segment")
+        if self.empty_count + sum(item.count for item in self.items) != self.segment_count:
+            raise ValueError("inventory counts must cover every project segment")
+
+
+@dataclass(frozen=True)
 class LiteralReplaceRule:
     """One ordered, case-sensitive literal target replacement."""
 
@@ -404,6 +589,29 @@ class LiteralReplaceRule:
             raise ValueError("literal rule find value must not be empty")
         if not isinstance(self.enabled, bool):
             raise TypeError("literal rule enabled state must be a boolean")
+
+
+@dataclass(frozen=True)
+class PreprocessPreferences:
+    """Device-local saved literal rules and segment-status selection."""
+
+    rules: tuple[LiteralReplaceRule, ...] = ()
+    include_draft: bool = True
+    include_confirmed: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.rules) is not tuple:
+            raise TypeError("preprocess preference rules must be a tuple")
+        if not all(type(rule) is LiteralReplaceRule for rule in self.rules):
+            raise TypeError(
+                "preprocess preference rules must contain exact LiteralReplaceRule values"
+            )
+        if type(self.include_draft) is not bool:
+            raise TypeError("preprocess include_draft must be an exact boolean")
+        if type(self.include_confirmed) is not bool:
+            raise TypeError("preprocess include_confirmed must be an exact boolean")
+        if not self.include_draft and not self.include_confirmed:
+            raise ValueError("at least one preprocess segment status must be selected")
 
 
 @dataclass(frozen=True)
@@ -1381,6 +1589,27 @@ class ProjectSearchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceSearchRequest:
+    """Workspace-only field selection plus a closed document scope."""
+
+    query: str
+    fields: tuple[SearchField, ...]
+    options: SearchOptions
+    status: SegmentTranslationStatus | None = None
+    scope: SearchScope = SearchScope.ENTIRE_PROJECT
+
+    def __post_init__(self) -> None:
+        ProjectSearchRequest(
+            query=self.query,
+            fields=self.fields,
+            options=self.options,
+            status=self.status,
+        )
+        if type(self.scope) is not SearchScope:
+            raise TypeError("workspace search scope must be SearchScope")
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectSearchHit:
     """One half-open match range bound to stable project navigation identity."""
 
@@ -1419,6 +1648,42 @@ class ProjectSearchHit:
             raise ValueError(
                 "project search hit end index must not exceed preview length"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSearchHit:
+    """One workspace match bound to document and local segment identity."""
+
+    document_id: str
+    local_segment_id: str
+    project_global_index: int
+    field: SearchField
+    start_index: int
+    end_index: int
+    preview: str
+
+    def __post_init__(self) -> None:
+        validate_document_id(self.document_id)
+        validate_local_segment_id(self.local_segment_id)
+        _validate_exact_nonnegative_int(
+            self.project_global_index,
+            "workspace search hit global index",
+        )
+        if type(self.field) is not SearchField:
+            raise TypeError("workspace search hit field must be SearchField")
+        _validate_exact_nonnegative_int(
+            self.start_index,
+            "workspace search hit start index",
+        )
+        _validate_exact_nonnegative_int(
+            self.end_index,
+            "workspace search hit end index",
+        )
+        if self.end_index <= self.start_index:
+            raise ValueError("workspace search hit range must be nonempty")
+        _validate_exact_raw_text(self.preview, "workspace search hit preview")
+        if self.end_index > len(self.preview):
+            raise ValueError("workspace search hit range exceeds preview")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1500,6 +1765,70 @@ class ProjectSearchReport:
     def total(self) -> int:
         """Return the derived result count without duplicating report state."""
 
+        return len(self.hits)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSearchReport:
+    """Stable composite workspace hits plus the shared matcher projection."""
+
+    hits: tuple[WorkspaceSearchHit, ...]
+    capability: TextMatcherDisplayState
+
+    def __post_init__(self) -> None:
+        if type(self.hits) is not tuple or any(
+            type(hit) is not WorkspaceSearchHit for hit in self.hits
+        ):
+            raise TypeError(
+                "workspace search hits must be exact WorkspaceSearchHit values"
+            )
+        for hit in self.hits:
+            hit.__post_init__()
+        if type(self.capability) is not TextMatcherDisplayState:
+            raise TypeError("workspace search capability must be exact")
+        self.capability.__post_init__()
+        if self.capability.state is TextMatcherState.UNAVAILABLE and self.hits:
+            raise ValueError("unavailable workspace search cannot contain hits")
+        identity_by_index: dict[int, tuple[str, str]] = {}
+        index_by_identity: dict[tuple[str, str], int] = {}
+        identities: list[tuple[str, str, SearchField, int, int]] = []
+        sort_keys: list[tuple[int, int, int, int]] = []
+        for hit in self.hits:
+            identity = (hit.document_id, hit.local_segment_id)
+            if identity_by_index.setdefault(
+                hit.project_global_index,
+                identity,
+            ) != identity:
+                raise ValueError("workspace global index changed identity")
+            if index_by_identity.setdefault(
+                identity,
+                hit.project_global_index,
+            ) != hit.project_global_index:
+                raise ValueError("workspace identity changed global index")
+            identities.append(
+                (
+                    hit.document_id,
+                    hit.local_segment_id,
+                    hit.field,
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+            sort_keys.append(
+                (
+                    hit.project_global_index,
+                    _SEARCH_FIELD_ORDER[hit.field],
+                    hit.start_index,
+                    hit.end_index,
+                )
+            )
+        if len(identities) != len(set(identities)):
+            raise ValueError("workspace search report contains duplicate hits")
+        if sort_keys != sorted(sort_keys):
+            raise ValueError("workspace search hits must use stable project order")
+
+    @property
+    def total(self) -> int:
         return len(self.hits)
 
 
@@ -1907,6 +2236,165 @@ class ImportReport:
         return not self.errors
 
 
+MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS = 256
+MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS = 256
+
+
+@dataclass(frozen=True)
+class TermbaseImportSourceIdentity:
+    """Qt-safe exact projection of one Parser sealed-source identity."""
+
+    relative_reference_sha256: str
+    regular_file_identity: str
+    original_size: int
+    original_mtime_ns: int
+    content_sha256: str
+    byte_count: int
+    schema_version: int
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.relative_reference_sha256, "relative reference digest"),
+            (self.content_sha256, "content digest"),
+        ):
+            if type(value) is not str or not _LOWER_SHA256_DIGEST.fullmatch(value):
+                raise ValueError(f"termbase preview {field_name} must be lowercase SHA-256")
+        _validate_exact_non_empty_string(
+            self.regular_file_identity,
+            "termbase preview regular file identity",
+        )
+        _validate_exact_nonnegative_int(
+            self.original_size,
+            "termbase preview original size",
+        )
+        _validate_exact_nonnegative_int(
+            self.original_mtime_ns,
+            "termbase preview original mtime",
+        )
+        _validate_exact_nonnegative_int(
+            self.byte_count,
+            "termbase preview byte count",
+        )
+        if self.original_size != self.byte_count:
+            raise ValueError("termbase preview byte count must equal original size")
+        if type(self.schema_version) is not int or self.schema_version <= 0:
+            raise ValueError("termbase preview schema version must be a positive integer")
+
+
+@dataclass(frozen=True)
+class TermbaseImportPreviewColumn:
+    zero_based_index: int
+    header_candidate: str | None
+    header_original_char_count: int = 0
+    header_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_exact_nonnegative_int(
+            self.zero_based_index,
+            "termbase preview column index",
+        )
+        if self.header_candidate is not None:
+            if type(self.header_candidate) is not str:
+                raise TypeError("termbase preview header candidate must be a string or None")
+            if len(self.header_candidate) > MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS:
+                raise ValueError("termbase preview header candidate is too long")
+            _validate_exact_nonnegative_int(
+                self.header_original_char_count,
+                "termbase preview header original length",
+            )
+            _validate_exact_bool(
+                self.header_truncated,
+                "termbase preview header truncation",
+            )
+            if self.header_original_char_count < len(self.header_candidate):
+                raise ValueError("termbase preview header length is inconsistent")
+            if self.header_truncated != (
+                self.header_original_char_count > len(self.header_candidate)
+            ):
+                raise ValueError("termbase preview header truncation is inconsistent")
+        elif self.header_original_char_count != 0 or self.header_truncated:
+            raise ValueError("missing termbase preview header cannot carry truncation facts")
+
+
+@dataclass(frozen=True)
+class TermbaseImportPreview:
+    format_name: str
+    columns: tuple[TermbaseImportPreviewColumn, ...]
+    total_column_count: int
+    columns_truncated: bool
+    legacy_header_detected: bool
+    active_sheet_name: str | None
+    source_identity: TermbaseImportSourceIdentity
+
+    def __post_init__(self) -> None:
+        _validate_exact_non_empty_string(self.format_name, "termbase preview format")
+        if len(self.format_name) > 32:
+            raise ValueError("termbase preview format name is too long")
+        if type(self.columns) is not tuple or any(
+            type(column) is not TermbaseImportPreviewColumn
+            for column in self.columns
+        ):
+            raise TypeError("termbase preview columns must be an exact immutable tuple")
+        if not self.columns:
+            raise ValueError("termbase preview must expose at least one column")
+        if len(self.columns) > MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS:
+            raise ValueError("termbase preview retains too many columns")
+        expected_indices = tuple(range(len(self.columns)))
+        if tuple(column.zero_based_index for column in self.columns) != expected_indices:
+            raise ValueError("termbase preview columns must preserve dense physical order")
+        _validate_exact_nonnegative_int(
+            self.total_column_count,
+            "termbase preview total column count",
+        )
+        if self.total_column_count < len(self.columns):
+            raise ValueError("termbase preview total column count is inconsistent")
+        _validate_exact_bool(self.columns_truncated, "termbase preview truncation")
+        if self.columns_truncated != (self.total_column_count > len(self.columns)):
+            raise ValueError("termbase preview truncation state is inconsistent")
+        _validate_exact_bool(
+            self.legacy_header_detected,
+            "termbase preview legacy header detection",
+        )
+        if self.active_sheet_name is not None:
+            if type(self.active_sheet_name) is not str:
+                raise TypeError("termbase preview active sheet name must be a string or None")
+            if len(self.active_sheet_name) > MAX_TERMBASE_IMPORT_PREVIEW_LABEL_CHARS:
+                raise ValueError("termbase preview active sheet name is too long")
+        if type(self.source_identity) is not TermbaseImportSourceIdentity:
+            raise TypeError("termbase preview source identity is invalid")
+
+
+@dataclass(frozen=True)
+class TermbaseImportSelection:
+    source_zero_based_index: int
+    target_zero_based_index: int
+    header_mode: TermbaseImportHeaderMode
+    preview_column_count: int
+    preview_source_identity: TermbaseImportSourceIdentity
+
+    def __post_init__(self) -> None:
+        _validate_exact_nonnegative_int(
+            self.source_zero_based_index,
+            "termbase import source column index",
+        )
+        _validate_exact_nonnegative_int(
+            self.target_zero_based_index,
+            "termbase import target column index",
+        )
+        if self.source_zero_based_index == self.target_zero_based_index:
+            raise ValueError("termbase source and target columns must differ")
+        if type(self.preview_column_count) is not int or self.preview_column_count <= 0:
+            raise ValueError("termbase preview column count must be a positive integer")
+        if self.preview_column_count > MAX_TERMBASE_IMPORT_PREVIEW_COLUMNS:
+            raise ValueError("termbase preview column count exceeds the visible preview limit")
+        if max(self.source_zero_based_index, self.target_zero_based_index) >= self.preview_column_count:
+            raise ValueError("termbase column selection exceeds the visible preview")
+        if type(self.header_mode) is not TermbaseImportHeaderMode:
+            raise TypeError("termbase import header mode is invalid")
+        if type(self.preview_source_identity) is not TermbaseImportSourceIdentity:
+            raise TypeError("termbase import preview source identity is invalid")
+
+
 @dataclass(frozen=True)
 class TMResourceWriteOutcome:
     """Body-free result of one confirmed-translation TM append attempt."""
@@ -2015,9 +2503,15 @@ class ImportRequest:
     input_path: Path
     source_locale: str = ""
     target_locale: str = ""
+    termbase_selection: TermbaseImportSelection | None = None
 
     def __post_init__(self) -> None:
         if not self.resource_id.strip():
             raise ValueError("resource id must not be empty")
         if not self.input_path.is_absolute():
             raise ValueError("input path must be absolute")
+        if self.termbase_selection is not None:
+            if type(self.termbase_selection) is not TermbaseImportSelection:
+                raise TypeError("termbase selection must use the typed import contract")
+            if self.input_path.suffix.lower() not in {".csv", ".xlsx"}:
+                raise ValueError("termbase column selection only applies to CSV/XLSX imports")

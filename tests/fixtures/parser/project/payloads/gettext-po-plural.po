@@ -1,0 +1,4 @@
+msgid "One file"
+msgid_plural "Many files"
+msgstr[0] "一个文件"
+msgstr[1] "多个文件"

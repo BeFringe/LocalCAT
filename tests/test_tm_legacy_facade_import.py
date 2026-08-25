@@ -9,6 +9,7 @@ JSONL last-write-wins merge unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -16,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from parser_composition import OpenedParserInput
 from resource_importer import import_tmx
 from tm_contracts import SourceBindingState
 from tm_engine import open_canonical_tm_store
@@ -146,6 +148,46 @@ class CanonicalImportSeamTests(unittest.TestCase):
             )
             self.assertEqual(target.read_bytes(), original)
 
+    def test_activated_import_maps_localcat_context_and_preserves_unknown_props(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _activate_resource(root)
+            source = root / "props.tmx"
+            self._write_tmx(
+                source,
+                '<tu><prop type="x-LocalCAT-context-prev">Before</prop>'
+                '<prop type="x-LocalCAT-context-next">After</prop>'
+                '<prop type="x-LocalCAT-speaker">Narrator</prop>'
+                '<prop type="x-MateCAT-status">translated</prop>'
+                '<prop type="x-vendor-note" xml:lang="en-US">one</prop>'
+                '<prop type="x-vendor-note">two</prop>'
+                '<tuv xml:lang="en-US"><seg>Alpha</seg></tuv>'
+                '<tuv xml:lang="zh-CN"><seg>甲</seg></tuv></tu>',
+            )
+
+            report = import_tmx(source, target, "en-US", "zh-CN")
+            record = _store_for(target).exact_records("Alpha")[0]
+
+        self.assertTrue(report.succeeded)
+        self.assertEqual(record.speaker_raw, "Narrator")
+        self.assertEqual(record.context_prev_raw, "Before")
+        self.assertEqual(record.context_next_raw, "After")
+        self.assertIn(("tmx.status", "translated"), record.provenance)
+        raw_props = [
+            json.loads(value)
+            for key, value in record.provenance
+            if key == "tmx.prop"
+        ]
+        self.assertEqual(
+            raw_props[-2:],
+            [
+                ["tu", "x-vendor-note", "en-us", "one"],
+                ["tu", "x-vendor-note", "", "two"],
+            ],
+        )
+
     def test_identical_digest_reimport_fails_closed_without_duplicates(
         self,
     ) -> None:
@@ -184,22 +226,31 @@ class CanonicalImportSeamTests(unittest.TestCase):
                 1,
             )
 
-    def test_import_records_and_digest_share_one_input_snapshot(self) -> None:
+    def test_import_records_digest_and_receipt_share_one_input_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = _activate_resource(root)
-            source = root / "batch.tmx"
+            source = root / "origin-batch.tmx"
             self._write_tmx(source, _tmx_units(("Alpha", "甲")))
             original = source.read_bytes()
+            expected_digest = hashlib.sha256(original).hexdigest()
+            expected_receipt_source = source.resolve()
+            replacement = root / "replacement-name.tmx"
+            self._write_tmx(replacement, _tmx_units(("Beta", "乙")))
 
-            def snapshot_then_replace(path: Path) -> bytes:
-                captured = path.read_bytes()
-                self._write_tmx(path, _tmx_units(("Beta", "乙")))
-                return captured
+            original_stream = OpenedParserInput.stream
+
+            def stream_then_replace(opened: OpenedParserInput):
+                source.unlink()
+                source.symlink_to(replacement)
+                return original_stream(opened)
 
             with patch(
-                "resource_importer._read_tmx_snapshot",
-                side_effect=snapshot_then_replace,
+                "parser_composition.OpenedParserInput.stream",
+                autospec=True,
+                side_effect=stream_then_replace,
             ):
                 first = import_tmx(source, target, "en-US", "zh-CN")
 
@@ -207,10 +258,34 @@ class CanonicalImportSeamTests(unittest.TestCase):
             store = _store_for(target)
             self.assertEqual(store.exact_records("Alpha")[0].target_raw, "甲")
             self.assertFalse(store.exact_records("Beta"))
+            imported = store.capture_export_snapshot().records[3].record
+            self.assertEqual(imported.file_source, "origin-batch.tmx")
+            self.assertEqual(
+                imported.provenance,
+                (
+                    ("source", "tmx-import"),
+                    ("file", "origin-batch.tmx"),
+                ),
+            )
+            with sqlite3.connect(
+                target.with_name(f"{target.name}.sqlite3")
+            ) as connection:
+                origin = connection.execute(
+                    "SELECT source_digest, source_path "
+                    "FROM tm_origin_batch WHERE kind = 'import'"
+                ).fetchone()
+            self.assertEqual(
+                origin,
+                (expected_digest, str(expected_receipt_source)),
+            )
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(source.resolve(), replacement.resolve())
 
             # Restoring the exact captured bytes must hit the same origin
-            # digest.  If digesting had re-read the replaced path, this
-            # second call would incorrectly create a duplicate Alpha row.
+            # digest.  If digesting or receipt provenance had re-read the
+            # replaced path, this second call would incorrectly create a
+            # duplicate Alpha row or bind the receipt to the replacement.
+            source.unlink()
             source.write_bytes(original)
             second = import_tmx(source, target, "en-US", "zh-CN")
             self.assertFalse(second.succeeded)
@@ -274,6 +349,36 @@ class CanonicalImportSeamTests(unittest.TestCase):
                 report.errors,
                 ("canonical import transaction constraint failed",),
             )
+            self.assertEqual(store.canonical_revision().record_count, 3)
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_generic_sqlite_failure_is_body_safe_and_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _activate_resource(root)
+            original = target.read_bytes()
+            source = root / "batch.tmx"
+            self._write_tmx(source, _tmx_units(("Alpha", "甲")))
+            store = _store_for(target)
+
+            with patch.object(
+                SQLiteTMStore,
+                "append_batch",
+                side_effect=sqlite3.OperationalError(
+                    "SECRET database body"
+                ),
+            ):
+                report = import_tmx(source, target, "en-US", "zh-CN")
+
+            self.assertFalse(report.succeeded)
+            self.assertEqual(report.imported, 0)
+            self.assertEqual(report.skipped, 0)
+            self.assertEqual(report.overwritten, 0)
+            self.assertEqual(
+                report.errors,
+                ("canonical import transaction failed",),
+            )
+            self.assertNotIn("SECRET", " ".join(report.errors))
             self.assertEqual(store.canonical_revision().record_count, 3)
             self.assertEqual(target.read_bytes(), original)
 

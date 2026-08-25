@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE tmx [
+  <!ENTITY blocked "synthetic entity text">
+]>
+<tmx version="1.4">
+  <header srclang="en-US"/>
+  <body>
+    <tu>
+      <tuv xml:lang="en-US"><seg>&blocked;</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>应拒绝</seg></tuv>
+    </tu>
+  </body>
+</tmx>

@@ -63,8 +63,8 @@
 ## Governance Impact
 
 - **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`roadmap.md`、`spec-ownership.md` 与 repository safety rules。
-- **Applicable ADRs**：ADR-007～013；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。
-- **ADR disposition**：Follow ADR-012 处理 unpublished orphan residue；Gate D follow ADR-009/011 的单一 Core authority，并按 ADR-013 复证设备本地资格。
+- **Applicable ADRs**：ADR-007～013、ADR-016；ADR-002/006 仅保留 never-activated legacy exact-only 与历史背景。
+- **ADR disposition**：Follow ADR-012 处理 unpublished orphan residue；Gate D follow ADR-009/011 的单一 Core authority，并按 ADR-013 复证设备本地资格；已完整发布 canonical 的 device-only 平台身份漂移 follow ADR-016 的显式同 generation re-attestation。
 - **Scope amendment**：Approved for ADR-012 orphan-residue remediation。首次迁移、完整激活、失败可重试、无 prior canonical 时保留 JSONL 兼容能力，已由 `tm-storage-retrieval-index` Requirement 2 批准；ADR-012 明确了 unpublished residue 不得被提升为 canonical authority fact。
 - **Steering sync**：Required。实现闭合时同步 `product.md`、`structure.md`、`tech.md` 的 exact-only/JSONL 当前态与新增文件边界；已同步的 integration boundary、roadmap 和 ownership 不重复改写。
 - **Downstream revalidation**：`qt-editor-json-mvp-increment` Requirement 3/7 matcher handoff、既有 Qt/Excel/legacy tests、macOS bootstrap；Parser/multi-document 仅登记未来触发器。
@@ -247,6 +247,7 @@ stateDiagram-v2
     Activating --> SourceDiverged: update failure keeps last-known-good
     CanonicalActive --> Unavailable: canonical authority cannot be re-proven
     SourceDiverged --> Unavailable: canonical authority cannot be re-proven
+    Unavailable --> CanonicalActive: explicit ADR-016 same-generation re-attestation succeeds
 ```
 
 - 打开应用、项目、设置、刷新或查询绝不调用 migration。
@@ -257,6 +258,7 @@ stateDiagram-v2
 - 成功后先重新 resolve 并 re-prove canonical runtime，再原子替换 resource snapshot、递增 epoch、刷新当前建议。
 - 已证明未发布 canonical authority 的首次取消或完整回滚保持 JSONL bytes/config 和 legacy exact-only；已有 canonical 更新失败保持 last-known-good，不查询 JSONL。
 - 上述 legacy 保留只适用于 Core 明确证明“从未发布 canonical”或“首次 activation 已完整取消/回滚”的 outcome；存在 ambiguous durable facts、rollback/cleanup 无法证明或可能已发布 authority 时，资源进入 `UNAVAILABLE`，不得查询 legacy。
+- 普通重开仍对已发布 canonical 执行完整 active attestation；若唯一差异是 source/manifest/SQLite 的一致 device-number 漂移，resolver 只投影资源局部 `CANONICAL_REATTESTATION_REQUIRED` safe code，不自行修复或创建 legacy port。用户显式操作成功后才由同一 runtime replacement 路径恢复该资源。
 
 ### Apply、确认与写回
 
@@ -491,6 +493,7 @@ class TMRuntimeSnapshot:
 - 返回 `None` 只表示 never-activated/cancelled-first legacy；创建 legacy exact port。
 - canonical reopen 成功时创建 store-backed handle/append port，并校验 Core resource identity 与 config id。
 - 任意 present-but-invalid/tampered/ambiguous canonical fact产生 `UNAVAILABLE`；不得创建 legacy fallback。
+- ADR-016 的 repairable device-only drift 仍属于普通查询不可用；resolver 只携带安全原因，不能把 repairability 当成 authority 或直接打开 store。
 - 一个资源失败只关闭该资源。完整 snapshot 构造后一次交换；旧 snapshot 在活动操作结束后释放。
 
 ### EditorTMAdapter
@@ -546,6 +549,23 @@ class TMMigrationService:
 - application 可按现有 public constructor 注入与 resource/store identity 精确绑定的 `ResourceStoreCoordinator`；`activate_initial()` 内部独占其 `_seal_stage`/publish/recovery 调用。private registry、StageSealer、sealed/prepared value 和 token 不得由外部注入或取得。并发、foreign identity、ambiguous durable facts 或 rollback 不能证明时均 fail-closed 为稳定 code，不允许 legacy fallback。但按 ADR-012，无 live reservation 且无 durable publication/recovery fact 的 salted mutable stage orphan 不是 authority ambiguity；Core 必须保留其 inode/bytes、继续 legacy exact 并使用 fresh nonce 重试，不自动 cleanup。
 - 用户取消边界位于调用前；Core stage 建议固定为 `PREFLIGHT/BUILD/SEAL/PREPARE/JOURNAL/PUBLISH/VERIFY/RECOVERY`，UI 只接收安全映射。
 - 该 seam 完成 Feature 5 已批准 Requirement 2 的 application-facing 公开合同，同时是本 Spec Requirement 5 的执行性依赖；不由 `editor_tm_adapter.py` 或 Qt 实现。未通过 Core 既有合同、防篡改、seal、publication 与 recovery 回归前，必须阻断下游 Controller/TM UI，不得删除显式激活或从 UI 私补迁移链。
+
+### Canonical device-only re-attestation（ADR-016）
+
+**Contracts**: Service [x] / Maintenance [x]
+
+```python
+class TMMigrationService:
+    def reattest_completed_authority(
+        self, source: Path, resource_id: str
+    ) -> MigrationReport: ...
+```
+
+- 入口只接受当前 configured identity，先取得持久资源锁，再由 activation recovery 重验唯一 completed `GENERATION_PUBLISHED` record；Qt/Controller 不接触 journal 或 attestation。
+- repairable proof 必须同时证明 persisted source/manifest/SQLite 共用一个旧 device、observed artifacts 共用一个不同的新 device，并逐一闭合 inode、size、SHA-256、resource/store/generation、manifest/binding 与 phase。任意 mixed identity、byte/inode drift、pending terminal/temp/stage 或 recovery 歧义都拒绝且零 mutation。
+- 成功只通过既有 fsync + atomic replace 协议更新 durable device identity，随后重开、query lease 与 health/binding proof 必须证明同一 store id、同一 generation。generation 1+ 不得降级为 generation 0。
+- application worker 在完成前后重新证明 operation resource/store/generation，成功后原子替换 runtime snapshot、epoch 与当前建议；失败保留 resource-local unavailable，peer resources 不受影响。
+- 本操作不读取 Gate D evidence、不调用 Gate D owner、不发布 Context/Fuzzy capability。若 current-source/Gate C identity 因代码变更使 ADR-013 compatibility 失配，Fuzzy 由其独立显式重验流程处理。
 
 ### EditorController
 

@@ -6,15 +6,22 @@
 
 | 层 | 职责 | 当前关键文件 |
 |----|------|-------------|
-| Layer 1 Storage | legacy JSONL、canonical SQLite、mixed termbase CSV、资源/工作区状态与持久恢复 | `resource_repository.py`, `workspace_state.py`, `termbase_store.py`, `tm_sqlite_store.py`, `tm_activation_*.py` |
-| Layer 2 Engine / Parser | TM retrieval/scoring、capability-gated text matcher、项目搜索、Trie 术语、项目/资源解析 | `tm_retrieval.py`, `tm_similarity.py`, `text_matcher.py`, `project_search.py`, `glossary_engine.py`, `editor_project.py` |
-| Layer 3 Application / Logic | capability/runtime composition、TM adapter、Qt 有状态会话；Excel 无状态三态入口 | `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
-| Layer 4 Frontend | Excel、PySide6 主窗口/资源/术语交互与桌面启动入口 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_settings_dialog.py`, `qt_termbase_dialog.py`, `qt_editor.py` |
+| Layer 1 Storage | legacy JSONL、canonical SQLite、mixed termbase CSV、资源/工作区状态、ResourcePackage receipt/pending、namespaced Chunk metadata 与持久恢复 | `resource_repository.py`, `resource_receipt_ledger.py`, `workspace_state.py`, `termbase_store.py`, `tm_sqlite_store.py`, `tm_activation_*.py`, `collaborative_chunk_store.py` |
+| Layer 2 Engine / Parser | TM retrieval/scoring、capability-gated text matcher、项目搜索、Trie 术语；中立 Parser contracts/source/registry 与格式 codec | `tm_retrieval.py`, `tm_similarity.py`, `text_matcher.py`, `project_search.py`, `glossary_engine.py`, `parser_contracts.py`, `parser_source.py`, `parser_registry.py`, `parser_*_codec.py` |
+| Layer 3 Application / Logic | Parser composition/facade mapping、workspace immutable contracts/identity/explicit intake/reconciliation/carrier-neutral save+recovery/compatibility adapter、deterministic ProjectPackage ZIP v1、独立 ResourcePackage ZIP v1 与 profile transaction、Chunk topology/assignment/permission/progress/rebase/conflict 与 Workspace composition、issued multi-document Controller session 与复合搜索投影、capability/runtime composition、TM adapter；Excel 无状态三态入口 | `parser_composition.py`, `editor_project.py`, `project_workspace*.py`, `project_save.py`, `project_package.py`, `resource_package*.py`, `resource_portability.py`, `resource_artifact_save.py`, `tm_resource_port.py`, `project_search.py`, `collaborative_chunks.py`, `collaborative_chunk_*.py`, `chunk_controller_adapter.py`, `workspace_state.py`, `resource_importer.py`, `tm_json_importer.py`, `capability_host.py`, `tm_application_composition.py`, `editor_tm_adapter.py`, `editor_controller.py`, `logic_controller.py` |
+| Layer 4 Frontend | Excel、PySide6 主窗口/资源/术语/协作分工交互与桌面启动入口 | `excel_adapter*.py`, `qt_editor_window.py`, `qt_chunk_manager_dialog.py`, `qt_settings_dialog.py`, `qt_termbase_dialog.py`, `qt_editor.py` |
 
 关键约束：
 
 - Engine、Parser、Repository 不得导入 PySide6 或 xlwings。
+- Parser 与 Engine/Store 互不导入；Application 只经 `parser_contracts.py` 与 `parser_composition.py` 消费中立结果，只有 composition 可导入具体内建 codec。
+- 多文档显式文件 intake 仅由 `project_workspace_intake.py` 通过中立 Parser surface 建立 rooted verified facts；`project_workspace.py` 只负责 carrier-neutral 聚合与 reconciliation，不打开 source、不枚举目录、不导入 Parser/codec、不拥有 writer 或 durable publication。
+- `project_save.py` 仅协调 workspace snapshot、逐Document baseline、candidate/LKG、structured report 与 cold recovery；物理 ProjectPackage carrier、archive grammar、target path 与 durability primitive 仍属 C2C port，不得在 save service 内抢跑。
+- `project_package.py` 实现 ADR-019 唯一 `localcat-project-package-zip-v1` carrier：仅接受 classic single-disk `ZIP_STORED`，拒绝 ZIP64/压缩/encryption/data descriptor/extra/comment/非闭集member；手工 export/import 复用 `project_save.py` 的 stage→validate→arm→publish→双readback→cleanup 协调，不得为sync/provider、ResourcePackage或codec-private语义owner。
+- `resource_package.py` 独立实现 `localcat-resource-package-zip-v1`：每包恰好一个 TM JSONL 或术语 CSV/v1 payload，strict two-member `ZIP_STORED` carrier 与 ProjectPackage 不共享 manifest、identity、receipt、merge 或 package authority。`resource_portability.py` 只经 TM/Termbase owner snapshot port 完成 direct/package export、sealed preview、create/replace apply、receipt 与冷重开；不复制 live SQLite、sidecar、journal 或 stage。
+- 多文档 Application 只通过 C2 owner 的 prepare/discard/commit capability 预构建并单点发布 Controller session；legacy `ProjectSearch*`/`RecentProject` 保持 exact，workspace 另用复合 `WorkspaceSearch*`/`RecentWorkspaceProject`，两种搜索共享同一 Core matcher pipeline。
 - Qt 模块只调用 `EditorController` 与 frozen contracts，不得直接导入 repository、store、retrieval、matcher 或 capability owner。
+- Chunk Qt 只调用 `ChunkControllerAdapter` 暴露的 frozen application projections/commands；不解码 chunk store/metadata，不把分工范围当成 ProjectPackage、ResourcePackage 或 TMX payload。
 - `CapabilityHost` 是 matcher/retrieval capability 发布权威；`TMRuntimeHost` 持有完整 resource snapshot，`EditorTMAdapter` 只将同一 operation 投影给 `EditorController`。
 - `LogicController` 的三态与 legacy TM 优先规则保持不变；`EditorController` 单独持有 Qt 项目、搜索、TM/术语 issuance 与资源操作会话。
 
@@ -22,6 +29,7 @@
 
 - Python：当前在 3.14 上开发与验证。
 - 核心与无头入口：标准库为主。
+- Parser contracts/source/registry 与 JSON/TXT/PO/POT/TMX/normalized JSON codec 使用标准库；XLSX codec 仅在安全 preflight 后条件使用 openpyxl。
 - Qt 前端：`PySide6==6.11.1`。
 - XLSX：`openpyxl>=3.1,<4`。
 - 交互式 Excel：xlwings，可选且只属于 Excel Layer 4。
@@ -43,18 +51,21 @@ python qt_editor.py --install-macos-app
 | JSONL | legacy TM 的 exact/source-LWW 兼容存储，也是首次 canonical 激活的可核对 source snapshot |
 | SQLite + sidecars/journal | 每资源 canonical TM；版本化记录、多译文、索引、generation、snapshot binding 与可崩溃恢复发布 |
 | UTF-8-SIG CSV | mixed termbase；legacy 两列行原样保留，v1 行携带稳定 id 与 Match Case / Whole Word |
-| JSON / TXT | 编辑项目输入；项目保存为版本化 JSON |
-| TMX | Level 1 导入；最大 100 MB；拒绝 DTD/ENTITY；行内 XML 单元跳过 |
-| XLSX | 术语导入前两列；依赖 openpyxl |
+| JSON / TXT | `project_document` 单输入；JSON 支持 schema-v1 canonical write，TXT source-only/read-only |
+| PO / POT | `project_document` singular profile；保留 opaque gettext metadata，plural 输入 fail closed |
+| TMX | `translation_memory` Level 1；最大 100 MB；拒绝 DTD/ENTITY/外部实体；行内 XML 单元 warning+skip |
+| normalized TM JSON | `translation_memory` 单文件数组根；单输入 codec 保序保重复，目录/LWW/JSONL 输出留在 CLI Application |
+| CSV / XLSX | `termbase` 显式列选择；Qt 导入先消费 codec-owned 有界列 preview，并把完整 source identity 与可见列数绑定到正式导入；未提供选择的调用继续前两列兼容 preset，XLSX 只读 active worksheet且不聚合多 Sheet |
 | workspace.json | 最近十个项目、稳定段落 ID/索引回退、显示/TM 偏好以及 ADR-014 批准的预处理规则/状态偏好；不写入翻译项目或执行会话 |
 
-项目保存、资源清单与导入均使用同目录临时文件加 `os.replace`。整体解析失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
+LocalCAT JSON canonical writer 由 codec 只生成确定性 bytes，`parser_source.py` 在 rooted target parent 内执行独占临时文件、file fsync、原子 replace 与 readback receipt；resource/store 与 normalized CLI 继续拥有各自事务。任何入口只有在 verified terminal 后才可提交，整体解析、consumer 或 commit 失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
 
 ## 开发与测试标准
 
 - 跨层契约使用 `@dataclass(frozen=True)` 和 tuple 集合。
 - 新代码使用 `pathlib.Path`、现代类型语法和显式异常/结构化报告。
 - 正式测试使用 stdlib `unittest`；Qt 使用 offscreen 与 QtTest；旧核心继续保留模块自检。
+- Parser completion 使用合成可分发 golden、故障注入、mutation-sensitive completion matrix 与 AST/import closed-world guards；Gate D 100,000 条 TM 仍是 retrieval 性能资格，不是 Parser limit。
 - `.kiro/specs/` 保存需求、设计和任务；`.kiro/steering/` 保存当前项目级事实。
 
 ```bash
@@ -77,5 +88,10 @@ python translation_runner.py
 - TM/termbase 候选图均先完整构建和验证，成功后一次替换；失败保留上一组可用实例或明确 fail closed。
 - 浏览/校对页与三栏编辑器共享同一个 `EditorProject` 会话，只读表格不复制或覆盖未保存译文。
 - canonical 查询固定 EXACT → CONTEXT → FUZZY；Gate D 按 ADR-013 由 Core 复证设备本地资格，兼容键命中可跨进程恢复，缺失/失配只允许显式重验。FUZZY 仍只在正式 capability 开放且候选分数达到 device-local 阈值时出现，从不自动应用。
+- 已发布 canonical 的跨重启平台文件身份恢复按 ADR-016；普通打开、内容证明、generation 与 Fuzzy 资格边界保持不变。
 - 项目搜索与版本化术语共用 capability-gated `TextMatcher`的 Unicode/Whole Word 语义；Qt 不复制 matcher 实现。
-- Parser 与 Engine 按 ADR-015 保持互不导入；Application façade/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
+- Parser 与 Engine 按 ADR-015 保持互不导入；Application 兼容入口/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
+- CSV/XLSX 术语列 preview 是 Parser reader 的显式 capability：CSV 复用首个逻辑 record，XLSX 复用 OPC preflight 与 active worksheet 首行；正式导入在同一新 sealed snapshot 上先复核完整身份和可见列数，再允许 verified stream 与 TermbaseStore 事务。Qt/Controller 不拥有 CSV/XLSX grammar，也不自动猜测语言列。
+- TM candidate 模块解耦已按 ADR-017 落地：`tm_candidate_index.py` 只消费 `tm_candidate_store_contracts.py` 的中立 storage port，`tm_sqlite_candidate_projection.py` 独占 steady-state candidate SQL/row data plane；`SQLiteTMStore` / query view 继续独占 connection、transaction、generation、stable error mapping 与公开入口。schema、proof-query-v3、scorer/budget/order 未改，final roots 上 Gate C、fault/acceptance/release 及真实 100,000 条 FTS5/fallback Gate D 均已重签为 GO。
+- Multi-Document 实现受 ADR-018/019 约束：ProjectPackage 是多文档 workspace 的 canonical persistence，ProjectOrigin 只描述 source/reconciliation/write-back，`codec_private_member` 保持 codec-owned opaque；ProjectPackage 与 ResourcePackage 不共享 authority。已落地 workspace v1 身份/origin、legacy 单 JSON promotion boundary、suffix-neutral 显式多文件选择与 JSON/TXT/PO/POT intake/reconciliation、carrier-neutral candidate/LKG/逐Document baseline/save+recovery、ADR-019 严格 `localcat-project-package-zip-v1` 的 export/validate/preview/import/apply/receipt 与冷重开，以及 Controller-issued session、复合搜索、Qt 文档导航/连续段落/逐文档保存与恢复反馈。Qt 首页、项目主按钮、项目菜单唯一的本地打开命令和 `Ctrl+O` 共用单选/多选分流；Shift 多选只签发有序显式文件集，复用同一 review/save/intake 流且不扫描目录。无箭头文件夹菜单只导航当前 workspace 文档；ProjectPackage open/import 仍在“项目”菜单完成 preview/apply。Legacy会话的import另选package destination，preview不创建目标或修改旧文件，Apply才以`NEW`/`REPLACE`发布incoming包并切换workspace；它不提升Legacy内容。成功冷重开的 package 是 durable workspace；未发布的显式文件 intake 仍为 `durable=False`，directory discovery 与 workbook project profile 仍未启用。Browse/Review 分组轮次默认使用自动收起式指示条，也可切换固定式预览列表；两种显示方式共享当前 Document projection 与首段 issued identity；“段落”列按字体度量动态保留完整文档内编号。Cluster 4 final current-source evidence 已在冻结 tree 重签：digest `544d9ddf2d1e8acc3cbcd6cf0b95fda11a84ced45e65031d682b5ecc0ed84f3f`，19 个 production roots，characterization 9/9 与 strict check 通过；未运行或刷新 TM Gate C/D。
+- Collaborative Chunks 保持 `Project → Document → Segment` 身份不变，以 exact Segment identity 建立不重叠 partial partition、单 assignee、Controller mutation permission、派生 progress 与 Workspace transition rebase。namespaced metadata/audit/LKG 不改 ProjectPackage bytes；retired chunk IDs append-only，退役型 head 不复活。Project 菜单拥有“协作分工管理 / 当前分工”，选定后编辑、浏览/校对与文档文件夹共用 exact membership 切面；主拆分对整项目/源分工动态 2–N 均分，起止/离散段落范围只服务高级操作。Chunk current-source overlay 已以 digest `acfa2cd9e5108828940bec50b14e190fddedc97cc49aa31ddd614fc96f9a8bca` 重签 8 个 production roots。

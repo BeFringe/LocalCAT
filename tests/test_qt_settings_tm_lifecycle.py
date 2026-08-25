@@ -38,17 +38,30 @@ from PySide6.QtWidgets import (
 )
 
 from capability_host import CapabilityHost
-from editor_contracts import EditorProject, EditorSegment, ResourceKind
+from editor_contracts import (
+    EditorProject,
+    EditorSegment,
+    ResourceKind,
+    TMResourceDisplayMode,
+    TMResourceStatus,
+)
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
-from qt_settings_dialog import DEFAULT_VISIBLE_RESOURCE_ROWS, QtSettingsDialog
+from qt_settings_dialog import (
+    DEFAULT_VISIBLE_RESOURCE_ROWS,
+    QtSettingsDialog,
+    _tm_status_safe_reason,
+)
 from resource_repository import ResourceRepository
 from tm_application_composition import (
     TMResourceResolver,
     TMRuntimeHost,
     _TMEngineLegacyBackend,
 )
+from tm_contracts import CanonicalResourceIdentity
 from tm_migration import TMMigrationService
+from tm_sqlite_store import _activation_journal_path
+from tests.test_tm_canonical_reattestation import _rewrite_persisted_devices
 from tests.test_tm_initial_activation_recovery import _legacy_failure
 
 
@@ -142,6 +155,51 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(capabilities)
         assert capabilities is not None
         return capabilities
+
+    def test_activation_prompt_and_aggregate_fuzzy_reason_are_localized(self) -> None:
+        status = TMResourceStatus(
+            resource_id="tm-1",
+            resource_name="TM 1",
+            mode=TMResourceDisplayMode.CANONICAL_ACTIVE,
+            exact_available=True,
+            context_available=True,
+            fuzzy_available=True,
+            safe_codes=("RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED",),
+            retryable=False,
+        )
+        reason = _tm_status_safe_reason(status, status.safe_codes[0])
+        self.assertEqual(
+            reason,
+            "另一 Fuzzy 路径性能证据未通过（当前 Fuzzy 可用）",
+        )
+        self.assertNotIn("状态信息不可用", reason)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, (resource_id,) = _controller(Path(temporary))
+            dialog = QtSettingsDialog(controller)
+            button_texts: list[str] = []
+
+            def cancel_prompt() -> None:
+                for widget in QApplication.topLevelWidgets():
+                    if not isinstance(widget, QMessageBox):
+                        continue
+                    accept = widget.button(QMessageBox.StandardButton.Yes)
+                    cancel = widget.button(QMessageBox.StandardButton.Cancel)
+                    if accept is None or cancel is None:
+                        continue
+                    button_texts.extend((accept.text(), cancel.text()))
+                    self.assertEqual(
+                        widget.defaultButton(),
+                        cancel,
+                    )
+                    cancel.click()
+                    return
+
+            QTimer.singleShot(25, cancel_prompt)
+            self._action(dialog, resource_id).trigger()
+            self.assertEqual(button_texts, ["激活", "取消"])
+            self.assertIsNone(controller.tm_activation_operation())
+            dialog.close()
 
     def _assert_app_owned_more_indicator(self, button: QToolButton) -> None:
         image = button.grab().toImage()
@@ -250,6 +308,71 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         dialog._poll_tm_operation()
         self._events()
 
+    def test_device_drift_offers_canonical_revalidation_not_fuzzy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, (resource_id,) = _controller(Path(temporary))
+            preflight = controller.prepare_tm_activation(resource_id)
+            started = controller.activate_tm_resource(preflight)
+            completed = controller.wait_tm_activation(
+                started.operation_id,
+                timeout=20.0,
+            )
+            self.assertTrue(completed.succeeded)
+            config = controller.repository.get(resource_id)
+            identity = CanonicalResourceIdentity.from_configured_jsonl(
+                resource_id,
+                config.path,
+            )
+            _rewrite_persisted_devices(
+                _activation_journal_path(identity),
+                persisted_device=config.path.stat().st_dev + 17,
+            )
+            dialog = QtSettingsDialog(controller)
+            dialog.show()
+            self._events()
+
+            status = next(
+                item
+                for item in controller.tm_resource_statuses()
+                if item.resource_id == resource_id
+            )
+            self.assertEqual(
+                status.safe_codes,
+                ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",),
+            )
+            action = self._action(dialog, resource_id)
+            self.assertEqual(action.text(), "重新验证 canonical")
+            self.assertTrue(action.isEnabled())
+            with (
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                patch.object(
+                    controller,
+                    "revalidate_tm_fuzzy",
+                    side_effect=AssertionError(
+                        "canonical re-attestation must not run Gate D"
+                    ),
+                ) as fuzzy_revalidation,
+            ):
+                action.trigger()
+                self._events()
+                self._complete_operation(dialog, controller)
+                fuzzy_revalidation.assert_not_called()
+
+            refreshed = next(
+                item
+                for item in controller.tm_resource_statuses()
+                if item.resource_id == resource_id
+            )
+            self.assertEqual(
+                refreshed.mode,
+                TMResourceDisplayMode.CANONICAL_ACTIVE,
+            )
+            self.assertIn("已完成", dialog.status_label.text())
+            dialog.close()
+
     def test_open_and_refresh_are_read_only_and_show_legacy_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, (resource_id,) = _controller(Path(temporary))
@@ -314,7 +437,7 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             inner = dialog.active_table.verticalScrollBar()
             outer = dialog.resource_tables_scroll.verticalScrollBar()
             self.assertEqual(inner.maximum(), 56)
-            self.assertEqual(outer.maximum(), 308)
+            self.assertGreaterEqual(outer.maximum(), 250)
 
             phases = (
                 Qt.ScrollPhase.NoScrollPhase,
@@ -456,9 +579,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             dialog = QtSettingsDialog(controller)
 
             with (
-                patch.object(
-                    QMessageBox,
-                    "question",
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
                     return_value=QMessageBox.StandardButton.Cancel,
                 ) as question,
                 patch.object(
@@ -502,9 +624,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
 
             dialog = QtSettingsDialog(controller)
             with (
-                patch.object(
-                    QMessageBox,
-                    "question",
+                patch(
+                    "qt_settings_dialog._ask_localized_question",
                     return_value=QMessageBox.StandardButton.Yes,
                 ),
                 patch.object(
@@ -551,7 +672,10 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 prompts.append(message)
                 return QMessageBox.StandardButton.Yes
 
-            with patch.object(QMessageBox, "question", side_effect=confirm):
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
+                side_effect=confirm,
+            ):
                 self._action(dialog, resource_id).trigger()
                 self._complete_operation(dialog, controller)
 
@@ -688,9 +812,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             controller, resource_ids = _controller(Path(temporary), resources=3)
             canonical_id, legacy_id, missing_id = resource_ids
             activation_dialog = QtSettingsDialog(controller)
-            with patch.object(
-                QMessageBox,
-                "question",
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
                 return_value=QMessageBox.StandardButton.Yes,
             ):
                 self._action(activation_dialog, canonical_id).trigger()

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": " Chapter One ",
+  "source_locale": "en-US",
+  "target_locale": "zh-CN",
+  "segments": [
+    {
+      "id": "one",
+      "source": " First source ",
+      "target": "",
+      "speaker": "",
+      "confirmed": false
+    }
+  ]
+}

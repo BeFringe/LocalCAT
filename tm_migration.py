@@ -1069,6 +1069,67 @@ class TMMigrationService:
                     source_before=source_before,
                 )
 
+    def reattest_completed_authority(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationReport:
+        """Explicitly repair one completed device-number-only authority.
+
+        The persistent resource lock spans source scan, Core re-attestation,
+        and success projection.  No new generation/store is minted and no
+        stage, snapshot, or configured source bytes are written.
+        """
+
+        coordinator = self._coordinator
+        if type(resource_id) is not str or not resource_id.strip():
+            raise MigrationPreflightError("MIGRATION.RESOURCE_ID_INVALID")
+        if resource_id != self._resource_identity.resource_id:
+            raise MigrationPreflightError(
+                "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
+            )
+        if coordinator is None:
+            raise MigrationPreflightError(
+                "MIGRATION.COORDINATOR_UNAVAILABLE"
+            )
+        if (
+            coordinator._resource_identity != self._resource_identity
+            or coordinator.resource_id != resource_id
+            or coordinator.canonical_store_id != self._canonical_store_id
+            or coordinator.current_generation is not None
+            or coordinator.active_store_path is not None
+            or coordinator.state != "READY"
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_OWNER_INVALID"
+            )
+        self._validate_source_preconditions(source)
+        try:
+            reservation = _InitialActivationResourceReservation.acquire(
+                self._resource_identity
+            )
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_LOCK_UNAVAILABLE"
+            ) from error
+        with reservation:
+            reservation.reprove()
+            preflight = _scan_jsonl(source)
+            try:
+                recovered = coordinator.reattest_completed_authority()
+            except ActivationPreparationError as error:
+                raise MigrationPreflightError(error.code) from error
+            reservation.reprove()
+            if recovered.generation is None:
+                raise MigrationPreflightError(
+                    "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+                )
+            return self._recovered_reattestation_success_report(
+                coordinator=coordinator,
+                preflight=preflight,
+                generation=recovered.generation,
+            )
+
     def _initial_resource_reservation_failure(
         self,
         *,
@@ -1617,6 +1678,130 @@ class TMMigrationService:
             expected_binding_digest=_sealed_source_binding_digest(binding),
             generation=generation,
         )
+        return MigrationReport(
+            resource_id=self._resource_identity.resource_id,
+            canonical_store_id=self._canonical_store_id,
+            source_digest=preflight.source_digest,
+            snapshot_receipt=receipt,
+            migrated_count=preflight.valid_count,
+            variant_count=preflight.variant_count,
+            skipped_count=preflight.invalid_count,
+            diagnostics=preflight.diagnostics,
+            activated_generation=generation,
+            canonical_exact_available=True,
+            context_available=False,
+            fuzzy_available=False,
+        )
+
+    def _recovered_reattestation_success_report(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        preflight: MigrationPreflight,
+        generation: int,
+    ) -> MigrationReport:
+        """Project an explicitly re-attested completed generation.
+
+        Unlike first-activation recovery, this projection accepts any fully
+        published generation.  It does not rebuild or reinterpret the
+        snapshot: the current manifest/receipt, hydrated coordinator, query
+        lease, revision and generation must all close over the same resource
+        and store before the existing ``MigrationReport`` is emitted for the
+        application runtime swap.
+        """
+
+        try:
+            manifest_payload = (
+                self._resource_identity.snapshot_manifest_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            ) from error
+        try:
+            decoded = contract_from_json(manifest_payload)
+        except ValueError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            ) from error
+        if type(decoded) is not SnapshotManifest:
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            )
+        manifest = decoded
+        try:
+            binding = SnapshotBinding(
+                configured_jsonl_path=(
+                    self._resource_identity.configured_jsonl_path
+                ),
+                manifest_path=self._resource_identity.snapshot_manifest_path,
+                snapshot_kind=manifest.snapshot_kind,
+                receipt=manifest.receipt,
+                manifest=manifest,
+            )
+        except ValueError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            ) from error
+        receipt = binding.receipt
+        if (
+            type(generation) is not int
+            or generation < 0
+            or receipt.resource_id != self._resource_identity.resource_id
+            or receipt.canonical_store_id != self._canonical_store_id
+            or receipt.jsonl_digest != preflight.source_digest
+            or receipt.record_count != preflight.valid_count
+            or coordinator.state != "READY"
+            or coordinator.current_generation != generation
+            or coordinator.canonical_store_id != self._canonical_store_id
+            or coordinator.resource_id != self._resource_identity.resource_id
+            or coordinator.active_store_path is None
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            )
+        try:
+            if coordinator.durable_activation_phase != "GENERATION_PUBLISHED":
+                raise MigrationPreflightError(
+                    "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+                )
+            store = SQLiteTMStore.from_coordinator(coordinator)
+            health = store.health()
+            revision = store.canonical_revision()
+            with store.query_lease() as query_view:
+                query_health = query_view.health()
+        except MigrationPreflightError:
+            raise
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_REOPEN_FAILED"
+            ) from error
+        if (
+            not health.healthy
+            or not health.exact_available
+            or health.context_available
+            or health.fuzzy_available
+            or health.generation != generation
+            or health.snapshot_binding_digest
+            != _sealed_source_binding_digest(binding)
+            or health.source_binding_state is None
+            or health.diagnostic_codes
+            or query_health != health
+            or revision.resource_id != self._resource_identity.resource_id
+            or revision.canonical_store_id != self._canonical_store_id
+            or revision.generation != generation
+            or revision.head_revision < receipt.exported_revision
+            or revision.record_count < receipt.record_count
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+            )
         return MigrationReport(
             resource_id=self._resource_identity.resource_id,
             canonical_store_id=self._canonical_store_id,

@@ -15,6 +15,8 @@ from uuid import uuid4
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
 from editor_contracts import (
+    BatchOperationReport,
+    BatchUndoState,
     ConfirmResult,
     DisplayPreferences,
     EditorProject,
@@ -23,15 +25,22 @@ from editor_contracts import (
     FuzzyValidationState,
     ImportReport,
     ImportRequest,
+    LiteralReplaceRule,
+    PreprocessChange,
+    PreprocessPreferences,
+    PreprocessPreview,
     ProjectSearchHit,
     ProjectSearchReport,
     ProjectSearchRequest,
     ProjectToolCapability,
     SearchField,
+    SearchScope,
     SegmentTranslationStatus,
+    SpeakerInventory,
     ResourceConfig,
     ResourceKind,
     RecentProject,
+    RecentWorkspaceProject,
     RetrievalDisplayState,
     LegacyExactTMSuggestion,
     SuggestionBundle,
@@ -47,11 +56,15 @@ from editor_contracts import (
     TermCommitOutcome,
     TermCommitState,
     TermDraft,
+    TermbaseImportPreview,
     TermRecord,
     TermRecordLocator,
     TermSuggestion,
     TextMatcherDisplayState,
     WriteReport,
+    WorkspaceSearchHit,
+    WorkspaceSearchReport,
+    WorkspaceSearchRequest,
 )
 from editor_tm_adapter import (
     EditorTMAdapter,
@@ -68,15 +81,31 @@ from glossary_engine import GlossaryEngine
 from resource_importer import (
     ImportFailure,
     import_tmx,
+    preview_termbase_import as preview_termbase_import_file,
     read_legacy_termbase_import,
 )
 from resource_repository import ResourceError, ResourceRepository
+from resource_package_contracts import (
+    PortableResourceKind,
+    ResourceExportOutcome,
+    ResourceImportMode,
+    ResourcePackageImportPreview,
+    ResourcePackageImportResult,
+    ResourcePackageValidationReport,
+    ResourcePortabilityError,
+    ResourceRecoveryAction,
+    ResourceRecoveryDisposition,
+    ResourceRecoveryOutcome,
+    ResourceRecoveryPreview,
+)
+from resource_portability import ResourcePortabilityService
 from renpy_tm_compat import build_dialogue_alias, unwrap_dialogue_target
 from project_search import (
     ProjectSearchError,
     ProjectSearchService,
     segment_translation_status,
 )
+from speaker_inventory import build_speaker_inventory
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
@@ -86,11 +115,53 @@ from tm_contracts import (
     StoreHealth,
     TextMatcherState,
 )
-from tm_engine import SourceUnit, TMEngine
+from tm_engine import SourceUnit, TMEngine, canonical_authority_facts
 from tm_migration import MigrationPreflightError, TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator
 from termbase_store import TermbaseStore, TermbaseValidationError
+from target_preprocessor import PreprocessValidationError, preview_preprocessing
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
+from project_package import (
+    OpenedProjectPackage,
+    ProjectPackageExportReceipt,
+    ProjectPackagePersistenceBinding,
+    ProjectPackageImportPreview,
+    ProjectPackageImportReceipt,
+    ProjectPackageImportMode,
+    ProjectPackageService,
+)
+from project_save import ProjectSaveReport, ProjectSaveService
+from project_workspace import (
+    DocumentProgress,
+    FlatProjectSegment,
+    IssuedDocumentIdentity,
+    IssuedProjectIdentity,
+    IssuedSegmentIdentity,
+    ProjectProgress,
+    ProjectWorkspaceService,
+    ReconciliationAssociation,
+    ReconciliationDecision,
+    ReconciliationPreview,
+    ReconciliationReceipt,
+    WorkspaceDocumentView,
+    WorkspaceSaveState,
+    WorkspaceSegmentView,
+    WorkspaceSessionView,
+)
+from project_workspace_contracts import (
+    ProjectSegment,
+    ProjectWorkspace,
+    SegmentIdentity,
+    StagedSelectedProjectDocuments,
+)
+from project_workspace_identity import ProjectWorkspaceError
+from project_workspace_intake import (
+    OriginRenameMapping,
+    SelectedProjectDocumentsRequest,
+    revalidate_staged_selected_documents,
+    stage_selected_project_documents,
+    stage_workspace_rebind,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +178,127 @@ _PreparedTermOperation = Callable[[Path], PreparedTermMutation]
 
 class EditorControllerError(RuntimeError):
     """Raised when an editor operation cannot be completed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceSaveState:
+    """Current package baseline projection without carrier internals."""
+
+    dirty_document_ids: tuple[str, ...]
+    manifest_dirty: bool
+    project_dirty: bool
+    package_path: Path
+    artifact_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.dirty_document_ids) is not tuple:
+            raise TypeError("workspace dirty ids must be an exact tuple")
+        if len(self.dirty_document_ids) != len(set(self.dirty_document_ids)):
+            raise ValueError("workspace dirty ids must be unique")
+        if type(self.manifest_dirty) is not bool or type(self.project_dirty) is not bool:
+            raise TypeError("workspace dirty flags must be exact bool")
+        if self.project_dirty != bool(self.dirty_document_ids or self.manifest_dirty):
+            raise ValueError("workspace project dirty must close over document state")
+        if not isinstance(self.package_path, Path) or not self.package_path.is_absolute():
+            raise TypeError("workspace save state requires absolute package path")
+        if (
+            type(self.artifact_digest) is not str
+            or len(self.artifact_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.artifact_digest)
+        ):
+            raise ValueError("workspace save state requires artifact digest")
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceSaveResult:
+    save_report: ProjectSaveReport
+    receipt: ProjectPackageExportReceipt | None
+    session: WorkspaceSessionView
+    package_artifact_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.save_report) is not ProjectSaveReport:
+            raise TypeError("workspace save result requires exact report")
+        if self.receipt is not None and type(self.receipt) is not ProjectPackageExportReceipt:
+            raise TypeError("workspace save receipt must be exact or None")
+        if type(self.session) is not WorkspaceSessionView:
+            raise TypeError("workspace save result requires issued session")
+        if (
+            type(self.package_artifact_digest) is not str
+            or len(self.package_artifact_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.package_artifact_digest)
+        ):
+            raise ValueError("workspace save result requires artifact digest")
+        if self.receipt is not None and self.receipt.artifact_digest != self.package_artifact_digest:
+            raise ValueError("workspace save receipt artifact changed")
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceCreationResult:
+    """One newly exported package and the issued session opened from it."""
+
+    receipt: ProjectPackageExportReceipt
+    session: WorkspaceSessionView
+
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not ProjectPackageExportReceipt:
+            raise TypeError("workspace creation requires exact package receipt")
+        if type(self.session) is not WorkspaceSessionView:
+            raise TypeError("workspace creation requires exact issued session")
+        if self.receipt.project_id != self.session.project.project_id:
+            raise ValueError("workspace creation project identity changed")
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceImportResult:
+    receipt: ProjectPackageImportReceipt
+    session: WorkspaceSessionView
+    active_session_changed: bool
+
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not ProjectPackageImportReceipt:
+            raise TypeError("workspace import result requires exact receipt")
+        if type(self.session) is not WorkspaceSessionView:
+            raise TypeError("workspace import result requires issued session")
+        if type(self.active_session_changed) is not bool:
+            raise TypeError("workspace import swap flag must be exact bool")
+        if self.active_session_changed:
+            if self.session.project.project_id != self.receipt.project_id:
+                raise ValueError("workspace import session project changed")
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerWorkspaceConfirmResult:
+    """Workspace confirmation outcome without flattening it into EditorProject."""
+
+    session: WorkspaceSessionView
+    current_identity: IssuedSegmentIdentity
+    current_global_index: int
+    write_report: WriteReport
+
+    def __post_init__(self) -> None:
+        if type(self.session) is not WorkspaceSessionView:
+            raise TypeError("workspace confirmation requires issued session")
+        if type(self.current_identity) is not IssuedSegmentIdentity:
+            raise TypeError("workspace confirmation requires issued identity")
+        if type(self.current_global_index) is not int or self.current_global_index < 0:
+            raise TypeError("workspace confirmation index must be nonnegative")
+        if type(self.write_report) is not WriteReport:
+            raise TypeError("workspace confirmation requires exact write report")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedWorkspaceInstall:
+    """Fully built Controller state awaiting one non-failing field swap."""
+
+    service: ProjectWorkspaceService
+    save_service: ProjectSaveService
+    projection: tuple[FlatProjectSegment, ...]
+    current_index: int
+    generation: int
+    session_id: str
+    view: WorkspaceSessionView
+    observed_tm_signature: tuple[str, str, str, int, int, float, int, str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +368,42 @@ def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
     return TMMigrationService(
         resource_identity=identity,
         canonical_store_id=coordinator.canonical_store_id,
+        coordinator=coordinator,
+    )
+
+
+def _tm_reattestation_service(config: ResourceConfig) -> TMMigrationService:
+    """Construct an explicit owner for one refused canonical authority.
+
+    This path consumes only durable identity facts.  It does not open the
+    canonical store or grant query authority before the Core maintenance
+    transition repeats its device-only proof under the persistent lock.
+    """
+
+    if type(config) is not ResourceConfig:
+        raise TypeError("TM re-attestation config must be ResourceConfig")
+    config.__post_init__()
+    facts = canonical_authority_facts(config.path)
+    if facts is None:
+        raise EditorControllerError(
+            "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
+        )
+    resource_id, canonical_store_id = facts
+    if resource_id != config.id:
+        raise EditorControllerError(
+            "TM.RUNTIME.CANONICAL_REATTESTATION_IDENTITY_INVALID"
+        )
+    identity = CanonicalResourceIdentity.from_configured_jsonl(
+        config.id,
+        config.path,
+    )
+    coordinator = ResourceStoreCoordinator(
+        canonical_store_id=canonical_store_id,
+        resource_identity=identity,
+    )
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=canonical_store_id,
         coordinator=coordinator,
     )
 
@@ -529,6 +757,43 @@ def _clone_project_search_request(
     return cloned
 
 
+def _clone_workspace_search_request(
+    request: WorkspaceSearchRequest,
+) -> WorkspaceSearchRequest:
+    if type(request) is not WorkspaceSearchRequest:
+        raise TypeError("workspace search request must be exact")
+    request.__post_init__()
+    cloned = WorkspaceSearchRequest(
+        query=request.query,
+        fields=tuple(request.fields),
+        options=SearchOptions(
+            match_case=request.options.match_case,
+            whole_word=request.options.whole_word,
+        ),
+        status=request.status,
+        scope=request.scope,
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _clone_workspace_search_report(
+    report: WorkspaceSearchReport,
+) -> WorkspaceSearchReport:
+    if type(report) is not WorkspaceSearchReport:
+        raise TypeError("workspace search report must be exact")
+    report.__post_init__()
+    cloned = WorkspaceSearchReport(
+        hits=tuple(replace(hit) for hit in report.hits),
+        capability=replace(
+            report.capability,
+            supported_profiles=tuple(report.capability.supported_profiles),
+        ),
+    )
+    cloned.__post_init__()
+    return cloned
+
+
 def _clone_term_records(
     records: tuple[TermRecord, ...],
 ) -> tuple[TermRecord, ...]:
@@ -619,6 +884,21 @@ def _project_search_hit_fields_equal(
     )
 
 
+def _workspace_search_hit_fields_equal(
+    candidate: WorkspaceSearchHit,
+    issued: WorkspaceSearchHit,
+) -> bool:
+    return (
+        candidate.document_id == issued.document_id
+        and candidate.local_segment_id == issued.local_segment_id
+        and candidate.project_global_index == issued.project_global_index
+        and candidate.field is issued.field
+        and candidate.start_index == issued.start_index
+        and candidate.end_index == issued.end_index
+        and candidate.preview == issued.preview
+    )
+
+
 def _project_search_fields_digest(project: EditorProject) -> str:
     """Bind one issued report to stable identities and searchable field values."""
 
@@ -641,6 +921,74 @@ def _project_search_fields_digest(project: EditorProject) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _project_content_digest(project: EditorProject) -> str:
+    """Digest canonical editable project content without logging raw text."""
+
+    if type(project) is not EditorProject:
+        raise TypeError("project content digest requires EditorProject")
+    project.__post_init__()
+    payload = (
+        project.name,
+        project.source_locale,
+        project.target_locale,
+        tuple(
+            (
+                segment.id,
+                segment.source,
+                segment.target,
+                segment.speaker,
+                segment.confirmed,
+            )
+            for segment in project.segments
+        ),
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _clone_preprocess_preview(preview: PreprocessPreview) -> PreprocessPreview:
+    """Validate and detach one caller-owned preprocessing preview graph."""
+
+    if type(preview) is not PreprocessPreview:
+        raise TypeError("preprocess preview must be PreprocessPreview")
+    preview.__post_init__()
+    cloned = PreprocessPreview(
+        project_session_id=preview.project_session_id,
+        base_revision=preview.base_revision,
+        changes=tuple(replace(change) for change in preview.changes),
+    )
+    cloned.__post_init__()
+    return cloned
+
+
+def _clone_preprocess_preferences(
+    preferences: PreprocessPreferences,
+) -> PreprocessPreferences:
+    """Validate and detach one device-local preprocessing preference graph."""
+
+    if type(preferences) is not PreprocessPreferences:
+        raise TypeError("preprocess preferences must be PreprocessPreferences")
+    preferences.__post_init__()
+    cloned = PreprocessPreferences(
+        rules=tuple(
+            LiteralReplaceRule(
+                find=rule.find,
+                replacement=rule.replacement,
+                enabled=rule.enabled,
+            )
+            for rule in preferences.rules
+        ),
+        include_draft=preferences.include_draft,
+        include_confirmed=preferences.include_confirmed,
+    )
+    cloned.__post_init__()
+    return cloned
 
 
 def _validate_exact_project_search_handoff(
@@ -710,6 +1058,56 @@ def _validate_project_search_report_against_project(
             field_text = segment.speaker
         if hit.preview != field_text:
             raise ValueError("project search hit preview does not match the field")
+
+
+def _workspace_search_field_text(
+    segment: ProjectSegment,
+    field: SearchField,
+) -> str:
+    if field is SearchField.SOURCE:
+        return segment.source
+    if field is SearchField.TARGET:
+        return segment.target
+    return segment.raw_speaker
+
+
+def _validate_workspace_search_report(
+    report: WorkspaceSearchReport,
+    service: ProjectWorkspaceService,
+    request: WorkspaceSearchRequest,
+    *,
+    current_document_id: str,
+) -> None:
+    """Bind one report to current composite identities and exact field text."""
+
+    if type(report) is not WorkspaceSearchReport:
+        raise TypeError("workspace search report must be WorkspaceSearchReport")
+    if type(service) is not ProjectWorkspaceService:
+        raise TypeError("workspace search service must be ProjectWorkspaceService")
+    if type(request) is not WorkspaceSearchRequest:
+        raise TypeError("workspace search request must be WorkspaceSearchRequest")
+    report.__post_init__()
+    request.__post_init__()
+    projection = service.flat_segments
+    for hit in report.hits:
+        if hit.project_global_index >= len(projection):
+            raise ValueError("workspace search hit has no current composite identity")
+        flat = projection[hit.project_global_index]
+        if (
+            flat.document_id != hit.document_id
+            or flat.identity.local_segment_id != hit.local_segment_id
+            or hit.field not in request.fields
+            or (
+                request.scope is SearchScope.CURRENT_DOCUMENT
+                and flat.document_id != current_document_id
+            )
+            or (
+                request.status is not None
+                and segment_translation_status(flat.segment) is not request.status
+            )
+            or _workspace_search_field_text(flat.segment, hit.field) != hit.preview
+        ):
+            raise ValueError("workspace search hit does not match the workspace")
 
 
 def _stable_tm_safe_codes(
@@ -888,14 +1286,65 @@ class EditorController:
         self._tm_activation_worker_error: BaseException | None = None
         self._tm_runtime_blocked_safe_code: str | None = None
         self._project: EditorProject | None = None
+        self._workspace_service: ProjectWorkspaceService | None = None
+        self._workspace_save_service: ProjectSaveService | None = None
+        self._workspace_package_service = ProjectPackageService()
+        self._workspace_persistence_binding: ProjectPackagePersistenceBinding | None = None
+        self._workspace_flat_segments: tuple[FlatProjectSegment, ...] = ()
+        self._workspace_global_index = 0
+        self._workspace_generation = 0
+        self._workspace_session_view: WorkspaceSessionView | None = None
+        self._workspace_chunk_edit_gate: object | None = None
+        self._current_workspace_search_report: WorkspaceSearchReport | None = None
+        self._issued_workspace_search_hits: tuple[WorkspaceSearchHit, ...] = ()
+        self._issued_workspace_search_public_hits: tuple[WorkspaceSearchHit, ...] = ()
+        self._issued_workspace_search_context: tuple[
+            str,
+            int,
+            int,
+            str,
+            int,
+            str,
+            tuple[SearchField, ...],
+            SegmentTranslationStatus | None,
+            SearchScope,
+        ] | None = None
+        self._issued_workspace_reconciliation: tuple[
+            ReconciliationPreview,
+            StagedSelectedProjectDocuments,
+            ProjectWorkspaceService,
+            str,
+            int,
+            int,
+            str,
+        ] | None = None
+        self._issued_workspace_package_import: tuple[
+            ProjectPackageImportPreview,
+            str,
+            int,
+            int,
+            str,
+            bool,
+            bool,
+        ] | None = None
         self._current_index = 0
         self._dirty = False
+        self._project_revision = 0
+        self._saved_project_digest: str | None = None
+        self._batch_undo_state: BatchUndoState | None = None
         self._tm_engines: dict[str, TMEngine] = {}
         self._glossary_engines: dict[str, _TermEngine] = {}
         self._term_record_snapshots: dict[str, tuple[TermRecord, ...]] = {}
         self._term_quarantines: dict[str, TermCommitOutcome] = {}
         self._term_matcher_handoff: MatcherHandoffSnapshot | None = None
         self._term_store = TermbaseStore()
+        from tmx_resource_package_handler import TmxResourcePackagePayloadHandler
+
+        self._resource_portability = ResourcePortabilityService(
+            repository,
+            termbase_store=self._term_store,
+            tmx_payload_handler=TmxResourcePackagePayloadHandler(),
+        )
         self.reload_resources(_refresh_runtime=False)
 
     @property
@@ -910,11 +1359,142 @@ class EditorController:
 
     @property
     def current_segment(self) -> EditorSegment:
+        if self._workspace_service is not None:
+            segment = self.current_workspace_segment
+            return EditorSegment(
+                id=segment.identity.local_segment_id,
+                source=segment.source,
+                target=segment.target,
+                speaker=segment.raw_speaker,
+                confirmed=segment.confirmed,
+            )
         return self.project.segments[self._current_index]
 
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    @property
+    def project_revision(self) -> int:
+        """Return the monotonic content revision for the current session."""
+
+        return self._project_revision
+
+    @property
+    def _workspace_contract(self) -> ProjectWorkspace:
+        service = self._workspace_service
+        if service is None:
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
+        return service.workspace
+
+    @property
+    def has_workspace(self) -> bool:
+        return self._workspace_service is not None
+
+    @property
+    def has_active_project(self) -> bool:
+        """Return whether either the legacy or workspace session is active."""
+
+        return self._project is not None or self._workspace_service is not None
+
+    @property
+    def active_project_dirty(self) -> bool:
+        if self._workspace_service is not None:
+            return self.workspace_save_state.project_dirty
+        return self._dirty
+
+    @property
+    def workspace_global_index(self) -> int:
+        _ = self._require_workspace_session()
+        return self._workspace_global_index
+
+    @property
+    def workspace_view(self) -> WorkspaceSessionView:
+        _ = self._require_workspace_session()
+        view = self._workspace_session_view
+        if view is None:
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
+        return view
+
+    @property
+    def current_workspace_identity(self) -> IssuedSegmentIdentity:
+        return self.workspace_view.current_segment
+
+    @property
+    def workspace_segment_identities(self) -> tuple[IssuedSegmentIdentity, ...]:
+        return tuple(item.identity for item in self.workspace_view.segments)
+
+    def issue_tmx_workspace_scope(
+        self,
+    ) -> tuple[WorkspaceSessionView, object]:
+        """Issue the exact Workspace facts consumed by TMX export.
+
+        The content/order view and body-free presence projection remain
+        Workspace-owned.  The TMX coordinator may join them by stable segment
+        identity but cannot derive either fact itself.
+        """
+
+        service = self._require_workspace_session()
+        return self.workspace_view, service.capture_workspace_universe()
+
+    def revalidate_tmx_workspace_scope(
+        self,
+        session: WorkspaceSessionView,
+        universe: object,
+    ) -> tuple[WorkspaceSessionView, object]:
+        """Reprove one previously issued TMX Workspace scope before publish."""
+
+        if type(session) is not WorkspaceSessionView:
+            raise EditorControllerError("TMX.SCOPE.CONTRACT_INVALID")
+        service = self._require_workspace_session()
+        try:
+            validated_universe = service.validate_workspace_universe(universe)
+        except ProjectWorkspaceError as error:
+            raise EditorControllerError("TMX.SCOPE.STALE") from error
+        current = self.workspace_view
+        if current != session:
+            raise EditorControllerError("TMX.SCOPE.STALE")
+        return current, validated_universe
+
+    @property
+    def current_workspace_document_id(self) -> str:
+        return self.current_workspace_identity.document.document_id
+
+    @property
+    def current_workspace_segment(self) -> ProjectSegment:
+        _ = self._require_workspace_session()
+        return self._workspace_flat_segments[self._workspace_global_index].segment
+
+    @property
+    def workspace_document_progress(self) -> tuple[DocumentProgress, ...]:
+        return self._require_workspace_session().document_progress
+
+    @property
+    def workspace_project_progress(self) -> ProjectProgress:
+        return self._require_workspace_session().project_progress
+
+    @property
+    def workspace_save_state(self) -> ControllerWorkspaceSaveState:
+        _service, save_service, binding = self._require_workspace_save_session()
+        return ControllerWorkspaceSaveState(
+            dirty_document_ids=save_service.dirty_document_ids,
+            manifest_dirty=save_service.manifest_dirty,
+            project_dirty=save_service.project_dirty,
+            package_path=binding.path,
+            artifact_digest=binding.artifact_digest,
+        )
+
+    @property
+    def has_preprocessing_undo(self) -> bool:
+        """Return whether this session retains one applicable batch undo point."""
+
+        with self._tm_query_lock:
+            state = self._batch_undo_state
+            return (
+                self._project is not None
+                and state is not None
+                and state.project_session_id == self._project_session_id
+            )
 
     @property
     def project_session_id(self) -> str:
@@ -1241,6 +1821,70 @@ class EditorController:
             )
         return capability
 
+    def _require_preprocessing_json_gate(self) -> ProjectToolCapability:
+        """Validate the same single-JSON capability for preprocessing tools."""
+
+        try:
+            capability = self.project_tool_capability()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            ) from error
+        if type(capability) is not ProjectToolCapability:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            )
+        try:
+            capability.__post_init__()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            ) from error
+        if not capability.single_json_tools_available:
+            reason = capability.unavailable_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "PREPROCESS.PROJECT_GATE_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if capability.project_session_id != self._project_session_id:
+            raise EditorControllerError(
+                "PREPROCESS.PROJECT_GATE_INVALID"
+            )
+        return capability
+
+    def _require_speaker_inventory_json_gate(self) -> ProjectToolCapability:
+        """Validate the single-JSON capability without introducing a new authority."""
+
+        try:
+            capability = self.project_tool_capability()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            ) from error
+        if type(capability) is not ProjectToolCapability:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            )
+        try:
+            capability.__post_init__()
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            ) from error
+        if not capability.single_json_tools_available:
+            reason = capability.unavailable_reason
+            if reason is None:
+                raise EditorControllerError(
+                    "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+                )
+            raise EditorControllerError(reason)
+        if capability.project_session_id != self._project_session_id:
+            raise EditorControllerError(
+                "SPEAKER_INVENTORY.PROJECT_GATE_INVALID"
+            )
+        return capability
+
     def _capture_project_search_handoff(self) -> MatcherHandoffSnapshot:
         """Capture and validate exactly one Core matcher handoff."""
 
@@ -1275,7 +1919,7 @@ class EditorController:
     def _authorize_project_search_request(
         self,
         handoff: MatcherHandoffSnapshot,
-        request: ProjectSearchRequest,
+        request: ProjectSearchRequest | WorkspaceSearchRequest,
     ) -> None:
         """Apply the BASIC/TEXT_V1 gate without reproducing match semantics."""
 
@@ -1292,6 +1936,915 @@ class EditorController:
         if state is not TextMatcherState.TEXT_V1_VALIDATED:
             raise EditorControllerError(
                 "PROJECT_SEARCH.ADVANCED_OPTIONS_UNAVAILABLE"
+            )
+
+    def open_project_package(self, path: Path) -> WorkspaceSessionView:
+        """Cold-open one durable package and swap sessions only after success."""
+
+        try:
+            opened = self._workspace_package_service.open(path)
+            session_id = uuid4().hex
+            save_service = opened.create_save_service(
+                session_id=session_id,
+                revision=0,
+            )
+        except ProjectWorkspaceError as error:
+            raise EditorControllerError(error.code) from error
+        with self._tm_query_lock:
+            self._install_opened_workspace(
+                opened,
+                save_service,
+                session_id=session_id,
+            )
+            return self.workspace_view
+
+    def create_workspace_package(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        destination: Path,
+        *,
+        name: str,
+        source_locale: str,
+        target_locale: str,
+    ) -> ControllerWorkspaceCreationResult:
+        """Create one ProjectPackage from an explicit ordered file selection.
+
+        Qt supplies only user selections and display metadata.  Root binding,
+        Parser selection, format validation, identity issuance and package
+        publication stay in the already-approved C2 owners.
+        """
+
+        if not isinstance(root, Path) or not isinstance(destination, Path):
+            raise TypeError("workspace creation paths must be pathlib.Path")
+        if type(selected_paths) is not tuple or any(
+            not isinstance(path, Path) for path in selected_paths
+        ):
+            raise TypeError("workspace creation selection must be a Path tuple")
+        with self._tm_query_lock:
+            try:
+                staged = stage_selected_project_documents(
+                    root,
+                    selected_paths,
+                    SelectedProjectDocumentsRequest(
+                        name=name,
+                        source_locale=source_locale,
+                        target_locale=target_locale,
+                    ),
+                )
+                staging_service = ProjectWorkspaceService(
+                    staged.workspace,
+                    staged.origin_binding,
+                    session_id=uuid4().hex,
+                    revision=0,
+                )
+                receipt = self._workspace_package_service.export_copy(
+                    staging_service,
+                    destination,
+                )
+                opened = self._workspace_package_service.open(destination)
+                if (
+                    opened.validation.artifact_digest != receipt.artifact_digest
+                    or opened.validation.workspace_content_digest
+                    != receipt.workspace_content_digest
+                    or opened.workspace.project_id != receipt.project_id
+                ):
+                    raise ProjectWorkspaceError(
+                        "PROJECT.PACKAGE.DESTINATION_STALE"
+                    )
+                session_id = uuid4().hex
+                save_service = opened.create_save_service(
+                    session_id=session_id,
+                    revision=0,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            self._install_opened_workspace(
+                opened,
+                save_service,
+                session_id=session_id,
+            )
+            return ControllerWorkspaceCreationResult(
+                receipt=receipt,
+                session=self.workspace_view,
+            )
+
+    def create_workspace_project_from_selected_files(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        request: SelectedProjectDocumentsRequest,
+        destination: Path,
+    ) -> ControllerWorkspaceCreationResult:
+        """Accept the frozen C2 intake request without exposing it to Qt imports."""
+
+        if type(request) is not SelectedProjectDocumentsRequest:
+            raise TypeError(
+                "workspace creation requires SelectedProjectDocumentsRequest"
+            )
+        return self.create_workspace_package(
+            root,
+            selected_paths,
+            destination,
+            name=request.name,
+            source_locale=request.source_locale,
+            target_locale=request.target_locale,
+        )
+
+    def go_to_workspace_index(
+        self,
+        index: int,
+        *,
+        project: IssuedProjectIdentity,
+    ) -> WorkspaceSessionView:
+        """Navigate by one validated, current-session global projection index."""
+
+        if type(index) is not int:
+            raise TypeError("workspace global index must be exact int")
+        if type(project) is not IssuedProjectIdentity:
+            raise TypeError("workspace index navigation requires issued project")
+        with self._tm_query_lock:
+            _ = self._require_workspace_session()
+            if (
+                project is not self.workspace_view.project
+                or index < 0
+                or index >= len(self._workspace_flat_segments)
+            ):
+                raise EditorControllerError("PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED")
+            self._set_workspace_global_index(index)
+            return self.workspace_view
+
+    def go_to_workspace_segment(
+        self,
+        identity: IssuedSegmentIdentity,
+    ) -> WorkspaceSessionView:
+        """Navigate only an exact composite identity issued by this session."""
+
+        if type(identity) is not IssuedSegmentIdentity:
+            raise TypeError("workspace navigation requires issued segment identity")
+        with self._tm_query_lock:
+            _ = self._require_workspace_session()
+            index = next(
+                (
+                    item.project_global_index
+                    for item in self.workspace_view.segments
+                    if item.identity is identity
+                ),
+                None,
+            )
+            if index is None:
+                raise EditorControllerError(
+                    "PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED"
+                )
+            self._set_workspace_global_index(index)
+            return self.workspace_view
+
+    def select_workspace_document(
+        self,
+        document: IssuedDocumentIdentity,
+    ) -> WorkspaceSessionView:
+        """Select the first segment of one current-session document."""
+
+        if type(document) is not IssuedDocumentIdentity:
+            raise TypeError("workspace selection requires issued document identity")
+        with self._tm_query_lock:
+            _ = self._require_workspace_session()
+            if not any(item.identity is document for item in self.workspace_view.documents):
+                raise EditorControllerError(
+                    "PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED"
+                )
+            index = next(
+                (
+                    item.project_global_index
+                    for item in self._workspace_flat_segments
+                    if item.document_id == document.document_id
+                ),
+                None,
+            )
+            if index is None:
+                raise EditorControllerError(
+                    "PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED"
+                )
+            self._set_workspace_global_index(index)
+            return self.workspace_view
+
+    def move_workspace(
+        self,
+        direction: int,
+        *,
+        unconfirmed_only: bool = False,
+    ) -> WorkspaceSessionView:
+        """Navigate continuously across document boundaries."""
+
+        if type(direction) is not int or direction == 0:
+            raise EditorControllerError("PROJECT.WORKSPACE.NAVIGATION_INVALID")
+        if type(unconfirmed_only) is not bool:
+            raise TypeError("workspace unconfirmed flag must be exact bool")
+        with self._tm_query_lock:
+            _ = self._require_workspace_session()
+            step = 1 if direction > 0 else -1
+            destination = min(
+                max(self._workspace_global_index + step, 0),
+                len(self._workspace_flat_segments) - 1,
+            )
+            if unconfirmed_only:
+                destination = next(
+                    (
+                        index
+                        for index in range(
+                            self._workspace_global_index + step,
+                            len(self._workspace_flat_segments) if step > 0 else -1,
+                            step,
+                        )
+                        if not self._workspace_flat_segments[index].segment.confirmed
+                    ),
+                    self._workspace_global_index,
+                )
+            self._set_workspace_global_index(destination)
+            return self.workspace_view
+
+    def update_workspace_target(self, target: str) -> WorkspaceSessionView:
+        """Edit only the current overlay through the workspace authority."""
+
+        if type(target) is not str:
+            raise TypeError("workspace target must be exact str")
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            current_identity = self.current_workspace_identity.segment_identity
+            preparation = self._prepare_workspace_chunk_edit(
+                service,
+                current_identity,
+                target=target,
+                confirmed=False,
+            )
+            try:
+                receipt = self._commit_workspace_chunk_edit(
+                    preparation,
+                    service,
+                    current_identity,
+                    target=target,
+                    confirmed=False,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            if receipt.changed:
+                self._project_revision = receipt.resulting_revision
+                self._refresh_workspace_projection(current_identity)
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+            return self.workspace_view
+
+    def search_workspace(
+        self,
+        request: WorkspaceSearchRequest,
+    ) -> WorkspaceSearchReport:
+        """Issue a scope-bound search over the current workspace graph."""
+
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            private_request = _clone_workspace_search_request(request)
+            handoff = self._capture_project_search_handoff()
+            self._authorize_project_search_request(handoff, private_request)
+            matcher = handoff.matcher
+            if matcher is None:
+                raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+            try:
+                report = ProjectSearchService(matcher).search_workspace(
+                    service,
+                    private_request,
+                    current_document_id=self.current_workspace_document_id,
+                )
+                private_report = _clone_workspace_search_report(report)
+                _validate_workspace_search_report(
+                    private_report,
+                    service,
+                    private_request,
+                    current_document_id=self.current_workspace_document_id,
+                )
+            except ProjectSearchError as error:
+                raise EditorControllerError(error.code) from error
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_INVALID"
+                ) from error
+            if private_report.capability != handoff.display:
+                raise EditorControllerError("PROJECT_SEARCH.REPORT_MISMATCH")
+            issued_hits = tuple(replace(hit) for hit in private_report.hits)
+            public_report = _clone_workspace_search_report(private_report)
+            self._current_workspace_search_report = private_report
+            self._issued_workspace_search_hits = issued_hits
+            self._issued_workspace_search_public_hits = public_report.hits
+            self._issued_workspace_search_context = (
+                self._project_session_id,
+                self._workspace_generation,
+                service.revision,
+                service.workspace_content_digest,
+                handoff.generation,
+                self.current_workspace_document_id,
+                tuple(private_request.fields),
+                private_request.status,
+                private_request.scope,
+            )
+            return public_report
+
+    def _search_workspace_selection_for_chunk_controller(
+        self,
+        request: WorkspaceSearchRequest,
+        members: tuple[SegmentIdentity, ...],
+    ) -> WorkspaceSearchReport:
+        """Run the normal matcher over one exact, chunk-neutral selection."""
+
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            private_request = _clone_workspace_search_request(request)
+            if private_request.scope is not SearchScope.ENTIRE_PROJECT:
+                raise EditorControllerError("PROJECT_SEARCH.SELECTION_INVALID")
+            handoff = self._capture_project_search_handoff()
+            self._authorize_project_search_request(handoff, private_request)
+            matcher = handoff.matcher
+            if matcher is None:
+                raise EditorControllerError("PROJECT_SEARCH.HANDOFF_INVALID")
+            try:
+                report = ProjectSearchService(
+                    matcher
+                ).search_workspace_selection(
+                    service,
+                    private_request,
+                    members=members,
+                )
+                private_report = _clone_workspace_search_report(report)
+                _validate_workspace_search_report(
+                    private_report,
+                    service,
+                    private_request,
+                    current_document_id=self.current_workspace_document_id,
+                )
+            except ProjectSearchError as error:
+                raise EditorControllerError(error.code) from error
+            except ValueError as error:
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.REPORT_INVALID"
+                ) from error
+            if private_report.capability != handoff.display:
+                raise EditorControllerError("PROJECT_SEARCH.REPORT_MISMATCH")
+            issued_hits = tuple(replace(hit) for hit in private_report.hits)
+            public_report = _clone_workspace_search_report(private_report)
+            self._current_workspace_search_report = private_report
+            self._issued_workspace_search_hits = issued_hits
+            self._issued_workspace_search_public_hits = public_report.hits
+            self._issued_workspace_search_context = (
+                self._project_session_id,
+                self._workspace_generation,
+                service.revision,
+                service.workspace_content_digest,
+                handoff.generation,
+                self.current_workspace_document_id,
+                tuple(private_request.fields),
+                private_request.status,
+                private_request.scope,
+            )
+            return public_report
+
+    def clear_workspace_search(self) -> None:
+        """Revoke only workspace-search reports and issued hit membership."""
+
+        with self._tm_query_lock:
+            self._clear_workspace_search_state()
+
+    def go_to_workspace_search_hit(
+        self,
+        hit: WorkspaceSearchHit,
+    ) -> WorkspaceSessionView:
+        """Navigate one exact issued hit after revalidating all live facts."""
+
+        if type(hit) is not WorkspaceSearchHit:
+            raise TypeError("workspace search hit must be WorkspaceSearchHit")
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            if not any(
+                hit is public_hit
+                for public_hit in self._issued_workspace_search_public_hits
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.HIT_NOT_ISSUED")
+            context = self._issued_workspace_search_context
+            report = self._current_workspace_search_report
+            if context is None or report is None:
+                raise EditorControllerError("PROJECT_SEARCH.NO_ISSUED_REPORT")
+            (
+                issued_session,
+                issued_generation,
+                issued_revision,
+                issued_digest,
+                issued_matcher_generation,
+                issued_current_document,
+                issued_fields,
+                issued_status,
+                issued_scope,
+            ) = context
+            handoff = self._capture_project_search_handoff()
+            if (
+                issued_session != self._project_session_id
+                or issued_generation != self._workspace_generation
+                or issued_revision != service.revision
+                or issued_digest != service.workspace_content_digest
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_WORKSPACE")
+            if (
+                issued_matcher_generation != handoff.generation
+                or report.capability != handoff.display
+            ):
+                raise EditorControllerError(
+                    "PROJECT_SEARCH.STALE_MATCHER_GENERATION"
+                )
+            issued = next(
+                (
+                    item
+                    for item in self._issued_workspace_search_hits
+                    if _workspace_search_hit_fields_equal(hit, item)
+                ),
+                None,
+            )
+            if issued is None:
+                raise EditorControllerError("PROJECT_SEARCH.HIT_NOT_ISSUED")
+            if issued.project_global_index >= len(self._workspace_flat_segments):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_WORKSPACE")
+            flat = self._workspace_flat_segments[issued.project_global_index]
+            if (
+                issued.document_id != flat.document_id
+                or issued.local_segment_id != flat.identity.local_segment_id
+                or issued.field not in issued_fields
+                or (
+                    issued_scope is SearchScope.CURRENT_DOCUMENT
+                    and flat.document_id != issued_current_document
+                )
+                or (
+                    issued_status is not None
+                    and segment_translation_status(flat.segment) is not issued_status
+                )
+                or _workspace_search_field_text(flat.segment, issued.field)
+                != issued.preview
+            ):
+                raise EditorControllerError("PROJECT_SEARCH.STALE_WORKSPACE")
+            self._set_workspace_global_index(issued.project_global_index)
+            return self.workspace_view
+
+    def save_workspace_package(self) -> ControllerWorkspaceSaveResult:
+        with self._tm_query_lock:
+            _service, save_service, binding = self._require_workspace_save_session()
+            try:
+                result = self._workspace_package_service.save_workspace(
+                    save_service,
+                    binding.path,
+                    persistence_binding=binding,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            if result.persistence_binding is not None:
+                self._workspace_persistence_binding = result.persistence_binding
+            self._reissue_workspace_session_view()
+            binding = self._workspace_persistence_binding
+            if binding is None:
+                raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+            return ControllerWorkspaceSaveResult(
+                save_report=result.save_report,
+                receipt=result.receipt,
+                session=self.workspace_view,
+                package_artifact_digest=binding.artifact_digest,
+            )
+
+    def save_workspace_document(
+        self,
+        document: IssuedDocumentIdentity,
+    ) -> ControllerWorkspaceSaveResult:
+        if type(document) is not IssuedDocumentIdentity:
+            raise TypeError("workspace save requires issued document identity")
+        with self._tm_query_lock:
+            _service, save_service, binding = self._require_workspace_save_session()
+            if not any(item.identity is document for item in self.workspace_view.documents):
+                raise EditorControllerError(
+                    "PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED"
+                )
+            try:
+                result = self._workspace_package_service.save_document(
+                    save_service,
+                    document.document_id,
+                    binding.path,
+                    persistence_binding=binding,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            if result.persistence_binding is not None:
+                self._workspace_persistence_binding = result.persistence_binding
+            self._reissue_workspace_session_view()
+            binding = self._workspace_persistence_binding
+            if binding is None:
+                raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+            return ControllerWorkspaceSaveResult(
+                save_report=result.save_report,
+                receipt=result.receipt,
+                session=self.workspace_view,
+                package_artifact_digest=binding.artifact_digest,
+            )
+
+    def preview_workspace_reconciliation(
+        self,
+        staged: StagedSelectedProjectDocuments,
+        *,
+        associations: tuple[ReconciliationAssociation, ...] = (),
+    ) -> ReconciliationPreview:
+        """Stage source reconciliation against the current issued session."""
+
+        if type(staged) is not StagedSelectedProjectDocuments:
+            raise TypeError("reconciliation input must be staged selected documents")
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            try:
+                stage = (
+                    service.stage_source_rebind
+                    if service.origin_binding is None
+                    else service.stage_reconciliation
+                )
+                preview = stage(
+                    staged,
+                    associations=associations,
+                    session_id=self._project_session_id,
+                    base_revision=self._project_revision,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            self._issued_workspace_reconciliation = (
+                preview,
+                staged,
+                service,
+                self._project_session_id,
+                self._workspace_generation,
+                self._project_revision,
+                service.workspace_content_digest,
+            )
+            return preview
+
+    def stage_workspace_source_rebind(
+        self,
+        root: Path,
+        selected_paths: tuple[Path, ...],
+        *,
+        rename_mappings: tuple[OriginRenameMapping, ...] = (),
+    ) -> StagedSelectedProjectDocuments:
+        """Stage explicit device-local sources against manifest-issued IDs."""
+
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            try:
+                return stage_workspace_rebind(
+                    root,
+                    selected_paths,
+                    service.workspace,
+                    rename_mappings=rename_mappings,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+
+    def apply_workspace_reconciliation(
+        self,
+        preview: ReconciliationPreview,
+        staged: StagedSelectedProjectDocuments,
+        *,
+        decisions: tuple[ReconciliationDecision, ...] = (),
+    ) -> ReconciliationReceipt:
+        """Consume one issued reconciliation and publish one in-memory swap."""
+
+        if type(preview) is not ReconciliationPreview:
+            raise TypeError("reconciliation preview must be exact")
+        if type(staged) is not StagedSelectedProjectDocuments:
+            raise TypeError("reconciliation input must be exact")
+        with self._tm_query_lock:
+            service = self._require_workspace_session()
+            issued = self._issued_workspace_reconciliation
+            if (
+                issued is None
+                or preview is not issued[0]
+                or staged is not issued[1]
+            ):
+                raise EditorControllerError("PROJECT.RECONCILE.PREVIEW_STALE")
+            if (
+                issued[3] != self._project_session_id
+                or issued[4] != self._workspace_generation
+                or issued[5] != self._project_revision
+                or issued[6] != service.workspace_content_digest
+            ):
+                raise EditorControllerError("PROJECT.RECONCILE.PREVIEW_STALE")
+            reconciliation_service = issued[2]
+            old_projection = self._workspace_flat_segments
+            old_index = self._workspace_global_index
+            binding = self._workspace_persistence_binding
+            if binding is None:
+                raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+            self._issued_workspace_reconciliation = None
+            try:
+                revalidated = revalidate_staged_selected_documents(staged)
+                token = reconciliation_service.prepare_reconciliation(
+                    preview.operation_id,
+                    decisions=decisions,
+                    session_id=self._project_session_id,
+                    base_revision=self._project_revision,
+                    incoming_source_identities=revalidated.source_identities,
+                )
+                try:
+                    candidate_service = (
+                        reconciliation_service.prepared_workspace_service(token)
+                    )
+                    current_save_service = self._workspace_save_service
+                    if current_save_service is None:
+                        raise EditorControllerError(
+                            "PROJECT.WORKSPACE.NO_SAVE_BINDING"
+                        )
+                    candidate_save_service = (
+                        current_save_service.fork_for_workspace_service(
+                            candidate_service
+                        )
+                    )
+                    new_projection = candidate_service.flat_segments
+                    old_identity = old_projection[old_index].identity
+                    surviving = {item.identity for item in new_projection}
+                    if old_identity in surviving:
+                        chosen = old_identity
+                    else:
+                        ordered_old = tuple(item.identity for item in old_projection)
+                        chosen = next(
+                            (
+                                identity
+                                for identity in ordered_old[old_index + 1 :]
+                                if identity in surviving
+                            ),
+                            next(
+                                (
+                                    identity
+                                    for identity in reversed(
+                                        ordered_old[:old_index]
+                                    )
+                                    if identity in surviving
+                                ),
+                                new_projection[0].identity,
+                            ),
+                        )
+                    candidate_index = next(
+                        item.project_global_index
+                        for item in new_projection
+                        if item.identity == chosen
+                    )
+                    candidate_install = self._prepare_workspace_install(
+                        candidate_save_service,
+                        session_id=self._project_session_id,
+                        generation=self._workspace_generation,
+                        current_index=candidate_index,
+                    )
+                except BaseException:
+                    reconciliation_service.discard_prepared_reconciliation(
+                        token
+                    )
+                    raise
+                receipt = reconciliation_service.commit_reconciliation(token)
+                try:
+                    published_transition = (
+                        reconciliation_service.published_workspace_transition(
+                            receipt
+                        )
+                    )
+                    self._capture_workspace_chunk_transition(
+                        reconciliation_service,
+                        published_transition,
+                    )
+                except BaseException:
+                    # Reconciliation is already published and cannot be
+                    # rolled back.  Preserve the mandatory Workspace swap and
+                    # let the optional Chunk layer rebind in a blocked state.
+                    self._mark_workspace_chunk_transition_capture_failed(
+                        reconciliation_service
+                    )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            self._project = None
+            self._current_index = 0
+            self._dirty = False
+            self._saved_project_digest = None
+            self._batch_undo_state = None
+            self._workspace_service = candidate_install.service
+            self._workspace_save_service = candidate_install.save_service
+            self._workspace_persistence_binding = binding
+            self._workspace_flat_segments = candidate_install.projection
+            self._workspace_global_index = candidate_install.current_index
+            self._workspace_generation = candidate_install.generation
+            self._workspace_session_view = candidate_install.view
+            self._project_session_id = candidate_install.session_id
+            self._project_revision = candidate_install.service.revision
+            self._current_project_search_report = None
+            self._issued_project_search_hits = ()
+            self._issued_project_search_public_hits = ()
+            self._issued_project_search_context = None
+            self._current_workspace_search_report = None
+            self._issued_workspace_search_hits = ()
+            self._issued_workspace_search_public_hits = ()
+            self._issued_workspace_search_context = None
+            self._issued_workspace_reconciliation = None
+            self._issued_workspace_package_import = None
+            self._issued_tm_suggestions = ()
+            self._issued_legacy_tm_suggestions = ()
+            self._legacy_issued_context = None
+            self._current_tm_report = None
+            self._tm_query_epoch += 1
+            self._observed_tm_signature = candidate_install.observed_tm_signature
+            self._notify_workspace_chunk_opened()
+            return receipt
+
+    def preview_workspace_package_import(
+        self,
+        source: Path,
+        *,
+        associations: tuple[ReconciliationAssociation, ...] = (),
+        destination: Path | None = None,
+    ) -> ProjectPackageImportPreview:
+        """Preview one package transaction against the active session.
+
+        A workspace defaults to its current package binding.  A legacy project
+        must supply a distinct package destination; importing there replaces
+        the active session only after apply and never rewrites the legacy file.
+        """
+
+        with self._tm_query_lock:
+            legacy_session = not self.has_workspace
+            if legacy_session:
+                if self._project is None:
+                    raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
+                if destination is None:
+                    raise EditorControllerError(
+                        "PROJECT.PACKAGE.DESTINATION_REQUIRED"
+                    )
+                service = None
+                save_service = None
+                binding_path = None
+                target = destination
+                content_digest = _project_content_digest(self._project)
+            else:
+                service, save_service, binding = (
+                    self._require_workspace_save_session()
+                )
+                binding_path = binding.path
+                target = binding.path if destination is None else destination
+                content_digest = service.workspace_content_digest
+            try:
+                preview = self._workspace_package_service.preview_import(
+                    source,
+                    target,
+                    workspace_service=service,
+                    associations=associations,
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            swap_active = legacy_session or target == binding_path
+            if (
+                save_service is not None
+                and swap_active
+                and preview.mode is ProjectPackageImportMode.REPLACE
+                and save_service.project_dirty
+            ):
+                raise EditorControllerError(
+                    "PROJECT.PACKAGE.ACTIVE_WORKSPACE_DIRTY"
+                )
+            self._issued_workspace_package_import = (
+                preview,
+                self._project_session_id,
+                self._workspace_generation,
+                self._project_revision,
+                content_digest,
+                swap_active,
+                legacy_session,
+            )
+            return preview
+
+    def apply_workspace_package_import(
+        self,
+        preview: ProjectPackageImportPreview,
+        *,
+        decisions: tuple[ReconciliationDecision, ...] = (),
+    ) -> ControllerWorkspaceImportResult:
+        """Durably apply one issued package preview, then swap the session once."""
+
+        if type(preview) is not ProjectPackageImportPreview:
+            raise TypeError("package import preview must be exact")
+        with self._tm_query_lock:
+            issued = self._issued_workspace_package_import
+            if issued is None or preview is not issued[0]:
+                raise EditorControllerError("PROJECT.PACKAGE.PREVIEW_STALE")
+            legacy_session = issued[6]
+            if legacy_session:
+                current_content_digest = (
+                    None
+                    if self._project is None or self.has_workspace
+                    else _project_content_digest(self._project)
+                )
+            else:
+                service = self._require_workspace_session()
+                current_content_digest = service.workspace_content_digest
+            if (
+                issued[1] != self._project_session_id
+                or issued[2] != self._workspace_generation
+                or issued[3] != self._project_revision
+                or issued[4] != current_content_digest
+            ):
+                raise EditorControllerError("PROJECT.PACKAGE.PREVIEW_STALE")
+            self._issued_workspace_package_import = None
+            swap_active = issued[5]
+            try:
+                if not swap_active:
+                    result = self._workspace_package_service.apply_import_result(
+                        preview.operation_id,
+                        decisions=decisions,
+                        session_id=(
+                            self._project_session_id if preview.same_project else None
+                        ),
+                        base_revision=(
+                            self._project_revision if preview.same_project else None
+                        ),
+                    )
+                    return ControllerWorkspaceImportResult(
+                        receipt=result.receipt,
+                        session=self.workspace_view,
+                        active_session_changed=False,
+                    )
+
+                prepared_import = self._workspace_package_service.prepare_import(
+                    preview.operation_id,
+                    decisions=decisions,
+                    session_id=(
+                        self._project_session_id if preview.same_project else None
+                    ),
+                    base_revision=(
+                        self._project_revision if preview.same_project else None
+                    ),
+                )
+                try:
+                    next_session = uuid4().hex
+                    candidate_save_service = (
+                        self._workspace_package_service.create_prepared_import_save_service(
+                            prepared_import,
+                            session_id=next_session,
+                        )
+                    )
+                    candidate_install = self._prepare_workspace_install(
+                        candidate_save_service,
+                        session_id=next_session,
+                        generation=self._workspace_generation + 1,
+                        current_index=0,
+                    )
+                    self._validate_workspace_chunk_replacement(
+                        candidate_install.service
+                    )
+                except BaseException:
+                    self._workspace_package_service.discard_prepared_import(
+                        prepared_import
+                    )
+                    raise
+                result = self._workspace_package_service.commit_prepared_import(
+                    prepared_import
+                )
+            except ProjectWorkspaceError as error:
+                raise EditorControllerError(error.code) from error
+            binding = result.installed.persistence_binding
+            self._project = None
+            self._current_index = 0
+            self._dirty = False
+            self._saved_project_digest = None
+            self._batch_undo_state = None
+            self._workspace_service = candidate_install.service
+            self._workspace_save_service = candidate_install.save_service
+            self._workspace_persistence_binding = binding
+            self._workspace_flat_segments = candidate_install.projection
+            self._workspace_global_index = candidate_install.current_index
+            self._workspace_generation = candidate_install.generation
+            self._workspace_session_view = candidate_install.view
+            self._project_session_id = candidate_install.session_id
+            self._project_revision = candidate_install.service.revision
+            self._current_project_search_report = None
+            self._issued_project_search_hits = ()
+            self._issued_project_search_public_hits = ()
+            self._issued_project_search_context = None
+            self._current_workspace_search_report = None
+            self._issued_workspace_search_hits = ()
+            self._issued_workspace_search_public_hits = ()
+            self._issued_workspace_search_context = None
+            self._issued_workspace_reconciliation = None
+            self._issued_workspace_package_import = None
+            self._issued_tm_suggestions = ()
+            self._issued_legacy_tm_suggestions = ()
+            self._legacy_issued_context = None
+            self._current_tm_report = None
+            self._tm_query_epoch += 1
+            self._observed_tm_signature = candidate_install.observed_tm_signature
+            self._notify_workspace_chunk_opened()
+            return ControllerWorkspaceImportResult(
+                receipt=result.receipt,
+                session=self.workspace_view,
+                active_session_changed=True,
             )
 
     def open_project(self, path: Path) -> EditorProject:
@@ -1331,10 +2884,25 @@ class EditorController:
         if not project.segments:
             raise EditorControllerError("project contains no segments")
         with self._tm_query_lock:
+            self._remember_current_workspace_position()
+            if self._workspace_service is not None:
+                self._notify_workspace_chunk_closed()
+            self._workspace_service = None
+            self._workspace_save_service = None
+            self._workspace_persistence_binding = None
+            self._workspace_flat_segments = ()
+            self._workspace_global_index = 0
+            self._workspace_session_view = None
+            self._clear_workspace_search_state()
+            self._issued_workspace_reconciliation = None
+            self._issued_workspace_package_import = None
             self._project = project
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._project_revision = 0
+            self._saved_project_digest = _project_content_digest(project)
+            self._batch_undo_state = None
             self._clear_project_search_state()
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
@@ -1356,8 +2924,236 @@ class EditorController:
                 confirmed=False,
             )
             self._project = replace(self.project, segments=tuple(segments))
-            self._dirty = True
+            self._project_revision += 1
+            self._recompute_project_dirty()
             return self.project
+
+    def preview_preprocessing(
+        self,
+        rules: tuple[LiteralReplaceRule, ...],
+        *,
+        include_draft: bool = True,
+        include_confirmed: bool = True,
+    ) -> PreprocessPreview:
+        """Preview ordered target-only literal rules without changing the project."""
+
+        if type(rules) is not tuple or not all(
+            type(rule) is LiteralReplaceRule for rule in rules
+        ):
+            raise EditorControllerError("PREPROCESS.INVALID_RULES")
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            try:
+                preview = preview_preprocessing(
+                    self.project,
+                    self._project_session_id,
+                    self._project_revision,
+                    tuple(replace(rule) for rule in rules),
+                    include_draft=include_draft,
+                    include_confirmed=include_confirmed,
+                )
+                return _clone_preprocess_preview(preview)
+            except PreprocessValidationError as error:
+                raise EditorControllerError(
+                    f"PREPROCESS.{error.code}"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError("PREPROCESS.INVALID_RULES") from error
+
+    def preprocess_preferences(self) -> PreprocessPreferences:
+        """Return a detached view of saved device-local preprocessing settings."""
+
+        with self._tm_query_lock:
+            try:
+                preferences = self.workspace_state.preprocess_preferences()
+                return _clone_preprocess_preferences(preferences)
+            except WorkspaceStateError as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_READ_FAILED"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_INVALID"
+                ) from error
+
+    def update_preprocess_preferences(
+        self,
+        preferences: PreprocessPreferences,
+    ) -> PreprocessPreferences:
+        """Validate and atomically save device-local preprocessing settings."""
+
+        try:
+            private_preferences = _clone_preprocess_preferences(preferences)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError(
+                "PREPROCESS.PREFERENCES_INVALID"
+            ) from error
+        with self._tm_query_lock:
+            try:
+                saved = self.workspace_state.update_preprocess_preferences(
+                    private_preferences
+                )
+                return _clone_preprocess_preferences(saved)
+            except WorkspaceStateError as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_SAVE_FAILED"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "PREPROCESS.PREFERENCES_INVALID"
+                ) from error
+
+    def speaker_inventory(self) -> SpeakerInventory:
+        """Return a fresh, deterministic inventory without changing the session."""
+
+        with self._tm_query_lock:
+            self._require_speaker_inventory_json_gate()
+            try:
+                inventory = build_speaker_inventory(self.project)
+                result = SpeakerInventory(
+                    items=tuple(replace(item) for item in inventory.items),
+                    empty_count=inventory.empty_count,
+                    segment_count=inventory.segment_count,
+                )
+                result.__post_init__()
+                return result
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError(
+                    "SPEAKER_INVENTORY.INVALID_RESULT"
+                ) from error
+
+    def apply_preprocessing(
+        self,
+        preview: PreprocessPreview,
+    ) -> BatchOperationReport:
+        """Atomically apply one session/revision-bound preprocessing preview."""
+
+        try:
+            private_preview = _clone_preprocess_preview(preview)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError("PREPROCESS.PREVIEW_INVALID") from error
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            if private_preview.project_session_id != self._project_session_id:
+                raise EditorControllerError(
+                    "PREPROCESS.STALE_PROJECT_SESSION"
+                )
+            if private_preview.base_revision != self._project_revision:
+                raise EditorControllerError("PREPROCESS.STALE_REVISION")
+            if not private_preview.changes:
+                raise EditorControllerError("PREPROCESS.PREVIEW_INVALID")
+
+            segments = list(self.project.segments)
+            seen_indices: set[int] = set()
+            for change in private_preview.changes:
+                if type(change) is not PreprocessChange:
+                    raise EditorControllerError(
+                        "PREPROCESS.PREVIEW_INVALID"
+                    )
+                index = change.segment_index
+                if index in seen_indices or index >= len(segments):
+                    raise EditorControllerError(
+                        "PREPROCESS.PREVIEW_INVALID"
+                    )
+                seen_indices.add(index)
+                current = segments[index]
+                if (
+                    current.id != change.segment_id
+                    or current.target != change.before_target
+                    or current.confirmed != change.before_confirmed
+                ):
+                    raise EditorControllerError("PREPROCESS.STALE_SEGMENT")
+
+            dirty_before = self._dirty
+            baseline = self._saved_project_digest
+            if baseline is None:
+                raise EditorControllerError("PREPROCESS.BASELINE_UNAVAILABLE")
+            for change in private_preview.changes:
+                current = segments[change.segment_index]
+                segments[change.segment_index] = replace(
+                    current,
+                    target=change.after_target,
+                    confirmed=False,
+                )
+
+            self._project = replace(self.project, segments=tuple(segments))
+            self._project_revision += 1
+            self._recompute_project_dirty()
+            self._batch_undo_state = BatchUndoState(
+                project_session_id=self._project_session_id,
+                applied_revision=self._project_revision,
+                dirty_before=dirty_before,
+                saved_baseline_digest_at_apply=baseline,
+                changes=tuple(
+                    replace(change) for change in private_preview.changes
+                ),
+            )
+            report = BatchOperationReport(
+                operation="apply",
+                project_session_id=self._project_session_id,
+                resulting_revision=self._project_revision,
+                changed_segment_ids=tuple(
+                    change.segment_id for change in private_preview.changes
+                ),
+                dirty=self._dirty,
+            )
+            report.__post_init__()
+            return report
+
+    def undo_latest_preprocessing(self) -> BatchOperationReport:
+        """Undo the latest batch if every affected segment remains unchanged."""
+
+        with self._tm_query_lock:
+            self._require_preprocessing_json_gate()
+            state = self._batch_undo_state
+            if state is None:
+                raise EditorControllerError("PREPROCESS.NO_UNDO")
+            try:
+                state.__post_init__()
+            except (TypeError, ValueError) as error:
+                raise EditorControllerError("PREPROCESS.UNDO_INVALID") from error
+            if state.project_session_id != self._project_session_id:
+                raise EditorControllerError(
+                    "PREPROCESS.STALE_UNDO_SESSION"
+                )
+
+            segments = list(self.project.segments)
+            seen_indices: set[int] = set()
+            for change in state.changes:
+                index = change.segment_index
+                if index in seen_indices or index >= len(segments):
+                    raise EditorControllerError("PREPROCESS.STALE_UNDO")
+                seen_indices.add(index)
+                current = segments[index]
+                if (
+                    current.id != change.segment_id
+                    or current.target != change.after_target
+                    or current.confirmed != change.after_confirmed
+                ):
+                    raise EditorControllerError("PREPROCESS.STALE_UNDO")
+
+            for change in state.changes:
+                current = segments[change.segment_index]
+                segments[change.segment_index] = replace(
+                    current,
+                    target=change.before_target,
+                    confirmed=change.before_confirmed,
+                )
+            self._project = replace(self.project, segments=tuple(segments))
+            self._project_revision += 1
+            self._batch_undo_state = None
+            self._recompute_project_dirty()
+            report = BatchOperationReport(
+                operation="undo",
+                project_session_id=self._project_session_id,
+                resulting_revision=self._project_revision,
+                changed_segment_ids=tuple(
+                    change.segment_id for change in state.changes
+                ),
+                dirty=self._dirty,
+            )
+            report.__post_init__()
+            return report
 
     def move(self, direction: int, unconfirmed_only: bool = False) -> EditorProject:
         """Move one segment or find the next unconfirmed segment without losing edits."""
@@ -1405,14 +3201,16 @@ class EditorController:
     def save_project(self, path: Path) -> EditorProject:
         """Atomically save the current project and clear the session dirty flag."""
 
-        try:
-            saved_path = save_project_file(self.project, path)
-        except ProjectError as exc:
-            raise EditorControllerError("PROJECT.SAVE_FAILED") from exc
-        self._project = replace(self.project, path=saved_path)
-        self._dirty = False
-        self._remember_current_position()
-        return self.project
+        with self._tm_query_lock:
+            try:
+                saved_path = save_project_file(self.project, path)
+            except ProjectError as exc:
+                raise EditorControllerError("PROJECT.SAVE_FAILED") from exc
+            self._project = replace(self.project, path=saved_path)
+            self._saved_project_digest = _project_content_digest(self.project)
+            self._dirty = False
+            self._remember_current_position()
+            return self.project
 
     def close_project(self) -> None:
         """Leave the current project after the frontend has handled unsaved changes."""
@@ -1420,11 +3218,27 @@ class EditorController:
         with self._tm_query_lock:
             if self._project is not None:
                 self._remember_current_position()
+            else:
+                self._remember_current_workspace_position()
+                if self._workspace_service is not None:
+                    self._notify_workspace_chunk_closed()
             self._project = None
+            self._workspace_service = None
+            self._workspace_save_service = None
+            self._workspace_persistence_binding = None
+            self._workspace_flat_segments = ()
+            self._workspace_global_index = 0
+            self._workspace_session_view = None
             self._current_index = 0
             self._dirty = False
             self._project_session_id = uuid4().hex
+            self._project_revision = 0
+            self._saved_project_digest = None
+            self._batch_undo_state = None
             self._clear_project_search_state()
+            self._clear_workspace_search_state()
+            self._issued_workspace_reconciliation = None
+            self._issued_workspace_package_import = None
             self._advance_tm_query_epoch()
             self._observed_tm_signature = None
 
@@ -1432,6 +3246,11 @@ class EditorController:
         """Return locally remembered projects in most-recent-first order."""
 
         return self.workspace_state.recent_projects()
+
+    def recent_workspace_projects(self) -> tuple[RecentWorkspaceProject, ...]:
+        """Return device-local composite ProjectPackage positions."""
+
+        return self.workspace_state.recent_workspace_projects()
 
     def remove_recent_project(self, path: Path) -> None:
         """Forget a stale recent-project entry without touching its file."""
@@ -1565,7 +3384,9 @@ class EditorController:
                 )
 
             if requested == previous:
-                if self._tm_adapter is not None and self._project is not None:
+                if self._tm_adapter is not None and (
+                    self._project is not None or self._workspace_service is not None
+                ):
                     try:
                         self._require_tm_runtime_available()
                         if self._current_tm_report is None:
@@ -1598,7 +3419,9 @@ class EditorController:
 
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
-            if self._tm_adapter is not None and self._project is not None:
+            if self._tm_adapter is not None and (
+                self._project is not None or self._workspace_service is not None
+            ):
                 try:
                     self._require_tm_runtime_available()
                     _ = self._query_and_issue_current_tm_report()
@@ -1879,7 +3702,9 @@ class EditorController:
         self._term_record_snapshots = records
         self._term_matcher_handoff = handoff
 
-    def confirm_current(self) -> ConfirmResult:
+    def confirm_current(
+        self,
+    ) -> ConfirmResult | ControllerWorkspaceConfirmResult:
         """Write the current translation to every writable TM before confirmation."""
 
         with self._tm_query_lock:
@@ -1889,28 +3714,48 @@ class EditorController:
                 raise EditorControllerError(
                     "target text must not be empty before confirmation"
                 )
-            adapter = self._tm_adapter
-            if adapter is not None:
-                report = adapter.append_confirmed(
-                    segment=current,
-                    target=current.target,
-                    file_source=self.project.name,
+            workspace_mode = self._workspace_service is not None
+            workspace_edit_preparation: object | None = None
+            workspace_identity: SegmentIdentity | None = None
+            workspace_service: ProjectWorkspaceService | None = None
+            if workspace_mode:
+                workspace_service = self._require_workspace_session()
+                workspace_identity = (
+                    self.current_workspace_identity.segment_identity
                 )
-                if type(report) is not WriteReport:
-                    raise TypeError("TM adapter must return WriteReport")
-                report.__post_init__()
-                if not report.outcomes and (
-                    report.written_resource_ids or report.errors
-                ):
-                    raise ValueError(
-                        "TM adapter write report must retain structured outcomes"
+                workspace_edit_preparation = self._prepare_workspace_chunk_edit(
+                    workspace_service,
+                    workspace_identity,
+                    target=current.target,
+                    confirmed=True,
+                )
+            file_source = (
+                self._workspace_contract.name if workspace_mode else self.project.name
+            )
+            adapter = self._tm_adapter
+
+            def publish_resources() -> WriteReport:
+                if adapter is not None:
+                    published = adapter.append_confirmed(
+                        segment=current,
+                        target=current.target,
+                        file_source=file_source,
                     )
-            else:
+                    if type(published) is not WriteReport:
+                        raise TypeError("TM adapter must return WriteReport")
+                    published.__post_init__()
+                    if not published.outcomes and (
+                        published.written_resource_ids or published.errors
+                    ):
+                        raise ValueError(
+                            "TM adapter write report must retain structured outcomes"
+                        )
+                    return published
                 unit = SourceUnit(
                     id=current.id,
                     text=current.source,
                     speaker=current.speaker or None,
-                    file_source=self.project.name,
+                    file_source=file_source,
                 )
                 written: list[str] = []
                 errors: list[str] = []
@@ -1932,22 +3777,84 @@ class EditorController:
                         errors.append(
                             f"{resource.name}: unable to write translation memory"
                         )
-                report = WriteReport(
+                return WriteReport(
                     written_resource_ids=tuple(written),
                     errors=tuple(errors),
                 )
 
+            workspace_receipt: object | None = None
+            try:
+                if workspace_mode:
+                    assert workspace_service is not None
+                    assert workspace_identity is not None
+                    report, workspace_receipt = (
+                        self._commit_workspace_chunk_confirmed_edit(
+                            workspace_edit_preparation,
+                            workspace_service,
+                            workspace_identity,
+                            target=current.target,
+                            publish_resources=publish_resources,
+                        )
+                    )
+                else:
+                    report = publish_resources()
+            except BaseException:
+                self._cancel_workspace_chunk_edit(workspace_edit_preparation)
+                raise
+
             if not report.succeeded:
+                self._cancel_workspace_chunk_edit(workspace_edit_preparation)
+                if workspace_mode:
+                    return ControllerWorkspaceConfirmResult(
+                        session=self.workspace_view,
+                        current_identity=self.current_workspace_identity,
+                        current_global_index=self._workspace_global_index,
+                        write_report=report,
+                    )
                 return ConfirmResult(
                     project=self.project,
                     current_index=self._current_index,
                     write_report=report,
                 )
 
+            if workspace_mode:
+                assert workspace_service is not None
+                assert workspace_identity is not None
+                receipt = workspace_receipt
+                if receipt is None:
+                    raise EditorControllerError("CHUNK.COMMIT_FAILED")
+                if receipt.changed:
+                    self._project_revision = receipt.resulting_revision
+                    self._refresh_workspace_projection(workspace_identity)
+                next_index = next(
+                    (
+                        index
+                        for index in range(
+                            self._workspace_global_index + 1,
+                            len(self._workspace_flat_segments),
+                        )
+                        if not self._workspace_flat_segments[index].segment.confirmed
+                    ),
+                    self._workspace_global_index,
+                )
+                self._workspace_global_index = next_index
+                self._reissue_workspace_session_view()
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+                self._remember_current_workspace_position()
+                return ControllerWorkspaceConfirmResult(
+                    session=self.workspace_view,
+                    current_identity=self.current_workspace_identity,
+                    current_global_index=next_index,
+                    write_report=report,
+                )
+
             segments = list(self.project.segments)
             segments[self._current_index] = replace(current, confirmed=True)
             self._project = replace(self.project, segments=tuple(segments))
-            self._dirty = True
+            if not current.confirmed:
+                self._project_revision += 1
+            self._recompute_project_dirty()
             current_index = self._current_index
             next_index = next(
                 (
@@ -2126,6 +4033,75 @@ class EditorController:
                 raise
             return replace(operation)
 
+    def reattest_tm_resource(
+        self,
+        resource_id: str,
+    ) -> TMActivationOperationView:
+        """Start one explicit same-generation canonical re-attestation."""
+
+        if type(resource_id) is not str or not resource_id.strip():
+            raise EditorControllerError(
+                "TM re-attestation resource id is required"
+            )
+        with self._tm_activation_condition:
+            current_operation = self._tm_activation_operation
+            if current_operation is not None:
+                if not current_operation.completed:
+                    raise EditorControllerError(
+                        "a TM activation is already in progress"
+                    )
+                self._tm_activation_operation = None
+                self._tm_activation_outcome = None
+                self._tm_activation_worker_error = None
+            try:
+                config = self.repository.get(resource_id)
+            except ResourceError as error:
+                raise EditorControllerError(
+                    "TM re-attestation resource is unavailable"
+                ) from error
+            if config.kind is not ResourceKind.TRANSLATION_MEMORY:
+                raise EditorControllerError(
+                    "TM re-attestation requires a translation memory resource"
+                )
+            try:
+                service = _tm_reattestation_service(config)
+            except (OSError, UnicodeError, ValueError) as error:
+                raise EditorControllerError(
+                    "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
+                ) from error
+            operation = TMActivationOperationView(
+                operation_id=uuid4().hex,
+                resource_id=config.id,
+                phase="ACTIVATING",
+                completed=False,
+                succeeded=False,
+                safe_code=None,
+                retryable=False,
+            )
+            private_operation = replace(operation)
+            self._tm_activation_operation = private_operation
+            self._tm_activation_outcome = None
+            self._tm_activation_worker_error = None
+            self._prepared_tm_activation = None
+            worker = Thread(
+                target=self._run_tm_activation,
+                kwargs={
+                    "operation_id": private_operation.operation_id,
+                    "service": service,
+                    "source": config.path,
+                    "resource_id": config.id,
+                    "action": "REATTEST",
+                },
+                name=f"localcat-tm-reattest-{operation.operation_id[:8]}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                self._tm_activation_operation = None
+                raise
+            return replace(operation)
+
     def _start_initial_tm_activation(
         self,
         preflight: TMActivationPreflightView,
@@ -2241,6 +4217,11 @@ class EditorController:
                 candidate = service.activate_initial(source, resource_id)
             elif action == "REBUILD":
                 candidate = service.rebuild_from_snapshot(source, resource_id)
+            elif action == "REATTEST":
+                candidate = service.reattest_completed_authority(
+                    source,
+                    resource_id,
+                )
             else:
                 raise ValueError("TM operation action is unsupported")
             if type(candidate) is MigrationReport:
@@ -2576,6 +4557,501 @@ class EditorController:
         self._current_tm_report = None
         self._tm_query_epoch += 1
 
+    def _recompute_project_dirty(self) -> None:
+        """Compare current canonical content with the latest saved baseline."""
+
+        baseline = self._saved_project_digest
+        if baseline is None:
+            raise EditorControllerError("PROJECT.BASELINE_UNAVAILABLE")
+        self._dirty = _project_content_digest(self.project) != baseline
+
+    def _require_workspace_session(self) -> ProjectWorkspaceService:
+        service = self._workspace_service
+        if (
+            service is None
+            or not self._workspace_flat_segments
+            or service.session_id != self._project_session_id
+            or service.revision != self._project_revision
+        ):
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
+        return service
+
+    def _workspace_owner_for_chunk_controller(self) -> ProjectWorkspaceService:
+        """Return the exact live owner to the installed composition adapter."""
+
+        return self._require_workspace_session()
+
+    def _install_workspace_chunk_edit_gate(self, gate: object) -> None:
+        """Install one private prepare/commit gate without importing Chunk."""
+
+        if not all(
+            callable(getattr(gate, name, None))
+            for name in (
+                "prepare_segment_edit",
+                "commit_segment_edit",
+                "commit_confirmed_edit",
+                "cancel_segment_edit",
+            )
+        ):
+            raise TypeError("workspace chunk edit gate is incomplete")
+        current = self._workspace_chunk_edit_gate
+        if current is not None and current is not gate:
+            raise EditorControllerError("CHUNK.CONTROLLER_GATE_ALREADY_INSTALLED")
+        self._workspace_chunk_edit_gate = gate
+
+    def _notify_workspace_chunk_opened(self) -> object | None:
+        """Notify an optional application gate after a Workspace is installed."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = None if gate is None else getattr(gate, "workspace_opened", None)
+        if callable(callback):
+            try:
+                return callback()
+            except BaseException:
+                recovery = getattr(gate, "workspace_open_failed", None)
+                if callable(recovery):
+                    try:
+                        recovery()
+                    except BaseException:
+                        pass
+        return None
+
+    def _notify_workspace_chunk_closed(self) -> None:
+        """Revoke optional Chunk application state before dropping its owner."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = None if gate is None else getattr(gate, "workspace_closed", None)
+        if callable(callback):
+            callback()
+
+    def _capture_workspace_chunk_transition(
+        self,
+        workspace_owner: ProjectWorkspaceService,
+        projection: object,
+    ) -> object | None:
+        """Pass one owner-issued transition through the optional Chunk seam."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "capture_workspace_transition", None)
+        )
+        if callable(callback):
+            return callback(workspace_owner, projection)
+        return None
+
+    def _mark_workspace_chunk_transition_capture_failed(
+        self,
+        workspace_owner: ProjectWorkspaceService,
+    ) -> None:
+        """Tell the optional Chunk gate to fail closed after publication."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "workspace_transition_capture_failed", None)
+        )
+        if callable(callback):
+            try:
+                callback(workspace_owner)
+            except BaseException:
+                # Workspace publication is already durable and cannot be rolled
+                # back.  Candidate installation below remains mandatory.
+                pass
+
+    def _validate_workspace_chunk_replacement(
+        self,
+        candidate_owner: ProjectWorkspaceService,
+    ) -> None:
+        """Let the optional Chunk gate reject a swap before package publish."""
+
+        gate = self._workspace_chunk_edit_gate
+        callback = (
+            None
+            if gate is None
+            else getattr(gate, "validate_workspace_replacement", None)
+        )
+        if not callable(callback):
+            return
+        try:
+            callback(candidate_owner)
+        except EditorControllerError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", None)
+            raise EditorControllerError(
+                code if type(code) is str and code else "CHUNK.RECOVERY_REQUIRED"
+            ) from error
+
+    def _prepare_workspace_chunk_edit(
+        self,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        confirmed: bool,
+    ) -> object | None:
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            return None
+        return gate.prepare_segment_edit(
+            service,
+            identity,
+            target=target,
+            confirmed=confirmed,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+        )
+
+    def _commit_workspace_chunk_edit(
+        self,
+        preparation: object | None,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        confirmed: bool,
+    ) -> object:
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            return service.update_segment_edit(
+                identity,
+                target=target,
+                confirmed=confirmed,
+                session_id=self._project_session_id,
+                base_revision=self._project_revision,
+            )
+        receipt = gate.commit_segment_edit(
+            preparation,
+            service,
+            identity,
+            target=target,
+            confirmed=confirmed,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+        )
+        return receipt
+
+    def _cancel_workspace_chunk_edit(self, preparation: object | None) -> None:
+        gate = self._workspace_chunk_edit_gate
+        if gate is not None:
+            gate.cancel_segment_edit(preparation)
+
+    def _commit_workspace_chunk_confirmed_edit(
+        self,
+        preparation: object | None,
+        service: ProjectWorkspaceService,
+        identity: SegmentIdentity,
+        *,
+        target: str,
+        publish_resources: Callable[[], WriteReport],
+    ) -> tuple[WriteReport, object | None]:
+        """Run resource publication only after the final Chunk revalidation."""
+
+        gate = self._workspace_chunk_edit_gate
+        if gate is None:
+            report = publish_resources()
+            if not report.succeeded:
+                return report, None
+            receipt = service.update_segment_edit(
+                identity,
+                target=target,
+                confirmed=True,
+                session_id=self._project_session_id,
+                base_revision=self._project_revision,
+            )
+            return report, receipt
+        result = gate.commit_confirmed_edit(
+            preparation,
+            service,
+            identity,
+            target=target,
+            session_id=self._project_session_id,
+            base_revision=self._project_revision,
+            publish_resources=publish_resources,
+        )
+        if (
+            type(result) is not tuple
+            or len(result) != 2
+            or type(result[0]) is not WriteReport
+        ):
+            raise EditorControllerError("CHUNK.COMMIT_FAILED")
+        return result
+
+    def _require_workspace_save_session(
+        self,
+    ) -> tuple[
+        ProjectWorkspaceService,
+        ProjectSaveService,
+        ProjectPackagePersistenceBinding,
+    ]:
+        service = self._require_workspace_session()
+        save_service = self._workspace_save_service
+        binding = self._workspace_persistence_binding
+        if (
+            save_service is None
+            or save_service.workspace_service is not service
+            or type(binding) is not ProjectPackagePersistenceBinding
+            or binding.project_id != service.workspace.project_id
+        ):
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+        return service, save_service, binding
+
+    def _build_workspace_session_view(
+        self,
+        service: ProjectWorkspaceService,
+        save_service: ProjectSaveService,
+        projection: tuple[FlatProjectSegment, ...],
+        *,
+        current_index: int,
+        generation: int,
+    ) -> WorkspaceSessionView:
+        if not projection or current_index < 0 or current_index >= len(projection):
+            raise ValueError("workspace view requires one current segment")
+        project_identity = IssuedProjectIdentity(
+            project_id=service.workspace.project_id,
+            session_id=service.session_id,
+            generation=generation,
+            workspace_revision=service.revision,
+        )
+        progress_by_id = {
+            item.document_id: item for item in service.document_progress
+        }
+        document_identities = {
+            document.document_id: IssuedDocumentIdentity(
+                project=project_identity,
+                document_id=document.document_id,
+            )
+            for document in service.workspace.documents
+        }
+        documents = tuple(
+            WorkspaceDocumentView(
+                identity=document_identities[document.document_id],
+                display_name=document.display_name,
+                source_ref=document.source_ref,
+                order=document.order,
+                progress=progress_by_id[document.document_id],
+            )
+            for document in service.workspace.documents
+        )
+        segments = tuple(
+            WorkspaceSegmentView(
+                identity=IssuedSegmentIdentity(
+                    document=document_identities[item.document_id],
+                    local_segment_id=item.identity.local_segment_id,
+                ),
+                document_local_index=item.document_local_index,
+                project_global_index=item.project_global_index,
+                source=item.segment.source,
+                target=item.segment.target,
+                raw_speaker=item.segment.raw_speaker,
+                confirmed=item.segment.confirmed,
+            )
+            for item in projection
+        )
+        return WorkspaceSessionView(
+            project=project_identity,
+            name=service.workspace.name,
+            source_locale=service.workspace.source_locale,
+            target_locale=service.workspace.target_locale,
+            documents=documents,
+            segments=segments,
+            current_segment=segments[current_index].identity,
+            project_progress=service.project_progress,
+            save_state=WorkspaceSaveState(
+                dirty_document_ids=save_service.dirty_document_ids,
+                manifest_dirty=save_service.manifest_dirty,
+                project_dirty=save_service.project_dirty,
+            ),
+        )
+
+    def _prepare_workspace_tm_signature(
+        self,
+        *,
+        session_id: str,
+        projection: tuple[FlatProjectSegment, ...],
+        current_index: int,
+    ) -> tuple[str, str, str, int, int, float, int, str] | None:
+        adapter = self._tm_adapter
+        if adapter is None:
+            return None
+        segment = projection[current_index].segment
+        editor_segment = EditorSegment(
+            id=segment.identity.local_segment_id,
+            source=segment.source,
+            target=segment.target,
+            speaker=segment.raw_speaker,
+            confirmed=segment.confirmed,
+        )
+        preferences = self.workspace_state.tm_preferences()
+        try:
+            runtime_generation, retrieval_generation = (
+                adapter._current_query_generations()
+            )
+        except ValueError:
+            return None
+        return self._tm_signature(
+            segment=editor_segment,
+            preferences=preferences,
+            runtime_generation=runtime_generation,
+            retrieval_generation=retrieval_generation,
+            session_id=session_id,
+        )
+
+    def _prepare_workspace_install(
+        self,
+        save_service: ProjectSaveService,
+        *,
+        session_id: str,
+        generation: int,
+        current_index: int,
+    ) -> _PreparedWorkspaceInstall:
+        if type(save_service) is not ProjectSaveService:
+            raise TypeError("workspace save service must be exact")
+        service = save_service.workspace_service
+        if service.session_id != session_id:
+            raise ValueError("workspace session id changed during preparation")
+        projection = service.flat_segments
+        if not projection or current_index < 0 or current_index >= len(projection):
+            raise ValueError("workspace candidate has no selected segment")
+        view = self._build_workspace_session_view(
+            service,
+            save_service,
+            projection,
+            current_index=current_index,
+            generation=generation,
+        )
+        observed = self._prepare_workspace_tm_signature(
+            session_id=session_id,
+            projection=projection,
+            current_index=current_index,
+        )
+        return _PreparedWorkspaceInstall(
+            service=service,
+            save_service=save_service,
+            projection=projection,
+            current_index=current_index,
+            generation=generation,
+            session_id=session_id,
+            view=view,
+            observed_tm_signature=observed,
+        )
+
+    def _reissue_workspace_session_view(self) -> None:
+        service = self._require_workspace_session()
+        save_service = self._workspace_save_service
+        if save_service is None or save_service.workspace_service is not service:
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+        self._workspace_session_view = self._build_workspace_session_view(
+            service,
+            save_service,
+            self._workspace_flat_segments,
+            current_index=self._workspace_global_index,
+            generation=self._workspace_generation,
+        )
+
+    def _install_opened_workspace(
+        self,
+        opened: OpenedProjectPackage,
+        save_service: ProjectSaveService,
+        *,
+        session_id: str,
+    ) -> None:
+        if type(opened) is not OpenedProjectPackage:
+            raise TypeError("opened package must be exact OpenedProjectPackage")
+        if type(save_service) is not ProjectSaveService:
+            raise TypeError("workspace save service must be exact ProjectSaveService")
+        service = save_service.workspace_service
+        if (
+            type(service) is not ProjectWorkspaceService
+            or service.workspace != opened.workspace
+            or service.session_id != session_id
+        ):
+            raise ValueError("opened workspace session binding is invalid")
+        projection = service.flat_segments
+        if not projection:
+            raise ValueError("opened workspace contains no navigable segments")
+        next_generation = self._workspace_generation + 1
+        candidate_view = self._build_workspace_session_view(
+            service,
+            save_service,
+            projection,
+            current_index=0,
+            generation=next_generation,
+        )
+        previous_state = self.__dict__.copy()
+        try:
+            self._remember_current_position()
+            self._remember_current_workspace_position()
+            self._project = None
+            self._current_index = 0
+            self._dirty = False
+            self._saved_project_digest = None
+            self._batch_undo_state = None
+            self._workspace_service = service
+            self._workspace_save_service = save_service
+            self._workspace_persistence_binding = opened.persistence_binding
+            self._workspace_flat_segments = projection
+            self._workspace_global_index = 0
+            self._workspace_generation = next_generation
+            self._workspace_session_view = candidate_view
+            self._project_session_id = session_id
+            self._project_revision = service.revision
+            self._clear_project_search_state()
+            self._clear_workspace_search_state()
+            self._issued_workspace_reconciliation = None
+            self._issued_workspace_package_import = None
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+            self._restore_workspace_position(opened.persistence_binding.path)
+            self._reissue_workspace_session_view()
+            self._remember_current_workspace_position()
+            self._notify_workspace_chunk_opened()
+        except BaseException:
+            self.__dict__.clear()
+            self.__dict__.update(previous_state)
+            raise
+
+    def _refresh_workspace_projection(
+        self,
+        selected_identity: SegmentIdentity,
+    ) -> None:
+        service = self._require_workspace_session()
+        projection = service.flat_segments
+        index = next(
+            (
+                item.project_global_index
+                for item in projection
+                if item.identity == selected_identity
+            ),
+            None,
+        )
+        if index is None:
+            raise EditorControllerError("PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED")
+        self._workspace_flat_segments = projection
+        self._workspace_global_index = index
+        self._reissue_workspace_session_view()
+
+    def _set_workspace_global_index(self, index: int) -> None:
+        if index != self._workspace_global_index:
+            self._workspace_global_index = index
+            view = self.workspace_view
+            self._workspace_session_view = replace(
+                view,
+                current_segment=view.segments[index].identity,
+            )
+            self._advance_tm_query_epoch()
+            self._record_current_tm_baseline()
+        self._remember_current_workspace_position()
+
+    def _clear_workspace_search_state(self) -> None:
+        self._current_workspace_search_report = None
+        self._issued_workspace_search_hits = ()
+        self._issued_workspace_search_public_hits = ()
+        self._issued_workspace_search_context = None
+
     def _clear_project_search_state(self) -> None:
         """Invalidate only project-search issuance, independent of TM epochs."""
 
@@ -2591,9 +5067,10 @@ class EditorController:
         preferences: TMPreferences,
         runtime_generation: int,
         retrieval_generation: int,
+        session_id: str | None = None,
     ) -> tuple[str, str, str, int, int, float, int, str]:
         return (
-            self._project_session_id,
+            self._project_session_id if session_id is None else session_id,
             segment.id,
             hashlib.sha256(segment.source.encode("utf-8")).hexdigest(),
             runtime_generation,
@@ -2624,7 +5101,9 @@ class EditorController:
         )
 
     def _record_current_tm_baseline(self) -> None:
-        if self._tm_adapter is None or self._project is None:
+        if self._tm_adapter is None or (
+            self._project is None and self._workspace_service is None
+        ):
             self._observed_tm_signature = None
             return
         try:
@@ -2639,7 +5118,9 @@ class EditorController:
     ) -> None:
         """Observe resource, capability, source, and preference changes."""
 
-        if self._tm_adapter is None or self._project is None:
+        if self._tm_adapter is None or (
+            self._project is None and self._workspace_service is None
+        ):
             return
         if self._tm_runtime_blocked_safe_code is not None:
             return
@@ -2693,12 +5174,17 @@ class EditorController:
     def _apply_tm_target_if_generations_current(
         self,
         target: str,
-    ) -> EditorProject:
+    ) -> EditorProject | WorkspaceSessionView:
         """Commit a target while the issued runtime/retrieval pair is current."""
 
         adapter = self._tm_adapter
+        apply_target = (
+            self.update_workspace_target
+            if self._workspace_service is not None
+            else self.update_target
+        )
         if adapter is None:
-            return self.update_target(target)
+            return apply_target(target)
         signature = self._observed_tm_signature
         if signature is None:
             raise EditorControllerError(
@@ -2710,7 +5196,7 @@ class EditorController:
             return adapter._run_if_query_generations_current(
                 runtime_generation=runtime_generation,
                 retrieval_generation=retrieval_generation,
-                operation=lambda: self.update_target(target),
+                operation=lambda: apply_target(target),
             )
         except _TMQueryGenerationChanged as error:
             self._advance_tm_query_epoch()
@@ -2731,6 +5217,56 @@ class EditorController:
             )
         except WorkspaceStateError as exc:
             LOGGER.warning("Unable to remember project position: %s", exc)
+
+    def _restore_workspace_position(self, path: Path) -> None:
+        remembered = self.workspace_state.find_workspace_project(path)
+        if remembered is None:
+            legacy = self.workspace_state.find_project(path)
+            if legacy is None:
+                return
+            if (
+                legacy.index < len(self._workspace_flat_segments)
+                and self._workspace_flat_segments[
+                    legacy.index
+                ].identity.local_segment_id == legacy.segment_id
+            ):
+                self._workspace_global_index = legacy.index
+            return
+        if (
+            remembered.project_id != self._workspace_contract.project_id
+        ):
+            return
+        index = next(
+            (
+                item.project_global_index
+                for item in self._workspace_flat_segments
+                if item.document_id == remembered.document_id
+                and item.identity.local_segment_id == remembered.local_segment_id
+            ),
+            None,
+        )
+        if index is not None:
+            self._workspace_global_index = index
+
+    def _remember_current_workspace_position(self) -> None:
+        binding = self._workspace_persistence_binding
+        if (
+            self._workspace_service is None
+            or type(binding) is not ProjectPackagePersistenceBinding
+            or not self._workspace_flat_segments
+        ):
+            return
+        identity = self.current_workspace_identity
+        try:
+            self.workspace_state.remember_workspace_project(
+                binding.path,
+                project_id=self._workspace_contract.project_id,
+                document_id=identity.document.document_id,
+                local_segment_id=identity.local_segment_id,
+                index=self._workspace_global_index,
+            )
+        except WorkspaceStateError as exc:
+            LOGGER.warning("Unable to remember workspace position: %s", exc)
 
     def apply_tm_suggestion(
         self,
@@ -2834,7 +5370,7 @@ class EditorController:
         self,
         suggestion: TermSuggestion,
         position: int | None = None,
-    ) -> EditorProject:
+    ) -> EditorProject | WorkspaceSessionView:
         """Insert one term target at an editor cursor position without confirmation."""
 
         if not isinstance(suggestion, TermSuggestion):
@@ -2844,6 +5380,8 @@ class EditorController:
         if insertion_point < 0 or insertion_point > len(target):
             raise EditorControllerError("term insertion position is outside the target text")
         updated = target[:insertion_point] + suggestion.target_term + target[insertion_point:]
+        if self._workspace_service is not None:
+            return self.update_workspace_target(updated)
         return self.update_target(updated)
 
     def add_term(self, source: str, target: str) -> ResourceConfig:
@@ -3111,6 +5649,194 @@ class EditorController:
 
         return self.repository.list_resources()
 
+    def export_resource_direct(
+        self,
+        resource_id: str,
+        destination: Path,
+    ) -> ResourceExportOutcome:
+        """Export one owner snapshot as its direct JSONL/CSV profile."""
+
+        with self._tm_query_lock:
+            try:
+                return self._resource_portability.export_direct(
+                    resource_id,
+                    destination,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
+    def export_resource_package(
+        self,
+        resource_id: str,
+        destination: Path,
+    ) -> ResourceExportOutcome:
+        """Export one configured resource as ResourcePackage."""
+
+        with self._tm_query_lock:
+            try:
+                return self._resource_portability.export_package(
+                    resource_id,
+                    destination,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
+    def export_tmx_resource_package(
+        self,
+        resource_id: str,
+        destination: Path,
+        source_locale: str,
+        target_locale: str,
+    ) -> ResourceExportOutcome:
+        """Export one managed TM through the ResourcePackage TMX profile.
+
+        The TMX handler only supplies deterministic payload and cold proof;
+        ResourcePortabilityService remains the package/receipt/recovery owner.
+        """
+
+        from tmx_context_contracts import TmxEffectiveLocales
+        from tmx_resource_package_handler import TmxResourcePackagePayloadHandler
+
+        try:
+            locales = TmxEffectiveLocales(source_locale, target_locale)
+        except (TypeError, ValueError) as error:
+            raise EditorControllerError("TMX.LOCALE.INVALID") from error
+        handler = TmxResourcePackagePayloadHandler(locales)
+        service = ResourcePortabilityService(
+            self.repository,
+            termbase_store=self._term_store,
+            tmx_payload_handler=handler,
+        )
+        with self._tm_query_lock:
+            try:
+                return service.export_package(
+                    resource_id,
+                    destination,
+                    payload_profile=handler.profile,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+
+    def validate_resource_package(
+        self,
+        source: Path,
+    ) -> ResourcePackageValidationReport:
+        try:
+            return self._resource_portability.validate_resource_package(source)
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    @staticmethod
+    def resource_package_import_supported(
+        report: ResourcePackageValidationReport,
+    ) -> bool:
+        """Project the package owner's import capability without leaking its enum."""
+
+        if type(report) is not ResourcePackageValidationReport:
+            raise TypeError("resource package validation report must be exact")
+        return ResourcePortabilityService.import_supported(report)
+
+    def preview_resource_package_import(
+        self,
+        source: Path,
+        mode: ResourceImportMode,
+        *,
+        destination_resource_id: str | None = None,
+        new_resource_name: str | None = None,
+    ) -> ResourcePackageImportPreview:
+        try:
+            return self._resource_portability.preview_resource_package_import(
+                source,
+                mode,
+                destination_resource_id=destination_resource_id,
+                new_resource_name=new_resource_name,
+            )
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def cancel_resource_package_import(
+        self,
+        preview: ResourcePackageImportPreview,
+    ) -> None:
+        try:
+            self._resource_portability.cancel_resource_package_import(preview)
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def apply_resource_package_import(
+        self,
+        preview: ResourcePackageImportPreview,
+    ) -> ResourcePackageImportResult:
+        """Consume one preview and reload exactly the resulting resource graph."""
+
+        with self._tm_query_lock:
+            try:
+                result = self._resource_portability.apply_resource_package_import(
+                    preview
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+            try:
+                self._reload_resources_after_persisted_mutation()
+            except EditorControllerError as error:
+                try:
+                    self._resource_portability.retain_runtime_recovery(result.receipt)
+                except ResourcePortabilityError:
+                    pass
+                raise EditorControllerError(
+                    "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                ) from error
+            return result
+
+    def inspect_resource_portability_recovery(
+        self,
+    ) -> tuple[ResourceRecoveryPreview, ...]:
+        try:
+            return self._resource_portability.inspect_resource_portability_recovery()
+        except ResourcePortabilityError as error:
+            raise EditorControllerError(error.code) from error
+
+    def recover_resource_portability(
+        self,
+        preview: ResourceRecoveryPreview,
+        action: ResourceRecoveryAction,
+    ) -> ResourceRecoveryOutcome:
+        with self._tm_query_lock:
+            try:
+                outcome = self._resource_portability.recover_resource_portability(
+                    preview,
+                    action,
+                )
+            except ResourcePortabilityError as error:
+                raise EditorControllerError(error.code) from error
+            if outcome.receipt is not None:
+                try:
+                    self._reload_resources_after_persisted_mutation()
+                except EditorControllerError as error:
+                    try:
+                        self._resource_portability.retain_runtime_recovery(
+                            outcome.receipt
+                        )
+                    except ResourcePortabilityError:
+                        pass
+                    raise EditorControllerError(
+                        "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                    ) from error
+            return outcome
+
+    def preview_termbase_import(
+        self,
+        input_path: Path,
+    ) -> TermbaseImportPreview:
+        """Preview codec-owned columns without entering TM or Store authority."""
+
+        if not isinstance(input_path, Path):
+            raise TypeError("termbase preview input path must be a Path")
+        try:
+            return preview_termbase_import_file(input_path)
+        except ImportFailure as error:
+            raise EditorControllerError(str(error)) from error
+
     def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create a managed resource and make it available immediately."""
 
@@ -3193,7 +5919,8 @@ class EditorController:
 
             try:
                 rows, skipped = read_legacy_termbase_import(
-                    request.input_path
+                    request.input_path,
+                    request.termbase_selection,
                 )
             except (
                 ImportFailure,

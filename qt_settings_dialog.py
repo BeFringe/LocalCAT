@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 from pathlib import Path
@@ -60,13 +61,35 @@ from editor_contracts import (
     ImportRequest,
     ResourceConfig,
     ResourceKind,
+    TermbaseImportHeaderMode,
+    TermbaseImportPreview,
+    TermbaseImportSelection,
     TMActivationOperationView,
     TMResourceDisplayMode,
     TMResourceStatus,
 )
-from editor_controller import EditorController, EditorControllerError
+from editor_controller import (
+    EditorController,
+    EditorControllerError,
+    PortableResourceKind,
+    ResourceExportOutcome,
+    ResourceImportMode,
+    ResourcePackageImportPreview,
+    ResourcePackageImportResult,
+    ResourcePackageValidationReport,
+    ResourceRecoveryAction,
+    ResourceRecoveryDisposition,
+    ResourceRecoveryOutcome,
+    ResourceRecoveryPreview,
+)
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
+from qt_localized_message_box import show_localized_critical
+from qt_tmx_export_dialog import (
+    TmxExportDialog,
+    TmxExportDialogPreview,
+    TmxExportScopeChoice,
+)
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -77,6 +100,7 @@ from qt_tm_threshold import (
 
 TMX_FILE_FILTER = "TMX files (*.tmx)"
 TERMBASE_FILE_FILTER = "Termbase files (*.csv *.xlsx)"
+RESOURCE_PACKAGE_FILE_FILTER = "LocalCAT ResourcePackage (*.localcat-resource)"
 DEFAULT_VISIBLE_RESOURCE_ROWS = 3
 _EMPTY_RESOURCE_TABLE_BODY_HEIGHT = 36
 _RESOURCE_MORE_BUTTON_STYLE = """
@@ -110,6 +134,73 @@ QComboBox#newResourceKind {
     background-color: #ffffff;
 }
 """
+_RESOURCE_PACKAGE_DIALOG_STYLE = """
+QDialog#resourcePackageImportOptionsDialog,
+QDialog#resourcePackageApplyDialog {
+    background: #f2f7fb;
+    color: #17344f;
+    font-family: "Inter", "Noto Sans CJK SC", sans-serif;
+    font-size: 13px;
+}
+QLabel#resourcePackageDialogTitle {
+    color: #082f5b;
+    font-size: 24px;
+    font-weight: 700;
+}
+QLabel#resourcePackageDialogSummary,
+QLabel#resourcePackageDestinationSummary {
+    color: #087da3;
+    font-size: 17px;
+    font-weight: 700;
+}
+QFrame#resourcePackageSummaryCard {
+    background: #ffffff;
+    border: 1px solid #c6dceb;
+    border-radius: 10px;
+}
+QLabel#resourcePackageModeBadge {
+    color: #965008;
+    background: #fff2dc;
+    border: 1px solid #efbf73;
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-weight: 700;
+}
+QLabel#resourcePackageCheckPassed {
+    color: #08704f;
+    background: #e2f5eb;
+    border: 1px solid #a8ddc3;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-weight: 600;
+}
+QLabel#resourcePackageDialogNote {
+    color: #55738c;
+}
+QComboBox, QLineEdit {
+    background: #ffffff;
+    border: 1px solid #bfd3e2;
+    border-radius: 7px;
+    padding: 7px 9px;
+    min-height: 22px;
+}
+QPushButton {
+    background: #ffffff;
+    color: #173f5f;
+    border: 1px solid #b8cfdf;
+    border-radius: 7px;
+    padding: 8px 18px;
+    min-width: 86px;
+}
+QPushButton:hover, QPushButton:focus {
+    border-color: #08a4cd;
+}
+QPushButton:default {
+    color: #ffffff;
+    background: #08a4cd;
+    border-color: #08a4cd;
+}
+"""
 _TM_MODE_LABELS = {
     TMResourceDisplayMode.LEGACY_EXACT_ONLY: "Legacy exact-only",
     TMResourceDisplayMode.ACTIVATING: "激活中",
@@ -128,6 +219,9 @@ _TM_SAFE_REASON_LABELS = {
     "TM.RUNTIME.SOURCE_DIVERGED": "外部来源已变更",
     "TM.RUNTIME.REFRESH_FAILED": "运行时刷新失败",
     "TM.ACTIVATION.RUNTIME_REFRESH_FAILED": "激活后运行时验证失败",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED": "Canonical 文件身份需重新验证",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE": "Canonical 文件身份不满足重新验证条件",
+    "TM.RUNTIME.CANONICAL_REATTESTATION_IDENTITY_INVALID": "Canonical 资源身份无法验证",
     "TM.LEGACY.QUERY_FAILED": "Legacy 查询失败",
     "TM.ACTIVATION.IO_FAILED": "本地读写失败",
     "TM.ACTIVATION.PROGRAMMER_ERROR": "Canonical 操作未能安全完成",
@@ -142,8 +236,17 @@ _TM_SAFE_REASON_LABELS = {
     "MIGRATION.SOURCE_UNREADABLE": "本地来源不可读",
     "MIGRATION.SOURCE_CHANGED": "本地来源已变更",
     "RETRIEVAL.CONTEXT_EVIDENCE_MISSING": "Context 尚未开放",
+    "RETRIEVAL.CONTEXT_IDENTITY_INVALID": "Context 证据身份无法验证",
+    "RETRIEVAL.CONTEXT_EVIDENCE_FAILED": "Context 正确性证据未通过",
+    "RETRIEVAL.CONTEXT_EVIDENCE_EXPIRED": "Context 证据已过期",
     "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_MISSING": "Fuzzy 正确性尚未开放",
+    "RETRIEVAL.FUZZY_CORRECTNESS_IDENTITY_INVALID": "Fuzzy 正确性证据身份无法验证",
+    "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_FAILED": "Fuzzy 正确性证据未通过",
+    "RETRIEVAL.FUZZY_CORRECTNESS_EVIDENCE_EXPIRED": "Fuzzy 正确性证据已过期",
     "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_MISSING": "Fuzzy 性能尚未开放",
+    "RETRIEVAL.FUZZY_BENCHMARK_IDENTITY_INVALID": "Fuzzy 性能证据身份无法验证",
+    "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED": "Fuzzy 性能证据未通过",
+    "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_EXPIRED": "Fuzzy 性能证据已过期",
 }
 _TM_ACTION_EXCEPTION_SAFE_CODES = frozenset(_TM_SAFE_REASON_LABELS)
 _TM_KIND_LEGACY_COLOR = "#d59a00"
@@ -158,6 +261,42 @@ def _tm_safe_reason(code: str | None) -> str:
         code,
         f"状态信息不可用（{code}）",
     )
+
+
+def _tm_status_safe_reason(status: TMResourceStatus, code: str) -> str:
+    """Explain aggregate evidence without contradicting an open gate."""
+
+    if (
+        code == "RETRIEVAL.FUZZY_BENCHMARK_EVIDENCE_FAILED"
+        and status.fuzzy_available
+    ):
+        return "另一 Fuzzy 路径性能证据未通过（当前 Fuzzy 可用）"
+    return _tm_safe_reason(code)
+
+
+def _ask_localized_question(
+    parent: QWidget,
+    title: str,
+    message: str,
+    buttons: QMessageBox.StandardButton,
+    default_button: QMessageBox.StandardButton,
+    button_labels: dict[QMessageBox.StandardButton, str],
+) -> QMessageBox.StandardButton:
+    """Show one native question box with explicit LocalCAT button text."""
+
+    prompt = QMessageBox(
+        QMessageBox.Icon.Question,
+        title,
+        message,
+        buttons,
+        parent,
+    )
+    prompt.setDefaultButton(default_button)
+    for standard_button, label in button_labels.items():
+        button = prompt.button(standard_button)
+        if button is not None:
+            button.setText(label)
+    return QMessageBox.StandardButton(prompt.exec())
 
 
 class _ResourceMoreButton(QToolButton):
@@ -285,6 +424,384 @@ class ImportWorker(QThread):
         self.report_ready.emit(report)
 
 
+class PreviewWorker(QThread):
+    """Build one codec-owned termbase preview away from the GUI thread."""
+
+    def __init__(
+        self,
+        controller: EditorController,
+        input_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.input_path = input_path
+        self.preview: TermbaseImportPreview | None = None
+        self.error_message: str | None = None
+
+    def run(self) -> None:
+        try:
+            preview = self.controller.preview_termbase_import(self.input_path)
+            if type(preview) is not TermbaseImportPreview:
+                raise TypeError("术语表列预览返回了无效结果。")
+            self.preview = preview
+        except EditorControllerError as exc:
+            self.error_message = str(exc)
+        except Exception:
+            self.error_message = "术语表列预览未能安全完成。"
+
+
+class ResourcePortabilityWorker(QThread):
+    """Run one ResourcePackage/direct-export Controller operation off-thread."""
+
+    def __init__(
+        self,
+        operation: Callable[[], object],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if not callable(operation):
+            raise TypeError("resource portability operation must be callable")
+        self.operation = operation
+        self.result: object | None = None
+        self.error_message: str | None = None
+
+    def run(self) -> None:
+        try:
+            self.result = self.operation()
+        except EditorControllerError as error:
+            self.error_message = str(error)
+        except Exception:
+            self.error_message = "RESOURCE.PORTABILITY.OPERATION_FAILED"
+
+
+class ResourcePackageImportOptionsDialog(QDialog):
+    """Choose create/replace after a package has passed cold validation."""
+
+    def __init__(
+        self,
+        report: ResourcePackageValidationReport,
+        resources: tuple[ResourceConfig, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.report = report
+        self.setObjectName("resourcePackageImportOptionsDialog")
+        self.setWindowTitle("导入 ResourcePackage")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 26, 30, 24)
+        layout.setSpacing(13)
+        title = QLabel("导入 ResourcePackage")
+        title.setObjectName("resourcePackageDialogTitle")
+        layout.addWidget(title)
+        kind_label = (
+            "翻译记忆库"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "术语表"
+        )
+        summary = QLabel(
+            f"{kind_label} · {report.record_count} 条记录 · "
+            f"{report.payload_profile.value}"
+        )
+        summary.setObjectName("resourcePackageDialogSummary")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        card = QFrame()
+        card.setObjectName("resourcePackageSummaryCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.addWidget(QLabel(f"包大小：{report.artifact_byte_count} bytes"))
+        card_layout.addWidget(QLabel(f"Payload：{report.payload_byte_count} bytes"))
+        if report.resource_kind is PortableResourceKind.TERMBASE:
+            card_layout.addWidget(
+                QLabel(
+                    f"Legacy {report.legacy_record_count} · v1 {report.v1_record_count}"
+                )
+            )
+        layout.addWidget(card)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("导入方式"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("resourcePackageImportMode")
+        self.mode_combo.addItem("新建本地资源", ResourceImportMode.CREATE_NEW)
+        self.mode_combo.addItem("替换明选资源", ResourceImportMode.REPLACE_SELECTED)
+        configure_combo_popup(
+            self.mode_combo,
+            object_name="resourcePackageImportModePopup",
+            accessible_name="ResourcePackage 导入方式",
+        )
+        mode_row.addWidget(self.mode_combo, 1)
+        layout.addLayout(mode_row)
+
+        self.name_label = QLabel("新资源名称")
+        layout.addWidget(self.name_label)
+        self.name_input = QLineEdit(
+            "Imported translation memory"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "Imported termbase"
+        )
+        self.name_input.setObjectName("resourcePackageNewResourceName")
+        layout.addWidget(self.name_input)
+
+        self.destination_label = QLabel("替换目标")
+        layout.addWidget(self.destination_label)
+        self.destination_combo = QComboBox()
+        self.destination_combo.setObjectName("resourcePackageDestination")
+        expected = (
+            ResourceKind.TRANSLATION_MEMORY
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else ResourceKind.TERMBASE
+        )
+        for resource in resources:
+            if resource.kind is expected:
+                self.destination_combo.addItem(resource.name, resource.id)
+        configure_combo_popup(
+            self.destination_combo,
+            object_name="resourcePackageDestinationPopup",
+            accessible_name="ResourcePackage 替换目标",
+        )
+        layout.addWidget(self.destination_combo)
+
+        note = QLabel("继续后会生成一次性预览；取消不会修改任何资源文件。")
+        note.setObjectName("resourcePackageDialogNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("继续预览")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._accept_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.mode_combo.currentIndexChanged.connect(self._refresh_mode)
+        self.name_input.textChanged.connect(self._refresh_mode)
+        self._refresh_mode()
+
+    def _refresh_mode(self, _index: int = -1) -> None:
+        create = (
+            ResourceImportMode(self.mode_combo.currentData())
+            is ResourceImportMode.CREATE_NEW
+        )
+        self.name_label.setVisible(create)
+        self.name_input.setVisible(create)
+        self.destination_label.setVisible(not create)
+        self.destination_combo.setVisible(not create)
+        self._accept_button.setEnabled(
+            bool(self.name_input.text().strip())
+            if create
+            else self.destination_combo.count() > 0
+        )
+
+    def selection(self) -> tuple[ResourceImportMode, str | None, str | None]:
+        mode = ResourceImportMode(self.mode_combo.currentData())
+        if mode is ResourceImportMode.CREATE_NEW:
+            return mode, None, self.name_input.text().strip()
+        return mode, self.destination_combo.currentData(), None
+
+
+class ResourcePackageApplyDialog(QDialog):
+    """Display the sealed import plan before its one allowed apply."""
+
+    def __init__(
+        self,
+        preview: ResourcePackageImportPreview,
+        destination_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("resourcePackageApplyDialog")
+        self.setWindowTitle("预览并导入 ResourcePackage")
+        self.setModal(True)
+        self.setMinimumWidth(680)
+        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 26, 30, 24)
+        layout.setSpacing(14)
+        title = QLabel("预览并导入 ResourcePackage")
+        title.setObjectName("resourcePackageDialogTitle")
+        layout.addWidget(title)
+        badge = QLabel(
+            "REPLACE · 替换明选资源"
+            if preview.mode is ResourceImportMode.REPLACE_SELECTED
+            else "CREATE · 新建本地资源"
+        )
+        badge.setObjectName("resourcePackageModeBadge")
+        layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignRight)
+        report = preview.validation
+        kind = (
+            "翻译记忆库"
+            if report.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            else "术语表"
+        )
+        destination = QLabel(f"{kind}  →  {destination_name}")
+        destination.setObjectName("resourcePackageDestinationSummary")
+        destination.setWordWrap(True)
+        layout.addWidget(destination)
+        facts = QFrame()
+        facts.setObjectName("resourcePackageSummaryCard")
+        facts_layout = QHBoxLayout(facts)
+        facts_layout.addWidget(QLabel(f"记录 {report.record_count}"))
+        facts_layout.addWidget(QLabel(f"Payload {report.payload_byte_count} bytes"))
+        if report.resource_kind is PortableResourceKind.TERMBASE:
+            facts_layout.addWidget(
+                QLabel(
+                    f"Legacy {report.legacy_record_count} · v1 {report.v1_record_count}"
+                )
+            )
+        facts_layout.addStretch()
+        layout.addWidget(facts)
+        status = QLabel("检查通过 · 来源与目标会在应用前再次验证")
+        status.setObjectName("resourcePackageCheckPassed")
+        layout.addWidget(status)
+        warning = QLabel(
+            "替换会完整取代所选资源快照，不执行逐条合并。"
+            if preview.mode is ResourceImportMode.REPLACE_SELECTED
+            else "新资源在快照冷重开成功前不会出现在资源列表。"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用导入")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class TermbaseColumnSelectionDialog(QDialog):
+    """Select two physical columns from one Controller-issued preview."""
+
+    def __init__(
+        self,
+        preview: TermbaseImportPreview,
+        parent: QWidget | None = None,
+    ) -> None:
+        if type(preview) is not TermbaseImportPreview:
+            raise TypeError("termbase column prompt requires TermbaseImportPreview")
+        super().__init__(parent)
+        self.preview = preview
+        self.setObjectName("termbaseColumnSelectionDialog")
+        self.setWindowTitle("选择术语表列")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        scope_parts = [f"格式：{preview.format_name}"]
+        if preview.active_sheet_name:
+            scope_parts.append(f"活动工作表：{preview.active_sheet_name}")
+        scope = QLabel(" · ".join(scope_parts))
+        scope.setObjectName("termbasePreviewScope")
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+
+        if preview.columns_truncated:
+            truncation = QLabel(
+                f"文件共有 {preview.total_column_count} 列；"
+                f"当前安全预览显示前 {len(preview.columns)} 列。"
+            )
+            truncation.setObjectName("termbasePreviewTruncation")
+            truncation.setWordWrap(True)
+            layout.addWidget(truncation)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("原文列"))
+        self.source_combo = QComboBox()
+        self.source_combo.setObjectName("termbaseSourceColumn")
+        self.source_combo.setAccessibleName("术语表原文列")
+        source_row.addWidget(self.source_combo, 1)
+        layout.addLayout(source_row)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("译文列"))
+        self.target_combo = QComboBox()
+        self.target_combo.setObjectName("termbaseTargetColumn")
+        self.target_combo.setAccessibleName("术语表译文列")
+        target_row.addWidget(self.target_combo, 1)
+        layout.addLayout(target_row)
+
+        for column in preview.columns:
+            label = self._column_label(column)
+            self.source_combo.addItem(label, column.zero_based_index)
+            self.target_combo.addItem(label, column.zero_based_index)
+        if len(preview.columns) > 1:
+            self.target_combo.setCurrentIndex(1)
+
+        configure_combo_popup(
+            self.source_combo,
+            object_name="termbaseSourceColumnPopup",
+            accessible_name="术语表原文列选项",
+        )
+        configure_combo_popup(
+            self.target_combo,
+            object_name="termbaseTargetColumnPopup",
+            accessible_name="术语表译文列选项",
+        )
+
+        self.header_checkbox = QCheckBox("首行是表头")
+        self.header_checkbox.setObjectName("termbaseFirstRowHeader")
+        self.header_checkbox.setAccessibleName("首行是表头")
+        self.header_checkbox.setChecked(preview.legacy_header_detected)
+        layout.addWidget(self.header_checkbox)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        self.buttons.setObjectName("termbaseColumnButtons")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.source_combo.currentIndexChanged.connect(self._update_accept_enabled)
+        self.target_combo.currentIndexChanged.connect(self._update_accept_enabled)
+        self._update_accept_enabled()
+
+    @staticmethod
+    def _column_label(column) -> str:
+        candidate = column.header_candidate
+        if candidate is None or not candidate:
+            display = "（空）"
+        else:
+            display = candidate.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+            if column.header_truncated:
+                display += "…"
+        return f"第 {column.zero_based_index + 1} 列 · {display}"
+
+    def _update_accept_enabled(self, _index: int = -1) -> None:
+        source_index = self.source_combo.currentData()
+        target_index = self.target_combo.currentData()
+        enabled = (
+            type(source_index) is int
+            and type(target_index) is int
+            and source_index != target_index
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(enabled)
+
+    def selection(self) -> TermbaseImportSelection:
+        """Build the immutable selection consumed by the existing import command."""
+
+        return TermbaseImportSelection(
+            source_zero_based_index=self.source_combo.currentData(),
+            target_zero_based_index=self.target_combo.currentData(),
+            header_mode=(
+                TermbaseImportHeaderMode.FIRST_ROW
+                if self.header_checkbox.isChecked()
+                else TermbaseImportHeaderMode.NO_HEADER
+            ),
+            preview_column_count=len(self.preview.columns),
+            preview_source_identity=self.preview.source_identity,
+        )
+
+
 class QtSettingsDialog(QDialog):
     """Manage local TM and termbase configuration through EditorController only."""
 
@@ -294,7 +811,13 @@ class QtSettingsDialog(QDialog):
     fuzzy_validation_changed = Signal(object)
     term_suggestions_changed = Signal()
 
-    def __init__(self, controller: EditorController, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        controller: EditorController,
+        parent: QWidget | None = None,
+        *,
+        tmx_export_service: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self.new_resource_button: QPushButton
         self.tm_threshold_chip: QPushButton
@@ -302,13 +825,17 @@ class QtSettingsDialog(QDialog):
         self._resource_row_resize_pending = False
         self._resource_row_layout_signature: tuple[object, ...] | None = None
         self.controller = controller
+        self.tmx_export_service = tmx_export_service
         self.setObjectName("settingsDialog")
         self.setWindowTitle("LocalCAT · 语言资源设置")
         self.setMinimumSize(860, 560)
         self.resize(1040, 680)
         self.setModal(True)
         self.import_worker: ImportWorker | None = None
+        self.preview_worker: PreviewWorker | None = None
+        self.portability_worker: ResourcePortabilityWorker | None = None
         self._import_busy = False
+        self._portability_busy = False
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
         self._tm_operation_id: str | None = None
@@ -453,22 +980,36 @@ class QtSettingsDialog(QDialog):
         section_hint = QLabel("选择资源的可见性与读写权限，或创建新的本地资源。")
         section_hint.setObjectName("resourceSectionHint")
         storage_hint = QLabel(
-            "导入文件会转换并合并到列表所示的内部 JSONL/CSV；这里显示的是 "
-            "LocalCAT 实际查询的本地存储路径。"
+            "导入文件会转换并合并至内部 JSONL/CSV。"
+            "列表中的路径就是 LocalCAT 实际查询的本地存储位置。"
         )
         storage_hint.setObjectName("resourceStorageHint")
         storage_hint.setWordWrap(True)
         intro.addWidget(section_title)
         intro.addWidget(section_hint)
         intro.addWidget(storage_hint)
-        intro_row.addLayout(intro)
-        intro_row.addStretch()
+        intro_row.addLayout(intro, 1)
+        intro_row.addSpacing(24)
         new_button = QPushButton("＋ 新建资源")
         new_button.setObjectName("newResourceButton")
         new_button.clicked.connect(self._prompt_create_resource)
         self.new_resource_button = new_button
         intro_row.addWidget(new_button)
+        package_button = QPushButton("导入资源包")
+        package_button.setObjectName("importResourcePackageButton")
+        package_button.setToolTip("验证 ResourcePackage 后新建或替换一个本地资源")
+        package_button.clicked.connect(self._prompt_resource_package_import)
+        self.resource_package_button = package_button
+        intro_row.addWidget(package_button)
         content_layout.addLayout(intro_row)
+
+        self.resource_recovery_panel = QFrame()
+        self.resource_recovery_panel.setObjectName("resourceRecoveryPanel")
+        self.resource_recovery_layout = QVBoxLayout(self.resource_recovery_panel)
+        self.resource_recovery_layout.setContentsMargins(12, 10, 12, 10)
+        self.resource_recovery_layout.setSpacing(8)
+        self.resource_recovery_panel.hide()
+        content_layout.addWidget(self.resource_recovery_panel)
 
         threshold_panel = QFrame()
         threshold_panel.setObjectName("settingsTmThresholdPanel")
@@ -615,6 +1156,7 @@ class QtSettingsDialog(QDialog):
             if type(status) is TMResourceStatus
         }
         self._refresh_tm_threshold_entry()
+        self._refresh_resource_recovery()
         try:
             operation = self.controller.tm_activation_operation()
         except Exception:
@@ -647,6 +1189,88 @@ class QtSettingsDialog(QDialog):
             self.status_label.setText(
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
             )
+
+    def _refresh_resource_recovery(self) -> None:
+        layout = self.resource_recovery_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        try:
+            recoveries = self.controller.inspect_resource_portability_recovery()
+        except EditorControllerError:
+            recoveries = ()
+        self.resource_recovery_panel.setVisible(bool(recoveries))
+        if not recoveries:
+            return
+        title = QLabel(f"有 {len(recoveries)} 项资源操作需要收尾")
+        title.setObjectName("resourceRecoveryTitle")
+        layout.addWidget(title)
+        for recovery in recoveries:
+            row = QFrame()
+            row.setObjectName(f"resourceRecovery_{recovery.operation_id}")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            summary = QLabel(self._resource_recovery_summary(recovery))
+            summary.setWordWrap(True)
+            row_layout.addWidget(summary, 1)
+            if recovery.disposition is ResourceRecoveryDisposition.COMPLETE_AVAILABLE:
+                action = ResourceRecoveryAction.COMPLETE
+                button = QPushButton("完成恢复")
+            elif recovery.disposition is ResourceRecoveryDisposition.ROLLBACK_AVAILABLE:
+                action = ResourceRecoveryAction.ROLLBACK
+                button = QPushButton("确认回退")
+            else:
+                button = None
+            if button is not None:
+                button.setObjectName(f"recoverResource_{recovery.operation_id}")
+                button.clicked.connect(
+                    lambda _checked=False, current=recovery, decision=action: self._run_resource_recovery(
+                        current,
+                        decision,
+                    )
+                )
+                row_layout.addWidget(button)
+            layout.addWidget(row)
+
+    @staticmethod
+    def _resource_recovery_summary(recovery: ResourceRecoveryPreview) -> str:
+        if recovery.disposition is ResourceRecoveryDisposition.COMPLETE_AVAILABLE:
+            state = "本地资源已发布，可完成登记与回执"
+        elif recovery.disposition is ResourceRecoveryDisposition.ROLLBACK_AVAILABLE:
+            state = "原资源保持不变，可清理未完成操作"
+        else:
+            state = "目标状态无法自动证明，需要人工检查"
+        return f"{recovery.operation_kind.value} · {state}"
+
+    def _run_resource_recovery(
+        self,
+        recovery: ResourceRecoveryPreview,
+        action: ResourceRecoveryAction,
+    ) -> None:
+        self._start_portability_operation(
+            lambda: self.controller.recover_resource_portability(recovery, action),
+            "正在核对并收尾资源操作…",
+            self._finish_resource_recovery,
+        )
+
+    def _finish_resource_recovery(
+        self,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourceRecoveryOutcome:
+            self._show_import_feedback(
+                f"资源恢复未完成：{error or 'RESOURCE.RECOVERY.RESULT_INVALID'}",
+                failed=True,
+            )
+            self._refresh_resource_recovery()
+            return
+        self.refresh_resources()
+        self.resources_changed.emit()
+        label = "恢复已完成" if result.receipt is not None else "未完成操作已清理"
+        self._show_import_feedback(label, failed=False)
 
     def _refresh_resource_menu_tab_order(
         self,
@@ -858,6 +1482,55 @@ class QtSettingsDialog(QDialog):
                     )
                 )
                 menu.addSeparator()
+            direct_export_action = menu.addAction(
+                "导出兼容 JSONL"
+                if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                else "导出 CSV/v1"
+            )
+            direct_export_action.setObjectName(f"exportDirect_{resource.id}")
+            direct_export_action.setToolTip("导出此资源的完整兼容快照")
+            direct_export_action.triggered.connect(
+                lambda _checked=False, configured=resource: self._prompt_export_direct(
+                    configured
+                )
+            )
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                tmx_ready = (
+                    status_by_resource_id.get(resource.id) is not None
+                    and status_by_resource_id[resource.id].mode
+                    is TMResourceDisplayMode.CANONICAL_ACTIVE
+                )
+                tmx_export_action = menu.addAction("导出 TMX")
+                tmx_export_action.setObjectName(f"exportTmx_{resource.id}")
+                tmx_export_action.setToolTip(
+                    "将此 managed TM 的完整 canonical snapshot 导出为 TMX"
+                )
+                tmx_export_action.setEnabled(
+                    self.tmx_export_service is not None and tmx_ready
+                )
+                tmx_export_action.triggered.connect(
+                    lambda _checked=False, configured=resource: self._prompt_export_tmx(
+                        configured
+                    )
+                )
+            package_export_action = menu.addAction("导出资源包")
+            package_export_action.setObjectName(f"exportPackage_{resource.id}")
+            package_export_action.setToolTip(
+                (
+                    "将此 managed TM 的完整 canonical snapshot "
+                    "以 TMX payload 封装为 ResourcePackage"
+                    if resource.kind is ResourceKind.TRANSLATION_MEMORY
+                    else "将此资源的完整快照封装为可验证 ResourcePackage"
+                )
+            )
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                package_export_action.setEnabled(tmx_ready)
+            package_export_action.triggered.connect(
+                lambda _checked=False, configured=resource: self._prompt_export_package(
+                    configured
+                )
+            )
+            menu.addSeparator()
             delete_action = menu.addAction("删除资源")
             delete_action.setObjectName(f"delete_{resource.id}")
             delete_action.triggered.connect(
@@ -1010,6 +1683,17 @@ class QtSettingsDialog(QDialog):
     def _tm_lifecycle_action_spec(
         status: TMResourceStatus | None,
     ) -> tuple[str, str, bool]:
+        if (
+            status is not None
+            and status.mode is TMResourceDisplayMode.UNAVAILABLE
+            and status.safe_codes
+            == ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",)
+        ):
+            return (
+                "重新验证 canonical",
+                "重新证明同一 canonical 文件身份，不重建 TM 或运行 Fuzzy 验证",
+                True,
+            )
         if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
             return (
                 "激活 canonical",
@@ -1083,7 +1767,7 @@ class QtSettingsDialog(QDialog):
             safe_codes = status.safe_codes
             text = _TM_MODE_LABELS[mode]
             if safe_codes:
-                text += f" · {_tm_safe_reason(safe_codes[0])}"
+                text += f" · {_tm_status_safe_reason(status, safe_codes[0])}"
         status_label.setText(text)
         status_label.setProperty("tm_mode", mode.value)
         status_label.setProperty("tmMode", mode.value)
@@ -1121,7 +1805,35 @@ class QtSettingsDialog(QDialog):
                 for item in self.controller.tm_resource_statuses()
                 if item.resource_id == resource_id
             )
-            if status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
+            if (
+                status.mode is TMResourceDisplayMode.UNAVAILABLE
+                and status.safe_codes
+                == ("TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",)
+            ):
+                answer = _ask_localized_question(
+                    self,
+                    "重新验证 canonical TM",
+                    (
+                        f"资源：{resource.name}\n\n"
+                        "将重新证明同一 canonical generation 的本地文件身份；"
+                        "不会重建或修改 TM 内容，也不会启动 Fuzzy 性能验证。"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "重新验证",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.status_label.setText(
+                        f"已取消 {resource.name} 的 canonical 重新验证。"
+                    )
+                    return
+                started = self.controller.reattest_tm_resource(resource_id)
+                action_name = "Canonical 重新验证"
+            elif status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
                 preflight = self.controller.prepare_tm_activation(resource_id)
                 prompt = (
                     f"资源：{preflight.resource_name}\n"
@@ -1130,13 +1842,17 @@ class QtSettingsDialog(QDialog):
                     "预期变化：Legacy exact-only → Canonical active。\n"
                     "Context / fuzzy 仍只按当前已验证能力开放。"
                 )
-                answer = QMessageBox.question(
+                answer = _ask_localized_question(
                     self,
                     "激活 canonical TM",
                     prompt,
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "激活",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.controller.cancel_tm_activation(preflight)
@@ -1151,7 +1867,7 @@ class QtSettingsDialog(QDialog):
                 TMResourceDisplayMode.SOURCE_DIVERGED,
                 TMResourceDisplayMode.DEGRADED,
             ) and status.exact_available:
-                answer = QMessageBox.question(
+                answer = _ask_localized_question(
                     self,
                     "重建 canonical TM",
                     (
@@ -1162,6 +1878,10 @@ class QtSettingsDialog(QDialog):
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "重建",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.status_label.setText(
@@ -1243,7 +1963,7 @@ class QtSettingsDialog(QDialog):
             updated = replace(resource, **{field: checked})
             self.controller.update_resource(updated)
         except (StopIteration, EditorControllerError, ValueError) as exc:
-            QMessageBox.critical(self, "无法更新资源", str(exc))
+            show_localized_critical(self, title="无法更新资源", text=str(exc))
             self.refresh_resources()
             return
         self.resources_changed.emit()
@@ -1259,7 +1979,7 @@ class QtSettingsDialog(QDialog):
         return resource
 
     def _confirm_delete_resource(self, resource: ResourceConfig) -> None:
-        answer = QMessageBox.question(
+        answer = _ask_localized_question(
             self,
             "删除语言资源",
             (
@@ -1269,13 +1989,17 @@ class QtSettingsDialog(QDialog):
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
+            {
+                QMessageBox.StandardButton.Yes: "删除",
+                QMessageBox.StandardButton.Cancel: "取消",
+            },
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
             self.controller.delete_resource(resource.id)
         except EditorControllerError as exc:
-            QMessageBox.critical(self, "无法删除资源", str(exc))
+            show_localized_critical(self, title="无法删除资源", text=str(exc))
             return
         self.refresh_resources()
         self.resources_changed.emit()
@@ -1316,11 +2040,369 @@ class QtSettingsDialog(QDialog):
         try:
             self.create_resource(name_input.text(), kind_input.currentData())
         except EditorControllerError as exc:
-            QMessageBox.critical(self, "无法创建资源", str(exc))
+            show_localized_critical(self, title="无法创建资源", text=str(exc))
+
+    def _prompt_export_direct(self, resource: ResourceConfig) -> None:
+        file_filter = (
+            "JSONL snapshot (*.jsonl)"
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY
+            else "CSV/v1 snapshot (*.csv)"
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出兼容快照",
+            "",
+            file_filter,
+        )
+        if not selected:
+            return
+        self._start_portability_operation(
+            lambda: self.controller.export_resource_direct(
+                resource.id,
+                Path(selected),
+            ),
+            f"正在导出 {resource.name}…",
+            lambda result, error: self._finish_resource_export(
+                result,
+                error,
+                package=False,
+            ),
+        )
+
+    def _prompt_export_package(self, resource: ResourceConfig) -> None:
+        locales: tuple[str, str] | None = None
+        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+            locales = self._prompt_tmx_package_locales(resource)
+            if locales is None:
+                return
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 ResourcePackage",
+            "",
+            RESOURCE_PACKAGE_FILE_FILTER,
+        )
+        if not selected:
+            return
+        destination = Path(selected)
+        if destination.suffix != ".localcat-resource":
+            destination = destination.with_name(
+                f"{destination.name}.localcat-resource"
+            )
+        if locales is not None:
+            operation = lambda: self.controller.export_tmx_resource_package(
+                resource.id,
+                destination,
+                locales[0],
+                locales[1],
+            )
+        else:
+            operation = lambda: self.controller.export_resource_package(
+                resource.id,
+                destination,
+            )
+        self._start_portability_operation(
+            operation,
+            f"正在封装 {resource.name}…",
+            lambda result, error: self._finish_resource_export(
+                result,
+                error,
+                package=True,
+            ),
+        )
+
+    def _prompt_export_tmx(self, resource: ResourceConfig) -> None:
+        service = self.tmx_export_service
+        if service is None:
+            self._show_import_feedback("TMX 导出当前不可用。", failed=True)
+            return
+
+        def prepare(
+            _token: str,
+            source: str,
+            target: str,
+            destination: Path,
+        ) -> TmxExportDialogPreview:
+            application_preparation = service.prepare_resource_export(
+                resource.id,
+                source,
+                target,
+                destination,
+            )
+            preview = application_preparation.preview
+            return TmxExportDialogPreview(
+                domain_preparation=application_preparation,
+                badge="RESOURCE · MANAGED TM",
+                title=resource.name,
+                binding=(
+                    f"managed_resource · {resource.id} · "
+                    f"{preview.operation_id[:12]}"
+                ),
+                document_count=0,
+                attached_count=preview.attached_count,
+                included_count=preview.included_count,
+                excluded_count=preview.excluded_count,
+                warning_count=preview.warning_count,
+                profile_id=preview.profile_id,
+            )
+
+        dialog = TmxExportDialog(
+            title="导出翻译记忆 TMX",
+            scopes=(TmxExportScopeChoice(resource.id, resource.name),),
+            source_locale="und",
+            target_locale="und",
+            prepare=prepare,
+            publish=service.publish,
+            parent=self,
+        )
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                receipt = dialog.receipt
+                self._show_import_feedback(
+                    f"TMX 已导出 · {getattr(receipt, 'included_count', 0)} 条记录。",
+                    failed=False,
+                )
+        finally:
+            dialog.deleteLater()
+
+    def _prompt_tmx_package_locales(
+        self,
+        resource: ResourceConfig,
+    ) -> tuple[str, str] | None:
+        dialog = QDialog(self)
+        dialog.setObjectName("tmxPackageLocaleDialog")
+        dialog.setWindowTitle("导出 TMX 资源包")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        title = QLabel(f"将“{resource.name}”封装为 TMX ResourcePackage")
+        title.setStyleSheet("font-size: 18px; font-weight: 750; color: #083b5c;")
+        layout.addWidget(title)
+        hint = QLabel(
+            "资源范围固定为该 managed TM 的完整 canonical snapshot；"
+            "请确认 TMX 语言对。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        row = QHBoxLayout()
+        source = QLineEdit()
+        source.setObjectName("tmxPackageSourceLocale")
+        source.setPlaceholderText("默认 en")
+        target = QLineEdit()
+        target.setObjectName("tmxPackageTargetLocale")
+        target.setPlaceholderText("默认 zh-CN")
+        row.addWidget(QLabel("源语言"))
+        row.addWidget(source)
+        row.addWidget(QLabel("目标语言"))
+        row.addWidget(target)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("继续")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return (
+                source.text().strip() or "en",
+                target.text().strip() or "zh-CN",
+            )
+        finally:
+            dialog.deleteLater()
+
+    def _finish_resource_export(
+        self,
+        result: object | None,
+        error: str | None,
+        *,
+        package: bool,
+    ) -> None:
+        if error is not None or type(result) is not ResourceExportOutcome:
+            self._show_import_feedback(
+                f"导出未完成：{error or 'RESOURCE.EXPORT.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        receipt = result.receipt
+        label = "ResourcePackage" if package else "兼容快照"
+        self._show_import_feedback(
+            f"{label}已导出 · {receipt.record_count} 条记录。",
+            failed=False,
+        )
+
+    def _prompt_resource_package_import(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 ResourcePackage",
+            "",
+            RESOURCE_PACKAGE_FILE_FILTER,
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        self._start_portability_operation(
+            lambda: self.controller.validate_resource_package(source),
+            "正在验证 ResourcePackage…",
+            lambda result, error: self._after_resource_package_validation(
+                source,
+                result,
+                error,
+            ),
+        )
+
+    def _after_resource_package_validation(
+        self,
+        source: Path,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageValidationReport:
+            self._show_import_feedback(
+                f"资源包检查未通过：{error or 'RESOURCE.PACKAGE.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        if not self.controller.resource_package_import_supported(result):
+            self._show_import_feedback(
+                "TMX ResourcePackage 当前仅支持导出，不能导入 LocalCAT；"
+                "当前可导入 TM JSONL/v1 与术语 CSV/v1 ResourcePackage。",
+                failed=True,
+            )
+            return
+        options = ResourcePackageImportOptionsDialog(
+            result,
+            self.controller.list_resources(),
+            self,
+        )
+        try:
+            if options.exec() != QDialog.DialogCode.Accepted:
+                self._show_import_feedback("已取消资源包导入。", failed=False)
+                return
+            mode, destination_resource_id, new_resource_name = options.selection()
+        finally:
+            options.deleteLater()
+        self._start_portability_operation(
+            lambda: self.controller.preview_resource_package_import(
+                source,
+                mode,
+                destination_resource_id=destination_resource_id,
+                new_resource_name=new_resource_name,
+            ),
+            "正在生成一次性导入预览…",
+            lambda preview, preview_error: self._after_resource_package_preview(
+                preview,
+                preview_error,
+                new_resource_name,
+            ),
+        )
+
+    def _after_resource_package_preview(
+        self,
+        result: object | None,
+        error: str | None,
+        new_resource_name: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageImportPreview:
+            self._show_import_feedback(
+                f"无法生成导入预览：{error or 'RESOURCE.IMPORT.PREVIEW_INVALID'}",
+                failed=True,
+            )
+            return
+        preview = result
+        if preview.destination_resource_id is None:
+            destination_name = new_resource_name or "新本地资源"
+        else:
+            destination_name = next(
+                (
+                    resource.name
+                    for resource in self.controller.list_resources()
+                    if resource.id == preview.destination_resource_id
+                ),
+                preview.destination_resource_id,
+            )
+        confirmation = ResourcePackageApplyDialog(
+            preview,
+            destination_name,
+            self,
+        )
+        try:
+            if confirmation.exec() != QDialog.DialogCode.Accepted:
+                try:
+                    self.controller.cancel_resource_package_import(preview)
+                except EditorControllerError:
+                    pass
+                self._show_import_feedback("已取消资源包导入。", failed=False)
+                return
+        finally:
+            confirmation.deleteLater()
+        self._start_portability_operation(
+            lambda: self.controller.apply_resource_package_import(preview),
+            "正在应用 ResourcePackage 并冷重开资源…",
+            self._finish_resource_package_apply,
+        )
+
+    def _finish_resource_package_apply(
+        self,
+        result: object | None,
+        error: str | None,
+    ) -> None:
+        if error is not None or type(result) is not ResourcePackageImportResult:
+            self._show_import_feedback(
+                f"资源包导入未完成：{error or 'RESOURCE.IMPORT.RESULT_INVALID'}",
+                failed=True,
+            )
+            return
+        self.refresh_resources()
+        self.resources_changed.emit()
+        self._show_import_feedback(
+            f"资源包已应用 · {result.receipt.record_count} 条记录。",
+            failed=False,
+        )
+
+    def _start_portability_operation(
+        self,
+        operation: Callable[[], object],
+        message: str,
+        callback: Callable[[object | None, str | None], None],
+    ) -> bool:
+        if self.is_importing:
+            self._show_import_feedback("已有资源操作正在运行，请等待完成。", failed=True)
+            return False
+        self._portability_busy = True
+        self._set_import_busy(True, message)
+        worker = ResourcePortabilityWorker(operation, self)
+        self.portability_worker = worker
+        worker.finished.connect(
+            lambda current=worker, done=callback: self._finish_portability_worker(
+                current,
+                done,
+            )
+        )
+        worker.start()
+        return True
+
+    def _finish_portability_worker(
+        self,
+        worker: ResourcePortabilityWorker,
+        callback: Callable[[object | None, str | None], None],
+    ) -> None:
+        if self.portability_worker is not worker:
+            worker.deleteLater()
+            return
+        self.portability_worker = None
+        result = worker.result
+        error = worker.error_message
+        worker.deleteLater()
+        self._portability_busy = False
+        self._set_import_busy(False)
+        callback(result, error)
 
     @property
     def is_importing(self) -> bool:
-        return self._import_busy
+        return self._import_busy or self._portability_busy
 
     def _prompt_import(self, resource: ResourceConfig) -> None:
         file_filter = (
@@ -1332,39 +2414,146 @@ class QtSettingsDialog(QDialog):
         selected, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if not selected:
             return
+        if resource.kind is ResourceKind.TERMBASE:
+            self.start_termbase_preview(resource.id, Path(selected))
+            return
         source_locale = ""
         target_locale = ""
-        if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-            try:
-                default_source = self.controller.project.source_locale
-                default_target = self.controller.project.target_locale
-            except EditorControllerError:
-                default_source = "en-US"
-                default_target = "zh-CN"
-            locale_dialog = QDialog(self)
-            locale_dialog.setWindowTitle("选择 TMX 语言对")
-            locale_layout = QVBoxLayout(locale_dialog)
-            locale_layout.addWidget(QLabel("源语言 locale"))
-            source_input = QLineEdit(default_source)
-            source_input.setObjectName("tmxSourceLocale")
-            locale_layout.addWidget(source_input)
-            locale_layout.addWidget(QLabel("目标语言 locale"))
-            target_input = QLineEdit(default_target)
-            target_input.setObjectName("tmxTargetLocale")
-            locale_layout.addWidget(target_input)
-            locale_buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
-            )
-            locale_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
-            locale_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-            locale_buttons.accepted.connect(locale_dialog.accept)
-            locale_buttons.rejected.connect(locale_dialog.reject)
-            locale_layout.addWidget(locale_buttons)
-            if locale_dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            source_locale = source_input.text()
-            target_locale = target_input.text()
+        try:
+            default_source = self.controller.project.source_locale
+            default_target = self.controller.project.target_locale
+        except EditorControllerError:
+            default_source = "en-US"
+            default_target = "zh-CN"
+        locale_dialog = QDialog(self)
+        locale_dialog.setWindowTitle("选择 TMX 语言对")
+        locale_layout = QVBoxLayout(locale_dialog)
+        locale_layout.addWidget(QLabel("源语言 locale"))
+        source_input = QLineEdit(default_source)
+        source_input.setObjectName("tmxSourceLocale")
+        locale_layout.addWidget(source_input)
+        locale_layout.addWidget(QLabel("目标语言 locale"))
+        target_input = QLineEdit(default_target)
+        target_input.setObjectName("tmxTargetLocale")
+        locale_layout.addWidget(target_input)
+        locale_buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        locale_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("开始导入")
+        locale_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        locale_buttons.accepted.connect(locale_dialog.accept)
+        locale_buttons.rejected.connect(locale_dialog.reject)
+        locale_layout.addWidget(locale_buttons)
+        if locale_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        source_locale = source_input.text()
+        target_locale = target_input.text()
         self.start_import(resource.id, Path(selected), source_locale, target_locale)
+
+    @staticmethod
+    def _lexical_absolute(path: Path) -> Path:
+        expanded = path.expanduser()
+        return expanded if expanded.is_absolute() else expanded.absolute()
+
+    def start_termbase_preview(
+        self,
+        resource_id: str,
+        input_path: Path,
+    ) -> bool:
+        """Start the codec-owned preview while holding the shared import gate."""
+
+        if self.is_importing:
+            self._show_import_feedback("已有导入任务正在运行，请等待完成。", failed=True)
+            return False
+        try:
+            resource = next(
+                configured
+                for configured in self.controller.list_resources()
+                if configured.id == resource_id
+            )
+        except StopIteration:
+            self._show_import_feedback(f"找不到资源：{resource_id}", failed=True)
+            return False
+        if resource.kind is not ResourceKind.TERMBASE:
+            self._show_import_feedback("只有术语表导入需要列预览。", failed=True)
+            return False
+        if not isinstance(input_path, Path):
+            self._show_import_feedback("术语表路径无效。", failed=True)
+            return False
+
+        lexical_input = self._lexical_absolute(input_path)
+        self.last_import_report = None
+        self._import_target_kind = ResourceKind.TERMBASE
+        self._import_busy = True
+        self._set_import_busy(True, f"正在预览 {resource.name} 的列…")
+        worker = PreviewWorker(self.controller, lexical_input, self)
+        self.preview_worker = worker
+        worker.finished.connect(
+            lambda current=worker, configured=resource: self._on_preview_finished(
+                current,
+                configured,
+            )
+        )
+        worker.start()
+        return True
+
+    def _on_preview_finished(
+        self,
+        worker: PreviewWorker,
+        resource: ResourceConfig,
+    ) -> None:
+        if self.preview_worker is not worker:
+            worker.deleteLater()
+            return
+        self.preview_worker = None
+        preview = worker.preview
+        error_message = worker.error_message
+        input_path = worker.input_path
+        worker.deleteLater()
+
+        if error_message is not None:
+            self._finish_preview_without_import(
+                f"无法预览术语表：{error_message}",
+                failed=True,
+            )
+            return
+        if preview is None:
+            self._finish_preview_without_import(
+                "无法预览术语表：预览结果不可用。",
+                failed=True,
+            )
+            return
+        if len(preview.columns) < 2:
+            self._finish_preview_without_import(
+                "术语表预览至少 2 列才能导入。",
+                failed=True,
+            )
+            return
+
+        prompt = TermbaseColumnSelectionDialog(preview, self)
+        try:
+            if prompt.exec() != QDialog.DialogCode.Accepted:
+                self._finish_preview_without_import("已取消术语表导入。", failed=False)
+                return
+            try:
+                selection = prompt.selection()
+                request = ImportRequest(
+                    resource_id=resource.id,
+                    input_path=input_path,
+                    termbase_selection=selection,
+                )
+            except (TypeError, ValueError) as exc:
+                self._finish_preview_without_import(str(exc), failed=True)
+                return
+        finally:
+            prompt.deleteLater()
+
+        self._launch_import(resource, request, busy_already=True)
+
+    def _finish_preview_without_import(self, message: str, *, failed: bool) -> None:
+        self._import_busy = False
+        self._set_import_busy(False)
+        self._show_import_feedback(message, failed=failed)
 
     def start_import(
         self,
@@ -1372,6 +2561,7 @@ class QtSettingsDialog(QDialog):
         input_path: Path,
         source_locale: str = "",
         target_locale: str = "",
+        termbase_selection: TermbaseImportSelection | None = None,
     ) -> bool:
         """Start a non-blocking import; return False when another import is active."""
 
@@ -1395,29 +2585,41 @@ class QtSettingsDialog(QDialog):
         try:
             request = ImportRequest(
                 resource_id=resource_id,
-                input_path=input_path.expanduser().resolve(),
+                input_path=self._lexical_absolute(input_path),
                 source_locale=source_locale,
                 target_locale=target_locale,
+                termbase_selection=termbase_selection,
             )
         except (TypeError, ValueError) as exc:
             self._show_import_feedback(str(exc), failed=True)
             return False
 
+        self._launch_import(resource, request, busy_already=False)
+        return True
+
+    def _launch_import(
+        self,
+        resource: ResourceConfig,
+        request: ImportRequest,
+        *,
+        busy_already: bool,
+    ) -> None:
+        if not busy_already:
+            self._import_busy = True
         self.last_import_report = None
         self._import_target_kind = resource.kind
-        self._import_busy = True
         self._set_import_busy(True, f"正在导入 {resource.name}…")
         worker = ImportWorker(self.controller, request, self)
         self.import_worker = worker
         worker.report_ready.connect(self._on_import_finished)
         worker.finished.connect(lambda current=worker: self._release_worker(current))
         worker.start()
-        return True
 
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
         self.active_table.setEnabled(not busy)
         self.inactive_table.setEnabled(not busy)
         self.new_resource_button.setEnabled(not busy)
+        self.resource_package_button.setEnabled(not busy)
         self.close_button.setEnabled(not busy)
         self.import_progress.setVisible(busy)
         if message:
@@ -1463,7 +2665,7 @@ class QtSettingsDialog(QDialog):
 
     def reject(self) -> None:
         if self.is_importing:
-            self._show_import_feedback("导入完成前无法关闭设置。", failed=True)
+            self._show_import_feedback("导入预览或导入完成前无法关闭设置。", failed=True)
             return
         super().reject()
 

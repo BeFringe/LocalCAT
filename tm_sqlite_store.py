@@ -10,9 +10,9 @@ journal-authenticated new set cannot be proven at any phase.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 import hashlib
@@ -26,11 +26,34 @@ import sqlite3
 import stat
 import threading
 import time
-from typing import Any, NoReturn, Protocol, SupportsIndex, cast
+from typing import Any, NoReturn, Protocol, cast
 import unicodedata
 import uuid
 
 import tm_contracts as contract_module
+import tm_candidate_store_contracts as candidate_contracts
+import tm_sqlite_candidate_projection as candidate_projection
+from tm_candidate_store_contracts import (
+    CANDIDATE_INDEX_VERSION,
+    CANDIDATE_PROOF_BLOCK_SIZE,
+    CANDIDATE_PROOF_BLOCK_VERSION_V1,
+    CandidateProofIndexError,
+    SQLiteCandidateProofBlock,
+    SQLiteCandidateProofDensePhase1,
+    SQLiteCandidateProofDensePhase2,
+    SQLiteCandidateProofRecord,
+    SQLiteCandidateProofSnapshot,
+    SQLiteCandidateRecallSnapshot,
+    SQLiteCandidateRecord,
+    SQLiteCandidateWritePlan,
+    SQLiteGramRow,
+    SQLiteStoreSchemaError,
+    _CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
+    _SQLiteCandidateProofDenseReceipt,
+    build_candidate_write_plan,
+    character_ngram_frequencies,
+    unique_character_ngrams,
+)
 from text_matcher import (
     TEXT_MATCHER_SEMANTICS_VERSION,
     UNICODE_VERSION,
@@ -237,6 +260,8 @@ from tm_activation_recovery import (
     _validate_published_activation_set,
     _validate_replaced_activation_database,
     publish_activation,
+    completed_authority_requires_reattestation,
+    reattest_completed_authority,
     recover_durable_activation,
     rollback_durable_activation,
 )
@@ -252,12 +277,7 @@ TM_LEGACY_SCHEMA_VERSION = 1
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
-CANDIDATE_INDEX_VERSION = "candidate-index-v1"
-CANDIDATE_PROOF_BLOCK_VERSION_V1 = "candidate-proof-block-v1"
-CANDIDATE_PROOF_BLOCK_SIZE = 256
 BUSY_TIMEOUT_MS = 5000
-_CANDIDATE_QUERY_CHUNK_SIZE = 256
-_CANDIDATE_SEED_POSTING_CAP = 4096
 _NATIVE_PATH_TYPE = type(Path())
 
 _RECORD_COLUMNS = (
@@ -505,18 +525,6 @@ _STREAMED_STAGE_SECONDARY_INDEX_NAMES = (
     "idx_tm_gram_lookup",
     "idx_tm_gram_block_lookup",
 )
-_STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS = tuple(
-    statement
-    for statement in _SCHEMA_STATEMENTS
-    if any(
-        f"CREATE INDEX {name}" in statement
-        for name in _STREAMED_STAGE_SECONDARY_INDEX_NAMES
-    )
-)
-if len(_STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS) != len(
-    _STREAMED_STAGE_SECONDARY_INDEX_NAMES
-):
-    raise RuntimeError("streamed-stage secondary index closure is invalid")
 
 _LEGACY_SCHEMA_STATEMENTS = (
     """
@@ -647,14 +655,6 @@ CREATE VIRTUAL TABLE tm_fts USING fts5(
 """
 
 
-class SQLiteStoreSchemaError(RuntimeError):
-    """A safe, resource-local schema or connection policy failure."""
-
-
-class CandidateProofIndexError(ValueError):
-    """One canonical candidate-proof fact failed exact recomputation."""
-
-
 class SQLiteStoreLifecycleError(SQLiteStoreSchemaError):
     """A safe lifecycle failure scoped to one resource generation."""
 
@@ -684,365 +684,6 @@ class SchemaUpgradeAncestryError(SQLiteStoreSchemaError):
         self.code = code
         self.retryable = retryable
         super().__init__(code)
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateRecord:
-    """Folded source input exposed to a pre-transaction plan builder."""
-
-    origin_ordinal: int
-    source_fold_v1: str
-
-    def __post_init__(self) -> None:
-        if type(self.origin_ordinal) is not int or self.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(self.source_fold_v1) is not str or not self.source_fold_v1:
-            raise ValueError("source_fold_v1 must be a non-empty string")
-
-
-@dataclass(frozen=True)
-class SQLiteGramRow:
-    """One declarative gram row for the store-owned transaction."""
-
-    origin_ordinal: int
-    gram_size: int
-    gram: str
-    term_frequency: int = 1
-
-    def __post_init__(self) -> None:
-        if type(self.origin_ordinal) is not int or self.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(self.gram_size) is not int or self.gram_size not in {1, 2, 3}:
-            raise ValueError("gram_size must be 1, 2, or 3")
-        if type(self.gram) is not str or len(self.gram) != self.gram_size:
-            raise ValueError("gram length must equal gram_size")
-        if type(self.term_frequency) is not int or self.term_frequency < 1:
-            raise ValueError("term_frequency must be a positive integer")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateWritePlan:
-    """Closed candidate rows returned without access to SQLite state."""
-
-    gram_rows: tuple[SQLiteGramRow, ...] = ()
-    fts_origin_ordinals: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if type(self.gram_rows) is not tuple:
-            raise TypeError("gram_rows must contain SQLiteGramRow values")
-        gram_keys: list[tuple[int, int, str]] = []
-        for row in self.gram_rows:
-            if type(row) is not SQLiteGramRow:
-                raise TypeError("gram_rows must contain SQLiteGramRow values")
-            origin_ordinal = row.origin_ordinal
-            gram_size = row.gram_size
-            gram = row.gram
-            term_frequency = row.term_frequency
-            if type(origin_ordinal) is not int or origin_ordinal < 0:
-                raise ValueError(
-                    "origin_ordinal must be a non-negative integer"
-                )
-            if type(gram_size) is not int or gram_size not in {1, 2, 3}:
-                raise ValueError("gram_size must be 1, 2, or 3")
-            if type(gram) is not str or len(gram) != gram_size:
-                raise ValueError("gram length must equal gram_size")
-            if type(term_frequency) is not int or term_frequency < 1:
-                raise ValueError("term_frequency must be a positive integer")
-            gram_keys.append((origin_ordinal, gram_size, gram))
-        if len(set(gram_keys)) != len(gram_keys):
-            raise ValueError("gram_rows must be unique")
-        if type(self.fts_origin_ordinals) is not tuple or any(
-            type(origin_ordinal) is not int or origin_ordinal < 0
-            for origin_ordinal in self.fts_origin_ordinals
-        ):
-            raise ValueError(
-                "fts_origin_ordinals must contain non-negative integers"
-            )
-        if len(set(self.fts_origin_ordinals)) != len(
-            self.fts_origin_ordinals
-        ):
-            raise ValueError("fts_origin_ordinals must be unique")
-
-
-def unique_character_ngrams(
-    folded_text: str,
-    gram_size: int,
-) -> tuple[str, ...]:
-    """Return first-occurrence unique code-point grams without folding."""
-
-    if type(folded_text) is not str:
-        raise TypeError("folded_text must be a built-in string")
-    if type(gram_size) is not int:
-        raise TypeError("gram_size must be a built-in integer")
-    if gram_size not in {1, 2, 3}:
-        raise ValueError("gram_size must be 1, 2, or 3")
-    seen: set[str] = set()
-    grams: list[str] = []
-    for offset in range(max(0, len(folded_text) - gram_size + 1)):
-        gram = folded_text[offset : offset + gram_size]
-        if gram not in seen:
-            seen.add(gram)
-            grams.append(gram)
-    return tuple(grams)
-
-
-def character_ngram_frequencies(
-    folded_text: str,
-    gram_size: int,
-) -> tuple[tuple[str, int], ...]:
-    """Return exact multiset frequencies in first-occurrence gram order."""
-
-    if type(folded_text) is not str:
-        raise TypeError("folded_text must be a built-in string")
-    if type(gram_size) is not int:
-        raise TypeError("gram_size must be a built-in integer")
-    if gram_size not in {1, 2, 3}:
-        raise ValueError("gram_size must be 1, 2, or 3")
-    frequencies: dict[str, int] = {}
-    for offset in range(max(0, len(folded_text) - gram_size + 1)):
-        gram = folded_text[offset : offset + gram_size]
-        frequencies[gram] = frequencies.get(gram, 0) + 1
-    return tuple(frequencies.items())
-
-
-def build_candidate_write_plan(
-    records: tuple[SQLiteCandidateRecord, ...],
-    *,
-    fts5_available: bool,
-) -> SQLiteCandidateWritePlan:
-    """Build the store-owned mandatory candidate plan for one generation."""
-
-    if type(records) is not tuple:
-        raise TypeError("records must be a built-in tuple")
-    if type(fts5_available) is not bool:
-        raise TypeError("fts5_available must be a built-in bool")
-    prepared: list[tuple[int, str]] = []
-    for record in records:
-        if type(record) is not SQLiteCandidateRecord:
-            raise TypeError("records must contain exact SQLiteCandidateRecord values")
-        if type(record.origin_ordinal) is not int or record.origin_ordinal < 0:
-            raise ValueError("origin_ordinal must be a non-negative integer")
-        if type(record.source_fold_v1) is not str or not record.source_fold_v1:
-            raise ValueError("source_fold_v1 must be a non-empty built-in string")
-        prepared.append((record.origin_ordinal, record.source_fold_v1))
-    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    return SQLiteCandidateWritePlan(
-        gram_rows=tuple(
-            SQLiteGramRow(origin_ordinal, gram_size, gram, term_frequency)
-            for origin_ordinal, folded_source in prepared
-            for gram_size in gram_sizes
-            for gram, term_frequency in character_ngram_frequencies(
-                folded_source,
-                gram_size,
-            )
-        ),
-        fts_origin_ordinals=(
-            tuple(origin_ordinal for origin_ordinal, _source in prepared)
-            if fts5_available
-            else ()
-        ),
-    )
-
-
-def _build_fts5_match_expression(trigrams: tuple[str, ...]) -> str:
-    return " OR ".join(
-        f'"{trigram.replace(chr(34), chr(34) * 2)}"'
-        for trigram in trigrams
-    )
-
-
-def _chunked(values: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
-    for offset in range(0, len(values), _CANDIDATE_QUERY_CHUNK_SIZE):
-        yield values[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateRecallSnapshot:
-    """Private-value snapshot returned by the leased candidate read seam."""
-
-    fts5_available: bool
-    stage_matches: tuple[tuple[str, tuple[tuple[int, int], ...]], ...]
-    folded_sources: tuple[tuple[int, str], ...]
-
-    def __post_init__(self) -> None:
-        if type(self.fts5_available) is not bool:
-            raise TypeError("fts5_available must be a built-in bool")
-        if type(self.stage_matches) is not tuple:
-            raise TypeError("stage_matches must be a built-in tuple")
-        stage_names: list[str] = []
-        for stage_entry in self.stage_matches:
-            if type(stage_entry) is not tuple or len(stage_entry) != 2:
-                raise TypeError("stage_matches must contain built-in pairs")
-            stage_name, matches = stage_entry
-            if type(stage_name) is not str or type(matches) is not tuple:
-                raise TypeError("candidate stage snapshot values are invalid")
-            if stage_name not in {"FTS_TRIGRAM", "GRAM_3", "GRAM_2", "GRAM_1"}:
-                raise ValueError("candidate stage snapshot name is invalid")
-            stage_names.append(stage_name)
-            record_ids: list[int] = []
-            for match in matches:
-                if type(match) is not tuple or len(match) != 2:
-                    raise TypeError("candidate stage matches must be pairs")
-                record_id, matched_count = match
-                if (
-                    type(record_id) is not int
-                    or record_id < 1
-                    or type(matched_count) is not int
-                    or matched_count < 0
-                ):
-                    raise ValueError("candidate stage match is invalid")
-                if matched_count < 1:
-                    raise ValueError("candidate stage overlap is invalid")
-                record_ids.append(record_id)
-            if len(set(record_ids)) != len(record_ids):
-                raise ValueError("candidate stage matches must be unique")
-        if len(set(stage_names)) != len(stage_names):
-            raise ValueError("candidate stage snapshot names must be unique")
-        if type(self.folded_sources) is not tuple:
-            raise TypeError("folded_sources must be a built-in tuple")
-        source_ids: list[int] = []
-        for source_entry in self.folded_sources:
-            if type(source_entry) is not tuple or len(source_entry) != 2:
-                raise TypeError("folded_sources must contain built-in pairs")
-            record_id, folded_source = source_entry
-            if (
-                type(record_id) is not int
-                or record_id < 1
-                or type(folded_source) is not str
-                or not folded_source
-            ):
-                raise ValueError("candidate folded source is invalid")
-            source_ids.append(record_id)
-        if len(set(source_ids)) != len(source_ids):
-            raise ValueError("candidate folded sources must be unique")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofBlock:
-    """One verified block bound input without any record source text."""
-
-    block_id: int
-    first_record_id: int
-    last_record_id: int
-    record_count: int
-    min_source_fold_length: int
-    max_source_fold_length: int
-    character_intersection_upper: int
-    bigram_intersection_upper: int
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofRecord:
-    """Exact record-bound facts derived from relevant proof rows only."""
-
-    record_id: int
-    block_id: int
-    source_fold_length: int
-    character_multiset_intersection: int
-    bigram_multiset_intersection: int
-
-
-_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY = object()
-
-
-class _SQLiteCandidateProofDenseReceipt:
-    """Opaque store-issued identity binding for one dense projection."""
-
-    __slots__ = (
-        "phase",
-        "binding_digest",
-        "item_count",
-        "record_ids",
-        "source_folds_v1",
-        "source_fold_lengths",
-        "bigram_multiset_intersections",
-        "_sealed",
-    )
-
-    phase: str
-    binding_digest: str
-    item_count: int
-    record_ids: tuple[int, ...] | None
-    source_folds_v1: tuple[str, ...] | None
-    source_fold_lengths: tuple[int, ...]
-    bigram_multiset_intersections: tuple[int, ...] | None
-    _sealed: bool
-
-    def __init__(
-        self,
-        *,
-        phase: str,
-        binding_digest: str,
-        item_count: int,
-        record_ids: tuple[int, ...] | None,
-        source_folds_v1: tuple[str, ...] | None,
-        source_fold_lengths: tuple[int, ...],
-        bigram_multiset_intersections: tuple[int, ...] | None,
-        _factory_key: object,
-    ) -> None:
-        if _factory_key is not _CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY:
-            raise TypeError("dense proof receipts are store-owned")
-        self._sealed = False
-        self.phase = phase
-        self.binding_digest = binding_digest
-        self.item_count = item_count
-        self.record_ids = record_ids
-        self.source_folds_v1 = source_folds_v1
-        self.source_fold_lengths = source_fold_lengths
-        self.bigram_multiset_intersections = bigram_multiset_intersections
-        self._sealed = True
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_sealed", False):
-            raise AttributeError("dense proof receipts are immutable")
-        object.__setattr__(self, name, value)
-
-    def __copy__(self) -> _SQLiteCandidateProofDenseReceipt:
-        return self
-
-    def __deepcopy__(
-        self,
-        memo: dict[int, object],
-    ) -> _SQLiteCandidateProofDenseReceipt:
-        memo[id(self)] = self
-        return self
-
-    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
-        del protocol
-        raise TypeError("dense proof receipts cannot be serialized")
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofDensePhase1:
-    """Length and exact-bigram facts from the committed dense phase one."""
-
-    source_fold_lengths: tuple[int, ...]
-    bigram_multiset_intersections: tuple[int, ...]
-    binding_digest: str
-    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofDensePhase2:
-    """Strict proof-only folded-source projection from committed phase two."""
-
-    record_ids: tuple[int, ...]
-    source_folds_v1: tuple[str, ...]
-    source_fold_lengths: tuple[int, ...]
-    binding_digest: str
-    _receipt: _SQLiteCandidateProofDenseReceipt = field(repr=False)
-
-
-@dataclass(frozen=True)
-class SQLiteCandidateProofSnapshot:
-    """Seed and block frontiers for one query generation, without record facts."""
-
-    index_kind: str
-    seed_stages: tuple[tuple[str, tuple[int, ...]], ...]
-    blocks: tuple[SQLiteCandidateProofBlock, ...]
-    total_record_count: int
-    head_revision: int
-    query_maxima_digest: str
 
 
 type _PreparedRecordDraft = tuple[
@@ -3894,6 +3535,29 @@ class ResourceStoreCoordinator:
             self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
 
+    def reattest_completed_authority(self) -> ActivationRecoveryReport:
+        """Repair only a fully proven cross-restart ``st_dev`` drift.
+
+        The ordinary open path remains strict.  Callers must explicitly
+        request this maintenance transition; Core then re-proves and
+        atomically re-attests the exact same completed generation.
+        """
+
+        with self._condition:
+            report = reattest_completed_authority(
+                _CoordinatorStorePort(self)
+            )
+            self._clear_initial_activation_fail_stop_after_recovery(report)
+            return report
+
+    def completed_authority_requires_reattestation(self) -> bool:
+        """Classify the exact repairable ``st_dev`` drift without granting it."""
+
+        with self._condition:
+            return completed_authority_requires_reattestation(
+                _CoordinatorStorePort(self)
+            )
+
     def rehydrate_runtime_authority(
         self,
     ) -> ActivationRecoveryReport | None:
@@ -5580,6 +5244,16 @@ class SQLiteTMStore:
     @property
     def coordinator(self) -> ResourceStoreCoordinator:
         return self._coordinator
+
+    @property
+    def resource_id(self) -> str:
+        """Expose only the immutable resource identity required by recall ports."""
+
+        return self._coordinator.resource_id
+
+    @property
+    def candidate_port_scope(self) -> str:
+        return "STORE"
 
     @property
     def source_binding_monitor(self) -> SourceBindingMonitor:
@@ -7716,6 +7390,10 @@ class SQLiteTMStore:
                     validated_candidate_plan,
                     batch_id=prepared_batch_id,
                 )
+                _validate_candidate_index_before_publication(
+                    connection,
+                    fts5_available=lease.fts5_available,
+                )
                 completed_batch = connection.execute(
                     "UPDATE tm_origin_batch "
                     "SET status = 'completed', completed_revision = ? "
@@ -7845,6 +7523,16 @@ class SQLiteTMStore:
                                 ),
                             )
                         if is_last:
+                            if _defer_secondary_indexes:
+                                _restore_streamed_stage_secondary_indexes(
+                                    connection,
+                                    lease,
+                                    before_publication=True,
+                                )
+                            _validate_candidate_index_before_publication(
+                                connection,
+                                fts5_available=lease.fts5_available,
+                            )
                             _complete_streamed_batch(
                                 connection,
                                 batch_id=batch_id,
@@ -7862,11 +7550,6 @@ class SQLiteTMStore:
                     chunk_index += 1
                     if is_last:
                         break
-                if _defer_secondary_indexes:
-                    _restore_streamed_stage_secondary_indexes(
-                        connection,
-                        lease,
-                    )
 
     def records_by_id(
         self,
@@ -7891,25 +7574,10 @@ class SQLiteTMStore:
                 self._validate_identity(connection, lease)
                 if not _meta_bool(_read_meta(connection), "fts5_available"):
                     return None
-                rows = connection.execute(
-                    "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
-                    (match_expression,),
-                ).fetchall()
-        record_ids: set[int] = set()
-        for row in rows:
-            if type(row) is not tuple or len(row) != 1:
-                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-            value = row[0]
-            if type(value) is int:
-                record_id = value
-            elif type(value) is str and value.isdecimal():
-                record_id = int(value)
-            else:
-                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-            if record_id < 1:
-                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-            record_ids.add(record_id)
-        return tuple(sorted(record_ids))
+                return candidate_projection.fts5_candidate_ids(
+                    connection,
+                    match_expression,
+                )
 
     def fts5_candidate_ids_for_trigrams(
         self,
@@ -7930,31 +7598,16 @@ class SQLiteTMStore:
             raise ValueError("trigrams must not be empty")
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
-                record_ids: set[int] = set()
                 try:
                     connection.execute("BEGIN")
                     self._validate_identity(connection, lease)
                     if not lease.fts5_available:
                         connection.rollback()
                         return None
-                    for chunk in _chunked(trigrams):
-                        rows = connection.execute(
-                            "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
-                            (_build_fts5_match_expression(chunk),),
-                        ).fetchall()
-                        for row in rows:
-                            if type(row) is not tuple or len(row) != 1:
-                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-                            value = row[0]
-                            if type(value) is int:
-                                record_id = value
-                            elif type(value) is str and value.isdecimal():
-                                record_id = int(value)
-                            else:
-                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-                            if record_id < 1:
-                                raise SQLiteStoreSchemaError("STORE.FTS5_RESULT_INVALID")
-                            record_ids.add(record_id)
+                    record_ids = candidate_projection.fts5_candidate_ids_for_trigrams(
+                        connection,
+                        trigrams,
+                    )
                     connection.commit()
                 except sqlite3.Error as error:
                     connection.rollback()
@@ -7962,7 +7615,7 @@ class SQLiteTMStore:
                 except BaseException:
                     connection.rollback()
                     raise
-        return tuple(sorted(record_ids))
+        return record_ids
 
     def gram_candidate_overlaps(
         self,
@@ -7993,40 +7646,16 @@ class SQLiteTMStore:
         if not 1 <= candidate_cap <= 8192:
             raise ValueError("candidate_cap is outside the safe range")
 
-        matched_by_id: dict[int, int] = {}
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
                 try:
                     connection.execute("BEGIN")
                     self._validate_identity(connection, lease)
-                    for offset in range(0, len(prepared), _CANDIDATE_QUERY_CHUNK_SIZE):
-                        chunk = prepared[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-                        values_sql = ",".join("(?, ?)" for _ in chunk)
-                        parameters: list[int | str] = []
-                        for gram_size, gram in chunk:
-                            parameters.extend((gram_size, gram))
-                        rows = connection.execute(
-                            "WITH query_grams(gram_size, gram) AS (VALUES "
-                            f"{values_sql}) "
-                            "SELECT postings.record_id, COUNT(*) AS matched_count "
-                            "FROM tm_gram AS postings "
-                            "JOIN query_grams AS query "
-                            "ON query.gram_size = postings.gram_size "
-                            "AND query.gram = postings.gram "
-                            "GROUP BY postings.record_id",
-                            tuple(parameters),
-                        ).fetchall()
-                        for row in rows:
-                            if (
-                                type(row) is not tuple
-                                or len(row) != 2
-                                or type(row[0]) is not int
-                                or row[0] < 1
-                                or type(row[1]) is not int
-                                or not 1 <= row[1] <= len(chunk)
-                            ):
-                                raise SQLiteStoreSchemaError("STORE.GRAM_RESULT_INVALID")
-                            matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
+                    overlaps = candidate_projection.gram_candidate_overlaps(
+                        connection,
+                        tuple(prepared),
+                        candidate_cap=candidate_cap,
+                    )
                     connection.commit()
                 except sqlite3.Error as error:
                     connection.rollback()
@@ -8036,11 +7665,7 @@ class SQLiteTMStore:
                 except BaseException:
                     connection.rollback()
                     raise
-        return tuple(
-            sorted(matched_by_id.items(), key=lambda item: (-item[1], item[0]))[
-                :candidate_cap
-            ]
-        )
+        return overlaps
 
     def candidate_recall_snapshot(
         self,
@@ -8199,8 +7824,6 @@ def _candidate_recall_snapshot_body(
     lease: _SQLiteGenerationView,
     prepared: _PreparedCandidateRecallInputs,
 ) -> SQLiteCandidateRecallSnapshot:
-    stage_matches: list[tuple[str, tuple[tuple[int, int], ...]]] = []
-    cumulative_ids: set[int] = set()
     with _open_leased_connection(lease) as connection:
         try:
             connection.execute("BEGIN")
@@ -8212,136 +7835,49 @@ def _candidate_recall_snapshot_body(
                 raise SQLiteStoreSchemaError(
                     "STORE.CANDIDATE_CAPABILITY_MISMATCH"
                 )
-            fts5_available = lease.fts5_available
-
-            fts_ids: set[int] = set()
-            if prepared.fts_query_trigrams is not None and fts5_available:
-                for chunk in _chunked(prepared.fts_query_trigrams):
-                    fts_rows = connection.execute(
-                        "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ?",
-                        (_build_fts5_match_expression(chunk),),
-                    ).fetchall()
-                    for row in fts_rows:
-                        if type(row) is not tuple or len(row) != 1:
-                            raise SQLiteStoreSchemaError(
-                                "STORE.CANDIDATE_RESULT_INVALID"
-                            )
-                        value = row[0]
-                        if type(value) is int:
-                            record_id = value
-                        elif type(value) is str and value.isdecimal():
-                            record_id = int(value)
-                        else:
-                            raise SQLiteStoreSchemaError(
-                                "STORE.CANDIDATE_RESULT_INVALID"
-                            )
-                        if record_id < 1:
-                            raise SQLiteStoreSchemaError(
-                                "STORE.CANDIDATE_RESULT_INVALID"
-                            )
-                        fts_ids.add(record_id)
-                        cumulative_ids.add(record_id)
-
-            if prepared.fts_query_trigrams is None:
-                selected_stages = prepared.query_grams_by_size
-            elif not fts5_available:
-                selected_stages = prepared.query_grams_by_size
-            elif (
-                not cumulative_ids
-                or prepared.fts_query_degenerate
-                or len(cumulative_ids) < prepared.candidate_floor
-            ):
-                selected_stages = [
-                    stage for stage in prepared.query_grams_by_size if stage[0] in {1, 2}
-                ]
-            else:
-                selected_stages = []
-
-            for gram_size, grams in selected_stages:
-                if (
-                    prepared.fts_query_trigrams is not None
-                    and fts5_available
-                    and gram_size == 1
-                    and len(cumulative_ids) >= prepared.candidate_floor
-                ):
-                    continue
-                matched_by_id: dict[int, int] = {}
-                for chunk in _chunked(grams):
-                    placeholders = ",".join("?" for _ in chunk)
-                    rows = connection.execute(
-                        "SELECT record_id, COUNT(*) AS matched_count "
-                        "FROM tm_gram WHERE gram_size = ? "
-                        f"AND gram IN ({placeholders}) "
-                        "GROUP BY record_id",
-                        (gram_size, *chunk),
-                    ).fetchall()
-                    for row in rows:
-                        if (
-                            type(row) is not tuple
-                            or len(row) != 2
-                            or type(row[0]) is not int
-                            or row[0] < 1
-                            or type(row[1]) is not int
-                            or not 1 <= row[1] <= len(chunk)
-                        ):
-                            raise SQLiteStoreSchemaError(
-                                "STORE.CANDIDATE_RESULT_INVALID"
-                            )
-                        matched_by_id[row[0]] = matched_by_id.get(row[0], 0) + row[1]
-                        cumulative_ids.add(row[0])
-                stage_matches.append(
-                    (f"GRAM_{gram_size}", tuple(matched_by_id.items()))
-                )
-
-            folded_sources: list[tuple[int, str]] = []
-            candidate_ids = tuple(cumulative_ids)
-            for offset in range(0, len(candidate_ids), 512):
-                chunk = candidate_ids[offset : offset + 512]
-                placeholders = ",".join("?" for _ in chunk)
-                rows = connection.execute(
-                    "SELECT record_id, source_fold_v1 FROM tm_record "
-                    f"WHERE record_id IN ({placeholders})",
-                    chunk,
-                ).fetchall()
-                for row in rows:
-                    if (
-                        type(row) is not tuple
-                        or len(row) != 2
-                        or type(row[0]) is not int
-                        or row[0] < 1
-                        or type(row[1]) is not str
-                        or not row[1]
-                    ):
-                        raise SQLiteStoreSchemaError(
-                            "STORE.CANDIDATE_RESULT_INVALID"
-                        )
-                    folded_sources.append((row[0], row[1]))
-            if {record_id for record_id, _source in folded_sources} != cumulative_ids:
+            projected_rows = candidate_projection.candidate_recall_snapshot(
+                connection,
+                fts5_available=lease.fts5_available,
+                fts_query_trigrams=prepared.fts_query_trigrams,
+                query_grams_by_size=prepared.query_grams_by_size,
+                candidate_floor=prepared.candidate_floor,
+                fts_query_degenerate=prepared.fts_query_degenerate,
+            )
+            if type(projected_rows) is not tuple or len(projected_rows) != 2:
                 raise SQLiteStoreSchemaError(
-                    "STORE.CANDIDATE_SOURCE_MISSING"
+                    "STORE.CANDIDATE_RESULT_INVALID"
                 )
-            if prepared.fts_query_trigrams is not None and fts5_available:
-                sources_by_id = dict(folded_sources)
-                query_gram_set = set(prepared.fts_query_trigrams)
-                fts_matches = tuple(
-                    (
-                        record_id,
-                        len(
-                            query_gram_set.intersection(
-                                unique_character_ngrams(
-                                    sources_by_id[record_id], 3
-                                )
-                            )
-                        ),
-                    )
-                    for record_id in sorted(fts_ids)
+            try:
+                snapshot = SQLiteCandidateRecallSnapshot(
+                    fts5_available=lease.fts5_available,
+                    stage_matches=projected_rows[0],
+                    folded_sources=projected_rows[1],
                 )
-                if any(count < 1 for _record_id, count in fts_matches):
-                    raise SQLiteStoreSchemaError(
-                        "STORE.CANDIDATE_RESULT_INVALID"
-                    )
-                stage_matches.insert(0, ("FTS_TRIGRAM", fts_matches))
+            except (TypeError, ValueError) as error:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_RESULT_INVALID"
+                ) from error
+            if not lease.fts5_available and any(
+                stage_name == "FTS_TRIGRAM"
+                for stage_name, _matches in snapshot.stage_matches
+            ):
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_CAPABILITY_MISMATCH"
+                )
+            matched_ids = {
+                record_id
+                for _stage_name, matches in snapshot.stage_matches
+                for record_id, _overlap in matches
+            }
+            if matched_ids != {
+                record_id
+                for record_id, _folded_source in snapshot.folded_sources
+            }:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_RESULT_INVALID"
+                )
             connection.commit()
+            return snapshot
         except sqlite3.Error as error:
             connection.rollback()
             raise SQLiteStoreSchemaError(
@@ -8350,23 +7886,6 @@ def _candidate_recall_snapshot_body(
         except Exception:
             connection.rollback()
             raise
-    return SQLiteCandidateRecallSnapshot(
-        fts5_available=fts5_available,
-        stage_matches=tuple(stage_matches),
-        folded_sources=tuple(folded_sources),
-    )
-
-
-def _proof_int(value: object, code: str) -> int:
-    if type(value) is not int or value < 0:
-        raise SQLiteStoreSchemaError(code)
-    return value
-
-
-def _proof_text(value: object, code: str) -> str:
-    if type(value) is not str or not value:
-        raise SQLiteStoreSchemaError(code)
-    return value
 
 
 def _bounded_seed_stages(
@@ -8376,82 +7895,14 @@ def _bounded_seed_stages(
     fts5_available: bool,
     seed_limit: int,
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    """Execute one real bounded seed on the generation's selected index."""
+    """Late-bound compatibility wrapper for the unique projection owner."""
 
-    if len(folded_query) >= 3 and fts5_available:
-        trigrams = unique_character_ngrams(folded_query, 3)
-        if not trigrams:
-            return (("FTS_TRIGRAM", ()),)
-        ids: list[int] = []
-        seen: set[int] = set()
-        for chunk in _chunked(trigrams):
-            rows = connection.execute(
-                "SELECT record_id FROM tm_fts WHERE tm_fts MATCH ? "
-                "ORDER BY rowid DESC LIMIT ?",
-                (_build_fts5_match_expression(chunk), seed_limit),
-            ).fetchall()
-            for row in rows:
-                if type(row) is not tuple or len(row) != 1:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_SEED_INVALID")
-                raw_id = row[0]
-                if type(raw_id) is int:
-                    record_id = raw_id
-                elif type(raw_id) is str and raw_id.isdecimal():
-                    record_id = int(raw_id)
-                else:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_SEED_INVALID")
-                if record_id < 1:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_SEED_INVALID")
-                if record_id not in seen and len(ids) < seed_limit:
-                    seen.add(record_id)
-                    ids.append(record_id)
-        return (("FTS_TRIGRAM", tuple(ids)),)
-
-    if not folded_query:
-        return (("GRAM_1", ()),)
-    if len(folded_query) == 1:
-        sizes = (1,)
-    elif len(folded_query) == 2:
-        sizes = (2,)
-    else:
-        sizes = (3, 2, 1)
-    stages: list[tuple[str, tuple[int, ...]]] = []
-    for size in sizes:
-        grams = unique_character_ngrams(folded_query, size)
-        posting_budget = _CANDIDATE_SEED_POSTING_CAP
-        per_gram, remainder = divmod(posting_budget, len(grams))
-        matched: dict[int, int] = {}
-        for gram_ordinal, gram in enumerate(grams):
-            gram_limit = per_gram + (1 if gram_ordinal < remainder else 0)
-            rows = connection.execute(
-                "SELECT record_id FROM tm_gram "
-                "WHERE gram_size = ? AND gram = ? "
-                "ORDER BY record_id DESC LIMIT ?",
-                (size, gram, gram_limit),
-            ).fetchall()
-            previous_record_id: int | None = None
-            for row in rows:
-                if (
-                    type(row) is not tuple
-                    or len(row) != 1
-                    or type(row[0]) is not int
-                    or row[0] < 1
-                    or (
-                        previous_record_id is not None
-                        and row[0] >= previous_record_id
-                    )
-                ):
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_SEED_INVALID")
-                previous_record_id = row[0]
-                matched[row[0]] = matched.get(row[0], 0) + 1
-        ordered = tuple(
-            record_id
-            for record_id, _count in sorted(
-                matched.items(), key=lambda item: (-item[1], -item[0])
-            )[:seed_limit]
-        )
-        stages.append((f"GRAM_{size}", ordered))
-    return tuple(stages)
+    return candidate_projection.bounded_seed_stages(
+        connection,
+        folded_query=folded_query,
+        fts5_available=fts5_available,
+        seed_limit=seed_limit,
+    )
 
 
 def _candidate_proof_snapshot_body(
@@ -8463,16 +7914,6 @@ def _candidate_proof_snapshot_body(
 ) -> SQLiteCandidateProofSnapshot:
     """Read one real seed plus block frontiers without record-level facts."""
 
-    query_characters = Counter(folded_query)
-    query_bigrams = Counter(
-        folded_query[offset : offset + 2]
-        for offset in range(max(0, len(folded_query) - 1))
-    )
-    query_terms = tuple(
-        (size, gram, frequency)
-        for size, frequencies in ((1, query_characters), (2, query_bigrams))
-        for gram, frequency in frequencies.items()
-    )
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
@@ -8484,147 +7925,96 @@ def _candidate_proof_snapshot_body(
                 raise SQLiteStoreSchemaError(
                     "STORE.CANDIDATE_CAPABILITY_MISMATCH"
                 )
-            index_kind = (
-                "FTS5_TRIGRAM"
-                if fts5_available and len(folded_query) >= 3
-                else "GRAM_FALLBACK"
-            )
-            seed_stages = _bounded_seed_stages(
+            total_record_count = _table_count(connection, "tm_record")
+            projected_rows = candidate_projection.candidate_proof_snapshot(
                 connection,
                 folded_query=folded_query,
-                fts5_available=fts5_available,
                 seed_limit=seed_limit,
+                fts5_available=fts5_available,
+                total_record_count=total_record_count,
             )
-
-            block_uppers = _candidate_proof_query_block_uppers(
-                connection,
-                query_terms=query_terms,
-            )
-            block_rows = connection.execute(
-                "SELECT block_id, first_record_id, last_record_id, record_count, "
-                "min_source_fold_length, max_source_fold_length "
-                "FROM tm_candidate_block ORDER BY block_id"
-            ).fetchall()
-            total_record_count = _table_count(connection, "tm_record")
-            expected_block_count = (
-                total_record_count + CANDIDATE_PROOF_BLOCK_SIZE - 1
-            ) // CANDIDATE_PROOF_BLOCK_SIZE
-            blocks: list[SQLiteCandidateProofBlock] = []
-            covered_records = 0
-            for expected_block_id, row in enumerate(block_rows):
-                if type(row) is not tuple or len(row) != 6:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                values = tuple(
-                    _proof_int(value, "STORE.CANDIDATE_PROOF_INVALID")
-                    for value in row
+            if (
+                type(projected_rows) is not tuple
+                or len(projected_rows) != 3
+                or type(projected_rows[0]) is not tuple
+                or type(projected_rows[1]) is not tuple
+                or any(
+                    type(block) is not SQLiteCandidateProofBlock
+                    for block in projected_rows[1]
                 )
-                block_id, first_id, last_id, count, minimum, maximum = values
-                expected_first = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
-                expected_count = min(
-                    CANDIDATE_PROOF_BLOCK_SIZE,
-                    total_record_count - expected_first + 1,
+                or type(projected_rows[2]) is not str
+                or len(projected_rows[2]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in projected_rows[2]
                 )
-                if (
-                    block_id != expected_block_id
-                    or expected_count < 1
-                    or first_id != expected_first
-                    or last_id != expected_first + CANDIDATE_PROOF_BLOCK_SIZE - 1
-                    or count != expected_count
-                    or minimum < 1
-                    or maximum < minimum
-                ):
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                character_upper = block_uppers.get((block_id, 1), 0)
-                bigram_upper = block_uppers.get((block_id, 2), 0)
-                blocks.append(
-                    SQLiteCandidateProofBlock(
-                        block_id=block_id,
-                        first_record_id=first_id,
-                        last_record_id=last_id,
-                        record_count=count,
-                        min_source_fold_length=minimum,
-                        max_source_fold_length=maximum,
-                        character_intersection_upper=character_upper,
-                        bigram_intersection_upper=bigram_upper,
+            ):
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                )
+            expected_seed_names = (
+                ("FTS_TRIGRAM",)
+                if fts5_available and len(folded_query) >= 3
+                else tuple(
+                    f"GRAM_{size}"
+                    for size in (
+                        (1,)
+                        if len(folded_query) == 1
+                        else (2,)
+                        if len(folded_query) == 2
+                        else (3, 2, 1)
                     )
                 )
-                covered_records += count
-            if (
-                len(blocks) != expected_block_count
-                or covered_records != total_record_count
-                or any(key[0] >= expected_block_count for key in block_uppers)
-            ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+            )
+            seed_names: list[str] = []
+            for stage in projected_rows[0]:
+                if (
+                    type(stage) is not tuple
+                    or len(stage) != 2
+                    or type(stage[0]) is not str
+                    or type(stage[1]) is not tuple
+                    or any(
+                        type(record_id) is not int
+                        or not 1 <= record_id <= total_record_count
+                        for record_id in stage[1]
+                    )
+                    or len(set(stage[1])) != len(stage[1])
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.CANDIDATE_PROOF_INVALID"
+                    )
+                seed_names.append(stage[0])
+            if tuple(seed_names) != expected_seed_names:
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                )
+            candidate_projection.validate_candidate_proof_blocks(
+                connection,
+                blocks=projected_rows[1],
+                query_maxima_digest=projected_rows[2],
+            )
+            snapshot = SQLiteCandidateProofSnapshot(
+                index_kind=(
+                    "FTS5_TRIGRAM"
+                    if fts5_available and len(folded_query) >= 3
+                    else "GRAM_FALLBACK"
+                ),
+                seed_stages=projected_rows[0],
+                blocks=projected_rows[1],
+                total_record_count=total_record_count,
+                head_revision=head_revision,
+                query_maxima_digest=projected_rows[2],
+            )
             connection.commit()
+            return snapshot
         except sqlite3.Error as error:
             connection.rollback()
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_QUERY_FAILED") from error
+            raise SQLiteStoreSchemaError(
+                "STORE.CANDIDATE_PROOF_QUERY_FAILED"
+            ) from error
         except Exception:
             connection.rollback()
             raise
-    return SQLiteCandidateProofSnapshot(
-        index_kind=index_kind,
-        seed_stages=seed_stages,
-        blocks=tuple(blocks),
-        total_record_count=total_record_count,
-        head_revision=head_revision,
-        query_maxima_digest=_candidate_proof_query_maxima_digest(tuple(blocks)),
-    )
-
-
-def _candidate_proof_query_maxima_digest(
-    blocks: tuple[SQLiteCandidateProofBlock, ...],
-) -> str:
-    payload = json.dumps(
-        tuple(
-            (
-                block.block_id,
-                block.character_intersection_upper,
-                block.bigram_intersection_upper,
-            )
-            for block in blocks
-        ),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _candidate_proof_query_block_uppers(
-    connection: sqlite3.Connection,
-    *,
-    query_terms: tuple[tuple[int, str, int], ...],
-) -> dict[tuple[int, int], int]:
-    """Aggregate only the conservative per-block maxima used by traversal."""
-
-    block_uppers: dict[tuple[int, int], int] = {}
-    for offset in range(0, len(query_terms), _CANDIDATE_QUERY_CHUNK_SIZE):
-        chunk = query_terms[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-        values_sql = ",".join("(?, ?, ?)" for _ in chunk)
-        rows = connection.execute(
-            "WITH query_terms(gram_size, gram, query_frequency) "
-            f"AS (VALUES {values_sql}) "
-            "SELECT facts.block_id, facts.gram_size, SUM(CASE "
-            "WHEN facts.max_term_frequency < query_terms.query_frequency "
-            "THEN facts.max_term_frequency ELSE query_terms.query_frequency END) "
-            "FROM query_terms CROSS JOIN tm_gram_block_max AS facts "
-            "ON facts.gram_size = query_terms.gram_size "
-            "AND facts.gram = query_terms.gram "
-            "GROUP BY facts.block_id, facts.gram_size",
-            tuple(value for term in chunk for value in term),
-        ).fetchall()
-        for row in rows:
-            if type(row) is not tuple or len(row) != 3:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            key = (
-                _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID"),
-                _proof_int(row[1], "STORE.CANDIDATE_PROOF_INVALID"),
-            )
-            upper = _proof_int(row[2], "STORE.CANDIDATE_PROOF_INVALID")
-            if key[1] not in {1, 2} or upper < 1:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            block_uppers[key] = block_uppers.get(key, 0) + upper
-    return block_uppers
 
 
 def _candidate_proof_block_records_body(
@@ -8636,19 +8026,8 @@ def _candidate_proof_block_records_body(
     total_record_count: int,
     connection: sqlite3.Connection | None = None,
 ) -> tuple[SQLiteCandidateProofRecord, ...]:
-    """Read and close exact proof facts for exactly one opened 256-slot block."""
+    """Read and close exact proof facts for exactly one opened block."""
 
-    query_characters = Counter(folded_query)
-    query_bigrams = Counter(
-        folded_query[offset : offset + 2]
-        for offset in range(max(0, len(folded_query) - 1))
-    )
-    query_terms = tuple(
-        (size, gram, frequency)
-        for size, frequencies in ((1, query_characters), (2, query_bigrams))
-        for gram, frequency in frequencies.items()
-    )
-    final_record_id = min(block.last_record_id, total_record_count)
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
@@ -8659,134 +8038,19 @@ def _candidate_proof_block_records_body(
                 or _table_count(connection, "tm_record") != total_record_count
             ):
                 raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_STALE")
-            row = connection.execute(
-                "SELECT block_id, first_record_id, last_record_id, record_count, "
-                "min_source_fold_length, max_source_fold_length "
-                "FROM tm_candidate_block WHERE block_id = ?",
-                (block.block_id,),
-            ).fetchone()
-            expected_block = (
-                block.block_id,
-                block.first_record_id,
-                block.last_record_id,
-                block.record_count,
-                block.min_source_fold_length,
-                block.max_source_fold_length,
-            )
-            if row != expected_block:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            record_rows = connection.execute(
-                "SELECT record_id, source_fold_length FROM tm_record "
-                "WHERE record_id BETWEEN ? AND ? ORDER BY record_id",
-                (block.first_record_id, final_record_id),
-            ).fetchall()
-            lengths: dict[int, int] = {}
-            for offset, row in enumerate(record_rows):
-                if type(row) is not tuple or len(row) != 2:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                record_id = _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID")
-                length = _proof_int(row[1], "STORE.CANDIDATE_PROOF_INVALID")
-                if record_id != block.first_record_id + offset or length < 1:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                lengths[record_id] = length
-            if (
-                len(lengths) != block.record_count
-                or not lengths
-                or min(lengths.values()) != block.min_source_fold_length
-                or max(lengths.values()) != block.max_source_fold_length
-            ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-
-            intersections = {record_id: [0, 0] for record_id in lengths}
-            exact_maxima: dict[tuple[int, str], int] = {}
-            persisted_maxima: dict[tuple[int, str], int] = {}
-            for offset in range(0, len(query_terms), _CANDIDATE_QUERY_CHUNK_SIZE):
-                chunk = query_terms[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-                if not chunk:
-                    continue
-                values_sql = ",".join("(?, ?, ?)" for _ in chunk)
-                parameters: list[int | str] = []
-                for size, gram, frequency in chunk:
-                    parameters.extend((size, gram, frequency))
-                rows = connection.execute(
-                    "WITH query_terms(gram_size, gram, query_frequency) "
-                    f"AS (VALUES {values_sql}) "
-                    "SELECT facts.record_id, facts.gram_size, facts.gram, "
-                    "facts.term_frequency, query_terms.query_frequency "
-                    "FROM tm_gram AS facts JOIN query_terms "
-                    "ON query_terms.gram_size = facts.gram_size "
-                    "AND query_terms.gram = facts.gram "
-                    "WHERE facts.record_id BETWEEN ? AND ? "
-                    "ORDER BY facts.record_id, facts.gram_size, facts.gram",
-                    (*parameters, block.first_record_id, final_record_id),
-                ).fetchall()
-                for row in rows:
-                    if type(row) is not tuple or len(row) != 5:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    record_id = _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID")
-                    size = _proof_int(row[1], "STORE.CANDIDATE_PROOF_INVALID")
-                    gram = _proof_text(row[2], "STORE.CANDIDATE_PROOF_INVALID")
-                    frequency = _proof_int(row[3], "STORE.CANDIDATE_PROOF_INVALID")
-                    query_frequency = _proof_int(row[4], "STORE.CANDIDATE_PROOF_INVALID")
-                    if record_id not in lengths or size not in {1, 2} or frequency < 1:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    intersections[record_id][size - 1] += min(
-                        frequency, query_frequency
-                    )
-                    exact_maxima[(size, gram)] = max(
-                        exact_maxima.get((size, gram), 0), frequency
-                    )
-                maxima_rows = connection.execute(
-                    "WITH query_terms(gram_size, gram, query_frequency) "
-                    f"AS (VALUES {values_sql}) "
-                    "SELECT facts.gram_size, facts.gram, facts.max_term_frequency "
-                    "FROM tm_gram_block_max AS facts JOIN query_terms "
-                    "ON query_terms.gram_size = facts.gram_size "
-                    "AND query_terms.gram = facts.gram "
-                    "WHERE facts.block_id = ? ORDER BY facts.gram_size, facts.gram",
-                    (*parameters, block.block_id),
-                ).fetchall()
-                for row in maxima_rows:
-                    if type(row) is not tuple or len(row) != 3:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    key = (
-                        _proof_int(row[0], "STORE.CANDIDATE_PROOF_INVALID"),
-                        _proof_text(row[1], "STORE.CANDIDATE_PROOF_INVALID"),
-                    )
-                    frequency = _proof_int(row[2], "STORE.CANDIDATE_PROOF_INVALID")
-                    if key in persisted_maxima or frequency < 1:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    persisted_maxima[key] = frequency
-            if persisted_maxima != exact_maxima:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            character_upper = sum(
-                min(query_frequency, persisted_maxima.get((1, gram), 0))
-                for gram, query_frequency in query_characters.items()
-            )
-            bigram_upper = sum(
-                min(query_frequency, persisted_maxima.get((2, gram), 0))
-                for gram, query_frequency in query_bigrams.items()
-            )
-            if (
-                character_upper != block.character_intersection_upper
-                or bigram_upper != block.bigram_intersection_upper
-            ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            records = tuple(
-                SQLiteCandidateProofRecord(
-                    record_id=record_id,
-                    block_id=block.block_id,
-                    source_fold_length=length,
-                    character_multiset_intersection=intersections[record_id][0],
-                    bigram_multiset_intersection=intersections[record_id][1],
-                )
-                for record_id, length in lengths.items()
+            records = candidate_projection.candidate_proof_block_records(
+                connection,
+                folded_query=folded_query,
+                block=block,
+                total_record_count=total_record_count,
             )
             connection.commit()
             return records
         except sqlite3.Error as error:
             connection.rollback()
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_QUERY_FAILED") from error
+            raise SQLiteStoreSchemaError(
+                "STORE.CANDIDATE_PROOF_QUERY_FAILED"
+            ) from error
         except Exception:
             connection.rollback()
             raise
@@ -8847,20 +8111,11 @@ def _validate_candidate_proof_dense_phase1_result(
         total_record_count=total_record_count,
         query_maxima_digest=query_maxima_digest,
     )
-    receipt = getattr(value, "_receipt", None)
-    if (
-        type(receipt) is not _SQLiteCandidateProofDenseReceipt
-        or receipt.phase != "DENSE_PHASE1_V1"
-        or receipt.binding_digest != expected_binding
-        or receipt.binding_digest != value.binding_digest
-        or receipt.item_count != total_record_count
-        or receipt.record_ids is not None
-        or receipt.source_folds_v1 is not None
-        or receipt.source_fold_lengths is not value.source_fold_lengths
-        or receipt.bigram_multiset_intersections
-        is not value.bigram_multiset_intersections
-    ):
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    candidate_contracts.validate_candidate_proof_dense_phase1_result(
+        value,
+        binding_digest=expected_binding,
+        total_record_count=total_record_count,
+    )
 
 
 def _validate_candidate_proof_dense_phase2_result(
@@ -8872,23 +8127,12 @@ def _validate_candidate_proof_dense_phase2_result(
 ) -> None:
     """Accept only the exact store-issued ordered phase-two projection."""
 
-    if type(value) is not SQLiteCandidateProofDensePhase2:
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-    receipt = getattr(value, "_receipt", None)
-    if (
-        type(receipt) is not _SQLiteCandidateProofDenseReceipt
-        or receipt.phase != "DENSE_PHASE2_V1"
-        or receipt.binding_digest != binding_digest
-        or receipt.binding_digest != value.binding_digest
-        or receipt.item_count != len(record_ids)
-        or receipt.record_ids is not value.record_ids
-        or receipt.source_folds_v1 is not value.source_folds_v1
-        or receipt.source_fold_lengths is not value.source_fold_lengths
-        or receipt.bigram_multiset_intersections is not None
-        or value.record_ids != record_ids
-        or value.source_fold_lengths != source_fold_lengths
-    ):
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+    candidate_contracts.validate_candidate_proof_dense_phase2_result(
+        value,
+        binding_digest=binding_digest,
+        record_ids=record_ids,
+        source_fold_lengths=source_fold_lengths,
+    )
 
 
 def _validate_candidate_proof_dense_binding(
@@ -8908,31 +8152,11 @@ def _validate_candidate_proof_dense_binding(
         or _table_count(connection, "tm_record") != total_record_count
     ):
         raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_STALE")
-    block_rows = connection.execute(
-        "SELECT block_id, first_record_id, last_record_id, record_count, "
-        "min_source_fold_length, max_source_fold_length "
-        "FROM tm_candidate_block ORDER BY block_id"
-    ).fetchall()
-    expected_blocks = tuple(
-        (
-            block.block_id,
-            block.first_record_id,
-            block.last_record_id,
-            block.record_count,
-            block.min_source_fold_length,
-            block.max_source_fold_length,
-        )
-        for block in blocks
+    candidate_projection.validate_candidate_proof_blocks(
+        connection,
+        blocks=blocks,
+        query_maxima_digest=query_maxima_digest,
     )
-    if tuple(block_rows) != expected_blocks:
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-
-    # Dense phase one consumes exact bigram facts rather than the coarse
-    # persisted maxima. Rebind the query-maxima snapshot while resource/store,
-    # generation, head, count and the complete block layout remain unchanged;
-    # SPARSE continues to validate per-term maxima when each block opens.
-    if _candidate_proof_query_maxima_digest(blocks) != query_maxima_digest:
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
     return _candidate_proof_dense_binding_digest(
         lease=lease,
         folded_query=folded_query,
@@ -8955,10 +8179,6 @@ def _candidate_proof_dense_phase1_body(
 ) -> SQLiteCandidateProofDensePhase1:
     """Return all lengths and exact bigram intersections, then commit."""
 
-    query_bigrams = Counter(
-        folded_query[offset : offset + 2]
-        for offset in range(max(0, len(folded_query) - 1))
-    )
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
@@ -8971,129 +8191,46 @@ def _candidate_proof_dense_phase1_body(
                 total_record_count=total_record_count,
                 query_maxima_digest=query_maxima_digest,
             )
-            length_row = connection.execute(
-                "SELECT json_group_array(source_fold_length), "
-                "MIN(record_id), MAX(record_id), COUNT(*) FROM ("
-                "SELECT record_id, source_fold_length FROM tm_record "
-                "ORDER BY record_id)"
-            ).fetchone()
+            projected_rows = candidate_projection.candidate_proof_dense_phase1(
+                connection,
+                folded_query=folded_query,
+                blocks=blocks,
+                total_record_count=total_record_count,
+            )
             if (
-                type(length_row) is not tuple
-                or len(length_row) != 4
-                or type(length_row[0]) is not str
-                or type(length_row[1]) is not int
-                or length_row[1] != 1
-                or type(length_row[2]) is not int
-                or length_row[2] != total_record_count
-                or type(length_row[3]) is not int
-                or length_row[3] != total_record_count
-            ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            try:
-                length_payload = json.loads(length_row[0])
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                raise SQLiteStoreSchemaError(
-                    "STORE.CANDIDATE_PROOF_INVALID"
-                ) from error
-            if (
-                type(length_payload) is not list
-                or len(length_payload) != total_record_count
+                type(projected_rows) is not tuple
+                or len(projected_rows) != 2
+                or type(projected_rows[0]) is not tuple
+                or type(projected_rows[1]) is not tuple
+                or len(projected_rows[0]) != total_record_count
+                or len(projected_rows[1]) != total_record_count
                 or any(
                     type(length) is not int or length < 1
-                    for length in length_payload
+                    for length in projected_rows[0]
+                )
+                or any(
+                    type(intersection) is not int or intersection < 0
+                    for intersection in projected_rows[1]
                 )
             ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            lengths = tuple(length_payload)
-            for block in blocks:
-                final_record_id = min(block.last_record_id, total_record_count)
-                block_lengths = lengths[
-                    block.first_record_id - 1 : final_record_id
-                ]
-                if (
-                    len(block_lengths) != block.record_count
-                    or not block_lengths
-                    or min(block_lengths) != block.min_source_fold_length
-                    or max(block_lengths) != block.max_source_fold_length
-                ):
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-
-            bigram_intersections = [0] * (total_record_count + 1)
-            query_terms = tuple(query_bigrams.items())
-            for offset in range(0, len(query_terms), _CANDIDATE_QUERY_CHUNK_SIZE):
-                chunk = query_terms[offset : offset + _CANDIDATE_QUERY_CHUNK_SIZE]
-                values_sql = ",".join("(?, ?)" for _ in chunk)
-                intersection_row = connection.execute(
-                    "WITH query_terms(gram, query_frequency) "
-                    f"AS (VALUES {values_sql}) "
-                    "SELECT json_group_array(record_id), "
-                    "json_group_array(intersection) FROM ("
-                    "SELECT facts.record_id AS record_id, "
-                    "SUM(MIN(facts.term_frequency, "
-                    "query_terms.query_frequency)) AS intersection "
-                    "FROM query_terms CROSS JOIN tm_gram AS facts "
-                    "ON facts.gram_size = 2 AND facts.gram = query_terms.gram "
-                    "GROUP BY facts.record_id ORDER BY facts.record_id)",
-                    tuple(value for term in chunk for value in term),
-                ).fetchone()
-                if (
-                    type(intersection_row) is not tuple
-                    or len(intersection_row) != 2
-                    or any(
-                        type(payload) is not str
-                        for payload in intersection_row
-                    )
-                ):
-                    raise SQLiteStoreSchemaError(
-                        "STORE.CANDIDATE_PROOF_INVALID"
-                    )
-                try:
-                    intersection_record_ids = json.loads(intersection_row[0])
-                    intersection_values = json.loads(intersection_row[1])
-                except (TypeError, ValueError, json.JSONDecodeError) as error:
-                    raise SQLiteStoreSchemaError(
-                        "STORE.CANDIDATE_PROOF_INVALID"
-                    ) from error
-                if (
-                    type(intersection_record_ids) is not list
-                    or type(intersection_values) is not list
-                    or len(intersection_record_ids) != len(intersection_values)
-                ):
-                    raise SQLiteStoreSchemaError(
-                        "STORE.CANDIDATE_PROOF_INVALID"
-                    )
-                prior_record_id = 0
-                for record_id, intersection in zip(
-                    intersection_record_ids,
-                    intersection_values,
-                    strict=True,
-                ):
-                    record_id = _proof_int(
-                        record_id,
-                        "STORE.CANDIDATE_PROOF_INVALID",
-                    )
-                    intersection = _proof_int(
-                        intersection,
-                        "STORE.CANDIDATE_PROOF_INVALID",
-                    )
-                    if not prior_record_id < record_id <= total_record_count:
-                        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                    bigram_intersections[record_id] += intersection
-                    prior_record_id = record_id
-            ordered_bigram_intersections = tuple(bigram_intersections[1:])
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                )
+            source_fold_lengths = projected_rows[0]
+            bigram_intersections = projected_rows[1]
             receipt = _SQLiteCandidateProofDenseReceipt(
                 phase="DENSE_PHASE1_V1",
                 binding_digest=binding_digest,
                 item_count=total_record_count,
                 record_ids=None,
                 source_folds_v1=None,
-                source_fold_lengths=lengths,
-                bigram_multiset_intersections=ordered_bigram_intersections,
+                source_fold_lengths=source_fold_lengths,
+                bigram_multiset_intersections=bigram_intersections,
                 _factory_key=_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
             )
             result = SQLiteCandidateProofDensePhase1(
-                source_fold_lengths=lengths,
-                bigram_multiset_intersections=ordered_bigram_intersections,
+                source_fold_lengths=source_fold_lengths,
+                bigram_multiset_intersections=bigram_intersections,
                 binding_digest=binding_digest,
                 _receipt=receipt,
             )
@@ -9124,22 +8261,6 @@ def _candidate_proof_dense_phase2_body(
 ) -> SQLiteCandidateProofDensePhase2:
     """Return only the ordered folded-source projection for the exact R set."""
 
-    if len(record_ids) != len(source_fold_lengths):
-        raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-    prior_record_id = 0
-    for record_id, source_fold_length in zip(
-        record_ids,
-        source_fold_lengths,
-        strict=True,
-    ):
-        if (
-            type(record_id) is not int
-            or not prior_record_id < record_id <= total_record_count
-            or type(source_fold_length) is not int
-            or source_fold_length < 1
-        ):
-            raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-        prior_record_id = record_id
     with _leased_connection_scope(lease, connection) as connection:
         try:
             connection.execute("BEGIN")
@@ -9153,112 +8274,49 @@ def _candidate_proof_dense_phase2_body(
                 query_maxima_digest=query_maxima_digest,
             )
             if actual_binding != binding_digest:
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            use_dense_projection = total_record_count - len(record_ids) <= 2_048
-            if use_dense_projection:
-                requested = iter(record_ids)
-                current = next(requested, None)
-                excluded: list[int] = []
-                for possible_record_id in range(1, total_record_count + 1):
-                    if current == possible_record_id:
-                        current = next(requested, None)
-                    else:
-                        excluded.append(possible_record_id)
-                if current is not None or len(excluded) > 2_048:
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                where = ""
-                parameters: tuple[int, ...] = ()
-                if excluded:
-                    placeholders = ",".join("?" for _ in excluded)
-                    where = f"WHERE record_id NOT IN ({placeholders}) "
-                    parameters = tuple(excluded)
-                projection_row = connection.execute(
-                    "SELECT json_group_array(record_id), "
-                    "json_group_array(source_fold_v1), "
-                    "json_group_array(source_fold_length) FROM ("
-                    "SELECT record_id, source_fold_v1, source_fold_length "
-                    f"FROM tm_record {where}ORDER BY record_id)",
-                    parameters,
-                ).fetchone()
-            else:
-                request_json = json.dumps(
-                    record_ids,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                )
-                projection_row = connection.execute(
-                    "SELECT json_group_array(record_id), "
-                    "json_group_array(source_fold_v1), "
-                    "json_group_array(source_fold_length) FROM ("
-                    "SELECT records.record_id, records.source_fold_v1, "
-                    "records.source_fold_length "
-                    "FROM json_each(?) AS requested "
-                    "CROSS JOIN tm_record AS records "
-                    "ON records.record_id = CAST(requested.value AS INTEGER) "
-                    "ORDER BY CAST(requested.key AS INTEGER))",
-                    (request_json,),
-                ).fetchone()
-            if (
-                type(projection_row) is not tuple
-                or len(projection_row) != 3
-                or any(type(payload) is not str for payload in projection_row)
-            ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            try:
-                projected_record_ids = json.loads(projection_row[0])
-                projected_source_folds = json.loads(projection_row[1])
-                projected_source_lengths = json.loads(projection_row[2])
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
                 raise SQLiteStoreSchemaError(
                     "STORE.CANDIDATE_PROOF_INVALID"
-                ) from error
+                )
+            projected_rows = candidate_projection.candidate_proof_dense_phase2(
+                connection,
+                total_record_count=total_record_count,
+                record_ids=record_ids,
+                source_fold_lengths=source_fold_lengths,
+            )
             if (
-                type(projected_record_ids) is not list
-                or type(projected_source_folds) is not list
-                or type(projected_source_lengths) is not list
-                or len(projected_record_ids) != len(record_ids)
-                or len(projected_source_folds) != len(record_ids)
-                or len(projected_source_lengths) != len(record_ids)
+                type(projected_rows) is not tuple
+                or len(projected_rows) != 3
+                or any(type(values) is not tuple for values in projected_rows)
+                or projected_rows[0] != record_ids
+                or projected_rows[2] != source_fold_lengths
+                or len(projected_rows[1]) != len(record_ids)
+                or any(
+                    type(source) is not str
+                    or not source
+                    or len(source) != source_fold_lengths[ordinal]
+                    for ordinal, source in enumerate(projected_rows[1])
+                )
             ):
-                raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-            copied_record_ids: list[int] = []
-            copied_source_folds: list[str] = []
-            copied_source_lengths: list[int] = []
-            for ordinal, projected_record_id in enumerate(projected_record_ids):
-                projected_source_fold = projected_source_folds[ordinal]
-                projected_source_length = projected_source_lengths[ordinal]
-                expected_source_length = source_fold_lengths[ordinal]
-                if (
-                    type(projected_record_id) is not int
-                    or projected_record_id != record_ids[ordinal]
-                    or type(projected_source_fold) is not str
-                    or not projected_source_fold
-                    or type(projected_source_length) is not int
-                    or projected_source_length != expected_source_length
-                    or len(projected_source_fold) != expected_source_length
-                ):
-                    raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
-                copied_record_ids.append(projected_record_id)
-                copied_source_folds.append(projected_source_fold)
-                copied_source_lengths.append(projected_source_length)
-            ordered_record_ids = tuple(copied_record_ids)
-            ordered_source_folds = tuple(copied_source_folds)
-            ordered_source_lengths = tuple(copied_source_lengths)
+                raise SQLiteStoreSchemaError(
+                    "STORE.CANDIDATE_PROOF_INVALID"
+                )
+            projected_record_ids = projected_rows[0]
+            projected_source_folds = projected_rows[1]
+            projected_source_lengths = projected_rows[2]
             receipt = _SQLiteCandidateProofDenseReceipt(
                 phase="DENSE_PHASE2_V1",
                 binding_digest=actual_binding,
-                item_count=len(ordered_record_ids),
-                record_ids=ordered_record_ids,
-                source_folds_v1=ordered_source_folds,
-                source_fold_lengths=ordered_source_lengths,
+                item_count=len(projected_record_ids),
+                record_ids=projected_record_ids,
+                source_folds_v1=projected_source_folds,
+                source_fold_lengths=projected_source_lengths,
                 bigram_multiset_intersections=None,
                 _factory_key=_CANDIDATE_PROOF_DENSE_RECEIPT_FACTORY_KEY,
             )
             result = SQLiteCandidateProofDensePhase2(
-                record_ids=ordered_record_ids,
-                source_folds_v1=ordered_source_folds,
-                source_fold_lengths=ordered_source_lengths,
+                record_ids=projected_record_ids,
+                source_folds_v1=projected_source_folds,
+                source_fold_lengths=projected_source_lengths,
                 binding_digest=actual_binding,
                 _receipt=receipt,
             )
@@ -9807,7 +8865,6 @@ def _apply_candidate_write_plan(
     if type(gram_rows) is not tuple or type(fts_origin_ordinals) is not tuple:
         raise TypeError("validated candidate plan is invalid")
     seen_grams: set[tuple[int, int, str]] = set()
-    validated_gram_rows: list[tuple[int, str, int, int]] = []
     for row in gram_rows:
         if type(row) is not tuple or len(row) != 4:
             raise TypeError("validated gram row is invalid")
@@ -9826,21 +8883,7 @@ def _apply_candidate_write_plan(
         ):
             raise ValueError("validated gram row is invalid")
         seen_grams.add(key)
-        validated_gram_rows.append(
-            (
-                gram_size,
-                gram,
-                record_ids_by_ordinal[origin_ordinal],
-                term_frequency,
-            )
-        )
-    connection.executemany(
-        "INSERT INTO tm_gram(gram_size, gram, record_id, term_frequency) "
-        "VALUES (?, ?, ?, ?)",
-        validated_gram_rows,
-    )
     seen_fts_ordinals: set[int] = set()
-    validated_fts_rows: list[tuple[str, int]] = []
     for origin_ordinal in fts_origin_ordinals:
         if (
             type(origin_ordinal) is not int
@@ -9850,250 +8893,56 @@ def _apply_candidate_write_plan(
         ):
             raise ValueError("validated FTS row is invalid")
         seen_fts_ordinals.add(origin_ordinal)
-        validated_fts_rows.append(
-            (
-                folded_sources_by_ordinal[origin_ordinal],
-                record_ids_by_ordinal[origin_ordinal],
-            )
-        )
-    if validated_fts_rows:
-        try:
-            connection.executemany(
-                "INSERT INTO tm_fts(source_fold_v1, record_id) VALUES (?, ?)",
-                validated_fts_rows,
-            )
-        except sqlite3.OperationalError as error:
-            raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
-    _maintain_candidate_proof_summaries(
+    copied_record_ids = tuple(record_ids_by_ordinal.items())
+    copied_folded_sources = tuple(folded_sources_by_ordinal.items())
+    gram_result = candidate_projection.insert_candidate_gram_rows(
         connection,
+        plan,
+        record_ids_by_ordinal=copied_record_ids,
+        folded_sources_by_ordinal=copied_folded_sources,
+    )
+    if gram_result is not None:
+        raise TypeError("candidate write projection returned authority")
+    try:
+        fts_result = candidate_projection.insert_candidate_fts_rows(
+            connection,
+            plan,
+            record_ids_by_ordinal=copied_record_ids,
+            folded_sources_by_ordinal=copied_folded_sources,
+        )
+    except sqlite3.OperationalError as error:
+        raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
+    if fts_result is not None:
+        raise TypeError("candidate write projection returned authority")
+    proof_result = _maintain_candidate_proof_summaries(
+        connection,
+        plan=plan,
         record_ids_by_ordinal=record_ids_by_ordinal,
         folded_sources_by_ordinal=folded_sources_by_ordinal,
-        gram_rows=gram_rows,
     )
+    if proof_result is not None:
+        raise TypeError("candidate write projection returned authority")
 
 
 def _maintain_candidate_proof_summaries(
     connection: sqlite3.Connection,
     *,
+    plan: _ValidatedCandidateWritePlan,
     record_ids_by_ordinal: dict[int, int],
     folded_sources_by_ordinal: dict[int, str],
-    gram_rows: Sequence[tuple[int, int, str, int]],
-) -> None:
-    """Maintain exact proof blocks inside the owning record transaction."""
+) -> object:
+    """Late-bound compatibility wrapper for proof-summary projection."""
 
-    for origin_ordinal, record_id in sorted(
-        record_ids_by_ordinal.items(), key=lambda pair: pair[1]
-    ):
-        folded_source = folded_sources_by_ordinal[origin_ordinal]
-        source_fold_length = len(folded_source)
-        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
-        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
-        last_record_id = first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1
-        connection.execute(
-            "INSERT INTO tm_candidate_block("
-            "block_id, first_record_id, last_record_id, record_count, "
-            "min_source_fold_length, max_source_fold_length) "
-            "VALUES (?, ?, ?, 1, ?, ?) "
-            "ON CONFLICT(block_id) DO UPDATE SET "
-            "record_count = record_count + 1, "
-            "min_source_fold_length = min(min_source_fold_length, excluded.min_source_fold_length), "
-            "max_source_fold_length = max(max_source_fold_length, excluded.max_source_fold_length)",
-            (
-                block_id,
-                first_record_id,
-                last_record_id,
-                source_fold_length,
-                source_fold_length,
-            ),
-        )
-    for origin_ordinal, gram_size, gram, term_frequency in gram_rows:
-        if gram_size not in {1, 2}:
-            continue
-        record_id = record_ids_by_ordinal[origin_ordinal]
-        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
-        connection.execute(
-            "INSERT INTO tm_gram_block_max("
-            "gram_size, gram, block_id, max_term_frequency) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
-            "max_term_frequency = max(max_term_frequency, excluded.max_term_frequency)",
-            (gram_size, gram, block_id, term_frequency),
-        )
+    return candidate_projection.maintain_candidate_proof_summaries(
+        connection,
+        plan=plan,
+        record_ids_by_ordinal=tuple(record_ids_by_ordinal.items()),
+        folded_sources_by_ordinal=tuple(folded_sources_by_ordinal.items()),
+    )
 
 
 _CANDIDATE_PROJECTION_DIGEST_VERSION = "candidate-projection-digest-v2"
 _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS = 50_000
-
-
-def _candidate_projection_table_digest(table: str) -> Any:
-    digest = hashlib.sha256()
-    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(table.encode("ascii"))
-    digest.update(b"\0")
-    return digest
-
-
-def _update_candidate_projection_digest(
-    digest: Any,
-    row: tuple[object, ...],
-) -> None:
-    framed = bytearray()
-    for value in row:
-        if type(value) is int and not isinstance(value, bool):
-            encoded = str(value).encode("ascii")
-            framed.extend(b"i")
-        elif type(value) is str:
-            encoded = value.encode("utf-8")
-            framed.extend(b"s")
-        else:
-            raise CandidateProofIndexError(
-                "candidate projection digest fact is invalid"
-            )
-        framed.extend(str(len(encoded)).encode("ascii"))
-        framed.extend(b":")
-        framed.extend(encoded)
-        framed.extend(b";")
-    framed.extend(b"\n")
-    digest.update(framed)
-
-
-def _finish_candidate_projection_digest(
-    table_digests: dict[str, Any],
-    *,
-    fts5_available: bool,
-) -> str:
-    expected_tables = (
-        "tm_gram",
-        "tm_candidate_block",
-        "tm_gram_block_max",
-        *(("tm_fts",) if fts5_available else ()),
-    )
-    if tuple(table_digests) != expected_tables:
-        raise CandidateProofIndexError(
-            "candidate projection digest domain is invalid"
-        )
-    digest = hashlib.sha256()
-    digest.update(_CANDIDATE_PROJECTION_DIGEST_VERSION.encode("ascii"))
-    digest.update(b"\0complete\0")
-    for table in expected_tables:
-        digest.update(table.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(table_digests[table].digest())
-    return digest.hexdigest()
-
-
-def _update_candidate_gram_projection_digest(
-    connection: sqlite3.Connection,
-    digest: Any,
-) -> None:
-    """Hash term-major gram rows in bounded SQLite-native chunks."""
-
-    count_row = connection.execute(
-        "SELECT COUNT(*) FROM tm_gram NOT INDEXED"
-    ).fetchone()
-    if (
-        type(count_row) is not tuple
-        or len(count_row) != 1
-        or type(count_row[0]) is not int
-        or count_row[0] < 0
-    ):
-        raise CandidateProofIndexError(
-            "candidate projection digest count is invalid"
-        )
-    actual_count = count_row[0]
-    processed_count = 0
-    last_rowid: int | None = None
-    row_payload = (
-        "json_array("
-        "typeof(rowid), hex(CAST(rowid AS BLOB)), "
-        "typeof(record_id), hex(CAST(record_id AS BLOB)), "
-        "typeof(gram_size), hex(CAST(gram_size AS BLOB)), "
-        "typeof(gram), hex(CAST(gram AS BLOB)), "
-        "typeof(term_frequency), hex(CAST(term_frequency AS BLOB)), "
-        "rowid)"
-    )
-    while True:
-        where = ""
-        parameters: tuple[object, ...] = (
-            _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
-        )
-        if last_rowid is not None:
-            where = "WHERE rowid > ?"
-            parameters = (
-                last_rowid,
-                _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
-            )
-        row = connection.execute(
-            "SELECT group_concat(row_payload, char(10)), COUNT(*) FROM ("
-            f"SELECT {row_payload} AS row_payload "
-            f"FROM tm_gram NOT INDEXED {where} "
-            "ORDER BY rowid LIMIT ?)",
-            parameters,
-        ).fetchone()
-        if (
-            type(row) is not tuple
-            or len(row) != 2
-            or type(row[1]) is not int
-            or row[1] < 0
-        ):
-            raise CandidateProofIndexError(
-                "candidate projection digest chunk is invalid"
-            )
-        chunk_count = row[1]
-        if chunk_count == 0:
-            if row[0] is not None:
-                raise CandidateProofIndexError(
-                    "candidate projection digest chunk is invalid"
-                )
-            break
-        if (
-            chunk_count
-            > _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS
-            or type(row[0]) is not str
-        ):
-            raise CandidateProofIndexError(
-                "candidate projection digest chunk is invalid"
-            )
-        payload = row[0]
-        encoded = payload.encode("utf-8")
-        digest.update(b"chunk:")
-        digest.update(str(chunk_count).encode("ascii"))
-        digest.update(b":")
-        digest.update(str(len(encoded)).encode("ascii"))
-        digest.update(b":")
-        digest.update(encoded)
-        digest.update(b";")
-        try:
-            tail = json.loads(payload.rsplit("\n", 1)[-1])
-        except (TypeError, ValueError) as error:
-            raise CandidateProofIndexError(
-                "candidate projection digest tail is invalid"
-            ) from error
-        if (
-            type(tail) is not list
-            or len(tail) != 11
-            or type(tail[10]) is not int
-            or isinstance(tail[10], bool)
-        ):
-            raise CandidateProofIndexError(
-                "candidate projection digest tail is invalid"
-            )
-        next_rowid = tail[10]
-        if last_rowid is not None and next_rowid <= last_rowid:
-            raise CandidateProofIndexError(
-                "candidate projection digest order is invalid"
-            )
-        last_rowid = next_rowid
-        processed_count += chunk_count
-        if processed_count > actual_count:
-            raise CandidateProofIndexError(
-                "candidate projection digest count is invalid"
-            )
-    if processed_count != actual_count:
-        raise CandidateProofIndexError(
-            "candidate projection digest count is invalid"
-        )
 
 
 def _candidate_proof_projection_digest(
@@ -10101,52 +8950,10 @@ def _candidate_proof_projection_digest(
     *,
     fts5_available: bool,
 ) -> str:
-    """Hash every actual candidate projection row in canonical order."""
-
-    if type(connection) is not sqlite3.Connection:
-        raise TypeError("connection must be an exact sqlite3 connection")
-    if type(fts5_available) is not bool:
-        raise TypeError("fts5_available must be a built-in bool")
-    queries = (
-        (
-            "tm_candidate_block",
-            "SELECT block_id, first_record_id, last_record_id, "
-            "record_count, min_source_fold_length, "
-            "max_source_fold_length FROM tm_candidate_block "
-            "ORDER BY block_id",
-        ),
-        (
-            "tm_gram_block_max",
-            "SELECT block_id, gram_size, gram, max_term_frequency "
-            "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram",
-        ),
-        *(
-            (
-                (
-                    "tm_fts",
-                    "SELECT record_id, source_fold_v1 FROM tm_fts "
-                    "ORDER BY record_id",
-                ),
-            )
-            if fts5_available
-            else ()
-        ),
-    )
-    table_digests: dict[str, Any] = {
-        "tm_gram": _candidate_projection_table_digest("tm_gram")
-    }
-    _update_candidate_gram_projection_digest(
+    return candidate_projection.candidate_proof_projection_digest(
         connection,
-        table_digests["tm_gram"],
-    )
-    for table, query in queries:
-        table_digest = _candidate_projection_table_digest(table)
-        for row in connection.execute(query):
-            _update_candidate_projection_digest(table_digest, row)
-        table_digests[table] = table_digest
-    return _finish_candidate_projection_digest(
-        table_digests,
         fts5_available=fts5_available,
+        gram_chunk_rows=_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
     )
 
 
@@ -10157,203 +8964,12 @@ def _validate_candidate_proof_index_core(
     fts5_available: bool,
     include_projection_digest: bool,
 ) -> tuple[tuple[tuple[int, int], ...], int, str | None]:
-    """Stream-recompute exact facts, optionally binding projection rows."""
-
-    if type(connection) is not sqlite3.Connection:
-        raise TypeError("connection must be an exact sqlite3 connection")
-    if type(required_sizes) is not tuple or any(
-        type(size) is not int for size in required_sizes
-    ):
-        raise TypeError("required_sizes must be a tuple of built-in integers")
-    if type(fts5_available) is not bool:
-        raise TypeError("fts5_available must be a built-in bool")
-    if type(include_projection_digest) is not bool:
-        raise TypeError("include_projection_digest must be a built-in bool")
-    expected_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    if required_sizes != expected_sizes:
-        raise ValueError("candidate gram sizes do not match the index path")
-    try:
-        worker_row = connection.execute("PRAGMA threads=2").fetchone()
-    except sqlite3.Error as error:
-        raise CandidateProofIndexError(
-            "candidate proof worker configuration is invalid"
-        ) from error
-    if (
-        type(worker_row) is not tuple
-        or len(worker_row) != 1
-        or type(worker_row[0]) is not int
-        or worker_row[0] not in {0, 1, 2}
-    ):
-        raise CandidateProofIndexError(
-            "candidate proof worker configuration is invalid"
-        )
-
-    def proof_int(value: object) -> int:
-        if type(value) is not int:
-            raise CandidateProofIndexError("candidate integer fact is invalid")
-        return value
-
-    def proof_text(value: object) -> str:
-        if type(value) is not str or not value:
-            raise CandidateProofIndexError("candidate text fact is invalid")
-        return value
-
-    record_cursor = connection.execute(
-        "SELECT record_id, source_raw, source_fold_v1, source_fold_length "
-        "FROM tm_record ORDER BY record_id"
-    )
-    gram_cursor = connection.execute(
-        "SELECT record_id, gram_size, gram, term_frequency FROM tm_gram "
-        "ORDER BY record_id, gram_size, gram"
-    )
-    block_cursor = connection.execute(
-        "SELECT block_id, first_record_id, last_record_id, record_count, "
-        "min_source_fold_length, max_source_fold_length "
-        "FROM tm_candidate_block ORDER BY block_id"
-    )
-    maximum_cursor = connection.execute(
-        "SELECT block_id, gram_size, gram, max_term_frequency "
-        "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram"
-    )
-    fts_cursor = (
-        connection.execute(
-            "SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id"
-        )
-        if fts5_available
-        else None
-    )
-    current_gram = gram_cursor.fetchone()
-    current_block = block_cursor.fetchone()
-    current_maximum = maximum_cursor.fetchone()
-    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
-    gram_counts = {size: 0 for size in required_sizes}
-    fts_count = 0
-    block_id: int | None = None
-    block_lengths: list[int] = []
-    block_maxima: dict[tuple[int, str], int] = {}
-
-    def flush_block() -> None:
-        nonlocal current_block, current_maximum
-        if block_id is None:
-            return
-        first_record_id = block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1
-        expected_block = (
-            block_id,
-            first_record_id,
-            first_record_id + CANDIDATE_PROOF_BLOCK_SIZE - 1,
-            len(block_lengths),
-            min(block_lengths),
-            max(block_lengths),
-        )
-        if current_block is None or tuple(
-            proof_int(value) for value in current_block
-        ) != expected_block:
-            raise CandidateProofIndexError("candidate block fact is invalid")
-        current_block = block_cursor.fetchone()
-        actual_maxima: dict[tuple[int, str], int] = {}
-        while current_maximum is not None:
-            maximum_block_id = proof_int(current_maximum[0])
-            if maximum_block_id != block_id:
-                break
-            size = proof_int(current_maximum[1])
-            gram = proof_text(current_maximum[2])
-            frequency = proof_int(current_maximum[3])
-            key = (size, gram)
-            if size not in {1, 2} or frequency < 1 or key in actual_maxima:
-                raise CandidateProofIndexError(
-                    "candidate block maximum is invalid"
-                )
-            actual_maxima[key] = frequency
-            current_maximum = maximum_cursor.fetchone()
-        if actual_maxima != block_maxima:
-            raise CandidateProofIndexError("candidate block maximum is invalid")
-
-    expected_record_id = 1
-    for record_row in record_cursor:
-        record_id = proof_int(record_row[0])
-        source_raw = proof_text(record_row[1])
-        stored_folded_source = proof_text(record_row[2])
-        source_fold_length = proof_int(record_row[3])
-        folded_source = fold_text_value_v1(source_raw)
-        if (
-            not folded_source
-            or record_id != expected_record_id
-            or stored_folded_source != folded_source
-            or source_fold_length != len(folded_source)
-        ):
-            raise CandidateProofIndexError("candidate record fact is invalid")
-        expected_record_id += 1
-        next_block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
-        if block_id is not None and next_block_id != block_id:
-            flush_block()
-            block_lengths.clear()
-            block_maxima.clear()
-        block_id = next_block_id
-        block_lengths.append(source_fold_length)
-
-        actual_grams: dict[tuple[int, str], int] = {}
-        while current_gram is not None:
-            gram_record_id = proof_int(current_gram[0])
-            if gram_record_id != record_id:
-                break
-            size = proof_int(current_gram[1])
-            gram = proof_text(current_gram[2])
-            frequency = proof_int(current_gram[3])
-            key = (size, gram)
-            if (
-                size not in required_sizes
-                or frequency < 1
-                or key in actual_grams
-            ):
-                raise CandidateProofIndexError(
-                    "candidate gram fact is invalid"
-                )
-            actual_grams[key] = frequency
-            current_gram = gram_cursor.fetchone()
-        expected_grams = {
-            (size, gram): frequency
-            for size in required_sizes
-            for gram, frequency in character_ngram_frequencies(
-                folded_source, size
-            )
-        }
-        if actual_grams != expected_grams:
-            raise CandidateProofIndexError("candidate gram fact is invalid")
-        for (size, gram), frequency in actual_grams.items():
-            gram_counts[size] += 1
-            if size in {1, 2}:
-                key = (size, gram)
-                block_maxima[key] = max(block_maxima.get(key, 0), frequency)
-
-        if fts5_available:
-            if current_fts is None:
-                raise CandidateProofIndexError("candidate FTS fact is invalid")
-            fts_record_id = proof_int(current_fts[0])
-            fts_source = proof_text(current_fts[1])
-            if (fts_record_id, fts_source) != (record_id, folded_source):
-                raise CandidateProofIndexError("candidate FTS fact is invalid")
-            fts_count += 1
-            current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
-
-    flush_block()
-    if any(
-        row is not None
-        for row in (current_gram, current_block, current_maximum)
-    ):
-        raise CandidateProofIndexError("candidate proof index has extra rows")
-    if current_fts is not None:
-        raise CandidateProofIndexError("candidate FTS fact is invalid")
-    return (
-        tuple(sorted(gram_counts.items())),
-        fts_count,
-        (
-            _candidate_proof_projection_digest(
-                connection,
-                fts5_available=fts5_available,
-            )
-            if include_projection_digest
-            else None
-        ),
+    return candidate_projection._validate_candidate_proof_index_core(
+        connection,
+        required_sizes=required_sizes,
+        fts5_available=fts5_available,
+        include_projection_digest=include_projection_digest,
+        gram_chunk_rows=_CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS,
     )
 
 
@@ -10382,7 +8998,7 @@ def validate_candidate_proof_index(
     required_sizes: tuple[int, ...],
     fts5_available: bool,
 ) -> tuple[tuple[tuple[int, int], ...], int]:
-    """Stream-recompute exact length, TF, block and optional FTS facts."""
+    """Late-bound compatibility wrapper for proof-index validation."""
 
     gram_counts, fts_count, projection_digest = (
         _validate_candidate_proof_index_core(
@@ -10395,6 +9011,25 @@ def validate_candidate_proof_index(
     if projection_digest is not None:
         raise AssertionError("candidate projection digest is unexpected")
     return gram_counts, fts_count
+
+
+def _validate_candidate_index_before_publication(
+    connection: sqlite3.Connection,
+    *,
+    fts5_available: bool,
+) -> None:
+    """Authorize the complete candidate index before batch/head publication."""
+
+    try:
+        validate_candidate_proof_index(
+            connection,
+            required_sizes=(1, 2) if fts5_available else (1, 2, 3),
+            fts5_available=fts5_available,
+        )
+    except (CandidateProofIndexError, sqlite3.DatabaseError) as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.CANDIDATE_INDEX_INVALID"
+        ) from error
 
 
 def _suspend_streamed_stage_secondary_indexes(
@@ -10427,20 +9062,23 @@ def _suspend_streamed_stage_secondary_indexes(
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_STATE_INVALID"
             )
-        actual = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND name IN (?, ?, ?, ?)",
-                _STREAMED_STAGE_SECONDARY_INDEX_NAMES,
-            ).fetchall()
-        }
-        if actual != set(_STREAMED_STAGE_SECONDARY_INDEX_NAMES):
+        try:
+            actual = (
+                candidate_projection.streamed_stage_secondary_index_inventory(
+                    connection
+                )
+            )
+        except CandidateProofIndexError as error:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_INDEX_INVALID"
+            ) from error
+        if actual != tuple(sorted(_STREAMED_STAGE_SECONDARY_INDEX_NAMES)):
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_INDEX_INVALID"
             )
-        for name in _STREAMED_STAGE_SECONDARY_INDEX_NAMES:
-            connection.execute(f"DROP INDEX {name}")
+        candidate_projection.suspend_streamed_stage_secondary_indexes(
+            connection
+        )
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -10450,10 +9088,24 @@ def _suspend_streamed_stage_secondary_indexes(
 def _restore_streamed_stage_secondary_indexes(
     connection: sqlite3.Connection,
     lease: _SQLiteGenerationView,
+    *,
+    before_publication: bool = False,
 ) -> None:
     """Bulk-build the exact frozen secondary-index schema before exposure."""
 
-    connection.execute("BEGIN IMMEDIATE")
+    if type(before_publication) is not bool:
+        raise TypeError("before_publication must be a built-in bool")
+    if before_publication:
+        if not connection.in_transaction:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+    else:
+        if connection.in_transaction:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_STATE_INVALID"
+            )
+        connection.execute("BEGIN IMMEDIATE")
     try:
         identity = lease.stage.resource_identity
         _validate_store_identity(
@@ -10465,23 +9117,30 @@ def _restore_streamed_stage_secondary_indexes(
         meta = _read_meta(connection)
         if (
             meta.get("activation_status") != "UNPUBLISHED"
-            or _meta_int(meta, "head_revision") != 1
+            or _meta_int(meta, "head_revision")
+            != (0 if before_publication else 1)
             or lease.active_content_attestation is not None
         ):
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_STATE_INVALID"
             )
-        existing = connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
-            "AND name IN (?, ?, ?, ?)",
-            _STREAMED_STAGE_SECONDARY_INDEX_NAMES,
-        ).fetchone()
-        if existing != (0,):
+        try:
+            existing = (
+                candidate_projection.streamed_stage_secondary_index_inventory(
+                    connection
+                )
+            )
+        except CandidateProofIndexError as error:
+            raise SQLiteStoreSchemaError(
+                "STORE.STREAMED_BUILD_INDEX_INVALID"
+            ) from error
+        if existing != ():
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_INDEX_INVALID"
             )
-        for statement in _STREAMED_STAGE_SECONDARY_INDEX_STATEMENTS:
-            connection.execute(statement)
+        candidate_projection.restore_streamed_stage_secondary_indexes(
+            connection
+        )
         fts5_available = _meta_bool(meta, "fts5_available")
         if _schema_digest(
             connection,
@@ -10490,9 +9149,11 @@ def _restore_streamed_stage_secondary_indexes(
             raise SQLiteStoreSchemaError(
                 "STORE.STREAMED_BUILD_INDEX_INVALID"
             )
-        connection.commit()
+        if not before_publication:
+            connection.commit()
     except BaseException:
-        connection.rollback()
+        if not before_publication:
+            connection.rollback()
         raise
 
 
@@ -10716,103 +9377,59 @@ def _insert_streamed_candidate_index(
     *,
     fts5_available: bool,
 ) -> None:
-    """Bulk-insert one bounded chunk's grams and FTS rows in PK order."""
+    """Late-bound wrapper for one bounded streamed candidate projection."""
 
+    candidate_records = tuple(
+        (draft[10], draft[2]) for draft in prepared_drafts
+    )
+    copied_record_ids = tuple(record_ids_by_ordinal.items())
     gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    grams_by_size: dict[int, dict[str, list[tuple[int, int]]]] = {
-        gram_size: {} for gram_size in gram_sizes
-    }
-    block_stats: dict[int, list[int]] = {}
-    block_maxima: dict[tuple[int, str, int], int] = {}
-    fts_rows: list[tuple[str, int]] = []
-    for draft in prepared_drafts:
-        origin_ordinal = draft[10]
-        folded_source = draft[2]
-        record_id = record_ids_by_ordinal[origin_ordinal]
-        source_fold_length = len(folded_source)
-        block_id = (record_id - 1) // CANDIDATE_PROOF_BLOCK_SIZE
-        stats = block_stats.setdefault(
-            block_id,
-            [0, source_fold_length, source_fold_length],
-        )
-        stats[0] += 1
-        stats[1] = min(stats[1], source_fold_length)
-        stats[2] = max(stats[2], source_fold_length)
-        for gram_size in gram_sizes:
-            bucket = grams_by_size[gram_size]
-            for gram, term_frequency in character_ngram_frequencies(
-                folded_source,
-                gram_size,
-            ):
-                bucket.setdefault(gram, []).append(
-                    (record_id, term_frequency)
-                )
-                if gram_size in {1, 2}:
-                    maximum_key = (gram_size, gram, block_id)
-                    block_maxima[maximum_key] = max(
-                        block_maxima.get(maximum_key, 0),
-                        term_frequency,
-                    )
-        if fts5_available:
-            fts_rows.append((folded_source, record_id))
+    expected_gram_row_count = 0
     for gram_size in gram_sizes:
-        bucket = grams_by_size[gram_size]
-        connection.executemany(
-            "INSERT INTO tm_gram("
-            "gram_size, gram, record_id, term_frequency) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                (gram_size, gram, record_id, term_frequency)
-                for gram in sorted(bucket)
-                for record_id, term_frequency in bucket[gram]
-            ),
+        candidate_gram_facts = tuple(
+            (draft[10], gram_size, gram, term_frequency)
+            for draft in prepared_drafts
+            for gram, term_frequency in character_ngram_frequencies(
+                draft[2],
+                gram_size,
+            )
         )
-    if fts_rows:
-        try:
-            connection.executemany(
-                "INSERT INTO tm_fts(source_fold_v1, record_id) "
-                "VALUES (?, ?)",
-                fts_rows,
-            )
-        except sqlite3.OperationalError as error:
+        gram_result = candidate_projection.insert_streamed_candidate_gram_rows(
+            connection,
+            candidate_records,
+            copied_record_ids,
+            candidate_gram_facts,
+            gram_size=gram_size,
+        )
+        if gram_result is not None:
+            raise TypeError("streamed candidate projection returned authority")
+        expected_gram_row_count += len(candidate_gram_facts)
+        del candidate_gram_facts
+    try:
+        fts_result = candidate_projection.insert_streamed_candidate_fts_rows(
+            connection,
+            candidate_records,
+            copied_record_ids,
+            fts5_available=fts5_available,
+        )
+    except sqlite3.OperationalError as error:
+        if (
+            type(error) is sqlite3.OperationalError
+            and len(error.args) == 1
+            and error.args[0] is candidate_projection._STREAMED_FTS_WRITE_FAILED
+        ):
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
-    connection.executemany(
-        "INSERT INTO tm_candidate_block("
-        "block_id, first_record_id, last_record_id, record_count, "
-        "min_source_fold_length, max_source_fold_length) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(block_id) DO UPDATE SET "
-        "record_count = record_count + excluded.record_count, "
-        "min_source_fold_length = min(min_source_fold_length, "
-        "excluded.min_source_fold_length), "
-        "max_source_fold_length = max(max_source_fold_length, "
-        "excluded.max_source_fold_length)",
-        tuple(
-            (
-                block_id,
-                block_id * CANDIDATE_PROOF_BLOCK_SIZE + 1,
-                (block_id + 1) * CANDIDATE_PROOF_BLOCK_SIZE,
-                stats[0],
-                stats[1],
-                stats[2],
-            )
-            for block_id, stats in sorted(block_stats.items())
-        ),
+        raise
+    if fts_result is not None:
+        raise TypeError("streamed candidate projection returned authority")
+    proof_result = candidate_projection.insert_streamed_candidate_proof_rows(
+        connection,
+        candidate_records,
+        copied_record_ids,
+        expected_gram_row_count=expected_gram_row_count,
     )
-    connection.executemany(
-        "INSERT INTO tm_gram_block_max("
-        "gram_size, gram, block_id, max_term_frequency) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(gram_size, gram, block_id) DO UPDATE SET "
-        "max_term_frequency = max(max_term_frequency, "
-        "excluded.max_term_frequency)",
-        tuple(
-            (gram_size, gram, block_id, maximum)
-            for (gram_size, gram, block_id), maximum in sorted(
-                block_maxima.items()
-            )
-        ),
-    )
+    if proof_result is not None:
+        raise TypeError("streamed candidate projection returned authority")
 
 
 def _complete_streamed_batch(
@@ -11261,6 +9878,11 @@ class SQLiteTMQueryView:
         return self._lease.stage.resource_identity.resource_id
 
     @property
+    def candidate_port_scope(self) -> str:
+        self._check_lifetime()
+        return "QUERY_VIEW"
+
+    @property
     def generation(self) -> int:
         self._check_lifetime()
         return self._lease.generation
@@ -11476,6 +10098,46 @@ class SQLiteTMQueryView:
             record_ids=tuple(record_ids),
             source_fold_lengths=tuple(source_fold_lengths),
             connection=self._candidate_connection(),
+        )
+
+    def validate_candidate_proof_dense_phase1_result(
+        self,
+        value: object,
+        *,
+        folded_query: str,
+        blocks: tuple[SQLiteCandidateProofBlock, ...],
+        head_revision: int,
+        total_record_count: int,
+        query_maxima_digest: str,
+    ) -> None:
+        """Validate a dense phase-one result on this captured generation."""
+
+        _validate_candidate_proof_dense_phase1_result(
+            value,
+            view=self,
+            folded_query=folded_query,
+            blocks=blocks,
+            head_revision=head_revision,
+            total_record_count=total_record_count,
+            query_maxima_digest=query_maxima_digest,
+        )
+
+    def validate_candidate_proof_dense_phase2_result(
+        self,
+        value: object,
+        *,
+        binding_digest: str,
+        record_ids: tuple[int, ...],
+        source_fold_lengths: tuple[int, ...],
+    ) -> None:
+        """Validate a dense phase-two result on this captured generation."""
+
+        self._check_lifetime()
+        _validate_candidate_proof_dense_phase2_result(
+            value,
+            binding_digest=binding_digest,
+            record_ids=record_ids,
+            source_fold_lengths=source_fold_lengths,
         )
 
     def health(self) -> StoreHealth:

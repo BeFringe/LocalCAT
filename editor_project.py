@@ -1,167 +1,157 @@
-"""Qt-free project codecs for LocalCAT editor JSON and line-based text files."""
+"""Qt-free Application facade for one LocalCAT editor project document."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import tempfile
 from pathlib import Path
-from typing import cast
 
 from editor_contracts import EditorProject, EditorSegment
+from parser_composition import create_parser_application_surface
+from parser_contracts import (
+    CanonicalDocumentWrite,
+    CanonicalSegmentWrite,
+    CanonicalSerializeRequest,
+    ContractViolation,
+    DocumentHeader,
+    EffectivePurpose,
+    LINE_TEXT_V1,
+    LOCALCAT_JSON_V1,
+    ParsedSegment,
+    RawSpeaker,
+    ReadRequest,
+    SelectionFailure,
+    SelectionRequest,
+    SourceReference,
+    TargetReference,
+    TranslationState,
+)
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 1
-SUPPORTED_PROJECT_SUFFIXES = frozenset({".json", ".txt"})
 
 
 class ProjectError(RuntimeError):
     """Raised when an editor project cannot be loaded or saved safely."""
 
 
-def _clean_string(value: object, field_name: str, *, required: bool = False) -> str:
-    if value is None:
-        text = ""
-    elif isinstance(value, str):
-        text = value.strip()
-    else:
-        raise ProjectError(f"segment field '{field_name}' must be a string")
-    if required and not text:
-        raise ProjectError(f"segment field '{field_name}' must not be empty")
-    return text
+def _absolute_lexical_path(file_path: Path) -> Path:
+    """Return an absolute selection without resolving symlinks or real paths."""
+
+    expanded = Path(file_path).expanduser()
+    return Path(os.path.abspath(os.fspath(expanded)))
 
 
-def _segment_from_mapping(entry: object, index: int) -> EditorSegment:
-    if not isinstance(entry, dict):
-        raise ProjectError(f"segment {index + 1} must be an object")
-    mapping = cast(dict[str, object], entry)
-    segment_id = _clean_string(mapping.get("id"), "id") or f"segment-{index + 1}"
-    source = _clean_string(mapping.get("source"), "source", required=True)
-    target = _clean_string(mapping.get("target"), "target")
-    speaker = _clean_string(mapping.get("speaker"), "speaker")
-    confirmed_value = mapping.get("confirmed", False)
-    if not isinstance(confirmed_value, bool):
-        raise ProjectError(f"segment {index + 1} field 'confirmed' must be a boolean")
-    return EditorSegment(
-        id=segment_id,
-        source=source,
-        target=target,
-        speaker=speaker,
-        confirmed=confirmed_value,
-    )
-
-
-def _load_json_project(path: Path) -> EditorProject:
-    try:
-        payload = cast(object, json.loads(path.read_text(encoding="utf-8-sig")))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ProjectError(f"unable to read JSON project '{path}': {exc}") from exc
-
-    if isinstance(payload, list):
-        raw_segments = cast(list[object], payload)
-        name = path.stem
-        source_locale = "en-US"
-        target_locale = "zh-CN"
-    elif isinstance(payload, dict):
-        mapping = cast(dict[str, object], payload)
-        raw_segments_value = mapping.get("segments")
-        if not isinstance(raw_segments_value, list):
-            raise ProjectError("JSON project must contain a 'segments' array")
-        raw_segments = cast(list[object], raw_segments_value)
-        name = _clean_string(mapping.get("name"), "name") or path.stem
-        source_locale = _clean_string(mapping.get("source_locale"), "source_locale") or "en-US"
-        target_locale = _clean_string(mapping.get("target_locale"), "target_locale") or "zh-CN"
-    else:
-        raise ProjectError("JSON project root must be an array or object")
-
-    segments = tuple(_segment_from_mapping(entry, index) for index, entry in enumerate(raw_segments))
-    if not segments:
-        raise ProjectError("project contains no translatable segments")
-    try:
-        return EditorProject(
-            name=name,
-            segments=segments,
-            source_locale=source_locale,
-            target_locale=target_locale,
-            path=path,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ProjectError(f"invalid project contract: {exc}") from exc
-
-
-def _load_text_project(path: Path) -> EditorProject:
-    try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except (OSError, UnicodeError) as exc:
-        raise ProjectError(f"unable to read text project '{path}': {exc}") from exc
-    segments = tuple(
-        EditorSegment(id=f"segment-{index}", source=line.strip())
-        for index, line in enumerate((line for line in lines if line.strip()), start=1)
-    )
-    if not segments:
-        raise ProjectError("text project contains no non-empty lines")
-    return EditorProject(name=path.stem, segments=segments, path=path)
+def _format_for_suffix(suffix: str):
+    if suffix == ".json":
+        return LOCALCAT_JSON_V1
+    if suffix == ".txt":
+        return LINE_TEXT_V1
+    raise ProjectError(f"unsupported project format: {suffix or '<none>'}")
 
 
 def load_project(file_path: Path) -> EditorProject:
     """Load a supported local project without mutating any current session."""
 
-    path = file_path.expanduser().resolve()
-    if not path.exists() or not path.is_file():
-        raise ProjectError(f"project file does not exist: {path}")
+    path = _absolute_lexical_path(file_path)
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_PROJECT_SUFFIXES:
-        raise ProjectError(f"unsupported project format: {suffix or '<none>'}")
-    LOGGER.info("Loading editor project from %s", path)
-    return _load_json_project(path) if suffix == ".json" else _load_text_project(path)
+    format_id = _format_for_suffix(suffix)
+    purpose = EffectivePurpose.PROJECT_DOCUMENT
+    try:
+        surface = create_parser_application_surface()
+        opened = surface.open_input(
+            SourceReference(
+                safe_root=str(path.parent),
+                selected_path=str(path),
+                display_hint=path.name,
+            ),
+            SelectionRequest(purpose=purpose, format_id=format_id),
+            ReadRequest(purpose=purpose, format_id=format_id),
+        )
+        if isinstance(opened, SelectionFailure):
+            raise ProjectError(f"unable to read project: {opened.code}")
 
+        header: DocumentHeader | None = None
+        staged_segments: list[ParsedSegment] = []
+        with opened:
+            session = opened.stream()
+            try:
+                for event in session:
+                    if type(event) is DocumentHeader:
+                        header = event
+                    elif type(event) is ParsedSegment:
+                        staged_segments.append(event)
+                _ = session.verified_terminal()
+            finally:
+                session.close()
 
-def _project_payload(project: EditorProject) -> dict[str, object]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "name": project.name,
-        "source_locale": project.source_locale,
-        "target_locale": project.target_locale,
-        "segments": [
-            {
-                "id": segment.id,
-                "source": segment.source,
-                "target": segment.target,
-                "speaker": segment.speaker,
-                "confirmed": segment.confirmed,
-            }
-            for segment in project.segments
-        ],
-    }
+        if header is None:
+            raise ProjectError("unable to read project: verified document header is missing")
+        project = EditorProject(
+            name=header.name,
+            source_locale=header.source_locale or "en-US",
+            target_locale=header.target_locale or "zh-CN",
+            segments=tuple(
+                EditorSegment(
+                    id=segment.local_id,
+                    source=segment.source,
+                    target=segment.target if segment.target is not None else "",
+                    speaker=segment.speaker.value,
+                    confirmed=(
+                        segment.translation_state is TranslationState.CONFIRMED
+                    ),
+                )
+                for segment in staged_segments
+            ),
+            path=path,
+        )
+    except ProjectError:
+        raise
+    except (ContractViolation, OSError, TypeError, ValueError) as exc:
+        raise ProjectError(f"unable to read project '{path}': {exc}") from exc
+    LOGGER.info("Loaded editor project from %s", path)
+    return project
 
 
 def save_project(project: EditorProject, file_path: Path) -> Path:
     """Atomically save a project in LocalCAT's versioned JSON format."""
 
-    path = file_path.expanduser().resolve()
+    path = _absolute_lexical_path(file_path)
     if path.suffix.lower() != ".json":
         raise ProjectError("editor projects can only be saved as .json")
     try:
+        document = CanonicalDocumentWrite(
+            name=project.name,
+            source_locale=project.source_locale,
+            target_locale=project.target_locale,
+            segments=tuple(
+                CanonicalSegmentWrite(
+                    local_id=segment.id,
+                    source=segment.source,
+                    target=segment.target,
+                    speaker=RawSpeaker(segment.speaker),
+                    confirmed=segment.confirmed,
+                )
+                for segment in project.segments
+            ),
+        )
+        surface = create_parser_application_surface()
+        prepared = surface.prepare_canonical(
+            EffectivePurpose.PROJECT_DOCUMENT,
+            CanonicalSerializeRequest(
+                format_id=LOCALCAT_JSON_V1,
+                document=document,
+            ),
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
-        rendered = json.dumps(_project_payload(project), ensure_ascii=False, indent=2) + "\n"
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            _ = handle.write(rendered)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except (OSError, TypeError, ValueError) as exc:
-        if "temp_path" in locals():
-            Path(temp_path).unlink(missing_ok=True)
+        _ = prepared.write(
+            TargetReference(
+                safe_root=str(path.parent),
+                selected_path=str(path),
+                display_hint=path.name,
+            ),
+        )
+    except (ContractViolation, OSError, TypeError, ValueError) as exc:
         raise ProjectError(f"unable to save project '{path}': {exc}") from exc
     LOGGER.info("Saved editor project to %s", path)
     return path

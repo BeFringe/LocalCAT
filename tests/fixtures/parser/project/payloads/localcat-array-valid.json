@@ -1,0 +1,14 @@
+[
+  {
+    "id": " intro ",
+    "source": " Hello  world ",
+    "target": " 你好 ",
+    "speaker": " Narrator ",
+    "confirmed": true
+  },
+  {
+    "source": "Second source",
+    "target": null,
+    "speaker": null
+  }
+]

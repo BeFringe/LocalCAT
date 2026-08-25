@@ -433,6 +433,25 @@ class QtSettingsDialogTest(unittest.TestCase):
             self.assertGreater(table.columnWidth(5), small_path_width)
             dialog.close()
 
+    def test_resource_storage_hint_uses_remaining_width_without_semicolon_wrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            dialog.resize(1040, 680)
+            dialog.show()
+            self.app.processEvents()
+            storage_hint = dialog.findChild(QLabel, "resourceStorageHint")
+            self.assertIsNotNone(storage_hint)
+            assert storage_hint is not None
+
+            self.assertNotIn("；", storage_hint.text())
+            self.assertGreaterEqual(storage_hint.width(), 700)
+            self.assertLessEqual(
+                storage_hint.height(),
+                storage_hint.fontMetrics().lineSpacing() * 2,
+            )
+            dialog.close()
+
     def test_more_button_is_compact_accessible_and_action_column_does_not_stretch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = self._controller(Path(temp_dir))
@@ -709,9 +728,8 @@ class QtSettingsDialogTest(unittest.TestCase):
             delete_action = next(
                 action for action in menu.actions() if action.text() == "删除资源"
             )
-            with patch.object(
-                QMessageBox,
-                "question",
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
                 return_value=QMessageBox.StandardButton.Yes,
             ):
                 delete_action.trigger()
@@ -738,9 +756,8 @@ class QtSettingsDialogTest(unittest.TestCase):
                 action for action in menu.actions() if action.text() == "删除资源"
             )
 
-            with patch.object(
-                QMessageBox,
-                "question",
+            with patch(
+                "qt_settings_dialog._ask_localized_question",
                 return_value=QMessageBox.StandardButton.Cancel,
             ):
                 delete_action.trigger()

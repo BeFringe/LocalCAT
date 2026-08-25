@@ -21,7 +21,7 @@ LocalCAT 可安装一个独立、可禁用的跨端同步插件。用户选择�
 
 ## Approach
 
-定义稳定的同步插件边界、provider 能力与项目包清单，由插件协调本地 snapshot、远程 listing、差异计划、冲突决策和提交。首批优先 S3-compatible 与 WebDAV，其他 provider 后续独立扩展。借鉴 Remotely Save 的 provider、增量同步、保护阈值和可选加密思路，但不复制其 Obsidian 状态模型，也不依赖其 PRO 代码。
+定义稳定的同步插件边界、provider 能力与 opaque transport snapshot/index，由插件协调本地已批准 package bytes、远程 listing、差异计划、冲突决策和提交。首批优先 S3-compatible 与 WebDAV，其他 provider 后续独立扩展。借鉴 Remotely Save 的 provider、增量同步、保护阈值和可选加密思路，但不复制其 Obsidian 状态模型，也不依赖其 PRO 代码；插件不得另造 ProjectPackage/ResourcePackage manifest authority。
 
 ## Scope
 
@@ -35,7 +35,7 @@ LocalCAT 可安装一个独立、可禁用的跨端同步插件。用户选择�
 - provider 只负责远程列举、读写、删除和 metadata；
 - sync planner 产生只读计划，用户批准后才执行；
 - conflict record 保留 local/remote/base 信息，不以 modified time 直接静默覆盖；
-- chunk metadata 可作为项目包成员，但 chunk 语义仍归协作规格。
+- chunk metadata 只有在协作规格以及新的 ProjectPackage schema/version 或明确 extension 共同批准后才可作为可运输成员；strict v1 不预埋该字段，chunk 语义始终归协作规格。
 
 ## Out of Boundary
 
@@ -49,7 +49,7 @@ LocalCAT 可安装一个独立、可禁用的跨端同步插件。用户选择�
 
 ## Upstream / Downstream
 
-- **Upstream**: `multi-document-project-workspace` 的稳定项目包、原子保存和 source reconciliation；资源仓储的可验证导入导出。
+- **Upstream**: `multi-document-project-workspace` 的稳定 ProjectPackage、原子保存和 source reconciliation；`language-resource-portability` 批准的 ResourcePackage 与资源 import/apply transaction。
 - **Downstream**: 多设备个人工作流；未来可选择同步 `collaborative-job-chunks` metadata，但不提供协作权限。
 
 ## Existing Spec Touchpoints
@@ -65,7 +65,7 @@ Remotely Save 的 `src/tests/docs/assets` 采用 Apache-2.0，而 `pro` 目录�
 
 ## Promotion Clusters
 
-1. plugin host、同步 package manifest 与本地 snapshot/import boundary；
+1. plugin host、opaque transport snapshot/index 与本地 package import boundary；
 2. provider capability、planner、凭据与加密；
 3. apply/recovery、冲突保护和操作日志；
 4. Qt 预览/确认与真实 provider acceptance。
