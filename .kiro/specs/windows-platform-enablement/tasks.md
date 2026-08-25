@@ -1,13 +1,13 @@
 # 实施计划
 
-> **PROVISIONAL / NO-GO**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。W1/W2/W3 已获用户批准作为临时命名基线，但任务生成和命名批准不等于 Requirements、Design、正式 ADR、scope 或 amendment 获批；任务 0.1～0.5 全部闭合前不得执行实现任务。owner 指 Spec/branch/合同 authority，不指 Agent 或 thread；可用独立执行 Agent 做 native scout、实现或对抗性评审，但不能借此跨越 owning Spec。实施/累计复审节奏见 `review-clustering.md`。
+> **PROVISIONAL / NO-GO**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。W1/W2/W3 已获用户批准作为临时命名基线，但任务生成和命名批准不等于 Requirements、Design、正式 ADR、scope 或 amendment 获批；任务 0.1～0.5 全部闭合前不得执行实现任务。owner 指 Spec/branch/合同 authority，不指 Agent 或 thread；Parent可按需派发只读scout、Implementer或Cumulative reviewer，但不能借此跨越 owning Spec。实施/累计复审节奏见 `review-clustering.md`。
 
 - [ ] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
 
-- [ ] 0.1 由 Governance owner 将已批准临时命名的 W1/W2/W3 定型为正式 ADR
-  - W1 固定 live-handle identity、handle/share profiles、`CREATE_IF_ABSENT`/`REPLACE_UNDER_LOCK`、非 expected-ID CAS threat scope、candidate rename→close→reopen、稳定错误和首版本地 NTFS durability success boundary
-  - W2 固定 TokenUser/owner SID、精确 DACL/AccessCheck、standard/elevated/local/domain/AzureAD matrix、FileId reuse 反例，以及 digest/phase/private/device-secret persistent receipt schema
-  - W3 固定 embedded bootstrap trust root、`TrustedSourceAuthority`、external `.py` loader/closure、build owner、onedir release gate；明确 ADR-011 只拥有 Feature 5/UI composition
+- [ ] 0.1 由 Governance owner 完成人工审阅并采纳 ADR-020/W1、ADR-021/W2、ADR-022/W3 草案
+  - W1 固定 live-handle identity、handle/share profiles、protocol-control lock exact ACL与可恢复首次初始化、`CREATE_IF_ABSENT`/`REPLACE_UNDER_LOCK`、retained readback→durable owner commit→terminal reproof、非 expected-ID CAS threat scope、稳定错误和版本化 `DurabilityProfile`
+  - W2 固定 TokenUser/owner SID、`windows-private-v1` exact DACL/AccessCheck、standard/elevated/local/domain/AzureAD matrix、FileId reuse反例及只作为业务envelope子记录的`WindowsPrivateProof`；明确其Windows物理谓词对ADR-013/016的部分取代范围
+  - W3 固定native entry在首次Python DLL/非KnownDLL load前的DLL policy、完整Boot TCB、`TrustedSourceAuthority`、retained-handle exact-byte `TrustedSourceLoader`、external `.py` closure、clean/content-addressed build provenance、onedir release gate；明确ADR-020依赖及ADR-011只拥有Feature 5/UI composition
   - 完成时，三个正式 ADR 编号、批准 revision 和取代/相交关系可从治理分支唯一追踪；任一未决即保持 NO-GO
   - _Requirements: 1.2, 2.1, 2.3, 3.4, 4.1, 4.2, 8.5, 8.6, 10.1, 10.6, 12.3_
   - _Boundary: Governance ADR Ownership_
@@ -29,7 +29,7 @@
   - _Depends: 0.1, 0.2_
 
 - [ ] 0.3b 派发 persistence/recovery amendments
-  - 派发 WA-03 Project、WA-04 Resource、WA-05 TMX、WA-06 TM Core，附 publish mode、owner lease、power-cut boundary、W2 receipt 和 FileId reuse 反例
+  - 派发 WA-03 Project、WA-04 Resource、WA-05 TMX、WA-06 TM Core，附 publish mode、owner lease、`DurabilityProfile`、owner-specific receipt + nested W2 proof和FileId reuse反例
   - 明确每项 R/D/T suffix、merge dependency、zero-mutation/recovery evidence；WA-05 必须使用任务 0.2批准的唯一 owner
   - 完成时，四项 dispatch 均有 owning branch acknowledgement；缺一项不得进入任务 5/6
   - _Requirements: 3.1, 4.1, 4.3, 5.1, 7.1, 8.1, 8.4, 9.1_
@@ -53,7 +53,7 @@
   - _Depends: 0.3a, 0.3b, 0.3c_
 
 - [ ] 0.5 完成独立对抗性设计评审并取得人工 Design approval
-  - 由未参与主设计的 reviewer/Agent 重放 bootstrap chicken-and-egg、candidate self-sharing、pre-snapshot non-CAS、真实断电、FileId reuse、ACL token 与 SourceFileLoader duplicate 反例
+  - 由未参与实现上下文的Cumulative reviewer重放native-entry/Python-DLL时序与bootstrap TCB/chicken-and-egg、lock首次初始化/creator crash、candidate self-sharing、readback→commit窗口、pre-snapshot non-CAS、真实断电profile映射、FileId reuse、exact ACL/token与source/bytecode duplicate反例
   - 所有 blocker 必须在 Requirements/Design/ADR/ledger 中得到可执行处置；只写 Implementation Notes 或说明“实现时再看”不构成关闭
   - 完成时，review disposition、剩余风险、Design approval 和 `spec.json` 状态一致，才允许任务 1及以后开始
   - _Requirements: 1.2, 2.3, 4.2, 8.5, 10.3, 12.2, 12.3_
@@ -78,17 +78,17 @@
   - _Boundary: Windows Evidence and Diagnostic Contract_
   - _Depends: 1.1_
 
-- [ ] 1.3 (P) 用 native scout 固定低密度 Windows 场景与迁移清单
+- [ ] 1.3 (P) 固定低密度 Windows 场景与迁移清单
   - 扫描 production/tests 中 `fcntl/flock/dir_fd/O_DIRECTORY/O_NOFOLLOW/directory fsync/st_dev/st_ino` 与 CWD/checkout resource path，按 owning Spec 和 amendment ID分类
   - 扩充 target-open、self-sharing、kill release、junction/reparse/hardlink/ancestor swap、FileId reuse、ACL token、power-cut与 frozen visibility 场景清单
   - 完成时，清单能追踪到具体 consumer、合同/反例、owner、task 和 evidence key；不得把静态无命中当 runtime pass
   - _Requirements: 2.2, 2.3, 3.2, 4.4, 5.2, 10.2, 11.5, 12.2, 12.4_
-  - _Boundary: Native Scenario Inventory_
+  - _Boundary: Windows Scenario Inventory_
   - _Depends: 1.1_
 
 - [ ] 1.4 在完整实现前完成最小 PyInstaller frozen-source/bootstrap spike
-  - 使用 W3批准版本的 CPython 3.14.x + PyInstaller 6.22.x，仅构建 embedded bootstrap、一个 `module_collection_mode='py'` critical module 和一个 fixture
-  - 证明 loader exact type、`__file__/spec.origin/loader.path/co_filename` 一致、无 PYZ duplicate、非仓库 CWD启动、manifest digest/handle-read，以及 bundle ancestor/source/fixture reparse/swap/tamper fail closed
+  - 使用W3批准版本的CPython 3.14.x + PyInstaller 6.22.x，仅构建完整声明的最小Boot TCB、一个`module_collection_mode='py'` critical module和一个fixture；审计native bootloader PE imports/delay-load
+  - 证明native entry在首次Python DLL/非KnownDLL load前排除CWD/PATH并用已绑定bundle绝对路径加载摘要锁定DLL；随后`TrustedSourceLoader`从retained verified handle读取manifest匹配的exact bytes并直接编译执行，attestation/digest与metadata一致且无`.pyc`/`__pycache__`/PYZ duplicate；覆盖pre-entry/late DLL注入、非仓库CWD、reparse/swap/tamper
   - 完成时，全部断言通过并保存 dist inventory；任一失败返回 W3重新审批且停止任务 7，不允许降级 loader/source proof
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.1, 12.3_
   - _Boundary: W3 Minimal Frozen Feasibility Gate_
@@ -97,7 +97,7 @@
 - [ ] 2. 建立共享平台合同与 POSIX parity adapter
 
 - [ ] 2.1 定义 backend-neutral authority、identity、lock、publish 与 private proof 合同
-  - 实现 context-managed opaque authorities、live-only `FileObjectIdentity`、`PersistentFileReceipt` schema port、`PublishMode`/`PublishFacts`、stable `PlatformFileError`
+  - 实现context-managed opaque authorities、live-only`FileObjectIdentity`、opaque private-proof port、`PublishMode`/`PublishFacts`、stable`PlatformFileError`；平台合同不得把business phase/generation/compatibility合并成generic receipt
   - 禁止上层取得 raw HANDLE/dirfd，禁止 platform API宣称 expected-target CAS，关闭后 authority 不可复用
   - 完成时，shape/type/name/error/closed-handle与非法组合合同 tests 全绿
   - _Requirements: 1.2, 2.1, 3.3, 3.5, 4.1, 5.1, 5.3_
@@ -131,8 +131,8 @@
 - [ ] 3. 实现 Windows rooted/lock/private/publish/durability backend
 
 - [ ] 3.1 实现 Win32 FFI wrapper、RAII handle 与受支持主机 Gate
-  - 精确绑定 CreateFileW、GetFileInformationByHandleEx、GetFinalPathNameByHandleW、SetFileInformationByHandle、FlushFileBuffers、LockFileEx/UnlockFileEx、GetSecurityInfo/AccessCheck及结构/错误
-  - 首版只 mint Windows 11 x64 local fixed NTFS；UNC/remote/ReFS/FAT/exFAT或 probe缺失均 `CAPABILITY_UNAVAILABLE`
+  - 精确绑定CreateFileW、GetFileInformationByHandleEx、GetFinalPathNameByHandleW、SetFileInformationByHandle、FlushFileBuffers、LockFileEx/UnlockFileEx、GetSecurityInfo/AccessCheck、storage write-cache query及结构/错误
+  - 首版只mint匹配批准`DurabilityProfile`的Windows 11 x64 local fixed NTFS；UNC/remote/ReFS/FAT/exFAT、unknown cache/flush/write-through/power-protection facts或probe缺失均`CAPABILITY_UNAVAILABLE`
   - 完成时，结构尺寸/argtypes/restype/last-error/close-on-failure、自检和 unsupported matrix 全绿
   - _Requirements: 1.2, 2.1, 2.2, 3.1, 4.2_
   - _Boundary: Windows Native API and Host Gate_
@@ -147,32 +147,33 @@
   - _Depends: 3.1_
 
 - [ ] 3.3 (P) 实现 LockFileEx persistent lease 与 crash release
-  - lock file使用 deterministic name、single-link/private proof/payload/entry identity，文件永久保留且不 unlink/replace
+  - lock file使用W1 exact protocol-control ACL（well-known SID bytes、AceFlags/control bits）、deterministic name、single-link/`ProtocolControlLockPayloadV1`/entry identity，文件永久保留且不unlink/replace；不得反向依赖W2 attestation private proof
+  - 首次creator用`CREATE_NEW`+share-none init handle写完整可重算payload并flush/readback；loser bounded retry。creator crash后仅空/expected strict-prefix/完整expected bytes可在exclusive init handle下确定性恢复，unknown bytes fail closed；恢复后必须重新打开普通LOCK profile
   - 实现明确 byte range、blocking/timeout/contention结果；normal unlock/close与 TerminateProcess 后 eventual release不承诺公平/零延迟
-  - 完成时，双进程 acquire、timeout、payload/FileId tamper、kill/retry与错误映射全绿
+  - 完成时，双进程acquire/timeout、two-creator、create/write/flush/readback/close逐边界crash接管、payload/FileId tamper、kill/retry与错误映射全绿
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 8.3_
   - _Boundary: Windows Process File Lock_
-  - _Depends: 3.1_
+  - _Depends: 3.2_
 
-- [ ] 3.4 (P) 实现 W2 private storage 与跨重启 receipt重新证明
-  - 显式创建 owner=TokenUser SID、protected canonical DACL；精确验证允许 ACE masks/order、SYSTEM/Administrators policy、inheritance、link/reparse/live identity
-  - persistent authority重新绑定 exact bytes/digest、generation/phase、private proof与device-secret MAC；覆盖 delete/recreate/FileId reuse，不信任历史 tuple
-  - 完成时，standard/elevated/local/domain/AzureAD矩阵通过，service/AppContainer/impersonation与未知 ACE/owner/tamper fail closed
+- [ ] 3.4 (P) 实现 W2 private storage 与跨重启 proof重新证明
+  - 对private dir/device key/attestation/candidate显式创建owner=TokenUser SID、DACL present/protected且非defaulted/auto-inherited，exact三条AceFlags=0的TokenUser/`S-1-5-18`/`S-1-5-32-544` `ACCESS_ALLOWED_ACE(FILE_ALL_ACCESS)`；well-known SID由`CreateWellKnownSid`取得，拒绝name lookup、其他control/ACE flags、deny/object/callback/inherited/unknown ACE/principal
+  - `AccessCheck`使用当前primary token复制的`SecurityImpersonation` token；`GENERIC_ALL`经file/directory mapping后必须精确为`FILE_ALL_ACCESS`且全部获准，同SID low-integrity/restricted token不得获write/delete；owner先摘要不含proof的canonical private-context，W2再对proof unsigned projection做domain-separated HMAC，输出`WindowsPrivateProof`并由Gate D/canonical owner分别嵌入自身envelope
+  - 完成时，standard/elevated/local/domain/AzureAD正向矩阵通过，low-integrity/restricted/service/AppContainer/impersonation与未知 ACE/owner/tamper fail closed
   - _Requirements: 1.2, 8.4, 8.5, 8.6_
   - _Boundary: Windows Private Storage and Persistent Re-attestation_
-  - _Depends: 3.1_
+  - _Depends: 3.2_
 
 - [ ] 3.5 实现 handle-bound publish 的两个模式与精确生命周期
   - candidate `CREATE_NEW`/share=none，完成 write+FlushFileBuffers；支持 create-if-absent与持有resource-family lease的replace-under-lock
-  - 严格执行 rename→capture final facts→close every candidate handle→reopen/readback；pre-snapshot只作 stale/recovery fact，不声称 CAS
+  - 严格执行rename→capture final facts→close every candidate handle→reopen/readback并保留no-write/no-delete destination handle→owner durable commit→terminal identity/digest/state reproof；pre-snapshot只作stale/recovery fact，不声称CAS
   - 完成时，同进程 close前reopen得到预期 sharing violation，close后成功；协作writer被lease排除，不合作instruction-boundary swap只产生检测失败/recovery-required
   - _Requirements: 3.4, 4.1, 4.3, 4.4, 4.5_
   - _Boundary: Windows Bound Publisher_
-  - _Depends: 3.2, 3.3, 3.4_
+  - _Depends: 3.2, 3.3_
 
 - [ ] 3.6 在真实 reboot 边界批准 NTFS durability success contract
-  - 在 disposable VM/VHD或批准物理lab分别于 content flush、arm、rename、candidate close、metadata commit、cleanup边界执行 forced power-off/reboot
-  - 每次重启只接受完整old、完整new或owner recovery-only；无法证明success boundary的host/volume在arm前返回 `DURABILITY_UNAVAILABLE`，arm后不确定返回 `RECOVERY_REQUIRED`
+  - 生成release-owned版本化`DurabilityProfile`，把Windows build、NTFS/volume、storage bus/controller、write-cache、write-through、flush与power-protection facts绑定到disposable VM/VHD或批准物理lab的forced power-off/reboot evidence family
+  - runtime必须精确匹配该profile且每次重启只接受完整old、完整new或owner recovery-only；只匹配filesystem name、unknown/changed cache facts或无法映射evidence family时，arm前返回`DURABILITY_UNAVAILABLE`，arm后不确定返回`RECOVERY_REQUIRED`
   - 完成时，W1定义与实际matrix一致且可复现；process kill/fault injection仅作为补充，不能替代此门
   - _Requirements: 4.2, 4.3, 4.5, 7.4, 8.4, 12.2, 12.3_
   - _Boundary: Windows NTFS Power-Cut Durability Gate_
@@ -180,11 +181,11 @@
 
 - [ ] 3.7 运行共享合同与完整 Windows 对抗性矩阵
   - 覆盖 rooted、share、lock、private、publish、identity reuse、target-open、kill、fault/power和resource cleanup，mandatory case不得 skip
-  - 由独立 reviewer核对日志事实与稳定 code，特别验证没有 path-only proof、expected-CAS宣称、share扩大或 FileId永久化
+  - 由Cumulative reviewer核对日志事实与稳定code，特别验证没有path-only proof、expected-CAS宣称、share扩大、FileId永久化或W1/W2依赖循环
   - 完成时，Windows adapter可由factory mint；任何 mandatory失败保持 capability unavailable
   - _Requirements: 1.2, 2.2, 2.3, 3.1, 4.3, 4.4, 5.4, 12.2, 12.3_
   - _Boundary: Windows Platform Capability Gate_
-  - _Depends: 3.6_
+  - _Depends: 3.4, 3.6_
 
 - [ ] 4. 合并 Parser/Chunk amendments并恢复 source Qt启动
 
@@ -281,7 +282,7 @@
   - _Depends: 6.1_
 
 - [ ] 6.3 验证W2 attestation、FileId reuse与device-local恢复
-  - restart时重新证明exact bytes/digest、generation/phase、private DACL和device-secret MAC；历史Volume/FileId只作反例/diagnostic
+  - restart时由Gate D/canonical owner分别重验自身compatibility或generation/phase envelope、exact bytes/digest及nested `WindowsPrivateProof`/device-secret MAC；历史Volume/FileId只作反例/diagnostic
   - 覆盖delete/recreate复用、owner/ACE/inheritance/link/reparse/volume/tamper、standard/elevated/domain/AzureAD token；不可证明则fail closed且不回落legacy
   - 完成时，合法authority恢复，任何弱路径/token/identity替代均被拒绝
   - _Requirements: 8.2, 8.4, 8.5, 8.6_
@@ -308,22 +309,22 @@
 
 - [ ] 7.1 生成deterministic frozen source/fixture/data manifest
   - 从approved owner roots解析Gate A/C/D、benchmark contract与dynamic import递归闭包，记录schema/commit/reason/relative path/kind/SHA-256和UTF-8排序
-  - critical modules只允许source-only collection，无未声明duplicate/PYZ copy；missing、extra、digest drift或closure cycle失败build
+  - production build要求clean tracked tree；spec/hooks/generator/bootstrap/owner roots、locked wheels、bootloader/Python/native runtime全部content-addressed。critical modules只允许source-only collection，无`.pyc`/`__pycache__`/未声明PYZ duplicate
   - 完成时，manifest generator可重复产生byte-identical output并覆盖真实`.py`、JSON/TXT fixtures及获批tm/terms/logo/benchmark assets
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 11.2, 11.5_
   - _Boundary: Frozen Source Manifest_
   - _Depends: 1.4, 6.5_
 
-- [ ] 7.2 实现embedded bootstrap到CapabilityHost的可信handoff
-  - launcher先用直接Win32 bootstrap绑定bundle/manifest/source/fixture handles、拒绝ancestor/final reparse/swap并验证embedded manifest digest，再mint不可序列化`TrustedSourceAuthority`
-  - 外置CapabilityHost收到authority后验证loader/origin/co_filename/digest/Gate closure；任何失败不导入或授权相关能力
-  - 完成时，bootstrap不依赖待验证adapter，source/fixture handle-read、tamper/reparse/duplicate/circular-trust tests全绿
+- [ ] 7.2 实现native boot entry到CapabilityHost的可信handoff
+  - release-owned native bootloader审计entry前PE imports/delay-load，在首次Python DLL/非KnownDLL load前固定搜索、拒绝CWD/PATH、绑定bundle/native目录并以受限绝对路径加载摘要锁定DLL；随后把bundle/DLL attestation交给Python bootstrap闭合其余Boot TCB/source/fixture handles
+  - `TrustedSourceLoader`从retained handle读取、摘要并直接编译exact `.py` bytes后mint不可序列化`TrustedSourceAuthority`；外置CapabilityHost验证loader attestation/source digest/origin/co_filename/Gate closure，不以metadata相等代答executed bytes
+  - 完成时，bootstrap不导入待验证adapter但满足W1 invariants，Boot TCB/source/fixture handle-read、bytecode/PYZ、tamper/reparse/DLL injection/circular-trust tests全绿
   - _Requirements: 1.2, 10.1, 10.2, 10.3, 10.5, 10.6_
-  - _Boundary: Frozen Bootstrap Trust Handoff_
+  - _Boundary: Native Boot and Frozen Trust Handoff_
   - _Depends: 7.1_
 
 - [ ] 7.3 建立受版本控制的Windows PyInstaller build definition
-  - 使用`--onedir --windowed`、独立locked build requirements、custom spec/hook、source-only module map；不把PyInstaller/xlwings加入UI runtime requirements
+  - 使用`--onedir --windowed`、独立locked build requirements、custom spec/hook与必要的release-owned/customized native bootloader、source-only module map；clean tracked input与所有实际build inputs/dists均有digest，不把PyInstaller/xlwings加入UI runtime requirements
   - 收集Qt实际plugins与`platforms/qwindows.dll`、`.ico`、version metadata和mandatory data；不从build checkout绝对路径读取runtime依赖
   - 完成时，clean build venv可由单组PowerShell命令重建相同layout，build exit 0不替代runtime gates
   - _Requirements: 1.5, 6.1, 6.4, 11.1, 11.2, 11.4_
@@ -331,7 +332,7 @@
   - _Depends: 7.2_
 
 - [ ] 7.4 验证dist可见性、资源fallback与repository-path absence
-  - inventory验证qwindows、critical `.py`、fixtures、tm/terms/logo/benchmark、ico/version和实际Qt plugins；assert loader exact identity与无PYZ duplicate
+  - inventory验证qwindows、critical `.py`、fixtures、tm/terms/logo/benchmark、ico/version和实际Qt plugins；assert retained-handle loader attestation、exact executed-source digest与无`.pyc`/PYZ duplicate
   - 验证真实Qt avatar catalog在Windows索引/解码匹配头像，无匹配头像时显示“— / 无内置头像”；从non-repository CWD/clean environment启动且不访问source checkout
   - 完成时，missing/extra/tamper/checkout-access均令release validator失败并列出精确artifact
   - _Requirements: 6.4, 6.5, 10.3, 10.5, 11.2, 11.3, 11.4, 11.5_
@@ -381,7 +382,7 @@
   - _Depends: 8.1_
 
 - [ ] 8.5 重算frozen Gate并验证完整source/resource visibility
-  - 在dist内重算Gate A/C/D与benchmark contract，逐项验证raw `.py` loader、fixture handle identity/digest、data/assets和bundle root
+  - 在dist内重算Gate A/C/D与benchmark contract，逐项验证raw `.py` retained-handle/executed-byte binding、fixture handle identity/digest、Boot TCB、data/assets和bundle root
   - 修改manifest/source/fixture、插入bundle junction/reparse、制造PYZ duplicate或从checkout提供缺失文件都必须fail closed
   - 完成时，source runtime与frozen Gate结果符合approved contract且zero mandatory skip
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.5_
@@ -414,8 +415,8 @@
   - _Boundary: Final Reproducible Evidence Package_
   - _Depends: 9.2_
 
-- [ ] 9.4 完成独立对抗性实现评审与最终治理差异核对
-  - reviewer从Requirements/Design/ADRs/ledger反向检查实际tree/runtime，重放bootstrap、share/CAS、ACL/FileId、power-cut、Windows source/EXE与Mac/Linux红线
+- [ ] 9.4 完成累计对抗性实现评审与最终治理差异核对
+  - Cumulative reviewer从Requirements/Design/ADRs/ledger反向检查实际tree/runtime，重放Boot TCB/executed-byte binding、share/CAS、ACL/FileId、durability profile、Windows source/EXE与Mac/Linux红线
   - 检查所有WA merge identity、WR evidence、Steering sync与实际delta；实施期新增跨门槛事实必须回到ADR/Spec审批，不能用Implementation Notes补授权
   - 完成时，无unresolved blocker/major、无未批准delta、diff/checksum/branch tree一致；否则保持NO-GO
   - _Requirements: 1.2, 5.1, 10.3, 12.2, 12.3, 12.5_

@@ -31,9 +31,9 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 | Cluster | Tasks | 共享心智模型 / 验证目标 | impl | review |
 |---|---|---|---|---|
 | **C0 — Governance, ownership and dispatch** | 0.1～0.5 | W1/W2/W3正式promotion、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
-| **C1 — Baseline and frozen feasibility** | 1.1～1.4 | b925b80现场矩阵、portable evidence schema、Windows API inventory与最小bootstrap/SourceFileLoader spike | `high` | `xhigh` |
+| **C1 — Baseline and frozen feasibility** | 1.1～1.4 | b925b80现场矩阵、portable evidence schema、Windows API inventory与native-entry/最小Boot TCB/TrustedSourceLoader spike | `high` | `xhigh` |
 | **C2 — Shared contracts and POSIX parity** | 2.1～2.4 | opaque authority/identity/lock/publish/private contracts、POSIX characterization/extraction、composition fail-closed | `high` | `high` |
-| **C3 — Windows native capability** | 3.1～3.7 | Win32 handle/rooted/share/lock/ACL/publish、FileId reuse、rename→close→reopen、真实power-cut durability与反例闭包 | `xhigh` | `xhigh` |
+| **C3 — Windows native capability** | 3.1～3.7 | Win32 handle/rooted/share/lock首次初始化与crash接管/ACL/publish、FileId reuse、rename→close→reopen、真实power-cut durability与反例闭包 | `xhigh` | `xhigh` |
 | **C4 — Startup and Source/Writer** | 4.1～4.4 | WA-02移除`fcntl`启动阻塞、WA-01 Parser rooted Source/Writer、Chunk recovery、真实Qt source startup | `high` | `xhigh` |
 | **C5 — Project, Resource and TMX persistence** | 5.1～5.5 | WA-03/04/05、owner lease、deterministic carrier、canonical save/import、old/new/recovery-only | `xhigh` | `xhigh` |
 | **C6 — TM authority and UI composition** | 6.1～6.5 | WA-06/07、initial activation、唯一generation、W2 re-attestation、FTS5 reopen与CapabilityHost handoff | `xhigh` | `xhigh` |
@@ -64,7 +64,8 @@ C0 Governance
 
 - C4的第一个可观察目标“Qt source window可以启动”直接依赖WA-02删除Chunk顶层`fcntl`；WA-01不代答该import阻塞，但后续Project/TMX/source workflow必须实际使用WA-01 rooted Source/Writer。
 - C3的process fault tests不代答power-cut durability；C5/C6只有在W1批准的真实reboot success boundary下才能声称durable publication。
-- C1的外置`.py`存在不代答source trust；C7必须实际消费bootstrap铸造的`TrustedSourceAuthority`并运行loader/origin/co_filename/fixture handle-read验证。
+- C3的LockFileEx正常crash release不代答首次载体初始化；必须独立覆盖two-creator与create/write/flush/readback/close各边界creator crash接管。
+- C1的外置`.py`存在不代答source trust；C7必须实际消费bootstrap铸造的`TrustedSourceAuthority`并运行retained-handle/executed-byte、loader attestation、origin/co_filename与fixture handle-read验证。
 - C6的SQLite compile option不代答FTS5；C8/C10必须用真实published store执行create/MATCH/close/reopen业务查询。
 - C8的source runtime PASS不代答EXE；C10只接受同一dist、non-repository CWD、clean user的完整业务旅程。
 

@@ -50,8 +50,8 @@
 
 ## Governance Impact
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`release-governance.md`、`project-principles.md`、`repository-safety.md`。
-- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019。
-- **ADR disposition**: **New candidates W1/W2/W3 — APPROVED_FOR_BASELINE_NAMING**；用户已批准临时标签作为本 Spec 基线引用，但尚未批准为正式 adopted ADR。详见 `research.md#governance-candidates`。W1/W2 改变实现边界与持久身份表示；W3 建立跨 Spec frozen distribution 长期所有权。
+- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019；ADR-020/W1、ADR-021/W2、ADR-022/W3（治理分支草案，均未采纳）。
+- **ADR disposition**: **New draft ADR-020/021/022 — NO-GO**；用户只批准 W1/W2/W3 临时标签作为本 Spec 基线引用，三个标签现已唯一映射到治理分支草案，但尚未批准为 adopted ADR。详见 `research.md#governance-candidates`。ADR-020/021 改变实现边界与持久身份表示；ADR-022 建立跨 Spec frozen distribution 长期所有权。
 - **Scope amendment**: **Pending**；`windows-platform-enablement` 尚未记录于 `.kiro/steering/spec-ownership.md` 和 `.kiro/steering/roadmap.md`。
 - **Steering sync**: Required；由 governance/steering owner 在获批后更新 `spec-ownership.md`、`roadmap.md`、必要时 `tech.md`/`structure.md`。本 feature branch 不自行修改 steering。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
@@ -189,13 +189,14 @@ class EntrySnapshot:
     reparse_free: bool
 
 @dataclass(frozen=True, slots=True)
-class PersistentFileReceipt:
+class WindowsPrivateProof:
     schema: int
-    content_sha256: bytes
-    byte_count: int
-    owner_phase: str
-    generation: str
-    private_proof_digest: bytes
+    object_role: str
+    acl_profile_id: str
+    owner_sid_sha256: bytes
+    authority_descriptor_sha256: bytes
+    owner_context_sha256: bytes
+    device_key_id: bytes
     device_secret_mac: bytes
 
 class PlatformFileError(RuntimeError):
@@ -206,7 +207,7 @@ class PlatformFileError(RuntimeError):
 - `FileObjectIdentity` 只比较同时存活、已验证 handles 是否指向同一对象；它不是跨重启 receipt，也不是 globally permanent UUID。Windows FileId 在删除后可复用，持久状态不得单独保存/信任该 tuple。
 - Windows `file_id` 必须来自 `FILE_ID_INFO`，不得从 pathname hash 或 64-bit `nFileIndex*` 降级。
 - `modified_token` 仅用于 stale detection；authority 仍由 open handle + identity + content proof 组成。
-- `PersistentFileReceipt` 的字段/编码由 W2 与 owning business Spec 固定；恢复时必须重新打开当前对象并同时验证 exact bytes/digest、phase/generation、private proof 与 device-secret MAC。历史 FileId 只能是诊断或反例输入，不能单独铸造 authority。
+- `WindowsPrivateProof` 只证明 Windows 私有存储表示和 owner 提供的 opaque context digest，不解释 content、phase、generation 或 Gate compatibility。owner先对不含本proof的canonical private-context bytes取SHA-256；W2再对domain tag与proof中除MAC外的canonical字段执行HMAC-SHA256，避免self-MAC。Gate D envelope 继续归 ADR-013，canonical activation/re-attestation envelope 继续归 ADR-016 与 TM owner；各 owner 把完整proof作为子记录嵌入自己的版本化receipt，并在恢复时同时重验业务字段、exact bytes与本proof。历史FileId只能是诊断或反例输入，不能单独铸造authority。
 
 ### Service Interfaces
 
@@ -246,7 +247,7 @@ class PrivateStorageProof(Protocol):
 ## Windows Native Adapter
 
 ### Supported Host Gate
-首版 capability 仅在以下事实全部成立时 mint：Windows 11 desktop、CPython x64、local fixed **NTFS** volume、`FILE_ID_INFO`/reparse/ACL/handle-relative rename/LockFileEx 可用，且 W1 的真实 power-cut/reboot durability lane 已批准该主机/volume policy。ReFS 只有在取得独立同等矩阵和 ADR amendment 后进入支持范围。UNC、remote、ReFS（首版）、FAT/exFAT、缺少 security descriptor support 或 probe 失败均返回 `PLATFORM.FS.CAPABILITY_UNAVAILABLE`，由业务映射既有 safe code。
+首版 capability 仅在以下事实全部成立时 mint：Windows 11 desktop、CPython x64、local fixed **NTFS** volume、`FILE_ID_INFO`/reparse/ACL/handle-relative rename/LockFileEx 可用，并且 runtime facts 精确匹配 W1 批准的版本化 `DurabilityProfile`。该 profile 由 release owner 把 Windows build、NTFS/volume、storage bus/controller、write-cache、write-through、flush 与 power-protection facts 绑定到真实 forced-power-off/reboot evidence family；只看文件系统名称或在实验机通过都不能授权另一主机。unknown/changed cache facts、profile mismatch 或无法查询均返回 `PLATFORM.FS.DURABILITY_UNAVAILABLE`。ReFS 只有在取得独立同等矩阵和 ADR amendment 后进入支持范围；UNC、remote、ReFS（首版）、FAT/exFAT、缺少 security descriptor support 或 probe 失败均 fail closed。
 
 ### Handle Profiles
 
@@ -291,18 +292,20 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> ParentBound
-    ParentBound --> CandidateCreated: CREATE_NEW + private proof
+    ParentBound --> CandidateCreated: CREATE_NEW + requested security profile
     CandidateCreated --> CandidateFlushed: write + FlushFileBuffers
     CandidateFlushed --> Armed: journal/LKG protocol owns intent
     Armed --> RenamedHandleHeld: SetFileInformationByHandle relative to bound parent
     RenamedHandleHeld --> CandidateClosed: capture final facts + close every candidate handle
-    CandidateClosed --> Readback: reopen destination + candidate FileId/digest
-    Readback --> Committed: business metadata commit
-    Committed --> Clean: owned residue cleanup
+    CandidateClosed --> ReadbackHeld: reopen destination + candidate FileId/digest
+    ReadbackHeld --> Committed: retain handle + durable business metadata commit
+    Committed --> TerminalReproved: final identity/digest/owner-state reproof
+    TerminalReproved --> Clean: close handle + owned residue cleanup
     CandidateCreated --> Failed: write/flush failure
     Armed --> RecoveryRequired: rename or post-rename uncertainty
     RenamedHandleHeld --> RecoveryRequired: close/final-fact uncertainty
-    CandidateClosed --> RecoveryRequired: reopen/readback/commit failure
+    CandidateClosed --> RecoveryRequired: reopen/readback failure
+    ReadbackHeld --> RecoveryRequired: commit/final-reproof failure
     Failed --> [*]
     RecoveryRequired --> [*]
     Clean --> [*]
@@ -311,20 +314,22 @@ stateDiagram-v2
 - `publish_candidate` receives the still-open candidate handle and bound destination parent; source path is never reopened。
 - `CREATE_IF_ABSENT` 使用 replace=false；`REPLACE_UNDER_LOCK` 要求 owner 已持有覆盖 destination family 的排他 `LockLease`，锁内 target snapshot 只是 stale/recovery 事实，不是 OS-level expected-ID CAS。未持 lease 的 replace 请求 fail closed。
 - candidate share=none，因此 rename 后先 capture candidate/final facts，再关闭所有 candidate handles，之后才允许 reopen destination；close 前 reopen 必须在测试中得到 sharing violation，不能靠扩大 share mask 隐藏生命周期错误。
-- 协作进程受同一 lease 协议排除；不合作的同用户进程仍可能在 snapshot 与 rename 间改写。需要抵抗此威胁的 owner 必须使用 immutable generation + journal/pointer commit；平台层不得宣称已执行 expected-target CAS。post-readback 不一致进入 `RECOVERY_REQUIRED`。
-- Success requires content flush、handle-relative rename、candidate close、readback、owner state-machine commit，以及 W1 对本地 NTFS 定义并由 power-cut lane 证明的 naming success boundary。
+- reopen/readback 后的 destination handle 必须保持 no-write/no-delete share，直至 owner durable metadata commit 与 terminal identity/digest/state reproof全部完成；之后才关闭并清理 owned residue。该保留 handle 缩小 readback→commit 窗口，但平台仍不宣称 expected-target CAS。
+- 协作进程受同一 lease 协议排除；不合作的同用户进程仍可能在 pre-snapshot 与 rename 前竞态。需要 stronger-than-lease 语义的 owner 必须使用 immutable generation + journal/pointer commit；任一 terminal reproof 不一致进入 `RECOVERY_REQUIRED`。
+- Success requires content flush、handle-relative rename、candidate close、retained readback、owner durable state-machine commit、terminal reproof，以及 runtime host匹配 W1 `DurabilityProfile`。
 - API ambiguous/failure states不由 platform adapter 擅自删除；adapter returns facts，现有 journal/LKG owner 分类 recovery。
 
 ### Lock Flow
-- persistent lock file 使用 deterministic basename、private proof、single-link、identity payload；文件从不 unlink/replace。
+- persistent lock file 使用 W1 自有的 protocol-control integrity ACL profile、deterministic basename、single-link与identity payload；文件从不 unlink/replace。该 profile只保护锁协议完整性，不铸造 W2 attestation private proof，因此 W1 不反向依赖 W2。
+- payload固定为可重算的`ProtocolControlLockPayloadV1`（magic/schema/resource-family digest/range-map digest），不保存随机token或跨重启FileId。首次creator以`CREATE_NEW`+`INIT` share-none handle一次写入、flush、handle-readback后关闭；loser把sharing violation按bounded policy视为初始化进行中。creator crash后，后继仅在root/entry/exact ACL/single-link复证并取得同一share-none init handle后，对空、expected strict-prefix或完整expected bytes执行确定性rewrite/补flush；未知/超长/非前缀bytes返回`LOCK_UNAVAILABLE`且不得unlink/replace。两名recoverer由share-none open互斥，完成后必须重新以普通`LOCK` profile打开。
 - bootstrap serialization 与 long-lived resource lock 使用不同 byte ranges 或不同 lock objects，防止一个 active resource 阻塞同目录其他资源初始化。
 - `LockFileEx` 默认阻塞/timeout policy 由 caller contract 给出；release 先 `UnlockFileEx` 后 close，进程终止依赖 OS eventual unlock。
 - acquire/reprove 同时比较 open handle identity、entry identity、payload 和 parent authority。
 
 ### Private Storage Proof
 - W2 的拟议主体是进程 primary token 的 `TokenUser` SID；以 SID bytes 比较，不以账户显示名比较。创建时显式把 owner 设为该 SID。standard 与 UAC elevated token 必须解析为同一用户 SID；domain/AzureAD 用户同样只按 SID 处理；service/AppContainer/impersonation token 首版 `CAPABILITY_UNAVAILABLE`。
-- 拟议 DACL 为 protected、无继承、canonical order，只允许 TokenUser、SYSTEM 与 BUILTIN Administrators 的精确 allow ACE mask；TokenUser 对该对象拥有 required full control，SYSTEM/Administrators 仅保留 W2 列出的维护权限。任一未知 allow principal、额外 write/delete 权限、继承 ACE、未知 object-specific ACE 或 owner 不匹配均拒绝，不进行“看起来够私有”的宽松接受。
-- reprove 使用 handle-bound `GetSecurityInfo` 并验证 owner SID、canonical/protected DACL、ACE type/order/mask、link count、reparse-free、live-handle identity 与 volume；需要 `AccessCheck` 的语义、generic-right mapping 和 token 类型由 W2 固定。
+- `windows-private-v1` DACL 对 private directory、device key、attestation 与其 candidate逐对象显式设置：owner为TokenUser；revision=`ACL_REVISION`；authority control bits精确要求DACL present/protected并清除defaulted/auto-inherited/auto-inherit-request（`SELF_RELATIVE`归一化掉）；恰有按TokenUser canonical SID、`WinLocalSystemSid`=`S-1-5-18`、`WinBuiltinAdministratorsSid`=`S-1-5-32-544`排列的三个`ACCESS_ALLOWED_ACE_TYPE`，每个`AceFlags == 0`且mask=`FILE_ALL_ACCESS`。well-known principal只用`CreateWellKnownSid` canonical bytes，不做localized name lookup；null/defaulted DACL及其他control/ACE flags、deny、object/callback、inherited、unknown ACE/principal均拒绝。W1 protocol-control lock file不属于本profile。
+- reprove 使用 handle-bound `GetSecurityInfo` 验证 owner/DACL/link/reparse/live identity。`AccessCheck` 使用从当前 primary token复制的 `SecurityImpersonation` token；requested access固定为`GENERIC_ALL`，按file/directory `GENERIC_MAPPING`执行`MapGenericMask`后必须精确为`FILE_ALL_ACCESS`且全部获准。standard/elevated TokenUser必须通过，同SID low-integrity/restricted token必须不能获得write/delete；账户显示名、writable probe或inherited access均无授权力。SACL/audit ACE不作为discretionary授权输入；mandatory-integrity的可观察结果仍由该正/负矩阵强制，未知或不满足时能力unavailable。
 - standard、elevated、local、domain/AzureAD、继承/显式 ACE、未知 principal 和 ACL tamper 矩阵是 W2 approval/implementation gate。
 - 该表示在 W2 ADR 批准前仅是候选；不得把 `os.chmod(0o600)` 结果作为 Windows pass。
 
@@ -341,22 +346,23 @@ stateDiagram-v2
 | Parser atomic writer | prepared write uses bound publisher | candidate/replace/readback | candidate handle rename + digest/FileId |
 | Collaborative chunk | injected lock/publisher; no top-level fcntl | journal/LKG/recovery codes | LockFileEx + bound parent |
 | Project/Resource/TMX | replace local `_bind_parent` helpers | deterministic carrier/receipt/atomic save | shared adapter + hostile path matrix |
-| TM activation | reservation injected from lock service | single authority/bootstrap serialization | persistent private lock + crash release |
-| TM attestation | platform private proof/identity | device-local fail-closed re-attest | SID/DACL + live Volume/FileId + digest/phase/device-secret receipt |
+| TM activation | reservation injected from lock service | single authority/bootstrap serialization | W1 integrity-bound persistent lock + crash release |
+| TM attestation | platform private proof/identity | device-local fail-closed re-attest | owner envelope + nested `WindowsPrivateProof`; live FileId只作当次证明 |
 | TM snapshot/recovery | bound publisher and opaque identities | seal/generation/LKG/recovery | handle-bound publish/reprove |
 | Qt composition | platform factory constructed before controller graph | exact-only/capability fail-closed | no unsupported import; diagnostic code |
 
 ## Frozen Distribution Design
 
-### Bootstrap Trust Root
-- frozen launcher 内只嵌入一个最小 `frozen_source_bootstrap` trust root；它使用直接绑定的 Win32 declarations 打开 bundle root/manifest/source/fixture handles，不导入待验证的 `platform_fs_windows.py`、`capability_host.py` 或外置关键源码，因此不存在“先信任 adapter 再用 adapter 证明自身”的循环。
-- build 将 canonical manifest digest 和 bootstrap schema 固定进 executable-side bootstrap；runtime 先证明 bundle ancestor/final 均非 reparse、live-handle containment、manifest exact digest，再以 handle 读取/验证外置 `.py` 与 fixture，mint 不可序列化的 `TrustedSourceAuthority`。
-- `capability_host` 只有收到该 authority 后才可导入/验证 `SourceFileLoader`、`spec.origin`、`co_filename` 与 Gate closure。Windows 路径不再把 `Path.resolve()`、`lstat()`、`st_dev/st_ino` 或 `O_NOFOLLOW=0` 当 source authority。
-- bootstrap 本身是 W3 明示的发行 trust root，不宣称在运行时自证；其源、生成输入、executable hash 与 manifest digest 由 build/release evidence 绑定。改变 bootstrap、manifest schema 或 embedded digest composition 必须重新走 W3 trigger。
+### Bootstrap Trust Base
+- W3 governance可与W1并行，但实现必须等待正式 W1 语义；bootstrap不导入待验证的 `platform_fs_windows.py`，却必须满足 W1 的 rooted/reparse/live-identity/threat invariants。
+- `frozen_source_bootstrap` 是唯一项目级Python bootstrap authority，不是全部TCB。Boot TCB闭包至少包含release-owned/customized PyInstaller native bootloader/executable、Python DLL、pre-authority runtime hooks、bootstrap及其必要stdlib/`ctypes`/hash/manifest/import-loader代码、加载的native extension/DLL，以及明确allowlist的Windows system DLL；构建与release evidence逐项内容寻址。
+- native bootloader审计PE static imports/delay-load，保证process entry前只有获批KnownDLL/System32 trust；native entry后、首次加载Python DLL或任一非KnownDLL前即排除CWD/PATH、逐组件绑定bundle/native目录，并用受限绝对路径和获批`LoadLibraryExW` flags加载摘要锁定的Python DLL。它把bundle/DLL attestation移交Python bootstrap；后者只能继续source/fixture proof，不能追溯证明entry前load。upstream bootloader不满足时，最小spike失败并转向获批custom bootloader/launcher。
+- critical module 由bootstrap-owned `TrustedSourceLoader` 从 retained verified handle读取exact source bytes，校验digest后直接 `source_to_code`/compile并执行；critical module禁止`.pyc`、`__pycache__`和PYZ duplicate。`capability_host`验证loader attestation、source digest、`spec.origin`/`co_filename`和Gate closure，而不把metadata相等当作executed-byte proof。
+- build 将 canonical manifest digest 和 bootstrap schema 固定进 executable-side TCB；runtime闭合后才mint不可序列化的 `TrustedSourceAuthority`。TCB不在runtime声称自证，其source/binary、生成输入、executable hash、DLL inventory与manifest digest由clean-build/release evidence绑定。
 
 ### Early Frozen Feasibility Spike
 - W3 获批后的第一个实现证据是最小 onedir/windowed spike，版本固定为 CPython 3.14.x + PyInstaller 6.22.x；只验证 bootstrap、一个外置 critical module 和一个 fixture。
-- spike 必须证明 `type(loader) is SourceFileLoader`、`__file__ == spec.origin == loader.path`、`co_filename` 指向同一 bundle `.py`、无 PYZ duplicate、非 repository CWD 启动以及 reparse/swap/manifest tamper fail closed。
+- spike 必须证明native entry在首次Python DLL/非KnownDLL load前闭合搜索策略与bundle/DLL attestation；随后`TrustedSourceLoader`只从retained handle读取manifest匹配的exact `.py` bytes并直接编译执行，loader attestation/source digest与`__file__/spec.origin/co_filename`一致，无`.pyc`/`__pycache__`/PYZ duplicate；同时覆盖非repository CWD、pre-entry/late DLL path注入、reparse/swap/manifest tamper fail closed。
 - 任何断言失败立即返回 W3 重新设计；不得把该可行性风险拖到完整 UI/TM 打包后处理。
 
 ### Build Flow
@@ -383,9 +389,9 @@ flowchart TD
 ```
 
 ### Manifest Contract
-- Deterministic canonical JSON，记录 schema、repository commit、root reason、relative path、kind、SHA-256；排序按 UTF-8 relative path。
+- Production build只接受clean tracked tree；deterministic canonical JSON记录schema、repository commit、root reason、relative path、kind与SHA-256，排序按UTF-8 relative path。spec/hooks/generator/bootstrap/owner roots、locked wheels、bootloader/Python/native runtime inventory全部内容寻址；dirty/untracked build input或摘要缺失直接失败。
 - Source closure至少包含 capability host、Gate validator/runtime graphs 和 manifest 所引用 modules；dynamic imports 由 owner roots 显式声明。
-- 关键 modules 使用 PyInstaller documented `module_collection_mode='py'`，并从 PYZ collection 排除；post-build probe 断言 `type(loader) is SourceFileLoader`、`__file__ == spec.origin == loader.path` resolved path。
+- 关键 modules 使用 PyInstaller documented `module_collection_mode='py'`，并从 PYZ/bytecode collection排除；post-build probe验证`TrustedSourceLoader`的retained-handle source digest、direct-compile attestation与origin/co_filename绑定。
 - data/resources 保持源码期望 relative layout；runtime bundle root 来自 bootstrap 持有的 `TrustedSourceAuthority`，不得仅由待验证 module `__file__`、CWD 或 repository absolute path 推断。
 - build manifest 与 dist visibility report 写入 release evidence；dist 不允许未声明的 duplicate critical source。
 
@@ -442,7 +448,7 @@ flowchart TD
 ### Windows Adversarial Integration Tests
 - symlink、junction、mount reparse、ancestor swap、final swap、hardlink/single-link、ADS/device path、case/trailing-dot/reserved-name。
 - open handle share matrix：read/write/delete/rename；candidate handle publish不自阻塞。
-- two-process LockFileEx contention、timeout、normal release、TerminateProcess 后 eventual release、payload/FileId tamper。
+- two-process LockFileEx contention、timeout、normal release、TerminateProcess后eventual release；首次two-creator竞争、creator在create/write/flush/readback/close各边界退出、空/strict-prefix接管、unknown payload/FileId tamper。
 - fault injection at create/write/flush/arm/rename/candidate-close/reopen/readback/commit/cleanup；覆盖同进程 self-sharing block、协作 writer lease、instruction-boundary uncooperative target swap；只产生 old/new valid authority 或 recovery-required，且不宣称 expected-ID CAS。
 - SID/DACL/owner/inheritance/link/volume/FileId reuse/recreation tamper 与 cross-restart digest/phase/private/device-secret re-attestation；覆盖 standard/elevated/local/domain/AzureAD token。
 - 独立 disposable VM/VHD 或批准的物理 lab 在 content flush、rename、journal/metadata commit 各边界执行真实 forced power-off/reboot；重启后只能得到 old、new 或 recovery-only。仅 process kill/fault seam 不能把 durability 标为 VERIFIED；未运行或不支持的 volume 返回 `DURABILITY_UNAVAILABLE`。
