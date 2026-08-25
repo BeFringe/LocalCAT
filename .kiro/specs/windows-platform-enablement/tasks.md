@@ -1,0 +1,434 @@
+# 实施计划
+
+> **PROVISIONAL / NO-GO**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。W1/W2/W3 已获用户批准作为临时命名基线，但任务生成和命名批准不等于 Requirements、Design、正式 ADR、scope 或 amendment 获批；任务 0.1～0.5 全部闭合前不得执行实现任务。owner 指 Spec/branch/合同 authority，不指 Agent 或 thread；可用独立执行 Agent 做 native scout、实现或对抗性评审，但不能借此跨越 owning Spec。实施/累计复审节奏见 `review-clustering.md`。
+
+- [ ] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
+
+- [ ] 0.1 由 Governance owner 将已批准临时命名的 W1/W2/W3 定型为正式 ADR
+  - W1 固定 live-handle identity、handle/share profiles、`CREATE_IF_ABSENT`/`REPLACE_UNDER_LOCK`、非 expected-ID CAS threat scope、candidate rename→close→reopen、稳定错误和首版本地 NTFS durability success boundary
+  - W2 固定 TokenUser/owner SID、精确 DACL/AccessCheck、standard/elevated/local/domain/AzureAD matrix、FileId reuse 反例，以及 digest/phase/private/device-secret persistent receipt schema
+  - W3 固定 embedded bootstrap trust root、`TrustedSourceAuthority`、external `.py` loader/closure、build owner、onedir release gate；明确 ADR-011 只拥有 Feature 5/UI composition
+  - 完成时，三个正式 ADR 编号、批准 revision 和取代/相交关系可从治理分支唯一追踪；任一未决即保持 NO-GO
+  - _Requirements: 1.2, 2.1, 2.3, 3.4, 4.1, 4.2, 8.5, 8.6, 10.1, 10.6, 12.3_
+  - _Boundary: Governance ADR Ownership_
+
+- [ ] 0.2 由 Governance owner批准 Windows owning scope 与 Steering 同步
+  - 在治理分支把 `windows-platform-enablement` 记录到 `spec-ownership.md`/`roadmap.md`，固定本 Spec 只拥有共享合同/backends/bootstrap/build/release ledger，相邻 Spec 拥有 consumer business invariants
+  - 确定 `tmx-context-interchange` 唯一 owner branch，并确认 Qt avatar 只作为 Windows 功能回归，不改变现有资源或打包边界
+  - 完成时，scope lineage、Steering、Design 与 amendment ledger 无冲突，功能分支不产生重复 Steering 提交
+  - _Requirements: 5.1, 10.5, 11.2, 11.4, 12.5_
+  - _Boundary: Steering and Spec Ownership_
+  - _Depends: 0.1_
+
+- [ ] 0.3a 派发 startup/source amendments
+  - 按 `cross-spec-amendments.md` 向 WA-01 Parser、WA-02 Chunk、WA-07 CapabilityHost owners 派发精确 R/D/T delta；追加既有 task 的 `a` 后缀，不重排原任务
+  - 每个 owner 记录 approval/commit，覆盖 rooted source/writer、无顶层 `fcntl`、bootstrap-before-import、stable body-safe errors
+  - 完成时，三项 dispatch 均有 owning branch acknowledgement；缺一项不得进入任务 4
+  - _Requirements: 1.1, 1.2, 2.1, 2.6, 5.1, 5.2, 10.6_
+  - _Boundary: Cross-Spec Dispatch Group A_
+  - _Depends: 0.1, 0.2_
+
+- [ ] 0.3b 派发 persistence/recovery amendments
+  - 派发 WA-03 Project、WA-04 Resource、WA-05 TMX、WA-06 TM Core，附 publish mode、owner lease、power-cut boundary、W2 receipt 和 FileId reuse 反例
+  - 明确每项 R/D/T suffix、merge dependency、zero-mutation/recovery evidence；WA-05 必须使用任务 0.2批准的唯一 owner
+  - 完成时，四项 dispatch 均有 owning branch acknowledgement；缺一项不得进入任务 5/6
+  - _Requirements: 3.1, 4.1, 4.3, 5.1, 7.1, 8.1, 8.4, 9.1_
+  - _Boundary: Cross-Spec Dispatch Group B_
+  - _Depends: 0.1, 0.2_
+
+- [ ] 0.3c 派发 UI/frozen journey amendments与 revalidation-only manifest
+  - 派发 WA-07 Feature5/UI、WA-08 Qt increment；将 WR-01 TM store、WR-02 termbase、WR-03 old Qt 标为 revalidation-only/no-amendment，不制造空洞任务
+  - 固定 qwindows/visible window、avatar catalog解码与无匹配头像fallback、clean-user/non-repository CWD 与 source-proof failure diagnostics
+  - 完成时，UI/frozen dispatch 与 revalidation理由均获 owner确认；缺少 WA-07/08 merge 不得进入最终 EXE gate
+  - _Requirements: 6.2, 6.4, 6.5, 10.1, 10.5, 11.2, 11.3, 12.1_
+  - _Boundary: Cross-Spec Dispatch Group C_
+  - _Depends: 0.1, 0.2_
+
+- [ ] 0.4 冻结 amendment merge ledger 与实现依赖图
+  - 批准 ledger schema、WA-01～08 `PENDING` rows、owning branch acknowledgement、R/D/T amendment request identity 与 fail-closed dependency；本任务不预填尚未发生的 amendment/merge commit、artifact 或 disposition
+  - 验证合并顺序为 platform → Parser/Chunk → Project/Resource/TMX → TM Core → Feature5/UI → Qt journey；平行线不得复制 patch-equivalent commit
+  - 完成时，ledger schema/dispatch identity获批且每个实现 cluster都有fail-closed dependency gate；实际 commit/merge/evidence/disposition由任务4.1/5.1/6.1/6.5/7.5逐行追加，禁止用`SKIPPED`放行required row
+  - _Requirements: 5.1, 5.3, 12.3, 12.4, 12.5_
+  - _Boundary: Amendment Merge Authority Ledger_
+  - _Depends: 0.3a, 0.3b, 0.3c_
+
+- [ ] 0.5 完成独立对抗性设计评审并取得人工 Design approval
+  - 由未参与主设计的 reviewer/Agent 重放 bootstrap chicken-and-egg、candidate self-sharing、pre-snapshot non-CAS、真实断电、FileId reuse、ACL token 与 SourceFileLoader duplicate 反例
+  - 所有 blocker 必须在 Requirements/Design/ADR/ledger 中得到可执行处置；只写 Implementation Notes 或说明“实现时再看”不构成关闭
+  - 完成时，review disposition、剩余风险、Design approval 和 `spec.json` 状态一致，才允许任务 1及以后开始
+  - _Requirements: 1.2, 2.3, 4.2, 8.5, 10.3, 12.2, 12.3_
+  - _Boundary: Independent Adversarial Design Gate_
+  - _Depends: 0.4_
+
+- [ ] 1. 建立可移植 baseline、日志模型与最小 frozen 可行性证据
+
+- [ ] 1.1 在精确基线重放 Windows 失败/通过矩阵
+  - fail-closed 核对 `ui-mvp@b925b803d81001f55dea46ace8b26159ca82db19`、Windows 11、CPython 3.14 x64、clean venv 和无用户 WIP覆盖
+  - 重放 requirements/pip check、Qt visible window/qwindows、SQLite FTS5/trigram、source startup `fcntl`、Parser rooted、Project/TM/TMX 与 baseline PyInstaller onedir/windowed
+  - 完成时，每项有 exact PowerShell command、版本、exit code、stdout/stderr、SHA-256 inventory 和 PASS/FAIL reason；历史报告只能交叉核对，不能替代 fresh evidence
+  - _Requirements: 6.1, 6.2, 7.1, 8.1, 9.1, 9.3, 11.1, 12.4_
+  - _Boundary: Fresh Baseline Evidence_
+  - _Depends: 0.5_
+
+- [ ] 1.2 实现 portable release evidence schema 与无泄漏日志 harness
+  - 输出到仓库相对 `artifacts/windows/<commit>/<run-id>/` 或批准的 CI artifact key；manifest记录 commands、environment、exit、log digest、matrix/checklists，不以本机绝对路径充当 identity
+  - 文件系统事件记录 operation/profile、volume/filesystem、live FileId comparison、final-path/reparse verdict、share flags、LockFileEx range、flush/rename/close/reopen/recovery phase与稳定 code；不得记录正文/secret/raw private path
+  - 完成时，成功/失败/中断日志均可由 schema validator复核，windowed failure 有 marker/diagnostic而非静默退出
+  - _Requirements: 1.2, 6.4, 12.3, 12.4_
+  - _Boundary: Windows Evidence and Diagnostic Contract_
+  - _Depends: 1.1_
+
+- [ ] 1.3 (P) 用 native scout 固定低密度 Windows 场景与迁移清单
+  - 扫描 production/tests 中 `fcntl/flock/dir_fd/O_DIRECTORY/O_NOFOLLOW/directory fsync/st_dev/st_ino` 与 CWD/checkout resource path，按 owning Spec 和 amendment ID分类
+  - 扩充 target-open、self-sharing、kill release、junction/reparse/hardlink/ancestor swap、FileId reuse、ACL token、power-cut与 frozen visibility 场景清单
+  - 完成时，清单能追踪到具体 consumer、合同/反例、owner、task 和 evidence key；不得把静态无命中当 runtime pass
+  - _Requirements: 2.2, 2.3, 3.2, 4.4, 5.2, 10.2, 11.5, 12.2, 12.4_
+  - _Boundary: Native Scenario Inventory_
+  - _Depends: 1.1_
+
+- [ ] 1.4 在完整实现前完成最小 PyInstaller frozen-source/bootstrap spike
+  - 使用 W3批准版本的 CPython 3.14.x + PyInstaller 6.22.x，仅构建 embedded bootstrap、一个 `module_collection_mode='py'` critical module 和一个 fixture
+  - 证明 loader exact type、`__file__/spec.origin/loader.path/co_filename` 一致、无 PYZ duplicate、非仓库 CWD启动、manifest digest/handle-read，以及 bundle ancestor/source/fixture reparse/swap/tamper fail closed
+  - 完成时，全部断言通过并保存 dist inventory；任一失败返回 W3重新审批且停止任务 7，不允许降级 loader/source proof
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.1, 12.3_
+  - _Boundary: W3 Minimal Frozen Feasibility Gate_
+  - _Depends: 1.2_
+
+- [ ] 2. 建立共享平台合同与 POSIX parity adapter
+
+- [ ] 2.1 定义 backend-neutral authority、identity、lock、publish 与 private proof 合同
+  - 实现 context-managed opaque authorities、live-only `FileObjectIdentity`、`PersistentFileReceipt` schema port、`PublishMode`/`PublishFacts`、stable `PlatformFileError`
+  - 禁止上层取得 raw HANDLE/dirfd，禁止 platform API宣称 expected-target CAS，关闭后 authority 不可复用
+  - 完成时，shape/type/name/error/closed-handle与非法组合合同 tests 全绿
+  - _Requirements: 1.2, 2.1, 3.3, 3.5, 4.1, 5.1, 5.3_
+  - _Boundary: Platform File Contracts_
+  - _Depends: 1.2, 1.3_
+
+- [ ] 2.2 固定现有 POSIX 行为的 characterization matrix
+  - 在迁移前记录 Parser/Chunk/Project/Resource/TMX/TM 的 success/error/receipt/recovery bytes与 macOS/Linux支持条件
+  - 覆盖 openat/dirfd/O_NOFOLLOW/flock/file+directory fsync、candidate/readback/LKG 和 direct-import boundaries
+  - 完成时，矩阵能区分 business invariant 与 POSIX implementation fact，后续 adapter parity 有唯一 oracle
+  - _Requirements: 1.4, 4.3, 5.3, 5.4, 12.5_
+  - _Boundary: POSIX Characterization Baseline_
+  - _Depends: 2.1_
+
+- [ ] 2.3 把 POSIX primitives 迁入唯一 adapter并保持语义
+  - 将 `fcntl`、dirfd/openat/no-follow、pread、file/directory fsync 封装进 `platform_fs_posix.py`；纯合同/composition模块在 Windows import 时不加载 POSIX module
+  - 保持已固定 public codes、receipt/recovery和 fail-closed behavior，不借重构改变业务 authority
+  - 完成时，共享 contract tests 与任务 2.2 characterization 全绿，Mac/Linux consumer diff可追踪到相邻 amendments
+  - _Requirements: 1.1, 1.4, 5.1, 5.2, 5.3, 5.4_
+  - _Boundary: POSIX Platform Adapter_
+  - _Depends: 2.2_
+
+- [ ] 2.4 实现 fail-closed composition factory 与 backend self-probe
+  - factory只在 OS/volume/backend contract gate通过后返回 capability；Windows不得导入 POSIX adapter，POSIX不得导入 Win32 API
+  - 未知平台、unsupported volume、structure/API/self-probe失败映射稳定 capability error，不以布尔常量或 fallback path I/O开放能力
+  - 完成时，import graph/AST、factory matrix和 fault seam均证明没有隐藏 authority
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 5.2, 5.4_
+  - _Boundary: Platform Composition Factory_
+  - _Depends: 2.3_
+
+- [ ] 3. 实现 Windows rooted/lock/private/publish/durability backend
+
+- [ ] 3.1 实现 Win32 FFI wrapper、RAII handle 与受支持主机 Gate
+  - 精确绑定 CreateFileW、GetFileInformationByHandleEx、GetFinalPathNameByHandleW、SetFileInformationByHandle、FlushFileBuffers、LockFileEx/UnlockFileEx、GetSecurityInfo/AccessCheck及结构/错误
+  - 首版只 mint Windows 11 x64 local fixed NTFS；UNC/remote/ReFS/FAT/exFAT或 probe缺失均 `CAPABILITY_UNAVAILABLE`
+  - 完成时，结构尺寸/argtypes/restype/last-error/close-on-failure、自检和 unsupported matrix 全绿
+  - _Requirements: 1.2, 2.1, 2.2, 3.1, 4.2_
+  - _Boundary: Windows Native API and Host Gate_
+  - _Depends: 2.4_
+
+- [ ] 3.2 实现逐组件 rooted handle authority 与 sealed handle-read
+  - 以 ROOT/INTERMEDIATE/SOURCE profiles保留 ancestor/final handles，拒绝 reparse/nonregular/ADS/device/reserved/ambiguous names，比较 final path/volume/live FileId
+  - content与fixture只从已证明final handle读取；路径检查失败前不读body，创建时重新证明bound parent
+  - 完成时，junction/symlink/mount/final+ancestor swap/hardlink policy/case/trailing-dot matrix获得稳定结果且无逃逸
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6_
+  - _Boundary: Windows Rooted Authority_
+  - _Depends: 3.1_
+
+- [ ] 3.3 (P) 实现 LockFileEx persistent lease 与 crash release
+  - lock file使用 deterministic name、single-link/private proof/payload/entry identity，文件永久保留且不 unlink/replace
+  - 实现明确 byte range、blocking/timeout/contention结果；normal unlock/close与 TerminateProcess 后 eventual release不承诺公平/零延迟
+  - 完成时，双进程 acquire、timeout、payload/FileId tamper、kill/retry与错误映射全绿
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 8.3_
+  - _Boundary: Windows Process File Lock_
+  - _Depends: 3.1_
+
+- [ ] 3.4 (P) 实现 W2 private storage 与跨重启 receipt重新证明
+  - 显式创建 owner=TokenUser SID、protected canonical DACL；精确验证允许 ACE masks/order、SYSTEM/Administrators policy、inheritance、link/reparse/live identity
+  - persistent authority重新绑定 exact bytes/digest、generation/phase、private proof与device-secret MAC；覆盖 delete/recreate/FileId reuse，不信任历史 tuple
+  - 完成时，standard/elevated/local/domain/AzureAD矩阵通过，service/AppContainer/impersonation与未知 ACE/owner/tamper fail closed
+  - _Requirements: 1.2, 8.4, 8.5, 8.6_
+  - _Boundary: Windows Private Storage and Persistent Re-attestation_
+  - _Depends: 3.1_
+
+- [ ] 3.5 实现 handle-bound publish 的两个模式与精确生命周期
+  - candidate `CREATE_NEW`/share=none，完成 write+FlushFileBuffers；支持 create-if-absent与持有resource-family lease的replace-under-lock
+  - 严格执行 rename→capture final facts→close every candidate handle→reopen/readback；pre-snapshot只作 stale/recovery fact，不声称 CAS
+  - 完成时，同进程 close前reopen得到预期 sharing violation，close后成功；协作writer被lease排除，不合作instruction-boundary swap只产生检测失败/recovery-required
+  - _Requirements: 3.4, 4.1, 4.3, 4.4, 4.5_
+  - _Boundary: Windows Bound Publisher_
+  - _Depends: 3.2, 3.3, 3.4_
+
+- [ ] 3.6 在真实 reboot 边界批准 NTFS durability success contract
+  - 在 disposable VM/VHD或批准物理lab分别于 content flush、arm、rename、candidate close、metadata commit、cleanup边界执行 forced power-off/reboot
+  - 每次重启只接受完整old、完整new或owner recovery-only；无法证明success boundary的host/volume在arm前返回 `DURABILITY_UNAVAILABLE`，arm后不确定返回 `RECOVERY_REQUIRED`
+  - 完成时，W1定义与实际matrix一致且可复现；process kill/fault injection仅作为补充，不能替代此门
+  - _Requirements: 4.2, 4.3, 4.5, 7.4, 8.4, 12.2, 12.3_
+  - _Boundary: Windows NTFS Power-Cut Durability Gate_
+  - _Depends: 3.5_
+
+- [ ] 3.7 运行共享合同与完整 Windows 对抗性矩阵
+  - 覆盖 rooted、share、lock、private、publish、identity reuse、target-open、kill、fault/power和resource cleanup，mandatory case不得 skip
+  - 由独立 reviewer核对日志事实与稳定 code，特别验证没有 path-only proof、expected-CAS宣称、share扩大或 FileId永久化
+  - 完成时，Windows adapter可由factory mint；任何 mandatory失败保持 capability unavailable
+  - _Requirements: 1.2, 2.2, 2.3, 3.1, 4.3, 4.4, 5.4, 12.2, 12.3_
+  - _Boundary: Windows Platform Capability Gate_
+  - _Depends: 3.6_
+
+- [ ] 4. 合并 Parser/Chunk amendments并恢复 source Qt启动
+
+- [ ] 4.1 验证并合并 WA-01 Parser 与 WA-02 Chunk amendment commits
+  - 核对 owning branch、R/D/T approvals、task suffix、commit/merge parent和portable evidence，不从其他工作树复制patch
+  - 更新ledger为 `MERGED_PASS`前重跑双方contract/adversarial tests；任一身份不一致停止
+  - 完成时，Windows分支可达两个approved merge，且业务错误/状态机仍由原 owner拥有
+  - _Requirements: 2.6, 3.1, 5.1, 5.3, 12.5_
+  - _Boundary: Parser and Chunk Amendment Merge_
+  - _Depends: 0.3a, 3.7_
+
+- [ ] 4.2 验证 Parser Windows source/writer vertical slice
+  - 真实读写获授权source，执行sealed copy、codec/body-safe/stale/atomic writer/readback；所有原POSIX-only rooted adversarial cases在Windows backend运行
+  - 能力不可用仍返回既有`PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE`/获批子码，且目标/正文零变更
+  - 完成时，source与最小frozen Parser均通过，无mock/skip/现场patch
+  - _Requirements: 1.2, 2.1, 2.2, 2.6, 5.3, 10.3_
+  - _Boundary: Parser Windows Vertical Slice_
+  - _Depends: 4.1_
+
+- [ ] 4.3 验证 collaborative chunk lock/publish/recovery vertical slice
+  - 证明import/controller composition不再顶层加载`fcntl`，chunk publish沿LockFileEx+publisher并保留journal/LKG/recovery codes
+  - 运行双进程竞争、target-open、kill release、rename/close/readback faults与restart recovery
+  - 完成时，唯一authority/old-new-recovery矩阵全绿且无direct POSIX primitive
+  - _Requirements: 1.1, 3.1, 3.2, 4.3, 5.2, 6.3_
+  - _Boundary: Collaborative Chunk Windows Vertical Slice_
+  - _Depends: 4.1_
+
+- [ ] 4.4 在源码环境启动真实 LocalCAT Qt主窗口
+  - clean CPython 3.14 x64 venv安装`requirements-ui.txt`并`pip check`；不得安装xlwings/Excel或注入兼容patch
+  - 使用Qt windows plugin加载真实`qwindows.dll`、创建可见主窗口、进入事件循环并输出受控smoke marker
+  - 完成时，source LocalCAT从非仓库CWD启动，不因POSIX import/capability composition退出；缺插件路径返回可诊断失败
+  - _Requirements: 1.1, 1.5, 6.1, 6.2, 6.3, 6.4_
+  - _Boundary: Windows Source Qt Startup_
+  - _Depends: 4.2, 4.3_
+
+- [ ] 5. 合并 Project/Resource/TMX amendments并完成持久化 vertical slices
+
+- [ ] 5.1 验证并合并 WA-03 Project、WA-04 Resource、WA-05 TMX commits
+  - 核对owner/approvals/task suffix/commit/merge/evidence；WA-05 owner必须与任务0.2一致
+  - 合并后重跑共享rooted/publish contract和各owner业务baseline，ledger仅在fresh pass后标`MERGED_PASS`
+  - 完成时，三个consumer都通过platform port且无重复Windows filesystem实现
+  - _Requirements: 5.1, 5.2, 5.3, 7.1, 9.1, 12.5_
+  - _Boundary: Persistence Amendment Merge_
+  - _Depends: 0.3b, 4.2_
+
+- [ ] 5.2 完成Project保存、退出、重开与deterministic carrier验证
+  - 保存真实项目并重新打开相同protected content/metadata；跨进程重启重新证明authority，不复用内存身份
+  - 覆盖junction/ancestor swap/target-open/双进程竞争、deterministic ZIP members、LKG和fault/reboot recovery
+  - 完成时，canonical bytes/digest与old/new/recovery结果满足ADR-018/019且无部分覆盖
+  - _Requirements: 4.3, 7.1, 7.2, 7.3, 7.4_
+  - _Boundary: Windows Project Save and Reopen_
+  - _Depends: 5.1_
+
+- [ ] 5.3 (P) 完成Resource/Termbase portability与receipt验证
+  - 验证resource artifact/package/importer/repository/ledger/workspace state与termbase consumer通过shared ports保存/重开
+  - hostile source、target-open、receipt tamper和resource-local failure不影响其他authority；WR-02 column-selection regression保持业务语义
+  - 完成时，resource/termbase结果、bytes与portable receipts可重启复核
+  - _Requirements: 2.2, 4.3, 5.1, 5.3, 7.3_
+  - _Boundary: Windows Resource Portability_
+  - _Depends: 5.1_
+
+- [ ] 5.4 (P) 完成TMX获授权导入、canonical保存与重启验证
+  - 从真实rooted source导入有效TMX，保持locale normalization/conflict rules/准确count并保存canonical target
+  - escaped/reparse/swap/invalid source在发布前fail closed且目标byte hash不变；进程重启后结果仍可查询
+  - 完成时，source与frozen-ready TMX journey全绿，无import count伪成功
+  - _Requirements: 2.2, 9.1, 9.2, 9.4_
+  - _Boundary: Windows TMX Import and Persistence_
+  - _Depends: 5.1_
+
+- [ ] 5.5 运行Project/Resource/TMX组合并发、崩溃与power-cut矩阵
+  - 在owner resource lease下重放save/import/export faults、uncooperative target swap、opened-target rejection和reboot recovery
+  - 验证每个business owner只消费platform facts并决定journal/LKG，不将pre-snapshot当CAS或擅自清理ambiguous residue
+  - 完成时，三个vertical slices只产生完整old/new或recovery-only且日志可审计
+  - _Requirements: 3.4, 4.2, 4.3, 4.5, 7.3, 7.4, 9.2, 12.2_
+  - _Boundary: Persistence Recovery Matrix_
+  - _Depends: 5.2, 5.3, 5.4_
+
+- [ ] 6. 合并TM Core/Feature5 UI amendments并完成activation/FTS5恢复
+
+- [ ] 6.1 验证并合并 WA-06 TM Core amendment
+  - 核对W1/W2映射、approved R/D/T suffix、feature5 commit/merge identity与activation/attestation/recovery evidence
+  - 重跑Core frozen contracts、canonical migration/retrieval、FileId reuse、ACL token、two-process/power-cut和WR-01 module-extraction regression
+  - 完成时，Core business authority仍归`tm-storage-retrieval-index`，Windows分支只提供platform能力和merge evidence
+  - _Requirements: 5.1, 8.1, 8.3, 8.4, 8.5, 8.6, 12.5_
+  - _Boundary: TM Core Amendment Merge_
+  - _Depends: 0.3b, 3.7, 5.5_
+
+- [ ] 6.2 完成TM首次激活、双进程唯一authority与restart recovery
+  - 激活合法source，序列化bootstrap/reservation，发布唯一canonical SQLite generation并打开精确published store
+  - 覆盖双进程首次激活、TerminateProcess、reservation/migration/seal/publish/cleanup faults与重启；失败方返回稳定竞争/既有authority结果
+  - 完成时，无重复generation/部分authority，published-tail恢复同一generation，unknown residue保持unavailable
+  - _Requirements: 3.1, 3.2, 8.1, 8.2, 8.3, 8.4_
+  - _Boundary: Windows TM Activation and Recovery_
+  - _Depends: 6.1_
+
+- [ ] 6.3 验证W2 attestation、FileId reuse与device-local恢复
+  - restart时重新证明exact bytes/digest、generation/phase、private DACL和device-secret MAC；历史Volume/FileId只作反例/diagnostic
+  - 覆盖delete/recreate复用、owner/ACE/inheritance/link/reparse/volume/tamper、standard/elevated/domain/AzureAD token；不可证明则fail closed且不回落legacy
+  - 完成时，合法authority恢复，任何弱路径/token/identity替代均被拒绝
+  - _Requirements: 8.2, 8.4, 8.5, 8.6_
+  - _Boundary: Windows TM Attestation Re-proof_
+  - _Depends: 6.2_
+
+- [ ] 6.4 完成SQLite FTS5/trigram真实创建、查询、关闭与重开
+  - 在Windows source runtime对canonical store创建实际FTS5/trigram schema，写入数据、执行MATCH/排序，关闭进程后重开同一published authority查询
+  - 不只检查compile options；运行时缺能力返回稳定unavailable并阻止依赖发布/激活，不切换未批准算法
+  - 完成时，结果与Core排序合同一致并包含exact version/options/schema/query evidence
+  - _Requirements: 9.3, 9.4, 9.5_
+  - _Boundary: Windows SQLite FTS5 Runtime_
+  - _Depends: 6.2_
+
+- [ ] 6.5 验证并合并 WA-07 Feature5/UI amendment
+  - 核对Feature5/UI owner approvals、task suffix、commit/merge identity；CapabilityHost消费`TrustedSourceAuthority`而非Windows path/lstat/O_NOFOLLOW fallback
+  - 运行activation/restart projections、resource-local safe state、bootstrap-before-import、no raw proof/path UI和existing Gate A/C/D contract regression
+  - 完成时，source UI可激活TM、重启恢复并查询FTS5；ledger记录`MERGED_PASS`
+  - _Requirements: 5.1, 6.3, 8.1, 8.2, 9.4, 10.1, 10.3, 10.6_
+  - _Boundary: Feature5 UI Windows Integration Merge_
+  - _Depends: 0.3a, 0.3c, 1.4, 6.3, 6.4_
+
+- [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
+
+- [ ] 7.1 生成deterministic frozen source/fixture/data manifest
+  - 从approved owner roots解析Gate A/C/D、benchmark contract与dynamic import递归闭包，记录schema/commit/reason/relative path/kind/SHA-256和UTF-8排序
+  - critical modules只允许source-only collection，无未声明duplicate/PYZ copy；missing、extra、digest drift或closure cycle失败build
+  - 完成时，manifest generator可重复产生byte-identical output并覆盖真实`.py`、JSON/TXT fixtures及获批tm/terms/logo/benchmark assets
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 11.2, 11.5_
+  - _Boundary: Frozen Source Manifest_
+  - _Depends: 1.4, 6.5_
+
+- [ ] 7.2 实现embedded bootstrap到CapabilityHost的可信handoff
+  - launcher先用直接Win32 bootstrap绑定bundle/manifest/source/fixture handles、拒绝ancestor/final reparse/swap并验证embedded manifest digest，再mint不可序列化`TrustedSourceAuthority`
+  - 外置CapabilityHost收到authority后验证loader/origin/co_filename/digest/Gate closure；任何失败不导入或授权相关能力
+  - 完成时，bootstrap不依赖待验证adapter，source/fixture handle-read、tamper/reparse/duplicate/circular-trust tests全绿
+  - _Requirements: 1.2, 10.1, 10.2, 10.3, 10.5, 10.6_
+  - _Boundary: Frozen Bootstrap Trust Handoff_
+  - _Depends: 7.1_
+
+- [ ] 7.3 建立受版本控制的Windows PyInstaller build definition
+  - 使用`--onedir --windowed`、独立locked build requirements、custom spec/hook、source-only module map；不把PyInstaller/xlwings加入UI runtime requirements
+  - 收集Qt实际plugins与`platforms/qwindows.dll`、`.ico`、version metadata和mandatory data；不从build checkout绝对路径读取runtime依赖
+  - 完成时，clean build venv可由单组PowerShell命令重建相同layout，build exit 0不替代runtime gates
+  - _Requirements: 1.5, 6.1, 6.4, 11.1, 11.2, 11.4_
+  - _Boundary: Windows PyInstaller Build_
+  - _Depends: 7.2_
+
+- [ ] 7.4 验证dist可见性、资源fallback与repository-path absence
+  - inventory验证qwindows、critical `.py`、fixtures、tm/terms/logo/benchmark、ico/version和实际Qt plugins；assert loader exact identity与无PYZ duplicate
+  - 验证真实Qt avatar catalog在Windows索引/解码匹配头像，无匹配头像时显示“— / 无内置头像”；从non-repository CWD/clean environment启动且不访问source checkout
+  - 完成时，missing/extra/tamper/checkout-access均令release validator失败并列出精确artifact
+  - _Requirements: 6.4, 6.5, 10.3, 10.5, 11.2, 11.3, 11.4, 11.5_
+  - _Boundary: Frozen Distribution Visibility_
+  - _Depends: 7.3_
+
+- [ ] 7.5 验证并合并 WA-08 Qt increment amendment
+  - 核对Qt owner approvals/task suffix/commit/merge evidence，运行单JSON editor、bundle resources、qwindows/visible window、avatar功能回归和clean-user journeys
+  - 保持Layer 4/Controller boundary、keyboard/accessibility与旧Qt baseline；不得把Windows平台逻辑散落进widgets
+  - 完成时，WA-08与WR-03 evidence闭合，所有required amendment rows均`MERGED_PASS`
+  - _Requirements: 5.1, 6.2, 6.4, 6.5, 7.1, 11.2, 11.3, 12.5_
+  - _Boundary: Qt Windows Journey Amendment Merge_
+  - _Depends: 0.3c, 7.4_
+
+- [ ] 8. 在clean Windows发行环境运行分能力packaged E2E
+
+- [ ] 8.1 验证真实windowed EXE、qwindows与诊断路径
+  - 从clean user profile、清除PYTHONPATH/Qt developer paths、非仓库CWD启动真实EXE，创建可见main window并进入event loop
+  - 分别移除插件/asset/source proof副本验证稳定诊断；windowed模式用受控marker/log/exit helper取得结果
+  - 完成时，正常启动PASS，任何mandatory缺失均明确FAIL而非静默退出
+  - _Requirements: 6.2, 6.3, 6.4, 11.3, 11.5, 12.1_
+  - _Boundary: Packaged Qt Startup_
+  - _Depends: 7.5_
+
+- [ ] 8.2 验证packaged项目保存/退出/重开
+  - EXE创建/编辑/保存项目，完全退出后重新启动并重开，比较受合同保护content/metadata/authority
+  - 运行target-open、双实例、junction/ancestor swap、save fault与recovery；不得读取checkout或调用venv Python业务模块
+  - 完成时，正常journey与old/new/recovery-only矩阵在真实dist上通过
+  - _Requirements: 7.1, 7.2, 7.3, 7.4, 12.1, 12.2_
+  - _Boundary: Packaged Project Lifecycle_
+  - _Depends: 8.1_
+
+- [ ] 8.3 (P) 验证packaged TM激活/退出/重启恢复与并发
+  - EXE首次激活合法TM，验证唯一canonical generation；完全退出/重启后恢复相同authority并查询
+  - 运行双EXE竞争、kill、activation fault、attestation tamper/FileId reuse与power-cut recovery；未知事实不回落legacy
+  - 完成时，single authority/restart/LKG/recovery与safe UI state全部通过
+  - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 12.1, 12.2_
+  - _Boundary: Packaged TM Lifecycle_
+  - _Depends: 8.1_
+
+- [ ] 8.4 (P) 验证packaged TMX导入与FTS5持久检索
+  - 从rooted source导入有效TMX并核对count/locale/conflict/canonical bytes；escaped/reparse/swap source保持target零变化
+  - 在published SQLite创建/查询FTS5 trigram，退出EXE后重启并查询相同结果；不以compile-option字符串代替行为
+  - 完成时，TMX与FTS5正常/失败矩阵在真实dist全绿
+  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 12.1, 12.2_
+  - _Boundary: Packaged TMX and FTS5_
+  - _Depends: 8.1_
+
+- [ ] 8.5 重算frozen Gate并验证完整source/resource visibility
+  - 在dist内重算Gate A/C/D与benchmark contract，逐项验证raw `.py` loader、fixture handle identity/digest、data/assets和bundle root
+  - 修改manifest/source/fixture、插入bundle junction/reparse、制造PYZ duplicate或从checkout提供缺失文件都必须fail closed
+  - 完成时，source runtime与frozen Gate结果符合approved contract且zero mandatory skip
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.5_
+  - _Boundary: Packaged Capability Gates_
+  - _Depends: 8.1_
+
+- [ ] 9. 闭合跨平台回归、清单、日志与独立Feature GO预审
+
+- [ ] 9.1 运行direct-platform-primitive与frozen-closure静态门
+  - production consumers不得直接import/use `fcntl/flock/dir_fd/O_DIRECTORY/O_NOFOLLOW/directory fsync`或Win32 wrapper；仅platform adapters/approved bootstrap可出现
+  - frozen roots与代码dependency graph双向核对，任何新增critical module/fixture未入manifest即失败
+  - 完成时，命中均有owner-approved exception或为零，不能以平台条件分支隐藏
+  - _Requirements: 1.1, 5.2, 5.4, 10.2, 12.3_
+  - _Boundary: Platform Boundary Static Gate_
+  - _Depends: 8.2, 8.3, 8.4, 8.5_
+
+- [ ] 9.2 在同一commit运行macOS/Linux全量回归与POSIX parity
+  - 使用任务2.2 characterization和现有CI矩阵验证Parser/Chunk/Project/Resource/TMX/TM/Qt public codes、bytes、recovery和Gate不回退
+  - 平台专属差异只能是approved backend facts；不得把Windows pass换成Mac/Linux skip或改变authority
+  - 完成时，同一full commit获得fresh artifacts，mandatory失败/skip阻塞Feature GO
+  - _Requirements: 1.4, 5.3, 5.4, 12.3, 12.5_
+  - _Boundary: macOS Linux Regression and Parity_
+  - _Depends: 9.1_
+
+- [ ] 9.3 生成完整通过/失败矩阵、Windows适配与frozen packaging清单
+  - 汇总baseline→candidate、环境/versions、exact commands、exit/log/checksum、filesystem/lock profiles、power-cut、consumer journeys、source/fixture/resource/Qt inventory
+  - 每项标PASS/FAIL/NOT_RUN与阻塞reason；required项不得以source-only pass、mock、skip、手工patch或推断转绿
+  - 完成时，portable evidence manifest可复核所有日志且没有本机绝对路径作为authority
+  - _Requirements: 11.2, 11.4, 11.5, 12.1, 12.2, 12.3, 12.4_
+  - _Boundary: Final Reproducible Evidence Package_
+  - _Depends: 9.2_
+
+- [ ] 9.4 完成独立对抗性实现评审与最终治理差异核对
+  - reviewer从Requirements/Design/ADRs/ledger反向检查实际tree/runtime，重放bootstrap、share/CAS、ACL/FileId、power-cut、Windows source/EXE与Mac/Linux红线
+  - 检查所有WA merge identity、WR evidence、Steering sync与实际delta；实施期新增跨门槛事实必须回到ADR/Spec审批，不能用Implementation Notes补授权
+  - 完成时，无unresolved blocker/major、无未批准delta、diff/checksum/branch tree一致；否则保持NO-GO
+  - _Requirements: 1.2, 5.1, 10.3, 12.2, 12.3, 12.5_
+  - _Boundary: Independent Implementation and Governance Review_
+  - _Depends: 9.3_
+
+- [ ] 10. 完成Windows onedir/windowed最终发布验收
+
+- [ ] 10.1 在同一clean发行候选上完成LocalCAT启动、项目保存/重开、TM激活/重启恢复、TMX导入与FTS5最终闭环
+  - 从全新Windows user profile、非仓库CWD、无Python/Excel依赖启动真实`LocalCAT.exe`并确认可见Qt窗口与`qwindows.dll`
+  - 依次保存/退出/重开项目，首次激活TM/退出/重启恢复，导入rooted TMX并验证count，创建/查询/关闭/重开FTS5 trigram；随后执行双进程锁、target-open、kill/recovery和approved power-cut lane
+  - 对同一dist重算frozen source/Gates、校验fixtures/data/resources/ico/version与avatar功能回归；归档exact commands、完整日志、PASS/FAIL矩阵、Windows FS/lock清单、frozen-source/packaging清单与SHA-256 inventory
+  - 完成时，所有mandatory项在同一commit/dist上PASS、zero skip/patch/mock，WA/WR ledger与Mac/Linux回归闭合，Governance owner才可将Windows状态从NOT_VERIFIED改为VERIFIED；否则保持NO-GO
+  - _Requirements: 1.1, 1.2, 2.1, 3.1, 4.1, 4.2, 5.1, 6.2, 6.5, 7.1, 7.2, 8.1, 8.2, 9.1, 9.3, 9.4, 10.1, 10.2, 11.1, 11.2, 11.3, 12.1, 12.2, 12.3, 12.4, 12.5_
+  - _Boundary: Final Windows Packaged Feature GO_
+  - _Depends: 9.4_
