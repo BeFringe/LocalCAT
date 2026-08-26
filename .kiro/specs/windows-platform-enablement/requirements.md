@@ -4,7 +4,7 @@
 Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT UI 依赖，并独立验证 Qt `windows` 平台插件和 SQLite FTS5；但 `ui-mvp@b925b80` 的 LocalCAT 源码会在导入 `fcntl` 时中止，Windows 又不具备现有 POSIX rooted-handle、文件锁和目录 durability 原语，因此项目持久化、TM 生命周期和 frozen EXE 均不可用。本 Spec 在不削弱 macOS/Linux fail-closed 契约的前提下，为 Windows 建立等价的能力证明和发布路径，直到真实 EXE 上的启动、项目保存/重开、TM 激活/重启恢复、TMX 导入与 FTS5 全部通过。
 
 ## 边界说明
-- **范围内**：Windows 原生 rooted file authority、路径逃逸与 reparse 防护、跨进程锁、原子发布与恢复；所有现有 POSIX 文件语义消费者的共享平台边界接入；LocalCAT Qt 启动、项目生命周期、TM 生命周期、TMX 导入、FTS5；PyInstaller `--onedir --windowed` frozen-source 能力证明、资源收集和 Windows 发行物验证；Qt speaker avatar 的 Windows 功能回归；macOS/Linux 回归保护。
+- **范围内**：Windows 原生 rooted file authority、路径逃逸与 reparse 防护、跨进程锁、原子发布与恢复；所有现有 POSIX 文件语义消费者的共享平台边界接入；LocalCAT Qt 启动、项目生命周期、TM 生命周期、TMX 导入、FTS5；依赖用户管理 CPython/venv/source 的轻量 Windows 启动入口；PyInstaller `--onedir --windowed` frozen-source 能力证明、资源收集和 Windows 发行物验证；Qt speaker avatar 的 Windows 功能回归；macOS/Linux 回归保护。
 - **范围外**：旧 Excel 交互适配器、`xlwings` 或 Microsoft Excel 的安装与验证；`--onefile` 发行；安装器、自动更新、代码签名和商店分发；首版不承诺 remote/UNC share、FAT/exFAT 或不能证明 FileId/reparse/ACL/durability 的第三方文件系统，在这些位置必须明确 fail closed；改变翻译业务语义、TM 检索算法或 UI 产品流程；以 monkeypatch、mock、跳过 Gate、降低身份校验或现场修补代替能力实现。
 - **相邻期望**：Feature 5 与 `feature5-ui-integration` 继续拥有 TM/UI 冻结契约；Parser、项目包、资源、TM snapshot/attestation/recovery 与协作分工规格继续拥有各自业务不变量和 consumer 接入实现；本 Spec 只拥有共享跨平台文件系统/锁合同、Windows backend、amendment dispatch/merge ledger、Windows packaging 和最终集成证据。
 
@@ -13,6 +13,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
 - **审批状态**：ADR-020～023、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已于2026-08-26批准；实现仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
+- **交付路线**：Windows source compatibility 与 ADR-022 frozen distribution 是两个累计验收阶段。source 阶段可先形成依赖用户管理 CPython 3.14 x64、venv、`requirements-ui.txt` 与受审 source tree 的本地运行入口；它不铸造 `TrustedSourceAuthority`、不满足 Requirement 10～12，也不改变 frozen 最终发行门。W3 custom in-process entry 的规划可与 source 平台迁移并行，gate-quality spike 在 W1 rooted contract 冻结后、任何 frozen consumer merge前完成。
 
 ## 需求
 
@@ -76,6 +77,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. When 运行 LocalCAT 的受支持 smoke-test 入口, the 应用 shall 在无源码补丁、无环境 monkeypatch 的条件下返回成功并留下可验证结果。
 4. If Qt 平台插件或必要运行时资源缺失, the 应用 shall 给出可诊断失败，而不是无提示终止。
 5. When Windows avatar 功能使用有效的 speaker avatar catalog, the Qt UI shall 能索引并解码匹配头像；If 没有匹配头像, the UI shall 保持“— / 无内置头像”fallback。
+6. When source compatibility 已闭合且用户安装 CPython 3.14 x64、创建专用 venv并按`requirements-ui.txt`安装依赖, the LocalCAT shall 可由轻量 Windows GUI入口使用受验证的绝对`pythonw.exe`与source bootstrap启动；该入口shall不复制或伪装bundled Python，不宣称 packaged/frozen release，并在环境或source失效时返回可诊断失败。
 
 ### Requirement 7：项目保存、重开与并发安全
 **目标：** 作为译者，我希望在 Windows 保存并重开项目，以便译文、元数据和项目 authority 能跨进程重启可靠保留。
