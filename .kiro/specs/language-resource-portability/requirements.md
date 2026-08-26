@@ -19,6 +19,13 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 - **Borrowed lesson, not authority**：`multi-document-project-workspace` C2C 的 sealed source、strict ZIP、preview/apply stale binding、candidate/LKG/readback/recovery 经验；不复用其 manifest 或项目身份。
 - **Contract state**：本 R/D/T 已冻结并可实施；本文只描述目标合同，不表示 runtime 已实现。
 
+### Windows Compatibility Amendment WA-04
+
+1. Resource direct artifact、ResourcePackage source、repository target 与 receipt ledger 在 Windows 必须消费 ADR-020 rooted authority、process lock 与 bound publisher，保持 profile/carrier/preview/apply/receipt 业务语义不变。
+2. Windows source/package validation 必须拒绝 junction/reparse、hardlink alias、ancestor/final swap、non-regular 与 identity drift；不得以 checkout/CWD、`Path.resolve()` 或 path hash 代替 retained handle proof。
+3. Resource export/import/repository publication 成功必须闭合 candidate、cold validation、owner lease、retained readback、resource/registry durable commit 与 terminal reproof；失败保持 prior resource/registry/runtime 或返回 recovery-required。
+4. source 与 frozen journey 必须从 bundle authority 找到已声明 data，不依赖 repository layout；本 amendment 不把 TM/Termbase payload grammar、ProjectPackage、TMX profile、provider 或 packaging owner 迁入本 Spec。
+
 ## 需求
 
 ### Requirement 1：独立 ResourcePackage Authority

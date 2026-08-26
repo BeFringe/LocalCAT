@@ -21,6 +21,13 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 - Chunk metadata 与 `Chunk_Scope_Projection` 都不是 ResourcePackage payload 或默认 transport candidate。后续 `tmx-context-interchange` 只能消费最小 scope projection，由 Workspace join 当前正文/presence/order；`language-resource-portability` 的 ResourcePackage 仍只包装一个 managed resource 快照。
 - 未来 sync 可以搬运本规格批准的 exact chunk metadata bytes/digest，但必须另经 ProjectPackage 新 schema/namespaced extension 或独立 companion transport 批准；provider 仍不得解释 membership/permission。
 
+### Windows Compatibility Amendment WA-02
+
+1. Chunk composition 在 Windows 启动时不得导入 `fcntl` 或其他 POSIX-only module；repository 必须经 ADR-020 的 `ProcessFileLock`、`RootedFileSystem` 与 `BoundDirectoryPublisher` ports 取得锁和发布能力。
+2. 跨进程锁必须保持W1 exact protocol-control ACL、可重算且不含owner token/FileId的`ProtocolControlLockPayloadV1`、`CREATE_NEW` share-none首次初始化、empty/strict-prefix/full exact creator-crash接管、unknown bytes fail-closed、普通`LOCK` profile重开、进程终止eventual release与stale/foreign identity拒绝；业务层不得用进程内mutex、存在性文件或删除未知锁代替。
+3. Chunk journal/LKG/state machine 仍由本 Spec 拥有；Windows publish、readback、cleanup 或 kill 中断必须恢复为完整 old/new/recovery-required 之一，不得出现半发布 metadata/audit 状态。
+4. source 与 frozen Qt composition 均须证明 controller import/startup 无平台专属顶层依赖；本 amendment 不改变 chunk identity、membership、permission、ProjectPackage 或 sync authority。
+
 ## 术语
 
 - **Chunk_Plan**：一个 Project 的可选协作视图，拥有稳定 `chunk_plan_id`、单调 revision、有序 chunks 和独立语义 digest。

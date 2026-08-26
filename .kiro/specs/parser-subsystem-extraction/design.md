@@ -73,10 +73,17 @@ Parser 只回答四类问题：这个输入按什么用途和格式读取、如�
 - ADR-015 定义 Parser Foundation 与 Engine/Store 的中立依赖方向，并取代 ADR-004/005 的旧方向。
 - Parser 触发的 Feature 5 current-source evidence 重验由 Integration TM owner 处理；Parser 只交接变更清单，不自签 TM 资格。
 
+### Windows Compatibility Amendment WA-01
+
+- **ADR mapping**：follow ADR-020；Parser 继续拥有 sealed source/canonical writer 与 `PARSER.*` 失败语义，平台层只提供 rooted identity、publisher facts 与 normalized platform errors。
+- **Reader port**：`parser_source.py` 不再直接选择 POSIX/Win32 primitive；composition 注入 `RootedFileSystem`，Windows adapter 必须以 retained handles 证明 root containment、regular identity、reparse state 与 exact snapshot bytes。
+- **Writer port**：canonical serializer 仍只生成 bytes；Source Boundary明确选择`CREATE_IF_ABSENT`或在调用owner持有destination-family排他lease时使用`REPLACE_UNDER_LOCK`。candidate保持打开完成write/content flush与owner journal/LKG arm后相对bound parent rename，捕获final facts、关闭全部candidate handles，再以retained destination readback handle闭合Parser durable commit、receipt与terminal reproof。平台 failure/ambiguity 不得被折成成功或 pathname-only fallback。
+- **Verification**：source 与 frozen 两种 composition 都覆盖 junction/reparse、hardlink、ancestor/final swap、body-unread、candidate close/reopen、publish/kill/recovery；POSIX 当前合同做 parity regression。
+
 | 项目 | 处置 |
 |---|---|
 | Applicable Steering | `tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md` |
-| Applicable ADRs | ADR-015；相邻 ADR-009/011/012/013/014 不迁权 |
+| Applicable ADRs | ADR-015、ADR-020；相邻 ADR-009/011/012/013/014 不迁权 |
 | ADR disposition | Follow ADR-015；ADR-004/005 已被取代 |
 | Scope contract | `rebaseline-plan.md` 与本规格 Requirements |
 | Steering sync | runtime 收口时只更新真实派生事实 |

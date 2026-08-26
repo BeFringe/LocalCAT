@@ -23,6 +23,13 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 - ProjectPackage 与后续 ResourcePackage 是两个正交的持久/交换单元：前者拥有项目内容和编辑状态，后者拥有 TM/术语资源可移植产物。本规格不建立两者的共同 authority。
 - RPY 产品实施排在 Sync 主线之后；TMX 仍只是 language resource；PO/POT writer 需等待后续 codec 规格批准。这些后置项不得以预留产品控件或格式专属字段的方式进入本规格。
 
+### Windows Compatibility Amendment WA-03
+
+1. Windows 的显式 selected-files intake、ProjectPackage validate/save/import/reopen 必须消费 ADR-020 rooted authority 和 bound publisher，保持 Project/Document/Segment identity、deterministic carrier、preview binding 与 receipt 语义不变。
+2. Project save 只能在 owner lease 下发布；target-open/share violation、concurrent writer、junction/reparse/hardlink、ancestor/final swap 与同字节换 FileId 必须在 mutation 前拒绝，或在 publication 后进入可证明 recovery，不得用 pathname/mtime 猜测结果。
+3. candidate close/readback、owner durable state commit、terminal reproof 与匹配 `DurabilityProfile` 共同定义 Windows success；crash/restart/power-boundary结果必须归入完整 old/new/recovery-only 集合并保留正确 dirty/baseline。
+4. 本 amendment 不改变 ADR-018/019 的 ProjectPackage carrier、manifest、receipt、LKG 与 workspace authority，也不取得 ResourcePackage、TMX、Chunk 或 frozen bootstrap 权威。
+
 ## 术语
 
 - **Project**：一个翻译工作区的稳定身份、语言、origin、有序 documents 和项目状态。

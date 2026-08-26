@@ -21,6 +21,13 @@ RPY 不属于 Parser 首波内建 runtime。`rpy-project-codec` 作为可配置�
 - `parser-rebaseline` 只拥有本规格的 Parser 契约门。它不得修改相邻 Spec 的 brief、Requirements、Design、Tasks 或 review-clustering，也不得借本规格拥有 multi-document、RPY 聚合、chunk 或 sync 实施权。
 - UI→Parser→multi-document→chunk→sync 的顺序是本轮治理边界；手工包→自动同步是后续演化方向，不改变本轮 Parser 的单输入职责。
 
+### Windows Compatibility Amendment WA-01
+
+1. Parser 的 rooted source 与 canonical target 必须消费 ADR-020 的 `RootedFileSystem` / `BoundDirectoryPublisher`；POSIX 与 Windows adapter 对外保持相同 snapshot、stale、terminal、receipt 与 body-safe error 语义。
+2. Windows source 必须由 live rooted handle、regular-file identity、ancestor/final reparse proof 与 exact bytes 共同闭合；junction/reparse、hardlink alias、ancestor/final swap 或能力缺失须在正文交付前 fail closed，禁止用 `Path.resolve()`、`lstat()` 或 pathname hash 近似授权。
+3. Windows canonical write 必须在 retained target-parent authority 内选择 `CREATE_IF_ABSENT` 或由调用 owner 持有 destination-family 排他 lease 的 `REPLACE_UNDER_LOCK`；candidate 保持打开完成 write/content flush 与 owner journal/LKG arm 后相对 bound parent rename，捕获 final facts、关闭全部 candidate handles，再以 retained destination handle完成readback、owner durable commit与terminal reproof。失败保持原目标或进入明确 recovery-required，不得仅因 `os.replace()` 返回成功而签发 receipt。
+4. 既有 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE` 保持为无法建立等价 rooted authority 时的稳定失败；本 amendment 不把 ProjectPackage、ResourcePackage、TMX publication、Store transaction 或 frozen bootstrap 权威迁入 Parser。
+
 ## 术语
 
 - **Effective_Purpose**：调用方声明的闭合输入用途。首波值为 `project_document`、`language_resource.translation_memory`、`language_resource.termbase`。

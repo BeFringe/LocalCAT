@@ -2,6 +2,8 @@
 
 ## 任务说明
 
+> **WA-02 Windows compatibility amendment**：以下 `a` 后缀任务只把 chunk metadata store 接到 ADR-020 平台原语；chunk identity、membership、permission 与 ProjectPackage 分权不变。
+
 本计划保持 brief 的四个 Promotion Cluster，并在它们之前增加只做治理的 Cluster 0。`multi-document-project-workspace` 完整 C2A/C2B/C2C 提供真实 ProjectPackage 作为 Chunk C1 的上游输入。
 
 `spec.json` 的 Requirements/Design/Tasks 三个 `approved` 和 `ready_for_implementation` 已置为 `true`。Cluster 1 只实现 identity/membership/topology/local metadata；不得提前引入 assignment、Controller/Qt、ResourcePackage 或 TMX 责任。
@@ -74,6 +76,11 @@ Multi-Document C2 complete
   - candidate validation、cold decode、publish revalidation 与 cold readback 各自复验 `assignee=None`/counts `0`；拒绝发生在 journal/LKG/replace/audit publication 前并保留原 store/LKG。
   - 不导入或调用 ProjectPackage physical/logical owner；证明 ProjectPackage v1 bytes/schema/golden 不变。
 
+- [ ] 1.3a 将 metadata store 注入平台文件系统、锁与发布端口
+  - store 不再顶层导入 `fcntl`，只消费 `RootedFileSystem`、`ProcessFileLock` 与 `BoundDirectoryPublisher`；journal/LKG/audit schema 与恢复 owner 保持原样。
+  - _Amendment: WA-02_
+  - _Depends: 1.3, ADR-020, windows-platform-enablement 2.1_
+
 - [x] 1.4 闭合 C1 contract/property/fault/architecture tests
   - 使用正式 exporter 产生至少两 Documents 且跨文档重复 local ID 的真实 ProjectPackage，冷开后创建连续/离散/跨文档 chunks。
   - 建立正向阶段矩阵：create → decode → preview/candidate → persist → cold readback/cold reopen 每一点都断言所有 active chunks `assignee=None` 且 assignment counts 为 `0`；split children 与 merge result 同样为 `None`。
@@ -82,6 +89,11 @@ Multi-Document C2 complete
   - 覆盖 scope projection exact fields/full membership、issue→plan drift→revalidate、stale/retired/foreign 拒绝与 forbidden-field scan；证明后续消费者无需读取 chunk store/metadata 或借用 search hits 才能取得并复验明选 membership。
   - 覆盖 metadata duplicate key/extra field/non-null assignee/non-zero assignment count/digest/size/depth、stage/replace/readback/cleanup/cold recovery，并在真实冷重开后复验未分配状态及扫描 body leakage。
   - 累计 architecture 和边界证据证明 chunk 没有变成 Document、ProjectPackage、Parser、TM 或 provider owner。
+
+- [ ] 1.4a 闭合 Windows source/frozen import 与启动组合
+  - 源码和 frozen 入口均须在导入 chunk store 时不触发 POSIX-only import，并通过同一 composition 注入 Windows 实现；缺失实现必须稳定 fail closed，不允许条件跳过 store。
+  - _Amendment: WA-02_
+  - _Depends: 1.3a, ADR-020, ADR-022, windows-platform-enablement 1.4_
 
 ### Cluster 1 完成门
 
@@ -135,6 +147,11 @@ Multi-Document C2 complete
   - current chunk 只接受当前 plan active ID，切换换 capability epoch；retired/foreign/stale 不改导航或 target。
   - 所有 target/confirmed mutation 命令在首次 workspace mutation 前重验 actor/session/plan/current chunk/segment。
 
+- [ ] 3.2a 以 `ProcessFileLock` 闭合跨进程 metadata mutation
+  - Windows使用W1 exact ACL和无owner token/FileId的可重算payload完成`CREATE_NEW` share-none首次初始化；creator crash只接管empty/strict-prefix/full exact bytes，unknown/tampered bytes保持`LOCK_UNAVAILABLE`，完成后重开普通`LOCK` profile，再覆盖acquire/timeout/release、持锁进程退出、stale generation与同一project并发打开。
+  - _Amendment: WA-02_
+  - _Depends: 1.3a, 3.2, windows-platform-enablement 3.7_
+
 - [x] 3.3 以 versioned contract 增加 `current_chunk` search scope
   - 保持 `current_document` / `entire_project` exact 语义；`current_chunk` 只遍历 exact active membership 并按 current workspace navigation order 投影。
   - 复用同一 matcher pipeline、composite hit identity、field/offset/stale guards，不复制 Match Case/Whole Word/TM 语义。
@@ -181,10 +198,20 @@ Multi-Document C2 complete
   - 运行 assign/switch/edit/read-only/search/progress/reconcile-rebase/split/merge/conflict/undo/close-reopen 完整 journeys。
   - 证明 chunk-only operations 不改 ProjectPackage bytes、workspace target/dirty 或 codec-private；实际 target edit 仍由 workspace/package 后续保存。
 
+- [ ] 4.4a 在 Windows 复验 metadata publication 与冷恢复
+  - 以真实ProjectPackage执行candidate write/flush→journal/LKG arm→仍打开handle rename→capture/close→retained reopen/readback→owner durable commit→terminal reproof，并在每个边界与进程终止后复证prior/new snapshot、audit head和workspace bytes。
+  - _Amendment: WA-02_
+  - _Depends: 3.2a, 4.4, windows-platform-enablement 3.7_
+
 - [x] 4.5 重签 evidence 并完成治理收尾
   - 在 final runtime roots 运行 chunk contract/topology/store/permission/rebase/controller/search/Qt/fault/acceptance 与无-plan legacy suites。
   - current-source 工具生成 evidence 并由 strict consumer 复读；evidence 后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实 structure/tech/roadmap/spec ownership，并以 final cumulative diff 的可重放验证闭合 Feature 验收。
+
+- [ ] 4.5a 执行 Windows 双进程、崩溃与 source/frozen import acceptance
+  - 在两个独立进程与ADR-022 frozen import harness中覆盖two-creator、create/write/flush/readback/close逐边界creator crash、unknown payload、锁竞争/owner kill、candidate self-sharing/target-open、journal phase crash、重开恢复和composition startup；不得通过禁用协作模块取得PASS。
+  - _Amendment: WA-02_
+  - _Depends: 1.4a, 4.4a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
 
 ### Cluster 4 完成门
 

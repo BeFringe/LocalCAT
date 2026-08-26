@@ -219,13 +219,13 @@
    - 定义Windows live-handle identity、reparse/share mode、W1 lock integrity ACL、retained readback→owner commit→terminal reproof、非CAS threat scope、版本化`DurabilityProfile`与稳定错误族。
    - 与 ADR-008/009/018/019 的 authority/atomicity/fail-closed 决策相交。
 2. **ADR candidate W2 — Windows device-local private attestation representation**
-   - 在Windows物理表示范围部分取代ADR-013/016的POSIX uid/mode/dev/inode谓词，冻结exact `windows-private-v1` SID/DACL/AccessCheck与nested `WindowsPrivateProof`；Gate D/canonical owner envelopes保持正交。
+   - ADR-021最初在Windows物理表示范围部分取代ADR-013/016的POSIX uid/mode/dev/inode谓词并冻结`WindowsPrivateAclV1`；Task 0.5随后形成并获采纳的ADR-023，以包含exact owner+DACL+MIC projection的`WindowsPrivateSecurityV2`接管该物理profile。nested `WindowsPrivateProof`与Gate D/canonical owner envelopes仍保持正交。
    - 改变 frozen/persistent identity 与安全恢复边界。
 3. **ADR candidate W3 — Windows frozen distribution ownership and source closure**
    - 新建onedir/windowed build owner、native-entry pre-Python DLL policy、完整Boot TCB、retained-handle exact-byte `TrustedSourceLoader`、`TrustedSourceAuthority`、clean/content-addressed source/fixture closure及发行门。
    - ADR-011 仍只拥有 Feature 5/UI DTO 与 composition；W3 是新的跨 Spec frozen/source-loader contract 与长期所有权，满足候选门槛。
 
-用户已在 2026-08-25 将 W1/W2/W3 批准为 `APPROVED_FOR_BASELINE_NAMING`，因此本 Spec、依赖图和 amendment dispatch 可以稳定引用这些临时标签；治理分支已形成唯一映射的 ADR-020/W1、ADR-021/W2、ADR-022/W3 草案。草案的人工采纳、取代关系落账和 Steering merge 仍由 Task 0.1/0.2 闭合；在此之前 design validation 与实现保持 **NO-GO**。
+W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-authority时序补充与V2 security profile窄范围修订正式采纳；取代/补充关系由治理分支唯一记录。`windows-platform-enablement` owning scope、`ui-mvp` 的 TMX owner 身份和 avatar 仅回归边界已由 Task 0.2 批准，WA-01～08 current R/D/T acknowledgement、ledger authority和独立Design approval均已闭合；实现从Task 1起按依赖逐簇进入，仍不得用局部能力代答最终EXE。
 
 ## Risks & Mitigations
 - **Windows share mask 自阻塞** — 为 root/intermediate/source/target/candidate/lock 定义不同 handle profiles；运行占用目标、同进程二次打开和跨进程 replace 矩阵。

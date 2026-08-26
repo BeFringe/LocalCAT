@@ -69,6 +69,13 @@
 - **Steering sync**：Required。实现闭合时同步 `product.md`、`structure.md`、`tech.md` 的 exact-only/JSONL 当前态与新增文件边界；已同步的 integration boundary、roadmap 和 ownership 不重复改写。
 - **Downstream revalidation**：`qt-editor-json-mvp-increment` Requirement 3/7 matcher handoff、既有 Qt/Excel/legacy tests、macOS bootstrap；Parser/multi-document 仅登记未来触发器。
 
+### Windows Compatibility Amendment WA-07
+
+- **ADR mapping**：follow ADR-020/021/022。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有bootstrap/build/manifest，TM Core拥有activation/private proof。
+- **Early composition**：source路径先由platform factory构造Windows ports，再import/construct CapabilityHost和Controller graph；frozen路径必须先由native entry与Boot TCB闭合DLL/source policy并铸造`TrustedSourceAuthority`，随后才构造platform factory，最后才进入CapabilityHost/Controller业务import。任一前置失败不得继续到下一层。
+- **Frozen source consumption**：CapabilityHost只接受`TrustedSourceAuthority`和loader attestation，核对exact executed-source digest、origin/`co_filename`与Gate closure；critical `.py`不得同时来自PYZ/`.pyc`/checkout。
+- **Lifecycle projection**：Windows activation/restart、nested private proof与resource lifecycle只经owner public ports进入；Qt状态不携raw ACL/FileId/path/proof，也不把frozen metadata提升为capability。
+
 ## 架构
 
 ### 现有架构分析

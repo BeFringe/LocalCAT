@@ -47,6 +47,13 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - Core 可以读取中立 raw records，不得依赖 PySide6、xlwings、Controller、workspace state 或 Parser 实现。
 - Compatibility facade 可依赖新 Core ports；新 Core 不反向依赖旧 `TMEngine`。
 
+### Windows Compatibility Amendment WA-06
+
+- **ADR mapping**：follow adopted ADR-020/021 as supplemented by adopted ADR-023 decisions 2～5，其中仅V1 DACL-only security profile由V2窄范围取代。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
+- **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`BoundDirectoryPublisher`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。
+- **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
+- **Durability/FTS5**：owner在`PendingPublication` retained readback authority存活时写自身durable phase、复证业务state，再调用platform terminal reproof；运行时profile只来自W1 canonical durability registry的source rooted或frozen bundle authority。Windows restart、two-process/kill/power fault matrix与FTS5/fallback create-query-reopen分别验收，且仍服从Gate C/D与benchmark owner。
+
 ### Revalidation Triggers
 
 - Python/SQLite/UCD 版本、FTS5 capability 或 WAL 安全范围改变。

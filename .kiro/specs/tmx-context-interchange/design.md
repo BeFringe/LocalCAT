@@ -13,6 +13,15 @@ Chunk owner ── one exact scope projection ───────┘       │
 Parser TMX reader ─> prop-preserving ResourceRecord ─> semantic TM importer ─> canonical TM owner
 ```
 
+## Governance Impact
+
+### Windows Compatibility Amendment WA-05
+
+- **ADR mapping**：follow ADR-020/022。TMX 保留 payload grammar、scope/loss、canonical writer 与 direct receipt；Parser 提供 sealed source，platform 提供 `BoundDirectoryPublisher`，packaging 提供 trusted bundle root。
+- **Source/writer**：import 不新增 Windows XML reader；`tmx_artifact_save.py` 的 dirfd/fsync implementation 改为注入 platform ports，owner仍负责 locale/scope/canonical byte validation和recovery classification。
+- **Frozen journey**：packaged import/export 从 trusted source/bundle authority 获取声明的 fixtures/resources，不从 CWD 或 checkout 推断；ResourcePackage profile仍通过既有 handler边界组合。
+- **Verification**：hostile source zero mutation、canonical byte/reopen、target-before preservation、publish/readback/restart recovery 与 clean-user packaged journey全部使用真实业务 reader/writer。
+
 ## 模块
 
 ### `tmx_context_contracts.py`

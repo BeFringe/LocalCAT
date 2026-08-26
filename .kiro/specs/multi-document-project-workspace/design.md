@@ -97,6 +97,13 @@ Project workspace ───────────────> ProjectPackage
 - **Steering sync**：C0 只建立 ADR、Requirements、Design、Tasks 与 border，不修改 runtime。真实模块落地并通过对应 Cluster gate 后，`structure.md` / `tech.md` 只同步已实现事实；Feature GO 再一次闭合 roadmap/ownership disposition。
 - **Downstream revalidation**：Cluster 2 完成后，`language-resource-portability` 才可借鉴已验证的原子写、digest、preview、receipt 原语起草独立 R/D/T；Chunk 必须等待 C2A/C2B/C2C，Sync 必须消费 ProjectPackage/ResourcePackage，RPY 产品顺序在 Sync 后。
 
+### Windows Compatibility Amendment WA-03
+
+- **ADR mapping**：follow ADR-020。Project owner 保留 ADR-018/019 carrier、receipt、LKG、dirty/baseline 和 recovery decisions；platform ports 替代本地 `dir_fd`/`O_NOFOLLOW`/directory-fsync helpers。
+- **Intake/save ports**：selected-files intake 消费 `RootedFileSystem` 的 retained root/file authorities；ProjectPackage save/import 消费 `ProcessFileLock` 与 `BoundDirectoryPublisher`，不把 Windows FileId 或 path 变成持久项目身份。
+- **Success boundary**：candidate cold validation、owner-lease publication、retained destination readback、durable Project state commit 和 terminal reproof 缺一不可；share violation 或不合作进程造成的 late drift 映射为现有 stale/recovery family。
+- **Verification**：真实 ProjectPackage 覆盖 save/reopen byte+digest parity、target-open rejection、concurrent writers、junction/swap、process kill与匹配 profile 的 power-boundary old/new/recovery-only matrix；POSIX carrier golden 保持不变。
+
 ## Critical Path 与验证锚点
 
 ```text
