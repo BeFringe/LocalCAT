@@ -22,10 +22,11 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 
 ### Windows Compatibility Amendment WA-08
 
-1. Windows source 与 onedir/windowed 两种 Qt journey 必须显示真实主窗口，并完成项目保存/重开、TMX路径和资源表面回归；`qwindows.dll`缺失、错误平台plugin或窗口不可见均为启动失败，不得用offscreen结果代替visible验收。
-2. `LocalCAT-logo-silver.png`、Windows icon与manifest声明的可选avatar catalog等本Spec presentation assets必须从ADR-022 trusted bundle resource root解析，不依赖checkout或CWD；头像仍只在inventory中按既有安全索引/解码/fallback语义展示，catalog未声明时保持无头像fallback。
-3. clean-user packaged journey必须从non-repository CWD运行并验证声明资源索引、图片解码或无catalog/无匹配头像fallback，以及项目保存/重开；测试输入不成为build authority或产品样本数量合同。
+1. Windows source与onedir/windowed两种Qt journey必须分别显示真实主窗口，并完成项目保存/重开、TMX路径和资源表面回归；`qwindows.dll`缺失、错误platform plugin或窗口不可见均为启动失败，不得用offscreen结果代替visible验收。
+2. source journey中的`LocalCAT-logo-silver.png`与可选avatar catalog必须从source-owned resource root解析；frozen journey中的logo、Windows icon与manifest声明catalog必须从ADR-022 trusted bundle resource root解析。两者均不依赖CWD或未经声明的checkout fallback，头像继续只在inventory中按既有安全索引/解码/fallback语义展示。
+3. user-managed source journey与clean-user packaged journey都必须从non-repository CWD运行并验证资源索引、图片解码或无catalog/无匹配头像fallback，以及项目保存/重开；测试输入不成为build authority或产品样本数量合同。
 4. 本 amendment不取得PyInstaller/bootstrap、ProjectPackage、ResourcePackage、TMX或Feature5 capability authority；它只拥有Qt单JSON journey与资源presentation的Windows消费验收。
+5. source阶段可交付使用用户已安装CPython 3.14 x64、专用venv和source tree的轻量Windows GUI入口；该入口不复制runtime/source、不满足ADR-022、不改变唯一frozen发行profile，环境或source失效时必须给出可诊断失败。
 
 ## 需求
 

@@ -30,6 +30,31 @@
 | frozen qwindows | PASS | 自动 hook 有效 | 最终发行仍执行可见窗口探针 |
 | frozen LocalCAT 启动 | FAIL：`capability_host.py` 不可见 | source identity 失败 | frozen-source 是发布阻塞项，不延后为安装器问题 |
 
+### Implement Notes — Task 1.1 fresh replay（2026-08-26）
+
+- 在detached clean `b925b803d81001f55dea46ace8b26159ca82db19`与新建CPython 3.14.7 x64 venv中重放后，上表的依赖、source、Parser、Project、TM/TMX和clean frozen-source结论仍成立；portable evidence位于`artifacts/windows/b925b803d81001f55dea46ace8b26159ca82db19/20260826-task1-1-fresh-01/`。
+- 新增信息：若PyInstaller继承包含外部tool runtime的`PATH`，其native analysis可把非CPython/PySide6来源的ICU/OpenSSL复制进dist，本次负向control因此使`Qt6Core.dll`以WinError 127失败；逐文件SHA-256相同的短路径副本排除了路径长度。净化为venv/standalone CPython/Windows system目录后，clean build恢复到既有`capability_host.py`不可见失败。因此W3 build provenance/native closure必须显式排除ambient `PATH`输入，不能只要求clean venv。
+- Task 1.1旧baseline matrix中的`frozen.qwindows_collection=PASS`是aggregate visibility命令内的独立子事实；该命令因raw `.py`/fixture/resource缺失整体exit 1。两者不矛盾，但旧matrix的单一`exit_code`字段不够清晰；Task 1.2版本化scenario contract已把command exact exit与各scenario/event fact分离，后续release matrix不得沿用该歧义表示。
+
+### Implement Notes — Task 1.2 portable evidence harness（2026-08-26）
+
+- 三个scenario contracts已分别经真实system Windows PowerShell 5.1 success、expected-failure与timeout/interruption做pre-commit dry-run；这些bundle只证明producer与validator内部一致，不能对尚未tracked的合同/runner宣称外部三锚，也不预填会随候选commit变化的artifact摘要。cluster退出条件是唯一候选提交后，在不再改动tracked tree的前提下由clean orchestrator对该HEAD重放三lane并生成独立external-anchor records；任一未完成或失败时不得退出C1S/进入Task 2。
+- `run_windows_evidence_harness_smoke.py`只生成脱敏、仓库相对identity的schema/日志证据并标记`INTERNAL_CONSISTENCY_ONLY`；`anchor_windows_evidence_harness_smoke.py`先验证HEAD/clean tracked orchestrator与`git show`合同bytes，再独立计算生成后的manifest摘要、执行外锚validator并写`EXTERNALLY_ANCHORED`记录。Task 1.1的完整build/dist、Analysis和原始现场日志继续保存在其content-addressed artifact key并由checksum ledger绑定，不进入Git或充当私有绝对路径authority。
+
+### Implement Notes — Task 1.4 W3 stock feasibility（2026-08-26）
+
+- 以CPython 3.14.7 x64、PyInstaller 6.22.2、官方sdist SHA-256 `89b65a3ad07d9dd5832253e37bc45f31872d10d7f9d5c9fd0fdd6088a83829dd`重放stock windowed bootloader静态门；`runw.exe` SHA-256为`87b0c589906a5d690c26c602bf2ee7e43b3eab55574bf72887a8ca07fbb2dba0`，baseline EXE为`20fccf54845e8b171928d5ed5f85efd716c5dfeb49508c0dcaf2ca0f163a5ac7`。工具直接比较sdist与extracted 51-file source aggregate，并以Task 1.1 checksum/matrix/inventory/Analysis把baseline绑定到`b925b803d81001f55dea46ace8b26159ca82db19`；stock/baseline `.text` SHA-256均为`6fcaee6735d961a7ded1c1d8fd789ef6d4a8ac7a5c551b04afbad8e32c1da4e3`。任一pin或关系不匹配为`INVALID_INPUT`/exit 2，不生成stock结论。审计器与机器可读结果位于`tools/audit_w3_stock_bootloader.py`和`artifacts/windows/b925b803d81001f55dea46ace8b26159ca82db19/20260826-task1-4-w3-stock-01/`。
+- stock源码先从executable pathname推导`application_home_dir`并调用`SetDllDirectoryW`，之后才进入`pyi_launch_execute`并以`LOAD_WITH_ALTERED_SEARCH_PATH`加载Python DLL；Python interpreter、bootstrap与`pyimod03_ctypes`均在其后。Task 1.1 inventory/Analysis确认该baseline实际包含`_ctypes.pyd`及`ctypes`模块，因此后置ctypes fallback的`sys._MEIPASS + PATH`搜索适用于本baseline。所审源码没有W3所需的`SetDefaultDllDirectories`/`AddDllDirectory`组合、`GetFileInformationByHandleEx`/`FILE_ID_INFO` live identity、final-component no-follow、native attestation handoff或`TrustedSourceLoader`。
+- stock `runw.exe`与baseline windowed EXE均为AMD64 GUI PE、无delay imports，静态导入`ADVAPI32.dll`、`COMCTL32.dll`、`GDI32.dll`、`KERNEL32.dll`、`USER32.dll`；静态名称不能证明实际KnownDLL/System32 identity，且`COMCTL32.dll`需要在W3中明确消除pre-entry依赖或批准并证明其WinSxS/System resolution closure。
+- 六项mandatory stock断言`DLL_POLICY_BEFORE_PYTHON`、`NATIVE_CLOSURE_PRELOAD`、`ACTUAL_MODULE_REPROOF`、`ATTESTATION_HANDOFF`、`PREAUTHORITY_HOOK`、`PE_SYSTEM_ONLY`全部FAIL。`module_collection_mode='py'`只能证明collection机制可用，不能代答native pre-authority与exact executed-byte proof；Task 1.4据此完成stock route NO-GO裁决并阻断所有frozen consumer与Task 7，完整W3 feasibility转由Task 1.5/1.6负责。
+- 当前host没有`cl.exe`、`link.exe`、`msbuild.exe`、`vswhere.exe`或Windows SDK include，仅发现`ninja.exe`。继续实现须按ADR-022既有fallback重新批准release-owned/customized PyInstaller bootloader/launcher方案，随后锁定编译器/SDK与bootloader source/patch，完成pre-load native closure、不可伪造attestation handoff及retained-handle exact-source loader；不能在stock dist上现场补文件或以Python runtime hook追认更早的load。
+- `tools/replay_w3_stock_bootloader.ps1`现以显式CPython、Task 1.1 artifact key、空work/output roots为输入，创建clean audit venv、下载并校验固定PyInstaller sdist/stock bootloader、提取source后重跑关系审计；不再依赖本机sibling目录布局。Task 1.1 baseline artifact仍是显式content-addressed外部输入，而不是被重复提交到Git的322MB build/dist树。
+
+### Implement Notes — Source / frozen delivery staging
+
+- stock NO-GO只证伪未经修改的PyInstaller entry，不证伪Windows source业务能力。Task 2～6.6b先以用户安装的CPython 3.14 x64、专用venv、`requirements-ui.txt`与受审source tree闭合Qt、Project、TM、TMX与FTS5；6.6a只实现轻量入口，WA-08 5.4a使用它运行产品journey，6.6b再汇总source里程碑。该入口只调用绝对`pythonw.exe`/source bootstrap，不属于frozen release。
+- W3没有降级：custom in-process entry的toolchain、ABI、Boot TCB与维护边界由Task 1.5立即规划；Task 1.6在W1 rooted contract冻结后执行gate-quality native spike。spike通过后只先放行pre-build roots/WA-07 3.6a与candidate构建；所有packaged owner revalidation必须等待platform 7.4同一发行候选，随后才由WA-08汇合。
+
 ## Codebase Gap Analysis
 
 ### 现有边界与可复用资产
@@ -200,15 +225,12 @@
 - **Rationale**: ADR-011 只拥有 Feature 5/UI DTO 与 composition，不是 source-loader trust authority；W3 必须明确建立 loader、bootstrap、manifest 和长期 build ownership 合同，不能把现状误称为 ADR-011 已批准。
 - **Trade-offs**: 发行物包含可读源码且体积增加；这是当前能力合同的显式成本。
 
-### Decision 5：按阻塞依赖分簇交付
-1. Governance/ADR/ownership closure。
-2. 最小 frozen Boot TCB/TrustedSourceLoader exact-byte feasibility spike；失败回到 W3。
-3. 平台合同、Windows native primitives、POSIX adapter parity、power-cut 与反例 harness。
-4. Parser + collaborative startup vertical slice。
-5. 项目/资源/TMX persistence vertical slice。
-6. TM lock/attestation/snapshot/recovery vertical slice。
-7. 完整 frozen-source/build manifest/Qt resources。
-8. clean Windows packaged E2E + macOS/Linux regression + release evidence。
+### Decision 5：按source/frozen双路线分簇交付
+1. Governance/ADR/ownership closure与stock entry NO-GO裁决。
+2. source主线：平台合同、Windows native primitives、POSIX parity与反例harness → Parser/Chunk startup → Project/Resource/TMX → TM/Feature5/UI → user-managed source journey。
+3. frozen并行规划：立即冻结custom in-process entry的toolchain、ABI、Boot TCB与维护边界；W1 rooted contract冻结后执行最小TrustedSourceLoader exact-byte spike，失败回到W3但不撤销source里程碑。
+4. spike全PASS后进入frozen owner revalidation、完整source/build manifest、Qt resources与WA-07/08 packaged journey。
+5. clean Windows packaged E2E + macOS/Linux regression + release evidence。
 
 ## Governance Candidates
 

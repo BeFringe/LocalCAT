@@ -75,6 +75,7 @@
 - **Early composition**：source路径先由platform factory构造Windows ports，再import/construct CapabilityHost和Controller graph；frozen路径必须先由native entry与Boot TCB闭合DLL/source policy并铸造`TrustedSourceAuthority`，随后才构造platform factory，最后才进入CapabilityHost/Controller业务import。任一前置失败不得继续到下一层。
 - **Frozen source consumption**：CapabilityHost只接受`TrustedSourceAuthority`和loader attestation，核对exact executed-source digest、origin/`co_filename`与Gate closure；critical `.py`不得同时来自PYZ/`.pyc`/checkout。
 - **Lifecycle projection**：Windows activation/restart、nested private proof与resource lifecycle只经owner public ports进入；Qt状态不携raw ACL/FileId/path/proof，也不把frozen metadata提升为capability。
+- **Route staging**：source composition、activation/restart、FTS5与safe projection先形成`SOURCE_MERGED_PASS`；frozen bootstrap/source-attestation tasks在W3 custom spike全PASS后重放并推进terminal状态。两阶段复用同一Controller/CapabilityHost ports，不建立第二业务authority；user-managed launcher只消费source阶段。
 
 ## 架构
 

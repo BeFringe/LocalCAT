@@ -24,7 +24,7 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 1. Resource direct artifact、ResourcePackage source、repository target 与 receipt ledger 在 Windows 必须消费 ADR-020 rooted authority、process lock 与 bound publisher，保持 profile/carrier/preview/apply/receipt 业务语义不变。
 2. Windows source/package validation 必须拒绝 junction/reparse、hardlink alias、ancestor/final swap、non-regular 与 identity drift；不得以 checkout/CWD、`Path.resolve()` 或 path hash 代替 retained handle proof。
 3. Resource export/import/repository publication 成功必须闭合 candidate、cold validation、owner lease、retained readback、resource/registry durable commit 与 terminal reproof；失败保持 prior resource/registry/runtime 或返回 recovery-required。
-4. source 与 frozen journey 必须从 bundle authority 找到已声明 data，不依赖 repository layout；本 amendment 不把 TM/Termbase payload grammar、ProjectPackage、TMX profile、provider 或 packaging owner 迁入本 Spec。
+4. source journey必须从rooted source authority、frozen journey必须从ADR-022 trusted bundle authority找到已声明data；两者均不得依赖CWD或未经声明的repository fallback。本 amendment不把TM/Termbase payload grammar、ProjectPackage、TMX profile、provider或packaging owner迁入本Spec。
 
 ## 需求
 

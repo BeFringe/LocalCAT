@@ -9,6 +9,7 @@
 - 在 Windows 11 本地受支持文件系统上提供与现有 POSIX 合同等强的 rooted read/create、identity、lock、atomic publish、private storage proof 与 recovery 能力。
 - 消除业务模块对 `fcntl`、`dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 和 POSIX directory fsync 的直接依赖，同时保持 macOS/Linux 回归。
 - 让 source 与 frozen LocalCAT 都能完成 Qt 启动、项目保存/重开、TM 激活/重启恢复、TMX 导入和 SQLite FTS5。
+- 在 frozen release闭合前提供明确标记的user-managed source runtime里程碑；轻量Windows入口只启动已验证的外部`pythonw.exe`与source bootstrap，不成为第二发行权威。
 - 以可复现命令、完整日志和反例矩阵证明能力；禁止能力旁路、测试 skip 或现场修补。
 
 ### Non-Goals
@@ -26,6 +27,7 @@
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
 - Windows PyInstaller onedir/windowed build owner、generated frozen-source closure、bundle-root/resource contract 和 clean-machine release matrix。
+- user-managed source runtime 的轻量 Windows GUI入口、环境失效诊断与非发行状态标识；Python/venv/source仍由用户安装并管理。
 - Windows `.ico` 与发行元数据。
 
 ### Out of Boundary
@@ -142,6 +144,7 @@ packaging/windows/
 ├── LocalCAT.spec                        # onedir/windowed, icon/version, data/source collection
 ├── frozen_roots.json                    # owner roots/assets; Gate graphs are resolved transitively, not copied by hand
 ├── durability_profiles.json             # W1-owned versioned host/profile registry + portable power-evidence manifest digests
+├── evidence-scenarios/                  # platform-owned versioned release-lane scenario contracts
 ├── LocalCAT.ico                         # version-controlled Windows icon
 ├── version_info.txt                     # Windows product/version metadata
 └── hooks/
@@ -355,6 +358,22 @@ stateDiagram-v2
 | TM snapshot/recovery | bound publisher and opaque identities | seal/generation/LKG/recovery | handle-bound publish/reprove |
 | Qt composition | platform factory constructed before controller graph | exact-only/capability fail-closed | no unsupported import; diagnostic code |
 
+## Staged Delivery Routes
+
+### Source Compatibility Lane
+- Source lane只依赖ADR-020/021平台合同、Windows backend与各owner的source阶段：`Task 2 → Task 3 → Task 4S → Task 5S → Task 6S`。这里的箭头是硬rendezvous：Task 5只在4.4真实Qt source启动后进入，Task 6再汇合persistence结果。它必须完成真实Qt、Project、Resource、TMX、TM activation/restart和FTS5业务验收，但不等待W3 native entry。
+- source authority来自受审source tree的rooted/loader合同；不得把W3 `TrustedSourceAuthority`、bundle manifest或`sys.frozen`前置到source composition。
+- 完成source consumer阶段后先由Task 6.6a交付轻量Windows GUI入口：它只用受验证的绝对路径启动专用venv中的`pythonw.exe`和source bootstrap，并固定non-repository CWD、环境清理、图标/版本与失败诊断。WA-08 5.4a随后经该入口运行完整source产品journey，Task 6.6b才汇总`WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`。入口不携带Python/PySide6/Qt/source，也不是Requirement 11发行物。
+
+### Diagnostic Onedir Lane
+- stock PyInstaller onedir/windowed可在source lane后用于hook、Qt plugin、资源布局和业务journey诊断，但产物必须标记`NO_AUTHORITY/NOT_FOR_RELEASE`；CapabilityHost与release validator不得消费它铸造capability，WA ledger也不得据此进入terminal `MERGED_PASS`。
+- diagnostic source/data列表只能由同一owner roots/closure生成，不能维护第二份手写发行清单。它不是是否执行W3的替代决策门。
+
+### Frozen Release Lane
+- W3 custom in-process entry的toolchain、ABI、Boot TCB、PE/system allowlist、native→Python handoff和升级维护边界在source实现期间并行规划；父wrapper启动stock `runw.exe`不能保护child process entry，不属于候选方案。
+- gate-quality native spike等待W1 rooted contract与Windows rooted handle invariants冻结后执行，并必须在任何frozen WA consumer merge和Task 7.1前全PASS。失败保持frozen lane NO-GO，但不撤销已经独立验证的source compatibility。
+- frozen lane分成pre-build与post-build两次汇合：1.6 PASS后先合并manifest/build必需的consumer roots与WA-07 3.6a，再生成manifest、handoff与发行候选；7.4验证同一dist后，WA-01/02/04/05/06与WA-07才运行packaged revalidation，最后由WA-08汇合Qt产品journey。source milestone、diagnostic onedir、最小spike与frozen release四者名称、证据和状态不得互相冒充。
+
 ## Frozen Distribution Design
 
 ### Bootstrap Trust Base
@@ -387,7 +406,8 @@ flowchart TD
     PYI --> DIST[onedir/windowed dist]
     DIST --> BOOT[bootstrap rooted source proof]
     BOOT --> VIS[visibility + loader + path probe]
-    VIS --> GATES[Gate A/C/D recomputation]
+    VIS --> OWNERS[owner packaged revalidation]
+    OWNERS --> GATES[Gate A/C/D recomputation]
     GATES --> E2E[Qt/Project/TM/TMX/FTS5 packaged E2E]
     E2E --> RELEASE{all pass, zero mandatory skip?}
 ```
@@ -433,7 +453,7 @@ flowchart TD
 | 3.1-3.6 | cross-process lock/reservation | lock adapter, chunk, TM migration | ProcessFileLock, LockLease | Lock Flow |
 | 4.1-4.5 | atomic publish/durability/recovery | publisher, business journals/LKG | BoundDirectoryAuthority, CandidateFile | Atomic Publish |
 | 5.1-5.4 | shared boundary/consumer parity | migration clusters | platform contracts | Consumer Integration |
-| 6.1-6.5 | dependency/Qt startup/avatar regression | Qt composition, avatar catalog, release validator | build/runtime smoke | Build + E2E |
+| 6.1-6.6 | dependency/Qt startup/avatar regression、user-managed source entry | Qt composition, avatar catalog, source launcher, release validator | source/runtime smoke | Source + Build + E2E |
 | 7.1-7.4 | project save/reopen | project package/workspace | publisher + project receipts | project vertical slice |
 | 8.1-8.6 | TM activation/restart/unique authority | migration, lock, attestation, recovery | lock/private/identity | TM vertical slice |
 | 9.1-9.5 | TMX/FTS5 | Parser, resource importer, SQLite store | rooted source + canonical store | packaged E2E |
@@ -474,7 +494,9 @@ flowchart TD
 
 ### Release Evidence Schema
 - commit/branch、OS build、Python/PySide6/Qt/PyInstaller/SQLite versions、filesystem/volume facts。
-- exact PowerShell commands、exit codes、stdout/stderr/log paths、SHA-256 inventory；文件系统日志含 native handle profile、volume/file-system、live FileId comparison、final path、reparse verdict、share flags、LockFileEx range、flush/rename/close/reopen phase、recovery result与稳定 code，不记录正文或私有绝对路径。
+- exact PowerShell commands、实际PowerShell flavor/version、由可信repository root推导的CWD role、版本化effective-environment profile及每条command的exact non-secret environment projection、exit codes、stdout/stderr/log paths、SHA-256 inventory；release harness固定使用Win32 `GetWindowsDirectoryW`定位的system Windows PowerShell，version probe与实际command使用同一binary和clean profile，不从ambient `PATH`选择shell。`CLEAN_WINDOWS_V1` registry构造完整环境而不继承调用进程环境，仅允许scenario contract逐command显式批准的`LOCALCAT_*` probe输入，并固定清除Python/Qt开发路径。文件系统日志含 native handle profile、volume/file-system、live FileId comparison、final path、reparse verdict、share flags、LockFileEx range、flush/rename/close/reopen phase、recovery result与稳定 code，不记录正文或私有绝对路径。
 - baseline-to-candidate PASS/FAIL matrix、Windows FS/lock checklist、frozen-source/packaging checklist。
+- Windows platform Spec拥有`packaging/windows/evidence-scenarios/<lane>.json`中的版本化scenario contract；合同逐项固定mandatory/optional、精确command/event expectation与稳定ID。harness和独立validator都只接受该目录下的单一lane相对key，以可信repository root解析并拒绝reparse/escape；同内容的任意其他repo路径、外部路径或artifact内副本均无authority。独立validator还要求release orchestrator从clean tracked checkout提供外部expected repository commit与scenario-contract SHA-256，逐项匹配manifest和实际合同bytes；外部manifest摘要缺失的`INTERNAL_CONSISTENCY_ONLY`结果只用于schema自检，不构成release evidence。更改scenario contract会改变release oracle，必须作为本Spec受审变更，不得在现场artifact中改写。
+- matrix与run status只由合同和实际facts派生；任何实际launch/containment failure或interruption必须降低全局run status，即使它落在不完整或optional scenario中，也不得被另一mandatory PASS掩盖。
 - portable evidence 写入仓库相对 `artifacts/windows/<commit>/<run-id>/`（或获批 CI artifact key）并生成 manifest/checksum；本机绝对路径不是合同身份。power-cut lane 另记录 VM image/build、snapshot boundary、power action 和 reboot recovery facts。
 - evidence output 是 artifact，不修改 capability result；任何现场 patch 令该 run 无效。
