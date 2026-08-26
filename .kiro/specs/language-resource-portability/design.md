@@ -79,6 +79,13 @@ ResourcePackage 可以复用或后续抽取以下无语义原语：
 - **Steering sync**：实现后才同步真实的 module/UI 事实，不在本规格生成提交中修改 Steering。
 - **No common authority**：任何建议“将 ProjectPackage 泛化为 PackageBase”都属于新的设计变更，不是实现便利。
 
+### Windows Compatibility Amendment WA-04
+
+- **ADR mapping**：follow ADR-020/022。Resource owner 保留 payload/profile/carrier/preview/apply/receipt/repository lifecycle；platform/bootstrap 只交付 rooted/publish facts 与 bundle resource authority。
+- **Port migration**：`resource_artifact_save.py`、`resource_package.py`、`resource_portability.py`、`resource_receipt_ledger.py` 与 `resource_repository.py` 消费 `RootedFileSystem`、`ProcessFileLock`、`BoundDirectoryPublisher`，不再内嵌 POSIX dirfd/flock/fsync 分支。
+- **Frozen resources**：package/profile data 的 relative layout 由 ADR-022 manifest 与 trusted bundle root 解析；Resource 模块不从 CWD、checkout absolute path 或待验证 `__file__` 推断发行数据。
+- **Verification**：direct/package export→validate→preview→create/replace→cold reopen 覆盖 Windows junction/swap/share/kill/recovery 和 non-repo CWD；最终由 TM/Termbase owner reader 与 receipt 闭合，不以 ZIP 可打开代替。
+
 ## Architecture
 
 ### Dependency Map

@@ -69,6 +69,13 @@
 - **Steering sync**：搜索表面与 avatar 不需要；ADR-014 已同步 `tech.md` 和 `structure.md` 中 `workspace.json` / `WorkspaceStateRepository` 的持久范围，最终 delta 已按五类语义门复核。
 - **Downstream revalidation**：Feature 5 Matcher Gate generation invalidation、JSON/TXT/sample capability、Qt search keyboard/accessibility 及 current-source Requirement 3 acceptance。
 
+### Windows Compatibility Amendment WA-08
+
+- **ADR mapping**：follow ADR-022，并消费WA-03/04/05/07。Qt increment保留单JSON产品journey、silver logo与inventory-only avatar presentation；Windows Spec拥有onedir/windowed build/bootstrap/source closure。
+- **Bundle resources**：Qt通过bootstrap提供的trusted bundle root定位logo、Windows icon与manifest声明的可选avatar catalog，不从CWD、checkout absolute path或待验证module `__file__`推断；catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback。
+- **Qt platform**：发行物显式收集PySide6 Qt plugins中的`platforms/qwindows.dll`并以visible window smoke验收；offscreen只保留自动化辅助，不能替代真实Windows窗口。
+- **Journey**：source与clean-user packaged两条路径均覆盖project save/reopen、TMX/resource入口、avatar catalog index/decode/fallback和non-repo CWD；失败保持既有project/resource state并输出body-safe diagnostics。
+
 ## 架构
 
 ### 现有架构分析

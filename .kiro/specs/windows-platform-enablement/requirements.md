@@ -9,10 +9,10 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 - **相邻期望**：Feature 5 与 `feature5-ui-integration` 继续拥有 TM/UI 冻结契约；Parser、项目包、资源、TM snapshot/attestation/recovery 与协作分工规格继续拥有各自业务不变量和 consumer 接入实现；本 Spec 只拥有共享跨平台文件系统/锁合同、Windows backend、amendment dispatch/merge ledger、Windows packaging 和最终集成证据。
 
 ### Scope Lineage
-- **Owning spec**：`windows-platform-enablement`（待人类审批并同步到 `.kiro/steering/spec-ownership.md`）
+- **Owning spec**：`windows-platform-enablement`；Governance owner 已批准其只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence，并同步到 `.kiro/steering/spec-ownership.md`/`roadmap.md`。
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
-- **审批状态**：PENDING；requirements/design/tasks 的生成不构成所有权、ADR 或实现授权审批。
+- **审批状态**：ADR-020～023、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已于2026-08-26批准；实现仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
 
 ## 需求
 
@@ -46,14 +46,14 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. If 锁对象、锁范围或底层文件身份不能被证明与目标资源一致, the 锁请求 shall fail closed，且不得进入受保护的发布或迁移区段。
 4. While 锁已持有, the 文件打开共享语义 shall 允许协议要求的读取、flush 与原子发布，同时拒绝会破坏互斥和身份证明的冲突操作。
 5. The Windows 锁合同 shall 不对公平性或排队顺序作超出操作系统可证明范围的承诺，并 shall 为竞争、超时、身份不匹配与平台不可用提供稳定结果。
-6. When persistent lock file 首次由两个进程并发创建或 creator 在 payload durable 前退出, the 锁能力 shall 通过独占初始化 profile 区分初始化进行中、可证明的空/严格前缀残留与未知 tamper；后继只能恢复可证明残留，未知 bytes shall fail closed，且不得 unlink/replace 该载体。
+6. When persistent lock file 首次由两个进程并发创建或 creator 在 payload durable 前退出, the 锁能力 shall 在`CREATE_NEW`返回`ERROR_FILE_EXISTS`后先用普通LOCK profile打开并复证：完整payload直接进入`LockFileEx`，该open的sharing violation才表示INIT进行中；空/严格前缀须关闭普通handle后争抢INIT share-none handle并二次复证再恢复。未知bytes/状态shall fail closed，且不得unlink/replace该载体。
 
 ### Requirement 4：原子发布、durability 与恢复
 **目标：** 作为项目和 TM 数据的所有者，我希望 Windows 上的保存与发布在成功返回后满足已声明的持久化合同，并在中断后恢复到有效状态，以便不会出现静默丢失或半发布。
 
 #### 验收标准
 1. When 内容被提交到 canonical path, the 发布能力 shall 在同一授权 parent 中准备完整候选、完成内容 flush，并按 `CREATE_IF_ABSENT` 或持有 owner-defined 排他资源锁的 `REPLACE_UNDER_LOCK` 模式执行协议允许的原子命名操作；平台层不得把 pre-snapshot 宣称为 expected-target 原子 CAS。
-2. If Windows 在 arm 之前无法证明 runtime host/volume/storage-cache facts 精确匹配 W1 批准的版本化 `DurabilityProfile` 及其 forced-power-loss evidence family, the 发布能力 shall 返回 `PLATFORM.FS.DURABILITY_UNAVAILABLE` 且不发布；If arm 之后命名结果或重启持久性无法确定, the 发布能力 shall 返回 `PLATFORM.FS.RECOVERY_REQUIRED`，不得返回成功。
+2. If Windows 在 arm 之前无法通过handle-bound authority加载并验证W1 owner发布、W3 manifest内容寻址的版本化`DurabilityProfile` registry，或runtime host/volume/storage-cache facts不能精确匹配其中profile及其portable forced-power-loss evidence-family digest, the 发布能力 shall 返回 `PLATFORM.FS.DURABILITY_UNAVAILABLE` 且不发布；If arm 之后命名结果或重启持久性无法确定, the 发布能力 shall 返回 `PLATFORM.FS.RECOVERY_REQUIRED`，不得返回成功。源码与frozen runtime都不得从CWD/checkout fallback获取该registry。
 3. If 进程在 prepare、replace、metadata commit 或 cleanup 任一边界中断, the 恢复流程 shall 只选择完整且可验证的旧版本或新版本，不得消费部分文件。
 4. While 读取句柄、锁句柄、临时文件或发布句柄仍存活, the 发布能力 shall 使用与原子替换协议一致的共享方式和生命周期；replace 后的 destination readback handle shall 保持禁止 write/delete 的共享约束，直到 owner durable metadata commit 与 terminal identity/digest/state reproof 完成，且不得自身阻塞合法 commit。
 5. When replace、flush 或 recovery 失败, the 调用方 shall 收到稳定错误，现有 canonical authority shall 保持可识别，且失败候选不得伪装成已发布状态。
@@ -95,7 +95,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. If 两个进程并发尝试首次激活同一 TM, the TM 系统 shall 最多发布一个 canonical authority；失败方 shall 获得稳定竞争/现有 authority 结果。
 4. If activation 在 reservation、migration、seal、publish 或 cleanup 边界中断, the TM 系统 shall 按 ADR-012/013/016 分类残留与重新证明，不得把未知残留当作成功 authority。
 5. If volume/file identity 或 device-local attestation 在 Windows 上不能被证明, the TM 系统 shall fail closed，并不得用弱于现有 POSIX 合同的路径字符串或可复制 token 替代。
-6. When Windows TM authority 跨重启恢复, the TM 系统 shall 由 Gate D 或 canonical owner 在各自版本化 envelope 中重新证明当前对象、exact content digest、compatibility 或 generation/phase，并重验嵌套的 `WindowsPrivateProof` 与 device-secret binding；共享平台层 shall 不合并业务 envelope，持久 proof shall 不把历史 Volume/FileId 本身当作永久身份。
+6. When Windows TM authority 跨重启恢复, the TM 系统 shall 由 Gate D 或 canonical owner 在各自版本化 envelope 中重新证明当前对象、exact content digest、compatibility 或 generation/phase，并重验嵌套的 `WindowsPrivateProof` 与 device-secret binding；共享平台层 shall 不合并业务 envelope，持久 proof shall 不把历史 Volume/FileId 本身当作永久身份。W1 lock与W2 private对象shall按ADR-023采纳后的`ProtocolControlLockSecurityV2`/`WindowsPrivateSecurityV2`显式设置并handle-bound重验exact owner+DACL+medium mandatory-integrity label/`NO_WRITE_UP` projection；`WindowsPrivateProof.security_profile_id`与authority descriptor digest shall绑定同一V2 projection，V1/unknown profile shall fail closed。label读取shall在`READ_CONTROL` handle上使用`LABEL_SECURITY_INFORMATION`，不得要求完整`SACL_SECURITY_INFORMATION`/`ACCESS_SYSTEM_SECURITY`；audit ACE与mandatory label不得混同，DACL-only `AccessCheck`不得代答MIC。
 
 ### Requirement 9：TMX 导入、SQLite FTS5 与持久检索
 **目标：** 作为译者，我希望在 Windows 导入 TMX 并通过 FTS5 使用已激活 TM，以便核心翻译记忆流程完整可用。
@@ -116,14 +116,14 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 3. If frozen 模块的运行来源、executed-source digest、loader attestation、manifest 闭包或 fixture 身份不一致，或关键模块存在 `.pyc`、`__pycache__`、未声明 PYZ duplicate, the capability host shall fail closed，且应用不得宣称相关能力可用。
 4. While 构建 frozen 产物, the 构建流程 shall 不以仅把 `.py` 复制为 data、检查 `origin`/`co_filename`、隐藏导入或跳过 validation 的方式假定 source identity 已满足。
 5. The frozen-source 合同 shall 同时说明源码运行与 frozen 布局的 bundle root 解析，并不得依赖构建机当前工作目录。
-6. When frozen capability host 导入任何能力关键模块或读取 fixture, the release-owned native bootloader shall 审计 entry 前 PE import、在首次非 KnownDLL/Python DLL load 前固定 DLL 搜索并绑定 bundle/native directory，随后移交不可伪造 attestation；Python bootstrap 再闭合版本化 Boot TCB（含 bootloader、Python DLL、pre-authority hooks、必要 stdlib/ctypes/hash/manifest/loader 与 native/system DLL allowlist），以不依赖待验证 Python adapter 的原生可信根证明 ancestor/final reparse、live-handle identity、manifest digest 和 handle-read。不得先信任 capability host 再用其证明自身，也不得声称 Python-level policy 能追溯保护 entry 前加载。
+6. When frozen capability host 导入任何能力关键模块或读取 fixture, the release-owned native bootloader shall 审计 entry 前 PE import、在首次非 KnownDLL/Python DLL load 前固定 DLL 搜索并绑定 bundle/native directory，递归枚举 Boot TCB 的 native static/delay-load closure，并要求owner manifest显式声明所有pre-authority `LoadLibrary*`动态native roots；在任一非系统 DLL 可执行加载前逐个完成 retained-handle rooted/reparse/live-identity/digest 预证明。加载后还 shall 把实际 module 与预证明 handle 复核；未声明动态load、无法闭合的依赖或仅依靠顶层 `LoadLibraryExW` flags/post-load path check均shall使spike fail closed。随后 native bootloader 移交不可伪造 attestation；Python bootstrap 再闭合版本化 Boot TCB（含 bootloader、Python DLL、pre-authority hooks、必要 stdlib/ctypes/hash/manifest/loader 与 native/system DLL allowlist），以不依赖待验证 Python adapter 的原生可信根证明 ancestor/final reparse、live-handle identity、manifest digest 和 handle-read。不得先信任 capability host 再用其证明自身，也不得声称 Python-level policy 能追溯保护 entry 前加载。
 
 ### Requirement 11：Windows onedir/windowed 发行物与资源
 **目标：** 作为 Windows 用户，我希望获得可解压运行的 LocalCAT EXE，以便无需 Python 环境即可使用经过验证的功能。
 
 #### 验收标准
 1. When 构建首个 Windows 发行候选, the 构建流程 shall 使用 PyInstaller `--onedir --windowed`；切换到 `--onefile` shall 视为改变 frozen trust/recovery boundary，并须另立 ADR 后方可实施。
-2. When 检查发行目录, the 产物 shall 包含 `qwindows.dll`、获批 frozen-source 闭包、Gate fixtures、`tm.jsonl`、`terms.csv`、`LocalCAT-logo-silver.png` 和 `benchmark_tm_contract.json`。
+2. When 检查发行目录, the 产物 shall 包含 `qwindows.dll`、获批 frozen-source 闭包、Gate fixtures、`tm.jsonl`、`terms.csv`、`LocalCAT-logo-silver.png`、`benchmark_tm_contract.json`和W1 owner发布的版本化`durability_profiles.json`；后者shall由W3 manifest内容寻址并引用portable power-evidence manifest digest，缺失或tamper时不得mint durability capability。
 3. When 从非仓库当前目录启动 EXE, the 应用 shall 通过 bundle root 解析并加载所需数据和资源。
 4. The Windows 发行物 shall 使用受版本控制的 `.ico`、产品名称和版本元数据，并 shall 不从构建机仓库路径读取运行时依赖。
 5. If 任何必须资源、插件或 source-proof artifact 缺失, the 发行验证 shall 失败并列出精确缺失项。

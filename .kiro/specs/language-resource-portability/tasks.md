@@ -2,6 +2,8 @@
 
 ## 任务说明
 
+> **WA-04 Windows compatibility amendment**：以下 `a` 后缀任务只把 ResourcePackage/direct artifact 的 root、lock 与 publication 接到 ADR-020；payload/profile、Repository 与 receipt authority 不变。
+
 本计划从已冻结的 R/D/T 开始，顺序闭合 TM JSONL 与术语 CSV/v1 的直接导出、独立 ResourcePackage carrier、validate/preview/import/apply/receipt/cold reopen，最后接入 Controller/Qt 并形成供 sync 未来消费的 immutable port。
 
 固定顺序：
@@ -104,12 +106,22 @@ Cluster 0 治理/characterization
   - _Requirements: 2.1–2.6, 3.1–3.6, 6.1–6.6, 9.1–9.7_
   - _Depends: 2.2, 2.3_
 
+- [ ] 2.4a 将 direct artifact source/destination 接入平台端口
+  - JSONL destination family 与 CSV/v1 publication 在 Windows 上使用 retained root/parent binding、`ProcessFileLock` 与 `BoundDirectoryPublisher`；不得绕过 owner snapshot/receipt 闭合。
+  - _Amendment: WA-04_
+  - _Depends: 2.4, ADR-020, WA-01, windows-platform-enablement 2.1_
+
 - [x] 2.5 闭合 direct export fault/cold-reopen matrix
   - 覆盖 source drift、parent/destination replacement、same-bytes/new-inode、stage/fsync/replace/readback/ledger/cleanup 故障，以及重启后 receipt-ready complete/manual recovery inventory。
   - 覆盖 JSONL+adjacent SnapshotManifest destination family 的事务一致性及 package 私有 companion 清理。
   - 覆盖 mixed termbase exact bytes/row facts、TM ExportReport/receipt closure 与 cold process reopen。
   - _Requirements: 6.1–6.6, 9.1–9.7, 12.2–12.4_
   - _Depends: 2.4_
+
+- [ ] 2.5a 扩展 Windows identity、锁与 durability fault matrix
+  - 覆盖 reparse/hardlink/multi-link、parent/destination replacement、锁竞争/owner exit、replace/readback crash 与 cold recovery；外来目标不删不覆盖。
+  - _Amendment: WA-04_
+  - _Depends: 2.4a, 2.5, windows-platform-enablement 3.7_
 
 ### Cluster 1 完成门
 
@@ -145,6 +157,11 @@ Cluster 0 治理/characterization
   - TM/Termbase profile validation 不在 package module 重写 row grammar。
   - _Requirements: 4.1–4.6, 5.1–5.6, 7.1–7.3, 12.5_
   - _Depends: 3.2_
+
+- [ ] 3.4a 以 rooted sealed handle 绑定 ResourcePackage validate/publication
+  - Windows validator 从 retained artifact handle 完成 carrier→manifest→payload→owner profile 验证，export publication 复用同一 bound parent；不按路径 hash 后重开。
+  - _Amendment: WA-04_
+  - _Depends: 3.4, 2.4a, windows-platform-enablement 2.1_
 
 - [x] 3.5 闭合 carrier/package export 对抗矩阵
   - 覆盖 local/CD name/CRC/size/offset、gap/overlap、flags/data descriptor/encryption、extra/comment/attrs、prefix/suffix、duplicate/missing/undeclared member。
@@ -189,6 +206,11 @@ Cluster 0 治理/characterization
   - _Requirements: 6.3–6.6, 8.6–8.8, 9.1–9.7, 11.1–11.3_
   - _Depends: 4.3_
 
+- [ ] 4.4a 将 package apply/Repository publication 接入 Windows 恢复协议
+  - create/replace 在同一 repository binding 与进程锁下协调 owner publication、registry/runtime switch、receipt 与 pending recovery；未知阶段保持 prior resource 和人工恢复事实。
+  - _Amendment: WA-04_
+  - _Depends: 4.4, 3.4a, windows-platform-enablement 3.7_
+
 - [x] 4.5 闭合 preview/apply/recovery fault matrix
   - source/package/profile adapter/destination/resource graph/generation/revision/baseline 在 preview 后变化的零 mutation。
   - create-new/replace 的 stage、owner publication、cold reopen、registry/runtime switch、receipt ledger、cleanup 故障。
@@ -232,12 +254,22 @@ Cluster 0 治理/characterization
   - _Requirements: 9.1–9.7, 10.1–10.6, 12.1–12.7_
   - _Depends: 5.2, 5.3_
 
+- [ ] 5.4a 执行 Windows direct/package hostile 与业务 journey
+  - 从真实 active TM 和 mixed termbase 完成 direct/package export、validate、create/replace apply、冷重开，并重放 source/destination replacement、锁与 crash matrix。
+  - _Amendment: WA-04_
+  - _Depends: 2.5a, 4.4a, 5.4, WA-01, windows-platform-enablement 3.7_
+
 - [x] 5.5 完成治理收尾
   - 只在 final runtime roots 冻结后机械重签 current-source inventory/evidence，不用旧结果纯重签。
   - 同步已实现的 structure/tech/roadmap 事实，不声称 TMX/provider/sync/conflict 已交付。
   - 以累计 diff、faults、cold-reopen receipt 和 ownership 的可重放证据闭合 Feature 验收。
   - _Requirements: 1.1–1.6, 11.1–11.5, 12.1–12.7_
   - _Depends: 5.4_
+
+- [ ] 5.5a 闭合 frozen ResourcePackage 可见性与消费合同
+  - 在ADR-022 frozen harness从non-repository CWD重放package/profile fixtures、真实`.py` authority与资源文件可见性，显式证明不访问checkout；交付final Qt journey所需的owner port与fail-closed断言，不让Qt/Controller取得carrier或Store权威。
+  - _Amendment: WA-04_
+  - _Depends: 5.4a, ADR-022, windows-platform-enablement 1.4_
 
 ### Cluster 4 完成门
 

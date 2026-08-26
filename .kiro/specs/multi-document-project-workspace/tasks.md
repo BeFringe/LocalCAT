@@ -2,6 +2,8 @@
 
 ## 任务说明
 
+> **WA-03 Windows compatibility amendment**：以下 `a` 后缀任务只把 Workspace/ProjectPackage 的 root、lock 与 publication 接到 ADR-020；ADR-018/019 的 logical/physical carrier authority 不变。
+
 本计划把 brief 的四个 Promotion Cluster 保持为 Cluster 1–4；Cluster 0 只完成治理、current-source characterization 与人工批准门。Cluster 0 未获项目 owner 明确批准前，业务代码一律 **NO-GO**。
 
 固定顺序：
@@ -86,6 +88,11 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
   - 保留同一 root fd 和所有 selected regular-file identities 至整批 terminal 完成，拒绝 hardlink/symlink/root replacement/file drift；发布的 staged DTO 必须明确 `durable=False` 且原 source bytes不变。
   - 冻结 flat segment 投影、document/project progress 与 deterministic workspace content digest；现有 Document 不得因 incoming selection reorder 改变顺序，真正 new Document 只按 incoming 顺序追加。
 
+- [ ] 2.1a 将 selected-source root 与 identity proof 接入 `RootedFileSystem`
+  - Windows 批量 intake 保持同一 retained portable root 与全部 selected regular-file handles 至整批 terminal；reparse/hardlink/root replacement/file drift 均在 workspace publication 前拒绝。
+  - _Amendment: WA-03_
+  - _Depends: 2.1, ADR-020, WA-01, windows-platform-enablement 2.1_
+
 - [x] 2.2 建立 source reconciliation
   - 按稳定复合 ID 与 source fingerprint 产生 `unchanged`、`source_changed`、`new`、`removed`、`ambiguous`、`unresolved`。
   - `source_changed` 保留 target 但撤销确认；`removed`、`ambiguous`、`unresolved` 保留恢复引用并要求显式处置，不按列表索引或正文相似猜测。
@@ -101,6 +108,11 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 - [x] 2.4 闭合 save/recovery fault model 与未来 origin 原子性红线
   - 覆盖 candidate、validation、publication、readback、commit、rollback 与 cold recovery fault；任何不确定状态保持 LKG、dirty 与恢复信息。
   - directory/workbook 仅冻结后续 profile 必须遵守的逐文档 journal/单文件原子替换红线；本 Cluster 不启用 directory discovery、workbook project profile 或新 source writer。
+
+- [ ] 2.4a 将 workspace/package save 绑定到平台 lease 与 publisher
+  - Windows 保存必须在同一 root/target binding 与 `ProcessFileLock` lease 下完成 candidate、validation、publication、readback 与 receipt；失败保持 LKG、dirty 和恢复事实。
+  - _Amendment: WA-03_
+  - _Depends: 2.4, ADR-020, WA-01, windows-platform-enablement 2.1_
 
 ### Cluster 2C：ProjectPackage Logical + Physical Closure
 
@@ -123,6 +135,11 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
   - 覆盖截断、重复/缺失/额外 member、路径穿越、digest/version/codec声明不符、preview 后篡改、commit/readback/reopen 失败。
   - live codec unavailable 只产生 body-safe warning并禁止source write-back，不阻止package离线导入/target编辑；只有声明损坏或请求解释private member的操作才fail closed。
   - 用至少两个 Document 且跨文档复用同一 local segment ID 的真实 ProjectPackage 冷重开，逐项核对项目/文档/segment 身份、顺序、source/target、opaque member 与 receipt。
+
+- [ ] 2.8a 闭合 Windows ProjectPackage 冷重开与恢复矩阵
+  - 在真实 NTFS 上覆盖 package source/destination replacement、锁竞争、replace/readback/reopen crash、foreign inode/FileId 与 clean-process recovery，且继续严格验证 ADR-019 ZIP carrier。
+  - _Amendment: WA-03_
+  - _Depends: 2.1a, 2.4a, 2.8, windows-platform-enablement 3.7_
 
 ### Cluster 2 完成门
 
@@ -174,11 +191,21 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
   - acceptance 从 Cluster 2 正式 exporter 生成真实 ProjectPackage，经 validate/preview/import/apply 后冷重开，再运行章节导航、编辑、搜索、保存与恢复 journeys。
   - 不得用内存伪 package、手写 manifest 或 fixture-only controller 注入代替真实 substrate。
 
+- [ ] 4.3a 执行 Windows hostile-path 与项目保存/重开 journey
+  - 通过 production Controller/Qt 在源码运行下完成多文档打开、编辑、保存、关闭、冷重开与 recovery feedback，并覆盖 junction/reparse、ancestor/target replacement 和 target-open 拒绝；逐项核对 identity、dirty、target 与 receipt。
+  - _Amendment: WA-03_
+  - _Depends: 2.8a, 4.3_
+
 - [x] 4.4 重签 current-source evidence 并完成治理收尾
   - 在 final runtime roots 冻结后运行全量 identity/reconciliation/save/package/controller/Qt/fault/acceptance 与单 JSON/TXT compatibility suites。
   - owner 工具生成并由 strict consumer 复读 evidence；随后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实结构/技术事实并由 Cluster 4 独立 reviewer 给出 Feature GO/NO-GO。
   - final evidence digest `28386cf0a399de347f92cdedbce3a3ddd5bfe29191fccc6d513101c48f6f063a`，19 个 production roots；owner strict check 在 characterization 9/9 前后均为 current。
+
+- [ ] 4.4a 执行 ProjectPackage 双进程与电源边界
+  - 通过真实ProjectPackage业务API重放4.3a，注入第二进程占锁、owner kill与每个publication phase中断，并在匹配获批`DurabilityProfile`的forced-power-loss/reboot lane只接受完整old、完整new或recovery-only；最终frozen Qt journey留给WA-08消费。
+  - _Amendment: WA-03_
+  - _Depends: 4.3a, ADR-020, windows-platform-enablement 3.7_
 
 - [x] 4.5 完成 Browse/Review 分组轮次 UI increment
   - 在 Browse/Review 主页表格左侧嵌入当前文件的可滚动轮次导航，同时压缩“段落”列；默认使用自动收起式窄指示条，设置中可切换为固定式预览列表，标题行按钮只打开设置。默认每组 20 段，严格“超过 5 组或 100 段”显示，尺寸只允许 20–200/步长 10。

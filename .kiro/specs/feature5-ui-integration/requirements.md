@@ -20,6 +20,13 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 2026-08-21 canonical identity amendment 由 ADR-016 授权：已完整发布的 generation 在普通冷开时仍严格验证平台文件身份；若 source、manifest、SQLite 与 publication proof 只发生一致的 device-number 漂移，可由用户显式、同 generation、零内容变更地重新证明。该维护动作不运行或授权 Gate D/Fuzzy，也不放宽 inode、bytes、binding、phase 或 pending recovery 的 fail-stop。
 
+### Windows Compatibility Amendment WA-07
+
+1. Windows source 与 frozen 启动必须先由 platform factory 和 ADR-022 Boot TCB/`TrustedSourceAuthority` 闭合，再 import CapabilityHost、Controller 或业务模块；不支持的平台状态只产生安全 startup/capability failure，不绕过为 path-only proof。
+2. `CapabilityHost` 只能消费 `TrustedSourceLoader` 对 retained-handle exact executed source 的 attestation/digest/origin/`co_filename` closure；不得用 `Path.resolve()`、`lstat()`、`O_NOFOLLOW=0`、loader metadata 或 PYZ/bytecode duplicate铸造 source authority。
+3. Windows canonical activation/restart与ADR-021 re-attestation必须保持Core owner envelope、nested `WindowsPrivateProof`、same store/generation与Gate C/D正交；UI只投影safe state，不显示raw proof/path或自行判定资格。
+4. packaged resource lifecycle、TM activation/restart与集成回归必须在 non-repository CWD 验证；本 amendment不把PyInstaller build、Qt project/resource journey、TM Core或Resource owner迁入本 Spec。
+
 ## 需求
 
 ### Requirement 1：当前段 TM 建议与可解释信息
