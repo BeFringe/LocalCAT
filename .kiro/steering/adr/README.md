@@ -33,8 +33,9 @@
 | ADR-017 | 已采纳 | TM candidate storage port 与 SQLite candidate 数据面责任分离 |
 | ADR-018 | 已采纳 | ProjectPackage 作为多文档工作区持久权威 |
 | ADR-019 | 已采纳 | ProjectPackage v1 确定性单文件 ZIP carrier |
-| ADR-020 | 已采纳 | 跨平台 rooted 文件权威、锁与耐久发布边界 |
-| ADR-021 | 已采纳 | Windows 设备本地私有证明与跨重启重新证明表示 |
-| ADR-022 | 已采纳 | Windows frozen onedir/windowed 发行所有权与可信源码闭包 |
+| ADR-020 | 已采纳（security profile由ADR-023修订；其余获补充） | 跨平台 rooted 文件权威、锁与耐久发布边界 |
+| ADR-021 | 已采纳（security profile由ADR-023修订） | Windows 设备本地私有证明与跨重启重新证明表示 |
+| ADR-022 | 已采纳（ADR-023补充） | Windows frozen onedir/windowed 发行所有权与可信源码闭包 |
+| ADR-023 | 已采纳 | Windows pre-authority 证明时序细化与安全 profile 修订 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。

@@ -28,9 +28,10 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 | Feature 5 | `feature5` | canonical TM、SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher、exact/context/fuzzy query | Qt 控件、Parser codec、Glossary 管理 UI、Docker/协作 |
 | Feature 5 UI Integration | `ui-mvp`（独立 Spec） | 精确 Feature 5 merge、composition root、Controller adapter、TM suggestion/阈值/状态、macOS bundle | 重写 Core、接管 Qt Req3 搜索或 Req7 术语 CRUD |
 | Parser Foundation | `parser-rebaseline` | 中立 contracts/source/registry/composition、八个单输入组合、唯一 Application surface | 不拥有多文档、RPY 实现、chunk、sync 或 TM storage |
+| Windows Platform Enablement | `codex/windows-platform-enablement` | 共享平台文件/锁/发布/private-proof contracts 与 backends、Windows frozen bootstrap/build、amendment ledger、release evidence | 不接管 consumer 业务状态机、receipt/journal/LKG、UI 产品语义或 `--onefile`/installer/signing |
 | Multi-document | 后续规格分支 | Project/Document/Segment、章节导航、保存与 reconciliation | 不改写 Parser 单输入局部身份 |
 
-`governance/kiro-steering` 不是第三条产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
+`governance/kiro-steering` 不是产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。Windows Platform Enablement 是平台/发行适配线，也不取得相邻产品 Feature 的业务实现权。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
 
 两条活动线使用单一、可追踪的继承链：共享 SDD/Steering 与已验收 Qt 基线先在 `ui-mvp` 提交一次，`feature5` 再通过 rebase/merge 继承该历史，并只追加 Feature 5 自身规格与实现。不得在两个 worktree 中分别重建等价补丁；共享治理或跨线契约也必须只提交一次，再由活动分支继承。分支 tip 无需长期相同，但共同改动必须拥有同一提交祖先。
 
@@ -63,6 +64,11 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - LocalCAT JSON/TXT、PO/POT、TMX Level 1、normalized TM JSON、CSV/XLSX 八个 reader 组合；
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
+- **Now — Windows Platform Enablement governance**:
+  - ADR-020/021/022 已采纳，批准 `windows-platform-enablement` 只拥有共享平台 contracts/backends、Windows private-proof 物理表示、frozen bootstrap/build composition、amendment ledger 与 release evidence；
+  - Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI 与 Qt 继续拥有各自业务不变量，并只通过 owning branch amendment 接入；`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`；
+  - Qt speaker avatar 只作为 Windows catalog 索引/解码与无匹配 fallback 回归，不改变资源语义、ignore 规则或打包 ownership；
+  - Task 0 governance/design gate 闭合前不进入 runtime，最终平台线只集成一次。
 - **Now — Termbase column selection import**:
   - CSV/XLSX 术语导入在 Qt 非阻塞取得 codec-owned 有界列 preview，用户显式选择 source/target 物理列和首行用途；
   - preview 与正式导入绑定完整 source identity，并在同一新 sealed snapshot 上复核可见列数后才允许 stream/Store transaction；
@@ -91,6 +97,8 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - Parser Foundation 保持存储和外部格式实现无关；只有显式声明 Writer/sidecar 的 format-codec plugin 才承诺 round-trip，LocalCAT Core 不直接写外部格式。
 - 活动 worktree 必须位于持久文件系统；不得把 `/tmp`、tmpfs 或其他会被系统清理的目录作为唯一工作副本。
 - `.kiro/` 是项目事实来源，必须由 Git 跟踪；生成或批准新的 Spec 阶段后应及时形成可恢复提交。
+- Windows consumer 不得直接增加 POSIX/Win32 primitive 分支；共享平台能力只能由 `windows-platform-enablement` 提供，业务 authority 与 recovery 决策仍由 owning Spec 保留。
+- Windows 首版发行 profile 固定为 CPython 3.14 x64 + PyInstaller `--onedir --windowed`；`--onefile`、installer、signing、remote/UNC 与未获证明的 filesystem 不在当前 scope。
 
 ## Boundary Strategy
 
@@ -118,6 +126,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
+- [ ] `windows-platform-enablement` -- ADR-020/021/022 约束的共享平台 contracts/backends、Windows frozen bootstrap/build、consumer amendment ledger 与 source/packaged release matrix；只集成一次，不拥有相邻业务语义。Dependencies: approved ADR-020/021/022, approved owning scope, required WA-01～08 owner amendments
 - [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [ ] `qt-editor-json-mvp-increment` -- 单 JSON 的 speaker、基础搜索/预处理/术语 CRUD 与第二阶段选项入口。Dependencies: `qt-editor-mvp`
 - [ ] `tm-storage-retrieval-index` -- SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher 和 exact/context/fuzzy。Dependencies: current exact/JSONL behavior baseline
@@ -150,6 +159,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 3. **Merge direction**：只从精确 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 形成可追踪 merge；不得 squash 或 cherry-pick 重建等价历史。
 4. **Integration gate**：merge 后由 integration Spec 完成 composition root、Controller adapter、canonical activation、mixed resource 与 TM suggestion 验收；原 Qt 的正交功能继续按自身 Spec 完成。
 5. **Integration anchor**：legacy source-LWW 与当前 100% 卡片只证明 legacy exact compatibility；多候选、非 100%、阈值、fuzzy 与全局 top-10 必须由真实 canonical SQLite + production `TMRetrievalService` 证明。
+6. **Windows platform gate**：`windows-platform-enablement` 在 owning amendments、完整 Windows source/packaged E2E、Mac/Linux parity 与累计评审闭合后只形成一次最终集成；治理同步只由 `governance/kiro-steering` 提交，禁止在平台或 consumer worktree 重建等价 Steering commit。
 
 ## Confirmed Requirements Decisions
 

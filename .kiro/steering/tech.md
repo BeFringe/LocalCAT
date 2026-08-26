@@ -24,6 +24,9 @@
 - Chunk Qt 只调用 `ChunkControllerAdapter` 暴露的 frozen application projections/commands；不解码 chunk store/metadata，不把分工范围当成 ProjectPackage、ResourcePackage 或 TMX payload。
 - `CapabilityHost` 是 matcher/retrieval capability 发布权威；`TMRuntimeHost` 持有完整 resource snapshot，`EditorTMAdapter` 只将同一 operation 投影给 `EditorController`。
 - `LogicController` 的三态与 legacy TM 优先规则保持不变；`EditorController` 单独持有 Qt 项目、搜索、TM/术语 issuance 与资源操作会话。
+- ADR-020 规定 Parser/Chunk/Project/Resource/TMX/TM 只消费 backend-neutral rooted authority、lock、bound publisher 与 opaque live identity；POSIX/Win32 primitive 只能存在于 `windows-platform-enablement` 拥有的平台 adapters/composition，不能散落进业务 owner。
+- ADR-021 只批准 Windows private-storage 的 SID/DACL/AccessCheck 与 `WindowsPrivateProof` 物理表示；Gate D/canonical envelope、generation、journal/LKG 与业务 recovery 继续归原 owner。
+- ADR-022 规定 Windows frozen 发行由单一 bootstrap/build authority 维护完整 Boot TCB、retained-handle exact-byte source loader、真实 `.py`/fixture closure 与 content-addressed onedir release evidence；CapabilityHost/Qt 不得从 frozen boolean、路径或旁置源码反向铸造能力。
 
 ## 运行环境与依赖
 
@@ -34,6 +37,7 @@
 - XLSX：`openpyxl>=3.1,<4`。
 - 交互式 Excel：xlwings，可选且只属于 Excel Layer 4。
 - Qt 依赖入口：`requirements-ui.txt`。
+- Windows production target（架构已批准、尚未实现/验证）：Windows 11、CPython 3.14 x64、PyInstaller `--onedir --windowed`；不包含 `xlwings`/Excel、`--onefile`、installer、signing 或未通过完整 capability gate 的 filesystem。
 
 ```bash
 python -m pip install --user -r requirements-ui.txt
