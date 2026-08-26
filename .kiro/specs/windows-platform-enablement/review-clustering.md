@@ -12,7 +12,7 @@
 - **Implementer**：承担合同、Win32 FFI、并发/恢复、bootstrap/packaging和consumer集成实现；只修改assignment授权边界，交付task-focused evidence。
 - **Cumulative reviewer**：使用独立于实现的推理上下文，对累计diff、共享不变量、反例和目标业务API证据做对抗性审计；finding关闭后复核固定tip。
 - Parent可按需派发只读scout处理POSIX primitive inventory、日志场景、artifact/checksum列表、命令/环境矩阵和缺项扫描；scout不进入effort矩阵，其输出不能批准authority、durability、recovery、source trust或Feature GO，也不能替代cumulative review。
-- Agent/model是执行资源而非ownership。派发记录实际读写范围、base/tip和返回证据；外部provider仍需用户对data boundary的明确授权。
+- Agent/model、branch 与 worktree 都是执行或血缘载体而非 ownership；Spec/合同才是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，派发记录实际读写范围、base/tip和返回证据；外部provider仍需用户对data boundary的明确授权。
 
 ## 每个子任务与审计簇的完成门
 
@@ -21,8 +21,8 @@
 1. 写出验证锚点：`Task N 完成后应看到的目标业务现象`以及依赖的本步能力；健康检查不能替代下一步使用的第一个业务API。
 2. implementer读取owning Spec、前置ADR/amendment和当前tip，完成精确任务边界及task-focused validation。
 3. Parent用fresh evidence验证完成条件、隐性依赖、用户WIP和五类治理门，确认本任务没有把必要不变量推迟给后续任务。
-4. 以显式路径形成小步提交；不使用`git add .`/`git add -A`，不吸收相邻Spec或用户WIP。
-5. 簇内所有task提交闭合后，cumulative reviewer读取完整`cluster-base..cluster-tip`、共享故障矩阵和task reports；通过后再运行fresh cluster suite并记录退出证据。
+4. 簇内保持task-focused diff/evidence边界，但不要求逐task小步提交；不使用`git add .`/`git add -A`，不吸收相邻Spec或用户WIP。
+5. cumulative reviewer读取固定的cluster working diff/tip、共享故障矩阵和task reports；全部finding关闭并通过fresh cluster suite后，Parent才以显式路径形成一次cluster提交。需在owning lineage branch独立形成的WA amendment commit仍按ledger执行，不被本规则压成Windows平台提交。
 
 cluster review不能替代task-focused validation，多个局部scout也不能替代累计diff审查。任一Critical/Important finding未关闭、required test被skip、目标业务API未运行或evidence绑定旧source时，对应簇保持未完成。
 
@@ -73,7 +73,7 @@ C0 Governance
 
 - `cluster-base`是该簇首个in-scope实现提交的父提交；`cluster-tip`是最后一个task/remediation提交。实际full hash写入该簇evidence manifest或owning task的真实信息增量，不反复改写本协议。
 - C0以本次独立docs baseline commit为输入；它只有在正式ADR、Steering scope、WA/WR owner acknowledgement、ledger schema与cumulative adversarial review全部闭合后退出。
-- WA amendment必须在owning branch获批并形成可追踪commit，再merge到Windows线；reviewer不得读取复制来的patch-equivalent工作树并把它视为正式merge。
+- WA amendment必须由owning Spec获批，并在其lineage branch形成可追踪commit后再merge到Windows线；reviewer不得读取复制来的patch-equivalent工作树并把它视为正式merge。
 - 进入一个簇前，其显式依赖和上述隐性依赖都必须由fresh evidence满足；不能因技术上可单独运行而越过前序authority gate。
 - 任何实施期新事实跨越canonical authority、persistent schema、publish/recovery、dependency/composition或cross-Spec frozen ownership门时，停止该簇并回到Design/ADR；不以审计finding或Implementation Note补授权。
 

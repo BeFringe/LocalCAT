@@ -88,6 +88,13 @@ Qt                                   (opaque transfer only)
 - **ADR disposition**：当前设计均在 Chunk 领域内，不新建 ADR。若改为写入 ProjectPackage v1、重叠多写者或跨端自动语义 merge，则必须先有后继 ADR。
 - **Steering sync**：spec ownership/border 记录长期责任边界；`structure.md`/`tech.md` 在真实 runtime 文件落地后同步。
 
+### Windows Compatibility Amendment WA-02
+
+- **ADR mapping**：follow ADR-020。Chunk 保留 journal、LKG、audit、revision 与 recovery classification；平台层只提供 `ProcessFileLock`、rooted identities、bound publication facts 和 stable platform errors。
+- **Composition**：`collaborative_chunk_store.py` 的业务 import graph 不得顶层导入 `fcntl`；POSIX/Windows adapter 由 composition root 注入，同一 store protocol 服务 source 与 frozen startup。
+- **Lock/publish**：Windows persistent lock artifact使用W1 exact ACL与无owner token/FileId的可重算payload；首次`CREATE_NEW` share-none初始化、two-creator与creator-crash仅允许empty/strict-prefix/full exact接管，unknown bytes fail closed，完成后必须重开普通`LOCK` profile再取得`LockFileEx` lease。candidate保持打开完成flush与journal/LKG arm后handle-relative publish，再capture final facts、close all candidate handles、retained readback、owner durable commit与terminal reproof后才报告成功。
+- **Verification**：two creator、creator crash、双进程竞争、`TerminateProcess`、candidate/readback/journal/LKG 每个 fault phase 和重新启动均进入稳定结果；无 cooperative lease 的外部 swap 只可 fail closed/recovery-required。
+
 ## Critical Path 与验证锚点
 
 ```text
