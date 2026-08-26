@@ -51,7 +51,8 @@
 - [x] 5.4 运行 Parser/TM/ResourcePackage/Project/Chunk/Qt/fault/architecture/full regression，更新 current-source steering/evidence。
 - [ ] 5.4a 在 ADR-022 frozen harness 重放 5.3a，证明 TMX fixtures、Parser 真实 `.py` 与 package resources 由受信 bundle authority 可见，并交付final Qt journey所需的fail-closed owner port。
   - _Amendment: WA-05_
-  - _Depends: 5.3a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.3a, ADR-022, windows-platform-enablement 7.4, windows-platform-enablement 3.7_
 - [x] 5.5 对照 Requirements/Design 验收，无 silent scope cut 后提交 `feat(tmx): 建立上下文互操作导出`。
 
 ## 明确禁止

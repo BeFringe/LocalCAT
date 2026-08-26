@@ -90,10 +90,16 @@ Multi-Document C2 complete
   - 覆盖 metadata duplicate key/extra field/non-null assignee/non-zero assignment count/digest/size/depth、stage/replace/readback/cleanup/cold recovery，并在真实冷重开后复验未分配状态及扫描 body leakage。
   - 累计 architecture 和边界证据证明 chunk 没有变成 Document、ProjectPackage、Parser、TM 或 provider owner。
 
-- [ ] 1.4a 闭合 Windows source/frozen import 与启动组合
-  - 源码和 frozen 入口均须在导入 chunk store 时不触发 POSIX-only import，并通过同一 composition 注入 Windows 实现；缺失实现必须稳定 fail closed，不允许条件跳过 store。
+- [ ] 1.4a 闭合Windows source import与启动组合
+  - source入口在导入chunk store时不得触发POSIX-only import，并通过platform composition注入Windows实现；缺失实现必须稳定fail closed，不允许条件跳过store。
   - _Amendment: WA-02_
-  - _Depends: 1.3a, ADR-020, ADR-022, windows-platform-enablement 1.4_
+  - _Depends: 1.3a, ADR-020, windows-platform-enablement 3.7_
+
+- [ ] 1.4b 闭合Windows frozen import与启动组合
+  - 在W3 custom spike全PASS后，从trusted bootstrap进入同一chunk composition，证明业务import无POSIX-only依赖且不从source checkout补载模块。
+  - _Amendment: WA-02_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 1.4a, ADR-022, windows-platform-enablement 7.4_
 
 ### Cluster 1 完成门
 
@@ -208,10 +214,16 @@ Multi-Document C2 complete
   - current-source 工具生成 evidence 并由 strict consumer 复读；evidence 后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实 structure/tech/roadmap/spec ownership，并以 final cumulative diff 的可重放验证闭合 Feature 验收。
 
-- [ ] 4.5a 执行 Windows 双进程、崩溃与 source/frozen import acceptance
-  - 在两个独立进程与ADR-022 frozen import harness中覆盖two-creator、create/write/flush/readback/close逐边界creator crash、unknown payload、锁竞争/owner kill、candidate self-sharing/target-open、journal phase crash、重开恢复和composition startup；不得通过禁用协作模块取得PASS。
+- [ ] 4.5a 执行Windows source双进程、崩溃与import acceptance
+  - 在两个独立source进程覆盖two-creator、create/write/flush/readback/close逐边界creator crash、unknown payload、锁竞争/owner kill、candidate self-sharing/target-open、journal phase crash、重开恢复和composition startup；不得通过禁用协作模块取得PASS。
   - _Amendment: WA-02_
-  - _Depends: 1.4a, 4.4a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
+  - _Depends: 1.4a, 4.4a, windows-platform-enablement 3.7_
+
+- [ ] 4.5b 在ADR-022 frozen import harness重放Windows acceptance
+  - 对同一业务矩阵重放frozen composition/startup，证明Boot TCB/source authority失败不会被禁用store、source checkout或source阶段证据旁路。
+  - _Amendment: WA-02_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 1.4b, 4.5a, ADR-022, windows-platform-enablement 7.4_
 
 ### Cluster 4 完成门
 

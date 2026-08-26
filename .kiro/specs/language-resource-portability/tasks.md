@@ -269,7 +269,8 @@ Cluster 0 治理/characterization
 - [ ] 5.5a 闭合 frozen ResourcePackage 可见性与消费合同
   - 在ADR-022 frozen harness从non-repository CWD重放package/profile fixtures、真实`.py` authority与资源文件可见性，显式证明不访问checkout；交付final Qt journey所需的owner port与fail-closed断言，不让Qt/Controller取得carrier或Store权威。
   - _Amendment: WA-04_
-  - _Depends: 5.4a, ADR-022, windows-platform-enablement 1.4_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.4a, ADR-022, windows-platform-enablement 7.4_
 
 ### Cluster 4 完成门
 

@@ -23,37 +23,71 @@
 
 依赖主线是 `W1 → Windows platform contracts/backends → WA consumers`；`W2` 在 TM private attestation 前闭合；`W3` 先做最小 frozen spike，再在 WA-07/08 合并后闭合完整发行物。未来 ADR 若取代或拆分现有决策，本 ledger 必须记录 superseding mapping，不能把 W1/W2/W3 短标签当成独立批准。
 
-ADR-020～023 promotion、Windows owning scope、WA-01～08 current R/D/T delta及owning Spec acknowledgement已批准。WA-06 `.1`因V2 security profile增量被`.2` request取代；amendment commit、merge identity、evidence和终态disposition仍待后续implementation clusters逐行闭合。任一`CONTRACT_CHANGE`行缺少current approved R/D/T、commit或可达merge时，对应Windows consumer cluster与最终EXE gate均为 **NO-GO**。
+### Source / Frozen Delivery Staging
+
+本节是一次独立、人工批准的cross-Spec delivery-staging amendment：它只把WA-01～08已批准的Windows source与frozen验收拆成累计阶段，不删除功能、不改变owner、W1/W2/W3 authority、public capability或ADR-022最终发行门。因为没有改写既有WA合同delta，它不替换`dispatch_request_revision`；但它对实际触及的owning Requirements/Design/Tasks另有下方逐owner acknowledgement，不以Windows ledger的一句说明冒充owner批准。source实现可先形成可追踪commit/merge/evidence并登记`SOURCE_MERGED_PASS`，同一WA row只有在post-build frozen revalidation与最终consumer journey闭合后才能进入terminal `MERGED_PASS`。
+
+- **Source lane**：`C1S → C2 → C3 → C4S → C5S/C6S → platform 6.6a launcher → WA-08 5.4a → platform 6.6b`。它使用用户安装的CPython 3.14 x64、专用venv、`requirements-ui.txt`与受审source tree；轻量Windows GUI入口只启动外部`pythonw.exe`/source bootstrap，不是发行profile且不铸造`TrustedSourceAuthority`。
+- **Frozen lane**：W3 custom in-process entry计划可立即进行，gate-quality spike等待W1 rooted contract/invariants冻结；spike全PASS后先合并pre-build roots/WA-07 3.6a并生成发行候选，候选通过7.4后才运行各owner packaged revalidation，最后由WA-08 frozen journey汇合最终EXE gate。
+- **Diagnostic onedir**：可用于hook/resource/Qt布局诊断，但必须标记`NO_AUTHORITY/NOT_FOR_RELEASE`，不得改变WA状态、CapabilityHost authority或release matrix。
+
+| Dispatch | Source phase | Frozen pre-build | Frozen post-build |
+|---|---|---|---|
+| WA-01 | `2.5a, 2.12a, 5.2a, 5.12a` | manifest/root declarations only | `5.12b` against platform 7.4 candidate |
+| WA-02 | `1.3a, 1.4a, 3.2a, 4.4a, 4.5a` | bootstrap/import hook declarations only | `1.4b, 4.5b` against platform 7.4 candidate |
+| WA-03 | 全部Windows owner implementation与source Project journey | no additional owner task | 由WA-08 packaged Project journey消费复验 |
+| WA-04 | `2.4a, 2.5a, 3.4a, 4.4a, 5.4a` | bundle resource declarations only | `5.5a` against platform 7.4 candidate |
+| WA-05 | `2.3a, 3.4a, 3.5a, 5.3a` | bundle source declarations only | `5.4a` against platform 7.4 candidate |
+| WA-06 | `1.2a, 5.3a, 5.6a～5.14a, 8.8a, 9.1a, 9.2a, 9.6a` | Gate/TM root declarations only | `9.6b` against platform 7.4 candidate |
+| WA-07 | `3.5a, 3.8a, 5.4a, 5.5a, 6.6a, 6.7a, 7.2a, 7.4a, 7.6a` | `3.6a` trusted bootstrap consumption | `6.6b, 7.4b, 7.6b, 9.2a` against platform 7.4 candidate |
+| WA-08 | `4.8a, 5.2a, 5.3a, 5.4a` | resource/plugin declarations only | `5.2b, 5.3b, 5.4b` after platform 7.4/7.4a |
+
+ADR-020～023 promotion、Windows owning scope、WA-01～08 current R/D/T delta及owning Spec acknowledgement已批准。WA-06 `R1`因V2 security profile增量被`R2` request取代；amendment commit、merge identity、evidence和终态disposition仍待后续implementation clusters逐行闭合。任一`CONTRACT_CHANGE`行缺少current approved R/D/T、commit或可达merge时，对应Windows consumer cluster与最终EXE gate均为 **NO-GO**。
+
+#### Delivery-staging Owner Approval Register
+
+本表只批准source/frozen验收拆分、task依赖与非终态status词汇；不新增或削弱任何WA public contract。该批准与既有`dispatch_request_revision`正交，后续若出现authority、持久格式、publish/recovery或依赖方向增量，仍必须提升对应WA request revision，不能借交付分期吸收。
+
+| dispatch | owning Spec | approved owner-document delta | owner acknowledgement |
+|---|---|---|---|
+| WA-01 | `parser-subsystem-extraction` | Tasks：source/frozen completion拆分及candidate依赖 | `APPROVED 2026-08-26` |
+| WA-02 | `collaborative-job-chunks` | Tasks：source/frozen composition/acceptance拆分及candidate依赖 | `APPROVED 2026-08-26` |
+| WA-03 | `multi-document-project-workspace` | ledger-only：source owner结果由WA-08 packaged Project journey复验；owner R/D/T不改 | `APPROVED 2026-08-26` |
+| WA-04 | `language-resource-portability` | Requirements/Tasks：source authority与packaged resource revalidation拆分 | `APPROVED 2026-08-26` |
+| WA-05 | `tmx-context-interchange` | Tasks：source TMX completion与packaged journey拆分 | `APPROVED 2026-08-26` |
+| WA-06 | `tm-storage-retrieval-index` | Tasks：source TM completion与candidate frozen revalidation拆分 | `APPROVED 2026-08-26` |
+| WA-07 | `feature5-ui-integration` | Requirements/Design/Tasks：source/frozen authority、pre-build bootstrap消费与post-build GO拆分 | `APPROVED 2026-08-26` |
+| WA-08 | `qt-editor-json-mvp-increment` | Requirements/Design/Tasks：launcher消费、source journey与packaged journey拆分 | `APPROVED 2026-08-26` |
 
 ### Dispatch Authority Register
 
-`dispatch_request_revision` 是每个 amendment 的稳定请求身份；同一 WA 在不同dispatch group出现时必须复用该身份、owning Spec acknowledgement与ledger row。真实合同增量必须升revision并把旧request保留为`SUPERSEDED`历史，不能原地改写。当前批准只冻结已acknowledged的R/D/T请求，不预填尚未发生的commit、artifact或终态disposition。owning Spec 的`spec.json`只表达该Spec基线文档/实现状态，不能覆盖本ledger登记的current amendment revision；对Windows cluster，授权条件是“基线允许且current `dispatch_request_revision`为`ACKNOWLEDGED`或更后终态”，任何`PENDING`/`SUPERSEDED`/`BLOCKED`均优先阻断对应suffix task、merge与evidence。
+`dispatch_id`是task使用的稳定amendment身份；`dispatch_request_revision`只在本register内记录同一dispatch的合同版本（`R1`、`R2`），不复制进每个task标签。同一WA在不同dispatch group出现时必须复用该身份、owning Spec acknowledgement与ledger row。真实合同增量必须升revision并把旧request保留为`SUPERSEDED`历史，不能原地改写。当前批准只冻结已acknowledged的R/D/T请求，不预填尚未发生的commit、artifact或终态disposition。owning Spec 的`spec.json`只表达该Spec基线文档/实现状态，不能覆盖本ledger登记的current amendment revision；对Windows cluster，授权条件是“基线允许且current `dispatch_request_revision`为`ACKNOWLEDGED`或更后终态”，任何`PENDING`/`SUPERSEDED`/`BLOCKED`均优先阻断对应suffix task、merge与evidence。
 
 | dispatch_id | dispatch_request_revision | owning_spec | lineage_branch | owner_acknowledgement | current_status |
 |---|---|---|---|---|---|
-| WA-01 | `WA-01/RDT/2026-08-26.1` | `parser-subsystem-extraction` | `parser-rebaseline` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-02 | `WA-02/RDT/2026-08-26.1` | `collaborative-job-chunks` | `feature/collaborative-job-chunks` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-03 | `WA-03/RDT/2026-08-26.1` | `multi-document-project-workspace` | `feature/multi-document-project-workspace` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-04 | `WA-04/RDT/2026-08-26.1` | `language-resource-portability` | `feature/language-resource-portability` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-05 | `WA-05/RDT/2026-08-26.1` | `tmx-context-interchange` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-06 | `WA-06/RDT/2026-08-26.2` | `tm-storage-retrieval-index` | `feature5` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-07 | `WA-07/RDT/2026-08-26.1` | `feature5-ui-integration` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
-| WA-08 | `WA-08/RDT/2026-08-26.1` | `qt-editor-json-mvp-increment` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-01 | `R1` | `parser-subsystem-extraction` | `parser-rebaseline` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-02 | `R1` | `collaborative-job-chunks` | `feature/collaborative-job-chunks` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-03 | `R1` | `multi-document-project-workspace` | `feature/multi-document-project-workspace` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-04 | `R1` | `language-resource-portability` | `feature/language-resource-portability` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-05 | `R1` | `tmx-context-interchange` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-06 | `R2` | `tm-storage-retrieval-index` | `feature5` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-07 | `R1` | `feature5-ui-integration` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
+| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ui-mvp` | `APPROVED 2026-08-26` | `ACKNOWLEDGED` |
 
-Superseded request history：`WA-06/RDT/2026-08-26.1`曾于2026-08-26获acknowledgement；Task 0.5发现V1不能表达MIC authority后，由`.2`完整取代并标记`SUPERSEDED`。`.1`不得驱动实现、merge或evidence。
+Superseded request history：WA-06 `R1`曾获acknowledgement；Task 0.5发现V1不能表达MIC authority后，由`R2`完整取代并标记`SUPERSEDED`。`R1`不得驱动实现、merge或evidence。
 
 ## Amendment Dispatch Table
 
 | Dispatch | Owning Spec / Branch | Disposition | Requirements delta | Design delta | Proposed amendment tasks | Merge dependency | Required evidence |
 |---|---|---|---|---|---|---|---|
-| WA-01 | `parser-subsystem-extraction` / `parser-rebaseline` | `CONTRACT_CHANGE` | 增加 Windows rooted read、canonical writer、reparse/ancestor/final swap、live-handle identity、body-safe failure；保持 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE` fail-closed | Parser 继续拥有 sealed source/writer 与业务错误，改为消费 `RootedFileSystem`/publisher；Windows source 不再用 path/lstat 近似 | `2.5a` rooted reader port；`2.12a` Windows adversarial read；`5.2a` canonical writer port；`5.12a` publish/recovery matrix | W1 + Windows contracts；先于 Project/Resource/TMX 和 packaged import | rooted source/writer shared contract；junction/reparse/hardlink/ancestor swap；body unread；source + frozen Parser evidence |
-| WA-02 | `collaborative-job-chunks` / `feature/collaborative-job-chunks` | `CONTRACT_CHANGE` | 增加 Windows startup、cross-process lock、publish/kill recovery 与稳定错误 | Chunk owner 保留 journal/LKG/state machine；注入 `ProcessFileLock`/publisher，删除业务顶层 `fcntl` | `1.3a` platform contracts；`1.4a` import/composition；`3.2a` LockFileEx；`4.4a` publish/recovery；`4.5a` two-process/kill matrix | W1 + Windows contracts；可与 WA-01 并行，WA-02 是 source Qt import/startup 的直接前置 | controller import 无 POSIX module；首次two-creator/creator-crash接管、双进程竞争、TerminateProcess 后释放、candidate close/reopen、journal/LKG recovery |
+| WA-01 | `parser-subsystem-extraction` / `parser-rebaseline` | `CONTRACT_CHANGE` | 增加 Windows rooted read、canonical writer、reparse/ancestor/final swap、live-handle identity、body-safe failure；保持 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE` fail-closed | Parser 继续拥有 sealed source/writer 与业务错误，改为消费 `RootedFileSystem`/publisher；Windows source 不再用 path/lstat 近似 | `2.5a` rooted reader port；`2.12a` Windows adversarial read；`5.2a` canonical writer port；`5.12a` source completion；`5.12b` frozen revalidation | source：W1 + Windows contracts；frozen：W3 spike + platform 7.4 candidate | rooted source/writer shared contract；junction/reparse/hardlink/ancestor swap；body unread；source与frozen证据分阶段 |
+| WA-02 | `collaborative-job-chunks` / `feature/collaborative-job-chunks` | `CONTRACT_CHANGE` | 增加 Windows startup、cross-process lock、publish/kill recovery 与稳定错误 | Chunk owner 保留 journal/LKG/state machine；注入 `ProcessFileLock`/publisher，删除业务顶层 `fcntl` | `1.3a` platform contracts；`1.4a/1.4b` source/frozen composition；`3.2a` LockFileEx；`4.4a` publish/recovery；`4.5a/4.5b` source/frozen acceptance | source：W1 + Windows contracts；frozen：W3 spike + platform 7.4 candidate；WA-02是source Qt import直接前置 | controller import无POSIX module；首次two-creator/creator-crash接管、双进程竞争、TerminateProcess后释放、candidate close/reopen、journal/LKG recovery |
 | WA-03 | `multi-document-project-workspace` / `feature/multi-document-project-workspace` | `CONTRACT_CHANGE` | 增加 Windows ProjectPackage save/reopen、deterministic ZIP、concurrent writer、crash/reboot recovery | Project owner 保留 ADR-018/019 carrier、receipt、LKG；本地 dirfd helper 改用 platform authority/publisher，replace 只在 owner lease 下 | `2.1a` identity/port；`2.4a` bound save；`2.8a` reopen/recovery；`4.3a` hostile Windows paths；`4.4a` process/power boundary | W1 + WA-01；可与 WA-04/05 并行 | save/reopen byte/digest parity、target-open rejection、uncooperative swap=>recovery、deterministic carrier、old/new/recovery-only |
-| WA-04 | `language-resource-portability` / `feature/language-resource-portability` | `CONTRACT_CHANGE` | 增加 resource artifact/package/import/repository/receipt 在 Windows 的 rooted/save/reopen/recovery | Resource owner 保留 portability/receipt semantics；共享 platform port 替代 `_bind_parent`/dirfd/fsync | `2.4a` rooted resource source；`2.5a` resource identity；`3.4a` bound publish；`4.4a` package/repository；`5.4a` Windows hostile matrix；`5.5a` packaged resource evidence | W1 + WA-01；可与 WA-03/05 并行 | Resource import/save/reopen、ledger/repository、junction/swap/lock/recovery、frozen data path |
-| WA-05 | `tmx-context-interchange` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows rooted TMX source、canonical save、no-target-change failure、restart/packaged import | TMX owner 保留 locale/conflict/receipt semantics；消费 Parser sealed source与 bound publisher | `2.3a` Windows source；`3.4a` bound writer；`3.5a` recovery；`5.3a` hostile source；`5.4a` packaged TMX journey | W1 + WA-01，之后与 WA-03/04 并行 | valid count、invalid/escaped/reparse source zero mutation、canonical bytes/reopen、frozen import |
-| WA-06 | `tm-storage-retrieval-index` / `feature5` | `CONTRACT_CHANGE` | 增加 Windows initial activation、single authority、restart recovery、FTS5 reopen、private attestation、FileId reuse 与 power-cut结果；`.2`以`WindowsPrivateSecurityV2`取代`.1`的V1 physical profile | Core 保留 SQLite authority/generation/reservation/journal/LKG及各自业务 envelope；消费 lock/private/rooted/publish ports，并把绑定V2 security profile/descriptor digest的 W2 `WindowsPrivateProof` 作为子记录嵌入 Gate D/canonical receipt，不把 FileId 当永久身份 | `1.2a` platform identity/security schema；`5.3a` reservation；`5.6a` private storage；`5.7a` publish；`5.8a` restart；`5.9a` FileId reuse；`5.12a`/`5.13a`/`5.14a` fault/power/adversarial；`8.8a` FTS5 reopen；`9.1a`/`9.2a`/`9.6a` activation/public regression | W1 + W2 + adopted ADR-023 + WA-01/02 + Windows primitives；先于 WA-07 | initial activation/restart/two-process/kill/power-cut；owner envelope + nested V2 proof；DACL/MIC token matrix；tamper/recreate；FTS5/trigram create/query/reopen |
-| WA-07 | `feature5-ui-integration` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows capability composition、TM activation/restart projections、frozen bootstrap/source authority 和 safe diagnostic | Feature5/UI owner 继续拥有 Controller/CapabilityHost；`capability_host` 消费 `TrustedSourceAuthority`，核验 loader attestation/executed-source digest，不得以 `Path.resolve/lstat/O_NOFOLLOW=0` 或 loader metadata 铸造 Windows source proof | `3.5a` Windows platform composition；`3.6a` frozen bootstrap consumption；`3.8a` resource lifecycle；`5.4a`/`5.5a` activation/restart；`6.6a`/`6.7a` W2 re-attestation；`7.2a`/`7.4a`/`7.6a` Qt state；`9.2a` packaged integration | W3 early spike + WA-06；先于 WA-08 final journey | no `fcntl` startup、完整Boot TCB先于业务import、retained-handle exact executed-source、无bytecode/PYZ duplicate、TM safe state/restart、no raw proof/path in UI |
-| WA-08 | `qt-editor-json-mvp-increment` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows source/frozen project journey、bundle resources、avatar功能回归和 qwindows diagnostics | Qt increment 继续拥有单 JSON editor journey/resource presentation；从 bundle authority 解析发行数据，不依赖 checkout/CWD | `4.8a` Windows save/reopen journey；`5.2a` frozen resource roots/avatar fallback；`5.3a` qwindows/visible window；`5.4a` clean-user packaged journey | WA-03/04/05/07 + full packaging；最后一个 consumer amendment | visible main window、project save/reopen、TMX/import path、avatar catalog索引/解码与无匹配头像fallback、non-repo CWD |
+| WA-04 | `language-resource-portability` / `feature/language-resource-portability` | `CONTRACT_CHANGE` | 增加 resource artifact/package/import/repository/receipt 在 Windows 的 rooted/save/reopen/recovery | Resource owner 保留 portability/receipt semantics；共享 platform port 替代 `_bind_parent`/dirfd/fsync | `2.4a` rooted resource source；`2.5a` resource identity；`3.4a` bound publish；`4.4a` package/repository；`5.4a` Windows hostile matrix；`5.5a` packaged resource evidence | source：W1 + WA-01，可与WA-03/05并行；frozen：platform 7.4 candidate | Resource import/save/reopen、ledger/repository、junction/swap/lock/recovery、frozen data path |
+| WA-05 | `tmx-context-interchange` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows rooted TMX source、canonical save、no-target-change failure、restart/packaged import | TMX owner 保留 locale/conflict/receipt semantics；消费 Parser sealed source与 bound publisher | `2.3a` Windows source；`3.4a` bound writer；`3.5a` recovery；`5.3a` hostile source；`5.4a` packaged TMX journey | source：W1 + WA-01，之后与WA-03/04并行；frozen：platform 7.4 candidate | valid count、invalid/escaped/reparse source zero mutation、canonical bytes/reopen、frozen import |
+| WA-06 | `tm-storage-retrieval-index` / `feature5` | `CONTRACT_CHANGE` | 增加 Windows initial activation、single authority、restart recovery、FTS5 reopen、private attestation、FileId reuse 与 power-cut结果；`R2`以`WindowsPrivateSecurityV2`取代`R1`的V1 physical profile | Core 保留 SQLite authority/generation/reservation/journal/LKG及各自业务 envelope；消费 lock/private/rooted/publish ports，并把绑定V2 security profile/descriptor digest的 W2 `WindowsPrivateProof` 作为子记录嵌入 Gate D/canonical receipt，不把 FileId 当永久身份 | 原`a`任务保持；`9.6a` source completion；`9.6b` frozen revalidation | source：W1 + W2 + ADR-023 + WA-01/02；frozen：W3 spike + platform 7.4 candidate | initial activation/restart/two-process/kill/power-cut；owner envelope + nested V2 proof；DACL/MIC token matrix；tamper/recreate；FTS5/trigram create/query/reopen |
+| WA-07 | `feature5-ui-integration` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows capability composition、TM activation/restart projections、frozen bootstrap/source authority 和 safe diagnostic | Feature5/UI owner 继续拥有 Controller/CapabilityHost；source消费rooted source authority，frozen消费`TrustedSourceAuthority`，两者均不得以path/metadata近似铸造proof | `3.5a` source composition；`3.6a` frozen bootstrap；`3.8a` source lifecycle；`6.6a/6.6b` source/frozen qualification；`7.4a/7.4b` failure projection；`7.6a/7.6b` regression；`9.2a` packaged integration | source：WA-06 source；frozen pre-build `3.6a`依赖W3 spike，其余依赖platform 7.4 + WA-06 frozen；先于WA-08对应阶段 | no `fcntl` startup、source业务E2E；frozen再证明Boot TCB/exact-source/no duplicate；TM safe state/restart、no raw proof/path in UI |
+| WA-08 | `qt-editor-json-mvp-increment` / `ui-mvp` | `CONTRACT_CHANGE` | 增加 Windows source/frozen project journey、资源/avatar回归和 qwindows diagnostics | Qt increment继续拥有单JSON journey/resource presentation；source使用source-owned roots，frozen使用trusted bundle root；轻量launcher不取得packaging authority | `4.8a` source save/reopen；`5.2a/5.2b` source/frozen resources；`5.3a/5.3b` source/frozen visible window；`5.4a/5.4b` user-managed/packaged journey | source：WA-03/04/05/07 source + platform 6.6a；frozen：platform 7.4a post-build owner PASS | visible main window、project save/reopen、TMX/import path、avatar catalog索引/解码与fallback、non-repo CWD |
 | WR-01 | `tm-store-module-extraction` / `maintenance/tm-store-module-extraction` | `REVALIDATION_ONLY` | 无 public contract delta | 模块拆分边界不拥有平台语义；只重跑 downstream import/authority/recovery regression | 不追加 amendment task；在 Windows final ledger 记录 revalidation evidence | WA-06 merge 后 | module boundary/AST、store reopen、无直接 POSIX/Win32 primitive regression |
 | WR-02 | `termbase-column-selection-import` / `ui-mvp` | `REVALIDATION_ONLY` | 无 column selection/import contract delta | Termbase 路径通过 Resource/Parser 端口获得 Windows 能力；本 Spec 不改列映射行为 | 不追加 amendment task；在 WA-04/05 consumer regression 中引用 | WA-01/04 merge 后 | column selection/import success + hostile source zero mutation；无平台专属业务分支 |
 | WR-03 | `qt-editor-mvp` / completed baseline | `NO_AMENDMENT` | 无；旧横向 Qt baseline 不重新打开 | 当前 Windows UI 增量由 WA-07/08 拥有 | 不追加 task | WA-07/08 完成后只跑 baseline | offscreen/visible startup、keyboard/accessibility baseline |
@@ -64,29 +98,32 @@ Superseded request history：`WA-06/RDT/2026-08-26.1`曾于2026-08-26获acknowle
 - **首先跑通 Qt source startup 的直接阻塞是 WA-02 Chunk**：`qt_editor.py` 启动组合必定加载协作分工模块，而其顶层 `fcntl` import 在 Windows 进入 composition 前即失败。WA-02 先消费 W1 lock/publisher contracts，移除该直接平台依赖并保持 chunk journal/LKG。
 - **WA-01 Parser 是紧随其后的 Source/Writer vertical slice**：它不负责消除最初的 `fcntl` import，但项目打开、TMX/resource import 与 canonical writer 都依赖其 Windows rooted authority，因此必须在 persistence amendments 前合并。
 - WA-01 与 WA-02 的 owner实现可以并行；启动验收顺序为 `Windows platform factory → WA-02 import/startup → WA-01 rooted source/writer`。
-- WA-07 CapabilityHost 的 `WA-07/RDT/2026-08-26.1` request 在本组提前派发以冻结 source authority接口；Group C只完成同一request，不产生第二dispatch/acknowledgement/row。其实现/合并仍位于 Group C，依赖 W3 minimal spike 与 WA-06 TM Core，不是最初 source Qt import 的前置。
+- WA-07 CapabilityHost 的`R1` request在本组提前派发以冻结source authority接口；Group C只完成同一request，不产生第二dispatch/acknowledgement/row。其source实现依赖WA-06 source阶段而不依赖W3；frozen实现另依赖W3 custom spike，不是最初source Qt import的前置。
 - 派发包必须附 W1/W3 reference、rooted/error/source authority delta 和禁止 Windows path-only proof 的反例。
 
 ### Group B — Persistence / Recovery
 - WA-03 Project、WA-04 Resource、WA-05 TMX、WA-06 TM Core。
 - 派发包必须附 publish mode/threat scope、retained readback→owner commit→terminal reproof、匹配 `DurabilityProfile` 的 power-cut success boundary、owner-specific envelope + nested W2 V2 proof 与 recovery results。
 
-### Group C — UI / Frozen Journey
+### Group C — UI / Staged Delivery Journey
 - 完成Group A已登记的同一WA-07 Feature5/UI request，并派发WA-08 Qt increment；WR-01/02/03仅进入revalidation manifest。
-- 派发包必须附 W3 native-entry pre-Python DLL policy、bootstrap/loader contract、bundle-relative assets、qwindows/visible UI 与最终 clean-user journey。
+- source阶段附rooted source authority、用户管理runtime、qwindows/visible UI与业务journey；frozen阶段另附W3 native-entry pre-Python DLL policy、bootstrap/loader contract、bundle-relative assets与最终clean-user packaged journey。
 
 ## Merge Order and Parallelism
 
 ```text
 W1 + Steering ownership
   -> Windows platform contracts/backends + POSIX parity
-  -> [WA-01 Parser || WA-02 Chunk]
+  -> [WA-01S Parser || WA-02S Chunk]
+  -> [WA-03S Project || WA-04S Resource || WA-05S TMX]
+[W2 + ADR-023 + WA-01S/02S + Windows backend] -> WA-06S TM Core
+[WA-06S + source authority] -> WA-07S Feature5/UI -> platform 6.6a launcher -> WA-08S -> platform 6.6b milestone
 
-W3 -> minimal frozen spike
-WA-01 -> [WA-03 Project || WA-04 Resource || WA-05 TMX]
-[W2 + adopted ADR-023 + WA-01 + WA-02 + Windows backend] -> WA-06 TM Core
-[W3 spike + WA-06] -> WA-07 Feature5/UI
-[WA-03/04/05 + WA-07 + full packaging] -> WA-08 Qt increment
+W3 custom plan || source lane
+[W3 custom spike PASS + source owner merges] -> WA-07 3.6a + pre-build roots
+  -> manifest/handoff/build -> platform 7.4 candidate
+  -> WA-01F/02F/04F/05F/06F + WA-07 post-build revalidation
+[WA-03/04/05 + post-build owner PASS] -> WA-08F
   -> WR-01/02/03 revalidation
   -> full onedir/windowed packaged E2E
   -> Windows + macOS/Linux final evidence
@@ -101,10 +138,10 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | Field | Required value |
 |---|---|
 | dispatch_id | 上表稳定 ID |
-| dispatch_request_revision | 与Dispatch Authority Register一致的唯一R/D/T request identity；同一WA跨group不得重发 |
+| dispatch_request_revision | 与`dispatch_id`组成唯一R/D/T request identity的`R1`/`R2`版本；同一WA跨group不得重发 |
 | owning_spec / lineage_branch | 人类批准的唯一 Spec/合同 authority，以及承载其 amendment 的提交血缘；branch/worktree 本身不是 owner |
 | owner_acknowledgement | owning Spec批准状态、日期及对应request revision |
-| current_status | `PENDING` / `ACKNOWLEDGED` / `COMMITTED` / `MERGED_PASS` / `BLOCKED` / `SUPERSEDED` |
+| current_status | `PENDING` / `ACKNOWLEDGED` / `SOURCE_COMMITTED` / `SOURCE_MERGED_PASS` / `FROZEN_PREBUILD_COMMITTED` / `FROZEN_REVALIDATED_PASS` / `COMMITTED` / `MERGED_PASS` / `BLOCKED` / `SUPERSEDED`；source与两个frozen staged状态均为非终态，只有`MERGED_PASS`是成功终态 |
 | requirements_approval | approved revision/commit |
 | design_approval | approved revision/commit，含 ADR mapping |
 | tasks_approval | approved revision/commit，含 amendment task IDs |

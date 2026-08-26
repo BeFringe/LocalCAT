@@ -72,9 +72,10 @@
 ### Windows Compatibility Amendment WA-08
 
 - **ADR mapping**：follow ADR-022，并消费WA-03/04/05/07。Qt increment保留单JSON产品journey、silver logo与inventory-only avatar presentation；Windows Spec拥有onedir/windowed build/bootstrap/source closure。
-- **Bundle resources**：Qt通过bootstrap提供的trusted bundle root定位logo、Windows icon与manifest声明的可选avatar catalog，不从CWD、checkout absolute path或待验证module `__file__`推断；catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback。
+- **Source resources/entry**：source journey从rooted source resource resolver取得logo/avatar catalog；轻量Windows GUI入口只启动用户专用venv的绝对`pythonw.exe`与source bootstrap，提供图标/版本/诊断但不携带runtime或取得packaging authority。
+- **Bundle resources**：frozen Qt通过bootstrap提供的trusted bundle root定位logo、Windows icon与manifest声明的可选avatar catalog，不从CWD、checkout absolute path或待验证module `__file__`推断；catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback。
 - **Qt platform**：发行物显式收集PySide6 Qt plugins中的`platforms/qwindows.dll`并以visible window smoke验收；offscreen只保留自动化辅助，不能替代真实Windows窗口。
-- **Journey**：source与clean-user packaged两条路径均覆盖project save/reopen、TMX/resource入口、avatar catalog index/decode/fallback和non-repo CWD；失败保持既有project/resource state并输出body-safe diagnostics。
+- **Journey**：source与clean-user packaged两条路径分别覆盖project save/reopen、TMX/resource入口、avatar catalog index/decode/fallback和non-repo CWD；source阶段只形成user-managed runtime evidence，frozen阶段才形成packaged evidence，失败均保持既有project/resource state并输出body-safe diagnostics。
 
 ## 架构
 
