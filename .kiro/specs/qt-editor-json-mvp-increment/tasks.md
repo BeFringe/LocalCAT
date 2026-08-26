@@ -8,7 +8,7 @@
 
 > **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
 
-> **WA-08 Windows compatibility amendment**：以下 `a` 后缀任务拥有 Qt/desktop 的 Windows frozen journey，并消费 WA-03/04/05/07；bootstrap/build/source authority 仍归 `windows-platform-enablement` 与 ADR-022。
+> **WA-08 Windows compatibility amendment**：`a`后缀任务拥有Qt/desktop的Windows source journey，`b`后缀任务在ADR-022发行物重放同一产品语义；bootstrap/build/source authority仍归`windows-platform-enablement`，两阶段消费WA-03/04/05/07对应route evidence。
 
 - [x] 1. 建立冻结契约与能力边界
 
@@ -361,10 +361,16 @@
   - _Boundary: Qt Project Tool Tests_
   - _Depends: 4.7a, 4.7b_
 
-- [ ] 5.2a 从受信 bundle resource root 验证 Qt 资源与头像退化
-  - source入口使用有效测试catalog验证speaker avatar唯一命中、大小写匹配、解码失败与可访问文本；clean frozen只消费ADR-022 manifest声明的catalog，若未声明头像资产则验证无匹配fallback，且不得扩大clean build输入。Windows`.ico`、silver logo与资产只读边界继续验收。
+- [ ] 5.2a 从rooted source resource root验证Qt资源与头像退化
+  - source入口使用有效测试catalog验证speaker avatar唯一命中、大小写匹配、解码失败、无匹配fallback与可访问文本；silver logo与资产只读边界继续验收，不依赖CWD。
   - _Amendment: WA-08_
-  - _Depends: 4.2a, 4.8, ADR-022, windows-platform-enablement 7.4_
+  - _Depends: 4.2a, 4.8_
+
+- [ ] 5.2b 从trusted bundle resource root重放Qt资源与头像退化
+  - clean frozen只消费ADR-022 manifest声明的logo/icon/catalog；若未声明catalog或无匹配头像则验证既有fallback，且不得扩大clean build输入或访问checkout。
+  - _Amendment: WA-08_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.2a, ADR-022, windows-platform-enablement 7.4_
 
 - [x] 5.3 (P) 验证 UI polish、可访问性与导入边界
   - 验证 silver logo、speaker inventory 头像等比缩放/退化状态、ellipsis 尺寸、resize、tooltip、accessible name 和键盘菜单
@@ -375,10 +381,16 @@
   - _Boundary: Qt Bootstrap, Settings and Boundary Tests_
   - _Depends: 4.8, 4.9_
 
-- [ ] 5.3a 验证 `qwindows.dll` 与真实可见窗口
-  - 在干净 CPython 3.14 x64 venv 和 frozen distribution 分别确认 PySide6 platform plugin 路径、`qwindows.dll` 加载、非 offscreen 主窗口可见、dialog/icon/keyboard journey 与无 console bootstrap。
+- [ ] 5.3a 在user-managed source runtime验证`qwindows.dll`与真实可见窗口
+  - 在干净CPython 3.14 x64专用venv确认PySide6 platform plugin路径、`qwindows.dll`加载、非offscreen主窗口可见与dialog/icon/keyboard journey；不安装Excel/xlwings。
   - _Amendment: WA-08_
-  - _Depends: 4.8a, 5.3, windows-platform-enablement 7.4_
+  - _Depends: 4.8a, 5.3_
+
+- [ ] 5.3b 在frozen distribution验证`qwindows.dll`与真实可见窗口
+  - 从windowed EXE确认bundle plugin路径、`qwindows.dll`加载、非offscreen主窗口可见、dialog/icon/keyboard journey与无console bootstrap；source venv结果不得代答。
+  - _Amendment: WA-08_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.3a, windows-platform-enablement 7.4_
 
 - [x] 5.4 执行全量回归与本地性验收
   - 运行 canonical 单元、集成、offscreen smoke 和 Excel 相关测试，只修复本规格引入的回归
@@ -388,10 +400,16 @@
   - 完成时，全量测试绿色，新能力仅在单 JSON gate 内可用，所有数据处理保持本地
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
 
-- [ ] 5.4a 执行 clean-user Windows `--onedir --windowed` 产品 journey
-  - 从无 repository cwd 的新用户 profile 启动真实窗口，完成项目保存/重开、TM 激活/重启恢复、TMX 导入、FTS5、资源与头像验证；不通过环境变量、复制源码或现场 patch 修复 bundle。
+- [ ] 5.4a 执行user-managed Windows source产品journey
+  - 用户安装CPython 3.14 x64、创建专用venv并安装`requirements-ui.txt`；从non-repository CWD经轻量GUI入口启动真实窗口，完成项目保存/重开、TM激活/重启恢复、TMX导入、FTS5、资源与头像验证。入口只调用受验证的绝对`pythonw.exe`/source bootstrap，失效时明确诊断。
   - _Amendment: WA-08_
-  - _Depends: 5.2a, 5.3a, WA-03, WA-04, WA-05, WA-07, windows-platform-enablement 7.4_
+  - _Depends: 5.2a, 5.3a, WA-03 source phase, WA-04 source phase, WA-05 source phase, WA-07 source phase, windows-platform-enablement 6.6a_
+
+- [ ] 5.4b 执行clean-user Windows `--onedir --windowed`产品journey
+  - 从无repository cwd的新用户profile启动真实EXE，重放5.4a完整业务journey；不通过环境变量、复制checkout源码、普通diagnostic onedir或现场patch修复bundle。
+  - _Amendment: WA-08_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.2b, 5.3b, WA-03, WA-04 frozen phase, WA-05 frozen phase, WA-07 frozen phase, windows-platform-enablement 7.4a_
 
 - [x] 5.5 完成 project-tool usability amendment 验收
   - QtTest 证明 inventory 表头完整、规则保存/重开/重启、两个复选筛选、状态计数和两类确认提示

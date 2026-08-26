@@ -387,7 +387,13 @@
   - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5_
   - _Depends: 5.11_
 
-- [ ] 5.12a 闭合 source 与 frozen writer 的 Windows fresh completion
-  - 分别在源码与 ADR-022 最小 frozen harness 运行 rooted read、canonical save、crash/recovery 与 clean-process reopen，证明原始 `.py`、fixtures 与发布资源由受信 source authority 可见且失败不现场修补。
+- [ ] 5.12a 闭合source writer的Windows fresh completion
+  - 在源码运行时执行rooted read、canonical save、crash/recovery与clean-process reopen，证明原始`.py`、fixtures与发布资源由rooted source authority可见且失败不现场修补；完成后只交付WA-01 source阶段证据。
   - _Amendment: WA-01_
-  - _Depends: 2.12a, 5.2a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
+  - _Depends: 2.12a, 5.2a, windows-platform-enablement 3.7_
+
+- [ ] 5.12b 在ADR-022最小frozen harness重放Windows writer
+  - 在W3 custom spike全PASS后重放5.12a，证明Parser真实`.py`、fixtures与发布资源只由trusted bundle authority可见，retained-handle exact-source和失败语义不回落source checkout。
+  - _Amendment: WA-01_
+  - _Delivery phase: frozen post-build_
+  - _Depends: 5.12a, ADR-022, windows-platform-enablement 7.4_
