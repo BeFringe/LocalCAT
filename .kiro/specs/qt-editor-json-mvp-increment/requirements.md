@@ -20,6 +20,13 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 
 2026-08-19 已批准的 project-tool usability amendment 修复 speaker inventory“出现次数”表头裁切，并扩展 Requirement 4：预处理对话框以“草稿 / 已确认”两个独立复选框筛选 preview，可显式保存有序 literal 规则、启用状态与筛选偏好到设备本地 `workspace.json`。保存偏好不修改项目且不自动运行规则；只要 preview 包含已确认段，应用前继续显示既有“变化段落设为待确认”警告。
 
+### Windows Compatibility Amendment WA-08
+
+1. Windows source 与 onedir/windowed 两种 Qt journey 必须显示真实主窗口，并完成项目保存/重开、TMX路径和资源表面回归；`qwindows.dll`缺失、错误平台plugin或窗口不可见均为启动失败，不得用offscreen结果代替visible验收。
+2. `LocalCAT-logo-silver.png`、Windows icon与manifest声明的可选avatar catalog等本Spec presentation assets必须从ADR-022 trusted bundle resource root解析，不依赖checkout或CWD；头像仍只在inventory中按既有安全索引/解码/fallback语义展示，catalog未声明时保持无头像fallback。
+3. clean-user packaged journey必须从non-repository CWD运行并验证声明资源索引、图片解码或无catalog/无匹配头像fallback，以及项目保存/重开；测试输入不成为build authority或产品样本数量合同。
+4. 本 amendment不取得PyInstaller/bootstrap、ProjectPackage、ResourcePackage、TMX或Feature5 capability authority；它只拥有Qt单JSON journey与资源presentation的Windows消费验收。
+
 ## 需求
 
 ### Requirement 1：Raw speaker 批量盘点
