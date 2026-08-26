@@ -2,6 +2,8 @@
 
 ## Tasks
 
+> **WA-01 Windows compatibility amendment**：以下 `a` 后缀任务只承接 ADR-020 的 Windows rooted-handle 与 durable publication 适配；原 Parser grammar、terminal 与 Application authority 不变。
+
 - [x] 1. Wave 0：建立现行行为与失败护栏
 - [x] 1.1 固定单文档项目 facade 的兼容行为
   - 覆盖 LocalCAT JSON 数组根、对象根、字段缺省、顺序、局部 ID、空项目和 TXT source-only 读取。
@@ -94,6 +96,11 @@
   - 完成时，outside-root、symlink/reparse、non-regular 与 read failure 均在消费内容前结构化失败。
   - _Requirements: 6.6, 9.6, 9.7_
 
+- [ ] 2.5a 将 rooted opener 接入平台 `RootedFileSystem`
+  - Windows 实现必须以 retained root/file handle 逐段绑定并证明最终 regular file；reparse point、hardlink/multi-link、root/path replacement 与能力缺失均在消费内容前 fail closed。
+  - _Amendment: WA-01_
+  - _Depends: 2.5, ADR-020, windows-platform-enablement 2.1_
+
 - [x] 2.6 实现 sealed snapshot copy、fingerprint 与封存
   - 从已绑定 descriptor 单次复制实际解析字节，在输入上限内同步计算 digest，并在复制前后核对 fstat 稳定性。
   - 私有 snapshot 完整 flush 后封存，codec 不能按 pathname 重开 snapshot 或原文件。
@@ -135,6 +142,11 @@
   - writer 只接受已序列化 canonical bytes，不拥有 LocalCAT schema 或 EditorProject 映射。
   - 完成时，任一注入失败都保留原目标字节且无 receipt，成功 receipt 绑定目标 identity 与 digest。
   - _Requirements: 3.9, 9.6, 10.2, 10.6_
+
+- [ ] 2.12a 执行 Windows rooted-source 对抗读取矩阵
+  - 在真实 NTFS 上覆盖 live handle、reparse point、hardlink/multi-link、ancestor/target replacement、same-byte FileId replacement、并发改写与 handle 清理；不得把 `ROOT_BINDING_UNAVAILABLE` 当作 Windows 通过结果。
+  - _Amendment: WA-01_
+  - _Depends: 2.5a, 2.6, 2.7, windows-platform-enablement 3.7_
 
 - [x] 2.13 实现共享的 bounded JSON lexical preflight
   - 在标准库 materialization 前验证完整输入、字符串边界、结构深度、编码与 profile 限制。
@@ -305,6 +317,11 @@
   - 完成时，Source Boundary 故障矩阵在所有支持平台上通过或以 root-binding unavailable 明确 fail closed。
   - _Requirements: 6.3, 6.4, 6.6, 7.2, 8.2, 9.6, 9.7, 15.3_
 
+- [ ] 5.2a 将 canonical byte writer 接入平台 `BoundDirectoryPublisher`
+  - Windows 路径显式选择`CREATE_IF_ABSENT`或由调用owner持有排他lease的`REPLACE_UNDER_LOCK`；candidate保持打开完成write/content flush和journal/LKG arm后rename，随后capture→close all candidate handles→retained reopen/readback→owner durable commit→terminal reproof，不以pathname resolve或删旧后改名代替。
+  - _Amendment: WA-01_
+  - _Depends: 2.12, ADR-020, windows-platform-enablement 2.1_
+
 - [x] 5.3 验证 limits、diagnostics、metadata 与编码边界
   - 参数化覆盖各 codec profile 的输入、字段、记录、materialization、issue、metadata 与结构深度边界。
   - 验证稳定 limit/encoding code、issue truncation、按 code 计数和安全摘要；确认 Gate D 100k 未被解释为 Parser limit。
@@ -369,3 +386,8 @@
   - 完成时，Parser runtime、下游 TM evidence 和治理派生事实形成同一 current-source 闭环，且不存在未解释失败。
   - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5_
   - _Depends: 5.11_
+
+- [ ] 5.12a 闭合 source 与 frozen writer 的 Windows fresh completion
+  - 分别在源码与 ADR-022 最小 frozen harness 运行 rooted read、canonical save、crash/recovery 与 clean-process reopen，证明原始 `.py`、fixtures 与发布资源由受信 source authority 可见且失败不现场修补。
+  - _Amendment: WA-01_
+  - _Depends: 2.12a, 5.2a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_

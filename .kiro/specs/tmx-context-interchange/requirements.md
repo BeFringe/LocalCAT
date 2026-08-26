@@ -12,6 +12,13 @@ LocalCAT 已有拒绝 DTD/ENTITY、限额流式读取和语言对选择的 TMX L
 - **范围外**：ProjectPackage、Workspace/Chunk identity 或 membership 生成、ResourcePackage manifest/ZIP/preview/apply/receipt、provider/网络、MyMemory API、Fuzzy、复杂内联标签编辑、Job 身份。
 - **上游**：Parser 安全 reader；canonical TM snapshot；Workspace session/universe projection；Chunk exact scope projection；ResourcePackage carrier/transaction owner。
 
+### Windows Compatibility Amendment WA-05
+
+1. Windows TMX source 必须通过 Parser 的 ADR-020 rooted sealed-source contract；invalid/escaped/reparse/stale source 在任何 import mutation 前失败，valid record count 与 terminal 继续由 Parser/TMX owner闭合。
+2. Direct `.tmx` canonical publication 必须消费 bound publisher，并保持 effective locale、scope、loss、canonical bytes、destination-before、receipt 与 recovery 语义；Windows path/lock primitive不得进入 TMX public contracts。
+3. publication failure 必须保持 target exact 不变，或在已发布结果不确定时进入 recovery-required；restart 后只依据 retained identity/digest/journal/LKG facts完成，不按 pathname/mtime 猜测。
+4. onedir/windowed journey 必须在 non-repository CWD 完成 TMX import/export/cold reopen；本 amendment 不把 Parser、ResourcePackage、Workspace、Chunk、TM Store 或 frozen bootstrap authority 迁入 TMX。
+
 ## 术语
 
 - **Source_Scope**：`managed_resource`、`entire_project` 或 `selected_chunk`。

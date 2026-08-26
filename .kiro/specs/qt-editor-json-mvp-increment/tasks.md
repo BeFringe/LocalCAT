@@ -8,6 +8,8 @@
 
 > **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
 
+> **WA-08 Windows compatibility amendment**：以下 `a` 后缀任务拥有 Qt/desktop 的 Windows frozen journey，并消费 WA-03/04/05/07；bootstrap/build/source authority 仍归 `windows-platform-enablement` 与 ADR-022。
+
 - [x] 1. 建立冻结契约与能力边界
 
 - [x] 1.1a 建立单 JSON 搜索与 matcher 能力契约
@@ -317,6 +319,11 @@
   - _Requirements: 8.1, 8.2_
   - _Boundary: QtBootstrap_
 
+- [ ] 4.8a 接入 Windows source 项目保存/重开 journey
+  - 通过 production Controller/Qt 完成项目打开、编辑、保存、关闭与 fresh-process 重开，并消费 WA-03 的 identity/receipt/recovery 投影；Qt 不实现 filesystem、package 或 writer authority。
+  - _Amendment: WA-08_
+  - _Depends: 4.8, WA-03_
+
 - [x] 4.9 收紧资源 ellipsis 并保持键盘可用
   - 使用 auto-raise、固定横向策略和 32 logical px 最小键盘命中宽度
   - 宽度取内容 size hint 加安全 padding，最大 40 logical px；操作列不参与 Stretch
@@ -354,6 +361,11 @@
   - _Boundary: Qt Project Tool Tests_
   - _Depends: 4.7a, 4.7b_
 
+- [ ] 5.2a 从受信 bundle resource root 验证 Qt 资源与头像退化
+  - source入口使用有效测试catalog验证speaker avatar唯一命中、大小写匹配、解码失败与可访问文本；clean frozen只消费ADR-022 manifest声明的catalog，若未声明头像资产则验证无匹配fallback，且不得扩大clean build输入。Windows`.ico`、silver logo与资产只读边界继续验收。
+  - _Amendment: WA-08_
+  - _Depends: 4.2a, 4.8, ADR-022, windows-platform-enablement 7.4_
+
 - [x] 5.3 (P) 验证 UI polish、可访问性与导入边界
   - 验证 silver logo、speaker inventory 头像等比缩放/退化状态、ellipsis 尺寸、resize、tooltip、accessible name 和键盘菜单
   - AST guard 覆盖主窗口、设置和三个新对话框，禁止 codec/store/domain/Core implementation 越层导入
@@ -363,6 +375,11 @@
   - _Boundary: Qt Bootstrap, Settings and Boundary Tests_
   - _Depends: 4.8, 4.9_
 
+- [ ] 5.3a 验证 `qwindows.dll` 与真实可见窗口
+  - 在干净 CPython 3.14 x64 venv 和 frozen distribution 分别确认 PySide6 platform plugin 路径、`qwindows.dll` 加载、非 offscreen 主窗口可见、dialog/icon/keyboard journey 与无 console bootstrap。
+  - _Amendment: WA-08_
+  - _Depends: 4.8a, 5.3, windows-platform-enablement 7.4_
+
 - [x] 5.4 执行全量回归与本地性验收
   - 运行 canonical 单元、集成、offscreen smoke 和 Excel 相关测试，只修复本规格引入的回归
   - 验证 JSON/TXT 打开、JSON 保存、精确 TM 优先、raw speaker TM identity、Trie 建议、资源导入/删除和 Excel 三态
@@ -370,6 +387,11 @@
   - 不把历史 Close-without-Saving 缺陷作为本规格新能力或完成条件
   - 完成时，全量测试绿色，新能力仅在单 JSON gate 内可用，所有数据处理保持本地
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
+
+- [ ] 5.4a 执行 clean-user Windows `--onedir --windowed` 产品 journey
+  - 从无 repository cwd 的新用户 profile 启动真实窗口，完成项目保存/重开、TM 激活/重启恢复、TMX 导入、FTS5、资源与头像验证；不通过环境变量、复制源码或现场 patch 修复 bundle。
+  - _Amendment: WA-08_
+  - _Depends: 5.2a, 5.3a, WA-03, WA-04, WA-05, WA-07, windows-platform-enablement 7.4_
 
 - [x] 5.5 完成 project-tool usability amendment 验收
   - QtTest 证明 inventory 表头完整、规则保存/重开/重启、两个复选筛选、状态计数和两类确认提示

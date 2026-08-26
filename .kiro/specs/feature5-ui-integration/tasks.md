@@ -2,6 +2,8 @@
 
 > 本计划只拥有 Feature 5 Core 到当前段 TM suggestions 的跨层闭环与 macOS 入口。owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 thread；同一 thread 可以依次执行不同簇，但必须重新载入 owning Spec。独立 Qt maintenance、原 Qt Requirement 3 单 JSON 搜索和 Requirement 7 术语 CRUD/管理入口分别在其 owning Spec 记账，不得用本计划的 checkbox 代替。
 
+> **WA-07 Windows compatibility amendment**：以下 `a` 后缀任务承接 ADR-020/021/022 的 composition、device qualification、canonical re-attestation 与 frozen-source 消费；Core/Integration/Qt 三方 authority 不变。
+
 - [x] 1. 闭合治理、精确身份与 Feature 5 合并基线
 
 - [x] 1.1 闭合获批治理顺序与三方所有权
@@ -114,6 +116,11 @@
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate C_
 
+- [ ] 3.5a 在 native entry 后装配 Windows 平台服务
+  - source composition先建立ADR-020/021 filesystem/lock/private-proof ports再进入TM resolver/CapabilityHost；frozen composition必须等待3.6a的native entry/Boot TCB/`TrustedSourceAuthority`闭合后才建立platform factory与业务graph。缺失或错平台实现只发布安全unavailable，不绕过startup owner。
+  - _Amendment: WA-07_
+  - _Depends: 3.5, 3.6a, ADR-020, ADR-021, windows-platform-enablement 3.7_
+
 - [x] 3.6 在同一 publisher 上闭合 Gate D 运行生命周期
   - 只使用合并后已跟踪的 `benchmark_tm_contract.json`，并为每个 process/code epoch 创建新的 `0700` private work root
   - evidence path 在调用前必须不存在；旧 evidence 或 receipt 不得在后续进程重铸授权
@@ -122,6 +129,11 @@
   - 完成时，Gate D success、old receipt、absent evidence、cleanup pending、identity drift、非阻塞与 exact/context preservation tests 全部通过
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate D_
+
+- [ ] 3.6a 从 frozen bootstrap 消费受信 source authority
+  - native entry/Boot TCB必须在import platform factory、CapabilityHost或其他业务模块前闭合DLL/source policy并铸造`TrustedSourceAuthority`；Gate C/D build inventory、approved roots、原始`.py`与benchmark contract只经bundle authority/loader attestation定位，不信任cwd、任意`sys._MEIPASS`文件或现场复制源码。
+  - _Amendment: WA-07_
+  - _Depends: 3.6, ADR-022, windows-platform-enablement 1.4_
 
 - [x] 3.7 将 declarative 资源解析为有序 runtime ports
   - 根据 Active/Lookup/Update 与显式资源顺序构造不可变 snapshot，不把 canonical lifecycle flag 复制进 registry
@@ -138,6 +150,11 @@
   - 完成时，缺失路径、损坏 activation facts、divergence、atomic replacement 与 in-flight lifetime tests 全部通过
   - _Requirements: 5.1, 5.9, 5.10, 6.5, 6.6, 6.7_
   - _Boundary: TMResourceResolver Lifecycle and Failure_
+
+- [ ] 3.8a 闭合 Windows packaged resource lifecycle
+  - resolver 在 clean-user source/frozen 环境复验 resource config、managed root、canonical private proof 与 generation；source-diverged/unavailable 继续资源局部 fail closed，不回落 JSONL。
+  - _Amendment: WA-07_
+  - _Depends: 3.5a, 3.8, WA-06, windows-platform-enablement 3.7_
 
 - [ ] 4. 实现 current-segment mixed retrieval adapter
 
@@ -207,6 +224,11 @@
   - _Requirements: 5.2, 5.3, 5.4, 5.5_
   - _Boundary: EditorController Activation Start_
 
+- [ ] 5.4a 在 Windows 闭合首次激活 Controller lifecycle
+  - production preflight/worker 只调用 Core public activation contract，覆盖 lock busy、private-proof failure 与 frozen source unavailable；UI 不暴露 handle/path/token 或 platform internals。
+  - _Amendment: WA-07_
+  - _Depends: 3.8a, 5.4, WA-06, windows-platform-enablement 3.7_
+
 - [x] 5.5 在 activation completion 后重建并原子替换 runtime
   - 成功 outcome 后重新 resolve、re-prove 并一次替换 resource snapshot，再递增 epoch、刷新状态与当前建议
   - proven first failure 保留 legacy；ambiguous facts 显示 unavailable；canonical update 失败保留 LKG 与 source-diverged 状态
@@ -214,6 +236,11 @@
   - 完成时，success/proven failure/ambiguous/diverged/LKG 的 Controller integration tests 全部通过
   - _Requirements: 5.6, 5.7, 5.8, 5.9, 5.10, 6.7_
   - _Boundary: EditorController Activation Completion_
+
+- [ ] 5.5a 在 Windows 重启后恢复 activation/runtime projection
+  - 成功、published-tail、proven rollback、ambiguous 与 source-diverged 经 fresh process 重新 resolve 并一次换代；不允许旧 JSONL、旧 runtime 或旧 suggestion membership 复活。
+  - _Amendment: WA-07_
+  - _Depends: 5.4a, 5.5, WA-06_
 
 - [x] 5.6 闭合阈值更新、持久化与重新查询
   - Controller 统一校验并保存阈值，成功后递增 epoch、构造新查询并刷新当前建议
@@ -276,6 +303,11 @@
   - _Boundary: ADR-013 Gate D Device Qualification_
   - _Depends: 3.6, 5.1, 6.1, 6.3, 6.4_
 
+- [ ] 6.6a 以 ADR-021 恢复 Windows 设备 Fuzzy 资格
+  - compatibility key 消费 Windows device qualification/private proof 与 ADR-022 source attestation；缺失、ACL/owner/environment/implementation 漂移显示“需重新验证”，不静默运行或授权 100k 结果。
+  - _Amendment: WA-07_
+  - _Depends: 3.6a, 6.6, ADR-021, ADR-022_
+
 - [x] 6.7 按 ADR-016 重新证明已发布 canonical 的 device-only 身份漂移
   - 普通冷开保持 fail-closed；仅当 completed publication 的 source/manifest/SQLite 除一致 device-number 漂移外全部精确闭合时，显示资源局部“重新验证 canonical”动作
   - 显式维护在持久锁下原子更新 attestation 并恢复同一 store id / generation；任何 byte、inode、binding、phase、mixed-device 或 pending recovery 差异均零 mutation 拒绝
@@ -283,6 +315,11 @@
   - _Requirements: 5.10, 5.11, 5.12, 5.13, 5.14, 6.5, 6.7_
   - _Boundary: ADR-016 Canonical Device Re-attestation_
   - _Depends: 3.8, 5.5, 6.2_
+
+- [ ] 6.7a 以 ADR-021 重新证明 Windows canonical private storage
+  - 显式维护在`ProcessFileLock`下复验exact store/generation、bytes、retained live-handle opaque identity comparison、ACL/owner、non-reparse root与journal phase；历史FileId不参与恢复授权，成功只更新同一canonical qualification，不铸造新store权威。
+  - _Amendment: WA-07_
+  - _Depends: 3.8a, 5.5a, 6.7, ADR-021_
 
 - [x] 7. 完成 TextMatcher handoff 与 canonical integration 验收
 
@@ -303,6 +340,11 @@
   - _Requirements: 9.6, 9.7, 9.8_
   - _Boundary: Canonical TM Integration Fixtures_
 
+- [ ] 7.2a 在 Windows 构建并冷重开真实 activated SQLite
+  - 由 production migration/activation 在 CPython 3.14 x64 生成 canonical store，显式验证 FTS5、generation、variants、query lease 与 fresh-process reopen，不手写 SQLite fixture。
+  - _Amendment: WA-07_
+  - _Depends: 5.5a, 6.7a, 7.2_
+
 - [x] 7.3 验证 canonical 阈值、排序与 mixed global top-10
   - 使用 production retrieval 覆盖 exact/context/fuzzy、双 source、最终分数和 0.60 inclusive / 1.00 fuzzy
   - 交错 legacy/canonical 资源，验证 exact-first、相似度降序、Core ties、去重和全资源一次 top-10
@@ -321,6 +363,11 @@
   - _Boundary: Capability Resource and Activation Failure Validation_
   - _Depends: 3.5, 3.6_
 
+- [ ] 7.4a 扩展 Windows platform/source/resource failure 投影
+  - 覆盖root/lock/private-proof/source-attestation与resource lifecycle失败，确保Controller和Feature5 TM surface只显示稳定safe code，健康资源结果保留且activated authority不回退JSONL；qwindows/plugin启动诊断仍归WA-08。
+  - _Amendment: WA-07_
+  - _Depends: 3.6a, 3.8a, 6.7a, 7.4_
+
 - [x] 7.5 验证 stale/tamper/apply 与写回权限矩阵
   - 对 project/segment/source/resource/capability/threshold epoch 变化和逐字段 suggestion substitution 执行 zero-mutation tests
   - 覆盖三种 match type 的显式 apply，以及 Active+Lookup 与 Active+Update 的 canonical/legacy 组合
@@ -336,6 +383,11 @@
   - 完成时，完整 integration baseline 在当前提交全绿且没有用 legacy 结果替代 canonical 验收
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.10_
   - _Boundary: Integration Regression Validation_
+
+- [ ] 7.6a 执行 Windows source/frozen 本地回归
+  - 在源码与 `--onedir --windowed` 运行 canonical/legacy/Trie/raw-speaker/Qt/JSON/TXT/TMX/Excel-optional 边界；Qt 主程序不得因未安装 Excel/xlwings 失败，旧 Excel adapter 仍明确条件依赖。
+  - _Amendment: WA-07_
+  - _Depends: 7.2a, 7.4a, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
 
 > **Checkpoint Q（不属于本 Spec checkbox）**：任务 7 的全部 handoff 与 validation 子任务闭合后，暂停本 Spec。先按原 `qt-editor-json-mvp-increment` 完成 Q1 / Requirement 3 单 JSON 搜索，再完成 Q2 / Requirement 7 术语 CRUD 与管理入口，并只更新原 Spec 的 Tasks。执行者可以是同一 thread；两簇以 fresh evidence 完成后才返回任务 8。
 
@@ -368,6 +420,11 @@
   - 完成时，所有门在当前提交绿色且证据直接验证目标业务 API 与 Finder/Dock 入口
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10_
   - _Boundary: Feature GO and Cross-Spec Revalidation_
+
+- [ ] 9.2a 以 clean-user Windows frozen CapabilityHost/TM integration 执行 fresh GO
+  - 在ADR-022 frozen harness完成CapabilityHost启动、TM激活/重启恢复、FTS5查询、resource-local safe projection与source gate；evidence绑定当前bundle manifest、原始`.py`与runtime tree。项目、TMX、qwindows与头像完整产品journey只由WA-08汇合。
+  - _Amendment: WA-07_
+  - _Depends: 7.6a, WA-06, ADR-022, windows-platform-enablement 1.4, windows-platform-enablement 3.7_
 
 ## Implementation Notes
 
