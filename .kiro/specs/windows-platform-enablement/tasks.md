@@ -160,15 +160,15 @@
 
 - [ ] 3. 实现 Windows rooted/lock/private/publish/durability backend
 
-- [ ] 3.1 实现 Win32 FFI wrapper、RAII handle 与受支持主机 Gate
+- [x] 3.1 实现 Win32 FFI wrapper、RAII handle 与受支持主机 Gate
   - 精确绑定CreateFileW、GetFileInformationByHandleEx、GetFinalPathNameByHandleW、SetFileInformationByHandle、FlushFileBuffers、LockFileEx/UnlockFileEx、GetSecurityInfo/AccessCheck、storage write-cache query及结构/错误
-  - 首版只mint匹配批准`DurabilityProfile`的Windows 11 x64 local fixed NTFS；UNC/remote/ReFS/FAT/exFAT、unknown cache/flush/write-through/power-protection facts或probe缺失均`CAPABILITY_UNAVAILABLE`
+  - 首版只mint匹配批准`DurabilityProfile`的Windows 11 x64 local fixed NTFS；Win32/OS/architecture/local-volume/NTFS/reparse/FileId等基础probe缺失或UNC/remote/ReFS/FAT/exFAT返回`CAPABILITY_UNAVAILABLE`，registry authority缺失、cache/flush/write-through/power-protection facts unknown/changed或无法匹配profile/evidence返回`DURABILITY_UNAVAILABLE`
   - 完成时，结构尺寸/argtypes/restype/last-error/close-on-failure、自检和 unsupported matrix 全绿
   - _Requirements: 1.2, 2.1, 2.2, 3.1, 4.2_
   - _Boundary: Windows Native API and Host Gate_
   - _Depends: 2.4_
 
-- [ ] 3.2 实现逐组件 rooted handle authority 与 sealed handle-read
+- [x] 3.2 实现逐组件 rooted handle authority 与 sealed handle-read
   - 以 ROOT/INTERMEDIATE/SOURCE profiles保留 ancestor/final handles，拒绝 reparse/nonregular/ADS/device/reserved/ambiguous names，比较 final path/volume/live FileId
   - content与fixture只从已证明final handle读取；路径检查失败前不读body，创建时重新证明bound parent
   - 完成时，junction/symlink/mount/final+ancestor swap/hardlink policy/case/trailing-dot matrix获得稳定结果且无逃逸
