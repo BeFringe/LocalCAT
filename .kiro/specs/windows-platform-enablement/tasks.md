@@ -108,8 +108,9 @@
 
 - [ ] 1.5 重新批准W3 custom in-process entry计划
   - 固定同一进程真实entry、编译器/Windows SDK/PyInstaller source与patch pin、PE/system allowlist、manifest parser/hash最小TCB、retained-handle→restricted load→actual-module reproof、native→Python handoff ABI、exact-source loader import order和升级维护边界
+  - 审批输入为`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch、E0～E11 entry顺序、one-shot opaque extension ABI、无自引用的pre-link/runtime/post-build manifests、MSVC x64 toolchain pin及14项mandatory spike矩阵
   - 明确轻量source launcher与父wrapper均不属于W3 boot entry；保持ADR-022唯一bootstrap authority、onedir profile、source proof和全部fail-closed要求，不用本任务新增第二发行权威
-  - 完成时，Design/Tasks/toolchain input与攻击矩阵获W3 reapproval；本任务可与source lane并行，但不授权Task 7或frozen WA merge
+  - 完成时，materialized compiler/SDK/tool摘要、applied patch digest、exact Python C API表、完整pre-authority TCB/native closure与PE/system allowlist均进入lock并连同Design/Tasks/攻击矩阵获W3 reapproval；当前host缺少compiler/SDK时保持未完成。本任务可与source lane并行，但不授权Task 7或frozen WA merge
   - _Requirements: 10.1, 10.3, 10.6, 11.1, 12.3_
   - _Boundary: W3 Custom Entry Reapproval_
   - _Depends: 1.4_

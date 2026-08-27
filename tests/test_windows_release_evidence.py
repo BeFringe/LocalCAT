@@ -66,14 +66,20 @@ def command_expectation(
     diagnostic_code: str | None = None,
     windowed: bool = False,
     cwd_role: str = "NON_REPOSITORY_CWD",
-    environment_profile: str = "CLEAN_WINDOWS_V1",
+    environment_profile: str = "CLEAN_WINDOWS_V2",
     environment_projection_additions: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    return {
+    expectation = {
         "id": command_id,
         "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
-        "shell_flavor": shell_flavor(),
-        "shell_version": shell_version(),
+        "shell_flavor": (
+            "WINDOWS_POWERSHELL"
+            if environment_profile == "CLEAN_WINDOWS_V2"
+            else shell_flavor()
+        ),
+        "shell_version": (
+            "5.1" if environment_profile == "CLEAN_WINDOWS_V2" else shell_version()
+        ),
         "cwd_role": cwd_role,
         "environment_profile": environment_profile,
         "environment_profile_sha256": environment_profile_digest(environment_profile),
@@ -86,6 +92,14 @@ def command_expectation(
         "exit_code": exit_code,
         "diagnostic_code": diagnostic_code,
     }
+    expectation.update(
+        {
+            "shell_edition": "Desktop",
+            "shell_process_architecture": "X64",
+            "shell_selection_role": "SYSTEM32_ABSOLUTE",
+        }
+    )
+    return expectation
 
 
 def environment() -> dict[str, str]:
@@ -105,6 +119,37 @@ def environment() -> dict[str, str]:
 
 
 class WindowsReleaseEvidenceTest(unittest.TestCase):
+    def test_clean_windows_v2_records_servicing_revision_without_pin_failure(self) -> None:
+        self.assertEqual(
+            evidence_module._parse_windows_powershell_probe(
+                "Desktop|5.1.26100.9168|True|X64"
+            ),
+            ("Desktop", "5.1.26100.9168", "X64"),
+        )
+        self.assertTrue(
+            evidence_module._shell_version_matches_expectation(
+                "5.1.26100.9168", "5.1", "CLEAN_WINDOWS_V2"
+            )
+        )
+        self.assertFalse(
+            evidence_module._shell_version_matches_expectation(
+                "7.5.9", "5.1", "CLEAN_WINDOWS_V2"
+            )
+        )
+
+    def test_clean_windows_v2_rejects_wrong_edition_or_architecture(self) -> None:
+        for probe in (
+            "Core|5.1.26100.9168|True|X64",
+            "Desktop|5.1.26100.9168|False|X64",
+            "Desktop|7.5.9.0|True|X64",
+            "Desktop|5.1|True|X64",
+            "Desktop|5.1.26100|True|X64",
+            "Desktop|5.1.26100.9168|True|Arm64",
+        ):
+            with self.subTest(probe=probe):
+                with self.assertRaises(EvidenceValidationError):
+                    evidence_module._parse_windows_powershell_probe(probe)
+
     def test_tracked_task1_scenario_contracts_are_canonical_and_valid(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         contract_root = repository / "packaging/windows/evidence-scenarios"
@@ -133,6 +178,205 @@ class WindowsReleaseEvidenceTest(unittest.TestCase):
                 lane_name,
             )
             self.assertEqual(command["windowed"], lane["windowed"], lane_name)
+            self.assertEqual(command["environment_profile"], "CLEAN_WINDOWS_V2")
+            self.assertEqual(command["shell_flavor"], "WINDOWS_POWERSHELL")
+            self.assertEqual(command["shell_version"], "5.1")
+            self.assertEqual(command["shell_edition"], "Desktop")
+            self.assertEqual(command["shell_process_architecture"], "X64")
+            self.assertEqual(command["shell_selection_role"], "SYSTEM32_ABSOLUTE")
+
+    def test_clean_windows_v1_keeps_exact_version_matching(self) -> None:
+        self.assertTrue(
+            evidence_module._shell_version_matches_expectation(
+                "5.1.26100.8875",
+                "5.1.26100.8875",
+                "CLEAN_WINDOWS_V1",
+            )
+        )
+        self.assertFalse(
+            evidence_module._shell_version_matches_expectation(
+                "5.1.26100.9168",
+                "5.1.26100.8875",
+                "CLEAN_WINDOWS_V1",
+            )
+        )
+
+    def test_v1_scenario_contract_remains_read_only_compatible(self) -> None:
+        expectation = command_expectation(
+            "legacy",
+            "Write-Output 'LEGACY'",
+            environment_profile="CLEAN_WINDOWS_V1",
+        )
+        for key in (
+            "shell_edition",
+            "shell_process_architecture",
+            "shell_selection_role",
+        ):
+            expectation.pop(key)
+        evidence_module._validate_scenario_contract(
+            {
+                "schema": evidence_module.SCENARIO_CONTRACT_SCHEMA_ID_V1,
+                "id": "legacy-v1",
+                "scenarios": [
+                    {
+                        "id": "legacy",
+                        "required": True,
+                        "expected_observation": "legacy-contract",
+                        "commands": [expectation],
+                        "events": [],
+                    }
+                ],
+            }
+        )
+
+    def test_clean_windows_v2_matrix_accepts_recorded_servicing_revision(self) -> None:
+        expectation = command_expectation("success", "Write-Output 'SAFE'")
+        actual = {
+            **expectation,
+            "shell_version": "5.1.26100.9168",
+            "shell_binary_sha256": "b" * 64,
+        }
+        matrix, status = evidence_module._derive_release_matrix(
+            {
+                "schema": evidence_module.SCENARIO_CONTRACT_SCHEMA_ID,
+                "id": "v2-servicing",
+                "scenarios": [
+                    {
+                        "id": "success",
+                        "required": True,
+                        "expected_observation": "servicing-recorded",
+                        "commands": [expectation],
+                        "events": [],
+                    }
+                ],
+            },
+            [actual],
+            [],
+        )
+        self.assertEqual(status, "PASS")
+        self.assertEqual(matrix["scenarios"][0]["verdict"], "PASS")
+
+    def test_each_command_reproves_shell_identity_in_the_launched_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evidence"
+            command = "Write-Output 'SAFE'"
+            harness = self.harness(
+                root,
+                commands=[command_expectation("success", command)],
+            )
+            harness.powershell_version = "5.1.0.0"
+            harness.powershell_edition = "STALE"
+            harness.powershell_process_architecture = "STALE"
+            harness.powershell_binary_sha256 = "0" * 64
+
+            recorded = harness.run_command("success", command)
+
+            self.assertEqual(recorded["status"], "PASS")
+            self.assertEqual(recorded["shell_edition"], "Desktop")
+            self.assertEqual(recorded["shell_process_architecture"], "X64")
+            self.assertRegex(str(recorded["shell_version"]), r"^5\.1\.\d+\.\d+$")
+            self.assertNotEqual(recorded["shell_binary_sha256"], "0" * 64)
+
+    def test_missing_per_command_shell_identity_is_a_harness_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evidence"
+            command = "Write-Output 'SAFE'"
+            harness = self.harness(
+                root,
+                commands=[command_expectation("success", command)],
+            )
+            with mock.patch.object(
+                evidence_module,
+                "_powershell_identity_prelude",
+                return_value=command,
+            ):
+                recorded = harness.run_command("success", command)
+
+            self.assertEqual(recorded["status"], "FAIL")
+            self.assertIsNone(recorded["exit_code"])
+            self.assertEqual(
+                recorded["diagnostic_code"],
+                "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
+            )
+            self.assertEqual(recorded["shell_version"], "UNPROVEN")
+
+    def test_interrupted_command_can_use_digest_matched_initial_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evidence"
+            command = "Start-Sleep -Seconds 5"
+            harness = self.harness(
+                root,
+                commands=[
+                    command_expectation(
+                        "timeout",
+                        command,
+                        status="INTERRUPTED",
+                        exit_code=None,
+                        diagnostic_code="EVIDENCE.COMMAND.TIMEOUT",
+                    )
+                ],
+            )
+            with mock.patch.object(
+                evidence_module,
+                "_powershell_identity_prelude",
+                return_value=command,
+            ):
+                recorded = harness.run_command(
+                    "timeout",
+                    command,
+                    timeout_seconds=0.1,
+                )
+
+            self.assertEqual(recorded["status"], "INTERRUPTED")
+            self.assertEqual(recorded["diagnostic_code"], "EVIDENCE.COMMAND.TIMEOUT")
+            self.assertRegex(str(recorded["shell_version"]), r"^5\.1\.\d+\.\d+$")
+
+    def test_v1_contract_is_validation_only_and_producer_fails_early(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            repository.mkdir()
+            root = Path(directory) / "evidence"
+            contract_key = "packaging/windows/evidence-scenarios/legacy.json"
+            contract_path = repository.joinpath(*contract_key.split("/"))
+            contract_path.parent.mkdir(parents=True)
+            expectation = command_expectation(
+                "legacy",
+                "Write-Output 'LEGACY'",
+                environment_profile="CLEAN_WINDOWS_V1",
+            )
+            for key in (
+                "shell_edition",
+                "shell_process_architecture",
+                "shell_selection_role",
+            ):
+                expectation.pop(key)
+            contract_path.write_bytes(
+                evidence_module._canonical_json_bytes(
+                    {
+                        "schema": evidence_module.SCENARIO_CONTRACT_SCHEMA_ID_V1,
+                        "id": "legacy-v1",
+                        "scenarios": [
+                            {
+                                "id": "legacy",
+                                "required": True,
+                                "expected_observation": "legacy-contract",
+                                "commands": [expectation],
+                                "events": [],
+                            }
+                        ],
+                    }
+                )
+            )
+            with self.assertRaisesRegex(EvidenceValidationError, "validation-only"):
+                EvidenceHarness(
+                    root,
+                    repository_commit=COMMIT,
+                    repository_branch="legacy-v1",
+                    run_id="legacy-v1",
+                    environment=environment(),
+                    repository_root=repository,
+                    scenario_contract_key=contract_key,
+                )
 
     def test_external_anchor_context_requires_clean_tracked_head_bytes(self) -> None:
         source_repository = Path(__file__).resolve().parents[1]
@@ -151,6 +395,12 @@ class WindowsReleaseEvidenceTest(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_repository.joinpath(*key.split("/")), destination)
             subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "core.autocrlf", "false"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
             subprocess.run(["git", "add", "--", *tracked_keys], cwd=repository, check=True)
             subprocess.run(
                 [
@@ -215,8 +465,8 @@ class WindowsReleaseEvidenceTest(unittest.TestCase):
             (
                 json.dumps(
                     {
-                        "schema": "localcat.windows-release-scenario-contract.v1",
-                        "id": "test-contract-v1",
+                        "schema": evidence_module.SCENARIO_CONTRACT_SCHEMA_ID,
+                        "id": "test-contract-v2",
                         "scenarios": scenarios or default_scenarios,
                     },
                     ensure_ascii=False,
@@ -369,9 +619,13 @@ class WindowsReleaseEvidenceTest(unittest.TestCase):
             self.assertEqual(passed["status"], "PASS")
             self.assertEqual(failed["status"], "FAIL")
             self.assertEqual(failed["exit_code"], 3)
-            self.assertEqual(failed["shell_flavor"], shell_flavor())
+            self.assertEqual(failed["shell_flavor"], "WINDOWS_POWERSHELL")
+            self.assertEqual(failed["shell_edition"], "Desktop")
+            self.assertEqual(failed["shell_process_architecture"], "X64")
+            self.assertEqual(failed["shell_selection_role"], "SYSTEM32_ABSOLUTE")
+            self.assertRegex(str(failed["shell_binary_sha256"]), r"[0-9a-f]{64}")
             self.assertEqual(failed["cwd_role"], "NON_REPOSITORY_CWD")
-            self.assertEqual(failed["environment_profile"], "CLEAN_WINDOWS_V1")
+            self.assertEqual(failed["environment_profile"], "CLEAN_WINDOWS_V2")
             self.assertEqual(
                 failed["environment_projection"]["LOCALCAT_TEST_SECRET"],
                 "<redacted:body>",
