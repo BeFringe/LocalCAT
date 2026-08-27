@@ -1,0 +1,528 @@
+{
+  "schema_version": 1,
+  "purpose": "迁移前唯一的 POSIX 文件系统与锁行为 oracle；业务不变量和 POSIX 实现事实必须分开解释。",
+  "baseline": {
+    "commit": "810a3ab283de18a9c6244eb36006ea13ddd5903d",
+    "tree": "064687f32ce972e2d4d28901d2f7be7efe6dae62",
+    "relationship": "pre-platform-adapter-extraction"
+  },
+  "execution_policy": {
+    "posix_runtime_required": true,
+    "windows_static_validation_only": true,
+    "mandatory_skip_is_pass": false,
+    "oracle_rule": "每项业务不变量由 baseline commit 中的精确 unittest ID 定义；direct boundary 只描述该历史 tree 的实现，不得提升为跨平台业务合同。"
+  },
+  "primitive_evidence": [
+    {
+      "primitive": "openat",
+      "path": "parser_source.py",
+      "source_token": "dir_fd=current"
+    },
+    {
+      "primitive": "dir_fd",
+      "path": "parser_source.py",
+      "source_token": "src_dir_fd=parent_descriptor"
+    },
+    {
+      "primitive": "O_NOFOLLOW",
+      "path": "parser_source.py",
+      "source_token": "flags = os.O_RDONLY | os.O_NOFOLLOW"
+    },
+    {
+      "primitive": "flock",
+      "path": "collaborative_chunk_store.py",
+      "source_token": "fcntl.flock(lock_descriptor, fcntl.LOCK_EX)"
+    },
+    {
+      "primitive": "file_fsync",
+      "path": "parser_source.py",
+      "source_token": "os.fsync(temporary_descriptor)"
+    },
+    {
+      "primitive": "directory_fsync",
+      "path": "collaborative_chunk_store.py",
+      "source_token": "os.fsync(parent)"
+    },
+    {
+      "primitive": "candidate",
+      "path": "parser_source.py",
+      "source_token": "candidate = f\".parser-{secrets.token_hex(16)}.tmp\""
+    },
+    {
+      "primitive": "readback",
+      "path": "parser_source.py",
+      "source_token": "actual_status = _prove_replaced_target("
+    },
+    {
+      "primitive": "LKG",
+      "path": "collaborative_chunk_store.py",
+      "source_token": "self.__lkg_name"
+    }
+  ],
+  "deferred_boundaries": [
+    {
+      "path": "capability_host.py",
+      "tokens": ["O_NOFOLLOW", "st_dev", "st_ino"],
+      "owner": "feature5-ui-integration",
+      "disposition": "source authority composition；不在 POSIX adapter 中固化 checkout/path proof，由后续 CapabilityHost source 接入任务消费 rooted authority。"
+    }
+  ],
+  "owners": [
+    {
+      "owner": "parser",
+      "owning_spec": "parser-subsystem-extraction",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "parser.success.atomic-write",
+          "kind": "success",
+          "oracle_test": "tests.test_parser_source.AtomicWriterTests.test_atomic_write_returns_digest_bound_receipt",
+          "expected": ["发布后的目标正文等于输入 payload", "只有成功完成发布与复证后才返回 receipt"]
+        },
+        {
+          "id": "parser.success.rooted-source",
+          "kind": "success",
+          "oracle_test": "tests.test_parser_source.RootedSourceAndSnapshotTests.test_rooted_open_and_snapshot_bind_actual_bytes_once",
+          "expected": ["rooted open 绑定真实相对路径和 regular-file authority", "sealed snapshot 的 digest、byte_count 与 lease read 等于首次绑定的 source bytes"]
+        },
+        {
+          "id": "parser.error.pre-publish",
+          "kind": "error",
+          "oracle_test": "tests.test_parser_source.AtomicWriterTests.test_writer_failures_before_replace_preserve_target_and_issue_no_receipt",
+          "expected": ["写入、文件 flush、candidate 校验或 replace 失败返回稳定 PARSER.SOURCE code", "目标保留旧正文且不残留 candidate"]
+        },
+        {
+          "id": "parser.error.rooted-source-inventory",
+          "kind": "error",
+          "oracle_test": "tests.test_parser_source.RootedSourceAndSnapshotTests.test_rooted_open_rejects_escape_symlink_and_non_regular_without_consuming",
+          "expected": ["escape、symlink、linked directory、directory、FIFO 与 dotdot 在读取正文前返回稳定 rooted-source code", "错误正文不泄露 source bytes"]
+        },
+        {
+          "id": "parser.receipt.digest-bound",
+          "kind": "receipt",
+          "oracle_test": "tests.test_parser_source.AtomicWriterTests.test_atomic_write_returns_digest_bound_receipt",
+          "expected": ["receipt 绑定 SHA-256、byte_count 与发布后 regular-file identity"]
+        },
+        {
+          "id": "parser.bytes.pre-and-post-publish",
+          "kind": "bytes",
+          "oracle_test": "tests.test_parser_source.ReviewerRemediationTests.test_post_replace_proof_failure_is_fail_closed_without_claiming_rollback",
+          "expected": ["replace 已发生但终态复证失败时不伪造 rollback，目标保持实际新正文且不返回 receipt"]
+        },
+        {
+          "id": "parser.bytes.rooted-snapshot",
+          "kind": "bytes",
+          "oracle_test": "tests.test_parser_source.RootedSourceAndSnapshotTests.test_rooted_open_and_snapshot_bind_actual_bytes_once",
+          "expected": ["sealed lease 返回的 bytes 与 source 首次绑定内容完全相同"]
+        }
+      ],
+      "not_applicable": {
+        "recovery": "Parser writer 没有持久 journal/LKG recovery API；replace 后不确定性以 fail-closed error 表达。"
+      },
+      "posix_implementation_facts": {
+        "primitives": ["openat", "dir_fd", "O_NOFOLLOW", "pread", "file_fsync", "candidate", "readback", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "parser_source.py",
+            "tokens": ["O_NOFOLLOW", "dir_fd=", "os.pread(", "os.fsync(", "os.replace("]
+          }
+        ]
+      }
+    },
+    {
+      "owner": "chunk",
+      "owning_spec": "collaborative-job-chunks",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "chunk.success.cold-reopen",
+          "kind": "success",
+          "oracle_test": "tests.test_collaborative_chunks_cluster1_store.CollaborativeChunkStoreTests.test_durable_publish_cold_reopen_dissolve_and_new_generation",
+          "expected": ["cold reopen 保留 snapshot、operation receipts 与 metadata digest", "dissolve 后的新 generation 不复用历史 plan identity"]
+        },
+        {
+          "id": "chunk.error.stale-writer",
+          "kind": "error",
+          "oracle_test": "tests.test_collaborative_chunks_cluster1_store.CollaborativeChunkStoreTests.test_compare_and_swap_stale_writer_does_not_replace_current",
+          "expected": ["stale writer 返回 CHUNK.DESTINATION_STALE", "当前目标正文不变"]
+        },
+        {
+          "id": "chunk.receipt.cold-stable",
+          "kind": "receipt",
+          "oracle_test": "tests.test_collaborative_chunks_cluster1_store.CollaborativeChunkStoreTests.test_durable_publish_cold_reopen_dissolve_and_new_generation",
+          "expected": ["operation receipt 序列在 durable publish 与 cold reopen 后保持完全相等"]
+        },
+        {
+          "id": "chunk.recovery.pre-and-post-replace",
+          "kind": "recovery",
+          "oracle_test": "tests.test_collaborative_chunks_cluster1_store.CollaborativeChunkStoreTests.test_after_replace_uncertainty_rolls_forward_once",
+          "expected": ["replace 后不确定性只 roll forward 一次", "恢复后只存在一条已提交 audit receipt"]
+        },
+        {
+          "id": "chunk.bytes.exact-lkg",
+          "kind": "bytes",
+          "oracle_test": "tests.test_collaborative_chunks_cluster1_store.CollaborativeChunkStoreTests.test_overwrite_uncertainty_can_restore_exact_lkg",
+          "expected": ["未知目标正文从 owner LKG 恢复为逐字节相同的旧 payload", "恢复后业务 snapshot 回到旧名称和旧 receipt 序列"]
+        }
+      ],
+      "not_applicable": {},
+      "posix_implementation_facts": {
+        "primitives": ["flock", "openat", "dir_fd", "O_NOFOLLOW", "O_DIRECTORY", "file_fsync", "directory_fsync", "candidate", "readback", "LKG", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "collaborative_chunk_store.py",
+            "tokens": ["import fcntl", "fcntl.flock", "O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.fsync(", "os.replace("]
+          }
+        ]
+      }
+    },
+    {
+      "owner": "project",
+      "owning_spec": "multi-document-project-workspace",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "project.success.deterministic-reopen",
+          "kind": "success",
+          "oracle_test": "tests.test_multi_document_cluster2c_project_package.Cluster2CProjectPackageRoundTripTests.test_real_two_document_export_is_deterministic_and_cold_reopens",
+          "expected": ["同一 immutable workspace 两次导出逐字节相同", "cold open 恢复相同 workspace 与 source member bytes"]
+        },
+        {
+          "id": "project.error.stale-bindings",
+          "kind": "error",
+          "oracle_test": "tests.test_multi_document_cluster2c_project_package.Cluster2CProjectPackageRoundTripTests.test_preview_binds_source_and_destination_without_partial_mutation",
+          "expected": ["source 或 destination 在 preview 后变化时返回稳定 stale code", "失败不产生部分 destination mutation"]
+        },
+        {
+          "id": "project.receipt.exact-install",
+          "kind": "receipt",
+          "oracle_test": "tests.test_multi_document_cluster2c_project_package.Cluster2CProjectPackageRoundTripTests.test_fresh_preview_is_read_only_single_use_and_apply_installs_exact_bytes",
+          "expected": ["durable import receipt 的 destination_after_digest 等于 source digest", "operation plan 单次消费"]
+        },
+        {
+          "id": "project.recovery.replace-failure",
+          "kind": "recovery",
+          "oracle_test": "tests.test_multi_document_cluster2c_project_package.Cluster2COpaqueMemberAndRecoveryTests.test_replace_failure_preserves_last_known_good_package",
+          "expected": ["replace 失败报告 ROLLED_BACK 且不宣称 recovery_required", "last-known-good package 保留"]
+        },
+        {
+          "id": "project.bytes.deterministic-carrier",
+          "kind": "bytes",
+          "oracle_test": "tests.test_multi_document_cluster2c_project_package.Cluster2CProjectPackageRoundTripTests.test_real_two_document_export_is_deterministic_and_cold_reopens",
+          "expected": ["两个 carrier 文件完全相同", "每个 sealed source member 等于原 source 文件 bytes"]
+        }
+      ],
+      "not_applicable": {},
+      "posix_implementation_facts": {
+        "primitives": ["openat", "dir_fd", "O_NOFOLLOW", "O_DIRECTORY", "pread", "file_fsync", "directory_fsync", "candidate", "readback", "LKG", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "project_package.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.pread(", "os.fsync(", "os.replace("]
+          },
+          {
+            "path": "project_workspace_intake.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.pread("]
+          },
+          {
+            "path": "workspace_state.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          }
+        ]
+      }
+    },
+    {
+      "owner": "resource",
+      "owning_spec": "language-resource-portability",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "resource.success.deterministic-package",
+          "kind": "success",
+          "oracle_test": "tests.test_resource_package_tmx_profile.ResourcePackageTmxProfileTests.test_export_cold_validate_publication_and_receipt_use_v2_triple",
+          "expected": ["同一 resource generation 的两次 package export 逐字节相同", "cold validation 保留 payload profile 与 record count"]
+        },
+        {
+          "id": "resource.error.unsafe-destination",
+          "kind": "error",
+          "oracle_test": "tests.test_resource_artifact_save.ResourceArtifactSaveTests.test_symlink_and_hardlink_destinations_are_rejected_without_mutation",
+          "expected": ["symlink/hardlink destination 返回 RESOURCE.EXPORT.DESTINATION_STALE", "source、candidate 与旧目标 authority 不被改写"]
+        },
+        {
+          "id": "resource.receipt.cold-ledger",
+          "kind": "receipt",
+          "oracle_test": "tests.test_resource_receipt_ledger.ResourceReceiptLedgerTests.test_append_is_durable_idempotent_and_cold_readable",
+          "expected": ["receipt append 幂等", "cold ledger 返回字段完全相同的 receipt value"]
+        },
+        {
+          "id": "resource.recovery.owner-published-create",
+          "kind": "recovery",
+          "oracle_test": "tests.test_resource_portability_recovery.ResourcePortabilityRecoveryTests.test_cold_service_completes_owner_published_create_after_registry_fault",
+          "expected": ["owner bytes 已发布但 registry 失败时返回 RECOVERY_REQUIRED", "cold service 可完成唯一 pending operation 并清除 pending ledger"]
+        },
+        {
+          "id": "resource.bytes.exact-prior-restore",
+          "kind": "bytes",
+          "oracle_test": "tests.test_resource_artifact_save.ResourceArtifactSaveTests.test_post_publish_validation_failure_restores_exact_prior_destination",
+          "expected": ["post-publish cold validation 失败时恢复逐字节相同的 prior destination", "owned LKG 清理完成"]
+        }
+      ],
+      "not_applicable": {},
+      "posix_implementation_facts": {
+        "primitives": ["openat", "dir_fd", "O_NOFOLLOW", "O_DIRECTORY", "file_fsync", "directory_fsync", "candidate", "readback", "LKG", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "resource_artifact_save.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.fsync(", "os.replace("]
+          },
+          {
+            "path": "resource_package.py",
+            "tokens": ["O_NOFOLLOW", "os.fsync("]
+          },
+          {
+            "path": "resource_portability.py",
+            "tokens": ["os.lstat(", "os.fsync("]
+          },
+          {
+            "path": "resource_receipt_ledger.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          },
+          {
+            "path": "resource_repository.py",
+            "tokens": ["os.lstat(", "os.replace(", "os.fsync("]
+          },
+          {
+            "path": "resource_importer.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          },
+          {
+            "path": "termbase_store.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          }
+        ]
+      }
+    },
+    {
+      "owner": "tmx",
+      "owning_spec": "tmx-context-interchange",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "tmx.success.absent-and-replace",
+          "kind": "success",
+          "oracle_test": "tests.test_tmx_artifact_save.TmxArtifactSaveTests.test_absent_and_existing_destination_publish_durable_receipts",
+          "expected": ["absent create 与 existing replace 都发布 canonical TMX", "成功后只保留 destination"]
+        },
+        {
+          "id": "tmx.success.rooted-inspection",
+          "kind": "success",
+          "oracle_test": "tests.test_tmx_context_interchange.TmxContextInterchangeTests.test_stateless_inspection_discovers_exact_locales_and_rejects_unsafe_inventory",
+          "expected": ["stateless source inspection 返回 exact locales、payload digest、parser digest 与 loss report"]
+        },
+        {
+          "id": "tmx.error.stale-destination",
+          "kind": "error",
+          "oracle_test": "tests.test_tmx_artifact_save.TmxArtifactSaveTests.test_stale_destination_and_scope_fail_before_candidate",
+          "expected": ["destination 或 scope 在 preview 后变化时返回稳定 stale code", "失败发生在 candidate 发布前且目标正文不变"]
+        },
+        {
+          "id": "tmx.error.rooted-inspection",
+          "kind": "error",
+          "oracle_test": "tests.test_tmx_context_interchange.TmxContextInterchangeTests.test_stateless_inspection_discovers_exact_locales_and_rejects_unsafe_inventory",
+          "expected": ["缺失受管 profile 返回 TMX.COLD_PROFILE_INVALID", "含不安全 XML inventory 的 source 返回 TMX.COLD_UNSAFE_XML"]
+        },
+        {
+          "id": "tmx.receipt.before-after-digest",
+          "kind": "receipt",
+          "oracle_test": "tests.test_tmx_artifact_save.TmxArtifactSaveTests.test_absent_and_existing_destination_publish_durable_receipts",
+          "expected": ["durable receipt 绑定 after digest", "replace receipt 同时绑定 exact prior digest"]
+        },
+        {
+          "id": "tmx.recovery.post-publish-readback",
+          "kind": "recovery",
+          "oracle_test": "tests.test_tmx_artifact_save.TmxArtifactSaveTests.test_post_publication_readback_failure_rolls_back_only_our_candidate",
+          "expected": ["post-publication readback 失败返回 TMX.POST_PUBLICATION_ROLLED_BACK", "只回滚 owner candidate 并恢复 prior destination"]
+        },
+        {
+          "id": "tmx.bytes.canonical-and-prior",
+          "kind": "bytes",
+          "oracle_test": "tests.test_tmx_artifact_save.TmxArtifactSaveTests.test_candidate_validation_failure_preserves_prior_exact_bytes",
+          "expected": ["candidate validation 失败时 destination 与 preview 前 bytes 完全相同"]
+        },
+        {
+          "id": "tmx.bytes.cold-drift",
+          "kind": "bytes",
+          "oracle_test": "tests.test_tmx_context_interchange.TmxContextInterchangeTests.test_cold_validation_rejects_byte_or_semantic_drift",
+          "expected": ["cold validator 接受 proof 绑定的 exact bytes，并以 TMX.COLD_DIGEST_MISMATCH 拒绝正文漂移"]
+        }
+      ],
+      "not_applicable": {},
+      "posix_implementation_facts": {
+        "primitives": ["openat", "dir_fd", "O_NOFOLLOW", "O_DIRECTORY", "file_fsync", "directory_fsync", "candidate", "readback", "LKG", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "tmx_artifact_save.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.fsync(", "os.replace("]
+          },
+          {
+            "path": "tmx_context_interchange.py",
+            "tokens": ["O_NOFOLLOW", "os.open("]
+          },
+          {
+            "path": "tmx_resource_package_handler.py",
+            "tokens": ["O_NOFOLLOW", "os.fsync("]
+          }
+        ]
+      }
+    },
+    {
+      "owner": "tm",
+      "owning_spec": "tm-storage-retrieval-index",
+      "support": {
+        "runtime_hosts": ["darwin", "linux"],
+        "runtime_gate": "os.name == 'posix'",
+        "windows_disposition": "NOT_EXECUTED",
+        "skip_counts_as_pass": false
+      },
+      "business_invariants": [
+        {
+          "id": "tm.success.activation-generation",
+          "kind": "success",
+          "oracle_test": "tests.test_tm_activation_publication.ActivationPublicationHappyPathTests.test_first_activation_publishes_one_complete_generation",
+          "expected": ["首次激活只发布 generation 0", "canonical DB、manifest、receipt 与 token 状态形成完整 active set"]
+        },
+        {
+          "id": "tm.error.durability-phase",
+          "kind": "error",
+          "oracle_test": "tests.test_tm_activation_publication.ActivationPublicationFailureTests.test_database_parent_fsync_failure_does_not_advance_or_publish_view",
+          "expected": ["database parent durability 失败返回 ACTIVATION.DB_REPLACE_FAILED", "journal 保持 PREPARED 且 generation 不可见"]
+        },
+        {
+          "id": "tm.receipt.recovered-generation",
+          "kind": "receipt",
+          "oracle_test": "tests.test_tm_activation_recovery.ActivationRecoveryCompletionTests.test_first_activation_db_replaced_recovery_publishes_one_generation",
+          "expected": ["cold recovery report 精确绑定 DB_REPLACED、COMPLETED、generation 0", "snapshot receipt 与 binding 行进入 completed 状态"]
+        },
+        {
+          "id": "tm.recovery.crash-replay",
+          "kind": "recovery",
+          "oracle_test": "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests.test_crash_after_jsonl_replace_reconstructs_on_recovery",
+          "expected": ["JSONL replace 后崩溃由 fresh store 唯一完成", "receipt、binding 与 source monitor 收敛为 completed/verified-current"]
+        },
+        {
+          "id": "tm.bytes.crash-old-or-new",
+          "kind": "bytes",
+          "oracle_test": "tests.test_tm_snapshot_recovery.TMRecoveryCrashBoundaryTests.test_crash_after_issued_cancels_on_recovery",
+          "expected": ["issued 阶段崩溃恢复后 configured JSONL 与 manifest pair 等于 exact prior pair", "owned temp/recovery bytes 全部清理"]
+        },
+        {
+          "id": "tm.bytes.content-attestation",
+          "kind": "bytes",
+          "oracle_test": "tests.test_tm_content_attestation.ContentFileProofTests.test_capture_binds_exact_bytes_and_inode",
+          "expected": ["content proof 同时区分同 inode 的 bytes mutation 与同 bytes 的 inode replacement"]
+        },
+        {
+          "id": "tm.error.content-authority",
+          "kind": "error",
+          "oracle_test": "tests.test_tm_content_attestation.ContentFileProofTests.test_capture_rejects_hard_links_and_symlinked_parent",
+          "expected": ["hardlink leaf 与 symlink parent 以稳定 content-attestation code fail closed"]
+        }
+      ],
+      "not_applicable": {},
+      "posix_implementation_facts": {
+        "primitives": ["flock", "openat", "dir_fd", "O_NOFOLLOW", "O_DIRECTORY", "pread", "file_fsync", "directory_fsync", "candidate", "readback", "LKG", "atomic_replace"],
+        "direct_boundaries": [
+          {
+            "path": "tm_migration.py",
+            "tokens": ["flock", "O_NOFOLLOW", "os.pread(", "os.fsync("]
+          },
+          {
+            "path": "tm_snapshot_artifacts.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd=", "os.fsync(", "os.replace("]
+          },
+          {
+            "path": "tm_snapshot_recovery.py",
+            "tokens": ["dir_fd=", "os.lstat(", "os.replace("]
+          },
+          {
+            "path": "tm_activation_journal.py",
+            "tokens": ["O_NOFOLLOW", "os.fsync(", "os.replace("]
+          },
+          {
+            "path": "tm_activation_recovery.py",
+            "tokens": ["O_NOFOLLOW", "os.lstat(", "os.replace("]
+          },
+          {
+            "path": "tm_content_attestation.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "dir_fd="]
+          },
+          {
+            "path": "tm_stage_sealer.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "os.fsync("]
+          },
+          {
+            "path": "tm_schema_upgrade.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "os.fsync("]
+          },
+          {
+            "path": "tm_sqlite_store.py",
+            "tokens": ["O_NOFOLLOW", "os.fsync(", "os.lstat("]
+          },
+          {
+            "path": "tm_resource_port.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          },
+          {
+            "path": "tm_json_importer.py",
+            "tokens": ["os.fsync(", "os.replace("]
+          },
+          {
+            "path": "tm_engine.py",
+            "tokens": ["os.lstat("]
+          },
+          {
+            "path": "tm_benchmark.py",
+            "tokens": ["O_NOFOLLOW", "os.lstat("]
+          },
+          {
+            "path": "tm_benchmark_process.py",
+            "tokens": ["O_NOFOLLOW", "os.open("]
+          },
+          {
+            "path": "tm_benchmark_query_process.py",
+            "tokens": ["O_NOFOLLOW", "os.open("]
+          },
+          {
+            "path": "tm_benchmark_gate.py",
+            "tokens": ["O_DIRECTORY", "O_NOFOLLOW", "os.fsync(", "os.replace("]
+          }
+        ]
+      }
+    }
+  ]
+}

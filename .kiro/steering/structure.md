@@ -47,6 +47,9 @@ Layer 1 resource / termbase / canonical TM storage
 ├── parser_tmx_codec.py          # TMX Level 1 资源 codec
 ├── parser_tm_json_codec.py      # normalized TM JSON 单输入资源 codec
 ├── parser_termbase_codec.py     # CSV/XLSX 显式列选择资源 codec
+├── platform_fs.py                # fail-closed 平台 backend 组合与只读 self-probe
+├── platform_fs_contracts.py      # backend-neutral rooted/identity/lock/publish/private authority 合同叶
+├── platform_fs_posix.py          # POSIX rooted/lock/publish/private adapter 与唯一 fcntl 生产边界
 ├── resource_repository.py       # 资源清单和受控本地文件
 ├── workspace_state.py           # legacy/复合最近项目断点、显示/TM 与设备本地预处理偏好
 ├── resource_importer.py         # TMX/CSV/XLSX Application policy 与事务导入
@@ -93,6 +96,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── multi_document_current_source_evidence.json # 19-root canonical current-source evidence
 ├── tools/generate_collaborative_chunks_current_source_evidence.py # Chunk overlay evidence owner
 ├── collaborative_chunks_current_source_evidence.json # 8-root Chunk current-source overlay
+├── tools/run_posix_characterization.py # 迁移前 POSIX 业务 oracle runner；非 POSIX 主机只报告 STATIC_ONLY
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实
 └── .kiro/steering/              # 当前项目级产品、技术与结构约束
@@ -154,6 +158,10 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
 - `tests/test_parser_*`：contracts/source/registry/composition、八个用途/格式组合、golden/fault/security/facade 与跨格式 completion 矩阵。
+- `tests/test_platform_fs_contracts.py`：共享平台 authority、identity、lock、publish/private port、关闭与非法组合合同。
+- `tests/test_platform_fs_composition.py`：平台组合 import graph、能力门、backend shape、self-probe 与稳定失败矩阵。
+- `tests/test_platform_fs_posix.py`：POSIX adapter rooted chain、candidate/publish、flock、private proof、fault cleanup 与 Windows 隔离导入。
+- `tests/test_platform_fs_posix_characterization.py`：POSIX 历史 tree、业务 oracle method、32 个 direct/deferred boundary 与平台执行语义守卫。
 - `tests/test_macos_app_launcher.py`：Finder/LaunchServices identity、cwd-independent bootstrap、atomic replacement 与失效路径。
 - `tests/test_tm_schema_upgrade_module_boundaries.py`：schema-upgrade 依赖方向、owner 权威与 late-bound 兼容接缝。
 - `tests/test_tm_snapshot_artifacts_module_boundaries.py`：snapshot artifact 依赖方向、owner 权威、late-bound fault seam 与移动等价性。
