@@ -1,0 +1,41 @@
+# Keep executable sources and authority-bound release inputs byte-stable
+# across Windows, macOS, and Linux checkouts.
+.gitattributes text eol=lf
+
+*.py text eol=lf
+*.pyi text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.tmx text eol=lf
+*.po text eol=lf
+*.pot text eol=lf
+*.hex text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.spec text eol=lf
+*.qss text eol=lf
+*.ui text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.webp -text
+*.ico -text
+*.icns -text
+*.dll -text
+*.exe -text
+*.zip -text
+*.xlsx -text
+*.sqlite -text
+*.db -text
