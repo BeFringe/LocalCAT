@@ -32,9 +32,10 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 |---|---|---|---|---|
 | **C0 — Governance, ownership and dispatch** | 0.1～0.5 | W1/W2/W3正式promotion、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
 | **C1S — Baseline and route evidence** | 1.1～1.4 | b925b80现场矩阵、portable evidence schema、Windows API inventory与stock native-entry NO-GO；只关闭source主线的调查前置，不宣称W3可行 | `high` | `xhigh` |
-| **C1F — W3 custom entry feasibility** | 1.5～1.6 | custom in-process entry/toolchain/ABI/TCB reapproval与最小TrustedSourceLoader spike；1.6在W1 rooted contract冻结后闭合 | `xhigh` | `xhigh` |
+| **C1F — W3 custom entry feasibility** | 1.5～1.6 | custom in-process entry/toolchain/ABI/TCB reapproval与最小TrustedSourceLoader spike；1.6按`2.1→2.2→2.3→2.4→3.1→3.2`进入 | `xhigh` | `xhigh` |
 | **C2 — Shared contracts and POSIX parity** | 2.1～2.4 | opaque authority/identity/lock/publish/private contracts、POSIX characterization/extraction、composition fail-closed | `high` | `high` |
-| **C3 — Windows native capability** | 3.1～3.7 | Win32 handle/rooted/share/lock首次初始化与crash接管/ACL/publish、FileId reuse、rename→close→reopen、真实power-cut durability与反例闭包 | `xhigh` | `xhigh` |
+| **C3A — Windows native rooted authority** | 3.1～3.2 | Win32 FFI/RAII/host Gate与逐组件rooted handle authority；形成C1F所需的稳定实现锚 | `xhigh` | `xhigh` |
+| **C3B — Windows lock, private and durable publish** | 3.3～3.7 | LockFileEx首次初始化与crash接管、ACL/MIC private proof、publish、FileId reuse、rename→close→reopen、真实power-cut durability与反例闭包 | `xhigh` | `xhigh` |
 | **C4S — Startup and Source/Writer** | 4.1～4.4 | WA-02移除`fcntl`启动阻塞、WA-01 Parser rooted Source/Writer、Chunk recovery、真实Qt source startup | `high` | `xhigh` |
 | **C5S — Project, Resource and TMX persistence** | 5.1～5.5 | WA-03/04/05 source阶段、owner lease、deterministic carrier、canonical save/import、old/new/recovery-only | `xhigh` | `xhigh` |
 | **C6S — TM authority and source UI composition** | 6.1～6.6b | WA-06/07 source阶段、initial activation、唯一generation、W2 re-attestation、FTS5 reopen、launcher实现→WA-08 journey→source milestone汇合 | `xhigh` | `xhigh` |
@@ -51,13 +52,15 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 C0 Governance
   -> C1S baseline + stock W3 NO-GO
   -> C2 shared contracts/POSIX parity
-  -> C3 Windows native capability
+  -> C3A Windows native rooted authority
+  -> [C1F custom minimal spike || C3B Windows lock/private/durable publish]
+  -> C3B complete
   -> C4S [WA-02 startup + WA-01 Source/Writer]
   -> [C5S Project/Resource/TMX || C6S TM prerequisites where dependencies permit]
   -> C6S TM authority + Feature5/UI source + launcher -> WA-08S -> source milestone
 
 C1S -> C1F plan
-C3 rooted contract/invariants -> C1F custom minimal spike
+C2 (2.1 -> 2.4) -> C3A (3.1 -> 3.2) -> C1F custom minimal spike
 C1F PASS + C6S -> C7F pre-build consumer -> candidate build -> owner frozen revalidation -> Qt journey
   -> C8 packaged business E2E
   -> C9 cross-platform/evidence convergence
@@ -67,9 +70,10 @@ C1F PASS + C6S -> C7F pre-build consumer -> candidate build -> owner frozen reva
 关键隐性依赖：
 
 - C4S的第一个可观察目标“Qt source window可以启动”直接依赖WA-02删除Chunk顶层`fcntl`；WA-01不代答该import阻塞，但后续Project/TMX/source workflow必须实际使用WA-01 rooted Source/Writer。
-- C3的process fault tests不代答power-cut durability；C5/C6只有在W1批准的真实reboot success boundary下才能声称durable publication。
-- C3的LockFileEx正常crash release不代答首次载体初始化；必须独立覆盖two-creator与create/write/flush/readback/close各边界creator crash接管。
+- C3B的process fault tests不代答power-cut durability；C5/C6只有在W1批准的真实reboot success boundary下才能声称durable publication。
+- C3B的LockFileEx正常crash release不代答首次载体初始化；必须独立覆盖two-creator与create/write/flush/readback/close各边界creator crash接管。
 - C1S的stock NO-GO与外置`.py`存在都不代答W3 feasibility；C1F必须以custom in-process entry实际通过retained-handle/executed-byte、loader attestation、origin/co_filename与fixture handle-read验证。
+- Task 1.6严格按`2.1→2.2→2.3→2.4→3.1→3.2`进入；C3A在3.2形成已审查的稳定提交锚后，C1F可与C3B并行，3.3～3.7不是W3 spike的技术前置。
 - C4S～C6S只接受rooted source authority并完成真实业务API；不得因没有W3而跳过source consumer，也不得把`WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`提升为packaged release。
 - C6S的SQLite compile option不代答FTS5；C8/C10必须用真实published store执行create/MATCH/close/reopen业务查询。
 - C8的source runtime PASS不代答EXE；C10只接受同一dist、non-repository CWD、clean user的完整业务旅程。
@@ -79,7 +83,7 @@ C1F PASS + C6S -> C7F pre-build consumer -> candidate build -> owner frozen reva
 - `cluster-base`是该簇首个in-scope实现提交的父提交；`cluster-tip`是最后一个task/remediation提交。实际full hash写入该簇evidence manifest或owning task的真实信息增量，不反复改写本协议。
 - C0以本次独立docs baseline commit为输入；它只有在正式ADR、Steering scope、WA/WR owner acknowledgement、ledger schema与cumulative adversarial review全部闭合后退出。
 - WA amendment必须由owning Spec获批，并在其lineage branch形成可追踪commit后再merge到Windows线；reviewer不得读取复制来的patch-equivalent工作树并把它视为正式merge。
-- 进入一个簇前，其所属source或frozen路线的显式依赖和上述隐性依赖都必须由fresh evidence满足；C1F/W3不再是C2～C6S的前序authority gate，但仍是任何frozen consumer、C7F及后续发行簇的硬门。
+- 进入一个簇前，其所属source或frozen路线的显式依赖和上述隐性依赖都必须由fresh evidence满足；C1F/W3不再是C2、C3A/C3B或C4S～C6S的前序authority gate，但仍是任何frozen consumer、C7F及后续发行簇的硬门。
 - 任何实施期新事实跨越canonical authority、persistent schema、publish/recovery、dependency/composition或cross-Spec frozen ownership门时，停止该簇并回到Design/ADR；不以审计finding或Implementation Note补授权。
 
 ## 累计审计输入与退出证据
