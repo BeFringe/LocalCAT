@@ -55,6 +55,16 @@
 - stock NO-GO只证伪未经修改的PyInstaller entry，不证伪Windows source业务能力。Task 2～6.6b先以用户安装的CPython 3.14 x64、专用venv、`requirements-ui.txt`与受审source tree闭合Qt、Project、TM、TMX与FTS5；6.6a只实现轻量入口，WA-08 5.4a使用它运行产品journey，6.6b再汇总source里程碑。该入口只调用绝对`pythonw.exe`/source bootstrap，不属于frozen release。
 - W3没有降级：custom in-process entry的toolchain、ABI、Boot TCB与维护边界由Task 1.5立即规划；Task 1.6在W1 rooted contract冻结后执行gate-quality native spike。spike通过后只先放行pre-build roots/WA-07 3.6a与candidate构建；所有packaged owner revalidation必须等待platform 7.4同一发行候选，随后才由WA-08汇合。
 
+### Implement Notes — Task 1 evidence environment profile V2（2026-08-27）
+
+- Windows servicing把system Windows PowerShell从`5.1.26100.8875`更新到`5.1.26100.9168`；实际success命令exit 0，但V1逐Build/Revision expectation产生`EVIDENCE.SCENARIO.OBSERVATION_MISMATCH`。该差异不改变LocalCAT command、containment或W3 TCB语义。
+- `CLEAN_WINDOWS_V1`及evidence/contract schema v1保持只读兼容，用于既有artifact复核；新scenario contracts采用schema v2 + `CLEAN_WINDOWS_V2`，仍从`GetWindowsDirectoryW`得到的system32绝对路径启动并硬门`PSEdition=Desktop`、5.1 major/minor、`RuntimeInformation.ProcessArchitecture=X64`。每条command在suspended process边界用`QueryFullProcessImageNameW`核对system32 selection并重算实际image SHA-256，再由同一进程输出identity prelude；极短timeout未输出prelude时，只有launch digest仍等于初始化probe digest才复用缓存identity。command record保存完整四段Build/Revision、edition、process architecture、system32 selection role和实际PowerShell binary SHA-256；只有servicing字段从阻断oracle降为审计事实，其他identity、环境projection和行为结果仍fail closed。旧schema v1 success bundle已用新validator走完整manifest/contract/checksum验证为PASS；producer则对v1合同尽早拒绝，避免生成代际不匹配bundle。
+
+### Implement Notes — Task 1.5 custom entry planning（2026-08-27）
+
+- Task 1.4的stock顺序事实使父wrapper和Python runtime hook都不能成为W3 entry。`w3-custom-entry-plan.md`据此选择同一进程、release-owned的PyInstaller 6.22.2 `runw`下游patch，并固定E0～E11时序、pre-link/runtime/post-build manifest分层、one-shot opaque extension authority、最小Boot TCB与攻击矩阵。
+- PyInstaller官方支持用Visual C++从sdist重建Windows bootloader，且MSVC路线可生成self-contained static executable；本路线因此选择MSVC x64而非MinGW/Cygwin。当前host仍无compiler/Windows SDK，因而materialized toolchain lock、完整native/system allowlist与exact C API表尚不存在；这些是Task 1.5自身完成条件，不能推迟到1.6或把路线草案误写成W3 reapproval/native spike通过。
+
 ## Codebase Gap Analysis
 
 ### 现有边界与可复用资产
@@ -275,6 +285,11 @@ W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-a
 - [Python 3.14 `os`](https://docs.python.org/3/library/os.html) — platform availability and Windows permission limitations。
 - [Python 3.14 `ctypes`](https://docs.python.org/3/library/ctypes.html) — `WinDLL(..., use_last_error=True)` FFI/error handling。
 - [PyInstaller spec files](https://pyinstaller.org/en/latest/spec-files.html)、[hooks](https://pyinstaller.org/en/latest/hooks.html)、[runtime information](https://pyinstaller.org/en/stable/runtime-information.html) — source/data collection and bundle paths。
+- [PyInstaller Building the Bootloader](https://pyinstaller.org/en/stable/bootloader-building.html) — 从sdist用MSVC重建Windows `runw`和static bootloader路线。
+- [Visual Studio 2022 release history](https://learn.microsoft.com/en-us/visualstudio/releases/2022/release-history) — fixed-version Build Tools `17.14.39` / build `17.14.37614.0`选择与后续layout materialization来源。
+- [Microsoft Dynamic-link library search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)、[`SetDefaultDllDirectories`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-setdefaultdlldirectories)与[`LoadLibraryExW`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw) — process policy及受限DLL search flags。
+- [Python 3.14 interpreter initialization](https://docs.python.org/3.14/c-api/interp-lifecycle.html) — embedded interpreter必须在其他Python C API前初始化及`PyConfig`边界。
+- [Windows PowerShell与PowerShell区别](https://learn.microsoft.com/en-us/powershell/scripting/what-is-windows-powershell) — Windows PowerShell 5.1是随Windows维护的系统组件；Build/Revision作为环境事实记录。
 - [Qt Windows deployment](https://doc.qt.io/qt-6/windows-deployment.html) — `qwindows.dll` plugin layout。
 - [SQLite FTS5](https://www.sqlite.org/fts5.html) — real FTS5/trigram behavior。
 - Internal discovery artifacts are non-authoritative inputs；正式 evidence 必须按 Design 的仓库相对 artifact key、manifest 与 checksum 生成，不能以本机绝对路径充当身份。

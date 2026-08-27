@@ -22,9 +22,11 @@ import tempfile
 from typing import Any
 
 
-SCHEMA_ID = "localcat.windows-release-evidence.v1"
+SCHEMA_ID_V1 = "localcat.windows-release-evidence.v1"
+SCHEMA_ID = "localcat.windows-release-evidence.v2"
 EVENT_SCHEMA_ID = "localcat.windows-release-event.v1"
-SCENARIO_CONTRACT_SCHEMA_ID = "localcat.windows-release-scenario-contract.v1"
+SCENARIO_CONTRACT_SCHEMA_ID_V1 = "localcat.windows-release-scenario-contract.v1"
+SCENARIO_CONTRACT_SCHEMA_ID = "localcat.windows-release-scenario-contract.v2"
 MANIFEST_NAME = "manifest.json"
 CHECKSUM_NAME = "checksums.sha256"
 EVENT_LOG_NAME = "events.jsonl"
@@ -62,7 +64,7 @@ _ENVIRONMENT_KEYS = frozenset(
         "volume_class",
     }
 )
-_COMMAND_KEYS = frozenset(
+_COMMAND_KEYS_V1 = frozenset(
     {
         "id",
         "shell",
@@ -84,6 +86,14 @@ _COMMAND_KEYS = frozenset(
         "stderr_sha256",
         "diagnostic_marker",
         "diagnostic_sha256",
+    }
+)
+_COMMAND_KEYS = _COMMAND_KEYS_V1 | frozenset(
+    {
+        "shell_edition",
+        "shell_process_architecture",
+        "shell_selection_role",
+        "shell_binary_sha256",
     }
 )
 _EVENT_KEYS = frozenset(
@@ -146,6 +156,7 @@ _DIAGNOSTIC_CODES = frozenset(
         "EVIDENCE.COMMAND.INTERRUPTED",
         "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
         "EVIDENCE.COMMAND.LAUNCH_FAILED",
+        "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
         "EVIDENCE.COMMAND.TIMEOUT",
         "EVIDENCE.WINDOWED.FAILURE",
         "EVIDENCE.WINDOWED.SILENT_FAILURE",
@@ -168,7 +179,7 @@ _SCENARIO_CONTRACT_KEYS = frozenset({"schema", "id", "scenarios"})
 _CONTRACT_SCENARIO_KEYS = frozenset(
     {"id", "required", "expected_observation", "commands", "events"}
 )
-_COMMAND_EXPECTATION_KEYS = frozenset(
+_COMMAND_EXPECTATION_KEYS_V1 = frozenset(
     {
         "id",
         "command_sha256",
@@ -184,8 +195,21 @@ _COMMAND_EXPECTATION_KEYS = frozenset(
         "diagnostic_code",
     }
 )
+_COMMAND_EXPECTATION_KEYS = _COMMAND_EXPECTATION_KEYS_V1 | frozenset(
+    {
+        "shell_edition",
+        "shell_process_architecture",
+        "shell_selection_role",
+    }
+)
 _EVENT_EXPECTATION_KEYS = _EVENT_KEYS - frozenset({"schema", "sequence"})
 _CREATE_SUSPENDED = 0x00000004
+_DEFAULT_ENVIRONMENT_PROFILE = "CLEAN_WINDOWS_V2"
+_WINDOWS_POWERSHELL_V2_VERSION_POLICY = "5.1"
+_WINDOWS_POWERSHELL_V2_EDITION = "Desktop"
+_WINDOWS_POWERSHELL_V2_ARCHITECTURE = "X64"
+_WINDOWS_POWERSHELL_V2_SELECTION = "SYSTEM32_ABSOLUTE"
+_SHELL_IDENTITY_MARKER = "LOCALCAT_SHELL_IDENTITY_V2|"
 
 _ENVIRONMENT_PROFILE_DEFINITIONS: dict[str, object] = {
     "CLEAN_WINDOWS_V1": {
@@ -229,7 +253,58 @@ _ENVIRONMENT_PROFILE_DEFINITIONS: dict[str, object] = {
             "TMP": "temp-root",
             "WINDIR": "windows-root",
         },
-    }
+    },
+    "CLEAN_WINDOWS_V2": {
+        "required_keys": [
+            "ALLUSERSPROFILE",
+            "ComSpec",
+            "PATH",
+            "PATHEXT",
+            "ProgramData",
+            "PYTHONNOUSERSITE",
+            "SystemDrive",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        ],
+        "allowed_addition_prefix": "LOCALCAT_",
+        "forbidden_keys": [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM_PLUGIN_PATH",
+        ],
+        "path_roles": [
+            "powershell-directory",
+            "program-data",
+            "system-drive",
+            "system32",
+            "windows-root",
+        ],
+        "required_projection": {
+            "ALLUSERSPROFILE": "program-data",
+            "ComSpec": "system32/cmd.exe",
+            "PATH": "powershell-directory;system32;windows-root",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "ProgramData": "program-data",
+            "PYTHONNOUSERSITE": "1",
+            "SystemDrive": "system-drive",
+            "SystemRoot": "windows-root",
+            "TEMP": "temp-root",
+            "TMP": "temp-root",
+            "WINDIR": "windows-root",
+        },
+        "shell_policy": {
+            "architecture": "x64",
+            "build_revision": "recorded_nonblocking",
+            "edition": "Desktop",
+            "flavor": "WINDOWS_POWERSHELL",
+            "major": 5,
+            "minor": 1,
+            "selection": "system32_absolute",
+        },
+    },
 }
 
 
@@ -648,6 +723,108 @@ def _system_powershell_executable() -> Path:
         raise EvidenceValidationError("system Windows PowerShell is unavailable") from error
 
 
+def _suspended_process_image_digest(
+    process: subprocess.Popen[bytes],
+    expected_executable: Path,
+) -> str:
+    """Bind the suspended process image to the selected system PowerShell bytes."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel32.QueryFullProcessImageNameW
+    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, wintypes.PDWORD]
+    query.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = wintypes.DWORD(len(buffer))
+    if not query(
+        wintypes.HANDLE(int(process._handle)),
+        0,
+        buffer,
+        ctypes.byref(length),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        actual = Path(buffer.value[: length.value]).resolve(strict=True)
+        expected = expected_executable.resolve(strict=True)
+        if not os.path.samefile(actual, expected):
+            raise EvidenceValidationError(
+                "launched process image is not the selected system Windows PowerShell"
+            )
+        return _sha256_file(actual)
+    except OSError as error:
+        raise EvidenceValidationError(
+            "unable to reprove the launched PowerShell process image"
+        ) from error
+
+
+def _parse_windows_powershell_probe(value: str) -> tuple[str, str, str]:
+    """Validate V2 shell identity while retaining its full servicing version."""
+
+    parts = value.strip().split("|")
+    if len(parts) != 4:
+        raise EvidenceValidationError("PowerShell identity probe has invalid shape")
+    edition, version, is_64_bit, process_architecture = parts
+    if edition != _WINDOWS_POWERSHELL_V2_EDITION:
+        raise EvidenceValidationError("system shell is not Windows PowerShell Desktop")
+    version_parts = version.split(".")
+    if len(version_parts) != 4 or any(not item.isdigit() for item in version_parts):
+        raise EvidenceValidationError("PowerShell version has invalid shape")
+    if version_parts[:2] != ["5", "1"]:
+        raise EvidenceValidationError("system shell is not Windows PowerShell 5.1")
+    if is_64_bit != "True":
+        raise EvidenceValidationError("system Windows PowerShell is not 64-bit")
+    if process_architecture != _WINDOWS_POWERSHELL_V2_ARCHITECTURE:
+        raise EvidenceValidationError("system Windows PowerShell process is not X64")
+    return (
+        _require_safe_value(edition, "PowerShell edition"),
+        _require_safe_value(version, "PowerShell version"),
+        _require_safe_value(process_architecture, "PowerShell process architecture"),
+    )
+
+
+def _powershell_identity_prelude(command_text: str) -> str:
+    return (
+        "$v=$PSVersionTable.PSVersion; $x=[Environment]::Is64BitProcess; "
+        "$a=[System.Runtime.InteropServices.RuntimeInformation]::"
+        "ProcessArchitecture.ToString(); "
+        f"Write-Output ('{_SHELL_IDENTITY_MARKER}' + $PSVersionTable.PSEdition + "
+        "'|' + $v.ToString() + '|' + $x.ToString() + '|' + $a); "
+        f"& {{\n{command_text}\n}}"
+    )
+
+
+def _extract_powershell_identity(
+    stdout_bytes: bytes,
+) -> tuple[str, str, str, bytes]:
+    lines = stdout_bytes.splitlines(keepends=True)
+    if not lines:
+        raise EvidenceValidationError("PowerShell command did not emit an identity prelude")
+    try:
+        first = lines[0].decode("utf-8", errors="strict").strip()
+    except UnicodeError as error:
+        raise EvidenceValidationError("PowerShell identity prelude is not UTF-8") from error
+    if not first.startswith(_SHELL_IDENTITY_MARKER):
+        raise EvidenceValidationError("PowerShell command identity prelude is missing")
+    edition, version, architecture = _parse_windows_powershell_probe(
+        first[len(_SHELL_IDENTITY_MARKER) :]
+    )
+    return edition, version, architecture, b"".join(lines[1:])
+
+
+def _shell_version_matches_expectation(
+    actual: object,
+    expected: object,
+    environment_profile: object,
+) -> bool:
+    if environment_profile != "CLEAN_WINDOWS_V2":
+        return actual == expected
+    if expected != _WINDOWS_POWERSHELL_V2_VERSION_POLICY or type(actual) is not str:
+        return False
+    parts = actual.split(".")
+    return len(parts) == 4 and parts[:2] == ["5", "1"] and all(
+        item.isdigit() for item in parts
+    )
+
+
 def _build_clean_windows_environment(
     profile: str,
     powershell_executable: str,
@@ -657,7 +834,7 @@ def _build_clean_windows_environment(
     definition = _ENVIRONMENT_PROFILE_DEFINITIONS.get(checked_profile)
     if definition is None:
         raise EvidenceValidationError("environment profile is not registered")
-    if checked_profile != "CLEAN_WINDOWS_V1":
+    if checked_profile not in {"CLEAN_WINDOWS_V1", "CLEAN_WINDOWS_V2"}:
         raise EvidenceValidationError("environment profile has no effective-environment builder")
     if os.name != "nt":
         raise EvidenceValidationError("clean Windows environment is unavailable on this host")
@@ -812,7 +989,7 @@ class EvidenceHarness:
         self.root = artifact_root.resolve()
         try:
             self.repository_root = repository_root.resolve(strict=True)
-        except OSError as error:
+        except (OSError, EvidenceValidationError) as error:
             raise EvidenceValidationError("trusted repository root is unavailable") from error
         contract_key = _scenario_contract_key(scenario_contract_key)
         contract_path = _trusted_repository_file(
@@ -891,6 +1068,11 @@ class EvidenceHarness:
         if contract_payload != _canonical_json_bytes(contract):
             raise EvidenceValidationError("scenario contract is not canonical JSON")
         _validate_scenario_contract(contract)
+        if contract["schema"] != SCENARIO_CONTRACT_SCHEMA_ID:
+            raise EvidenceValidationError(
+                "EvidenceHarness only produces current scenario contract schema v2; "
+                "v1 is validation-only"
+            )
         self.scenario_contract = contract
         self.scenario_contract_path = contract_path
         self.scenario_contract_key = contract_key
@@ -902,8 +1084,10 @@ class EvidenceHarness:
             Path(powershell).resolve().parent
         )
         self.powershell_flavor = "WINDOWS_POWERSHELL"
+        self.powershell_selection_role = _WINDOWS_POWERSHELL_V2_SELECTION
+        self.powershell_binary_sha256 = _sha256_file(powershell)
         version_environment, _ = _build_clean_windows_environment(
-            "CLEAN_WINDOWS_V1",
+            _DEFAULT_ENVIRONMENT_PROFILE,
             self.powershell_executable,
             None,
         )
@@ -915,7 +1099,11 @@ class EvidenceHarness:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "$PSVersionTable.PSVersion.ToString()",
+                    "$v=$PSVersionTable.PSVersion; $x=[Environment]::Is64BitProcess; "
+                    "$a=[System.Runtime.InteropServices.RuntimeInformation]::"
+                    "ProcessArchitecture.ToString(); "
+                    "Write-Output ($PSVersionTable.PSEdition + '|' + $v.ToString() + "
+                    "'|' + $x.ToString() + '|' + $a)",
                 ],
                 env=version_environment,
                 stdin=subprocess.DEVNULL,
@@ -927,10 +1115,14 @@ class EvidenceHarness:
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise EvidenceValidationError("unable to identify the PowerShell runtime") from error
-        shell_version = version_probe.stdout.decode("utf-8", errors="strict").strip()
-        if version_probe.returncode != 0 or not shell_version:
+        shell_identity = version_probe.stdout.decode("utf-8", errors="strict").strip()
+        if version_probe.returncode != 0 or not shell_identity:
             raise EvidenceValidationError("unable to identify the PowerShell runtime")
-        self.powershell_version = _require_safe_value(shell_version, "PowerShell version")
+        (
+            self.powershell_edition,
+            self.powershell_version,
+            self.powershell_process_architecture,
+        ) = _parse_windows_powershell_probe(shell_identity)
         self.command_records: list[dict[str, object]] = []
         self.events: list[dict[str, object]] = []
         self.release_outputs: dict[str, str] = {}
@@ -947,7 +1139,7 @@ class EvidenceHarness:
         timeout_seconds: float = 300.0,
         windowed: bool = False,
         environment_additions: Mapping[str, str] | None = None,
-        environment_profile: str = "CLEAN_WINDOWS_V1",
+        environment_profile: str = _DEFAULT_ENVIRONMENT_PROFILE,
         private_values: Mapping[str, str] | None = None,
     ) -> dict[str, object]:
         if self._finalized:
@@ -1009,6 +1201,11 @@ class EvidenceHarness:
         status = "FAIL"
         exit_code: int | None = None
         diagnostic_code: str | None = None
+        command_shell_edition = "UNPROVEN"
+        command_shell_version = "UNPROVEN"
+        command_shell_architecture = "UNPROVEN"
+        command_shell_binary_sha256: str | None = None
+        launch_matches_initial_probe = False
         process: subprocess.Popen[bytes] | None = None
         job: _SuspendedWindowsJob | None = None
         launch_phase = "containment"
@@ -1024,7 +1221,7 @@ class EvidenceHarness:
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    command_text,
+                    _powershell_identity_prelude(command_text),
                 ],
                 cwd=actual_cwd,
                 env=actual_env,
@@ -1032,6 +1229,14 @@ class EvidenceHarness:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=_CREATE_SUSPENDED | subprocess.CREATE_NO_WINDOW,
+            )
+            launch_phase = "process-identity"
+            command_shell_binary_sha256 = _suspended_process_image_digest(
+                process,
+                Path(self.powershell_executable),
+            )
+            launch_matches_initial_probe = (
+                command_shell_binary_sha256 == self.powershell_binary_sha256
             )
             launch_phase = "assignment"
             job.assign_and_resume(process)
@@ -1065,6 +1270,32 @@ class EvidenceHarness:
         finally:
             if job is not None:
                 job.close()
+
+        if launch_phase == "running":
+            try:
+                (
+                    command_shell_edition,
+                    command_shell_version,
+                    command_shell_architecture,
+                    stdout_bytes,
+                ) = _extract_powershell_identity(stdout_bytes)
+            except EvidenceValidationError:
+                if (
+                    status == "INTERRUPTED"
+                    and diagnostic_code
+                    in {
+                        "EVIDENCE.COMMAND.TIMEOUT",
+                        "EVIDENCE.COMMAND.INTERRUPTED",
+                    }
+                    and launch_matches_initial_probe
+                ):
+                    command_shell_edition = self.powershell_edition
+                    command_shell_version = self.powershell_version
+                    command_shell_architecture = self.powershell_process_architecture
+                else:
+                    status = "FAIL"
+                    exit_code = None
+                    diagnostic_code = "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE"
 
         stdout_text = redact_text(
             stdout_bytes.decode("utf-8", errors="replace"), redactions
@@ -1100,7 +1331,11 @@ class EvidenceHarness:
             "id": command_id,
             "shell": "powershell",
             "shell_flavor": self.powershell_flavor,
-            "shell_version": self.powershell_version,
+            "shell_version": command_shell_version,
+            "shell_edition": command_shell_edition,
+            "shell_process_architecture": command_shell_architecture,
+            "shell_selection_role": self.powershell_selection_role,
+            "shell_binary_sha256": command_shell_binary_sha256,
             "command": command_text,
             "command_sha256": hashlib.sha256(command_text.encode("utf-8")).hexdigest(),
             "cwd_role": checked_cwd_role,
@@ -1493,10 +1728,32 @@ def _validate_environment_projection(
             raise EvidenceValidationError(f"{label} contains a private path")
 
 
-def _validate_command(root: Path, value: object, artifact_digests: Mapping[str, str]) -> str:
+def _command_keys_for_schema(schema: str) -> frozenset[str]:
+    if schema == SCHEMA_ID_V1:
+        return _COMMAND_KEYS_V1
+    if schema == SCHEMA_ID:
+        return _COMMAND_KEYS
+    raise EvidenceValidationError("manifest schema mismatch")
+
+
+def _expectation_keys_for_schema(schema: str) -> frozenset[str]:
+    if schema == SCENARIO_CONTRACT_SCHEMA_ID_V1:
+        return _COMMAND_EXPECTATION_KEYS_V1
+    if schema == SCENARIO_CONTRACT_SCHEMA_ID:
+        return _COMMAND_EXPECTATION_KEYS
+    raise EvidenceValidationError("scenario contract schema mismatch")
+
+
+def _validate_command(
+    root: Path,
+    value: object,
+    artifact_digests: Mapping[str, str],
+    *,
+    schema: str,
+) -> str:
     if type(value) is not dict:
         raise EvidenceValidationError("command record must be an exact object")
-    _require_exact_keys(value, _COMMAND_KEYS, "command record")
+    _require_exact_keys(value, _command_keys_for_schema(schema), "command record")
     command_id = _require_string(value["id"], "command id")
     if _COMMAND_ID_RE.fullmatch(command_id) is None:
         raise EvidenceValidationError("command id has invalid grammar")
@@ -1508,6 +1765,16 @@ def _validate_command(root: Path, value: object, artifact_digests: Mapping[str, 
         "command shell flavor",
     )
     _require_safe_value(value["shell_version"], "command shell version")
+    if schema == SCHEMA_ID:
+        _require_safe_value(value["shell_edition"], "command shell edition")
+        _require_safe_value(
+            value["shell_process_architecture"],
+            "command shell process architecture",
+        )
+        _require_safe_value(value["shell_selection_role"], "command shell selection role")
+        shell_binary_sha256 = value["shell_binary_sha256"]
+        if shell_binary_sha256 is not None:
+            _require_sha256(shell_binary_sha256, "command shell binary digest")
     command_text = _require_string(value["command"], "command text")
     if _contains_absolute_path(command_text):
         raise EvidenceValidationError("command text contains a private absolute path")
@@ -1532,6 +1799,34 @@ def _validate_command(root: Path, value: object, artifact_digests: Mapping[str, 
         value["environment_projection"],
         "environment projection",
     )
+    identity_failure_codes = {
+        "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
+        "EVIDENCE.COMMAND.LAUNCH_FAILED",
+        "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
+    }
+    identity_unproven = value["diagnostic_code"] in identity_failure_codes
+    if environment_profile == "CLEAN_WINDOWS_V2":
+        if schema != SCHEMA_ID:
+            raise EvidenceValidationError("CLEAN_WINDOWS_V2 requires evidence schema v2")
+        if not identity_unproven and (
+            value["shell_flavor"] != "WINDOWS_POWERSHELL"
+            or value["shell_edition"] != _WINDOWS_POWERSHELL_V2_EDITION
+            or value["shell_process_architecture"]
+            != _WINDOWS_POWERSHELL_V2_ARCHITECTURE
+            or value["shell_selection_role"] != _WINDOWS_POWERSHELL_V2_SELECTION
+            or not _shell_version_matches_expectation(
+                value["shell_version"],
+                _WINDOWS_POWERSHELL_V2_VERSION_POLICY,
+                environment_profile,
+            )
+        ):
+            raise EvidenceValidationError(
+                "command shell does not satisfy CLEAN_WINDOWS_V2"
+            )
+        if not identity_unproven and shell_binary_sha256 is None:
+            raise EvidenceValidationError(
+                "CLEAN_WINDOWS_V2 command shell binary digest is missing"
+            )
     windowed = _require_boolean(value["windowed"], "windowed")
     status = _require_enum(value["status"], _COMMAND_STATUSES, "command status")
     exit_code = _require_optional_integer(value["exit_code"], "command exit code")
@@ -1615,6 +1910,7 @@ def _validate_command(root: Path, value: object, artifact_digests: Mapping[str, 
         elif diagnostic_code in {
             "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
             "EVIDENCE.COMMAND.LAUNCH_FAILED",
+            "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
         }:
             if status != "FAIL" or exit_code is not None:
                 raise EvidenceValidationError("launch diagnostic result mismatch")
@@ -1706,10 +2002,14 @@ def _validate_event(
         raise EvidenceValidationError("recovery-required event must bind its recovery result")
 
 
-def _validate_command_expectation(value: object) -> str:
+def _validate_command_expectation(value: object, *, schema: str) -> str:
     if type(value) is not dict:
         raise EvidenceValidationError("command expectation must be an exact object")
-    _require_exact_keys(value, _COMMAND_EXPECTATION_KEYS, "command expectation")
+    _require_exact_keys(
+        value,
+        _expectation_keys_for_schema(schema),
+        "command expectation",
+    )
     command_id = _require_string(value["id"], "expected command id")
     if _COMMAND_ID_RE.fullmatch(command_id) is None:
         raise EvidenceValidationError("expected command id has invalid grammar")
@@ -1720,6 +2020,16 @@ def _validate_command_expectation(value: object) -> str:
         "expected shell flavor",
     )
     _require_safe_value(value["shell_version"], "expected shell version")
+    if schema == SCENARIO_CONTRACT_SCHEMA_ID:
+        _require_safe_value(value["shell_edition"], "expected shell edition")
+        _require_safe_value(
+            value["shell_process_architecture"],
+            "expected shell process architecture",
+        )
+        _require_safe_value(
+            value["shell_selection_role"],
+            "expected shell selection role",
+        )
     _require_enum(
         value["cwd_role"],
         frozenset({"REPOSITORY_TREE", "NON_REPOSITORY_CWD"}),
@@ -1740,6 +2050,22 @@ def _validate_command_expectation(value: object) -> str:
         value["environment_projection"],
         "expected environment projection",
     )
+    if expected_environment_profile == "CLEAN_WINDOWS_V2":
+        if schema != SCENARIO_CONTRACT_SCHEMA_ID:
+            raise EvidenceValidationError(
+                "CLEAN_WINDOWS_V2 requires scenario contract schema v2"
+            )
+        if (
+            value["shell_flavor"] != "WINDOWS_POWERSHELL"
+            or value["shell_version"] != _WINDOWS_POWERSHELL_V2_VERSION_POLICY
+            or value["shell_edition"] != _WINDOWS_POWERSHELL_V2_EDITION
+            or value["shell_process_architecture"]
+            != _WINDOWS_POWERSHELL_V2_ARCHITECTURE
+            or value["shell_selection_role"] != _WINDOWS_POWERSHELL_V2_SELECTION
+        ):
+            raise EvidenceValidationError(
+                "CLEAN_WINDOWS_V2 requires system32 Windows PowerShell Desktop 5.1 X64"
+            )
     _require_boolean(value["windowed"], "expected windowed")
     status = _require_enum(value["status"], _COMMAND_STATUSES, "expected command status")
     exit_code = _require_optional_integer(value["exit_code"], "expected exit code")
@@ -1755,6 +2081,7 @@ def _validate_command_expectation(value: object) -> str:
     if diagnostic in {
         "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
         "EVIDENCE.COMMAND.LAUNCH_FAILED",
+        "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
     }:
         raise EvidenceValidationError("scenario contract cannot approve a harness launch failure")
     return command_id
@@ -1764,7 +2091,8 @@ def _validate_scenario_contract(value: object) -> None:
     if type(value) is not dict:
         raise EvidenceValidationError("scenario contract must be an exact object")
     _require_exact_keys(value, _SCENARIO_CONTRACT_KEYS, "scenario contract")
-    if value["schema"] != SCENARIO_CONTRACT_SCHEMA_ID:
+    schema = value["schema"]
+    if schema not in {SCENARIO_CONTRACT_SCHEMA_ID_V1, SCENARIO_CONTRACT_SCHEMA_ID}:
         raise EvidenceValidationError("scenario contract schema mismatch")
     _require_safe_value(value["id"], "scenario contract id")
     scenarios = value["scenarios"]
@@ -1796,7 +2124,7 @@ def _validate_scenario_contract(value: object) -> None:
             raise EvidenceValidationError("contract scenario requires a command or event")
         scenario_command_ids: set[str] = set()
         for expectation in commands:
-            command_id = _validate_command_expectation(expectation)
+            command_id = _validate_command_expectation(expectation, schema=str(schema))
             if command_id in command_ids:
                 raise EvidenceValidationError("contract command ids must be globally unique")
             command_ids.add(command_id)
@@ -1824,6 +2152,7 @@ def _derive_release_matrix(
     command_records: Sequence[Mapping[str, object]],
     events: Sequence[Mapping[str, object]],
 ) -> tuple[dict[str, object], str]:
+    expectation_keys = _expectation_keys_for_schema(str(contract["schema"]))
     commands_by_id = {str(record["id"]): record for record in command_records}
     if len(commands_by_id) != len(command_records):
         raise EvidenceValidationError("command ids must be unique")
@@ -1853,6 +2182,7 @@ def _derive_release_matrix(
         in {
             "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
             "EVIDENCE.COMMAND.LAUNCH_FAILED",
+            "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
         }
         for record in command_records
     )
@@ -1882,11 +2212,18 @@ def _derive_release_matrix(
                 if actual["diagnostic_code"] in {
                     "EVIDENCE.COMMAND.CONTAINMENT_UNAVAILABLE",
                     "EVIDENCE.COMMAND.LAUNCH_FAILED",
+                    "EVIDENCE.COMMAND.SHELL_IDENTITY_UNAVAILABLE",
                 }:
                     harness_failure = True
                 if actual["status"] == "INTERRUPTED":
                     interrupted = True
-                for key in _COMMAND_EXPECTATION_KEYS:
+                for key in expectation_keys:
+                    if key == "shell_version" and _shell_version_matches_expectation(
+                        actual[key],
+                        expected[key],
+                        expected["environment_profile"],
+                    ):
+                        continue
                     if actual[key] != expected[key]:
                         mismatch = True
             for expected in expected_events:
@@ -2036,8 +2373,18 @@ def validate_evidence_bundle(
     if manifest_payload != _canonical_json_bytes(manifest):
         raise EvidenceValidationError("manifest is not canonical JSON")
     _require_exact_keys(manifest, _MANIFEST_KEYS, "manifest")
-    if manifest["schema"] != SCHEMA_ID:
+    manifest_schema = manifest["schema"]
+    if manifest_schema not in {SCHEMA_ID_V1, SCHEMA_ID}:
         raise EvidenceValidationError("manifest schema mismatch")
+    expected_contract_schema = (
+        SCENARIO_CONTRACT_SCHEMA_ID_V1
+        if manifest_schema == SCHEMA_ID_V1
+        else SCENARIO_CONTRACT_SCHEMA_ID
+    )
+    if scenario_contract["schema"] != expected_contract_schema:
+        raise EvidenceValidationError(
+            "manifest and scenario contract schema generations do not match"
+        )
 
     scenario_contract_reference = manifest["scenario_contract"]
     if type(scenario_contract_reference) is not dict:
@@ -2177,7 +2524,13 @@ def validate_evidence_bundle(
     if type(commands) is not list:
         raise EvidenceValidationError("commands must be an exact list")
     command_ids = [
-        _validate_command(root, command, artifact_digests) for command in commands
+        _validate_command(
+            root,
+            command,
+            artifact_digests,
+            schema=str(manifest_schema),
+        )
+        for command in commands
     ]
     if len(command_ids) != len(set(command_ids)):
         raise EvidenceValidationError("command ids must be unique")
