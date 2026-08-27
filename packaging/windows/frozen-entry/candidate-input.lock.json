@@ -1,0 +1,1597 @@
+{
+  "schema": "localcat.windows-frozen-entry-candidate-input.v1",
+  "profile": "windows-x64-frozen-custom-entry-candidate",
+  "support": {
+    "verified_on": "2026-08-27",
+    "reference": "https://learn.microsoft.com/en-us/visualstudio/releases/2022/release-history"
+  },
+  "target_platform": {
+    "system": "Windows",
+    "machine": "AMD64"
+  },
+  "evidence_producer": {
+    "python": {
+      "role": "candidate input producer Python",
+      "name": "python.exe",
+      "bytes": 255200,
+      "sha256": "9b7bffc26240463c965a2a2a5fada1d8e741c21c25cd2e977728c339b82d9977"
+    },
+    "python_version": "3.14.7",
+    "base_runtime": {
+      "role": "candidate producer CPython base runtime",
+      "algorithm": "localcat.directory-input-sha256.v1",
+      "file_count": 3368,
+      "bytes": 90818546,
+      "sha256": "bc7eb31278de287e3a3851c7b9464b9a56e44024779a5d24d83b57fe00b0ce68"
+    },
+    "venv": {
+      "is_venv": true,
+      "include_system_site_packages": false
+    },
+    "preparer": {
+      "role": "candidate input producer",
+      "name": "prepare_windows_frozen_entry_inputs.py",
+      "bytes": 44417,
+      "sha256": "85c708d779009ca3d8724ae9c3eb692ced876f9ddc71b77ba68a8b7ad96c51cc"
+    },
+    "replay_wrapper": {
+      "role": "candidate input replay wrapper",
+      "name": "replay_windows_frozen_entry_inputs.ps1",
+      "bytes": 10460,
+      "sha256": "81a730725f26c0244c74b3019bc65246b9bbd02df7352f970a09242e322e41fa"
+    },
+    "stock_audit_helper": {
+      "role": "stock audit helper",
+      "name": "audit_w3_stock_bootloader.py",
+      "bytes": 33916,
+      "sha256": "f7a4db1c7986c1225a876c33b7182b3f41b5d56460360d518d3c28e1b76033e2"
+    },
+    "probe_evidence_recorder": {
+      "role": "probe build evidence recorder",
+      "name": "record_windows_frozen_entry_probe.py",
+      "bytes": 8939,
+      "sha256": "943b9d268413c8b7ee1347c9d1f6addebfef4153f8ee5af99824b08e1bd390dd"
+    },
+    "probe_prebuild_evidence_recorder": {
+      "role": "probe pre-build evidence recorder",
+      "name": "record_windows_frozen_entry_probe_prebuild.py",
+      "bytes": 2936,
+      "sha256": "9c4c050f568f543c810b25638fce535c6209a3696af2acefb2ff490e3b8107bb"
+    },
+    "vswhere": {
+      "role": "Visual Studio instance resolver",
+      "name": "vswhere.exe",
+      "bytes": 469456,
+      "sha256": "c54f3b7c9164ea9a0db8641e81ecdda80c2664ef5a47c4191406f848cc07c662"
+    },
+    "pefile": {
+      "version": "2024.8.26",
+      "source": {
+        "role": "pefile parser source",
+        "name": "pefile.py",
+        "bytes": 301767,
+        "sha256": "0d0eb68f0f169182613dc64b3ab50b20855508c1c1d2faafe8fccf23edb6a345"
+      },
+      "distribution_metadata": {
+        "role": "pefile distribution metadata",
+        "name": "METADATA",
+        "bytes": 1355,
+        "sha256": "8ad83a5f8659e8da6eeaabf2dafa0eebb8c05832a3def16a5db4dd0d52e72474"
+      }
+    }
+  },
+  "toolchain": {
+    "visual_studio": {
+      "instance": {
+        "installation_version": "17.14.37614.0",
+        "product_id": "Microsoft.VisualStudio.Product.BuildTools",
+        "product_line_version": "2022",
+        "product_display_version": "17.14.39 (August 2026)",
+        "is_complete": true,
+        "is_launchable": true
+      },
+      "layout_files": [
+        {
+          "role": "Visual Studio layout Catalog.json",
+          "name": "Catalog.json",
+          "bytes": 17955171,
+          "sha256": "3891c3018a07338b3880cbb28088bb22ef7762eb9206523655b2e3972b9d527e"
+        },
+        {
+          "role": "Visual Studio layout ChannelManifest.json",
+          "name": "ChannelManifest.json",
+          "bytes": 91833,
+          "sha256": "4c81e902fb7fe2acea779b828e6dc548fe0bbb693df50eda0224263c16686bdd"
+        },
+        {
+          "role": "Visual Studio layout Layout.json",
+          "name": "Layout.json",
+          "bytes": 414,
+          "sha256": "45639652ca2f28f24548be94abcf75f88375a79fe8d5b6eb389db25365bab842"
+        },
+        {
+          "role": "Visual Studio layout Response.json",
+          "name": "Response.json",
+          "bytes": 414,
+          "sha256": "45639652ca2f28f24548be94abcf75f88375a79fe8d5b6eb389db25365bab842"
+        },
+        {
+          "role": "Visual Studio layout bootstrapper",
+          "name": "vs_buildtools_2022_current.exe",
+          "bytes": 4473896,
+          "sha256": "2aeac090a9cfb2c56474aa9a6c5817ad8cfb879539e0ed1aecec33de9fc2dc4f"
+        }
+      ]
+    },
+    "msvc": {
+      "toolset_version": "14.44.35207",
+      "tools": {
+        "cl": {
+          "role": "cl",
+          "name": "cl.exe",
+          "bytes": 677736,
+          "sha256": "88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d"
+        },
+        "link": {
+          "role": "link",
+          "name": "link.exe",
+          "bytes": 3252576,
+          "sha256": "ca11e6c45debd34bf652dfe984c5360a531a005ed78bf72852330c9c2590cf0d"
+        },
+        "dumpbin": {
+          "role": "dumpbin",
+          "name": "dumpbin.exe",
+          "bytes": 23416,
+          "sha256": "12a1cd87238bd66dfdb788b4fcdcb91ce4b3f81236aab12a7a29e5ae1d85af50"
+        },
+        "rc": {
+          "role": "rc",
+          "name": "rc.exe",
+          "bytes": 55640,
+          "sha256": "43da1503c262c30894c851589bf0155f8365d77e63a5f7bc13982320e3a6b42d"
+        },
+        "mt": {
+          "role": "mt",
+          "name": "mt.exe",
+          "bytes": 1972584,
+          "sha256": "1b8a272d586a9ab53ac2ccd457a88bd0210d7d7ac3daea5b34743cc2afe73b26"
+        }
+      },
+      "compiler_bin": {
+        "role": "MSVC Hostx64/x64 binary inputs",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 85,
+        "bytes": 73061745,
+        "sha256": "5b1d4094d658914d101d1a6ca84ad1a66955a4b50cd2180ff8571357572b4361"
+      },
+      "headers": {
+        "role": "MSVC headers",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 347,
+        "bytes": 15504596,
+        "sha256": "ede9e692a40946ec7283e7eb25e31ac6e4d90d75e331f88eef84d459873a8cbf"
+      },
+      "libraries": {
+        "role": "MSVC x64 libraries",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 122,
+        "bytes": 309054963,
+        "sha256": "c0d51a47d267c73fabb48965a1e60edc4bd0c9350c498d07eeb63c2561488d35"
+      },
+      "stock_rebuild_probe": {
+        "scope": "selected-toolchain pristine stock rebuild import-table observation; probe PE bytes are not candidate authority",
+        "machine": 34404,
+        "import_table_sha256": "e237bbe5956ae2c64a8b133f9285c46b65e72a163dfee2d5c691adec67942b83",
+        "delay_imports": [],
+        "added_symbols": [
+          {
+            "dll": "KERNEL32.DLL",
+            "symbol": "InitializeCriticalSectionAndSpinCount"
+          },
+          {
+            "dll": "KERNEL32.DLL",
+            "symbol": "TlsAlloc"
+          },
+          {
+            "dll": "KERNEL32.DLL",
+            "symbol": "TlsFree"
+          },
+          {
+            "dll": "KERNEL32.DLL",
+            "symbol": "TlsGetValue"
+          },
+          {
+            "dll": "KERNEL32.DLL",
+            "symbol": "TlsSetValue"
+          }
+        ],
+        "removed_symbols": [],
+        "build_evidence": {
+          "schema": "localcat.windows-frozen-entry-toolchain-probe-evidence.v1",
+          "source": {
+            "sdist_sha256": "89b65a3ad07d9dd5832253e37bc45f31872d10d7f9d5c9fd0fdd6088a83829dd",
+            "actual_build_copy_source_scan": {
+              "scope": [
+                "bootloader/src/**/*.c",
+                "bootloader/src/**/*.h",
+                "PyInstaller/loader/**/*.py"
+              ],
+              "count": 51,
+              "sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+              "expected_count": 51,
+              "expected_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826"
+            },
+            "actual_build_copy_build_driver": {
+              "role": "PyInstaller bootloader build driver",
+              "algorithm": "localcat.directory-input-sha256.v1",
+              "file_count": 157,
+              "bytes": 2114847,
+              "sha256": "2d1760251a66805f33fb96bc1b88595aab5785d29992e457be911b2ed0aa426e"
+            },
+            "archive_source_scan": {
+              "scope": [
+                "bootloader/src/**/*.c",
+                "bootloader/src/**/*.h",
+                "PyInstaller/loader/**/*.py"
+              ],
+              "count": 51,
+              "sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+              "expected_count": 51,
+              "expected_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+              "marker_file_hashes": {
+                "bootloader/src/pyi_main.c": "19616e0a5982da96a27861bb9baca84c1b05d63625aea098962bfea85e6db43b",
+                "bootloader/src/pyi_launch.c": "50416af7e74b12a56f67cd360bfa46ed71770ac43629001eaa6d73c4e196880e",
+                "bootloader/src/pyi_dylib_python.c": "900996eac30595b5a474bd2ec3601ae0c5d1389f394979bbfca7f7a9313e67e7",
+                "bootloader/src/pyi_utils_win32_low_level.c": "ee6a6a0fef89d8c81af93185d97b116ad15618f2ef35c1c1cf78e30fdda5ff12",
+                "PyInstaller/loader/pyiboot01_bootstrap.py": "6773bb364344a01f176133f8624ddda9e8f992052eaddad32609b1e90399ef1f",
+                "PyInstaller/loader/pyimod03_ctypes.py": "a93c2ec1677cc5d77fa4c000136b9da36f61388f9536f2b1a66193b329d1f312"
+              }
+            },
+            "prebuild_evidence_digest": "3792488f8b51f6854702b8a5b10983fde4b1c3377086fac661096657d12a0dc6"
+          },
+          "toolchain": {
+            "msvc_version": "14.44.35207",
+            "windows_sdk_version": "10.0.26100.0",
+            "resolved_tools": {
+              "cl": {
+                "role": "probe build cl",
+                "name": "cl.exe",
+                "bytes": 677736,
+                "sha256": "88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d"
+              },
+              "link": {
+                "role": "probe build link",
+                "name": "link.exe",
+                "bytes": 3252576,
+                "sha256": "ca11e6c45debd34bf652dfe984c5360a531a005ed78bf72852330c9c2590cf0d"
+              },
+              "rc": {
+                "role": "probe build rc",
+                "name": "rc.exe",
+                "bytes": 55640,
+                "sha256": "43da1503c262c30894c851589bf0155f8365d77e63a5f7bc13982320e3a6b42d"
+              },
+              "mt": {
+                "role": "probe build mt",
+                "name": "mt.exe",
+                "bytes": 1972584,
+                "sha256": "1b8a272d586a9ab53ac2ccd457a88bd0210d7d7ac3daea5b34743cc2afe73b26"
+              }
+            }
+          },
+          "build": {
+            "arguments": [
+              "bootloader/waf",
+              "all",
+              "--target-arch=64bit",
+              "-j1"
+            ],
+            "environment_projection": {
+              "pre_vcvars_path_roles": [
+                "System32",
+                "Windows"
+              ],
+              "cleared": [
+                "CL",
+                "INCLUDE",
+                "LIB",
+                "LIBPATH",
+                "LINK",
+                "_CL_",
+                "_LINK_"
+              ],
+              "vscmd_skip_sendtelemetry": "1",
+              "vcvars": {
+                "script": "vcvarsall.bat",
+                "architecture": "x64",
+                "msvc_version": "14.44.35207",
+                "windows_sdk_version": "10.0.26100.0"
+              }
+            },
+            "stdout": {
+              "role": "probe build canonical stdout",
+              "normalization": "LF; approved path tokens; elapsed durations replaced",
+              "bytes": 9790,
+              "sha256": "678f140fcdb8c17ba7748a7521642680370793875b278c2f1b14d2b9591ae425"
+            },
+            "stderr": {
+              "role": "probe build canonical stderr",
+              "normalization": "LF; approved path tokens; elapsed durations replaced",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          },
+          "result": {
+            "machine": 34404,
+            "import_table_sha256": "e237bbe5956ae2c64a8b133f9285c46b65e72a163dfee2d5c691adec67942b83",
+            "delay_imports": []
+          },
+          "evidence_digest": "57d4a3b089cfd7d25a9c60496a595d9afb6c3ca22f902125db34f858f0e32547",
+          "status": "RECORDED"
+        }
+      }
+    },
+    "windows_sdk": {
+      "version": "10.0.26100.0",
+      "tools": {
+        "rc": {
+          "role": "rc",
+          "name": "rc.exe",
+          "bytes": 55640,
+          "sha256": "43da1503c262c30894c851589bf0155f8365d77e63a5f7bc13982320e3a6b42d"
+        },
+        "mt": {
+          "role": "mt",
+          "name": "mt.exe",
+          "bytes": 1972584,
+          "sha256": "1b8a272d586a9ab53ac2ccd457a88bd0210d7d7ac3daea5b34743cc2afe73b26"
+        }
+      },
+      "binary_inputs": {
+        "role": "Windows SDK x64 binary inputs",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 220,
+        "bytes": 73884717,
+        "sha256": "8de0553dd9dd50b9769254f4cb516c22eee49d70fdb6bda8020ba78602e8e5ec"
+      },
+      "headers": {
+        "role": "Windows SDK headers",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 4771,
+        "bytes": 361474762,
+        "sha256": "94a3ae69e5faf8a48aee16ac23e06efc849e383d68f256e49b7c4b821e351378"
+      },
+      "libraries": {
+        "role": "Windows SDK UM x64 libraries",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 481,
+        "bytes": 110173182,
+        "sha256": "1e9a7efc7077d37775e16761fd95d5c4d3ef104d9f7ce61b3b52235258d1b7b4"
+      },
+      "ucrt_libraries": {
+        "role": "Windows SDK UCRT x64 libraries",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 8,
+        "bytes": 90629762,
+        "sha256": "64edbd9aabf221a6164b258475f35f9b79577bd603d2f565fb33e5b5543c9cfc"
+      },
+      "catalogs": {
+        "role": "Windows SDK package catalogs",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 148,
+        "bytes": 4797245,
+        "sha256": "113915b6809c44708de85efcc19c7db48d5364dc83494ac8327e05875115ac48"
+      }
+    }
+  },
+  "runtime": {
+    "cpython": {
+      "version": "3.14.7",
+      "executable": {
+        "role": "CPython executable",
+        "name": "python.exe",
+        "bytes": 106208,
+        "sha256": "4942b86a6597e5aee0128daa00050ed79bc21f6e709a78eb19cbfeb0c2f39ac9"
+      },
+      "dll": {
+        "role": "CPython DLL",
+        "name": "python314.dll",
+        "bytes": 6785760,
+        "sha256": "0f9857ffdfe010fe6b99328d58c2e3c7472ce75f336bf9c2ad9bd5bca3bce700",
+        "machine": 34404,
+        "import_table_sha256": "19fa7ae97c5c481fde6c41f71dfd6036cf72ccf2133f3060c9e1813c7582759b",
+        "export_count": 1812,
+        "export_table_sha256": "54b694882d965144d28469f34c18981f9e808aab910b566f95db7c5cab19313d"
+      },
+      "import_library": {
+        "role": "CPython import library",
+        "name": "python314.lib",
+        "bytes": 404282,
+        "sha256": "2d9f969e69d5d17c506e96156c8ee2657f3cf76058074be2bb415d1a6f31751f"
+      },
+      "headers": {
+        "role": "CPython headers",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 283,
+        "bytes": 2017582,
+        "sha256": "b5b252b6f77743aaca0d48375fb374f2aee943838c05e683592174188c515fc0"
+      },
+      "native_closure": {
+        "root": "python314.dll",
+        "local_members": [
+          {
+            "role": "runtime native member python314.dll",
+            "name": "python314.dll",
+            "bytes": 6785760,
+            "sha256": "0f9857ffdfe010fe6b99328d58c2e3c7472ce75f336bf9c2ad9bd5bca3bce700",
+            "machine": 34404,
+            "imports": [
+              {
+                "dll": "ADVAPI32.dll",
+                "symbols": [
+                  "AdjustTokenPrivileges",
+                  "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                  "GetUserNameW",
+                  "LookupPrivilegeValueA",
+                  "LsaNtStatusToWinError",
+                  "OpenProcessToken",
+                  "RegCloseKey",
+                  "RegConnectRegistryW",
+                  "RegCreateKeyExW",
+                  "RegCreateKeyW",
+                  "RegDeleteKeyExW",
+                  "RegDeleteKeyW",
+                  "RegDeleteValueW",
+                  "RegEnumKeyExW",
+                  "RegEnumValueW",
+                  "RegFlushKey",
+                  "RegLoadKeyW",
+                  "RegOpenKeyExW",
+                  "RegQueryInfoKeyW",
+                  "RegQueryValueExW",
+                  "RegSaveKeyW",
+                  "RegSetValueExW"
+                ]
+              },
+              {
+                "dll": "api-ms-win-core-path-l1-1-0.dll",
+                "symbols": [
+                  "PathCchCombineEx",
+                  "PathCchSkipRoot"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-conio-l1-1-0.dll",
+                "symbols": [
+                  "_getch",
+                  "_getche",
+                  "_getwch",
+                  "_getwche",
+                  "_putch",
+                  "_putwch",
+                  "_ungetch",
+                  "_ungetwch"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+                "symbols": [
+                  "mbstowcs",
+                  "strtol",
+                  "strtoul",
+                  "wcstol",
+                  "wcstombs"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-environment-l1-1-0.dll",
+                "symbols": [
+                  "__p__wenviron",
+                  "_wgetcwd",
+                  "_wgetenv",
+                  "_wputenv",
+                  "_wputenv_s",
+                  "getenv"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+                "symbols": [
+                  "_umask",
+                  "_wstat64i32"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+                "symbols": [
+                  "_aligned_free",
+                  "_aligned_malloc",
+                  "_heapmin",
+                  "calloc",
+                  "free",
+                  "malloc",
+                  "realloc"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-locale-l1-1-0.dll",
+                "symbols": [
+                  "localeconv",
+                  "setlocale"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-math-l1-1-0.dll",
+                "symbols": [
+                  "_dclass",
+                  "_fdopen",
+                  "acos",
+                  "acosh",
+                  "asin",
+                  "asinh",
+                  "atan",
+                  "atan2",
+                  "atanh",
+                  "cbrt",
+                  "ceil",
+                  "copysign",
+                  "cos",
+                  "cosh",
+                  "erf",
+                  "erfc",
+                  "exp",
+                  "exp2",
+                  "expm1",
+                  "fabs",
+                  "floor",
+                  "fma",
+                  "fmod",
+                  "frexp",
+                  "hypot",
+                  "ldexp",
+                  "log",
+                  "log10",
+                  "log1p",
+                  "log2",
+                  "modf",
+                  "nextafter",
+                  "pow",
+                  "round",
+                  "sin",
+                  "sinh",
+                  "sqrt",
+                  "tan",
+                  "tanh"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-process-l1-1-0.dll",
+                "symbols": [
+                  "_cwait",
+                  "_wexecv",
+                  "_wexecve",
+                  "_wspawnv",
+                  "_wspawnve"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+                "symbols": [
+                  "__doserrno",
+                  "__fpe_flt_rounds",
+                  "__sys_errlist",
+                  "__sys_nerr",
+                  "_beginthreadex",
+                  "_cexit",
+                  "_configure_narrow_argv",
+                  "_crt_atexit",
+                  "_endthreadex",
+                  "_errno",
+                  "_execute_onexit_table",
+                  "_exit",
+                  "_getpid",
+                  "_initialize_narrow_environment",
+                  "_initialize_onexit_table",
+                  "_initterm",
+                  "_initterm_e",
+                  "_register_onexit_function",
+                  "_seh_filter_dll",
+                  "_set_abort_behavior",
+                  "_set_errno",
+                  "_set_thread_local_invalid_parameter_handler",
+                  "_wsystem",
+                  "abort",
+                  "exit",
+                  "raise",
+                  "signal",
+                  "strerror"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+                "symbols": [
+                  "__acrt_iob_func",
+                  "__stdio_common_vfprintf",
+                  "__stdio_common_vsprintf",
+                  "__stdio_common_vswprintf",
+                  "_chsize_s",
+                  "_close",
+                  "_commit",
+                  "_dup",
+                  "_dup2",
+                  "_fileno",
+                  "_get_osfhandle",
+                  "_isatty",
+                  "_kbhit",
+                  "_locking",
+                  "_lseek",
+                  "_lseeki64",
+                  "_open",
+                  "_open_osfhandle",
+                  "_read",
+                  "_setmode",
+                  "_wfopen",
+                  "_wopen",
+                  "_write",
+                  "clearerr",
+                  "fclose",
+                  "feof",
+                  "ferror",
+                  "fflush",
+                  "fgets",
+                  "fputc",
+                  "fputs",
+                  "fread",
+                  "ftell",
+                  "fwrite",
+                  "getc",
+                  "putchar",
+                  "puts",
+                  "rewind",
+                  "setvbuf",
+                  "ungetc"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-string-l1-1-0.dll",
+                "symbols": [
+                  "_strdup",
+                  "_stricmp",
+                  "_wcsicmp",
+                  "isalnum",
+                  "strcmp",
+                  "strcspn",
+                  "strncmp",
+                  "strncpy",
+                  "strpbrk",
+                  "tolower",
+                  "toupper",
+                  "wcscat_s",
+                  "wcscmp",
+                  "wcscoll",
+                  "wcscpy_s",
+                  "wcsncmp",
+                  "wcsncpy_s",
+                  "wcsnlen",
+                  "wcstok_s",
+                  "wcsxfrm"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-time-l1-1-0.dll",
+                "symbols": [
+                  "__daylight",
+                  "__timezone",
+                  "_gmtime64_s",
+                  "_localtime64_s",
+                  "_mktime64",
+                  "_time64",
+                  "_tzset",
+                  "clock",
+                  "strftime",
+                  "wcsftime"
+                ]
+              },
+              {
+                "dll": "bcrypt.dll",
+                "symbols": [
+                  "BCryptGenRandom"
+                ]
+              },
+              {
+                "dll": "KERNEL32.dll",
+                "symbols": [
+                  "AcquireSRWLockExclusive",
+                  "AddDllDirectory",
+                  "AddVectoredExceptionHandler",
+                  "CancelIoEx",
+                  "CloseHandle",
+                  "CompareStringOrdinal",
+                  "ConnectNamedPipe",
+                  "CopyFile2",
+                  "CreateDirectoryW",
+                  "CreateEventA",
+                  "CreateEventW",
+                  "CreateFileMappingA",
+                  "CreateFileMappingW",
+                  "CreateFileW",
+                  "CreateHardLinkW",
+                  "CreateMutexW",
+                  "CreateNamedPipeW",
+                  "CreatePipe",
+                  "CreateProcessW",
+                  "CreateSemaphoreA",
+                  "CreateSymbolicLinkW",
+                  "CreateThread",
+                  "CreateToolhelp32Snapshot",
+                  "CreateWaitableTimerExW",
+                  "DeleteFileW",
+                  "DeleteProcThreadAttributeList",
+                  "DeviceIoControl",
+                  "DuplicateHandle",
+                  "ExitProcess",
+                  "ExpandEnvironmentStringsW",
+                  "FindClose",
+                  "FindFirstFileW",
+                  "FindFirstVolumeW",
+                  "FindNextFileW",
+                  "FindNextVolumeW",
+                  "FindVolumeClose",
+                  "FlsAlloc",
+                  "FlsFree",
+                  "FlsSetValue",
+                  "FlushInstructionCache",
+                  "FlushViewOfFile",
+                  "FormatMessageW",
+                  "FreeLibrary",
+                  "GenerateConsoleCtrlEvent",
+                  "GetACP",
+                  "GetActiveProcessorCount",
+                  "GetConsoleCP",
+                  "GetConsoleMode",
+                  "GetConsoleOutputCP",
+                  "GetConsoleScreenBufferInfo",
+                  "GetCurrentDirectoryW",
+                  "GetCurrentProcess",
+                  "GetCurrentProcessId",
+                  "GetCurrentProcessorNumber",
+                  "GetCurrentThread",
+                  "GetCurrentThreadId",
+                  "GetCurrentThreadStackLimits",
+                  "GetDiskFreeSpaceExW",
+                  "GetDriveTypeW",
+                  "GetEnvironmentVariableA",
+                  "GetErrorMode",
+                  "GetExitCodeProcess",
+                  "GetExitCodeThread",
+                  "GetFileAttributesExW",
+                  "GetFileAttributesW",
+                  "GetFileInformationByHandle",
+                  "GetFileInformationByHandleEx",
+                  "GetFileSize",
+                  "GetFileType",
+                  "GetFinalPathNameByHandleW",
+                  "GetFullPathNameW",
+                  "GetHandleInformation",
+                  "GetLargePageMinimum",
+                  "GetLastError",
+                  "GetLocaleInfoA",
+                  "GetLogicalDriveStringsW",
+                  "GetLongPathNameW",
+                  "GetModuleFileNameW",
+                  "GetModuleHandleW",
+                  "GetNamedPipeHandleStateW",
+                  "GetNumaHighestNodeNumber",
+                  "GetNumaNodeProcessorMask",
+                  "GetNumberOfConsoleInputEvents",
+                  "GetOverlappedResult",
+                  "GetProcAddress",
+                  "GetProcessHeap",
+                  "GetProcessTimes",
+                  "GetShortPathNameW",
+                  "GetStdHandle",
+                  "GetStringTypeW",
+                  "GetSystemInfo",
+                  "GetSystemTimeAsFileTime",
+                  "GetSystemTimePreciseAsFileTime",
+                  "GetThreadTimes",
+                  "GetTickCount64",
+                  "GetTimeZoneInformation",
+                  "GetVersion",
+                  "GetVersionExW",
+                  "GetVolumePathNameW",
+                  "GetVolumePathNamesForVolumeNameW",
+                  "HeapAlloc",
+                  "HeapFree",
+                  "InitializeConditionVariable",
+                  "InitializeProcThreadAttributeList",
+                  "InitializeSListHead",
+                  "InitializeSRWLock",
+                  "IsDebuggerPresent",
+                  "IsProcessorFeaturePresent",
+                  "LCMapStringEx",
+                  "LoadLibraryA",
+                  "LoadLibraryExW",
+                  "LoadLibraryW",
+                  "LocalFree",
+                  "MapViewOfFile",
+                  "Module32FirstW",
+                  "Module32NextW",
+                  "MoveFileExW",
+                  "MultiByteToWideChar",
+                  "NeedCurrentDirectoryForExePathW",
+                  "OpenEventW",
+                  "OpenFileMappingW",
+                  "OpenMutexW",
+                  "OpenProcess",
+                  "OpenThread",
+                  "OutputDebugStringW",
+                  "PeekNamedPipe",
+                  "PssCaptureSnapshot",
+                  "PssFreeSnapshot",
+                  "PssQuerySnapshot",
+                  "QueryPerformanceCounter",
+                  "QueryPerformanceFrequency",
+                  "RaiseException",
+                  "ReadConsoleW",
+                  "ReadFile",
+                  "ReadProcessMemory",
+                  "ReleaseMutex",
+                  "ReleaseSRWLockExclusive",
+                  "ReleaseSemaphore",
+                  "RemoveDirectoryW",
+                  "RemoveDllDirectory",
+                  "RemoveVectoredExceptionHandler",
+                  "ResetEvent",
+                  "ResumeThread",
+                  "RtlCaptureContext",
+                  "RtlLookupFunctionEntry",
+                  "RtlVirtualUnwind",
+                  "SetCurrentDirectoryW",
+                  "SetEndOfFile",
+                  "SetEnvironmentVariableW",
+                  "SetErrorMode",
+                  "SetEvent",
+                  "SetFileAttributesW",
+                  "SetFileInformationByHandle",
+                  "SetFilePointerEx",
+                  "SetFileTime",
+                  "SetHandleInformation",
+                  "SetLastError",
+                  "SetNamedPipeHandleState",
+                  "SetThreadStackGuarantee",
+                  "SetUnhandledExceptionFilter",
+                  "SetWaitableTimerEx",
+                  "Sleep",
+                  "SleepConditionVariableSRW",
+                  "SleepEx",
+                  "SwitchToThread",
+                  "TerminateProcess",
+                  "TerminateThread",
+                  "TlsAlloc",
+                  "TlsFree",
+                  "TlsGetValue",
+                  "TlsSetValue",
+                  "UnhandledExceptionFilter",
+                  "UnmapViewOfFile",
+                  "UpdateProcThreadAttribute",
+                  "VirtualAlloc",
+                  "VirtualFree",
+                  "VirtualProtect",
+                  "VirtualQuery",
+                  "WaitForMultipleObjects",
+                  "WaitForSingleObject",
+                  "WaitForSingleObjectEx",
+                  "WaitNamedPipeW",
+                  "WakeConditionVariable",
+                  "WideCharToMultiByte",
+                  "WriteConsoleA",
+                  "WriteConsoleW",
+                  "WriteFile",
+                  "WriteProcessMemory"
+                ]
+              },
+              {
+                "dll": "VCRUNTIME140.dll",
+                "symbols": [
+                  "__C_specific_handler",
+                  "__std_type_info_destroy_list",
+                  "memchr",
+                  "memcmp",
+                  "memcpy",
+                  "memmove",
+                  "memset",
+                  "strchr",
+                  "strrchr",
+                  "strstr",
+                  "wcschr",
+                  "wcsrchr",
+                  "wcsstr"
+                ]
+              },
+              {
+                "dll": "VERSION.dll",
+                "symbols": [
+                  "GetFileVersionInfoSizeW",
+                  "GetFileVersionInfoW",
+                  "VerQueryValueW"
+                ]
+              },
+              {
+                "dll": "WS2_32.dll",
+                "symbols": [
+                  "WSAGetLastError",
+                  "getsockopt",
+                  "send"
+                ]
+              }
+            ],
+            "delay_imports": []
+          },
+          {
+            "role": "runtime native member vcruntime140.dll",
+            "name": "vcruntime140.dll",
+            "bytes": 178616,
+            "sha256": "d1f4225df2cd877dbf130d5668a021dce3f94118455ff5ec952061c30afc9ce7",
+            "machine": 34404,
+            "imports": [
+              {
+                "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+                "symbols": [
+                  "atol"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+                "symbols": [
+                  "calloc",
+                  "free",
+                  "malloc"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+                "symbols": [
+                  "abort",
+                  "terminate"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+                "symbols": [
+                  "__stdio_common_vsprintf",
+                  "__stdio_common_vsprintf_s"
+                ]
+              },
+              {
+                "dll": "api-ms-win-crt-string-l1-1-0.dll",
+                "symbols": [
+                  "strcpy_s",
+                  "strncmp"
+                ]
+              },
+              {
+                "dll": "KERNEL32.dll",
+                "symbols": [
+                  "DeleteCriticalSection",
+                  "EncodePointer",
+                  "EnterCriticalSection",
+                  "FlsAlloc",
+                  "FlsFree",
+                  "FlsGetValue",
+                  "FlsSetValue",
+                  "GetCurrentProcessId",
+                  "GetCurrentThreadId",
+                  "GetLastError",
+                  "GetModuleFileNameW",
+                  "GetModuleHandleW",
+                  "GetSystemTimeAsFileTime",
+                  "InitializeCriticalSectionEx",
+                  "InterlockedFlushSList",
+                  "InterlockedPushEntrySList",
+                  "LeaveCriticalSection",
+                  "LoadLibraryExW",
+                  "QueryPerformanceCounter",
+                  "RaiseException",
+                  "RtlLookupFunctionEntry",
+                  "RtlPcToFileHeader",
+                  "RtlUnwind",
+                  "RtlUnwindEx",
+                  "SetLastError"
+                ]
+              }
+            ],
+            "delay_imports": []
+          }
+        ],
+        "external_import_names": [
+          "ADVAPI32.DLL",
+          "API-MS-WIN-CORE-PATH-L1-1-0.DLL",
+          "API-MS-WIN-CRT-CONIO-L1-1-0.DLL",
+          "API-MS-WIN-CRT-CONVERT-L1-1-0.DLL",
+          "API-MS-WIN-CRT-ENVIRONMENT-L1-1-0.DLL",
+          "API-MS-WIN-CRT-FILESYSTEM-L1-1-0.DLL",
+          "API-MS-WIN-CRT-HEAP-L1-1-0.DLL",
+          "API-MS-WIN-CRT-LOCALE-L1-1-0.DLL",
+          "API-MS-WIN-CRT-MATH-L1-1-0.DLL",
+          "API-MS-WIN-CRT-PROCESS-L1-1-0.DLL",
+          "API-MS-WIN-CRT-RUNTIME-L1-1-0.DLL",
+          "API-MS-WIN-CRT-STDIO-L1-1-0.DLL",
+          "API-MS-WIN-CRT-STRING-L1-1-0.DLL",
+          "API-MS-WIN-CRT-TIME-L1-1-0.DLL",
+          "BCRYPT.DLL",
+          "KERNEL32.DLL",
+          "VERSION.DLL",
+          "WS2_32.DLL"
+        ]
+      }
+    },
+    "pyinstaller": {
+      "version": "6.22.2",
+      "sdist": {
+        "role": "PyInstaller official sdist",
+        "name": "pyinstaller-6.22.2.tar.gz",
+        "bytes": 4092631,
+        "sha256": "89b65a3ad07d9dd5832253e37bc45f31872d10d7f9d5c9fd0fdd6088a83829dd"
+      },
+      "source_scan": {
+        "scope": [
+          "bootloader/src/**/*.c",
+          "bootloader/src/**/*.h",
+          "PyInstaller/loader/**/*.py"
+        ],
+        "count": 51,
+        "sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+        "expected_count": 51,
+        "expected_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826"
+      },
+      "archive_source_scan": {
+        "scope": [
+          "bootloader/src/**/*.c",
+          "bootloader/src/**/*.h",
+          "PyInstaller/loader/**/*.py"
+        ],
+        "count": 51,
+        "sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+        "expected_count": 51,
+        "expected_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826",
+        "marker_file_hashes": {
+          "bootloader/src/pyi_main.c": "19616e0a5982da96a27861bb9baca84c1b05d63625aea098962bfea85e6db43b",
+          "bootloader/src/pyi_launch.c": "50416af7e74b12a56f67cd360bfa46ed71770ac43629001eaa6d73c4e196880e",
+          "bootloader/src/pyi_dylib_python.c": "900996eac30595b5a474bd2ec3601ae0c5d1389f394979bbfca7f7a9313e67e7",
+          "bootloader/src/pyi_utils_win32_low_level.c": "ee6a6a0fef89d8c81af93185d97b116ad15618f2ef35c1c1cf78e30fdda5ff12",
+          "PyInstaller/loader/pyiboot01_bootstrap.py": "6773bb364344a01f176133f8624ddda9e8f992052eaddad32609b1e90399ef1f",
+          "PyInstaller/loader/pyimod03_ctypes.py": "a93c2ec1677cc5d77fa4c000136b9da36f61388f9536f2b1a66193b329d1f312"
+        }
+      },
+      "python_314_api": {
+        "source_name": "pyi_dylib_python.c",
+        "source_sha256": "900996eac30595b5a474bd2ec3601ae0c5d1389f394979bbfca7f7a9313e67e7",
+        "binding_header_name": "pyi_dylib_python.h",
+        "binding_header_sha256": "d48d06af326552360b9942350fa97e15cbdaa444ea3f3b8811e42c7c95424c45",
+        "selection": "PEP-741 path required by CPython 3.14.7",
+        "symbols": [
+          "Py_DecRef",
+          "Py_DecodeLocale",
+          "Py_Finalize",
+          "Py_IsInitialized",
+          "Py_PreInitialize",
+          "PyInitConfig_Create",
+          "PyInitConfig_Free",
+          "PyInitConfig_SetInt",
+          "PyInitConfig_SetStr",
+          "PyInitConfig_SetStrList",
+          "PyInitConfig_GetError",
+          "Py_InitializeFromInitConfig",
+          "PyErr_Clear",
+          "PyErr_Fetch",
+          "PyErr_NormalizeException",
+          "PyErr_Occurred",
+          "PyErr_Print",
+          "PyErr_Restore",
+          "PyEval_EvalCode",
+          "PyImport_AddModule",
+          "PyImport_ExecCodeModule",
+          "PyImport_ImportModule",
+          "PyList_Append",
+          "PyMarshal_ReadObjectFromString",
+          "PyMem_RawFree",
+          "PyModule_GetDict",
+          "PyObject_CallFunction",
+          "PyObject_CallFunctionObjArgs",
+          "PyObject_GetAttrString",
+          "PyObject_SetAttrString",
+          "PyObject_Str",
+          "PyPreConfig_InitIsolatedConfig",
+          "PyRun_SimpleStringFlags",
+          "PyStatus_Exception",
+          "PySys_GetObject",
+          "PySys_SetObject",
+          "PyUnicode_AsUTF8",
+          "PyUnicode_Decode",
+          "PyUnicode_DecodeFSDefault",
+          "PyUnicode_FromFormat",
+          "PyUnicode_FromString",
+          "PyUnicode_Join",
+          "PyUnicode_Replace"
+        ],
+        "symbol_count": 43,
+        "missing_exports": []
+      },
+      "build_driver": {
+        "role": "PyInstaller bootloader build driver",
+        "algorithm": "localcat.directory-input-sha256.v1",
+        "file_count": 157,
+        "bytes": 2114847,
+        "sha256": "2d1760251a66805f33fb96bc1b88595aab5785d29992e457be911b2ed0aa426e"
+      }
+    }
+  },
+  "entry_contract": {
+    "contract_file": {
+      "role": "frozen-entry target contract",
+      "name": "candidate-contract.json",
+      "bytes": 7640,
+      "sha256": "7afca48f82dbc0bdfce7a1dff52ef8706b08fa5cf6dea694fb6d693c9acad36d"
+    },
+    "runtime_abi": {
+      "module": "_localcat_frozen_bootstrap",
+      "protocol": "localcat.frozen-bootstrap-attestation.v1",
+      "authority_type": "FrozenBootstrapAuthority",
+      "state_machine": [
+        "CREATED",
+        "TAKEN",
+        "CLOSED"
+      ]
+    },
+    "patch": {
+      "base": {
+        "pyinstaller_version": "6.22.2",
+        "source_scan_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826"
+      },
+      "owned_existing_files": [
+        "bootloader/src/main.c",
+        "bootloader/src/pyi_dylib_python.c",
+        "bootloader/src/pyi_dylib_python.h",
+        "bootloader/src/pyi_launch.c",
+        "bootloader/src/pyi_launch.h",
+        "bootloader/src/pyi_main.c",
+        "bootloader/src/pyi_main.h",
+        "bootloader/src/pyi_pyconfig_pep741.c",
+        "bootloader/src/pyi_python.c",
+        "bootloader/src/pyi_utils_win32_low_level.c",
+        "bootloader/src/pyi_utils_win32_low_level.h",
+        "bootloader/src/pyi_win32_utils.c",
+        "bootloader/src/pyi_win32_utils.h",
+        "bootloader/wscript"
+      ],
+      "owned_new_files": [
+        "bootloader/src/localcat_frozen_bootstrap.c",
+        "bootloader/src/localcat_frozen_bootstrap.h",
+        "bootloader/src/localcat_frozen_entry.c",
+        "bootloader/src/localcat_frozen_entry.h",
+        "bootloader/src/localcat_manifest.c",
+        "bootloader/src/localcat_manifest.h",
+        "bootloader/src/localcat_native_closure.c",
+        "bootloader/src/localcat_native_closure.h",
+        "bootloader/src/localcat_rooted_io.c",
+        "bootloader/src/localcat_rooted_io.h",
+        "bootloader/src/localcat_sha256.c",
+        "bootloader/src/localcat_sha256.h"
+      ],
+      "series": [
+        {
+          "id": "entry-policy",
+          "scope": "E0-E2 DLL policy and rooted bundle entry"
+        },
+        {
+          "id": "manifest-and-hash",
+          "scope": "E3-E5 canonical manifest, SHA-256 and retained input proof"
+        },
+        {
+          "id": "native-closure",
+          "scope": "E4-E7 restricted native load and actual-module reproof"
+        },
+        {
+          "id": "bootstrap-handoff",
+          "scope": "E8-E11 exact C API, one-shot authority and source loader"
+        },
+        {
+          "id": "reproducible-build",
+          "scope": "MSVC/Waf flags, COMCTL32 removal and manifest embedding"
+        }
+      ],
+      "apply": {
+        "format": "git unified diff",
+        "order": "series order",
+        "precondition": "base source aggregate and every owned existing file digest match",
+        "conflict_result": "INVALID_INPUT",
+        "result": "realized-build lock records ordered patch and resulting source digests"
+      }
+    },
+    "build": {
+      "architecture": "x64",
+      "configuration": "release windowed onedir bootloader",
+      "compiler_required_flags": [
+        "/Brepro",
+        "/guard:cf",
+        "/MT",
+        "/O2",
+        "/WX"
+      ],
+      "linker_required_flags": [
+        "/Brepro",
+        "/DYNAMICBASE",
+        "/GUARD:CF",
+        "/HIGHENTROPYVA",
+        "/MACHINE:X64",
+        "/NXCOMPAT",
+        "/OPT:ICF",
+        "/OPT:REF",
+        "/SUBSYSTEM:WINDOWS",
+        "/WX"
+      ],
+      "debug_directory": "one IMAGE_DEBUG_TYPE_REPRO entry",
+      "security_directory": "absent"
+    },
+    "python_c_api": {
+      "base": "pinned PyInstaller CPython 3.14 PEP-741 binding path",
+      "base_signature_authority": "bootloader/src/pyi_dylib_python.h in the pinned PyInstaller source aggregate",
+      "function_symbols": [
+        "Py_DecRef",
+        "Py_DecodeLocale",
+        "Py_Finalize",
+        "Py_IsInitialized",
+        "Py_PreInitialize",
+        "PyInitConfig_Create",
+        "PyInitConfig_Free",
+        "PyInitConfig_SetInt",
+        "PyInitConfig_SetStr",
+        "PyInitConfig_SetStrList",
+        "PyInitConfig_GetError",
+        "Py_InitializeFromInitConfig",
+        "PyErr_Clear",
+        "PyErr_Fetch",
+        "PyErr_NormalizeException",
+        "PyErr_Occurred",
+        "PyErr_Print",
+        "PyErr_Restore",
+        "PyEval_EvalCode",
+        "PyImport_AddModule",
+        "PyImport_ExecCodeModule",
+        "PyImport_ImportModule",
+        "PyList_Append",
+        "PyMarshal_ReadObjectFromString",
+        "PyMem_RawFree",
+        "PyModule_GetDict",
+        "PyObject_CallFunction",
+        "PyObject_CallFunctionObjArgs",
+        "PyObject_GetAttrString",
+        "PyObject_SetAttrString",
+        "PyObject_Str",
+        "PyPreConfig_InitIsolatedConfig",
+        "PyRun_SimpleStringFlags",
+        "PyStatus_Exception",
+        "PySys_GetObject",
+        "PySys_SetObject",
+        "PyUnicode_AsUTF8",
+        "PyUnicode_Decode",
+        "PyUnicode_DecodeFSDefault",
+        "PyUnicode_FromFormat",
+        "PyUnicode_FromString",
+        "PyUnicode_Join",
+        "PyUnicode_Replace",
+        "PyBool_FromLong",
+        "PyBytes_FromStringAndSize",
+        "PyErr_SetString",
+        "PyInitConfig_AddModule",
+        "PyLong_FromLong",
+        "PyLong_FromUnsignedLongLong",
+        "PyModule_AddObjectRef",
+        "PyModule_Create2",
+        "PyObject_CallNoArgs",
+        "PyObject_Free",
+        "PyThreadState_Get",
+        "PyThreadState_GetInterpreter",
+        "PyThread_get_thread_ident",
+        "PyTuple_New",
+        "PyTuple_SetItem",
+        "PyType_FromSpec",
+        "PyType_GenericNew",
+        "Py_CompileStringExFlags",
+        "Py_IncRef"
+      ],
+      "additional_function_signatures": {
+        "PyBool_FromLong": "PyObject *(*)(long)",
+        "PyBytes_FromStringAndSize": "PyObject *(*)(const char *, Py_ssize_t)",
+        "PyErr_SetString": "void (*)(PyObject *, const char *)",
+        "PyInitConfig_AddModule": "int (*)(PyInitConfig *, const char *, PyObject *(*)(void))",
+        "PyLong_FromLong": "PyObject *(*)(long)",
+        "PyLong_FromUnsignedLongLong": "PyObject *(*)(unsigned long long)",
+        "PyModule_AddObjectRef": "int (*)(PyObject *, const char *, PyObject *)",
+        "PyModule_Create2": "PyObject *(*)(PyModuleDef *, int)",
+        "PyObject_CallNoArgs": "PyObject *(*)(PyObject *)",
+        "PyObject_Free": "void (*)(void *)",
+        "PyThreadState_Get": "PyThreadState *(*)(void)",
+        "PyThreadState_GetInterpreter": "PyInterpreterState *(*)(PyThreadState *)",
+        "PyThread_get_thread_ident": "unsigned long (*)(void)",
+        "PyTuple_New": "PyObject *(*)(Py_ssize_t)",
+        "PyTuple_SetItem": "int (*)(PyObject *, Py_ssize_t, PyObject *)",
+        "PyType_FromSpec": "PyObject *(*)(PyType_Spec *)",
+        "PyType_GenericNew": "PyObject *(*)(PyTypeObject *, PyObject *, PyObject *)",
+        "Py_CompileStringExFlags": "PyObject *(*)(const char *, const char *, int, PyCompilerFlags *, int)",
+        "Py_IncRef": "void (*)(PyObject *)"
+      },
+      "data_symbols": [
+        "PyExc_RuntimeError"
+      ],
+      "data_export_types": {
+        "PyExc_RuntimeError": "PyObject ** (address of exported PyObject * variable)"
+      },
+      "symbol_count": 63,
+      "missing_exports": []
+    },
+    "expected_pe": {
+      "base_stock_runw": {
+        "role": "pinned stock runw",
+        "name": "runw.exe",
+        "bytes": 282624,
+        "sha256": "87b0c589906a5d690c26c602bf2ee7e43b3eab55574bf72887a8ca07fbb2dba0",
+        "machine": 34404,
+        "import_table_sha256": "106fc8725a12024545b8dd9ae94360b66320e8a538c2a9e52274023ffb628f17"
+      },
+      "imports": [
+        {
+          "dll": "ADVAPI32.DLL",
+          "symbols": [
+            "ConvertSidToStringSidW",
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            "GetTokenInformation",
+            "OpenProcessToken"
+          ]
+        },
+        {
+          "dll": "GDI32.DLL",
+          "symbols": [
+            "CreateFontIndirectW",
+            "DeleteObject",
+            "SelectObject"
+          ]
+        },
+        {
+          "dll": "KERNEL32.DLL",
+          "symbols": [
+            "CloseHandle",
+            "CompareStringOrdinal",
+            "CompareStringW",
+            "CreateDirectoryW",
+            "CreateFileW",
+            "CreateProcessW",
+            "CreateSymbolicLinkW",
+            "CreateToolhelp32Snapshot",
+            "DeleteCriticalSection",
+            "DeleteFileW",
+            "DeviceIoControl",
+            "EncodePointer",
+            "EnterCriticalSection",
+            "ExitProcess",
+            "ExpandEnvironmentStringsW",
+            "FileTimeToSystemTime",
+            "FindClose",
+            "FindFirstFileExW",
+            "FindFirstFileW",
+            "FindNextFileW",
+            "FlsAlloc",
+            "FlsFree",
+            "FlsGetValue",
+            "FlsSetValue",
+            "FlushFileBuffers",
+            "FormatMessageW",
+            "FreeEnvironmentStringsW",
+            "FreeLibrary",
+            "GetACP",
+            "GetCPInfo",
+            "GetCommandLineA",
+            "GetCommandLineW",
+            "GetConsoleMode",
+            "GetConsoleOutputCP",
+            "GetCurrentDirectoryW",
+            "GetCurrentProcess",
+            "GetCurrentProcessId",
+            "GetCurrentThreadId",
+            "GetDriveTypeW",
+            "GetEnvironmentStringsW",
+            "GetEnvironmentVariableW",
+            "GetExitCodeProcess",
+            "GetFileAttributesExW",
+            "GetFileAttributesW",
+            "GetFileInformationByHandle",
+            "GetFileInformationByHandleEx",
+            "GetFileSizeEx",
+            "GetFileType",
+            "GetFinalPathNameByHandleW",
+            "GetFullPathNameW",
+            "GetLastError",
+            "GetModuleFileNameW",
+            "GetModuleHandleExW",
+            "GetModuleHandleW",
+            "GetOEMCP",
+            "GetProcAddress",
+            "GetProcessHeap",
+            "GetStartupInfoW",
+            "GetStdHandle",
+            "GetStringTypeW",
+            "GetSystemDirectoryW",
+            "GetSystemTimeAsFileTime",
+            "GetTempPathW",
+            "GetTimeZoneInformation",
+            "GetVolumeInformationByHandleW",
+            "HeapAlloc",
+            "HeapFree",
+            "HeapReAlloc",
+            "HeapSize",
+            "InitializeCriticalSectionAndSpinCount",
+            "InitializeCriticalSectionEx",
+            "InitializeSListHead",
+            "IsDebuggerPresent",
+            "IsProcessorFeaturePresent",
+            "IsValidCodePage",
+            "K32EnumProcessModules",
+            "K32GetModuleFileNameExW",
+            "LCMapStringW",
+            "LeaveCriticalSection",
+            "LoadLibraryExW",
+            "LocalFree",
+            "MulDiv",
+            "MultiByteToWideChar",
+            "OpenProcess",
+            "PeekNamedPipe",
+            "Process32FirstW",
+            "Process32NextW",
+            "QueryFullProcessImageNameW",
+            "QueryPerformanceCounter",
+            "QueryPerformanceFrequency",
+            "RaiseException",
+            "ReadConsoleW",
+            "ReadFile",
+            "RemoveDirectoryW",
+            "RtlCaptureContext",
+            "RtlLookupFunctionEntry",
+            "RtlPcToFileHeader",
+            "RtlUnwindEx",
+            "RtlVirtualUnwind",
+            "SetConsoleCtrlHandler",
+            "SetDefaultDllDirectories",
+            "SetEndOfFile",
+            "SetEnvironmentVariableW",
+            "SetErrorMode",
+            "SetFilePointerEx",
+            "SetLastError",
+            "SetStdHandle",
+            "SetUnhandledExceptionFilter",
+            "Sleep",
+            "SystemTimeToTzSpecificLocalTime",
+            "TerminateProcess",
+            "TlsAlloc",
+            "TlsFree",
+            "TlsGetValue",
+            "TlsSetValue",
+            "UnhandledExceptionFilter",
+            "VirtualProtect",
+            "WaitForSingleObject",
+            "WideCharToMultiByte",
+            "WriteConsoleW",
+            "WriteFile"
+          ]
+        },
+        {
+          "dll": "USER32.DLL",
+          "symbols": [
+            "CreateWindowExW",
+            "DefWindowProcW",
+            "DestroyIcon",
+            "DestroyWindow",
+            "DialogBoxIndirectParamW",
+            "DispatchMessageW",
+            "DrawTextW",
+            "EndDialog",
+            "GetClientRect",
+            "GetCursorPos",
+            "GetDC",
+            "GetDialogBaseUnits",
+            "GetMessageW",
+            "GetMonitorInfoW",
+            "GetSystemMetrics",
+            "GetWindowLongPtrW",
+            "InvalidateRect",
+            "MessageBoxA",
+            "MessageBoxW",
+            "MonitorFromPoint",
+            "MoveWindow",
+            "MsgWaitForMultipleObjects",
+            "PeekMessageW",
+            "PostMessageW",
+            "RegisterClassW",
+            "ReleaseDC",
+            "SendMessageW",
+            "SetWindowLongPtrW",
+            "ShowWindow",
+            "ShutdownBlockReasonCreate",
+            "SystemParametersInfoW",
+            "TranslateMessage"
+          ]
+        }
+      ],
+      "delay_imports": []
+    },
+    "expected_runtime_native_closure": {
+      "source": "runtime.cpython.native_closure",
+      "sha256": "6bc3e91fd2addabec2e61bf4826bd23268d1bb33bbbb203b22553649a100cb07"
+    },
+    "boot_tcb": {
+      "native_roles": [
+        "customized runw and tracked LocalCAT native sources",
+        "compiled-in manifest parser and SHA-256",
+        "python314.dll and its verified non-system native closure",
+        "compiled-in _localcat_frozen_bootstrap module"
+      ],
+      "python_roles": [
+        "exact-byte bootstrap and interpreter-start support set",
+        "one source-only critical module",
+        "one retained-handle fixture"
+      ],
+      "external_roles": [
+        "versioned Windows system DLL and API-set resolution evidence"
+      ]
+    },
+    "dynamic_loader": {
+      "non_system_dispatcher": "localcat_native_closure_load_verified",
+      "allowed_flags": [
+        "LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
+        "LOAD_LIBRARY_SEARCH_SYSTEM32"
+      ],
+      "pre_authority_external_calls": [
+        "LoadLibraryExW through localcat_native_closure_load_verified"
+      ]
+    }
+  },
+  "assertions": [
+    {
+      "id": "FROZEN_ENTRY.INPUT.TOOLCHAIN_MATERIALIZED",
+      "status": "PASS",
+      "detail": "Windows AMD64, complete Build Tools 2022, exact MSVC and SDK inputs are content-addressed"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.UPSTREAM_PINNED",
+      "status": "PASS",
+      "detail": "PyInstaller sdist and audited source aggregate match the approved pin"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.PYTHON_RUNTIME_PINNED",
+      "status": "PASS",
+      "detail": "CPython version, DLL identity, and AMD64 machine match the approved pin"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.STOCK_API_EXPORTS",
+      "status": "PASS",
+      "detail": "all CPython symbols selected by the pinned PyInstaller 3.14 path are exported"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.TARGET_API_EXPORTS",
+      "status": "PASS",
+      "detail": "the exact custom-entry Python function/data target is exported by the pinned DLL"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.ENTRY_IMPORT_TARGET",
+      "status": "PASS",
+      "detail": "the exact custom-entry import target is derived from the pinned stock runw and approved deltas"
+    },
+    {
+      "id": "FROZEN_ENTRY.INPUT.TOOLCHAIN_IMPORT_PROBE",
+      "status": "PASS",
+      "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
+    }
+  ],
+  "candidate_input_digest": "36bc2b9a9e7cd276319653d24f1c07856cc881a1f23e206d2f58f0bd2c6a3a7b",
+  "status": "MATERIALIZED"
+}

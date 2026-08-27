@@ -24,9 +24,9 @@
 | E5 | 预证明source/fixture closure | 在Python初始化前逐组件rooted open并保留bootstrap、解释器启动所需exact-byte代码、一个critical `.py`和一个fixture的handle，记录identity/digest；同时拒绝同名PYZ/`.pyc`/`__pycache__`、extra source及manifest dependency cycle |
 | E6 | 受限加载 | 每个非system DLL只能由E4受审dispatcher使用已证明绝对路径和`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`加载；不把多个`AddDllDirectory`目录的未规定顺序作为authority |
 | E7 | actual-module reproof | `GetModuleFileNameW(HMODULE)`取得实际pathname，在仍由no-write/no-delete root/source handles固定的同一parent下rooted reopen，再比较live FileId/final path与E4 retained handle；basename唯一性已由E3固定。任何`DllMain`后才发现的不一致仍判失败，不倒推出pre-load PASS |
-| E8 | 绑定Python C API并注册built-in | `python314.dll`不作为PE静态import；以`GetProcAddress`绑定获批的exact symbol table，在解释器初始化前调用`PyImport_AppendInittab("_localcat_w3_native", ...)`；任何缺失/额外symbol或注册失败均在此停止 |
-| E9 | 初始化isolated Python | 以`PyConfig_InitIsolatedConfig`、显式manifest-bound module paths和`Py_InitializeFromConfig`初始化；`use_environment=0`、`user_site_directory=0`、`site_import=0`、`safe_path=1`、`parse_argv=0`且不含checkout/CWD；该阶段不得到达E4未批准的native loader callsite |
-| E10 | 建立不可伪造handoff | import已在E8注册的compiled-in `_localcat_w3_native`，mint并take一个one-shot opaque extension authority；其内容绑定E4/E5/E7证明且不向Python返回raw HANDLE |
+| E8 | 绑定Python C API | `python314.dll`不作为PE静态import；以`GetProcAddress`绑定获批的exact symbol table并固定built-in init function；任何缺失/额外symbol均在此停止 |
+| E9 | 初始化isolated Python并注册built-in | CPython 3.14固定使用PEP 741 `PyInitConfig_Create`的isolated defaults，通过`PyInitConfig_AddModule("_localcat_frozen_bootstrap", ...)`注册built-in，设置显式manifest-bound module paths后调用`Py_InitializeFromInitConfig`；配置结果必须保持`use_environment=0`、`user_site_directory=0`、`site_import=0`、`safe_path=1`、`parse_argv=0`且不含checkout/CWD，注册或初始化失败均停止；该阶段不得到达E4未批准的native loader callsite |
+| E10 | 建立不可伪造handoff | import已在E9通过init config注册的compiled-in `_localcat_frozen_bootstrap`，mint并take一个one-shot opaque extension authority；其内容绑定E4/E5/E7证明且不向Python返回raw HANDLE |
 | E11 | 执行可信bootstrap与source-only module | bootstrap从E5 native retained handle读取并直接编译；随后`TrustedSourceLoader`以同一authority执行critical `.py`和读取fixture，逐次复核live identity/digest并保持duplicate拒绝 |
 
 E0属于process-entry前外部证明；E0.5必须证明compiler/CRT startup没有在policy前打开新的load surface；E1～E11由native trace与post-load inventory证明。任何Python runtime hook都晚于E9，不能代答E0～E8。`LdrRegisterDllNotification`最多作为trace/fail-fast telemetry：callback不能否决已开始的load，因此不得充当E4 enforcement。
@@ -42,7 +42,7 @@ build采用无自引用的两阶段manifest。第一阶段canonical **pre-link i
 - customized `runw.exe`及其tracked upstream source/patch、新增native rooted/hash/manifest/handoff代码；
 - embedded runtime-manifest schema/root digest；
 - `python314.dll`和解释器初始化前真实加载的全部非system native closure；
-- `_localcat_w3_native` built-in module与最小Python C API symbol table；
+- `_localcat_frozen_bootstrap` built-in module与最小Python C API symbol table；
 - exact-byte bootstrap、其解释器启动所需PyInstaller bootstrap/stdlib集合，以及这些代码的动态native roots；
 - 一个source-only critical module、一个fixture和对应manifest entries；
 - 版本化Windows system DLL/API-set allowlist与E0 external resolution evidence。
@@ -51,9 +51,9 @@ build采用无自引用的两阶段manifest。第一阶段canonical **pre-link i
 
 ## 4. Native→Python ABI
 
-ABI名为`localcat.w3.bootstrap-attestation.v1`，由compiled-in module单次mint并单次take为不可构造、不可序列化的opaque extension type `W3Authority`，不使用裸`PyCapsule`作为Python调用协议。native对象内部至少绑定：ABI version/size、bootloader build id、pre-link input manifest digest、bundle root identity、每个E4/E5 retained entry的role/FileId/digest、actual-module reproof结果和native trace digest。状态机固定为`CREATED → TAKEN → CLOSED`；仅创建它的主解释器及初始化线程可take，take后所有权转移给`TrustedSourceAuthority`，析构或显式close统一关闭handles。Python API只允许：
+ABI名为`localcat.frozen-bootstrap-attestation.v1`，由compiled-in module单次mint并单次take为不可构造、不可序列化的opaque extension type `FrozenBootstrapAuthority`，不使用裸`PyCapsule`作为Python调用协议。native对象内部至少绑定：ABI version/size、bootloader build id、pre-link input manifest digest、bundle root identity、每个E4/E5 retained entry的role/FileId/digest、actual-module reproof结果和native trace digest。状态机固定为`CREATED → TAKEN → CLOSED`；仅创建它的主解释器及初始化线程可take，take后所有权转移给`TrustedSourceAuthority`，析构或显式close统一关闭handles。Python API只允许：
 
-- `_localcat_w3_native.take_attestation()`：仅成功一次并返回`W3Authority`；重复、提前、错误线程/解释器或handoff缺失均失败；
+- `_localcat_frozen_bootstrap.take_attestation()`：仅成功一次并返回`FrozenBootstrapAuthority`；重复、提前、错误线程/解释器或handoff缺失均失败；
 - `authority.read_verified(entry_id)`：从既有retained handle读exact bytes并复核live identity/digest；
 - `authority.module_reproof(entry_id)`：返回native层对实际loaded module完成的只读证明；
 - `authority.close()`：统一关闭authority；close/析构后所有操作及已取得的loader引用都失败，不能按pathname恢复。
@@ -64,20 +64,22 @@ type名、指针cookie或Python对象identity都不是独立信任根；可信�
 
 选择MSVC x64静态bootloader路线，不使用MinGW/Cygwin。PyInstaller官方文档支持从sdist用Visual C++重建bootloader；MSVC路线可生成self-contained static executable，减少bootloader自身CRT DLL pre-entry闭包。
 
-| 输入 | Task 1.5选择 | 进入1.6前的pin要求 |
+| 输入 | 长期兼容线 | 当前及后续candidate进入1.6前的exact lock要求 |
 |---|---|---|
-| CPython | CPython 3.14.7 x64；`python314.dll` SHA-256 `0f9857ffdfe010fe6b99328d58c2e3c7472ce75f336bf9c2ad9bd5bca3bce700` | Python安装/embedded输入、DLL、import library与headers全部摘要 |
-| PyInstaller | 6.22.2 official sdist SHA-256 `89b65a3ad07d9dd5832253e37bc45f31872d10d7f9d5c9fd0fdd6088a83829dd`；audited source aggregate `e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826` | sdist、51-file bootloader/loader aggregate和applied patch digest一致 |
-| Compiler | Visual Studio 2022 Build Tools fixed release `17.14.39`（build `17.14.37614.0`），MSVC x64 component，release build，static CRT，`/guard:cf`、`/Brepro`、无debug directory | fixed bootstrapper/layout catalog、实际MSVC component/toolset version、`cl.exe`/`link.exe`及实际include/lib输入摘要写入toolchain lock |
-| Windows SDK | Windows 11 SDK `10.0.26100` API surface；首选已由VS 17.14 servicing提供的`10.0.26100.4188`包，只使用本计划列出的Win32 API | SDK package/catalog identity、headers/libs/`mt.exe`/`rc.exe`实际输入摘要写入lock；resolved package若不是所选版本先回到W3 |
-| Build driver | sdist内Waf及tracked build wrapper | Python executable、Waf source、arguments、environment projection与stdout/stderr入证据 |
-| Custom source | upstream source + repository tracked patch/new files | clean commit、逐文件摘要、patch apply结果、compiler/linker flags与resulting PE摘要 |
+| CPython | CPython 3.14.x x64；patch版本变化按维护边界重验 | 当前candidate固定3.14.7、`python314.dll` SHA-256 `0f9857ffdfe010fe6b99328d58c2e3c7472ce75f336bf9c2ad9bd5bca3bce700`，并摘要Python安装/embedded输入、DLL、import library与headers |
+| PyInstaller | PyInstaller 6.22.x official sdist；patch版本变化按维护边界重验 | 当前candidate固定6.22.2 sdist SHA-256 `89b65a3ad07d9dd5832253e37bc45f31872d10d7f9d5c9fd0fdd6088a83829dd`、51-file source aggregate `e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826`、patch owner file set及有序apply合同 |
+| Compiler | candidate获批时受Microsoft支持、且与锁定PyInstaller source兼容的Visual Studio Build Tools MSVC x64 toolset；release build、static CRT、`/guard:cf`、`/Brepro`；PE Debug Directory固定为单一`IMAGE_DEBUG_TYPE_REPRO`，不生成CodeView/PDB | candidate构建前固定支持来源/核验日期、bootstrapper/offline layout或等价安装catalog、实际VS product/build、MSVC component/toolset、`cl.exe`/`link.exe`及实际include/lib输入摘要；每次clean build preflight重新摘要实际输入并与同一lock比较 |
+| Windows SDK | candidate获批时受支持、与所选MSVC及目标Windows版本兼容且提供本计划所需Win32 API的Windows SDK | candidate构建前固定支持来源/核验日期、SDK package/catalog identity、实际版本及headers/libs/`mt.exe`/`rc.exe`输入摘要；每次clean build preflight重新摘要实际输入并与同一lock比较，SDK变化形成新candidate并回到W3重验 |
+| Build driver | sdist内Waf及tracked build wrapper | producer Python source/native base runtime、独立venv语义与launcher、实际`pefile` source/version metadata、`vswhere.exe`、Waf source、arguments、净化environment projection与stdout/stderr入证据；wrapper复制无build cache的pristine source后、Waf运行前先摘要实际build-copy的完整bootloader build-driver输入，再按请求版本现场建立vcvars环境，核对`cl/link/rc/mt`解析路径并重建stock probe，只以exact import-table delta约束candidate，不把非`/Brepro` probe字节当发行authority |
+| Custom source | upstream source + repository tracked patch/new files | 1.5固定owner file scope、patch series顺序、apply/冲突规则与编译链接合同；1.6记录clean commit、逐文件摘要、applied patch digest、compiler/linker flags与resulting PE摘要 |
 
-当前host未安装compiler或Windows SDK，因此所选fixed release的bootstrapper/layout、resolved component版本与逐文件摘要尚未materialize。本文只能先确认候选路线和pin schema；**Task 1.5保持未完成且不得批准**，直至同一W3 review拿到materialized toolchain lock、applied patch digest、exact Python C API symbol table、完整pre-authority TCB/native dependency inventory和下述system allowlist。1.6不能接收“开始后再补”的lock。
+每个candidate使用本机或CI上按上表在**构建前**materialize并由同一W3 review批准的实际工具链，以candidate-input lock唯一标识；工具链升级建立新lock和新candidate。Task 1.5在materialized compiler/SDK/tool摘要、upstream/runtime摘要、patch owner/apply合同、exact Python C API目标表、pre-authority TCB边界和下述expected PE/system allowlist齐备并获批后完成。Task 1.6在W1 rooted contract冻结后实现并应用完整patch，生成applied patch/source digest、resulting PE、realized C API绑定表、实际native dependency inventory与PE/system allowlist，并将它们写入realized-build lock；任一结果偏离1.5合同即回到W3。最终用户运行profile只包含发行runtime。
+
+candidate-input lock只收录构建前已materialize的输入与获批目标合同，realized-build lock收录同一candidate的applied source和构建事实；两者通过candidate-input digest绑定，且realized API、import、dynamic-root与TCB边界必须是目标合同的精确实现。
 
 ### 5.1 PE/system allowlist boundary
 
-proposed custom `runw.exe`自身E0 static import只允许`KERNEL32.DLL`、`ADVAPI32.DLL`、`GDI32.DLL`、`USER32.DLL`；`COMCTL32.DLL`必须消除。API-set名称只在materialized PE inventory逐项列出并证明解析到获批System32/KnownDLL host后才允许。Python DLL、其非system依赖和每个system/API-set传递成员必须从实际locked binary递归生成exact allowlist；compiler生成任何额外import、delay import或manifest dependency即阻断1.5，而不是扩张通配allowlist。当前host的KnownDLLs观察仅是scout输入，不替代目标profile上的external resolution proof。
+proposed custom `runw.exe`自身E0 expected static import只允许`KERNEL32.DLL`、`ADVAPI32.DLL`、`GDI32.DLL`、`USER32.DLL`；`COMCTL32.DLL`必须消除。1.5从获批source/link合同固定exact name/symbol allowlist，并从锁定Python DLL及其非system依赖递归生成runtime expected allowlist。1.6从resulting PE生成realized static/delay/manifest inventory，逐项证明API-set解析到获批System32/KnownDLL host；compiler产生任何额外import、delay import或manifest dependency均回到W3，而不是扩张通配allowlist。当前host的KnownDLLs观察仅是scout输入，不替代目标profile上的external resolution proof。
 
 pre-authority动态加载首版采用“**可达调用点闭包**”而非OS级全局拦截：custom dispatcher是唯一获准的非system loader callsite；CRT、Python DLL `DllMain`、CPython初始化到E10之间的可达源码/反汇编与startup trace必须证明不会调用其他`LoadLibrary*`/`LdrLoadDll`/delay helper或native extension import。无法证明的binary/callsite直接NO-GO；E7 post-load inventory或loader notification不能追认。完整Task 7若Qt/PySide6/SQLite引入新的pre-authority callsite，须扩展同一闭包并重回W3。
 
@@ -98,7 +100,7 @@ pre-authority动态加载首版采用“**可达调用点闭包**”而非OS级�
 | `W3.CUSTOM.FIXTURE_EXACT_BYTES` | fixture missing/tamper/swap | 只从retained handle读取，digest/identity错误失败 |
 | `W3.CUSTOM.NONREPO_CWD` | 无checkout、净化`PATH/PYTHONPATH/Qt`、非仓库CWD | spike正常PASS且无checkout/CWD read |
 | `W3.CUSTOM.FAILURE_DIAGNOSTIC` | windowed pre-Python、bootstrap、loader各阶段失败 | 产生稳定无正文诊断marker，进程非零退出，不静默成功 |
-| `W3.CUSTOM.REPRODUCIBLE_INPUTS` | 两个clean build重放toolchain lock | input/runtime/release manifest与patch一致；规范化只允许清零COFF `TimeDateStamp`和OptionalHeader `CheckSum`，要求无Debug/Security Directory，剩余PE/dist bytes完全一致，否则失败 |
+| `W3.CUSTOM.REPRODUCIBLE_INPUTS` | 两个clean build重放toolchain lock | input/runtime/release manifest与patch一致；PE无Security Directory，Debug Directory只有单一`IMAGE_DEBUG_TYPE_REPRO`且无CodeView/PDB/其他entry；两个PE/dist bytes完全一致，否则失败 |
 
 1.6只有上述全部mandatory断言在同一custom entry build上PASS才完成。普通PyInstaller build成功、Qt窗口出现、source lane通过或单一positive smoke均不能替代此矩阵。
 
