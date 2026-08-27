@@ -27,8 +27,8 @@
 
 本节是一次独立、人工批准的cross-Spec delivery-staging amendment：它只把WA-01～08已批准的Windows source与frozen验收拆成累计阶段，不删除功能、不改变owner、W1/W2/W3 authority、public capability或ADR-022最终发行门。因为没有改写既有WA合同delta，它不替换`dispatch_request_revision`；但它对实际触及的owning Requirements/Design/Tasks另有下方逐owner acknowledgement，不以Windows ledger的一句说明冒充owner批准。source实现可先形成可追踪commit/merge/evidence并登记`SOURCE_MERGED_PASS`，同一WA row只有在post-build frozen revalidation与最终consumer journey闭合后才能进入terminal `MERGED_PASS`。
 
-- **Source lane**：`C1S → C2 → C3 → C4S → C5S/C6S → platform 6.6a launcher → WA-08 5.4a → platform 6.6b`。它使用用户安装的CPython 3.14 x64、专用venv、`requirements-ui.txt`与受审source tree；轻量Windows GUI入口只启动外部`pythonw.exe`/source bootstrap，不是发行profile且不铸造`TrustedSourceAuthority`。
-- **Frozen lane**：W3 custom in-process entry计划可立即进行，gate-quality spike等待W1 rooted contract/invariants冻结；spike全PASS后先合并pre-build roots/WA-07 3.6a并生成发行候选，候选通过7.4后才运行各owner packaged revalidation，最后由WA-08 frozen journey汇合最终EXE gate。
+- **Source lane**：`C1S → C2 → C3A → C3B → C4S → C5S/C6S → platform 6.6a launcher → WA-08 5.4a → platform 6.6b`。它使用用户安装的CPython 3.14 x64、专用venv、`requirements-ui.txt`与受审source tree；轻量Windows GUI入口只启动外部`pythonw.exe`/source bootstrap，不是发行profile且不铸造`TrustedSourceAuthority`。
+- **Frozen lane**：W3 custom in-process entry计划可立即进行；gate-quality spike严格按`platform 2.1→2.2→2.3→2.4→3.1→3.2`进入。3.2所属C3A形成已审查的稳定提交锚后，C1F可与C3B（3.3～3.7）并行。spike全PASS后先合并pre-build roots/WA-07 3.6a并生成发行候选，候选通过7.4后才运行各owner packaged revalidation，最后由WA-08 frozen journey汇合最终EXE gate。
 - **Diagnostic onedir**：可用于hook/resource/Qt布局诊断，但必须标记`NO_AUTHORITY/NOT_FOR_RELEASE`，不得改变WA状态、CapabilityHost authority或release matrix。
 
 | Dispatch | Source phase | Frozen pre-build | Frozen post-build |
@@ -120,6 +120,7 @@ W1 + Steering ownership
 [WA-06S + source authority] -> WA-07S Feature5/UI -> platform 6.6a launcher -> WA-08S -> platform 6.6b milestone
 
 W3 custom plan || source lane
+[platform 2.1 -> 2.2 -> 2.3 -> 2.4 -> 3.1 -> 3.2] -> [W3 custom spike || platform 3.3 -> 3.7]
 [W3 custom spike PASS + source owner merges] -> WA-07 3.6a + pre-build roots
   -> manifest/handoff/build -> platform 7.4 candidate
   -> WA-01F/02F/04F/05F/06F + WA-07 post-build revalidation
