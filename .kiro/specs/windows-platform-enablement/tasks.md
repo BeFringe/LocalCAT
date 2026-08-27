@@ -106,7 +106,7 @@
 
 - [ ] 1F. 规划并验证W3 custom in-process entry可行性
 
-- [ ] 1.5 重新批准W3 custom in-process entry计划
+- [x] 1.5 重新批准W3 custom in-process entry计划
   - 固定同一进程真实entry、本机或CI受支持MSVC x64/Windows SDK的candidate选择与构建前candidate-input lock、PyInstaller source pin与patch owner/apply合同、expected PE/system allowlist、manifest parser/hash最小TCB、retained-handle→restricted load→actual-module reproof、native→Python handoff ABI、exact-source loader import order和升级维护边界
   - 审批输入为`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch、E0～E11 entry顺序、领域语义命名的one-shot opaque extension ABI、无自引用的pre-link/runtime/post-build manifests、MSVC x64 candidate lock schema及14项mandatory spike矩阵；W3只保留为治理/证据ID，不进入产品runtime ABI命名
   - 明确轻量source launcher与父wrapper均不属于W3 boot entry；保持ADR-022唯一bootstrap authority、onedir profile、source proof和全部fail-closed要求，不用本任务新增第二发行权威

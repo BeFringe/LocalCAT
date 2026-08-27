@@ -1,6 +1,6 @@
 # W3 custom in-process entry reapproval plan
 
-- **状态**：DRAFT — awaiting W3 reapproval
+- **状态**：APPROVED — authorizes Task 1.6 minimal spike preparation only
 - **Task**：`windows-platform-enablement` 1.5
 - **上游事实**：Task 1.4 已证明 stock PyInstaller 6.22.2 `runw.exe` 六项 mandatory 断言全部失败
 - **实施授权**：本文获批只允许准备 Task 1.6 最小 spike；不授权 Task 7、frozen WA merge 或发行
