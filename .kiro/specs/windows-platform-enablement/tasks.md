@@ -107,10 +107,10 @@
 - [ ] 1F. 规划并验证W3 custom in-process entry可行性
 
 - [ ] 1.5 重新批准W3 custom in-process entry计划
-  - 固定同一进程真实entry、编译器/Windows SDK/PyInstaller source与patch pin、PE/system allowlist、manifest parser/hash最小TCB、retained-handle→restricted load→actual-module reproof、native→Python handoff ABI、exact-source loader import order和升级维护边界
-  - 审批输入为`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch、E0～E11 entry顺序、one-shot opaque extension ABI、无自引用的pre-link/runtime/post-build manifests、MSVC x64 toolchain pin及14项mandatory spike矩阵
+  - 固定同一进程真实entry、本机或CI受支持MSVC x64/Windows SDK的candidate选择与构建前candidate-input lock、PyInstaller source pin与patch owner/apply合同、expected PE/system allowlist、manifest parser/hash最小TCB、retained-handle→restricted load→actual-module reproof、native→Python handoff ABI、exact-source loader import order和升级维护边界
+  - 审批输入为`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch、E0～E11 entry顺序、领域语义命名的one-shot opaque extension ABI、无自引用的pre-link/runtime/post-build manifests、MSVC x64 candidate lock schema及14项mandatory spike矩阵；W3只保留为治理/证据ID，不进入产品runtime ABI命名
   - 明确轻量source launcher与父wrapper均不属于W3 boot entry；保持ADR-022唯一bootstrap authority、onedir profile、source proof和全部fail-closed要求，不用本任务新增第二发行权威
-  - 完成时，materialized compiler/SDK/tool摘要、applied patch digest、exact Python C API表、完整pre-authority TCB/native closure与PE/system allowlist均进入lock并连同Design/Tasks/攻击矩阵获W3 reapproval；当前host缺少compiler/SDK时保持未完成。本任务可与source lane并行，但不授权Task 7或frozen WA merge
+  - 完成时，由本机或CI在candidate构建前materialize的compiler/SDK/tool与upstream/runtime摘要、patch owner/apply合同、exact Python C API目标表、pre-authority TCB边界及expected native/PE/system allowlist均进入candidate-input lock，并连同Design/Tasks/攻击矩阵获W3 reapproval；本任务可与source lane并行，1.6从该批准状态开始
   - _Requirements: 10.1, 10.3, 10.6, 11.1, 12.3_
   - _Boundary: W3 Custom Entry Reapproval_
   - _Depends: 1.4_
@@ -118,6 +118,7 @@
 - [ ] 1.6 在W1 rooted contract冻结后完成custom entry最小W3 spike
   - 仅构建已批准完整Boot TCB、一个source-only critical module和一个fixture；在首次Python DLL/非KnownDLL load前闭合搜索、递归native closure与retained-handle proof，load后复核actual module identity并完成不可伪造handoff
   - `TrustedSourceLoader`只从retained verified handle读取manifest匹配的exact bytes并直接编译执行，attestation/digest与metadata一致且无`.pyc`/`__pycache__`/PYZ duplicate；覆盖未声明dynamic load、顶层/传递DLL注入、非仓库CWD、reparse/swap/manifest/source tamper
+  - 生成applied patch/source digest、resulting PE、realized Python C API绑定表、实际native dependency inventory与PE/system allowlist并写入candidate-input digest绑定的realized-build lock；任一结果偏离1.5合同即回到W3
   - 完成时全部mandatory断言PASS并保存content-addressed toolchain/dist inventory；任一失败继续保持W3、frozen WA与Task 7 NO-GO，不影响source milestone
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.1, 12.3_
   - _Boundary: W3 Custom Minimal Frozen Feasibility Gate_

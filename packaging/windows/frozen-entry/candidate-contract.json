@@ -1,0 +1,229 @@
+{
+  "schema": "localcat.windows-frozen-entry-target-contract.v1",
+  "runtime_abi": {
+    "module": "_localcat_frozen_bootstrap",
+    "protocol": "localcat.frozen-bootstrap-attestation.v1",
+    "authority_type": "FrozenBootstrapAuthority",
+    "state_machine": [
+      "CREATED",
+      "TAKEN",
+      "CLOSED"
+    ]
+  },
+  "patch": {
+    "base": {
+      "pyinstaller_version": "6.22.2",
+      "source_scan_sha256": "e9815b1301b5aaa706b44b55ee49c2348511b8d8c92f1dcc86a2b41602cb4826"
+    },
+    "owned_existing_files": [
+      "bootloader/src/main.c",
+      "bootloader/src/pyi_dylib_python.c",
+      "bootloader/src/pyi_dylib_python.h",
+      "bootloader/src/pyi_launch.c",
+      "bootloader/src/pyi_launch.h",
+      "bootloader/src/pyi_main.c",
+      "bootloader/src/pyi_main.h",
+      "bootloader/src/pyi_pyconfig_pep741.c",
+      "bootloader/src/pyi_python.c",
+      "bootloader/src/pyi_utils_win32_low_level.c",
+      "bootloader/src/pyi_utils_win32_low_level.h",
+      "bootloader/src/pyi_win32_utils.c",
+      "bootloader/src/pyi_win32_utils.h",
+      "bootloader/wscript"
+    ],
+    "owned_new_files": [
+      "bootloader/src/localcat_frozen_bootstrap.c",
+      "bootloader/src/localcat_frozen_bootstrap.h",
+      "bootloader/src/localcat_frozen_entry.c",
+      "bootloader/src/localcat_frozen_entry.h",
+      "bootloader/src/localcat_manifest.c",
+      "bootloader/src/localcat_manifest.h",
+      "bootloader/src/localcat_native_closure.c",
+      "bootloader/src/localcat_native_closure.h",
+      "bootloader/src/localcat_rooted_io.c",
+      "bootloader/src/localcat_rooted_io.h",
+      "bootloader/src/localcat_sha256.c",
+      "bootloader/src/localcat_sha256.h"
+    ],
+    "series": [
+      {
+        "id": "entry-policy",
+        "scope": "E0-E2 DLL policy and rooted bundle entry"
+      },
+      {
+        "id": "manifest-and-hash",
+        "scope": "E3-E5 canonical manifest, SHA-256 and retained input proof"
+      },
+      {
+        "id": "native-closure",
+        "scope": "E4-E7 restricted native load and actual-module reproof"
+      },
+      {
+        "id": "bootstrap-handoff",
+        "scope": "E8-E11 exact C API, one-shot authority and source loader"
+      },
+      {
+        "id": "reproducible-build",
+        "scope": "MSVC/Waf flags, COMCTL32 removal and manifest embedding"
+      }
+    ],
+    "apply": {
+      "format": "git unified diff",
+      "order": "series order",
+      "precondition": "base source aggregate and every owned existing file digest match",
+      "conflict_result": "INVALID_INPUT",
+      "result": "realized-build lock records ordered patch and resulting source digests"
+    }
+  },
+  "build": {
+    "architecture": "x64",
+    "configuration": "release windowed onedir bootloader",
+    "compiler_required_flags": [
+      "/Brepro",
+      "/guard:cf",
+      "/MT",
+      "/O2",
+      "/WX"
+    ],
+    "linker_required_flags": [
+      "/Brepro",
+      "/DYNAMICBASE",
+      "/GUARD:CF",
+      "/HIGHENTROPYVA",
+      "/MACHINE:X64",
+      "/NXCOMPAT",
+      "/OPT:ICF",
+      "/OPT:REF",
+      "/SUBSYSTEM:WINDOWS",
+      "/WX"
+    ],
+    "debug_directory": "one IMAGE_DEBUG_TYPE_REPRO entry",
+    "security_directory": "absent"
+  },
+  "python_c_api": {
+    "base": "PyInstaller 6.22.2 CPython 3.14 PEP-741 binding path",
+    "base_signature_authority": "bootloader/src/pyi_dylib_python.h in the pinned PyInstaller source aggregate",
+    "additional_functions": [
+      "PyBool_FromLong",
+      "PyBytes_FromStringAndSize",
+      "PyErr_SetString",
+      "PyInitConfig_AddModule",
+      "PyLong_FromLong",
+      "PyLong_FromUnsignedLongLong",
+      "PyModule_AddObjectRef",
+      "PyModule_Create2",
+      "PyObject_CallNoArgs",
+      "PyObject_Free",
+      "PyThreadState_Get",
+      "PyThreadState_GetInterpreter",
+      "PyThread_get_thread_ident",
+      "PyTuple_New",
+      "PyTuple_SetItem",
+      "PyType_FromSpec",
+      "PyType_GenericNew",
+      "Py_CompileStringExFlags",
+      "Py_IncRef"
+    ],
+    "function_signatures": {
+      "PyBool_FromLong": "PyObject *(*)(long)",
+      "PyBytes_FromStringAndSize": "PyObject *(*)(const char *, Py_ssize_t)",
+      "PyErr_SetString": "void (*)(PyObject *, const char *)",
+      "PyInitConfig_AddModule": "int (*)(PyInitConfig *, const char *, PyObject *(*)(void))",
+      "PyLong_FromLong": "PyObject *(*)(long)",
+      "PyLong_FromUnsignedLongLong": "PyObject *(*)(unsigned long long)",
+      "PyModule_AddObjectRef": "int (*)(PyObject *, const char *, PyObject *)",
+      "PyModule_Create2": "PyObject *(*)(PyModuleDef *, int)",
+      "PyObject_CallNoArgs": "PyObject *(*)(PyObject *)",
+      "PyObject_Free": "void (*)(void *)",
+      "PyThreadState_Get": "PyThreadState *(*)(void)",
+      "PyThreadState_GetInterpreter": "PyInterpreterState *(*)(PyThreadState *)",
+      "PyThread_get_thread_ident": "unsigned long (*)(void)",
+      "PyTuple_New": "PyObject *(*)(Py_ssize_t)",
+      "PyTuple_SetItem": "int (*)(PyObject *, Py_ssize_t, PyObject *)",
+      "PyType_FromSpec": "PyObject *(*)(PyType_Spec *)",
+      "PyType_GenericNew": "PyObject *(*)(PyTypeObject *, PyObject *, PyObject *)",
+      "Py_CompileStringExFlags": "PyObject *(*)(const char *, const char *, int, PyCompilerFlags *, int)",
+      "Py_IncRef": "void (*)(PyObject *)"
+    },
+    "data_exports": [
+      "PyExc_RuntimeError"
+    ],
+    "data_export_types": {
+      "PyExc_RuntimeError": "PyObject ** (address of exported PyObject * variable)"
+    }
+  },
+  "pe_allowlist": {
+    "base_stock_runw_sha256": "87b0c589906a5d690c26c602bf2ee7e43b3eab55574bf72887a8ca07fbb2dba0",
+    "compiler_probe": {
+      "purpose": "selected-toolchain pristine stock rebuild import-table observation; probe PE bytes are not candidate authority",
+      "import_table_sha256": "e237bbe5956ae2c64a8b133f9285c46b65e72a163dfee2d5c691adec67942b83",
+      "added_symbols": {
+        "KERNEL32.DLL": [
+          "InitializeCriticalSectionAndSpinCount",
+          "TlsAlloc",
+          "TlsFree",
+          "TlsGetValue",
+          "TlsSetValue"
+        ]
+      },
+      "removed_symbols": {}
+    },
+    "expected_dll_names": [
+      "ADVAPI32.DLL",
+      "GDI32.DLL",
+      "KERNEL32.DLL",
+      "USER32.DLL"
+    ],
+    "remove_dlls": [
+      "COMCTL32.DLL"
+    ],
+    "remove_symbols": {
+      "KERNEL32.DLL": [
+        "SetDllDirectoryW"
+      ]
+    },
+    "add_symbols": {
+      "KERNEL32.DLL": [
+        "CompareStringOrdinal",
+        "DeviceIoControl",
+        "GetFileAttributesW",
+        "GetFileInformationByHandleEx",
+        "GetFinalPathNameByHandleW",
+        "GetSystemDirectoryW",
+        "GetVolumeInformationByHandleW",
+        "InitializeCriticalSectionAndSpinCount",
+        "SetDefaultDllDirectories",
+        "TlsAlloc",
+        "TlsFree",
+        "TlsGetValue",
+        "TlsSetValue"
+      ]
+    }
+  },
+  "dynamic_loader": {
+    "non_system_dispatcher": "localcat_native_closure_load_verified",
+    "allowed_flags": [
+      "LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
+      "LOAD_LIBRARY_SEARCH_SYSTEM32"
+    ],
+    "pre_authority_external_calls": [
+      "LoadLibraryExW through localcat_native_closure_load_verified"
+    ]
+  },
+  "boot_tcb": {
+    "native_roles": [
+      "customized runw and tracked LocalCAT native sources",
+      "compiled-in manifest parser and SHA-256",
+      "python314.dll and its verified non-system native closure",
+      "compiled-in _localcat_frozen_bootstrap module"
+    ],
+    "python_roles": [
+      "exact-byte bootstrap and interpreter-start support set",
+      "one source-only critical module",
+      "one retained-handle fixture"
+    ],
+    "external_roles": [
+      "versioned Windows system DLL and API-set resolution evidence"
+    ]
+  }
+}
