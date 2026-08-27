@@ -124,9 +124,9 @@
   - _Boundary: W3 Custom Minimal Frozen Feasibility Gate_
   - _Depends: 1.5, 2.1, 3.2_
 
-- [ ] 2. 建立共享平台合同与 POSIX parity adapter
+- [x] 2. 建立共享平台合同与 POSIX parity adapter
 
-- [ ] 2.1 定义 backend-neutral authority、identity、lock、publish 与 private proof 合同
+- [x] 2.1 定义 backend-neutral authority、identity、lock、publish 与 private proof 合同
   - 实现context-managed opaque authorities、live-only`FileObjectIdentity`、opaque private-proof port、`PublishMode`/`PublishFacts`、跨owner durable commit保持retained destination的`PendingPublication`与stable`PlatformFileError`；`begin_publish`不得返回success，平台合同不得把business phase/generation/compatibility合并成generic receipt
   - 禁止上层取得 raw HANDLE/dirfd，禁止 platform API宣称 expected-target CAS，关闭后 authority 不可复用
   - 完成时，shape/type/name/error/closed-handle与非法组合合同 tests 全绿
@@ -134,7 +134,7 @@
   - _Boundary: Platform File Contracts_
   - _Depends: 1.2, 1.3_
 
-- [ ] 2.2 固定现有 POSIX 行为的 characterization matrix
+- [x] 2.2 固定现有 POSIX 行为的 characterization matrix
   - 在迁移前记录 Parser/Chunk/Project/Resource/TMX/TM 的 success/error/receipt/recovery bytes与 macOS/Linux支持条件
   - 覆盖 openat/dirfd/O_NOFOLLOW/flock/file+directory fsync、candidate/readback/LKG 和 direct-import boundaries
   - 完成时，矩阵能区分 business invariant 与 POSIX implementation fact，后续 adapter parity 有唯一 oracle
@@ -142,7 +142,7 @@
   - _Boundary: POSIX Characterization Baseline_
   - _Depends: 2.1_
 
-- [ ] 2.3 把 POSIX primitives 迁入唯一 adapter并保持语义
+- [x] 2.3 把 POSIX primitives 迁入唯一 adapter并保持语义
   - 将 `fcntl`、dirfd/openat/no-follow、pread、file/directory fsync 封装进 `platform_fs_posix.py`；纯合同/composition模块在 Windows import 时不加载 POSIX module
   - 保持已固定 public codes、receipt/recovery和 fail-closed behavior，不借重构改变业务 authority
   - 完成时，共享 contract tests 与任务 2.2 characterization 全绿，Mac/Linux consumer diff可追踪到相邻 amendments
@@ -150,7 +150,7 @@
   - _Boundary: POSIX Platform Adapter_
   - _Depends: 2.2_
 
-- [ ] 2.4 实现 fail-closed composition factory 与 backend self-probe
+- [x] 2.4 实现 fail-closed composition factory 与 backend self-probe
   - factory只在 OS/volume/backend contract gate通过后返回 capability；Windows不得导入 POSIX adapter，POSIX不得导入 Win32 API
   - 未知平台、unsupported volume、structure/API/self-probe失败映射稳定 capability error，不以布尔常量或 fallback path I/O开放能力
   - 完成时，import graph/AST、factory matrix和 fault seam均证明没有隐藏 authority
