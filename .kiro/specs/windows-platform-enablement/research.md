@@ -68,6 +68,11 @@
 - CPython 3.14目标表由PyInstaller PEP 741实际43-symbol路径和custom extension 19个function/1个data export组成，共63项且全部由锁定`python314.dll`导出；base binding header摘要、19个新增function签名与data export地址类型均进入exact合同，built-in注册统一使用`PyInitConfig_AddModule`。expected E0 import表从锁定stock `runw`逐symbol派生，删除`COMCTL32`和`SetDllDirectoryW`后只保留四个获批system DLL并加入rooted/identity/policy及所选MSVC代码生成所需Kernel32 API；realized import与native closure由1.6产物复核。
 - 同一materialized MSVC/SDK已从官方sdist现场构建`run/run_d/runw/runw_d`；candidate lock只把该stock rebuild的AMD64、无delay-import、exact import-table与相对官方stock的五项compiler-generated symbol delta作为1.5选择事实，不把未使用`/Brepro`的probe PE bytes当发行authority。custom patch、固定编译/链接flag、双clean build byte identity与完整能力结论仍由1.6 mandatory matrix给出。
 
+### Implement Notes — Task 3 Windows rooted authority（2026-08-28）
+
+- `GetVolumeInformationByHandleW`可直接查询保留的目录与Volume GUID根目录handle；本机对去除尾随分隔符的Volume GUID设备路径不能直接建立同类目录authority。`FILE_ID_INFO`的64-bit volume identity与`GetVolumeInformationByHandleW`的DWORD serial保持分域，不截断比较；storage device/cache事实继续由独立host gate查询，未知事实映射为durability不可用。
+- Win32文档化接口没有等价`openat(parent_handle, name)`的逐组件入口；首版因此从drive root构造Volume GUID累计路径，对每个组件执行no-follow ENTRY_PROBE并与随后保留的directory handle比较live identity，完整保留root chain，采用exact final-path spelling策略。真实junction、symlink、intermediate swap、ancestor rename与share矩阵均在正文读取前稳定关闭逃逸；本阶段不需要转向未文档化native API。
+
 ## Codebase Gap Analysis
 
 ### 现有边界与可复用资产

@@ -50,6 +50,8 @@ Layer 1 resource / termbase / canonical TM storage
 ├── platform_fs.py                # fail-closed 平台 backend 组合与只读 self-probe
 ├── platform_fs_contracts.py      # backend-neutral rooted/identity/lock/publish/private authority 合同叶
 ├── platform_fs_posix.py          # POSIX rooted/lock/publish/private adapter 与唯一 fcntl 生产边界
+├── platform_fs_windows.py        # Windows 主机门与逐组件 retained-handle rooted authority
+├── windows_file_api.py           # Win32 ctypes ABI、错误归一化与 RAII handle 边界
 ├── resource_repository.py       # 资源清单和受控本地文件
 ├── workspace_state.py           # legacy/复合最近项目断点、显示/TM 与设备本地预处理偏好
 ├── resource_importer.py         # TMX/CSV/XLSX Application policy 与事务导入
@@ -162,6 +164,9 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_platform_fs_composition.py`：平台组合 import graph、能力门、backend shape、self-probe 与稳定失败矩阵。
 - `tests/test_platform_fs_posix.py`：POSIX adapter rooted chain、candidate/publish、flock、private proof、fault cleanup 与 Windows 隔离导入。
 - `tests/test_platform_fs_posix_characterization.py`：POSIX 历史 tree、业务 oracle method、32 个 direct/deferred boundary 与平台执行语义守卫。
+- `tests/test_windows_file_api.py`：Win32 ABI、函数签名、错误映射与 handle 生命周期。
+- `tests/test_platform_fs_windows.py`：Windows host/volume/storage capability 与 durability gate。
+- `tests/test_platform_fs_windows_rooted.py`：Windows rooted chain、sealed read、reparse/swap/share 与清理竞态。
 - `tests/test_macos_app_launcher.py`：Finder/LaunchServices identity、cwd-independent bootstrap、atomic replacement 与失效路径。
 - `tests/test_tm_schema_upgrade_module_boundaries.py`：schema-upgrade 依赖方向、owner 权威与 late-bound 兼容接缝。
 - `tests/test_tm_snapshot_artifacts_module_boundaries.py`：snapshot artifact 依赖方向、owner 权威、late-bound fault seam 与移动等价性。
