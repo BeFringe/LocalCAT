@@ -1,0 +1,26 @@
+{
+  "schema": "localcat.windows-frozen-custom-entry-matrix.v1",
+  "ordered_assertion_ids": [
+    "W3.CUSTOM.PE_SYSTEM_ONLY",
+    "W3.CUSTOM.DLL_POLICY_FIRST",
+    "W3.CUSTOM.BUNDLE_ROOTED",
+    "W3.CUSTOM.NATIVE_CLOSURE_PRELOAD",
+    "W3.CUSTOM.DYNAMIC_ROOTS_DECLARED",
+    "W3.CUSTOM.ACTUAL_MODULE_REPROOF",
+    "W3.CUSTOM.HANDOFF_ONE_SHOT",
+    "W3.CUSTOM.MANIFEST_EXACT",
+    "W3.CUSTOM.SOURCE_EXACT_BYTES",
+    "W3.CUSTOM.SOURCE_ONLY",
+    "W3.CUSTOM.FIXTURE_EXACT_BYTES",
+    "W3.CUSTOM.NONREPO_CWD",
+    "W3.CUSTOM.FAILURE_DIAGNOSTIC",
+    "W3.CUSTOM.REPRODUCIBLE_INPUTS"
+  ],
+  "allowed_statuses": [
+    "PASS",
+    "FAIL",
+    "BLOCKED_NOT_RUN"
+  ],
+  "completion_rule": "Task 1.6 requires PASS for all fourteen assertions on the same realized custom-entry build.",
+  "no_go_rule": "A hard assertion failure stops candidate construction; later assertions remain BLOCKED_NOT_RUN and are never reported as PASS or SKIP."
+}
