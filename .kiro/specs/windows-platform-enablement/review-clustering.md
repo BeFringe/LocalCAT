@@ -30,12 +30,12 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 
 | Cluster | Tasks | 共享心智模型 / 验证目标 | impl | review |
 |---|---|---|---|---|
-| **C0 — Governance, ownership and dispatch** | 0.1～0.5 | W1/W2/W3正式promotion、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
+| **C0 — Governance, ownership and dispatch** | 0.1～0.6 | ADR-020～025正式promotion/取代关系、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
 | **C1S — Baseline and route evidence** | 1.1～1.4 | b925b80现场矩阵、portable evidence schema、Windows API inventory与stock native-entry NO-GO；只关闭source主线的调查前置，不宣称W3可行 | `high` | `xhigh` |
 | **C1F — W3 custom entry feasibility** | 1.5～1.6 | custom in-process entry/toolchain/ABI/TCB reapproval与最小TrustedSourceLoader spike；1.6按`2.1→2.2→2.3→2.4→3.1→3.2`进入 | `xhigh` | `xhigh` |
 | **C2 — Shared contracts and POSIX parity** | 2.1～2.4 | opaque authority/identity/lock/publish/private contracts、POSIX characterization/extraction、composition fail-closed | `high` | `high` |
 | **C3A — Windows native rooted authority** | 3.1～3.2 | Win32 FFI/RAII/host Gate与逐组件rooted handle authority；形成C1F所需的稳定实现锚 | `xhigh` | `xhigh` |
-| **C3B — Windows lock, private and durable publish** | 3.3～3.7 | LockFileEx首次初始化与crash接管、ACL/MIC private proof、publish、FileId reuse、rename→close→reopen、真实power-cut durability与反例闭包 | `xhigh` | `xhigh` |
+| **C3B — Windows lock, private and documented publish** | 3.3～3.7 | LockFileEx首次初始化与crash接管、provider-agnostic process-primary SID/token与ACL/MIC private proof、FileId reuse、`WindowsDocumentedPublishV1`的rename→close→reopen/readback→owner commit→terminal reproof，以及instruction fault/process termination/应用重启/正常OS reboot反例闭包；不建立硬件实验室门 | `xhigh` | `xhigh` |
 | **C4S — Startup and Source/Writer** | 4.1～4.4 | WA-02移除`fcntl`启动阻塞、WA-01 Parser rooted Source/Writer、Chunk recovery、真实Qt source startup | `high` | `xhigh` |
 | **C5S — Project, Resource and TMX persistence** | 5.1～5.5 | WA-03/04/05 source阶段、owner lease、deterministic carrier、canonical save/import、old/new/recovery-only | `xhigh` | `xhigh` |
 | **C6S — TM authority and source UI composition** | 6.1～6.6b | WA-06/07 source阶段、initial activation、唯一generation、W2 re-attestation、FTS5 reopen、launcher实现→WA-08 journey→source milestone汇合 | `xhigh` | `xhigh` |
@@ -70,7 +70,8 @@ C1F PASS + C6S -> C7F pre-build consumer -> candidate build -> owner frozen reva
 关键隐性依赖：
 
 - C4S的第一个可观察目标“Qt source window可以启动”直接依赖WA-02删除Chunk顶层`fcntl`；WA-01不代答该import阻塞，但后续Project/TMX/source workflow必须实际使用WA-01 rooted Source/Writer。
-- C3B的process fault tests不代答power-cut durability；C5/C6只有在W1批准的真实reboot success boundary下才能声称durable publication。
+- C3B的publish成功必须实际闭合`WindowsDocumentedPublishV1`，不能由单个process fault test代答；C5/C6还依赖instruction fault、process termination、应用重启与正常OS reboot的old/new/recovery-only矩阵。该证据不得命名或解释为forced-power-loss硬件认证。
+- C3B的private正向/负向矩阵按process-primary token/SID shape阻断：standard/elevated、同SID low/restricted、thread impersonation及service/AppContainer/impersonation边界必须覆盖；domain/Entra只可optional非阻断，不得因环境缺失形成mandatory skip。
 - C3B的LockFileEx正常crash release不代答首次载体初始化；必须独立覆盖two-creator与create/write/flush/readback/close各边界creator crash接管。
 - C1S的stock NO-GO与外置`.py`存在都不代答W3 feasibility；C1F必须以custom in-process entry实际通过retained-handle/executed-byte、loader attestation、origin/co_filename与fixture handle-read验证。
 - Task 1.6严格按`2.1→2.2→2.3→2.4→3.1→3.2`进入；C3A在3.2形成已审查的稳定提交锚后，C1F可与C3B并行，3.3～3.7不是W3 spike的技术前置。
@@ -93,7 +94,7 @@ C1F PASS + C6S -> C7F pre-build consumer -> candidate build -> owner frozen reva
 - full base/tip、commit graph与累计diff；
 - owning Requirements/Design/Tasks、正式ADR mapping、WA/WR ledger状态；
 - task-focused reports、exact命令/版本/exit code、stdout/stderr与artifact SHA-256；
-- 本簇共享正向、竞争、tamper、crash/reboot、recovery和body-safe failure矩阵；
+- 本簇共享正向、竞争、tamper、instruction fault/process termination/应用重启/正常OS reboot、recovery和body-safe failure矩阵；C3B另须证明arm前`DURABILITY_UNAVAILABLE`零命名mutation、arm后`RECOVERY_REQUIRED`，并记录provider-agnostic token mandatory/optional分类；
 - 用户WIP/相邻只读Spec未被吸收的status与hash保护事实；
 - 对下一个簇首个目标业务API的实际可用性证明。
 
