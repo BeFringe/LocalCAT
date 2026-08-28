@@ -5,9 +5,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 import math
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import Protocol, runtime_checkable
+import threading
+from typing import Callable, Protocol, runtime_checkable
 
 
 class PlatformFileErrorCode(str, Enum):
@@ -212,6 +215,226 @@ class LockPolicy:
             raise ValueError("timeout_seconds is only valid for timeout policy")
 
 
+WINDOWS_PRIVATE_PROOF_SCHEMA = 1
+WINDOWS_PRIVATE_SECURITY_PROFILE_ID = "WindowsPrivateSecurityV2"
+WINDOWS_PRIVATE_PROOF_DOMAIN_TAG = b"localcat.windows.private-proof.v1\0"
+DEVICE_SECRET_SIZE_BYTES = 32
+DEVICE_KEY_ID_HASH_ALGORITHM = "sha256"
+DEVICE_KEY_ID_SIZE_BYTES = 32
+PRIVATE_PROOF_DIGEST_SIZE_BYTES = 32
+
+
+class PrivateProofObjectRole(str, Enum):
+    PRIVATE_DIRECTORY = "PRIVATE_DIRECTORY"
+    DEVICE_KEY = "DEVICE_KEY"
+    ATTESTATION = "ATTESTATION"
+    DEVICE_KEY_CANDIDATE = "DEVICE_KEY_CANDIDATE"
+    ATTESTATION_CANDIDATE = "ATTESTATION_CANDIDATE"
+
+
+def _require_sha256_bytes(value: object, field_name: str) -> bytes:
+    if type(value) is not bytes:
+        raise TypeError(f"{field_name} must be exact bytes")
+    if len(value) != PRIVATE_PROOF_DIGEST_SIZE_BYTES:
+        raise ValueError(f"{field_name} must contain exactly 32 bytes")
+    return value
+
+
+def derive_device_key_id(device_secret: bytes) -> bytes:
+    """Derive the persistent key id from exact raw device-secret bytes."""
+
+    if type(device_secret) is not bytes:
+        raise TypeError("device_secret must be exact bytes")
+    if len(device_secret) != DEVICE_SECRET_SIZE_BYTES:
+        raise ValueError("device_secret must contain exactly 32 bytes")
+    return hashlib.sha256(device_secret).digest()
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateProofContext:
+    """Owner-selected role and digest of bytes canonicalized by that owner."""
+
+    object_role: PrivateProofObjectRole
+    owner_context_sha256: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.object_role) is not PrivateProofObjectRole:
+            raise TypeError("object_role must be exact PrivateProofObjectRole")
+        _require_sha256_bytes(self.owner_context_sha256, "owner_context_sha256")
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsPrivateProof:
+    """Untrusted persistent Windows private-proof value, never live authority."""
+
+    schema: int
+    object_role: PrivateProofObjectRole
+    security_profile_id: str
+    owner_sid_sha256: bytes
+    authority_descriptor_sha256: bytes
+    owner_context_sha256: bytes
+    device_key_id: bytes
+    device_secret_mac: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not int:
+            raise TypeError("schema must be exact int")
+        if self.schema != WINDOWS_PRIVATE_PROOF_SCHEMA:
+            raise ValueError("private proof schema is unsupported")
+        if type(self.object_role) is not PrivateProofObjectRole:
+            raise TypeError("object_role must be exact PrivateProofObjectRole")
+        if type(self.security_profile_id) is not str:
+            raise TypeError("security_profile_id must be exact str")
+        if self.security_profile_id != WINDOWS_PRIVATE_SECURITY_PROFILE_ID:
+            raise ValueError("private proof security profile is unsupported")
+        for field_name in (
+            "owner_sid_sha256",
+            "authority_descriptor_sha256",
+            "owner_context_sha256",
+            "device_key_id",
+            "device_secret_mac",
+        ):
+            _require_sha256_bytes(getattr(self, field_name), field_name)
+
+
+_WINDOWS_PRIVATE_PROOF_FIELDS = frozenset(
+    {
+        "schema",
+        "object_role",
+        "security_profile_id",
+        "owner_sid_sha256",
+        "authority_descriptor_sha256",
+        "owner_context_sha256",
+        "device_key_id",
+        "device_secret_mac",
+    }
+)
+
+
+def _windows_private_proof_unsigned_payload(
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    if type(proof) is not WindowsPrivateProof:
+        raise TypeError("proof must be exact WindowsPrivateProof")
+    return {
+        "schema": proof.schema,
+        "object_role": proof.object_role.value,
+        "security_profile_id": proof.security_profile_id,
+        "owner_sid_sha256": proof.owner_sid_sha256.hex(),
+        "authority_descriptor_sha256": proof.authority_descriptor_sha256.hex(),
+        "owner_context_sha256": proof.owner_context_sha256.hex(),
+        "device_key_id": proof.device_key_id.hex(),
+    }
+
+
+def _canonical_private_proof_json(payload: dict[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def encode_windows_private_proof_unsigned(proof: WindowsPrivateProof) -> bytes:
+    """Encode the exact MAC projection, excluding only device_secret_mac."""
+
+    return _canonical_private_proof_json(
+        _windows_private_proof_unsigned_payload(proof)
+    )
+
+
+def windows_private_proof_mac_message(proof: WindowsPrivateProof) -> bytes:
+    """Frame the domain tag and canonical unsigned projection for HMAC."""
+
+    return WINDOWS_PRIVATE_PROOF_DOMAIN_TAG + encode_windows_private_proof_unsigned(proof)
+
+
+def encode_windows_private_proof(proof: WindowsPrivateProof) -> bytes:
+    """Encode one strict nested proof mapping without an owner envelope or LF."""
+
+    payload = _windows_private_proof_unsigned_payload(proof)
+    payload["device_secret_mac"] = proof.device_secret_mac.hex()
+    return _canonical_private_proof_json(payload)
+
+
+def _decode_sha256_hex(value: object, field_name: str) -> bytes:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be exact str")
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{field_name} must be lowercase SHA-256 hex")
+    return bytes.fromhex(value)
+
+
+def decode_windows_private_proof(serialized: bytes) -> WindowsPrivateProof:
+    """Decode only the exact canonical nested Windows private-proof mapping."""
+
+    if type(serialized) is not bytes:
+        raise TypeError("serialized proof must be exact bytes")
+
+    class _DuplicateKeyError(ValueError):
+        pass
+
+    def reject_non_finite(value: str) -> None:
+        del value
+        raise ValueError("non-finite JSON number is not allowed")
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        mapping: dict[str, object] = {}
+        for key, value in pairs:
+            if key in mapping:
+                raise _DuplicateKeyError("duplicate JSON key")
+            mapping[key] = value
+        return mapping
+
+    try:
+        decoded = serialized.decode("utf-8")
+        value = json.loads(
+            decoded,
+            parse_constant=reject_non_finite,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise ValueError("serialized private proof is not strict JSON") from error
+    if type(value) is not dict or set(value) != _WINDOWS_PRIVATE_PROOF_FIELDS:
+        raise ValueError("serialized private proof fields are invalid")
+    role_value = value["object_role"]
+    if type(role_value) is not str:
+        raise TypeError("object_role must be exact str")
+    try:
+        role = PrivateProofObjectRole(role_value)
+    except ValueError:
+        raise ValueError("object_role is unsupported") from None
+    proof = WindowsPrivateProof(
+        schema=value["schema"],  # type: ignore[arg-type]
+        object_role=role,
+        security_profile_id=value["security_profile_id"],  # type: ignore[arg-type]
+        owner_sid_sha256=_decode_sha256_hex(
+            value["owner_sid_sha256"],
+            "owner_sid_sha256",
+        ),
+        authority_descriptor_sha256=_decode_sha256_hex(
+            value["authority_descriptor_sha256"],
+            "authority_descriptor_sha256",
+        ),
+        owner_context_sha256=_decode_sha256_hex(
+            value["owner_context_sha256"],
+            "owner_context_sha256",
+        ),
+        device_key_id=_decode_sha256_hex(value["device_key_id"], "device_key_id"),
+        device_secret_mac=_decode_sha256_hex(
+            value["device_secret_mac"],
+            "device_secret_mac",
+        ),
+    )
+    if encode_windows_private_proof(proof) != serialized:
+        raise ValueError("serialized private proof is not canonical")
+    return proof
+
+
 def validate_relative_name(name: str) -> str:
     """Validate one backend-neutral relative entry name without normalizing it."""
 
@@ -239,7 +462,7 @@ def validate_relative_path(relative: PurePath) -> PurePath:
 def validate_root_path(root: Path) -> Path:
     """Validate the neutral shape of a root before a backend proves it."""
 
-    if not isinstance(root, Path):
+    if type(root) is not type(Path()):
         raise TypeError("root must be a concrete pathlib Path")
     if not root.is_absolute():
         raise ValueError("root must be absolute")
@@ -344,11 +567,12 @@ class CandidateFile(OpaqueAuthority, ABC):
         self._require_open()
         if type(payload) is not bytes:
             raise TypeError("payload must be exact bytes")
+        self.__has_content = False
+        self.__flushed = False
         result = self._write_all(payload)
         if result is not None:
             raise TypeError("backend write_all must return None")
         self.__has_content = True
-        self.__flushed = False
 
     @abstractmethod
     def _write_all(self, payload: bytes) -> None: ...
@@ -357,6 +581,7 @@ class CandidateFile(OpaqueAuthority, ABC):
         self._require_open()
         if not self.__has_content:
             raise ValueError("candidate content must be written before flush")
+        self.__flushed = False
         result = self._flush_content()
         if result is not None:
             raise TypeError("backend flush_content must return None")
@@ -448,6 +673,48 @@ class PendingPublication(OpaqueAuthority, ABC):
 
 class PrivateAccessEvidence(OpaqueAuthority, ABC):
     pass
+
+
+class DeviceSecretAuthority(OpaqueAuthority, ABC):
+    """Issuer-owned retained key handle independent of its binding input."""
+
+    def reprove(self) -> None:
+        self._require_open()
+        result = self._reprove()
+        if result is not None:
+            raise TypeError("backend device-secret reproof must return None")
+
+    @abstractmethod
+    def _reprove(self) -> None: ...
+
+
+class VerifiedPrivateProof(OpaqueAuthority, ABC):
+    """Issuer-bound proof awaiting one locked terminal consumption."""
+
+    __slots__ = ("__consume_lock", "__consumed")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.__consume_lock = threading.Lock()
+        self.__consumed = False
+
+    def _consume_once(self, operation: Callable[[], None]) -> None:
+        if not callable(operation):
+            raise TypeError("consumption operation must be callable")
+        with self.__consume_lock:
+            self._require_open()
+            if self.__consumed:
+                raise PlatformFileError(
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                    retryable=False,
+                )
+            try:
+                result = operation()
+                if result is not None:
+                    raise TypeError("backend verified-proof consumption must return None")
+                self.__consumed = True
+            finally:
+                self.close()
 
 
 class BoundDirectoryAuthority(OpaqueAuthority, ABC):
@@ -722,6 +989,142 @@ class PrivateStorageProof(Protocol):
         self,
         authority: BoundDirectoryAuthority | BoundRegularFile,
     ) -> PrivateAccessEvidence: ...
+
+
+@runtime_checkable
+class PersistentPrivateProof(Protocol):
+    """Independent persistent proof port; never part of PlatformFileBackend.
+
+    Concrete backends must accept only their exact private-evidence, secret,
+    and verified-proof classes issued by the same backend issuer.  The generic
+    facade deliberately knows no backend concrete authority type and an
+    ``isinstance`` check alone never authorizes a persistent operation.
+    """
+
+    def bind_device_secret(
+        self,
+        secret_file: BoundRegularFile,
+    ) -> DeviceSecretAuthority:
+        if not isinstance(secret_file, BoundRegularFile):
+            raise TypeError("secret_file must be BoundRegularFile")
+        secret_file._require_open()
+        secret = self._bind_device_secret(secret_file)
+        if not isinstance(secret, DeviceSecretAuthority):
+            raise TypeError("backend secret binding must return DeviceSecretAuthority")
+        secret._require_open()
+        return secret
+
+    @abstractmethod
+    def _bind_device_secret(
+        self,
+        secret_file: BoundRegularFile,
+    ) -> DeviceSecretAuthority:
+        """Duplicate/retain the key handle; never borrow caller ownership."""
+        ...
+
+    def mint(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        context: PrivateProofContext,
+    ) -> WindowsPrivateProof:
+        if not isinstance(target, PrivateAccessEvidence):
+            raise TypeError("target must be PrivateAccessEvidence")
+        if not isinstance(secret, DeviceSecretAuthority):
+            raise TypeError("secret must be DeviceSecretAuthority")
+        if type(context) is not PrivateProofContext:
+            raise TypeError("context must be exact PrivateProofContext")
+        target._require_open()
+        secret._require_open()
+        proof = self._mint(target, secret, context)
+        if type(proof) is not WindowsPrivateProof:
+            raise TypeError("backend mint must return exact WindowsPrivateProof")
+        if (
+            proof.object_role is not context.object_role
+            or proof.owner_context_sha256 != context.owner_context_sha256
+        ):
+            raise ValueError("backend proof does not bind the requested owner context")
+        return proof
+
+    @abstractmethod
+    def _mint(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        context: PrivateProofContext,
+    ) -> WindowsPrivateProof:
+        """Require exact concrete target/secret types from this issuer."""
+        ...
+
+    def verify(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        proof: WindowsPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> VerifiedPrivateProof:
+        if not isinstance(target, PrivateAccessEvidence):
+            raise TypeError("target must be PrivateAccessEvidence")
+        if not isinstance(secret, DeviceSecretAuthority):
+            raise TypeError("secret must be DeviceSecretAuthority")
+        if type(proof) is not WindowsPrivateProof:
+            raise TypeError("proof must be exact WindowsPrivateProof")
+        if type(expected_context) is not PrivateProofContext:
+            raise TypeError("expected_context must be exact PrivateProofContext")
+        target._require_open()
+        secret._require_open()
+        if (
+            proof.object_role is not expected_context.object_role
+            or proof.owner_context_sha256 != expected_context.owner_context_sha256
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                retryable=False,
+            )
+        verified = self._verify(target, secret, proof, expected_context)
+        if not isinstance(verified, VerifiedPrivateProof):
+            raise TypeError("backend verify must return VerifiedPrivateProof")
+        verified._require_open()
+        return verified
+
+    @abstractmethod
+    def _verify(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        proof: WindowsPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> VerifiedPrivateProof:
+        """Require exact concrete target/secret types from this issuer."""
+        ...
+
+    def consume_verified(
+        self,
+        verified: VerifiedPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> None:
+        if not isinstance(verified, VerifiedPrivateProof):
+            raise TypeError("verified must be VerifiedPrivateProof")
+        if type(expected_context) is not PrivateProofContext:
+            raise TypeError("expected_context must be exact PrivateProofContext")
+        result = self._consume_verified(verified, expected_context)
+        if result is not None:
+            raise TypeError("backend verified-proof consumption must return None")
+
+    @abstractmethod
+    def _consume_verified(
+        self,
+        verified: VerifiedPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> None:
+        """Validate exact type, issuer and context before accepting ownership.
+
+        Rejection leaves the token caller-owned.  Once accepted, invoke
+        ``VerifiedPrivateProof._consume_once(verified, terminal_operation)``
+        explicitly so an untrusted subclass cannot override the one-shot lock
+        or terminal close.
+        """
+        ...
 
 
 @runtime_checkable
