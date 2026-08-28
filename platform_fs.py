@@ -6,8 +6,10 @@ import importlib
 import os
 from pathlib import Path
 import sys
+from typing import cast
 
 from platform_fs_contracts import (
+    PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -15,7 +17,10 @@ from platform_fs_contracts import (
 )
 
 
-__all__ = ["compose_platform_file_backend"]
+__all__ = [
+    "compose_platform_file_backend",
+    "narrow_windows_persistent_private_proof",
+]
 
 
 _POSIX_HOSTS = frozenset({"darwin", "linux"})
@@ -66,18 +71,6 @@ def _capability_unavailable() -> PlatformFileError:
         PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
         retryable=False,
     )
-
-
-def _normalize_probe_failure(error: BaseException) -> PlatformFileError:
-    if (
-        isinstance(error, PlatformFileError)
-        and error.code == PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value
-    ):
-        return PlatformFileError(
-            PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
-            retryable=False,
-        )
-    return _capability_unavailable()
 
 
 def _members_are_callable(owner: object, names: tuple[str, ...]) -> bool:
@@ -131,11 +124,16 @@ def _load_posix_backend() -> PlatformFileBackend:
     return backend
 
 
-def _load_windows_backend() -> PlatformFileBackend:
+def _load_windows_backend_type() -> type[object]:
     module = importlib.import_module("platform_fs_windows")
     backend_type = getattr(module, "WindowsPlatformAdapter", None)
     if not isinstance(backend_type, type):
         raise _capability_unavailable()
+    return backend_type
+
+
+def _load_windows_backend() -> PlatformFileBackend:
+    backend_type = _load_windows_backend_type()
     backend = backend_type()
     if type(backend) is not backend_type or not _backend_has_contract(backend):
         raise _capability_unavailable()
@@ -165,5 +163,28 @@ def compose_platform_file_backend(probe_root: Path) -> PlatformFileBackend:
             raise _capability_unavailable()
         _self_probe(backend, checked_root)
         return backend
-    except Exception as error:
-        raise _normalize_probe_failure(error) from None
+    except Exception:
+        raise _capability_unavailable() from None
+
+
+def narrow_windows_persistent_private_proof(
+    backend: PlatformFileBackend,
+    probe_root: Path,
+) -> PersistentPrivateProof:
+    """Narrow one exact composed Windows backend after a fresh live root probe."""
+
+    try:
+        checked_root = validate_root_path(probe_root)
+        if sys.platform != "win32":
+            raise _capability_unavailable()
+        backend_type = _load_windows_backend_type()
+        if (
+            type(backend) is not backend_type
+            or not _backend_has_contract(backend)
+            or not isinstance(backend, PersistentPrivateProof)
+        ):
+            raise _capability_unavailable()
+        _self_probe(backend, checked_root)
+        return cast(PersistentPrivateProof, backend)
+    except Exception:
+        raise _capability_unavailable() from None

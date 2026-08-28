@@ -15,6 +15,7 @@ from unittest import mock
 
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
+    PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -141,6 +142,40 @@ class _FaultingBackend:
     _prove_private = prove_private
 
 
+class _PersistentFaultingBackend(_FaultingBackend):
+    """Aggregate + persistent shape used only to exercise composition gates."""
+
+    def bind_device_secret(self, secret_file: object) -> object:
+        del secret_file
+        raise AssertionError
+
+    _bind_device_secret = bind_device_secret
+
+    def mint(self, target: object, secret: object, context: object) -> object:
+        del target, secret, context
+        raise AssertionError
+
+    _mint = mint
+
+    def verify(
+        self,
+        target: object,
+        secret: object,
+        proof: object,
+        expected_context: object,
+    ) -> object:
+        del target, secret, proof, expected_context
+        raise AssertionError
+
+    _verify = verify
+
+    def consume_verified(self, verified: object, expected_context: object) -> None:
+        del verified, expected_context
+        raise AssertionError
+
+    _consume_verified = consume_verified
+
+
 class _ConstructorFault:
     def __init__(self) -> None:
         raise RuntimeError("constructor fault")
@@ -149,6 +184,12 @@ class _ConstructorFault:
 def _module_with_backend(factory: type[object]) -> types.ModuleType:
     module = types.ModuleType("platform_fs_posix")
     module.PosixPlatformAdapter = factory
+    return module
+
+
+def _windows_module_with_backend(factory: type[object]) -> types.ModuleType:
+    module = types.ModuleType("platform_fs_windows")
+    module.WindowsPlatformAdapter = factory
     return module
 
 
@@ -228,6 +269,22 @@ class CompositionStaticBoundaryTests(unittest.TestCase):
         self.assertNotIn("token", source.casefold())
         self.assertNotIn("validated = true", source.casefold())
 
+    def test_windows_persistent_narrowing_has_explicit_backend_and_probe_root(self) -> None:
+        source = COMPOSITION_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "narrow_windows_persistent_private_proof"
+        )
+        self.assertEqual(
+            [argument.arg for argument in function.args.args],
+            ["backend", "probe_root"],
+        )
+        self.assertEqual(function.args.kwonlyargs, [])
+        self.assertEqual(ast.unparse(function.returns), "PersistentPrivateProof")
+
     def test_current_windows_import_does_not_load_posix_modules(self) -> None:
         if sys.platform != "win32":
             self.skipTest("requires the real Windows import environment")
@@ -246,6 +303,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
         self.assertIsInstance(backend, ProcessFileLock)
         self.assertIsInstance(backend, PrivateStorageProof)
         self.assertIsInstance(backend, PlatformFileBackend)
+        self.assertNotIsInstance(backend, PersistentPrivateProof)
         for missing in ("bind_root", "acquire", "prove_private"):
             members = {
                 name: (lambda *args, **kwargs: None)
@@ -283,6 +341,30 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
         _assert_stable_error(self, caught)
         import_module.assert_not_called()
 
+    def test_path_subclass_spoof_fails_without_backend_import(self) -> None:
+        class SpoofedPath(type(Path())):
+            def is_absolute(self) -> bool:
+                return True
+
+        spoofed = SpoofedPath("relative")
+        backend = _PersistentFaultingBackend(authority=_ProbeAuthority())
+        operations = (
+            lambda: platform_fs.compose_platform_file_backend(spoofed),
+            lambda: platform_fs.narrow_windows_persistent_private_proof(
+                backend,
+                spoofed,
+            ),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), mock.patch.object(
+                platform_fs.importlib,
+                "import_module",
+            ) as import_module:
+                with self.assertRaises(PlatformFileError) as caught:
+                    operation()
+            _assert_stable_error(self, caught)
+            import_module.assert_not_called()
+
     def test_windows_missing_backend_never_imports_posix(self) -> None:
         requested: list[str] = []
 
@@ -297,6 +379,140 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
                 platform_fs.compose_platform_file_backend(Path(directory))
         _assert_stable_error(self, caught)
         self.assertEqual(requested, ["platform_fs_windows"])
+
+    def test_windows_backend_constructor_fault_is_normalized(self) -> None:
+        module = _windows_module_with_backend(_ConstructorFault)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            platform_fs.sys, "platform", "win32"
+        ), mock.patch.object(
+            platform_fs.importlib, "import_module", return_value=module
+        ) as import_module:
+            with self.assertRaises(PlatformFileError) as caught:
+                platform_fs.compose_platform_file_backend(Path(directory))
+        _assert_stable_error(self, caught)
+        import_module.assert_called_once_with("platform_fs_windows")
+
+    def test_windows_persistent_narrowing_returns_same_exact_backend_after_live_probe(self) -> None:
+        authority = _ProbeAuthority()
+        backend = _PersistentFaultingBackend(authority=authority)
+        module = _windows_module_with_backend(_PersistentFaultingBackend)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            platform_fs.sys, "platform", "win32"
+        ), mock.patch.object(
+            platform_fs.importlib, "import_module", return_value=module
+        ) as import_module:
+            narrowed = platform_fs.narrow_windows_persistent_private_proof(
+                backend,
+                Path(directory),
+            )
+        self.assertIs(narrowed, backend)
+        self.assertIsInstance(narrowed, PlatformFileBackend)
+        self.assertIsInstance(narrowed, PersistentPrivateProof)
+        self.assertTrue(authority.closed)
+        self.assertEqual(authority.close_calls, 1)
+        import_module.assert_called_once_with("platform_fs_windows")
+
+    def test_windows_persistent_narrowing_rejects_foreign_and_structural_backends(self) -> None:
+        approved_module = _windows_module_with_backend(_PersistentFaultingBackend)
+
+        class ForeignPersistentBackend(_PersistentFaultingBackend):
+            pass
+
+        foreign = ForeignPersistentBackend(authority=_ProbeAuthority())
+        missing_persistent = _FaultingBackend(authority=_ProbeAuthority())
+        cases = (
+            (foreign, approved_module),
+            (missing_persistent, _windows_module_with_backend(_FaultingBackend)),
+        )
+        for backend, module in cases:
+            with self.subTest(backend=type(backend).__name__), tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                platform_fs.sys, "platform", "win32"
+            ), mock.patch.object(
+                platform_fs.importlib, "import_module", return_value=module
+            ):
+                with self.assertRaises(PlatformFileError) as caught:
+                    platform_fs.narrow_windows_persistent_private_proof(
+                        backend,  # type: ignore[arg-type]
+                        Path(directory),
+                    )
+            _assert_stable_error(self, caught)
+            self.assertFalse(backend.authority.closed)  # type: ignore[union-attr]
+
+    def test_windows_persistent_narrowing_normalizes_import_and_probe_faults(self) -> None:
+        import_fault_backend = _PersistentFaultingBackend(authority=_ProbeAuthority())
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            platform_fs.sys, "platform", "win32"
+        ), mock.patch.object(
+            platform_fs.importlib,
+            "import_module",
+            side_effect=ModuleNotFoundError("platform_fs_windows"),
+        ):
+            with self.assertRaises(PlatformFileError) as caught:
+                platform_fs.narrow_windows_persistent_private_proof(
+                    import_fault_backend,
+                    Path(directory),
+                )
+        _assert_stable_error(self, caught)
+
+        probe_authority = _ProbeAuthority(fail_reproof=True)
+        probe_fault_backend = _PersistentFaultingBackend(authority=probe_authority)
+        module = _windows_module_with_backend(_PersistentFaultingBackend)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            platform_fs.sys, "platform", "win32"
+        ), mock.patch.object(platform_fs.importlib, "import_module", return_value=module):
+            with self.assertRaises(PlatformFileError) as caught:
+                platform_fs.narrow_windows_persistent_private_proof(
+                    probe_fault_backend,
+                    Path(directory),
+                )
+        _assert_stable_error(self, caught)
+        self.assertTrue(probe_authority.closed)
+        self.assertEqual(probe_authority.close_calls, 1)
+
+    def test_windows_persistent_narrowing_normalizes_durability_probe_fault(self) -> None:
+        durability_error = PlatformFileError(
+            PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+            retryable=False,
+        )
+        backend = _PersistentFaultingBackend(error=durability_error)
+        module = _windows_module_with_backend(_PersistentFaultingBackend)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            platform_fs.sys, "platform", "win32"
+        ), mock.patch.object(platform_fs.importlib, "import_module", return_value=module):
+            with self.assertRaises(PlatformFileError) as caught:
+                platform_fs.narrow_windows_persistent_private_proof(
+                    backend,
+                    Path(directory),
+                )
+        _assert_stable_error(self, caught)
+
+    def test_windows_persistent_narrowing_rejects_relative_root_before_import(self) -> None:
+        backend = _PersistentFaultingBackend(authority=_ProbeAuthority())
+        with mock.patch.object(platform_fs.sys, "platform", "win32"), mock.patch.object(
+            platform_fs.importlib,
+            "import_module",
+        ) as import_module:
+            with self.assertRaises(PlatformFileError) as caught:
+                platform_fs.narrow_windows_persistent_private_proof(
+                    backend,
+                    Path("relative"),
+                )
+        _assert_stable_error(self, caught)
+        import_module.assert_not_called()
+
+    def test_non_windows_persistent_narrowing_never_loads_windows_or_posix(self) -> None:
+        backend = _PersistentFaultingBackend(authority=_ProbeAuthority())
+        for host in ("linux", "darwin", "plan9"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                platform_fs.sys, "platform", host
+            ), mock.patch.object(platform_fs.importlib, "import_module") as import_module:
+                with self.assertRaises(PlatformFileError) as caught:
+                    platform_fs.narrow_windows_persistent_private_proof(
+                        backend,
+                        Path(directory),
+                    )
+            _assert_stable_error(self, caught)
+            import_module.assert_not_called()
 
     def test_posix_backend_path_never_imports_windows_modules(self) -> None:
         requested: list[str] = []
@@ -421,7 +637,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
                     platform_fs.compose_platform_file_backend(Path(directory))
             _assert_stable_error(self, caught)
 
-    def test_durability_failure_is_the_only_backend_code_preserved(self) -> None:
+    def test_composition_normalizes_durability_probe_fault(self) -> None:
         error = PlatformFileError(
             PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
             retryable=False,
@@ -441,7 +657,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
         ):
             with self.assertRaises(PlatformFileError) as caught:
                 platform_fs.compose_platform_file_backend(Path(directory))
-        _assert_stable_error(self, caught, PlatformFileErrorCode.DURABILITY_UNAVAILABLE)
+        _assert_stable_error(self, caught)
 
     def test_current_windows_factory_is_body_safe_and_does_not_write_probe_files(self) -> None:
         if sys.platform != "win32":
