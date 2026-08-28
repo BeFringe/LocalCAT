@@ -19,12 +19,15 @@ from platform_fs_contracts import (
     BoundDirectoryAuthority,
     BoundRegularFile,
     CandidateFile,
+    CandidateContentFacts,
     DEVICE_KEY_ID_HASH_ALGORITHM,
     DEVICE_KEY_ID_SIZE_BYTES,
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
     EntrySnapshot,
     FileObjectIdentity,
+    LedgerEntryObservation,
+    LedgerEnumerationLimits,
     LockLease,
     LockPolicy,
     LockWait,
@@ -131,11 +134,13 @@ class _Candidate(CandidateFile):
     def _close_authority(self) -> None:
         pass
 
-    def _write_all(self, payload: bytes) -> None:
-        self.payload = payload
+    def _write_chunks(self, chunks: object) -> CandidateContentFacts:
+        self.payload = b"".join(chunks)  # type: ignore[arg-type]
+        return CandidateContentFacts(len(self.payload), hashlib.sha256(self.payload).digest())
 
-    def _flush_content(self) -> None:
+    def _flush_content(self, expected: CandidateContentFacts) -> CandidateContentFacts:
         self.flushed = True
+        return expected
 
     def _identity(self) -> FileObjectIdentity:
         return _identity()
@@ -147,15 +152,15 @@ class _FaultingCandidate(_Candidate):
         self.fail_write = False
         self.fail_flush = False
 
-    def _write_all(self, payload: bytes) -> None:
+    def _write_chunks(self, chunks: object) -> CandidateContentFacts:
         if self.fail_write:
             raise RuntimeError("write fault")
-        super()._write_all(payload)
+        return super()._write_chunks(chunks)
 
-    def _flush_content(self) -> None:
+    def _flush_content(self, expected: CandidateContentFacts) -> CandidateContentFacts:
         if self.fail_flush:
             raise RuntimeError("flush fault")
-        super()._flush_content()
+        return super()._flush_content(expected)
 
 
 class _Lease(LockLease):
@@ -262,6 +267,7 @@ class _Directory(RootedDirectoryAuthority):
         self.begin_calls = 0
         self.publish_events: list[tuple[str, bool]] = []
         self.publishing_candidate: CandidateFile | None = None
+        self.observations: tuple[LedgerEntryObservation, ...] = ()
 
     def _close_authority(self) -> None:
         pass
@@ -272,6 +278,14 @@ class _Directory(RootedDirectoryAuthority):
     def _inspect_entry(self, name: str) -> EntrySnapshot | None:
         del name
         return None
+
+    def _observe_ledger_entries(
+        self,
+        lease: LockLease,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        del lease, limits
+        return self.observations
 
     def _create_candidate(self, name: str, *, private: bool) -> CandidateFile:
         del name, private
@@ -1678,11 +1692,9 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
         directory = _Directory()
 
         write_fault = _FaultingCandidate()
-        write_fault.write_all(b"first")
-        write_fault.flush_content()
         write_fault.fail_write = True
         with self.assertRaises(RuntimeError):
-            write_fault.write_all(b"second")
+            write_fault.write_all(b"first")
         with self.assertRaises(ValueError):
             directory.begin_publish(
                 write_fault,
@@ -1704,6 +1716,78 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
                 mode=PublishMode.CREATE_IF_ABSENT,
                 lease=None,
             )
+
+    def test_candidate_stream_is_one_shot_ordered_bounded_and_write_all_delegates(self) -> None:
+        candidate = _Candidate()
+        iterated: list[bytes] = []
+
+        def chunks() -> object:
+            for chunk in (b"first", b"second"):
+                iterated.append(chunk)
+                yield chunk
+
+        facts = candidate.write_chunks(chunks(), maximum_bytes=11)  # type: ignore[arg-type]
+        self.assertEqual(iterated, [b"first", b"second"])
+        self.assertEqual(candidate.payload, b"firstsecond")
+        self.assertEqual(facts.byte_count, 11)
+        self.assertEqual(facts.content_sha256, hashlib.sha256(b"firstsecond").digest())
+        candidate.flush_content()
+        with self.assertRaises(ValueError):
+            candidate.write_chunks((b"again",), maximum_bytes=5)
+
+        compatibility = _Candidate()
+        self.assertIsNone(compatibility.write_all(b"payload"))
+        self.assertEqual(compatibility.payload, b"payload")
+
+        empty_stream = _Candidate()
+        empty_facts = empty_stream.write_chunks((), maximum_bytes=0)
+        self.assertEqual(empty_stream.payload, b"")
+        self.assertEqual(empty_facts.byte_count, 0)
+        self.assertEqual(empty_facts.content_sha256, hashlib.sha256(b"").digest())
+        empty_stream.flush_content()
+
+        empty_compatibility = _Candidate()
+        self.assertIsNone(empty_compatibility.write_all(b""))
+        self.assertEqual(empty_compatibility.payload, b"")
+        empty_compatibility.flush_content()
+
+        invalid_streams = (
+            ((b"",), 0),
+            ((b"x" * (64 * 1024 + 1),), 64 * 1024 + 1),
+            ((b"over",), 3),
+            ((bytearray(b"not exact"),), 9),
+        )
+        for stream, maximum in invalid_streams:
+            with self.subTest(stream=stream):
+                with self.assertRaises((TypeError, ValueError)):
+                    _Candidate().write_chunks(stream, maximum_bytes=maximum)  # type: ignore[arg-type]
+
+    def test_ledger_observations_are_limited_sorted_and_require_live_lease(self) -> None:
+        directory = _Directory()
+        lease = _Lease()
+        first = LedgerEntryObservation(
+            "a.json",
+            EntrySnapshot(_identity(), 3, b"a", True),
+        )
+        second = LedgerEntryObservation(
+            "b.json",
+            EntrySnapshot(
+                FileObjectIdentity("windows", b"volume", b"g" * 16, "regular", 1),
+                4,
+                b"b",
+                True,
+            ),
+        )
+        directory.observations = (first, second)
+        limits = LedgerEnumerationLimits(2, 16, 7)
+        self.assertEqual(directory.observe_ledger_entries(lease, limits), (first, second))
+
+        directory.observations = (second, first)
+        with self.assertRaises(ValueError):
+            directory.observe_ledger_entries(lease, limits)
+        lease.close()
+        with self.assertRaises(PlatformFileError):
+            directory.observe_ledger_entries(lease, limits)
 
     def test_authority_operations_validate_names_before_backend_calls(self) -> None:
         directory = _Directory()

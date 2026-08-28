@@ -13,14 +13,18 @@ from unittest import mock
 
 import platform_fs_windows
 from platform_fs_contracts import (
+    LedgerEnumerationLimits,
+    LockPolicy,
+    LockWait,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
     PrivateStorageProof,
     ProcessFileLock,
+    PublishMode,
     RootedFileSystem,
 )
-from platform_fs_windows import WindowsRootedFileSystem
+from platform_fs_windows import WindowsPlatformAdapter, WindowsRootedFileSystem
 from windows_file_api import Win32Handle
 
 
@@ -44,6 +48,41 @@ class WindowsRootedStaticTests(unittest.TestCase):
         self.assertNotIsInstance(rooted, ProcessFileLock)
         self.assertNotIsInstance(rooted, PrivateStorageProof)
         self.assertNotIsInstance(rooted, PlatformFileBackend)
+
+    def test_ledger_observation_uses_retained_directory_api_not_path_listing(self) -> None:
+        source = (ROOT / "platform_fs_windows.py").read_text(encoding="utf-8")
+        contracts = (ROOT / "platform_fs_contracts.py").read_text(encoding="utf-8")
+        self.assertIn("FILE_ID_EXTD_DIR_INFO_CLASS", source)
+        self.assertIn("GetFileInformationByHandleEx", source)
+        self.assertNotIn("FindFirstFile", source)
+        self.assertNotIn("FindNextFile", source)
+        self.assertNotIn("os.scandir", source)
+        self.assertNotIn("Win32Handle", contracts)
+
+    def test_directory_entry_abi_and_record_bounds_fail_closed(self) -> None:
+        self.assertEqual(platform_fs_windows._FILE_ID_EXTD_DIR_HEADER.size, 88)
+        platform_fs_windows._validate_directory_record_bounds(
+            offset=0,
+            name_length=2,
+            next_offset=96,
+            buffer_size=192,
+        )
+        for name_length, next_offset in ((2, 88), (3, 96), (2, 94)):
+            with self.subTest(
+                name_length=name_length,
+                next_offset=next_offset,
+            ), self.assertRaises(PlatformFileError) as caught:
+                platform_fs_windows._validate_directory_record_bounds(
+                    offset=0,
+                    name_length=name_length,
+                    next_offset=next_offset,
+                    buffer_size=192,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.IDENTITY_STALE,
+            )
 
     def test_component_grammar_is_fail_closed(self) -> None:
         hostile = (
@@ -753,6 +792,332 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         self.assertEqual(candidate.identity().kind, "regular")
         candidate.close()
         parent.close()
+
+    def test_candidate_streams_one_shot_chunks_without_whole_payload_write(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        generated: list[int] = []
+        chunks = (b"a" * 65536, b"b" * 17, b"c" * 4096)
+
+        def stream() -> object:
+            for chunk in chunks:
+                generated.append(len(chunk))
+                yield chunk
+
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                candidate = parent.create_candidate("stream.tmp", private=False)
+                facts = candidate.write_chunks(  # type: ignore[arg-type]
+                    stream(),
+                    maximum_bytes=sum(map(len, chunks)),
+                )
+                candidate.flush_content()
+                candidate.close()
+        payload = b"".join(chunks)
+        self.assertEqual(generated, [65536, 17, 4096])
+        self.assertEqual(facts.byte_count, len(payload))
+        self.assertEqual((self.nested / "stream.tmp").read_bytes(), payload)
+
+    def test_candidate_stream_completes_short_native_writes_and_publishes(self) -> None:
+        payload = b"short-native-write" * 37
+        adapter = WindowsPlatformAdapter()
+        with adapter.bind_root(self.root_path) as root:
+            with adapter.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                candidate = parent.create_candidate("partial-write.tmp", private=False)
+                real_write = candidate._api.WriteFile
+                write_calls = 0
+
+                def short_write(
+                    handle: int,
+                    buffer: object,
+                    requested: int,
+                    written: object,
+                    overlapped: object,
+                ) -> int:
+                    nonlocal write_calls
+                    write_calls += 1
+                    return real_write(
+                        handle,
+                        buffer,
+                        min(int(requested), 7),
+                        written,
+                        overlapped,
+                    )
+
+                with mock.patch.object(
+                    candidate._api,
+                    "WriteFile",
+                    side_effect=short_write,
+                ):
+                    facts = candidate.write_chunks((payload,), maximum_bytes=len(payload))
+                self.assertGreater(write_calls, 1)
+                self.assertEqual(facts.byte_count, len(payload))
+                candidate.flush_content()
+                pending = parent.begin_publish(
+                    candidate,
+                    "partial-write.bin",
+                    mode=PublishMode.CREATE_IF_ABSENT,
+                    lease=None,
+                )
+                try:
+                    self.assertEqual(pending.retained_destination().read_all(), payload)
+                    self.assertEqual(
+                        pending.terminal_reproof(),
+                        pending.preliminary_facts(),
+                    )
+                finally:
+                    pending.close()
+
+    def test_candidate_stream_fault_is_fail_closed_and_cannot_be_retried(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                candidate = parent.create_candidate("faulted-stream.tmp", private=False)
+                real_write = candidate._api.WriteFile
+                calls = 0
+
+                def fail_second(*args: object) -> int:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise platform_fs_windows.Win32CallError("WriteFile", 5)
+                    return real_write(*args)
+
+                with mock.patch.object(
+                    candidate._api,
+                    "WriteFile",
+                    side_effect=fail_second,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    candidate.write_chunks(
+                        (b"a" * 65536, b"b"),
+                        maximum_bytes=65537,
+                    )
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.PUBLISH_FAILED,
+                )
+                with self.assertRaises(ValueError):
+                    candidate.flush_content()
+                with self.assertRaises(ValueError):
+                    candidate.write_all(b"retry")
+                candidate.close()
+
+    def test_candidate_stream_preserves_contract_validation_errors(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        cases = (
+            ("empty", (b"",), 1, ValueError),
+            ("oversize", (b"x" * 65537,), 65537, ValueError),
+            ("maximum", (b"ab",), 1, ValueError),
+            ("type", (bytearray(b"x"),), 1, TypeError),
+        )
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                for label, chunks, maximum_bytes, expected_error in cases:
+                    with self.subTest(label=label):
+                        candidate = parent.create_candidate(
+                            f"invalid-{label}.tmp",
+                            private=False,
+                        )
+                        with self.assertRaises(expected_error):
+                            candidate.write_chunks(  # type: ignore[arg-type]
+                                chunks,
+                                maximum_bytes=maximum_bytes,
+                            )
+                        with self.assertRaises(ValueError):
+                            candidate.flush_content()
+                        with self.assertRaises(ValueError):
+                            candidate.write_all(b"retry")
+                        candidate.close()
+
+    def test_locked_ledger_observation_is_bounded_and_rejects_unsafe_children(self) -> None:
+        (self.nested / "alpha.json").write_bytes(b"alpha")
+        (self.nested / "beta.json").write_bytes(b"beta")
+        adapter = WindowsPlatformAdapter()
+        with adapter.bind_root(self.root_path) as root:
+            with adapter.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                lease = adapter.acquire(
+                    parent,
+                    ".ledger.lock",
+                    b"ledger-v1",
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                try:
+                    observations = parent.observe_ledger_entries(
+                        lease,
+                        LedgerEnumerationLimits(16, 255 * 4, 1024 * 1024),
+                    )
+                    names = tuple(item.name for item in observations)
+                    self.assertEqual(names, tuple(sorted(names)))
+                    self.assertIn("alpha.json", names)
+                    self.assertIn("beta.json", names)
+                    self.assertTrue(
+                        all(item.snapshot.identity.link_count == 1 for item in observations)
+                    )
+
+                    with self.assertRaises(PlatformFileError) as limited:
+                        parent.observe_ledger_entries(
+                            lease,
+                            LedgerEnumerationLimits(1, 255 * 4, 1024 * 1024),
+                        )
+                    _assert_platform_error(
+                        self,
+                        limited,
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    )
+
+                    unsafe_dir = self.nested / "unsafe-dir"
+                    unsafe_dir.mkdir()
+                    try:
+                        with self.assertRaises(PlatformFileError) as unsafe:
+                            parent.observe_ledger_entries(
+                                lease,
+                                LedgerEnumerationLimits(16, 255 * 4, 1024 * 1024),
+                            )
+                        _assert_platform_error(
+                            self,
+                            unsafe,
+                            PlatformFileErrorCode.REPARSE_REJECTED,
+                        )
+                    finally:
+                        unsafe_dir.rmdir()
+
+                finally:
+                    lease.close()
+
+        alias = self.nested / "alpha-alias.json"
+        os.link(self.nested / "alpha.json", alias)
+        try:
+            adapter = WindowsPlatformAdapter()
+            with adapter.bind_root(self.root_path) as root:
+                with adapter.bind_parent(
+                    root,
+                    PureWindowsPath("NestedCase", "placeholder.bin"),
+                ) as parent:
+                    lease = adapter.acquire(
+                        parent,
+                        ".ledger.lock",
+                        b"ledger-v1",
+                        LockPolicy(LockWait.FAIL_FAST),
+                    )
+                    try:
+                        with self.assertRaises(PlatformFileError) as hardlink:
+                            parent.observe_ledger_entries(
+                                lease,
+                                LedgerEnumerationLimits(16, 255 * 4, 1024 * 1024),
+                            )
+                        _assert_platform_error(
+                            self,
+                            hardlink,
+                            PlatformFileErrorCode.IDENTITY_STALE,
+                        )
+                    finally:
+                        lease.close()
+        finally:
+            alias.unlink()
+
+    def test_locked_ledger_observation_reproves_live_lease_at_terminal(self) -> None:
+        (self.nested / "alpha.json").write_bytes(b"alpha")
+        adapter = WindowsPlatformAdapter()
+        with adapter.bind_root(self.root_path) as root:
+            with adapter.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                lease = adapter.acquire(
+                    parent,
+                    ".ledger-terminal.lock",
+                    b"ledger-terminal-v1",
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                real_query = parent._api.GetFileInformationByHandleEx
+                closed = False
+
+                def close_during_first_directory_query(*args: object) -> int:
+                    nonlocal closed
+                    if (
+                        not closed
+                        and args[1]
+                        == platform_fs_windows.FILE_ID_EXTD_DIR_INFO_CLASS
+                    ):
+                        lease.close()
+                        closed = True
+                    return real_query(*args)
+
+                with mock.patch.object(
+                    parent._api,
+                    "GetFileInformationByHandleEx",
+                    side_effect=close_during_first_directory_query,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    parent.observe_ledger_entries(
+                        lease,
+                        LedgerEnumerationLimits(16, 255 * 4, 1024 * 1024),
+                    )
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                )
+                self.assertTrue(closed)
+
+    def test_locked_ledger_observation_rejects_first_second_scan_drift(self) -> None:
+        alpha = self.nested / "alpha.json"
+        alpha.write_bytes(b"alpha")
+        adapter = WindowsPlatformAdapter()
+        with adapter.bind_root(self.root_path) as root:
+            with adapter.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                lease = adapter.acquire(
+                    parent,
+                    ".ledger-drift.lock",
+                    b"ledger-drift-v1",
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                try:
+                    real_query = parent._api.GetFileInformationByHandleEx
+                    directory_queries = 0
+
+                    def drift_before_second_scan(*args: object) -> int:
+                        nonlocal directory_queries
+                        if args[1] == platform_fs_windows.FILE_ID_EXTD_DIR_INFO_CLASS:
+                            directory_queries += 1
+                            if directory_queries == 3:
+                                alpha.write_bytes(b"alpha-drifted")
+                        return real_query(*args)
+
+                    with mock.patch.object(
+                        parent._api,
+                        "GetFileInformationByHandleEx",
+                        side_effect=drift_before_second_scan,
+                    ), self.assertRaises(PlatformFileError) as caught:
+                        parent.observe_ledger_entries(
+                            lease,
+                            LedgerEnumerationLimits(16, 255 * 4, 1024 * 1024),
+                        )
+                    _assert_platform_error(
+                        self,
+                        caught,
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                    )
+                    self.assertGreaterEqual(directory_queries, 3)
+                finally:
+                    lease.close()
 
     def test_hostile_component_is_rejected_before_any_native_open(self) -> None:
         file_system = WindowsRootedFileSystem()

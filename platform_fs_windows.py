@@ -16,16 +16,19 @@ import struct
 import sys
 import threading
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
     BoundRegularFile,
     CandidateFile,
+    CandidateContentFacts,
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
     EntrySnapshot,
     FileObjectIdentity,
+    LedgerEntryObservation,
+    LedgerEnumerationLimits,
     LockLease,
     LockPolicy,
     LockWait,
@@ -111,6 +114,7 @@ FILE_STANDARD_INFO_CLASS = 1
 FILE_DISPOSITION_INFO_CLASS = 4
 FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
 FILE_ID_INFO_CLASS = 18
+FILE_ID_EXTD_DIR_INFO_CLASS = 19
 VOLUME_NAME_GUID = 0x1
 
 DRIVE_FIXED = 3
@@ -127,11 +131,16 @@ FILE_BEGIN = 0
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
+ERROR_NO_MORE_FILES = 18
 ERROR_SHARING_VIOLATION = 32
 ERROR_LOCK_VIOLATION = 33
 ERROR_FILE_EXISTS = 80
 ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_ALREADY_EXISTS = 183
+
+_FILE_ID_EXTD_DIR_HEADER = struct.Struct("<IIqqqqqqIIII16s")
+_FILE_ID_EXTD_DIR_HEADER_BYTES = 88
+_DIRECTORY_QUERY_BUFFER_BYTES = 64 * 1024
 
 TOKEN_QUERY = 0x0008
 TOKEN_DUPLICATE = 0x0002
@@ -596,6 +605,32 @@ def _append_component(
     return result
 
 
+def _validate_directory_record_bounds(
+    *,
+    offset: int,
+    name_length: int,
+    next_offset: int,
+    buffer_size: int,
+) -> None:
+    if _FILE_ID_EXTD_DIR_HEADER.size != _FILE_ID_EXTD_DIR_HEADER_BYTES:
+        raise _identity_stale()
+    record_size = _FILE_ID_EXTD_DIR_HEADER_BYTES + name_length
+    if (
+        name_length < 2
+        or name_length % 2
+        or offset < 0
+        or buffer_size < 0
+        or offset + record_size > buffer_size
+    ):
+        raise _identity_stale()
+    if next_offset != 0 and (
+        next_offset < record_size
+        or next_offset % 8
+        or offset + next_offset >= buffer_size
+    ):
+        raise _identity_stale()
+
+
 def _identity_from_file_info(
     identity_info: FILE_ID_INFO,
     standard: FILE_STANDARD_INFO,
@@ -979,6 +1014,163 @@ class _WindowsDirectoryAuthorityMixin:
             return None if proof is None else proof.snapshot
         except PlatformFileError:
             raise
+
+    def _observe_ledger_entries(
+        self,
+        lease: LockLease,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if not isinstance(lease, _WindowsLockLease) or not lease._matches_parent(
+            self._api,
+            self._records,
+        ):
+            raise _lock_unavailable()
+
+        def observe_once() -> tuple[LedgerEntryObservation, ...]:
+            record = _open_directory_record(
+                self._api,
+                self._leaf_path,
+                self._leaf_path,
+                stale=True,
+                expected_volume_id=self._records[0].identity.volume_id,
+            )
+            try:
+                if record.identity != self._records[-1].identity:
+                    raise _identity_stale()
+                observations: list[LedgerEntryObservation] = []
+                seen_names: set[str] = set()
+                total_bytes = 0
+                with record.handle.borrow() as raw:
+                    while True:
+                        buffer = ctypes.create_string_buffer(_DIRECTORY_QUERY_BUFFER_BYTES)
+                        if not self._api.GetFileInformationByHandleEx(
+                            raw,
+                            FILE_ID_EXTD_DIR_INFO_CLASS,
+                            buffer,
+                            len(buffer),
+                        ):
+                            error = self._api.last_error()
+                            if error == ERROR_NO_MORE_FILES:
+                                break
+                            raise Win32CallError(
+                                "GetFileInformationByHandleEx",
+                                error,
+                            )
+                        offset = 0
+                        while True:
+                            if offset + _FILE_ID_EXTD_DIR_HEADER.size > len(buffer):
+                                raise _identity_stale()
+                            values = _FILE_ID_EXTD_DIR_HEADER.unpack_from(buffer.raw, offset)
+                            (
+                                next_offset,
+                                _file_index,
+                                _creation_time,
+                                _last_access_time,
+                                _last_write_time,
+                                _change_time,
+                                end_of_file,
+                                _allocation_size,
+                                attributes,
+                                name_length,
+                                _ea_size,
+                                reparse_tag,
+                                file_id,
+                            ) = values
+                            _validate_directory_record_bounds(
+                                offset=offset,
+                                name_length=name_length,
+                                next_offset=next_offset,
+                                buffer_size=len(buffer),
+                            )
+                            name_start = offset + _FILE_ID_EXTD_DIR_HEADER.size
+                            try:
+                                name = buffer.raw[
+                                    name_start : name_start + name_length
+                                ].decode("utf-16-le", errors="strict")
+                            except UnicodeDecodeError:
+                                raise _identity_stale() from None
+                            if name not in {".", ".."}:
+                                if len(observations) >= limits.maximum_entries:
+                                    raise _capability_unavailable()
+                                component = _validate_windows_component(
+                                    name,
+                                    maximum_units=self._maximum_component_units,
+                                )
+                                if len(component.encode("utf-8")) > limits.maximum_name_bytes:
+                                    raise _capability_unavailable()
+                                folded = component.casefold()
+                                if folded in seen_names:
+                                    raise _identity_stale()
+                                seen_names.add(folded)
+                                if (
+                                    attributes & (
+                                        FILE_ATTRIBUTE_REPARSE_POINT
+                                        | FILE_ATTRIBUTE_DIRECTORY
+                                    )
+                                    or reparse_tag != 0
+                                    or end_of_file < 0
+                                    or not any(file_id)
+                                ):
+                                    raise _reparse_rejected()
+                                entry_path = _append_component(
+                                    self._leaf_path,
+                                    component,
+                                    maximum_units=self._maximum_component_units,
+                                )
+                                proof = _open_entry_proof(
+                                    self._api,
+                                    entry_path,
+                                    entry_path,
+                                    expected_kind="regular",
+                                    expected_volume_id=self._records[0].identity.volume_id,
+                                    stale=True,
+                                )
+                                if (
+                                    proof is None
+                                    or proof.identity.file_id != file_id
+                                    or proof.identity.link_count != 1
+                                    or proof.snapshot.byte_count != end_of_file
+                                ):
+                                    raise _identity_stale()
+                                total_bytes += proof.snapshot.byte_count
+                                if total_bytes > limits.maximum_total_bytes:
+                                    raise _capability_unavailable()
+                                observations.append(
+                                    LedgerEntryObservation(component, proof.snapshot)
+                                )
+                            if next_offset == 0:
+                                break
+                            offset += next_offset
+                observations.sort(key=lambda observation: observation.name)
+                return tuple(observations)
+            except PlatformFileError:
+                raise
+            except Exception:
+                raise _identity_stale() from None
+            finally:
+                try:
+                    record.handle.close()
+                except BaseException:
+                    if sys.exception() is None:
+                        raise _identity_stale() from None
+
+        self._reprove()
+        first = observe_once()
+        self._reprove()
+        second = observe_once()
+        self._reprove()
+        if first != second:
+            raise _identity_stale()
+        try:
+            terminal_lease_match = lease._matches_parent(
+                self._api,
+                self._records,
+            )
+        except Exception:
+            raise _lock_unavailable() from None
+        if not terminal_lease_match:
+            raise _lock_unavailable()
+        return second
 
     def _create_candidate(self, name: str, *, private: bool) -> CandidateFile:
         component = _validate_windows_component(
@@ -1946,6 +2138,31 @@ def _write_exact_payload(
     api.checked_bool("SetEndOfFile", api.SetEndOfFile, raw_handle)
 
 
+def _write_stream_chunk(
+    api: WindowsFileAPI,
+    raw_handle: int,
+    payload: bytes,
+) -> None:
+    written_total = 0
+    while written_total < len(payload):
+        remaining = payload[written_total:]
+        buffer = ctypes.create_string_buffer(remaining)
+        written = DWORD()
+        api.checked_bool(
+            "WriteFile",
+            api.WriteFile,
+            raw_handle,
+            buffer,
+            len(remaining),
+            ctypes.byref(written),
+            None,
+        )
+        count = int(written.value)
+        if count < 1 or count > len(remaining):
+            raise _publish_failed()
+        written_total += count
+
+
 def _prove_lock_handle(
     api: WindowsFileAPI,
     records: tuple[_WindowsDirectoryRecord, ...],
@@ -2685,16 +2902,17 @@ class _WindowsBoundRegularFile(BoundRegularFile):
             raise _capability_unavailable() from None
 
 
-def _read_publish_payload(
+def _read_publish_facts(
     api: WindowsFileAPI,
     handle: object,
     byte_count: int,
-) -> bytes:
+) -> CandidateContentFacts:
     if type(byte_count) is not int or byte_count < 0:
         raise _publish_failed()
     with handle.borrow() as raw:
         _seek_start(api, raw)
-        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        consumed = 0
         remaining = byte_count
         while remaining:
             requested = min(_READ_CHUNK_BYTES, remaining)
@@ -2712,7 +2930,8 @@ def _read_publish_payload(
             count = int(read.value)
             if count < 1 or count > requested:
                 raise _publish_failed()
-            chunks.append(buffer.raw[:count])
+            digest.update(buffer.raw[:count])
+            consumed += count
             remaining -= count
         eof_buffer = ctypes.create_string_buffer(1)
         eof_read = DWORD()
@@ -2727,7 +2946,7 @@ def _read_publish_payload(
         )
         if int(eof_read.value) != 0:
             raise _publish_failed()
-    return b"".join(chunks)
+    return CandidateContentFacts(consumed, digest.digest())
 
 
 def _rename_candidate_handle(
@@ -2849,25 +3068,42 @@ class _WindowsCandidateFile(CandidateFile):
                 raise
             raise self._failure() from None
 
-    def _write_all(self, payload: bytes) -> None:
+    def _write_chunks(self, chunks: Iterator[bytes]) -> CandidateContentFacts:
         try:
             self._reprove_handle()
+            digest = hashlib.sha256()
+            byte_count = 0
             with self._handle.borrow() as raw:
-                _write_exact_payload(self._api, raw, payload)
+                _seek_start(self._api, raw)
+                self._api.checked_bool("SetEndOfFile", self._api.SetEndOfFile, raw)
+                for chunk in chunks:
+                    _write_stream_chunk(self._api, raw, chunk)
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+                self._api.checked_bool("SetEndOfFile", self._api.SetEndOfFile, raw)
             proof = self._reprove_handle()
-            if proof.snapshot.byte_count != len(payload):
+            if proof.snapshot.byte_count != byte_count:
                 raise self._failure()
-            self._expected_digest = hashlib.sha256(payload).digest()
-            self._expected_count = len(payload)
+            self._expected_digest = digest.digest()
+            self._expected_count = byte_count
             self._flushed_digest = None
             self._flushed_count = None
+            return CandidateContentFacts(byte_count, digest.digest())
+        except (TypeError, ValueError):
+            # Contract validation is performed lazily while the backend
+            # consumes the checked iterator. Preserve those exact public
+            # errors instead of misclassifying caller input as an OS publish
+            # failure; the POSIX adapter has the same boundary.
+            raise
         except BaseException as error:
             if not isinstance(error, Exception):
                 raise
             raise self._failure() from None
 
-    def _flush_content(self) -> None:
+    def _flush_content(self, expected: CandidateContentFacts) -> CandidateContentFacts:
         if self._expected_digest is None or self._expected_count is None:
+            raise _publish_failed()
+        if expected != CandidateContentFacts(self._expected_count, self._expected_digest):
             raise _publish_failed()
         try:
             before = self._reprove_handle()
@@ -2884,21 +3120,20 @@ class _WindowsCandidateFile(CandidateFile):
                 if not isinstance(error, Exception):
                     raise
                 raise _durability_unavailable() from None
-            payload = _read_publish_payload(
+            actual = _read_publish_facts(
                 self._api,
                 self._handle,
                 self._expected_count,
             )
             after = self._reprove_handle()
-            digest = hashlib.sha256(payload).digest()
             if (
                 before.snapshot != after.snapshot
-                or len(payload) != self._expected_count
-                or digest != self._expected_digest
+                or actual != expected
             ):
                 raise self._failure()
-            self._flushed_digest = digest
-            self._flushed_count = len(payload)
+            self._flushed_digest = actual.content_sha256
+            self._flushed_count = actual.byte_count
+            return actual
         except BaseException as error:
             if not isinstance(error, Exception):
                 raise
@@ -2915,20 +3150,19 @@ class _WindowsCandidateFile(CandidateFile):
         if self._flushed_digest is None or self._flushed_count is None:
             raise self._failure()
         proof = self._reprove_handle()
-        payload = _read_publish_payload(self._api, self._handle, self._flushed_count)
+        actual = _read_publish_facts(self._api, self._handle, self._flushed_count)
         after = self._reprove_handle()
-        digest = hashlib.sha256(payload).digest()
         if (
             proof.snapshot != after.snapshot
-            or len(payload) != self._flushed_count
-            or digest != self._flushed_digest
+            or actual.byte_count != self._flushed_count
+            or actual.content_sha256 != self._flushed_digest
         ):
             raise self._failure()
         return PublishFacts(
             mode=mode,
             destination_identity=after.identity,
-            content_sha256=digest,
-            byte_count=len(payload),
+            content_sha256=actual.content_sha256,
+            byte_count=actual.byte_count,
             reparse_free=True,
         )
 
@@ -2957,13 +3191,25 @@ def _publish_facts_from_retained(
     mode: PublishMode,
 ) -> PublishFacts:
     try:
-        payload = retained.read_all()
+        expected = retained.snapshot()
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.byte_count:
+            chunk = retained.read_at(
+                offset,
+                min(_READ_CHUNK_BYTES, expected.byte_count - offset),
+                expected,
+            )
+            digest.update(chunk)
+            offset += len(chunk)
+        if retained.read_at(offset, 1, expected) or retained.snapshot() != expected:
+            raise _recovery_required()
         identity = retained._identity()
         return PublishFacts(
             mode=mode,
             destination_identity=identity,
-            content_sha256=hashlib.sha256(payload).digest(),
-            byte_count=len(payload),
+            content_sha256=digest.digest(),
+            byte_count=offset,
             reparse_free=True,
         )
     except BaseException as error:
