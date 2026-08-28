@@ -15,6 +15,7 @@ from typing import Callable, Protocol, runtime_checkable
 
 class PlatformFileErrorCode(str, Enum):
     CAPABILITY_UNAVAILABLE = "PLATFORM.FS.CAPABILITY_UNAVAILABLE"
+    ENTRY_UNAVAILABLE = "PLATFORM.FS.ENTRY_UNAVAILABLE"
     OUTSIDE_ROOT = "PLATFORM.FS.OUTSIDE_ROOT"
     REPARSE_REJECTED = "PLATFORM.FS.REPARSE_REJECTED"
     IDENTITY_STALE = "PLATFORM.FS.IDENTITY_STALE"
@@ -28,6 +29,7 @@ class PlatformFileErrorCode(str, Enum):
 
 _FIXED_RETRYABILITY = {
     PlatformFileErrorCode.CAPABILITY_UNAVAILABLE: False,
+    PlatformFileErrorCode.ENTRY_UNAVAILABLE: False,
     PlatformFileErrorCode.OUTSIDE_ROOT: False,
     PlatformFileErrorCode.REPARSE_REJECTED: False,
     PlatformFileErrorCode.IDENTITY_STALE: True,
@@ -527,15 +529,67 @@ class OpaqueAuthority(ABC):
 
 
 class BoundRegularFile(OpaqueAuthority, ABC):
-    def read_all(self) -> bytes:
+    _MAXIMUM_BOUNDED_READ_BYTES = 64 * 1024
+
+    def read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected: EntrySnapshot,
+    ) -> bytes:
         self._require_open()
-        payload = self._read_all()
+        if type(offset) is not int:
+            raise TypeError("offset must be exact int")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if type(maximum_bytes) is not int:
+            raise TypeError("maximum_bytes must be exact int")
+        if maximum_bytes < 1 or maximum_bytes > self._MAXIMUM_BOUNDED_READ_BYTES:
+            raise ValueError("maximum_bytes must be from 1 through 65536")
+        if type(expected) is not EntrySnapshot:
+            raise TypeError("expected must be exact EntrySnapshot")
+        if offset > expected.byte_count:
+            raise ValueError("offset must not exceed the expected byte count")
+        payload = self._read_at(offset, maximum_bytes, expected)
         if type(payload) is not bytes:
-            raise TypeError("backend read_all must return exact bytes")
+            raise TypeError("backend read_at must return exact bytes")
+        expected_count = min(maximum_bytes, expected.byte_count - offset)
+        if len(payload) != expected_count:
+            raise ValueError("backend read_at returned a non-exact byte count")
         return payload
 
     @abstractmethod
-    def _read_all(self) -> bytes: ...
+    def _read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected: EntrySnapshot,
+    ) -> bytes: ...
+
+    def read_all(self) -> bytes:
+        self._require_open()
+        expected = self.snapshot()
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < expected.byte_count:
+            maximum_bytes = min(
+                self._MAXIMUM_BOUNDED_READ_BYTES,
+                expected.byte_count - offset,
+            )
+            chunk = self.read_at(offset, maximum_bytes, expected)
+            chunks.append(chunk)
+            offset += len(chunk)
+        if self.read_at(offset, 1, expected):
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        if self.snapshot() != expected:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return b"".join(chunks)
 
     def identity(self) -> FileObjectIdentity:
         self._require_open()

@@ -806,10 +806,39 @@ class _PosixBoundRegularFile(BoundRegularFile):
                 retryable=True,
             ) from None
 
-    def _read_all(self) -> bytes:
+    def _read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected_snapshot: EntrySnapshot,
+    ) -> bytes:
         before = _snapshot_from_stat(self._reprove())
+        if before != expected_snapshot:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        expected_count = min(
+            maximum_bytes,
+            max(0, expected_snapshot.byte_count - offset),
+        )
         try:
-            payload = _read_fd_all(self._descriptor)
+            if expected_count == 0:
+                if os.pread(self._descriptor, 1, offset):
+                    raise _platform_error(
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                        retryable=True,
+                    )
+                payload = b""
+            else:
+                payload = os.pread(self._descriptor, expected_count, offset)
+                if len(payload) != expected_count:
+                    raise _platform_error(
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                        retryable=True,
+                    )
+        except PlatformFileError:
+            raise
         except OSError as error:
             raise _map_os_error(
                 error,
@@ -817,7 +846,7 @@ class _PosixBoundRegularFile(BoundRegularFile):
                 retryable=True,
             ) from None
         after = _snapshot_from_stat(self._reprove())
-        if before != after or len(payload) != after.byte_count:
+        if after != expected_snapshot:
             raise _platform_error(
                 PlatformFileErrorCode.IDENTITY_STALE,
                 retryable=True,
@@ -831,7 +860,7 @@ class _PosixBoundRegularFile(BoundRegularFile):
         return _snapshot_from_stat(self._reprove())
 
     def _publish_facts(self, mode: PublishMode) -> PublishFacts:
-        payload = self._read_all()
+        payload = self.read_all()
         return PublishFacts(
             mode=mode,
             destination_identity=self._identity(),
@@ -1258,6 +1287,11 @@ class PosixPlatformAdapter(RootedFileSystem, ProcessFileLock, PrivateStorageProo
             if retained_directories is not None:
                 for item in reversed(retained_directories):
                     _close_fd(item)
+            if error.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+                raise _platform_error(
+                    PlatformFileErrorCode.ENTRY_UNAVAILABLE,
+                    retryable=False,
+                ) from None
             raise _map_os_error(
                 error,
                 fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
