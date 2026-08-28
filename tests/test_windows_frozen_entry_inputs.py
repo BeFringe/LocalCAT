@@ -303,6 +303,7 @@ static int _pyi_dylib_python_import_symbols(void) {
         self.assertEqual({item["status"] for item in record["assertions"]}, {"PASS"})
         self.assertEqual(record["candidate_input_digest"], _json_digest(authority_payload))
         self.assertNotIn("host_observation", record)
+        self.assertNotIn("catalogs", record["toolchain"]["windows_sdk"])
         self.assertIsNone(
             re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", json.dumps(record, ensure_ascii=False))
         )

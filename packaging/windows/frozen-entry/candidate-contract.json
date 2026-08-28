@@ -185,7 +185,6 @@
     "add_symbols": {
       "KERNEL32.DLL": [
         "CompareStringOrdinal",
-        "DeviceIoControl",
         "GetFileAttributesW",
         "GetFileInformationByHandleEx",
         "GetFinalPathNameByHandleW",
