@@ -157,6 +157,7 @@ class WindowsReleaseEvidenceTest(unittest.TestCase):
             "evidence-harness-success.json",
             "evidence-harness-expected-failure.json",
             "evidence-harness-interrupted.json",
+            "windows-documented-publish-v1.json",
         }
         self.assertEqual({path.name for path in contract_root.glob("*.json")}, expected)
         for name in sorted(expected):

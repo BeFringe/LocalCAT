@@ -13,6 +13,7 @@ from pathlib import Path, PurePath, PurePosixPath
 import pickle
 import threading
 import unittest
+from unittest import mock
 
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
@@ -675,6 +676,16 @@ class PlatformFileValueContractTests(unittest.TestCase):
                 )
         with self.assertRaises(TypeError):
             encode_windows_private_proof(object())  # type: ignore[arg-type]
+
+    def test_private_proof_decoder_rejects_oversize_before_json_parse(self) -> None:
+        from platform_fs_contracts import WINDOWS_PRIVATE_PROOF_MAX_BYTES
+
+        with mock.patch("platform_fs_contracts.json.loads") as loads:
+            with self.assertRaises(ValueError):
+                decode_windows_private_proof(
+                    b"{" + b" " * WINDOWS_PRIVATE_PROOF_MAX_BYTES + b"}"
+                )
+        loads.assert_not_called()
 
     def test_private_proof_unsigned_mac_projection_and_key_id_have_golden_bytes(self) -> None:
         proof = _windows_private_proof()
