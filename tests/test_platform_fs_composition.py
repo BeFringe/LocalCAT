@@ -59,6 +59,10 @@ class _ProbeAuthority(BoundDirectoryAuthority):
         del name
         return None
 
+    def _observe_ledger_entries(self, lease: object, limits: object) -> tuple[object, ...]:
+        del lease, limits
+        return ()
+
     def _create_candidate(self, name: str, *, private: bool) -> object:
         del name, private
         raise AssertionError("composition must not create a candidate")
