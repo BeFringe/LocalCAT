@@ -122,7 +122,7 @@ flowchart LR
 |---|---|---|---|
 | UI | PySide6/Qt 6.11.1 | Windows visible application and smoke | `qwindows.dll` at platform plugin path |
 | Runtime | CPython 3.14 x64 | application/runtime FFI | Windows stdlib `ctypes` only |
-| Platform I/O | Win32 Kernel32/Advapi32 | handle, FileId, lock, rename, flush, ACL | wrapper binds arg/restype and `use_last_error=True` |
+| Platform I/O | Win32 Kernel32/Advapi32 + documented Ntdll naming port | handle, FileId, lock, same-parent rename, flush, ACL | Win32 wrapper binds arg/restype and `use_last_error=True`；native naming wrapper固定ABI与NTSTATUS映射 |
 | POSIX I/O | existing `os`/`fcntl` primitives | macOS/Linux adapter | `fcntl` import confined to POSIX module |
 | Storage | stdlib SQLite + FTS5 | canonical TM authority/search | real create/query/reopen gate |
 | Packaging | PyInstaller 6.22.x pinned build tool | onedir/windowed EXE | custom spec + generated hook/manifest |
@@ -308,7 +308,7 @@ stateDiagram-v2
     ParentBound --> CandidateCreated: CREATE_NEW + requested security profile
     CandidateCreated --> CandidateFlushed: write + FlushFileBuffers
     CandidateFlushed --> Armed: journal/LKG protocol owns intent
-    Armed --> RenamedHandleHeld: SetFileInformationByHandle relative to bound parent
+    Armed --> RenamedHandleHeld: NtSetInformationFile same-parent basename
     RenamedHandleHeld --> CandidateClosed: capture final facts + close every candidate handle
     CandidateClosed --> ReadbackHeld: reopen destination + candidate FileId/digest
     ReadbackHeld --> Committed: retain handle + durable business metadata commit
@@ -325,6 +325,7 @@ stateDiagram-v2
 ```
 
 - `begin_publish` receives the still-open candidate handle and bound destination parent; source path is never reopened，并返回仍持有destination readback authority的`PendingPublication`，不能在该调用返回时报告success。
+- Windows同父目录命名使用`NtSetInformationFile(FileRenameInformation)`，`RootDirectory=NULL`且`FileName`只接受已验证的单组件basename；内核以candidate open的`Open.Link.ParentFile`作为destination directory。调用前必须证明candidate记录的parent chain与retained bound parent为同一live实例；不得回退到CWD、完整路径、`SetFileInformationByHandle`或跨父目录rename。
 - `CREATE_IF_ABSENT` 使用 replace=false；`REPLACE_UNDER_LOCK` 要求 owner 已持有覆盖 destination family 的排他 `LockLease`，锁内 target snapshot 只是 stale/recovery 事实，不是 OS-level expected-ID CAS。未持 lease 的 replace 请求 fail closed。
 - candidate share=none，因此 rename 后先 capture candidate/final facts，再关闭所有 candidate handles，之后才允许 reopen destination；close 前 reopen 必须在测试中得到 sharing violation，不能靠扩大 share mask 隐藏生命周期错误。
 - reopen/readback 后的 destination handle 由`PendingPublication`保持 no-write/no-delete share；owner先通过该authority重验内容，完成自己的durable metadata commit与business-state reproof，再调用platform terminal identity/digest reproof，之后才关闭pending authority并清理owned residue。该显式handshake跨越readback→commit窗口，但平台不接收generic business receipt，也不宣称 expected-target CAS。

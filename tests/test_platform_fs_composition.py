@@ -659,16 +659,22 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
                 platform_fs.compose_platform_file_backend(Path(directory))
         _assert_stable_error(self, caught)
 
-    def test_current_windows_factory_is_body_safe_and_does_not_write_probe_files(self) -> None:
+    def test_current_windows_factory_and_persistent_narrowing_are_live_and_read_only(self) -> None:
         if sys.platform != "win32":
             self.skipTest("requires the real Windows host")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             before = tuple(root.iterdir())
-            with self.assertRaises(PlatformFileError) as caught:
-                platform_fs.compose_platform_file_backend(root)
+            backend = platform_fs.compose_platform_file_backend(root)
+            narrowed = platform_fs.narrow_windows_persistent_private_proof(
+                backend,
+                root,
+            )
             after = tuple(root.iterdir())
-        _assert_stable_error(self, caught)
+        from platform_fs_windows import WindowsPlatformAdapter
+
+        self.assertIs(type(backend), WindowsPlatformAdapter)
+        self.assertIs(narrowed, backend)
         self.assertEqual(after, before)
 
 
