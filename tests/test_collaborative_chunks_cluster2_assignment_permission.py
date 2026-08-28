@@ -39,6 +39,7 @@ from collaborative_chunks import (
 )
 from project_workspace_contracts import SourcePresence
 from project_workspace_identity import issue_project_id
+from platform_fs import compose_platform_file_backend
 from tests.test_collaborative_chunks_cluster1_acceptance import _RealPackageHarness
 
 
@@ -528,10 +529,12 @@ class CollaborativeChunkCluster2AssignmentTests(unittest.TestCase):
     def test_assignment_cold_reopens_with_canonical_opaque_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
+            platform_backend = compose_platform_file_backend(root)
             store = CollaborativeChunkStore(
                 root,
                 "chunks.json",
                 project_id=self.project_id,
+                platform_backend=platform_backend,
             )
             authority = ChunkTopologyPublicationAuthority(
                 project_id=self.project_id,
@@ -607,6 +610,7 @@ class CollaborativeChunkCluster2AssignmentTests(unittest.TestCase):
                     root,
                     "chunks.json",
                     project_id=self.project_id,
+                    platform_backend=platform_backend,
                 ),
             )
             snapshot = validate_chunk_plan_snapshot(reopened.current_snapshot())

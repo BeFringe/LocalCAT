@@ -6,6 +6,8 @@
 
 每个 Cluster 仍形成一个累计验证里程碑。review cells 只把不同 authority、故障面与验收问题交给定点检查；定点检查可以并行只读执行，但不能以多个局部检查替代最终累计 diff 验证。
 
+WA-02 source amendment采用两份有序 owner commits。第一份只审 `1.3a`、`1.4a`、`3.2a` 的独立 metadata/startup 闭包，可在 WA-03 前合入；第二份在平台 C5S、且 `multi-document-project-workspace` `2.8a`、`4.4a` 完成后审 `4.4a`、`4.5a` 的真实 ProjectPackage 组合闭包。第一份通过不等于最终 source owner PASS，第二份不得重新否定第一份已证明的平台能力或以替身绕过 Project owner。
+
 ## Promotion Cluster 评审边界
 
 | Cluster | 监督问题 | 前置与输入 | 必须证明的证据 | 明确不审成什么 |
@@ -15,6 +17,21 @@
 | C2 Assignment / Permission / Workspace Reconciliation | 谁可修改 target/confirmed，以及 workspace 变化后 membership 如何保持诚实而不变成账号或 reconciliation owner？ | C1 cumulative evidence；已发布 workspace/reconciliation facts | actor/manager/edit capability 矩阵、真实 mutation port 拒绝、stale capability、progress/detached、完整 workspace reconciliation fault matrix | 不实现 Controller session/search、Qt、provider/sync 或 export |
 | C3 Controller / Search / Conflict | Application 是否只组合既有 authority，且 search、conflict、undo 没有形成第二 membership/store 权威？ | C2 cumulative evidence；Multi-Document C3 稳定 API | target/confirmed 实际调用链、`current_chunk` matcher/composite hit、旧 scope 不变、diverged 禁止 LWW、current-head undo 新 revision | 不实现 Qt 或 export transaction；search hit 不是 export scope |
 | C4 Qt / Acceptance | UI 是否只是可信投影，并由同一 final tree 的真实命令与冷重开证据证明？ | C3 cumulative evidence；Multi-Document C4 稳定产品面 | 真实 ProjectPackage + metadata journey、Qt disabled 与 Controller denial 双证、窄布局/键盘、无-plan legacy、strict evidence reread | 不新增领域语义、不直接读 store、不增加 TMX/ResourcePackage/project export UI |
+
+## WA-02 Source 分阶段评审
+
+### 独立 Metadata / Startup 阶段
+
+- 输入为 Windows platform C3B 已通过的 lock、rooted publication 与 composition ports，以及 `1.3a`、`1.4a`、`3.2a` 的累计 diff。
+- 必须证明 chunk store 无 POSIX-only 顶层 import、Qt source composition 不禁用协作模块、W1 exact lock payload/first-creator/crash 接管、双进程竞争与 owner kill、candidate retained-handle publication、journal/LKG old/new/recovery-required 分类。
+- 该阶段 reviewer只裁决独立 metadata 与 startup 能力，可批准第一份 owner commit先于 WA-03 合入；不得要求 ProjectPackage Windows open/save 作为进入条件，也不得把本阶段结论写成 WA-02 source owner 最终 PASS。
+
+### ProjectPackage 组合阶段
+
+- 输入为第一阶段已合入结果、`multi-document-project-workspace` `2.8a`/`4.4a` 的 Windows public business API evidence，以及 `4.4a`、`4.5a` 的累计 diff。
+- 必须用真实双 Document ProjectPackage public API/bytes 重放 metadata publication、package bytes不变、workspace/audit prior-or-new、双进程/process kill、冷重开与 Qt composition journey。
+- mock ProjectPackage、私有 ZIP/manifest 构造、fixture-only workspace 注入、disabled module 或 skipped test 均不能形成通过证据。
+- 只有此阶段累计 reviewer关闭所有 finding，才能形成第二份 owner commit并给出 WA-02 source owner 最终 PASS；frozen `1.4b`、`4.5b` 仍由后置 frozen review 独立裁决。
 
 ## 正交 review cells
 
@@ -78,3 +95,4 @@
 3. 全部定点检查关闭后，仍须复核完整 Cluster 累计 diff、跨 cell interaction 与边界。
 4. 只有最终累计实施验证通过，才能勾选该 Cluster tasks 并进入下一簇；C4 闭合后再形成 Chunk 特性提交。
 5. 实现与评审可以分工；局部测试不能替代独立边界检查。
+6. WA-02第一阶段完成时只允许勾选 `1.3a`、`1.4a`、`3.2a`；`4.4a`、`4.5a` 保持未完成。两阶段分别通过本协议对应审查后形成有序 owner commits，最终 source owner PASS只由第二阶段给出。

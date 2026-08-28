@@ -9,15 +9,26 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import json
-import os
-from pathlib import Path
-import stat
+from pathlib import Path, PurePath
 from threading import Lock
-from typing import Iterator
+from typing import Callable, Iterator, Protocol, runtime_checkable
 import unicodedata
+
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    CandidateFile,
+    LockLease,
+    LockPolicy,
+    LockWait,
+    PendingPublication,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+    RootedDirectoryAuthority,
+)
 
 from collaborative_chunk_contracts import (
     CHUNK_AUDIT_RECORD_SCHEMA,
@@ -73,7 +84,75 @@ from collaborative_chunk_contracts import (
 _STORE_DIGEST_DOMAIN = b"localcat.chunk.store-envelope.v1\0"
 _JOURNAL_PHASES = frozenset({"PREPARED", "TARGET_REPLACED"})
 _MAX_FILENAME_BYTES = 255
-_READ_CHUNK = 1024 * 1024
+_LOCK_PAYLOAD_DOMAIN = b"LOCALCAT-PROTOCOL-CONTROL-LOCK\0"
+
+
+@runtime_checkable
+class ChunkMetadataFileBackend(Protocol):
+    """Filesystem, publication and process-lock ports used by Chunk metadata."""
+
+    def bind_root(self, root: Path) -> RootedDirectoryAuthority: ...
+
+    def open_regular(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundRegularFile: ...
+
+    def bind_parent(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundDirectoryAuthority: ...
+
+    def acquire(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        policy: LockPolicy,
+    ) -> LockLease: ...
+
+
+def _lock_payload(project_id: str, target_name: str) -> bytes:
+    resource_family = hashlib.sha256(
+        b"localcat.chunk.metadata-lock.v1\0"
+        + project_id.encode("ascii")
+        + b"\0"
+        + target_name.encode("utf-8")
+    ).hexdigest()
+    return (
+        _LOCK_PAYLOAD_DOMAIN
+        + b"schema=1\nresource-family="
+        + resource_family.encode("ascii")
+        + b"\nrange-map=exclusive-byte-0\n"
+    )
+
+
+def _map_platform_error(
+    error: PlatformFileError,
+    *,
+    journal_armed: bool = False,
+) -> ChunkError:
+    if journal_armed or error.code in {
+        PlatformFileErrorCode.RECOVERY_REQUIRED.value,
+        PlatformFileErrorCode.IDENTITY_STALE.value,
+        PlatformFileErrorCode.REPARSE_REJECTED.value,
+    }:
+        return ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True)
+    if error.code in {
+        PlatformFileErrorCode.LOCK_CONTENDED.value,
+        PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        PlatformFileErrorCode.OUTSIDE_ROOT.value,
+    }:
+        return ChunkError("CHUNK.METADATA_UNAVAILABLE", retryable=error.retryable)
+    return ChunkError("CHUNK.COMMIT_FAILED", retryable=error.retryable)
+
+
+def _hit_fault(injector: Callable[[str], None] | None, phase: str) -> None:
+    if injector is not None:
+        injector(phase)
 
 
 def _fail(code: str, *, retryable: bool = False) -> None:
@@ -1285,7 +1364,10 @@ class CollaborativeChunkStore:
 
     __slots__ = (
         "__root",
-        "__root_identity",
+        "__rooted_file_system",
+        "__process_file_lock",
+        "__lock_payload",
+        "__fault_injector",
         "__target_name",
         "__candidate_name",
         "__lkg_name",
@@ -1302,15 +1384,18 @@ class CollaborativeChunkStore:
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("CollaborativeChunkStore cannot be subclassed")
 
-    def __init__(self, root: Path | str, filename: str, *, project_id: str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        filename: str,
+        *,
+        project_id: str,
+        platform_backend: ChunkMetadataFileBackend,
+        _fault_injector: Callable[[str], None] | None = None,
+    ) -> None:
         root_path = Path(root)
         if not root_path.is_absolute():
             _fail("CHUNK.CONTRACT_INVALID")
-        try:
-            if root_path.resolve(strict=True) != root_path:
-                _fail("CHUNK.CONTRACT_INVALID")
-        except OSError as error:
-            raise ChunkError("CHUNK.CONTRACT_INVALID") from error
         self.__target_name = self._validate_filename(filename)
         self.__candidate_name = f".{filename}.candidate-v1"
         self.__lkg_name = f".{filename}.lkg-v1"
@@ -1332,18 +1417,23 @@ class CollaborativeChunkStore:
         ):
             self._validate_filename(value)
         self.__project_id = validate_chunk_project_id(project_id)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if not isinstance(platform_backend, ChunkMetadataFileBackend):
+            _fail("CHUNK.CONTRACT_INVALID")
+        self.__rooted_file_system = platform_backend
+        self.__process_file_lock = platform_backend
+        self.__lock_payload = _lock_payload(self.__project_id, self.__target_name)
+        if _fault_injector is not None and not callable(_fault_injector):
+            _fail("CHUNK.CONTRACT_INVALID")
+        self.__fault_injector = _fault_injector
+        root_authority: RootedDirectoryAuthority | None = None
         try:
-            descriptor = os.open(root_path, flags)
-        except OSError as error:
-            raise ChunkError("CHUNK.CONTRACT_INVALID") from error
-        try:
-            facts = os.fstat(descriptor)
-            if not stat.S_ISDIR(facts.st_mode):
-                _fail("CHUNK.CONTRACT_INVALID")
-            self.__root_identity = (facts.st_dev, facts.st_ino)
+            root_authority = self.__rooted_file_system.bind_root(root_path)
+            root_authority.reprove()
+        except PlatformFileError as error:
+            raise _map_platform_error(error) from None
         finally:
-            os.close(descriptor)
+            if root_authority is not None:
+                root_authority.close()
         self.__root = root_path
         self.__lock = Lock()
 
@@ -1364,164 +1454,207 @@ class CollaborativeChunkStore:
         return value
 
     @contextmanager
-    def _locked_parent(self) -> Iterator[int]:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    def _locked_parent(
+        self,
+    ) -> Iterator[
+        tuple[RootedDirectoryAuthority, BoundDirectoryAuthority, LockLease]
+    ]:
+        root: RootedDirectoryAuthority | None = None
+        parent: BoundDirectoryAuthority | None = None
+        lease: LockLease | None = None
         try:
-            parent = os.open(self.__root, flags)
-        except OSError:
-            raise ChunkError("CHUNK.DESTINATION_STALE", retryable=True) from None
-        lock_descriptor = -1
-        try:
-            facts = os.fstat(parent)
-            if (facts.st_dev, facts.st_ino) != self.__root_identity:
-                _fail("CHUNK.DESTINATION_STALE", retryable=True)
-            lock_descriptor = os.open(
-                self.__lock_name,
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent,
+            root = self.__rooted_file_system.bind_root(self.__root)
+            parent = self.__rooted_file_system.bind_parent(
+                root,
+                PurePath(self.__target_name),
             )
-            lock_facts = os.fstat(lock_descriptor)
-            if not stat.S_ISREG(lock_facts.st_mode):
-                _fail("CHUNK.DESTINATION_STALE", retryable=True)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        except ChunkError:
-            if lock_descriptor >= 0:
-                os.close(lock_descriptor)
-            os.close(parent)
-            raise
-        except OSError:
-            if lock_descriptor >= 0:
-                try:
-                    os.close(lock_descriptor)
-                except OSError:
-                    pass
-            try:
-                os.close(parent)
-            except OSError:
-                pass
-            raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
+            lease = self.__process_file_lock.acquire(
+                parent,
+                self.__lock_name,
+                self.__lock_payload,
+                LockPolicy(LockWait.BLOCK),
+            )
+        except PlatformFileError as error:
+            raise _map_platform_error(error) from None
         try:
-            yield parent
+            yield root, parent, lease
         finally:
-            if lock_descriptor >= 0:
+            close_failed = False
+            if lease is not None:
                 try:
-                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-                    os.close(lock_descriptor)
-                except OSError:
-                    pass
-            try:
-                os.close(parent)
-            except OSError:
-                pass
+                    lease.close()
+                except PlatformFileError:
+                    close_failed = True
+            if parent is not None:
+                try:
+                    parent.close()
+                except PlatformFileError:
+                    close_failed = True
+            if root is not None:
+                try:
+                    root.close()
+                except PlatformFileError:
+                    close_failed = True
+            if close_failed:
+                raise ChunkError(
+                    "CHUNK.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from None
 
     @staticmethod
-    def _entry_exists(parent: int, name: str) -> bool:
+    def _entry_exists(parent: BoundDirectoryAuthority, name: str) -> bool:
         try:
-            facts = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
-        if not stat.S_ISREG(facts.st_mode):
-            _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-        return True
+            snapshot = parent.inspect_entry(name)
+        except PlatformFileError as error:
+            raise _map_platform_error(error, journal_armed=True) from None
+        return snapshot is not None
 
-    @staticmethod
     def _read_entry(
-        parent: int,
+        self,
+        root: RootedDirectoryAuthority,
+        parent: BoundDirectoryAuthority,
         name: str,
         *,
         required: bool,
         maximum_bytes: int = MAX_METADATA_BYTES,
     ) -> bytes | None:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(name, flags, dir_fd=parent)
-        except FileNotFoundError:
+        if not self._entry_exists(parent, name):
             if required:
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
             return None
-        except OSError:
-            raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
+        authority = None
         try:
-            facts = os.fstat(descriptor)
-            if not stat.S_ISREG(facts.st_mode) or facts.st_size > maximum_bytes:
+            authority = self.__rooted_file_system.open_regular(
+                root,
+                PurePath(name),
+            )
+            snapshot = authority.snapshot()
+            if snapshot.byte_count > maximum_bytes:
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                block = os.read(descriptor, _READ_CHUNK)
-                if not block:
-                    break
-                total += len(block)
-                if total > maximum_bytes:
-                    _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-                chunks.append(block)
-            return b"".join(chunks)
+            payload = authority.read_all()
+            if len(payload) != snapshot.byte_count:
+                _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+            return payload
         except ChunkError:
             raise
-        except OSError:
-            raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
+        except PlatformFileError as error:
+            raise _map_platform_error(error, journal_armed=True) from None
         finally:
-            os.close(descriptor)
+            if authority is not None:
+                authority.close()
 
     @staticmethod
-    def _write_exclusive(parent: int, name: str, payload: bytes) -> None:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        descriptor = os.open(name, flags, 0o600, dir_fd=parent)
+    def _unlink(
+        parent: BoundDirectoryAuthority,
+        name: str,
+        *,
+        missing_ok: bool = True,
+    ) -> None:
         try:
-            offset = 0
-            while offset < len(payload):
-                written = os.write(descriptor, payload[offset:])
-                if written <= 0:
-                    raise OSError("short Chunk metadata write")
-                offset += written
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
-    @staticmethod
-    def _unlink(parent: int, name: str, *, missing_ok: bool = True) -> None:
-        try:
-            facts = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        except FileNotFoundError:
-            if missing_ok:
-                return
+            snapshot = parent.inspect_entry(name)
+            if snapshot is None:
+                if missing_ok:
+                    return
+                _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+            parent.unlink_owned(name, snapshot.identity)
+        except ChunkError:
             raise
-        except OSError:
-            raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
-        if not stat.S_ISREG(facts.st_mode):
-            _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-        os.unlink(name, dir_fd=parent)
+        except PlatformFileError as error:
+            raise _map_platform_error(error, journal_armed=True) from None
+
+    def _stage_candidate(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        *,
+        fault_prefix: str | None = None,
+    ) -> CandidateFile:
+        self._unlink(parent, name)
+        candidate: CandidateFile | None = None
+        try:
+            candidate = parent.create_candidate(name, private=True)
+            if fault_prefix is not None:
+                _hit_fault(self.__fault_injector, f"{fault_prefix}_after_create")
+            candidate.write_all(payload)
+            if fault_prefix is not None:
+                _hit_fault(self.__fault_injector, f"{fault_prefix}_after_write")
+            candidate.flush_content()
+            if fault_prefix is not None:
+                _hit_fault(self.__fault_injector, f"{fault_prefix}_after_flush")
+            return candidate
+        except PlatformFileError as error:
+            if candidate is not None:
+                candidate.close()
+            raise _map_platform_error(error) from None
+        except Exception:
+            if candidate is not None and not candidate.closed:
+                candidate.close()
+            raise
+
+    def _publish_staged(
+        self,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
+        candidate: CandidateFile,
+        destination: str,
+        payload: bytes,
+    ) -> PendingPublication:
+        mode = (
+            PublishMode.REPLACE_UNDER_LOCK
+            if self._entry_exists(parent, destination)
+            else PublishMode.CREATE_IF_ABSENT
+        )
+        pending: PendingPublication | None = None
+        try:
+            pending = parent.begin_publish(
+                candidate,
+                destination,
+                mode=mode,
+                lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+            )
+            if pending.retained_destination().read_all() != payload:
+                _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+            return pending
+        except ChunkError:
+            if pending is not None:
+                pending.close()
+            raise
+        except PlatformFileError as error:
+            if pending is not None:
+                pending.close()
+            raise _map_platform_error(error) from None
 
     def _write_replace(
         self,
-        parent: int,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
         temporary_name: str,
         final_name: str,
         payload: bytes,
+        *,
+        before_publish_phase: str | None = None,
     ) -> None:
-        self._unlink(parent, temporary_name)
-        self._write_exclusive(parent, temporary_name, payload)
-        os.replace(
-            temporary_name,
-            final_name,
-            src_dir_fd=parent,
-            dst_dir_fd=parent,
-        )
-        os.fsync(parent)
+        candidate = self._stage_candidate(parent, temporary_name, payload)
+        pending: PendingPublication | None = None
+        try:
+            if before_publish_phase is not None:
+                _hit_fault(self.__fault_injector, before_publish_phase)
+            pending = self._publish_staged(
+                parent,
+                lease,
+                candidate,
+                final_name,
+                payload,
+            )
+            pending.terminal_reproof()
+        finally:
+            if pending is not None:
+                pending.close()
+            elif not candidate.closed:
+                candidate.close()
 
-    def _pending(self, parent: int) -> bool:
+    def _pending(self, parent: BoundDirectoryAuthority) -> bool:
         return any(
             self._entry_exists(parent, name)
             for name in (
@@ -1534,8 +1667,17 @@ class CollaborativeChunkStore:
             )
         )
 
-    def _load_target(self, parent: int) -> tuple[ChunkMetadataState | None, str | None, bytes | None]:
-        payload = self._read_entry(parent, self.__target_name, required=False)
+    def _load_target(
+        self,
+        root: RootedDirectoryAuthority,
+        parent: BoundDirectoryAuthority,
+    ) -> tuple[ChunkMetadataState | None, str | None, bytes | None]:
+        payload = self._read_entry(
+            root,
+            parent,
+            self.__target_name,
+            required=False,
+        )
         if payload is None:
             return None, None, None
         try:
@@ -1548,9 +1690,11 @@ class CollaborativeChunkStore:
 
     def _load_rebase_intent(
         self,
-        parent: int,
+        root: RootedDirectoryAuthority,
+        parent: BoundDirectoryAuthority,
     ) -> tuple[ChunkRebaseIntent | None, bytes | None]:
         payload = self._read_entry(
+            root,
             parent,
             self.__rebase_intent_name,
             required=False,
@@ -1567,10 +1711,10 @@ class CollaborativeChunkStore:
         return intent, payload
 
     def load_rebase_intent(self) -> ChunkRebaseIntent | None:
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, _lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            intent, _ = self._load_rebase_intent(parent)
+            intent, _ = self._load_rebase_intent(root, parent)
             return intent
 
     def capture_rebase_intent(
@@ -1584,43 +1728,32 @@ class CollaborativeChunkStore:
         cold = decode_chunk_rebase_intent(payload)
         if cold != validated:
             _fail("CHUNK.DIGEST_MISMATCH")
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            state, _, _ = self._load_target(parent)
+            state, _, _ = self._load_target(root, parent)
             if (
                 state is None
                 or state.active_snapshot is None
                 or chunk_plan_binding(state.active_snapshot) != validated.plan_binding
             ):
                 _fail("CHUNK.REBASE_REQUIRED")
-            current, current_payload = self._load_rebase_intent(parent)
+            current, current_payload = self._load_rebase_intent(root, parent)
             if current is not None:
                 if current == validated and current_payload == payload:
                     return current
                 _fail("CHUNK.REBASE_REQUIRED")
             try:
-                self._write_exclusive(
+                self._write_replace(
                     parent,
-                    self.__rebase_intent_temp_name,
-                    payload,
-                )
-                staged = self._read_entry(
-                    parent,
-                    self.__rebase_intent_temp_name,
-                    required=True,
-                    maximum_bytes=MAX_REBASE_INTENT_BYTES,
-                )
-                if staged != payload or decode_chunk_rebase_intent(staged) != validated:
-                    _fail("CHUNK.DIGEST_MISMATCH")
-                os.replace(
+                    lease,
                     self.__rebase_intent_temp_name,
                     self.__rebase_intent_name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
+                    payload,
+                    before_publish_phase="rebase_intent_before_publish",
                 )
-                os.fsync(parent)
                 readback = self._read_entry(
+                    root,
                     parent,
                     self.__rebase_intent_name,
                     required=True,
@@ -1632,28 +1765,26 @@ class CollaborativeChunkStore:
             except ChunkError:
                 try:
                     self._unlink(parent, self.__rebase_intent_temp_name)
-                    os.fsync(parent)
-                except (ChunkError, OSError):
+                except ChunkError:
                     raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
                 raise
-            except OSError:
+            except Exception:
                 try:
                     self._unlink(parent, self.__rebase_intent_temp_name)
-                    os.fsync(parent)
-                except (ChunkError, OSError):
+                except Exception:
                     raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
                 raise ChunkError("CHUNK.COMMIT_FAILED", retryable=True) from None
 
     def clear_consumed_rebase_intent(self) -> bool:
         """Cold cleanup only after the main audit proves rebase/dissolve consumed it."""
 
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, _lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            intent, _ = self._load_rebase_intent(parent)
+            intent, _ = self._load_rebase_intent(root, parent)
             if intent is None:
                 return False
-            state, _, _ = self._load_target(parent)
+            state, _, _ = self._load_target(root, parent)
             if state is None:
                 _fail("CHUNK.REBASE_REQUIRED")
             final = state.audit_records[-1].receipt
@@ -1676,15 +1807,10 @@ class CollaborativeChunkStore:
             if not rebase_consumed and not dissolve_consumed:
                 _fail("CHUNK.REBASE_REQUIRED")
             try:
+                _hit_fault(self.__fault_injector, "rebase_intent_before_cleanup")
                 self._unlink(parent, self.__rebase_intent_name, missing_ok=False)
-                os.fsync(parent)
-            except ChunkError:
-                raise
-            except OSError:
-                raise ChunkError(
-                    "CHUNK.RECOVERY_REQUIRED",
-                    retryable=True,
-                ) from None
+            except Exception:
+                raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
             return True
 
     def load(self) -> ChunkMetadataState | None:
@@ -1692,20 +1818,20 @@ class CollaborativeChunkStore:
         return state
 
     def load_with_digest(self) -> tuple[ChunkMetadataState | None, str | None]:
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, _lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            state, digest, _ = self._load_target(parent)
+            state, digest, _ = self._load_target(root, parent)
             return state, digest
 
     def current_digest(self) -> str | None:
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, _lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            _, digest, _ = self._load_target(parent)
+            _, digest, _ = self._load_target(root, parent)
             return digest
 
-    def _cleanup_transaction(self, parent: int) -> None:
+    def _cleanup_transaction(self, parent: BoundDirectoryAuthority) -> None:
         for name in (
             self.__candidate_name,
             self.__lkg_temp_name,
@@ -1715,7 +1841,6 @@ class CollaborativeChunkStore:
             self.__rebase_intent_temp_name,
         ):
             self._unlink(parent, name)
-        os.fsync(parent)
 
     def publish(
         self,
@@ -1733,11 +1858,16 @@ class CollaborativeChunkStore:
             _fail("CHUNK.DIGEST_MISMATCH")
         candidate_digest = _sha256(candidate_payload)
         journal_armed = False
-        with self.__lock, self._locked_parent() as parent:
+        candidate: CandidateFile | None = None
+        pending: PendingPublication | None = None
+        with self.__lock, self._locked_parent() as (root, parent, lease):
             if self._pending(parent):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-            current_state, current_digest, current_payload = self._load_target(parent)
-            pending_intent, _ = self._load_rebase_intent(parent)
+            current_state, current_digest, current_payload = self._load_target(
+                root,
+                parent,
+            )
+            pending_intent, _ = self._load_rebase_intent(root, parent)
             final_action = validated.audit_records[-1].receipt.action
             if final_action is TopologyAction.REBASE:
                 if (
@@ -1769,29 +1899,24 @@ class CollaborativeChunkStore:
                 _fail("CHUNK.DESTINATION_STALE", retryable=True)
             validate_chunk_metadata_successor(current_state, validated)
             try:
-                self._write_exclusive(
+                candidate = self._stage_candidate(
                     parent,
                     self.__candidate_name,
                     candidate_payload,
+                    fault_prefix="candidate",
                 )
-                staged_payload = self._read_entry(
-                    parent,
-                    self.__candidate_name,
-                    required=True,
-                )
-                if staged_payload != candidate_payload:
-                    _fail("CHUNK.DIGEST_MISMATCH")
-                decode_chunk_metadata_state(staged_payload)
 
                 lkg_digest = None
                 if current_payload is not None:
                     self._write_replace(
                         parent,
+                        lease,
                         self.__lkg_temp_name,
                         self.__lkg_name,
                         current_payload,
                     )
                     lkg_payload = self._read_entry(
+                        root,
                         parent,
                         self.__lkg_name,
                         required=True,
@@ -1799,6 +1924,7 @@ class CollaborativeChunkStore:
                     if lkg_payload != current_payload:
                         _fail("CHUNK.DIGEST_MISMATCH")
                     lkg_digest = current_digest
+                    _hit_fault(self.__fault_injector, "lkg_after_publish")
 
                 journal = _JournalRecord(
                     project_id=self.__project_id,
@@ -1812,25 +1938,40 @@ class CollaborativeChunkStore:
                 )
                 self._write_replace(
                     parent,
+                    lease,
                     self.__journal_temp_name,
                     self.__journal_name,
                     _journal_bytes(journal),
                 )
                 journal_armed = True
+                _hit_fault(self.__fault_injector, "journal_after_arm")
 
-                _, revalidated_digest, _ = self._load_target(parent)
+                _, revalidated_digest, _ = self._load_target(root, parent)
                 if revalidated_digest != current_digest:
                     self._cleanup_transaction(parent)
                     journal_armed = False
                     _fail("CHUNK.DESTINATION_STALE", retryable=True)
 
-                os.replace(
-                    self.__candidate_name,
+                _hit_fault(self.__fault_injector, "target_before_publish")
+                pending = self._publish_staged(
+                    parent,
+                    lease,
+                    candidate,
                     self.__target_name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
+                    candidate_payload,
                 )
-                os.fsync(parent)
+                candidate = None
+                _hit_fault(self.__fault_injector, "target_after_publish")
+                retained_payload = pending.retained_destination().read_all()
+                try:
+                    readback_state = decode_chunk_metadata_state(retained_payload)
+                except ChunkError:
+                    _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+                readback_digest = _sha256(retained_payload)
+                if readback_state != validated or readback_digest != candidate_digest:
+                    _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+                _hit_fault(self.__fault_injector, "target_after_readback")
+
                 journal = _JournalRecord(
                     project_id=journal.project_id,
                     phase="TARGET_REPLACED",
@@ -1843,20 +1984,33 @@ class CollaborativeChunkStore:
                 )
                 self._write_replace(
                     parent,
+                    lease,
                     self.__journal_temp_name,
                     self.__journal_name,
                     _journal_bytes(journal),
                 )
-                readback_state, readback_digest, _ = self._load_target(parent)
-                if readback_state != validated or readback_digest != candidate_digest:
-                    _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
                 if clear_rebase_intent:
+                    _hit_fault(
+                        self.__fault_injector,
+                        "rebase_intent_before_cleanup",
+                    )
                     self._unlink(
                         parent,
                         self.__rebase_intent_name,
                         missing_ok=False,
                     )
-                    os.fsync(parent)
+                _hit_fault(self.__fault_injector, "owner_after_commit")
+                terminal = pending.terminal_reproof()
+                if (
+                    terminal.content_sha256
+                    != hashlib.sha256(candidate_payload).digest()
+                    or terminal.byte_count != len(candidate_payload)
+                ):
+                    _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
+                _hit_fault(self.__fault_injector, "terminal_after_reproof")
+                pending.close()
+                pending = None
+                _hit_fault(self.__fault_injector, "target_after_close")
                 self._cleanup_transaction(parent)
                 journal_armed = False
                 return ChunkMetadataPublicationResult(
@@ -1865,37 +2019,61 @@ class CollaborativeChunkStore:
                     previous_metadata_digest=current_digest,
                     lkg_was_present=current_payload is not None,
                 )
-            except ChunkError:
+            except ChunkError as error:
+                if journal_armed:
+                    raise ChunkError(
+                        "CHUNK.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from None
                 if not journal_armed:
                     try:
                         self._cleanup_transaction(parent)
-                    except (OSError, ChunkError):
+                    except ChunkError:
                         raise ChunkError(
                             "CHUNK.RECOVERY_REQUIRED", retryable=True
                         ) from None
-                raise
-            except OSError:
-                if not journal_armed:
+                raise error
+            except PlatformFileError as error:
+                raise _map_platform_error(error, journal_armed=journal_armed) from None
+            except Exception:
+                if journal_armed:
+                    raise ChunkError(
+                        "CHUNK.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from None
+                try:
+                    self._cleanup_transaction(parent)
+                except Exception:
+                    raise ChunkError(
+                        "CHUNK.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from None
+                raise ChunkError("CHUNK.COMMIT_FAILED", retryable=True) from None
+            finally:
+                if pending is not None:
                     try:
-                        self._cleanup_transaction(parent)
-                    except (OSError, ChunkError):
-                        raise ChunkError(
-                            "CHUNK.RECOVERY_REQUIRED", retryable=True
-                        ) from None
-                    raise ChunkError("CHUNK.COMMIT_FAILED", retryable=True) from None
-                raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
+                        pending.close()
+                    except PlatformFileError:
+                        if not journal_armed:
+                            raise ChunkError(
+                                "CHUNK.RECOVERY_REQUIRED",
+                                retryable=True,
+                            ) from None
+                elif candidate is not None and not candidate.closed:
+                    candidate.close()
 
     def recover(self) -> ChunkMetadataRecoveryReport:
         try:
             return self._recover()
         except ChunkError:
             raise
-        except OSError:
+        except PlatformFileError:
             raise ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True) from None
 
     def _recover(self) -> ChunkMetadataRecoveryReport:
-        with self.__lock, self._locked_parent() as parent:
+        with self.__lock, self._locked_parent() as (root, parent, lease):
             journal_payload = self._read_entry(
+                root,
                 parent,
                 self.__journal_name,
                 required=False,
@@ -1904,11 +2082,13 @@ class CollaborativeChunkStore:
                 had_pending = self._pending(parent)
                 outcome = "rolled_back" if had_pending else "no_recovery"
                 target_payload = self._read_entry(
+                    root,
                     parent,
                     self.__target_name,
                     required=False,
                 )
                 lkg_payload = self._read_entry(
+                    root,
                     parent,
                     self.__lkg_name,
                     required=False,
@@ -1921,13 +2101,13 @@ class CollaborativeChunkStore:
                     if lkg_state.project_id != self.__project_id:
                         _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
                     if target_payload is None:
-                        os.replace(
-                            self.__lkg_name,
+                        self._write_replace(
+                            parent,
+                            lease,
+                            self.__candidate_name,
                             self.__target_name,
-                            src_dir_fd=parent,
-                            dst_dir_fd=parent,
+                            lkg_payload,
                         )
-                        os.fsync(parent)
                         target_payload = lkg_payload
                         state = lkg_state
                     elif target_payload == lkg_payload:
@@ -1971,12 +2151,14 @@ class CollaborativeChunkStore:
             ):
                 _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
             target_payload = self._read_entry(
+                root,
                 parent,
                 self.__target_name,
                 required=False,
             )
             target_digest = None if target_payload is None else _sha256(target_payload)
             lkg_payload = self._read_entry(
+                root,
                 parent,
                 self.__lkg_name,
                 required=False,
@@ -2022,7 +2204,6 @@ class CollaborativeChunkStore:
                         )
                 if journal.expected_digest is None and lkg_payload is None:
                     self._unlink(parent, self.__target_name)
-                    os.fsync(parent)
                     self._cleanup_transaction(parent)
                     return ChunkMetadataRecoveryReport(
                         outcome="rolled_back",
@@ -2056,13 +2237,13 @@ class CollaborativeChunkStore:
                     _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
                 if state.project_id != self.__project_id:
                     _fail("CHUNK.RECOVERY_REQUIRED", retryable=True)
-                os.replace(
-                    self.__lkg_name,
+                self._write_replace(
+                    parent,
+                    lease,
+                    self.__candidate_name,
                     self.__target_name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
+                    lkg_payload,
                 )
-                os.fsync(parent)
                 self._cleanup_transaction(parent)
                 return ChunkMetadataRecoveryReport(
                     outcome="rolled_back",

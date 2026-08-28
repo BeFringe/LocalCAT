@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -26,7 +27,10 @@ from collaborative_chunk_contracts import (
     issue_chunk_operation_id,
     issue_chunk_plan_id,
 )
-from collaborative_chunk_store import CollaborativeChunkStore
+from collaborative_chunk_store import (
+    ChunkMetadataFileBackend,
+    CollaborativeChunkStore,
+)
 from collaborative_chunk_workspace_adapter import capture_live_workspace_universe
 from collaborative_chunks import (
     ChunkTopologyPublicationAuthority,
@@ -41,6 +45,7 @@ from project_workspace_intake import (
     SelectedProjectDocumentsRequest,
     stage_selected_project_documents,
 )
+from platform_fs import compose_platform_file_backend
 from qt_editor import _compose_editor_controller
 from resource_repository import ResourceRepository
 from tm_contracts import SearchOptions
@@ -59,6 +64,19 @@ class _Issuer:
         if self.kind == "plan":
             return issue_chunk_plan_id(seed)
         return issue_chunk_operation_id(seed)
+
+
+def _w1_only_backend(root: Path) -> ChunkMetadataFileBackend:
+    aggregate = compose_platform_file_backend(root)
+    backend = SimpleNamespace(
+        bind_root=aggregate.bind_root,
+        open_regular=aggregate.open_regular,
+        bind_parent=aggregate.bind_parent,
+        acquire=aggregate.acquire,
+    )
+    if not isinstance(backend, ChunkMetadataFileBackend):
+        raise AssertionError("test W1 backend does not satisfy the Chunk port")
+    return backend
 
 
 def _write_source(path: Path, name: str, rows: tuple[tuple[str, str], ...]) -> None:
@@ -85,6 +103,61 @@ def _write_source(path: Path, name: str, rows: tuple[tuple[str, str], ...]) -> N
         + "\n",
         encoding="utf-8",
     )
+
+
+class ChunkMetadataBackendBoundaryTests(unittest.TestCase):
+    def test_adapter_accepts_w1_only_backend(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="localcat-chunk-port-") as directory:
+            root = Path(directory).resolve()
+            backend = _w1_only_backend(root)
+            controller, _composition = _compose_editor_controller(
+                ResourceRepository(root / "app-data")
+            )
+            actor = LocalReferenceActorPort("local", "boundary")
+            adapter = ChunkControllerAdapter(
+                controller,
+                actor,
+                actor.current_actor(),
+                metadata_binding_resolver=lambda _project_id: (
+                    root,
+                    "chunks.json",
+                ),
+                platform_backend=backend,
+            )
+            self.assertIs(adapter._platform_backend, backend)
+
+    def test_adapter_stably_rejects_each_missing_w1_port(self) -> None:
+        required = ("bind_root", "open_regular", "bind_parent", "acquire")
+        with tempfile.TemporaryDirectory(prefix="localcat-chunk-port-") as directory:
+            root = Path(directory).resolve()
+            aggregate = compose_platform_file_backend(root)
+            actor = LocalReferenceActorPort("local", "boundary")
+            for missing in required:
+                with self.subTest(missing=missing):
+                    controller, _composition = _compose_editor_controller(
+                        ResourceRepository(root / f"app-data-{missing}")
+                    )
+                    backend = SimpleNamespace(
+                        **{
+                            name: getattr(aggregate, name)
+                            for name in required
+                            if name != missing
+                        }
+                    )
+                    with self.assertRaisesRegex(
+                        TypeError,
+                        "chunk controller requires one metadata file backend",
+                    ):
+                        ChunkControllerAdapter(
+                            controller,
+                            actor,
+                            actor.current_actor(),
+                            metadata_binding_resolver=lambda _project_id: (
+                                root,
+                                "chunks.json",
+                            ),
+                            platform_backend=backend,
+                        )
 
 
 class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
@@ -136,6 +209,7 @@ class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
             self.metadata_root,
             "chunks.json",
             project_id=setup_owner.workspace.project_id,
+            platform_backend=compose_platform_file_backend(self.metadata_root),
         )
         authority = ChunkTopologyPublicationAuthority(
             project_id=setup_owner.workspace.project_id,
@@ -258,6 +332,7 @@ class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
             metadata_binding_resolver=(
                 lambda _project_id: (self.metadata_root, "chunks.json")
             ),
+            platform_backend=_w1_only_backend(self.metadata_root),
         )
         self.adapter.open_project_package(self.package_path)
 
@@ -610,6 +685,8 @@ class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
                 "collaborative_chunks",
                 "editor_contracts",
                 "editor_controller",
+                "platform_fs",
+                "platform_fs_contracts",
                 "project_workspace",
                 "project_workspace_contracts",
                 "project_workspace_identity",

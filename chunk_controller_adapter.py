@@ -12,6 +12,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from platform_fs import compose_platform_file_backend
+from platform_fs_contracts import PlatformFileError
+
 from chunk_controller_contracts import (
     ChunkApplicationAccessView,
     ChunkApplicationChunkView,
@@ -46,7 +49,10 @@ from collaborative_chunk_contracts import (
     chunk_plan_binding,
 )
 import collaborative_chunk_conflict as chunk_conflict
-from collaborative_chunk_store import CollaborativeChunkStore
+from collaborative_chunk_store import (
+    ChunkMetadataFileBackend,
+    CollaborativeChunkStore,
+)
 from collaborative_chunk_workspace_adapter import (
     capture_live_workspace_progress,
     capture_live_workspace_transition,
@@ -214,6 +220,7 @@ class ChunkControllerAdapter:
         actor_handle: AuthenticatedActorHandle,
         *,
         metadata_binding_resolver: Callable[[str], tuple[Path, str]],
+        platform_backend: ChunkMetadataFileBackend | None = None,
     ) -> None:
         if type(controller) is not EditorController:
             raise TypeError("chunk controller requires exact EditorController")
@@ -223,6 +230,11 @@ class ChunkControllerAdapter:
             raise TypeError("chunk controller requires authenticated actor port")
         if not callable(metadata_binding_resolver):
             raise TypeError("chunk controller requires metadata binding resolver")
+        if platform_backend is not None and not isinstance(
+            platform_backend,
+            ChunkMetadataFileBackend,
+        ):
+            raise TypeError("chunk controller requires one metadata file backend")
         actor_ref = actor_port.revalidate_actor(actor_handle)
         if type(actor_ref) is not AssigneeRef:
             raise TypeError("chunk controller requires exact actor reference")
@@ -232,6 +244,7 @@ class ChunkControllerAdapter:
         self._actor_handle = actor_handle
         self._actor_ref = actor_ref
         self._metadata_binding_resolver = metadata_binding_resolver
+        self._platform_backend = platform_backend
         self._metadata_bindings: dict[str, tuple[Path, str]] = {}
         self._mode = ChunkControllerSessionMode.BLOCKED
         self._safe_code = "CHUNK.WORKSPACE_UNBOUND"
@@ -535,6 +548,15 @@ class ChunkControllerAdapter:
             ):
                 raise ChunkError("CHUNK.CONTRACT_INVALID")
             metadata_root, metadata_filename = resolved
+            platform_backend = self._platform_backend
+            if platform_backend is None:
+                try:
+                    platform_backend = compose_platform_file_backend(metadata_root)
+                except PlatformFileError:
+                    raise ChunkError(
+                        "CHUNK.METADATA_UNAVAILABLE",
+                        retryable=False,
+                    ) from None
             binding = (metadata_root, metadata_filename)
             established = self._metadata_bindings.get(project_id)
             if established is None:
@@ -545,6 +567,7 @@ class ChunkControllerAdapter:
                 metadata_root,
                 metadata_filename,
                 project_id=project_id,
+                platform_backend=platform_backend,
             )
             authority = ChunkTopologyPublicationAuthority(
                 project_id=project_id,
