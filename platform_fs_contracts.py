@@ -10,7 +10,7 @@ import json
 import math
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import threading
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Iterable, Iterator, Protocol, runtime_checkable
 
 
 class PlatformFileErrorCode(str, Enum):
@@ -158,6 +158,63 @@ class EntrySnapshot(_LiveOnlyValue):
             raise ValueError("modified_token must be non-empty")
         if type(self.reparse_free) is not bool:
             raise TypeError("reparse_free must be exact bool")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateContentFacts:
+    byte_count: int
+    content_sha256: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.byte_count) is not int:
+            raise TypeError("byte_count must be exact int")
+        if self.byte_count < 0:
+            raise ValueError("byte_count must be non-negative")
+        if type(self.content_sha256) is not bytes:
+            raise TypeError("content_sha256 must be exact bytes")
+        if len(self.content_sha256) != hashlib.sha256().digest_size:
+            raise ValueError("content_sha256 must be an exact SHA-256 digest")
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEnumerationLimits:
+    maximum_entries: int
+    maximum_name_bytes: int
+    maximum_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("maximum_entries", self.maximum_entries),
+            ("maximum_name_bytes", self.maximum_name_bytes),
+            ("maximum_total_bytes", self.maximum_total_bytes),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be exact int")
+        if self.maximum_entries < 1 or self.maximum_entries > 4096:
+            raise ValueError("maximum_entries must be from 1 through 4096")
+        if self.maximum_name_bytes < 1 or self.maximum_name_bytes > 4096:
+            raise ValueError("maximum_name_bytes must be from 1 through 4096")
+        if self.maximum_total_bytes < 0 or self.maximum_total_bytes > (1 << 63) - 1:
+            raise ValueError("maximum_total_bytes is outside the supported range")
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEntryObservation(_LiveOnlyValue):
+    """One bounded direct-child observation; it is not an entry authority or CAS."""
+
+    name: str
+    snapshot: EntrySnapshot
+
+    def __post_init__(self) -> None:
+        validate_relative_name(self.name)
+        if type(self.snapshot) is not EntrySnapshot:
+            raise TypeError("snapshot must be exact EntrySnapshot")
+        if not (
+            self.snapshot.identity.kind == "regular"
+            and self.snapshot.identity.link_count == 1
+            and self.snapshot.reparse_free
+        ):
+            raise ValueError("ledger observation must be direct regular single-link")
 
 
 class PublishMode(str, Enum):
@@ -613,39 +670,93 @@ class BoundRegularFile(OpaqueAuthority, ABC):
 
 
 class CandidateFile(OpaqueAuthority, ABC):
-    __slots__ = ("__has_content", "__flushed")
+    _MAXIMUM_STREAM_CHUNK_BYTES = 64 * 1024
+
+    __slots__ = ("__content_facts", "__flushed", "__write_started")
 
     def __init__(self) -> None:
         super().__init__()
-        self.__has_content = False
+        self.__content_facts: CandidateContentFacts | None = None
         self.__flushed = False
+        self.__write_started = False
 
     def write_all(self, payload: bytes) -> None:
-        self._require_open()
         if type(payload) is not bytes:
             raise TypeError("payload must be exact bytes")
-        self.__has_content = False
+        self.write_chunks(
+            (
+                payload[offset : offset + self._MAXIMUM_STREAM_CHUNK_BYTES]
+                for offset in range(0, len(payload), self._MAXIMUM_STREAM_CHUNK_BYTES)
+            ),
+            maximum_bytes=len(payload),
+        )
+
+    def write_chunks(
+        self,
+        chunks: Iterable[bytes],
+        *,
+        maximum_bytes: int,
+    ) -> CandidateContentFacts:
+        self._require_open()
+        if self.__write_started:
+            raise ValueError("candidate accepts exactly one content stream")
+        if type(maximum_bytes) is not int:
+            raise TypeError("maximum_bytes must be exact int")
+        if maximum_bytes < 0 or maximum_bytes > (1 << 63) - 1:
+            raise ValueError("maximum_bytes is outside the supported range")
+        try:
+            iterator = iter(chunks)
+        except TypeError:
+            raise TypeError("chunks must be an iterable of exact bytes") from None
+        self.__write_started = True
+        self.__content_facts = None
         self.__flushed = False
-        result = self._write_all(payload)
-        if result is not None:
-            raise TypeError("backend write_all must return None")
-        self.__has_content = True
+        digest = hashlib.sha256()
+        byte_count = 0
+        consumed = False
+
+        def checked_chunks() -> Iterator[bytes]:
+            nonlocal byte_count, consumed
+            for chunk in iterator:
+                if type(chunk) is not bytes:
+                    raise TypeError("stream chunks must be exact bytes")
+                if not chunk or len(chunk) > self._MAXIMUM_STREAM_CHUNK_BYTES:
+                    raise ValueError("stream chunks must contain from 1 through 65536 bytes")
+                byte_count += len(chunk)
+                if byte_count > maximum_bytes:
+                    raise ValueError("candidate stream exceeds maximum_bytes")
+                digest.update(chunk)
+                yield chunk
+            consumed = True
+
+        result = self._write_chunks(checked_chunks())
+        if not consumed:
+            raise TypeError("backend write_chunks must consume the exact stream once")
+        expected = CandidateContentFacts(byte_count, digest.digest())
+        if type(result) is not CandidateContentFacts:
+            raise TypeError("backend write_chunks must return exact CandidateContentFacts")
+        if result != expected:
+            raise ValueError("backend candidate content facts contradict the input stream")
+        self.__content_facts = result
+        return result
 
     @abstractmethod
-    def _write_all(self, payload: bytes) -> None: ...
+    def _write_chunks(self, chunks: Iterator[bytes]) -> CandidateContentFacts: ...
 
     def flush_content(self) -> None:
         self._require_open()
-        if not self.__has_content:
+        if self.__content_facts is None:
             raise ValueError("candidate content must be written before flush")
         self.__flushed = False
-        result = self._flush_content()
-        if result is not None:
-            raise TypeError("backend flush_content must return None")
+        result = self._flush_content(self.__content_facts)
+        if type(result) is not CandidateContentFacts:
+            raise TypeError("backend flush_content must return exact CandidateContentFacts")
+        if result != self.__content_facts:
+            raise ValueError("backend flushed content facts contradict the written stream")
         self.__flushed = True
 
     @abstractmethod
-    def _flush_content(self) -> None: ...
+    def _flush_content(self, expected: CandidateContentFacts) -> CandidateContentFacts: ...
 
     def identity(self) -> FileObjectIdentity:
         self._require_open()
@@ -659,7 +770,7 @@ class CandidateFile(OpaqueAuthority, ABC):
 
     def _require_publishable(self) -> None:
         self._require_open()
-        if not self.__has_content or not self.__flushed:
+        if self.__content_facts is None or not self.__flushed:
             raise ValueError("candidate must contain flushed content before publish")
 
 
@@ -794,6 +905,47 @@ class BoundDirectoryAuthority(OpaqueAuthority, ABC):
 
     @abstractmethod
     def _inspect_entry(self, name: str) -> EntrySnapshot | None: ...
+
+    def observe_ledger_entries(
+        self,
+        lease: LockLease,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        """Observe a bounded locked namespace; callers must reopen every entry."""
+
+        self._require_open()
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be LockLease")
+        lease._require_open()
+        if type(limits) is not LedgerEnumerationLimits:
+            raise TypeError("limits must be exact LedgerEnumerationLimits")
+        result = self._observe_ledger_entries(lease, limits)
+        if type(result) is not tuple:
+            raise TypeError("backend ledger observations must be an exact tuple")
+        if len(result) > limits.maximum_entries:
+            raise ValueError("backend ledger observations exceed the entry limit")
+        previous_name: str | None = None
+        total_bytes = 0
+        for observation in result:
+            if type(observation) is not LedgerEntryObservation:
+                raise TypeError("backend returned a non-exact ledger observation")
+            name_bytes = observation.name.encode("utf-8", errors="strict")
+            if len(name_bytes) > limits.maximum_name_bytes:
+                raise ValueError("backend ledger observation exceeds the name limit")
+            if previous_name is not None and observation.name <= previous_name:
+                raise ValueError("backend ledger observations must be uniquely sorted")
+            previous_name = observation.name
+            total_bytes += observation.snapshot.byte_count
+            if total_bytes > limits.maximum_total_bytes:
+                raise ValueError("backend ledger observations exceed the byte limit")
+        return result
+
+    @abstractmethod
+    def _observe_ledger_entries(
+        self,
+        lease: LockLease,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]: ...
 
     def create_candidate(self, name: str, *, private: bool) -> CandidateFile:
         self._require_open()
