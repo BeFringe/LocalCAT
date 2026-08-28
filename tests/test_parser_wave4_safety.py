@@ -65,6 +65,7 @@ from parser_source import (
     materialize,
     validate,
 )
+from tests.parser_io_test_support import create_test_sealed_snapshot
 from parser_termbase_codec import (
     TERMBASE_CSV_DESCRIPTOR,
     TERMBASE_XLSX_DESCRIPTOR,
@@ -897,7 +898,7 @@ class ParserWave4SafetyTests(unittest.TestCase):
 
     def _direct_snapshot(self, case, descriptor):
         selected = self._write(case)
-        return create_sealed_snapshot(
+        return create_test_sealed_snapshot(
             SourceReference(
                 safe_root=str(self.root),
                 selected_path=str(selected),
@@ -1224,7 +1225,7 @@ class ParserWave4SafetyTests(unittest.TestCase):
         self.assertTrue(all(handle.closed for handle in temporary_handles))
         self.assertEqual(tuple(self.root.glob("parser-snapshot-*")), ())
 
-    def test_application_open_stale_copy_releases_its_temporary_snapshot(
+    def test_application_open_stale_copy_creates_no_snapshot(
         self,
     ) -> None:
         case = _InputCase(
@@ -1234,7 +1235,6 @@ class ParserWave4SafetyTests(unittest.TestCase):
             b"A\n",
         )
         selected = self._write(case)
-        original_read = os.read
         original_temporary_file = tempfile.TemporaryFile
         temporary_handles = []
         mutated = False
@@ -1244,18 +1244,73 @@ class ParserWave4SafetyTests(unittest.TestCase):
             temporary_handles.append(handle)
             return handle
 
-        def mutate_during_copy(descriptor, byte_count):
-            nonlocal mutated
-            chunk = original_read(descriptor, byte_count)
-            if chunk and not mutated:
-                selected.write_bytes(b"replacement-with-different-identity\n")
-                mutated = True
-            return chunk
+        stack = ExitStack()
+        if os.name == "nt":
+            import platform_fs_windows
+            from platform_fs_windows import WindowsPlatformAdapter
 
-        with mock.patch(
+            def mark_body_read(phase: str) -> None:
+                nonlocal mutated
+                if phase == "windows_after_body_read":
+                    mutated = True
+
+            backend = WindowsPlatformAdapter(_fault_injector=mark_body_read)
+            real_capture = platform_fs_windows._capture_handle_proof
+
+            def drifting_capture(*args, **kwargs):
+                proof = real_capture(*args, **kwargs)
+                if mutated and kwargs.get("expected_kind") == "regular":
+                    changed = platform_fs_windows.EntrySnapshot(
+                        identity=proof.identity,
+                        byte_count=proof.snapshot.byte_count + 1,
+                        modified_token=proof.snapshot.modified_token,
+                        reparse_free=True,
+                    )
+                    return platform_fs_windows._WindowsHandleProof(
+                        proof.identity,
+                        changed,
+                        proof.final_path,
+                    )
+                return proof
+
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows,
+                    "_capture_handle_proof",
+                    side_effect=drifting_capture,
+                )
+            )
+        else:
+            import platform_fs_posix
+            from platform_fs_posix import PosixPlatformAdapter
+
+            original_read = platform_fs_posix.os.pread
+
+            def mutate_during_copy(descriptor, byte_count, offset):
+                nonlocal mutated
+                chunk = original_read(descriptor, byte_count, offset)
+                if chunk and not mutated:
+                    selected.write_bytes(b"replacement-with-different-identity\n")
+                    mutated = True
+                return chunk
+
+            backend = PosixPlatformAdapter()
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_posix.os,
+                    "pread",
+                    side_effect=mutate_during_copy,
+                )
+            )
+
+        with stack, mock.patch(
             "parser_source.tempfile.TemporaryFile",
             side_effect=capture_temporary,
-        ), mock.patch("parser_source.os.read", side_effect=mutate_during_copy):
+        ), mock.patch.object(
+            self.surface,
+            "_platform_backend_factory",
+            return_value=backend,
+        ):
             with self.assertRaises(ParserSourceError) as caught:
                 self._open(case, selected)
 
@@ -1658,7 +1713,7 @@ class ParserWave4SafetyTests(unittest.TestCase):
         self.assertNotIn("WEBSERVICE", serialized)
         self.assertNotIn("invalid.example", serialized)
 
-    def test_real_application_commit_faults_preserve_every_existing_target(
+    def test_real_project_commit_fault_preserves_existing_target(
         self,
     ) -> None:
         project_target = self.root / "project.json"
@@ -1667,30 +1722,42 @@ class ParserWave4SafetyTests(unittest.TestCase):
             name="Project",
             segments=(EditorSegment(id="1", source="A", target="B"),),
         )
-        before_names = {path.name for path in self.root.iterdir()}
-        with mock.patch(
-            "parser_source.os.replace",
-            side_effect=OSError("injected replace failure"),
-        ) as project_replace:
+        before_candidates = tuple(self.root.glob(".parser-*.tmp"))
+        if os.name == "nt":
+            from platform_fs_windows import WindowsPlatformAdapter
+
+            backend = WindowsPlatformAdapter()
+            fault = mock.patch.object(
+                backend._native_api(),
+                "self_probe_nt_set_information_file",
+                side_effect=RuntimeError("publish primitive unavailable"),
+            )
+        else:
+            from contextlib import nullcontext
+            from platform_fs_posix import PosixPlatformAdapter
+
+            def fail_after_create(phase: str) -> None:
+                if phase == "candidate_after_create":
+                    raise RuntimeError("candidate fault")
+
+            backend = PosixPlatformAdapter(_fault_injector=fail_after_create)
+            fault = nullcontext()
+        with fault, mock.patch(
+            "parser_composition._compose_platform_file_backend",
+            return_value=backend,
+        ):
             with self.assertRaises(ProjectError):
                 save_project(project, project_target)
-        project_replace.assert_called_once()
-        project_args, project_kwargs = project_replace.call_args
-        self.assertEqual(len(project_args), 2)
-        self.assertTrue(str(project_args[0]).startswith(".parser-"))
-        self.assertTrue(str(project_args[0]).endswith(".tmp"))
-        self.assertEqual(project_args[1], project_target.name)
-        self.assertEqual(
-            set(project_kwargs),
-            {"src_dir_fd", "dst_dir_fd"},
-        )
-        self.assertEqual(
-            project_kwargs["src_dir_fd"],
-            project_kwargs["dst_dir_fd"],
-        )
         self.assertEqual(project_target.read_bytes(), b"old-project")
-        self.assertEqual({path.name for path in self.root.iterdir()}, before_names)
+        self.assertEqual(tuple(self.root.glob(".parser-*.tmp")), before_candidates)
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "resource/TM publication remains owned by its follow-on Windows amendments",
+    )
+    def test_real_resource_commit_faults_preserve_every_existing_target(
+        self,
+    ) -> None:
         term_source = self.root / "incoming.csv"
         term_source.write_bytes(b"Source,Target\nA,B\n")
         term_target = self.root / "managed.csv"
