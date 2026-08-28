@@ -72,6 +72,9 @@ class PlatformFileError(RuntimeError):
         return self.__retryable
 
     def __setattr__(self, name: str, value: object) -> None:
+        if name in {"__traceback__", "__cause__", "__context__"}:
+            BaseException.__setattr__(self, name, value)
+            return
         del name, value
         raise AttributeError("PlatformFileError is immutable")
 
