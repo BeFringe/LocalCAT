@@ -558,6 +558,7 @@ def _compose_chunk_controller(controller: object, repository: object):
     )
     from collaborative_chunks import LocalReferenceActorPort
     from editor_controller import EditorController
+    from platform_fs import compose_platform_file_backend
     from resource_repository import ResourceRepository
 
     if type(controller) is not EditorController:
@@ -565,6 +566,8 @@ def _compose_chunk_controller(controller: object, repository: object):
     if type(repository) is not ResourceRepository:
         raise TypeError("chunk composition requires one ResourceRepository")
     metadata_root = (repository.config_dir / "collaborative-chunks").resolve()
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    platform_backend = compose_platform_file_backend(metadata_root)
     actor_port = LocalReferenceActorPort(
         "localcat-local-reference",
         "device-workflow",
@@ -577,6 +580,7 @@ def _compose_chunk_controller(controller: object, repository: object):
         metadata_binding_resolver=create_chunk_metadata_binding_resolver(
             metadata_root
         ),
+        platform_backend=platform_backend,
     )
 
 
