@@ -52,6 +52,7 @@ from collaborative_chunks import (
 )
 from project_workspace_contracts import SourcePresence
 from project_workspace_identity import issue_project_id
+from platform_fs import compose_platform_file_backend
 
 
 class CollaborativeChunkCluster2ProgressTests(unittest.TestCase):
@@ -352,6 +353,8 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
         self.manager = LocalReferenceManagerHandle("local-manager", "owner")
         self.store_path = Path(self.temporary.name).resolve()
         self.store_filename = "chunks.json"
+        self.platform_backend = compose_platform_file_backend(self.store_path)
+        self.store_fault_phase = None
         self.authority = ChunkTopologyPublicationAuthority(
             project_id=self.project_id,
             workspace_binding_provider=lambda: self.live_binding,
@@ -377,7 +380,13 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
             self.store_path,
             self.store_filename,
             project_id=self.project_id,
+            platform_backend=self.platform_backend,
+            _fault_injector=self._store_fault,
         )
+
+    def _store_fault(self, phase: str) -> None:
+        if phase == self.store_fault_phase:
+            raise OSError("injected Chunk owner fault")
 
     def _member(self, local_segment_id: str):
         return chunk_segment_ref_from_ids(
@@ -775,17 +784,8 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
     def test_intent_capture_fault_keeps_old_plan_and_no_partial_sidecar(self) -> None:
         capability = self._capability(TopologyAction.REBASE)
         before = self.authority.current_snapshot()
-        real_replace = __import__("os").replace
-
-        def fail_intent_replace(source, destination, *args, **kwargs):
-            if str(destination).endswith("rebase-intent-v1"):
-                raise OSError("private path")
-            return real_replace(source, destination, *args, **kwargs)
-
-        with mock.patch(
-            "collaborative_chunk_store.os.replace",
-            side_effect=fail_intent_replace,
-        ):
+        self.store_fault_phase = "rebase_intent_before_publish"
+        try:
             self._error(
                 "CHUNK.COMMIT_FAILED",
                 lambda: self.topology.inspect_rebase(
@@ -795,6 +795,8 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
                     expected_plan_binding=self.before_rebase_binding,
                 ),
             )
+        finally:
+            self.store_fault_phase = None
         self.assertEqual(self.authority.current_snapshot(), before)
         self.assertIsNone(self._store().load_rebase_intent())
 
@@ -897,17 +899,8 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
             released_missing_members=(self.b,),
             retire_empty_chunk_ids=(),
         )
-        real_unlink = __import__("os").unlink
-
-        def fail_intent_unlink(path, *args, **kwargs):
-            if str(path).endswith("rebase-intent-v1"):
-                raise PermissionError("private /secret/path")
-            return real_unlink(path, *args, **kwargs)
-
-        with mock.patch(
-            "collaborative_chunk_store.os.unlink",
-            side_effect=fail_intent_unlink,
-        ):
+        self.store_fault_phase = "rebase_intent_before_cleanup"
+        try:
             with self.assertRaises(ChunkError) as apply_failure:
                 self.topology.apply_rebase(
                     preview,
@@ -916,6 +909,8 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
                     workspace_binding=self.live_binding,
                     expected_plan_binding=self.before_rebase_binding,
                 )
+        finally:
+            self.store_fault_phase = None
         self.assertEqual(apply_failure.exception.code, "CHUNK.RECOVERY_REQUIRED")
         self.assertTrue(apply_failure.exception.retryable)
 
@@ -925,16 +920,16 @@ class CollaborativeChunkCluster2RebaseTests(unittest.TestCase):
         self.assertIsNotNone(store.load_rebase_intent())
         committed = recovery.state.active_snapshot
 
-        with mock.patch(
-            "collaborative_chunk_store.os.unlink",
-            side_effect=fail_intent_unlink,
-        ):
+        self.store_fault_phase = "rebase_intent_before_cleanup"
+        try:
             with self.assertRaises(ChunkError) as cold_failure:
                 ChunkTopologyPublicationAuthority(
                     project_id=self.project_id,
                     workspace_binding_provider=lambda: self.live_binding,
                     metadata_store=store,
                 )
+        finally:
+            self.store_fault_phase = None
         self.assertEqual(cold_failure.exception.code, "CHUNK.RECOVERY_REQUIRED")
         self.assertTrue(cold_failure.exception.retryable)
         self.assertNotIn("secret", str(cold_failure.exception))

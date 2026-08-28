@@ -4,9 +4,9 @@ import ast
 from dataclasses import fields
 import hashlib
 import json
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +29,7 @@ from collaborative_chunk_contracts import (
     segment_universe_digest_v1,
 )
 from collaborative_chunk_store import (
+    ChunkMetadataFileBackend,
     ChunkMetadataState,
     CollaborativeChunkStore,
     decode_chunk_metadata_state,
@@ -37,6 +38,12 @@ from collaborative_chunk_store import (
 from collaborative_chunks import ChunkTopologyPublicationAuthority
 from project_workspace_contracts import SegmentIdentity, SourcePresence
 from project_workspace_identity import issue_project_id
+from platform_fs import compose_platform_file_backend
+from platform_fs_contracts import (
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PrivateStorageProof,
+)
 
 
 def _document(seed: int) -> str:
@@ -48,6 +55,14 @@ def _member(project_id: str, document_seed: int, local_id: str) -> ChunkSegmentR
         project_id,
         SegmentIdentity(_document(document_seed), local_id),
     )
+
+
+def _raise_at(expected: str, message: str):
+    def fault(phase: str) -> None:
+        if phase == expected:
+            raise OSError(message)
+
+    return fault
 
 
 class _Issuer:
@@ -66,7 +81,13 @@ class _Issuer:
 
 
 class _DurableRuntime:
-    def __init__(self, root: Path, project_seed: bytes = b"S") -> None:
+    def __init__(
+        self,
+        root: Path,
+        project_seed: bytes = b"S",
+        *,
+        platform_backend: ChunkMetadataFileBackend | None = None,
+    ) -> None:
         self.project_id = issue_project_id(project_seed * 32)
         self.a = _member(self.project_id, 1, "a")
         self.b = _member(self.project_id, 1, "b")
@@ -86,16 +107,28 @@ class _DurableRuntime:
         )
         self.manager = LocalReferenceManagerHandle("local", "manager")
         self.root = root
+        self.platform_backend = (
+            compose_platform_file_backend(root)
+            if platform_backend is None
+            else platform_backend
+        )
         self.chunk_issuer = _Issuer("chunk", 1)
         self.plan_issuer = _Issuer("plan", 100)
         self.operation_issuer = _Issuer("operation", 200)
+        self.fault = None
         self.open()
+
+    def inject_fault(self, phase: str) -> None:
+        if self.fault is not None:
+            self.fault(phase)
 
     def store(self) -> CollaborativeChunkStore:
         return CollaborativeChunkStore(
             self.root,
             "project.chunks.json",
             project_id=self.project_id,
+            platform_backend=self.platform_backend,
+            _fault_injector=self.inject_fault,
         )
 
     def universe(self) -> ChunkWorkspaceUniverseProjection:
@@ -318,21 +351,65 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
             )
             self.assertEqual(second_state.audit_records[-1].receipt.base_revision, 0)
 
+    def test_w1_only_backend_is_usable_without_private_storage_capability(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            aggregate = compose_platform_file_backend(root)
+            backend = SimpleNamespace(
+                bind_root=aggregate.bind_root,
+                open_regular=aggregate.open_regular,
+                bind_parent=aggregate.bind_parent,
+                acquire=aggregate.acquire,
+            )
+            self.assertIsInstance(backend, ChunkMetadataFileBackend)
+            self.assertNotIsInstance(backend, PrivateStorageProof)
+
+            runtime = _DurableRuntime(root, platform_backend=backend)
+            chunk_id = runtime.create("W1", (runtime.a, runtime.b))
+            runtime.open()
+            snapshot = runtime.authority.current_snapshot()
+            assert snapshot is not None
+            self.assertEqual(snapshot.chunks[0].chunk_id, chunk_id)
+            cold_state = runtime.store().load()
+            assert cold_state is not None and cold_state.active_snapshot is not None
+            self.assertEqual(cold_state.active_snapshot, snapshot)
+
+    def test_each_missing_w1_backend_port_is_stably_rejected(self) -> None:
+        required = ("bind_root", "open_regular", "bind_parent", "acquire")
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            aggregate = compose_platform_file_backend(root)
+            for missing in required:
+                with self.subTest(missing=missing):
+                    backend = SimpleNamespace(
+                        **{
+                            name: getattr(aggregate, name)
+                            for name in required
+                            if name != missing
+                        }
+                    )
+                    self.assertNotIsInstance(backend, ChunkMetadataFileBackend)
+                    self.assert_error(
+                        "CHUNK.CONTRACT_INVALID",
+                        lambda backend=backend: CollaborativeChunkStore(
+                            root,
+                            "project.chunks.json",
+                            project_id=issue_project_id(b"W" * 32),
+                            platform_backend=backend,
+                        ),
+                    )
+
     def test_pre_replace_failure_rolls_back_first_publish(self) -> None:
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
-            real_replace = os.replace
-
-            def fail_target_replace(src, dst, *args, **kwargs):
-                if dst == "project.chunks.json":
-                    raise OSError("replace failed")
-                return real_replace(src, dst, *args, **kwargs)
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_target_replace):
+            runtime.fault = _raise_at("target_before_publish", "replace failed")
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.create("A", (runtime.a,)),
                 )
+            finally:
+                runtime.fault = None
             report = runtime.store().recover()
             self.assertEqual(report.outcome, "rolled_back")
             self.assertIsNone(report.state)
@@ -341,22 +418,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
     def test_after_replace_uncertainty_rolls_forward_once(self) -> None:
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            runtime.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.create("A", (runtime.a,)),
                 )
+            finally:
+                runtime.fault = None
             report = runtime.store().recover()
             self.assertEqual(report.outcome, "rolled_forward")
             assert report.state is not None
@@ -369,22 +441,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
             runtime = _DurableRuntime(Path(directory).resolve())
             chunk_id = runtime.create("A", (runtime.a,))
             old_payload = (runtime.root / "project.chunks.json").read_bytes()
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            runtime.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.rename(chunk_id, "B"),
                 )
+            finally:
+                runtime.fault = None
             (runtime.root / "project.chunks.json").write_bytes(b"tampered")
             report = runtime.store().recover()
             self.assertEqual(report.outcome, "rolled_back")
@@ -508,22 +575,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
                 rewritten_root / "project.chunks.json"
             ).read_bytes()
 
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            own.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: own.rename(own_id, "NEXT"),
                 )
+            finally:
+                own.fault = None
             journal_path = own_root / ".project.chunks.json.journal-v1"
             journal = json.loads(journal_path.read_bytes())
             (own_root / "project.chunks.json").write_bytes(rewritten_payload)
@@ -553,22 +615,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
             source.rename(source_id, "B")
             source_payload = (source_root / "project.chunks.json").read_bytes()
 
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            pending.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: pending.create("P", (pending.a,)),
                 )
+            finally:
+                pending.fault = None
             journal_path = pending_root / ".project.chunks.json.journal-v1"
             journal = json.loads(journal_path.read_bytes())
             (pending_root / "project.chunks.json").write_bytes(source_payload)
@@ -586,22 +643,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
     def test_journal_expected_and_lkg_digest_pair_is_exact(self) -> None:
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            runtime.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.create("A", (runtime.a,)),
                 )
+            finally:
+                runtime.fault = None
             journal_path = runtime.root / ".project.chunks.json.journal-v1"
             journal = json.loads(journal_path.read_bytes())
             journal["lkg_digest"] = "a" * 64
@@ -683,22 +735,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
     def test_tampered_journal_is_retained_and_fails_closed(self) -> None:
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
-            real_replace = os.replace
-            raised = False
-
-            def fail_after_target_replace(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "project.chunks.json" and not raised:
-                    raised = True
-                    raise OSError("interrupted after replace")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target_replace):
+            runtime.fault = _raise_at(
+                "target_after_publish",
+                "interrupted after replace",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.create("A", (runtime.a,)),
                 )
+            finally:
+                runtime.fault = None
             journal = runtime.root / ".project.chunks.json.journal-v1"
             journal.write_bytes(b'{"schema":"tampered"}')
             self.assert_error(
@@ -726,25 +773,17 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
                 own_root.mkdir()
                 runtime = _DurableRuntime(own_root)
                 chunk_id = runtime.create("A", (runtime.a,))
-                real_replace = os.replace
-                raised = False
-
-                def fail_after_target_replace(src, dst, *args, **kwargs):
-                    nonlocal raised
-                    result = real_replace(src, dst, *args, **kwargs)
-                    if dst == "project.chunks.json" and not raised:
-                        raised = True
-                        raise OSError("interrupted after replace")
-                    return result
-
-                with patch(
-                    "collaborative_chunk_store.os.replace",
-                    side_effect=fail_after_target_replace,
-                ):
+                runtime.fault = _raise_at(
+                    "target_after_publish",
+                    "interrupted after replace",
+                )
+                try:
                     self.assert_error(
                         "CHUNK.RECOVERY_REQUIRED",
                         lambda: runtime.rename(chunk_id, "B"),
                     )
+                finally:
+                    runtime.fault = None
                 journal_path = own_root / ".project.chunks.json.journal-v1"
                 journal = json.loads(journal_path.read_bytes())
                 if branch == "target":
@@ -774,8 +813,11 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
             with patch(
-                "collaborative_chunk_store.os.stat",
-                side_effect=PermissionError("SENSITIVE /private/path"),
+                "platform_fs_contracts.BoundDirectoryAuthority.inspect_entry",
+                side_effect=PlatformFileError(
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                    retryable=True,
+                ),
             ):
                 error = self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
@@ -788,23 +830,23 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             runtime = _DurableRuntime(Path(directory).resolve())
             chunk_id = runtime.create("A", (runtime.a,))
-            real_replace = os.replace
-
-            def fail_target_replace(src, dst, *args, **kwargs):
-                if dst == "project.chunks.json":
-                    raise OSError("prepare interruption")
-                return real_replace(src, dst, *args, **kwargs)
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_target_replace):
+            runtime.fault = _raise_at(
+                "target_before_publish",
+                "prepare interruption",
+            )
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: runtime.rename(chunk_id, "B"),
                 )
+            finally:
+                runtime.fault = None
             (runtime.root / "project.chunks.json").write_bytes(b"unknown")
             journal = runtime.root / ".project.chunks.json.journal-v1"
-            with patch(
-                "collaborative_chunk_store.os.replace",
-                side_effect=PermissionError("SENSITIVE /private/path"),
+            with patch.object(
+                CollaborativeChunkStore,
+                "_write_replace",
+                side_effect=ChunkError("CHUNK.RECOVERY_REQUIRED", retryable=True),
             ):
                 error = self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
@@ -831,13 +873,11 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
                     "__future__",
                     "contextlib",
                     "dataclasses",
-                    "fcntl",
                     "hashlib",
                     "json",
-                    "os",
                     "pathlib",
+                    "platform_fs_contracts",
                     "secrets",
-                    "stat",
                     "threading",
                     "typing",
                     "unicodedata",
@@ -850,6 +890,35 @@ class CollaborativeChunkStoreTests(unittest.TestCase):
         for contract in (ChunkMetadataState,):
             self.assertFalse(
                 {field.name.casefold() for field in fields(contract)} & forbidden
+            )
+        protocol = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ChunkMetadataFileBackend"
+        )
+        self.assertEqual(
+            {
+                node.name
+                for node in protocol.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            },
+            {"bind_root", "open_regular", "bind_parent", "acquire"},
+        )
+        for filename in (
+            "collaborative_chunk_store.py",
+            "chunk_controller_adapter.py",
+        ):
+            consumer = ast.parse(
+                Path(__file__).parents[1].joinpath(filename).read_text(encoding="utf-8")
+            )
+            self.assertNotIn(
+                "PlatformFileBackend",
+                {
+                    node.id
+                    for node in ast.walk(consumer)
+                    if isinstance(node, ast.Name)
+                },
             )
 
 

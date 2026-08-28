@@ -27,6 +27,9 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 2. 跨进程锁必须保持W1 exact protocol-control ACL、可重算且不含owner token/FileId的`ProtocolControlLockPayloadV1`、`CREATE_NEW` share-none首次初始化、empty/strict-prefix/full exact creator-crash接管、unknown bytes fail-closed、普通`LOCK` profile重开、进程终止eventual release与stale/foreign identity拒绝；业务层不得用进程内mutex、存在性文件或删除未知锁代替。
 3. Chunk journal/LKG/state machine 仍由本 Spec 拥有；Windows publish、readback、cleanup 或 kill 中断必须恢复为完整 old/new/recovery-required 之一，不得出现半发布 metadata/audit 状态。
 4. source 与 frozen Qt composition 均须证明 controller import/startup 无平台专属顶层依赖；本 amendment 不改变 chunk identity、membership、permission、ProjectPackage 或 sync authority。
+5. Windows source amendment shall 分为两个有序交付阶段：第一阶段只闭合独立 chunk metadata 的平台端口、source import/startup 与跨进程锁，可在 WA-03 前形成 owner commit 并合入 Windows source 路线；第二阶段在 `multi-document-project-workspace` 的 Windows ProjectPackage 冷重开与双进程恢复任务完成后，复验真实 ProjectPackage 业务对象/bytes 与 chunk metadata 的组合旅程。
+6. 第一阶段通过不得表述为 WA-02 source owner 最终 PASS，也不得代答真实 ProjectPackage 的 Windows open/save/recovery；最终 source owner PASS shall 以第二阶段的 package-coupled acceptance 为必要条件。
+7. 第二阶段不得用 mock ProjectPackage、私有 ZIP/manifest 构造、fixture-only workspace 注入或 skipped test 代替真实 ProjectPackage public business API；frozen acceptance 继续由独立 `b` 后缀任务约束，不因 source 分阶段而提前。
 
 ## 术语
 
@@ -53,6 +56,7 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 4. When Cluster 1 实施时, the implementation shall 只交付 chunk plan/identity、exact membership、create/split/merge/repartition/dissolve、独立 metadata persistence，以及这些 topology 变更所必需的最小 manager/capability substrate；C1 可冻结 optional assignee 字段 shape，但所有 C1 runtime-created/decoded/previewed/persisted/cold-reopened active chunk 都必须 `assignee=None`、assignment counts 必须为 `0`，且任何 non-null assignee 或 assignment command 必须在 publication 前 fail closed 且零 mutation。该 substrate 不授予 target/confirmed 编辑权，也不进入 assignment/permission 或 UI。
 5. When Cluster 2 实施时, the implementation shall 交付 assignment、permission、progress、workspace-rebase 和越界只读，不实现账号或远端传输。
 6. Before Cluster 3 接入时, the implementation shall 确认多文档 C3 Controller/session/search contract 已稳定并通过回归；before Cluster 4 接入时, it shall 确认多文档 C4 Qt workspace 产品面已稳定并通过回归。
+7. For WA-02 Windows source delivery, tasks `1.3a`、`1.4a`、`3.2a` may 作为独立 metadata/startup 阶段先行完成并形成第一份 owner commit；tasks `4.4a`、`4.5a` shall 等待 `multi-document-project-workspace` tasks `2.8a`、`4.4a`，在 Windows source 路线 C5S 完成 package-coupled 复验后形成后继 owner commit。两份提交有序共同闭合 amendment，第一份不得提升 Cluster 4 或最终 source completion。
 
 ### Requirement 2：Chunk identity 与 exact membership
 
