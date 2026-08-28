@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import ast
 import copy
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
+import hashlib
 import inspect
+import json
 import math
 from pathlib import Path, PurePath, PurePosixPath
 import pickle
+import threading
 import unittest
 
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
     BoundRegularFile,
     CandidateFile,
+    DEVICE_KEY_ID_HASH_ALGORITHM,
+    DEVICE_KEY_ID_SIZE_BYTES,
+    DEVICE_SECRET_SIZE_BYTES,
+    DeviceSecretAuthority,
     EntrySnapshot,
     FileObjectIdentity,
     LockLease,
@@ -22,15 +29,30 @@ from platform_fs_contracts import (
     LockWait,
     OpaqueAuthority,
     PendingPublication,
+    PersistentPrivateProof,
+    PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
     PrivateStorageProof,
     PrivateAccessEvidence,
+    PrivateProofContext,
+    PrivateProofObjectRole,
+    PRIVATE_PROOF_DIGEST_SIZE_BYTES,
     ProcessFileLock,
     PublishFacts,
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    VerifiedPrivateProof,
+    WINDOWS_PRIVATE_PROOF_DOMAIN_TAG,
+    WINDOWS_PRIVATE_PROOF_SCHEMA,
+    WINDOWS_PRIVATE_SECURITY_PROFILE_ID,
+    WindowsPrivateProof,
+    derive_device_key_id,
+    decode_windows_private_proof,
+    encode_windows_private_proof,
+    encode_windows_private_proof_unsigned,
+    windows_private_proof_mac_message,
     validate_relative_name,
     validate_relative_path,
 )
@@ -109,6 +131,23 @@ class _Candidate(CandidateFile):
         return _identity()
 
 
+class _FaultingCandidate(_Candidate):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_write = False
+        self.fail_flush = False
+
+    def _write_all(self, payload: bytes) -> None:
+        if self.fail_write:
+            raise RuntimeError("write fault")
+        super()._write_all(payload)
+
+    def _flush_content(self) -> None:
+        if self.fail_flush:
+            raise RuntimeError("flush fault")
+        super()._flush_content()
+
+
 class _Lease(LockLease):
     def _close_authority(self) -> None:
         pass
@@ -117,6 +156,72 @@ class _Lease(LockLease):
 class _PrivateEvidence(PrivateAccessEvidence):
     def _close_authority(self) -> None:
         pass
+
+
+class _IssuedPrivateEvidence(PrivateAccessEvidence):
+    __slots__ = ("issuer",)
+
+    def __init__(self, issuer: object) -> None:
+        super().__init__()
+        self.issuer = issuer
+
+    def _close_authority(self) -> None:
+        pass
+
+
+class _DeviceSecret(DeviceSecretAuthority):
+    __slots__ = ("issuer", "retained", "reprove_calls")
+
+    def __init__(self, issuer: object, payload: bytes = b"s" * 32) -> None:
+        super().__init__()
+        self.issuer = issuer
+        self.retained = _Regular(payload)
+        self.reprove_calls = 0
+
+    def _reprove(self) -> None:
+        self.retained.snapshot()
+        self.reprove_calls += 1
+
+    def clone(self) -> _DeviceSecret:
+        self.reprove()
+        return _DeviceSecret(self.issuer, self.retained.read_all())
+
+    def _close_authority(self) -> None:
+        self.retained.close()
+
+
+class _VerifiedPrivate(VerifiedPrivateProof):
+    __slots__ = (
+        "context",
+        "issuer",
+        "retained_secret",
+        "retained_target",
+        "terminal_reproof_calls",
+    )
+
+    def __init__(
+        self,
+        issuer: object,
+        context: PrivateProofContext,
+        secret: _DeviceSecret,
+    ) -> None:
+        super().__init__()
+        self.issuer = issuer
+        self.context = context
+        self.retained_target = _IssuedPrivateEvidence(issuer)
+        self.retained_secret = secret.clone()
+        self.terminal_reproof_calls = 0
+
+    def terminal_reproof(self) -> None:
+        self.retained_target._require_open()
+        self.retained_secret.reprove()
+        self.terminal_reproof_calls += 1
+
+    def _close_authority(self) -> None:
+        try:
+            self.retained_secret.close()
+        finally:
+            self.retained_target.close()
 
 
 class _Pending(PendingPublication):
@@ -254,6 +359,111 @@ class _PrivateService(PrivateStorageProof):
         return _PrivateEvidence()
 
 
+def _private_context(
+    role: PrivateProofObjectRole = PrivateProofObjectRole.ATTESTATION,
+) -> PrivateProofContext:
+    return PrivateProofContext(role, b"c" * 32)
+
+
+def _windows_private_proof(
+    context: PrivateProofContext | None = None,
+) -> WindowsPrivateProof:
+    selected = context or _private_context()
+    return WindowsPrivateProof(
+        schema=WINDOWS_PRIVATE_PROOF_SCHEMA,
+        object_role=selected.object_role,
+        security_profile_id=WINDOWS_PRIVATE_SECURITY_PROFILE_ID,
+        owner_sid_sha256=b"o" * 32,
+        authority_descriptor_sha256=b"a" * 32,
+        owner_context_sha256=selected.owner_context_sha256,
+        device_key_id=b"k" * 32,
+        device_secret_mac=b"m" * 32,
+    )
+
+
+class _PersistentPrivateService(PersistentPrivateProof):
+    def __init__(self) -> None:
+        self._issuer = object()
+        self.bind_calls = 0
+        self.mint_calls = 0
+        self.verify_calls = 0
+        self.consume_calls = 0
+
+    def issue_target(self) -> PrivateAccessEvidence:
+        return _IssuedPrivateEvidence(self._issuer)
+
+    def _require_target(self, target: PrivateAccessEvidence) -> None:
+        if type(target) is not _IssuedPrivateEvidence or target.issuer is not self._issuer:
+            raise PlatformFileError(
+                PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                retryable=False,
+            )
+
+    def _require_secret(self, secret: DeviceSecretAuthority) -> None:
+        if type(secret) is not _DeviceSecret or secret.issuer is not self._issuer:
+            raise PlatformFileError(
+                PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                retryable=False,
+            )
+
+    def _require_verified(self, verified: VerifiedPrivateProof) -> None:
+        if type(verified) is not _VerifiedPrivate or verified.issuer is not self._issuer:
+            raise PlatformFileError(
+                PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                retryable=False,
+            )
+
+    def _bind_device_secret(self, secret_file: BoundRegularFile) -> DeviceSecretAuthority:
+        self.bind_calls += 1
+        return _DeviceSecret(self._issuer, secret_file.read_all())
+
+    def _mint(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        context: PrivateProofContext,
+    ) -> WindowsPrivateProof:
+        self._require_target(target)
+        self._require_secret(secret)
+        self.mint_calls += 1
+        return _windows_private_proof(context)
+
+    def _verify(
+        self,
+        target: PrivateAccessEvidence,
+        secret: DeviceSecretAuthority,
+        proof: WindowsPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> VerifiedPrivateProof:
+        del proof
+        self._require_target(target)
+        self._require_secret(secret)
+        self.verify_calls += 1
+        return _VerifiedPrivate(
+            self._issuer,
+            expected_context,
+            secret,
+        )
+
+    def _consume_verified(
+        self,
+        verified: VerifiedPrivateProof,
+        expected_context: PrivateProofContext,
+    ) -> None:
+        self._require_verified(verified)
+        if verified.context != expected_context:
+            raise PlatformFileError(
+                PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                retryable=False,
+            )
+
+        def terminal_operation() -> None:
+            verified.terminal_reproof()
+            self.consume_calls += 1
+
+        VerifiedPrivateProof._consume_once(verified, terminal_operation)
+
+
 class PlatformFileContractArchitectureTests(unittest.TestCase):
     def test_contract_leaf_uses_only_backend_neutral_standard_library(self) -> None:
         tree = ast.parse((_ROOT / "platform_fs_contracts.py").read_text(encoding="utf-8"))
@@ -265,7 +475,18 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
                 imports.add(node.module.split(".", 1)[0])
         self.assertEqual(
             imports,
-            {"__future__", "abc", "dataclasses", "enum", "math", "pathlib", "typing"},
+            {
+                "__future__",
+                "abc",
+                "dataclasses",
+                "enum",
+                "hashlib",
+                "json",
+                "math",
+                "pathlib",
+                "threading",
+                "typing",
+            },
         )
         source = (_ROOT / "platform_fs_contracts.py").read_text(encoding="utf-8")
         for forbidden in ("fcntl", "ctypes", "msvcrt", "win32", "HANDLE", "dirfd"):
@@ -280,6 +501,8 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             LockLease,
             PendingPublication,
             PrivateAccessEvidence,
+            DeviceSecretAuthority,
+            VerifiedPrivateProof,
         ):
             with self.subTest(authority_type=authority_type.__name__):
                 self.assertTrue(issubclass(authority_type, OpaqueAuthority))
@@ -292,6 +515,25 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             ProcessFileLock.acquire: ("self", "parent", "name", "payload", "policy"),
             PrivateStorageProof.create_private_directory: ("self", "parent", "name"),
             PrivateStorageProof.prove_private: ("self", "authority"),
+            PersistentPrivateProof.bind_device_secret: ("self", "secret_file"),
+            PersistentPrivateProof.mint: (
+                "self",
+                "target",
+                "secret",
+                "context",
+            ),
+            PersistentPrivateProof.verify: (
+                "self",
+                "target",
+                "secret",
+                "proof",
+                "expected_context",
+            ),
+            PersistentPrivateProof.consume_verified: (
+                "self",
+                "verified",
+                "expected_context",
+            ),
         }
         for method, expected in expected_parameters.items():
             with self.subTest(method=method.__qualname__):
@@ -312,8 +554,195 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
                 forbidden,
             )
 
+    def test_persistent_proof_port_is_not_part_of_aggregate_backend(self) -> None:
+        self.assertNotIn(PersistentPrivateProof, PlatformFileBackend.__bases__)
+        self.assertFalse(isinstance(_PrivateService(), PersistentPrivateProof))
+        self.assertTrue(isinstance(_PersistentPrivateService(), PersistentPrivateProof))
+
 
 class PlatformFileValueContractTests(unittest.TestCase):
+    def test_private_proof_constants_context_and_record_shape_are_exact(self) -> None:
+        self.assertEqual(WINDOWS_PRIVATE_PROOF_SCHEMA, 1)
+        self.assertEqual(WINDOWS_PRIVATE_SECURITY_PROFILE_ID, "WindowsPrivateSecurityV2")
+        self.assertEqual(DEVICE_SECRET_SIZE_BYTES, 32)
+        self.assertEqual(DEVICE_KEY_ID_HASH_ALGORITHM, "sha256")
+        self.assertEqual(DEVICE_KEY_ID_SIZE_BYTES, 32)
+        self.assertEqual(PRIVATE_PROOF_DIGEST_SIZE_BYTES, 32)
+        self.assertEqual(
+            WINDOWS_PRIVATE_PROOF_DOMAIN_TAG,
+            b"localcat.windows.private-proof.v1\0",
+        )
+        self.assertEqual(
+            tuple(role.value for role in PrivateProofObjectRole),
+            (
+                "PRIVATE_DIRECTORY",
+                "DEVICE_KEY",
+                "ATTESTATION",
+                "DEVICE_KEY_CANDIDATE",
+                "ATTESTATION_CANDIDATE",
+            ),
+        )
+        context = _private_context()
+        proof = _windows_private_proof(context)
+        self.assertEqual(
+            tuple(field.name for field in fields(context)),
+            ("object_role", "owner_context_sha256"),
+        )
+        self.assertEqual(
+            tuple(field.name for field in fields(proof)),
+            (
+                "schema",
+                "object_role",
+                "security_profile_id",
+                "owner_sid_sha256",
+                "authority_descriptor_sha256",
+                "owner_context_sha256",
+                "device_key_id",
+                "device_secret_mac",
+            ),
+        )
+        self.assertNotIsInstance(proof, OpaqueAuthority)
+        self.assertEqual(pickle.loads(pickle.dumps(proof)), proof)
+        with self.assertRaises(FrozenInstanceError):
+            proof.schema = 2  # type: ignore[misc]
+
+    def test_private_proof_values_reject_open_roles_and_non_exact_digests(self) -> None:
+        with self.assertRaises(TypeError):
+            PrivateProofContext("ATTESTATION", b"c" * 32)  # type: ignore[arg-type]
+        for digest in (b"short", bytearray(b"c" * 32)):
+            with self.subTest(digest=digest):
+                with self.assertRaises((TypeError, ValueError)):
+                    PrivateProofContext(
+                        PrivateProofObjectRole.ATTESTATION,
+                        digest,  # type: ignore[arg-type]
+                    )
+
+        valid = dict(
+            schema=1,
+            object_role=PrivateProofObjectRole.ATTESTATION,
+            security_profile_id="WindowsPrivateSecurityV2",
+            owner_sid_sha256=b"o" * 32,
+            authority_descriptor_sha256=b"a" * 32,
+            owner_context_sha256=b"c" * 32,
+            device_key_id=b"k" * 32,
+            device_secret_mac=b"m" * 32,
+        )
+        invalid = (
+            {"schema": True},
+            {"schema": 2},
+            {"object_role": "ATTESTATION"},
+            {"security_profile_id": "windows-private-v1"},
+            {"owner_sid_sha256": b"short"},
+            {"authority_descriptor_sha256": bytearray(b"a" * 32)},
+            {"owner_context_sha256": b"short"},
+            {"device_key_id": b"short"},
+            {"device_secret_mac": b"short"},
+        )
+        for change in invalid:
+            with self.subTest(change=change):
+                with self.assertRaises((TypeError, ValueError)):
+                    WindowsPrivateProof(**(valid | change))  # type: ignore[arg-type]
+
+    def test_private_proof_nested_codec_is_exact_canonical_and_round_trips(self) -> None:
+        proof = _windows_private_proof()
+        encoded = encode_windows_private_proof(proof)
+        expected = (
+            b'{"authority_descriptor_sha256":"'
+            + b"61" * 32
+            + b'","device_key_id":"'
+            + b"6b" * 32
+            + b'","device_secret_mac":"'
+            + b"6d" * 32
+            + b'","object_role":"ATTESTATION","owner_context_sha256":"'
+            + b"63" * 32
+            + b'","owner_sid_sha256":"'
+            + b"6f" * 32
+            + b'","schema":1,"security_profile_id":"WindowsPrivateSecurityV2"}'
+        )
+        self.assertEqual(encoded, expected)
+        self.assertFalse(encoded.endswith(b"\n"))
+        self.assertEqual(decode_windows_private_proof(encoded), proof)
+        for role in PrivateProofObjectRole:
+            with self.subTest(role=role):
+                selected = _windows_private_proof(
+                    PrivateProofContext(role, b"c" * 32)
+                )
+                self.assertEqual(
+                    decode_windows_private_proof(
+                        encode_windows_private_proof(selected)
+                    ),
+                    selected,
+                )
+        with self.assertRaises(TypeError):
+            encode_windows_private_proof(object())  # type: ignore[arg-type]
+
+    def test_private_proof_unsigned_mac_projection_and_key_id_have_golden_bytes(self) -> None:
+        proof = _windows_private_proof()
+        unsigned = (
+            b'{"authority_descriptor_sha256":"'
+            + b"61" * 32
+            + b'","device_key_id":"'
+            + b"6b" * 32
+            + b'","object_role":"ATTESTATION","owner_context_sha256":"'
+            + b"63" * 32
+            + b'","owner_sid_sha256":"'
+            + b"6f" * 32
+            + b'","schema":1,"security_profile_id":"WindowsPrivateSecurityV2"}'
+        )
+        self.assertEqual(encode_windows_private_proof_unsigned(proof), unsigned)
+        self.assertEqual(
+            windows_private_proof_mac_message(proof),
+            b"localcat.windows.private-proof.v1\0" + unsigned,
+        )
+        self.assertNotIn(proof.device_secret_mac.hex().encode("ascii"), unsigned)
+        changed_mac = replace(proof, device_secret_mac=b"z" * 32)
+        self.assertEqual(
+            encode_windows_private_proof_unsigned(changed_mac),
+            unsigned,
+        )
+        self.assertEqual(
+            windows_private_proof_mac_message(changed_mac),
+            b"localcat.windows.private-proof.v1\0" + unsigned,
+        )
+
+        raw_secret = bytes(range(DEVICE_SECRET_SIZE_BYTES))
+        expected_key_id = bytes.fromhex(
+            "630dcd2966c4336691125448bbb25b4f"
+            "f412a49c732db2c8abc1b8581bd710dd"
+        )
+        self.assertEqual(derive_device_key_id(raw_secret), expected_key_id)
+        self.assertEqual(
+            derive_device_key_id(raw_secret),
+            hashlib.sha256(raw_secret).digest(),
+        )
+        for invalid in (b"short", b"x" * 33, bytearray(b"x" * 32)):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((TypeError, ValueError)):
+                    derive_device_key_id(invalid)  # type: ignore[arg-type]
+
+    def test_private_proof_nested_codec_rejects_noncanonical_and_malformed_bytes(self) -> None:
+        canonical = encode_windows_private_proof(_windows_private_proof())
+        mapping = json.loads(canonical)
+        malformed = (
+            canonical + b"\n",
+            json.dumps(mapping, indent=2).encode("utf-8"),
+            canonical.replace(b'"schema":1', b'"schema":1.0'),
+            canonical.replace(b'"schema":1', b'"schema":NaN'),
+            canonical.replace(b"ATTESTATION", b"UNKNOWN_ROLE"),
+            canonical.replace(b'"schema":1', b'"schema":1,"schema":1'),
+            canonical.replace(b'"schema":1', b'"extra":{"x":1,"x":2},"schema":1'),
+            canonical.replace(b"61" * 32, b"61" * 31, 1),
+            canonical.replace(b"61" * 32, b"6A" * 32, 1),
+            canonical.replace(b'"schema":1,', b"", 1),
+            canonical.replace(b'"schema":1', b'"schema":1,"unknown":0'),
+            canonical.decode("utf-8"),
+            bytearray(canonical),
+            b"\xff",
+        )
+        for value in malformed:
+            with self.subTest(value=repr(value)[:120]):
+                with self.assertRaises((TypeError, ValueError)):
+                    decode_windows_private_proof(value)  # type: ignore[arg-type]
     def test_file_identity_shape_is_frozen_exact_and_live_only(self) -> None:
         identity = _identity()
         self.assertEqual(
@@ -448,6 +877,461 @@ class PlatformFileErrorContractTests(unittest.TestCase):
 
 
 class PlatformFileAuthorityContractTests(unittest.TestCase):
+    def test_persistent_private_proof_port_validates_and_mints_only_values(self) -> None:
+        service = _PersistentPrivateService()
+        secret_file = _Regular(b"s" * DEVICE_SECRET_SIZE_BYTES)
+        target = service.issue_target()
+        context = _private_context()
+
+        secret = service.bind_device_secret(secret_file)
+        secret_file.close()
+        secret.reprove()
+        proof = service.mint(target, secret, context)
+        verified = service.verify(target, secret, proof, context)
+
+        self.assertIs(type(proof), WindowsPrivateProof)
+        self.assertNotIsInstance(proof, OpaqueAuthority)
+        self.assertIsInstance(secret, DeviceSecretAuthority)
+        self.assertIsInstance(verified, VerifiedPrivateProof)
+        self.assertFalse(secret.retained.closed)
+        self.assertEqual(
+            (
+                service.bind_calls,
+                service.mint_calls,
+                service.verify_calls,
+                service.consume_calls,
+            ),
+            (1, 1, 1, 0),
+        )
+        retained = secret.retained
+        secret.close()
+        self.assertTrue(retained.closed)
+        with self.assertRaises(PlatformFileError):
+            secret.reprove()
+
+    def test_persistent_private_proof_port_rejects_wrong_types_and_closed_inputs(self) -> None:
+        service = _PersistentPrivateService()
+        secret_file = _Regular(b"s" * DEVICE_SECRET_SIZE_BYTES)
+        target = service.issue_target()
+        context = _private_context()
+        secret = service.bind_device_secret(secret_file)
+        proof = service.mint(target, secret, context)
+
+        invalid_calls = (
+            lambda: service.bind_device_secret(object()),
+            lambda: service.mint(object(), secret, context),
+            lambda: service.mint(target, object(), context),
+            lambda: service.mint(target, secret, object()),
+            lambda: service.verify(object(), secret, proof, context),
+            lambda: service.verify(target, object(), proof, context),
+            lambda: service.verify(target, secret, object(), context),
+            lambda: service.verify(target, secret, proof, object()),
+        )
+        for call in invalid_calls:
+            with self.subTest(call=call):
+                with self.assertRaises(TypeError):
+                    call()  # type: ignore[misc]
+        self.assertEqual(
+            (service.bind_calls, service.mint_calls, service.verify_calls),
+            (1, 1, 0),
+        )
+
+        closed_file = _Regular(b"s" * DEVICE_SECRET_SIZE_BYTES)
+        closed_file.close()
+        with self.assertRaises(PlatformFileError):
+            service.bind_device_secret(closed_file)
+        target.close()
+        with self.assertRaises(PlatformFileError):
+            service.mint(target, secret, context)
+        replacement_target = service.issue_target()
+        secret.close()
+        with self.assertRaises(PlatformFileError):
+            service.verify(replacement_target, secret, proof, context)
+
+    def test_persistent_private_proof_context_mismatch_fails_before_backend_verify(self) -> None:
+        service = _PersistentPrivateService()
+        target = service.issue_target()
+        secret = service.bind_device_secret(_Regular(b"s" * DEVICE_SECRET_SIZE_BYTES))
+        proof = service.mint(target, secret, _private_context())
+        mismatches = (
+            PrivateProofContext(PrivateProofObjectRole.DEVICE_KEY, b"c" * 32),
+            PrivateProofContext(PrivateProofObjectRole.ATTESTATION, b"x" * 32),
+        )
+        for expected in mismatches:
+            with self.subTest(expected=expected):
+                with self.assertRaises(PlatformFileError) as caught:
+                    service.verify(target, secret, proof, expected)
+                self.assertEqual(
+                    caught.exception.code,
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+                )
+        self.assertEqual(service.verify_calls, 0)
+
+    def test_persistent_private_proof_port_rejects_backend_shape_violations(self) -> None:
+        service = _PersistentPrivateService()
+        target = service.issue_target()
+        secret_file = _Regular(b"s" * DEVICE_SECRET_SIZE_BYTES)
+        context = _private_context()
+
+        class BadBind(_PersistentPrivateService):
+            def _bind_device_secret(self, secret_file: BoundRegularFile) -> DeviceSecretAuthority:
+                del secret_file
+                return object()  # type: ignore[return-value]
+
+        with self.assertRaises(TypeError):
+            BadBind().bind_device_secret(secret_file)
+
+        class ClosedBind(_PersistentPrivateService):
+            def _bind_device_secret(self, secret_file: BoundRegularFile) -> DeviceSecretAuthority:
+                del secret_file
+                result = _DeviceSecret(self._issuer)
+                result.close()
+                return result
+
+        with self.assertRaises(PlatformFileError):
+            ClosedBind().bind_device_secret(secret_file)
+
+        secret = service.bind_device_secret(secret_file)
+
+        class BadMint(_PersistentPrivateService):
+            def _mint(
+                self,
+                target: PrivateAccessEvidence,
+                secret: DeviceSecretAuthority,
+                context: PrivateProofContext,
+            ) -> WindowsPrivateProof:
+                del target, secret, context
+                return object()  # type: ignore[return-value]
+
+        with self.assertRaises(TypeError):
+            BadMint().mint(target, secret, context)
+
+        class WrongContextMint(_PersistentPrivateService):
+            def _mint(
+                self,
+                target: PrivateAccessEvidence,
+                secret: DeviceSecretAuthority,
+                context: PrivateProofContext,
+            ) -> WindowsPrivateProof:
+                del target, secret, context
+                return _windows_private_proof(
+                    PrivateProofContext(PrivateProofObjectRole.DEVICE_KEY, b"x" * 32)
+                )
+
+        with self.assertRaises(ValueError):
+            wrong_service = WrongContextMint()
+            wrong_service.mint(
+                wrong_service.issue_target(),
+                wrong_service.bind_device_secret(secret_file),
+                context,
+            )
+
+        proof = service.mint(target, secret, context)
+
+        class BadVerify(_PersistentPrivateService):
+            def _verify(
+                self,
+                target: PrivateAccessEvidence,
+                secret: DeviceSecretAuthority,
+                proof: WindowsPrivateProof,
+                expected_context: PrivateProofContext,
+            ) -> VerifiedPrivateProof:
+                del target, secret, proof
+                return object()  # type: ignore[return-value]
+
+        with self.assertRaises(TypeError):
+            BadVerify().verify(target, secret, proof, context)
+
+        class ClosedVerify(_PersistentPrivateService):
+            def _verify(
+                self,
+                target: PrivateAccessEvidence,
+                secret: DeviceSecretAuthority,
+                proof: WindowsPrivateProof,
+                expected_context: PrivateProofContext,
+            ) -> VerifiedPrivateProof:
+                del target, secret, proof
+                result = _VerifiedPrivate(
+                    self._issuer,
+                    expected_context,
+                    _DeviceSecret(self._issuer),
+                )
+                result.close()
+                return result
+
+        with self.assertRaises(PlatformFileError):
+            ClosedVerify().verify(target, secret, proof, context)
+
+        class BadConsume(_PersistentPrivateService):
+            def _consume_verified(
+                self,
+                verified: VerifiedPrivateProof,
+                expected_context: PrivateProofContext,
+            ) -> None:
+                del verified, expected_context
+                return object()  # type: ignore[return-value]
+
+        bad_consume = BadConsume()
+        bad_target = bad_consume.issue_target()
+        bad_secret = bad_consume.bind_device_secret(secret_file)
+        bad_proof = bad_consume.mint(bad_target, bad_secret, context)
+        bad_verified = bad_consume.verify(
+            bad_target,
+            bad_secret,
+            bad_proof,
+            context,
+        )
+        with self.assertRaises(TypeError):
+            bad_consume.consume_verified(bad_verified, context)
+        self.assertFalse(bad_verified.closed)
+        bad_verified.close()
+
+    def test_persistent_private_proof_rejects_foreign_and_forged_authorities(self) -> None:
+        first = _PersistentPrivateService()
+        second = _PersistentPrivateService()
+        context = _private_context()
+        first_target = first.issue_target()
+        first_secret = first.bind_device_secret(_Regular(b"s" * DEVICE_SECRET_SIZE_BYTES))
+        first_proof = first.mint(first_target, first_secret, context)
+        first_verified = first.verify(
+            first_target,
+            first_secret,
+            first_proof,
+            context,
+        )
+
+        second_target = second.issue_target()
+        second_secret = second.bind_device_secret(_Regular(b"s" * DEVICE_SECRET_SIZE_BYTES))
+        second_proof = second.mint(second_target, second_secret, context)
+        second_verified = second.verify(
+            second_target,
+            second_secret,
+            second_proof,
+            context,
+        )
+
+        for call in (
+            lambda: second.mint(first_target, second_secret, context),
+            lambda: second.mint(second_target, first_secret, context),
+            lambda: second.verify(first_target, second_secret, second_proof, context),
+            lambda: second.verify(second_target, first_secret, second_proof, context),
+            lambda: second.consume_verified(first_verified, context),
+            lambda: first.mint(second_target, first_secret, context),
+            lambda: first.mint(first_target, second_secret, context),
+            lambda: first.verify(second_target, first_secret, first_proof, context),
+            lambda: first.verify(first_target, second_secret, first_proof, context),
+            lambda: first.consume_verified(second_verified, context),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(PlatformFileError) as caught:
+                    call()
+                self.assertEqual(
+                    caught.exception.code,
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+                )
+
+        class ForgedTarget(_IssuedPrivateEvidence):
+            pass
+
+        class ForgedSecret(_DeviceSecret):
+            pass
+
+        class ForgedVerified(_VerifiedPrivate):
+            pass
+
+        class DispatchBypassVerified(_VerifiedPrivate):
+            def __init__(
+                self,
+                issuer: object,
+                context: PrivateProofContext,
+                secret: _DeviceSecret,
+            ) -> None:
+                super().__init__(issuer, context, secret)
+                self.dynamic_calls: list[str] = []
+
+            def _consume_once(self, operation: object) -> None:
+                del operation
+                self.dynamic_calls.append("consume")
+
+            def _require_open(self) -> None:
+                self.dynamic_calls.append("require_open")
+
+            def close(self) -> None:
+                self.dynamic_calls.append("close")
+
+        forged_target = ForgedTarget(first._issuer)
+        forged_secret = ForgedSecret(first._issuer)
+        forged_verified = ForgedVerified(first._issuer, context, first_secret)
+        bypass_verified = DispatchBypassVerified(
+            first._issuer,
+            context,
+            first_secret,
+        )
+        for call in (
+            lambda: first.mint(_PrivateEvidence(), first_secret, context),
+            lambda: first.mint(forged_target, first_secret, context),
+            lambda: first.mint(first_target, forged_secret, context),
+            lambda: first.consume_verified(forged_verified, context),
+            lambda: first.consume_verified(bypass_verified, context),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(PlatformFileError) as caught:
+                    call()
+                self.assertEqual(
+                    caught.exception.code,
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+                )
+
+        self.assertFalse(first_verified.closed)
+        self.assertFalse(second_verified.closed)
+        self.assertFalse(forged_verified.closed)
+        self.assertEqual(bypass_verified.dynamic_calls, [])
+        self.assertFalse(bypass_verified.closed)
+        self.assertEqual(first.consume_calls, 0)
+        self.assertEqual(second.consume_calls, 0)
+
+        first.consume_verified(first_verified, context)
+        second.consume_verified(second_verified, context)
+        self.assertTrue(first_verified.closed)
+        self.assertTrue(second_verified.closed)
+        self.assertEqual(first.consume_calls, 1)
+        self.assertEqual(second.consume_calls, 1)
+
+        forged_verified.close()
+        self.assertTrue(forged_verified.closed)
+        self.assertTrue(forged_verified.retained_secret.closed)
+        self.assertTrue(forged_verified.retained_target.closed)
+        OpaqueAuthority.close(bypass_verified)
+        self.assertTrue(bypass_verified.closed)
+
+    def test_verified_private_proof_is_issuer_bound_one_shot_and_close_sensitive(self) -> None:
+        service = _PersistentPrivateService()
+        context = _private_context()
+        target = service.issue_target()
+        secret = service.bind_device_secret(_Regular(b"s" * DEVICE_SECRET_SIZE_BYTES))
+        proof = service.mint(target, secret, context)
+        verified = service.verify(target, secret, proof, context)
+
+        retained_secret = verified.retained_secret
+        retained_target = verified.retained_target
+        service.consume_verified(verified, context)
+        self.assertTrue(verified.closed)
+        self.assertEqual(verified.terminal_reproof_calls, 1)
+        self.assertTrue(retained_secret.closed)
+        self.assertTrue(retained_secret.retained.closed)
+        self.assertTrue(retained_target.closed)
+        self.assertEqual(service.consume_calls, 1)
+        with self.assertRaises(PlatformFileError):
+            service.consume_verified(verified, context)
+        self.assertEqual(service.consume_calls, 1)
+
+        closed = service.verify(target, secret, proof, context)
+        closed.close()
+        with self.assertRaises(PlatformFileError):
+            service.consume_verified(closed, context)
+        self.assertEqual(service.consume_calls, 1)
+
+        mismatch = service.verify(target, secret, proof, context)
+        with self.assertRaises(PlatformFileError) as caught:
+            service.consume_verified(
+                mismatch,
+                PrivateProofContext(PrivateProofObjectRole.ATTESTATION, b"x" * 32),
+            )
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+        )
+        self.assertFalse(mismatch.closed)
+        self.assertFalse(mismatch.retained_secret.closed)
+        self.assertFalse(mismatch.retained_target.closed)
+        self.assertEqual(service.consume_calls, 1)
+        service.consume_verified(mismatch, context)
+        self.assertTrue(mismatch.closed)
+        self.assertTrue(mismatch.retained_secret.closed)
+        self.assertTrue(mismatch.retained_target.closed)
+        self.assertEqual(service.consume_calls, 2)
+
+        stale = service.verify(target, secret, proof, context)
+        stale.retained_secret.retained.close()
+        with self.assertRaises(PlatformFileError):
+            service.consume_verified(stale, context)
+        self.assertTrue(stale.closed)
+        self.assertTrue(stale.retained_secret.closed)
+        self.assertTrue(stale.retained_target.closed)
+        self.assertEqual(stale.terminal_reproof_calls, 0)
+        self.assertEqual(service.consume_calls, 2)
+
+        public_verified_methods = {
+            name
+            for name, value in inspect.getmembers(
+                VerifiedPrivateProof,
+                inspect.isfunction,
+            )
+            if not name.startswith("_")
+        }
+        self.assertEqual(public_verified_methods, {"close"})
+
+    def test_verified_private_proof_serializes_concurrent_consumers(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingService(_PersistentPrivateService):
+            def _consume_verified(
+                self,
+                verified: VerifiedPrivateProof,
+                expected_context: PrivateProofContext,
+            ) -> None:
+                self._require_verified(verified)
+                if verified.context != expected_context:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                        retryable=False,
+                    )
+
+                def terminal_operation() -> None:
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise AssertionError("concurrent consumption test timed out")
+                    verified.terminal_reproof()
+                    self.consume_calls += 1
+
+                VerifiedPrivateProof._consume_once(verified, terminal_operation)
+
+        service = BlockingService()
+        context = _private_context()
+        target = service.issue_target()
+        secret = service.bind_device_secret(_Regular(b"s" * DEVICE_SECRET_SIZE_BYTES))
+        proof = service.mint(target, secret, context)
+        verified = service.verify(target, secret, proof, context)
+        outcomes: list[str] = []
+
+        def consume() -> None:
+            try:
+                service.consume_verified(verified, context)
+            except PlatformFileError as error:
+                outcomes.append(error.code)
+            else:
+                outcomes.append("consumed")
+
+        first = threading.Thread(target=consume)
+        second = threading.Thread(target=consume)
+        first.start()
+        self.assertTrue(entered.wait(timeout=2))
+        second.start()
+        release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertCountEqual(
+            outcomes,
+            ["consumed", PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value],
+        )
+        self.assertTrue(verified.closed)
+        self.assertEqual(verified.terminal_reproof_calls, 1)
+        self.assertEqual(service.consume_calls, 1)
+
     def test_authority_is_context_managed_noncopyable_and_closed_once(self) -> None:
         authority = _ProbeAuthority()
         with authority as entered:
@@ -668,6 +1552,37 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             directory.begin_publish(
                 written,
                 "again.json",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+
+    def test_candidate_backend_fault_invalidates_prior_publishable_state(self) -> None:
+        directory = _Directory()
+
+        write_fault = _FaultingCandidate()
+        write_fault.write_all(b"first")
+        write_fault.flush_content()
+        write_fault.fail_write = True
+        with self.assertRaises(RuntimeError):
+            write_fault.write_all(b"second")
+        with self.assertRaises(ValueError):
+            directory.begin_publish(
+                write_fault,
+                "write-fault.json",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+
+        flush_fault = _FaultingCandidate()
+        flush_fault.write_all(b"payload")
+        flush_fault.flush_content()
+        flush_fault.fail_flush = True
+        with self.assertRaises(RuntimeError):
+            flush_fault.flush_content()
+        with self.assertRaises(ValueError):
+            directory.begin_publish(
+                flush_fault,
+                "flush-fault.json",
                 mode=PublishMode.CREATE_IF_ABSENT,
                 lease=None,
             )
