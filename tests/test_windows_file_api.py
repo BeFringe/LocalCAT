@@ -13,21 +13,28 @@ import unittest
 from unittest import mock
 
 import windows_file_api as api_module
+from tests.windows_process_token_helper import (
+    PROCESS_INFORMATION,
+    STARTUPINFOEXW,
+    STARTUPINFOW,
+    TEST_PROCESS_SIGNATURES,
+    WindowsTestProcessAPI,
+)
 from windows_file_api import (
     ACCESS_ALLOWED_ACE,
     ACL_SIZE_INFORMATION,
     ACE_HEADER,
     FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO,
     FILE_ID_128,
     FILE_ID_INFO,
     FILE_RENAME_INFO,
+    FILE_RENAME_INFORMATION,
     FILE_STANDARD_INFO,
     GENERIC_MAPPING,
     OVERLAPPED,
-    STORAGE_DEVICE_DESCRIPTOR,
-    STORAGE_DESCRIPTOR_HEADER,
-    STORAGE_PROPERTY_QUERY,
-    STORAGE_WRITE_CACHE_PROPERTY,
+    IO_STATUS_BLOCK,
+    NtStatusError,
     SYSTEM_MANDATORY_LABEL_ACE,
     TOKEN_MANDATORY_LABEL,
     TOKEN_USER,
@@ -62,7 +69,10 @@ class Win32APIStaticTests(unittest.TestCase):
             FILE_ID_INFO,
             FILE_ATTRIBUTE_TAG_INFO,
             FILE_STANDARD_INFO,
+            FILE_DISPOSITION_INFO,
             FILE_RENAME_INFO,
+            FILE_RENAME_INFORMATION,
+            IO_STATUS_BLOCK,
             OVERLAPPED,
             GENERIC_MAPPING,
             ACL_SIZE_INFORMATION,
@@ -71,17 +81,16 @@ class Win32APIStaticTests(unittest.TestCase):
             ACE_HEADER,
             ACCESS_ALLOWED_ACE,
             SYSTEM_MANDATORY_LABEL_ACE,
-            STORAGE_PROPERTY_QUERY,
-            STORAGE_DESCRIPTOR_HEADER,
-            STORAGE_DEVICE_DESCRIPTOR,
-            STORAGE_WRITE_CACHE_PROPERTY,
         ):
             self.assertEqual(structure._layout_, "ms")
         self.assertEqual(ctypes.sizeof(FILE_ID_128), 16)
         self.assertEqual(ctypes.sizeof(FILE_ID_INFO), 24)
         self.assertEqual(ctypes.sizeof(FILE_ATTRIBUTE_TAG_INFO), 8)
         self.assertEqual(ctypes.sizeof(FILE_STANDARD_INFO), 24)
+        self.assertEqual(ctypes.sizeof(FILE_DISPOSITION_INFO), 1)
         self.assertEqual(ctypes.sizeof(FILE_RENAME_INFO), 24)
+        self.assertEqual(ctypes.sizeof(FILE_RENAME_INFORMATION), 24)
+        self.assertEqual(ctypes.sizeof(IO_STATUS_BLOCK), 16)
         self.assertEqual(ctypes.sizeof(OVERLAPPED), 32)
         self.assertEqual(ctypes.sizeof(GENERIC_MAPPING), 16)
         self.assertEqual(ctypes.sizeof(ACL_SIZE_INFORMATION), 12)
@@ -90,10 +99,6 @@ class Win32APIStaticTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(ACE_HEADER), 4)
         self.assertEqual(ctypes.sizeof(ACCESS_ALLOWED_ACE), 12)
         self.assertEqual(ctypes.sizeof(SYSTEM_MANDATORY_LABEL_ACE), 12)
-        self.assertEqual(ctypes.sizeof(STORAGE_PROPERTY_QUERY), 12)
-        self.assertEqual(ctypes.sizeof(STORAGE_DESCRIPTOR_HEADER), 8)
-        self.assertEqual(ctypes.sizeof(STORAGE_DEVICE_DESCRIPTOR), 40)
-        self.assertEqual(ctypes.sizeof(STORAGE_WRITE_CACHE_PROPERTY), 28)
 
         m = api_module
         layout_oracle = {
@@ -101,6 +106,7 @@ class Win32APIStaticTests(unittest.TestCase):
             m.FILE_ID_INFO: (24, {"VolumeSerialNumber": 0, "FileId": 8}),
             m.FILE_ATTRIBUTE_TAG_INFO: (8, {"FileAttributes": 0, "ReparseTag": 4}),
             m.FILE_STANDARD_INFO: (24, {"AllocationSize": 0, "EndOfFile": 8, "NumberOfLinks": 16, "DeletePending": 20, "Directory": 21}),
+            m.FILE_DISPOSITION_INFO: (1, {"DeleteFile": 0}),
             m._LARGE_INTEGER_PARTS: (8, {"LowPart": 0, "HighPart": 4}),
             m.LARGE_INTEGER: (8, {"parts": 0, "QuadPart": 0}),
             m.FILE_BASIC_INFO: (40, {"CreationTime": 0, "LastAccessTime": 8, "LastWriteTime": 16, "ChangeTime": 24, "FileAttributes": 32}),
@@ -109,6 +115,9 @@ class Win32APIStaticTests(unittest.TestCase):
             m.OVERLAPPED: (32, {"Internal": 0, "InternalHigh": 8, "position": 16, "hEvent": 24}),
             m._FILE_RENAME_NAME: (4, {"ReplaceIfExists": 0, "Flags": 0}),
             m.FILE_RENAME_INFO: (24, {"mode": 0, "RootDirectory": 8, "FileNameLength": 16, "FileName": 20}),
+            m.FILE_RENAME_INFORMATION: (24, {"ReplaceIfExists": 0, "RootDirectory": 8, "FileNameLength": 16, "FileName": 20}),
+            m._IO_STATUS_BLOCK_RESULT: (8, {"Status": 0, "Pointer": 0}),
+            m.IO_STATUS_BLOCK: (16, {"result": 0, "Information": 8}),
             m.GENERIC_MAPPING: (16, {"GenericRead": 0, "GenericWrite": 4, "GenericExecute": 8, "GenericAll": 12}),
             m.ACL_SIZE_INFORMATION: (12, {"AceCount": 0, "AclBytesInUse": 4, "AclBytesFree": 8}),
             m.LUID: (8, {"LowPart": 0, "HighPart": 4}),
@@ -121,10 +130,6 @@ class Win32APIStaticTests(unittest.TestCase):
             m.ACCESS_ALLOWED_ACE: (12, {"Header": 0, "Mask": 4, "SidStart": 8}),
             m.SYSTEM_MANDATORY_LABEL_ACE: (12, {"Header": 0, "Mask": 4, "SidStart": 8}),
             m.SECURITY_ATTRIBUTES: (24, {"nLength": 0, "lpSecurityDescriptor": 8, "bInheritHandle": 16}),
-            m.STORAGE_PROPERTY_QUERY: (12, {"PropertyId": 0, "QueryType": 4, "AdditionalParameters": 8}),
-            m.STORAGE_DESCRIPTOR_HEADER: (8, {"Version": 0, "Size": 4}),
-            m.STORAGE_DEVICE_DESCRIPTOR: (40, {"Version": 0, "Size": 4, "DeviceType": 8, "VendorIdOffset": 12, "BusType": 28, "RawPropertiesLength": 32, "RawDeviceProperties": 36}),
-            m.STORAGE_WRITE_CACHE_PROPERTY: (28, {"Version": 0, "Size": 4, "WriteCacheType": 8, "WriteCacheEnabled": 12, "WriteCacheChangeable": 16, "WriteThroughSupported": 20, "FlushCacheSupported": 24, "UserDefinedPowerProtection": 25, "NVCacheEnabled": 26}),
         }
         for structure, (expected_size, offsets) in layout_oracle.items():
             with self.subTest(structure=structure.__name__):
@@ -147,12 +152,16 @@ class Win32APIStaticTests(unittest.TestCase):
         api = WindowsFileAPI.load(_dll_loader=recording_loader)
         self.assertEqual(
             loaded,
-            [("kernel32.dll", True), ("advapi32.dll", True)],
+            [
+                ("kernel32.dll", True),
+                ("advapi32.dll", True),
+            ],
         )
         m = api_module
         pointer = ctypes.POINTER
         expected = {
             "CreateFileW": ((m.LPCWSTR, m.DWORD, m.DWORD, pointer(m.SECURITY_ATTRIBUTES), m.DWORD, m.DWORD, m.HANDLE), m.HANDLE),
+            "CreateDirectoryW": ((m.LPCWSTR, pointer(m.SECURITY_ATTRIBUTES)), m.BOOL),
             "CloseHandle": ((m.HANDLE,), m.BOOL),
             "DuplicateHandle": ((m.HANDLE, m.HANDLE, m.HANDLE, pointer(m.HANDLE), m.DWORD, m.BOOL, m.DWORD), m.BOOL),
             "ReadFile": ((m.HANDLE, m.LPVOID, m.DWORD, pointer(m.DWORD), pointer(m.OVERLAPPED)), m.BOOL),
@@ -160,6 +169,7 @@ class Win32APIStaticTests(unittest.TestCase):
             "GetFileInformationByHandleEx": ((m.HANDLE, ctypes.c_int, m.LPVOID, m.DWORD), m.BOOL),
             "GetFinalPathNameByHandleW": ((m.HANDLE, m.LPWSTR, m.DWORD, m.DWORD), m.DWORD),
             "SetFilePointerEx": ((m.HANDLE, m.LARGE_INTEGER, pointer(m.LARGE_INTEGER), m.DWORD), m.BOOL),
+            "SetEndOfFile": ((m.HANDLE,), m.BOOL),
             "SetFileInformationByHandle": ((m.HANDLE, ctypes.c_int, m.LPVOID, m.DWORD), m.BOOL),
             "FlushFileBuffers": ((m.HANDLE,), m.BOOL),
             "LockFileEx": ((m.HANDLE, m.DWORD, m.DWORD, m.DWORD, m.DWORD, pointer(m.OVERLAPPED)), m.BOOL),
@@ -169,7 +179,6 @@ class Win32APIStaticTests(unittest.TestCase):
             "GetVolumeInformationW": ((m.LPCWSTR, m.LPWSTR, m.DWORD, pointer(m.DWORD), pointer(m.DWORD), pointer(m.DWORD), m.LPWSTR, m.DWORD), m.BOOL),
             "GetVolumeInformationByHandleW": ((m.HANDLE, m.LPWSTR, m.DWORD, pointer(m.DWORD), pointer(m.DWORD), pointer(m.DWORD), m.LPWSTR, m.DWORD), m.BOOL),
             "GetDriveTypeW": ((m.LPCWSTR,), m.UINT),
-            "DeviceIoControl": ((m.HANDLE, m.DWORD, m.LPVOID, m.DWORD, m.LPVOID, m.DWORD, pointer(m.DWORD), pointer(m.OVERLAPPED)), m.BOOL),
             "CreateEventW": ((pointer(m.SECURITY_ATTRIBUTES), m.BOOL, m.BOOL, m.LPCWSTR), m.HANDLE),
             "WaitForSingleObject": ((m.HANDLE, m.DWORD), m.DWORD),
             "CancelIoEx": ((m.HANDLE, pointer(m.OVERLAPPED)), m.BOOL),
@@ -183,6 +192,7 @@ class Win32APIStaticTests(unittest.TestCase):
             "MapGenericMask": ((pointer(m.DWORD), pointer(m.GENERIC_MAPPING)), None),
             "OpenProcessToken": ((m.HANDLE, m.DWORD, pointer(m.HANDLE)), m.BOOL),
             "DuplicateTokenEx": ((m.HANDLE, m.DWORD, pointer(m.SECURITY_ATTRIBUTES), ctypes.c_int, ctypes.c_int, pointer(m.HANDLE)), m.BOOL),
+            "IsTokenRestricted": ((m.HANDLE,), m.BOOL),
             "GetTokenInformation": ((m.HANDLE, ctypes.c_int, m.LPVOID, m.DWORD, pointer(m.DWORD)), m.BOOL),
             "GetSecurityDescriptorControl": ((m.PSECURITY_DESCRIPTOR, pointer(m.WORD), pointer(m.DWORD)), m.BOOL),
             "GetAclInformation": ((m.PACL, m.LPVOID, m.DWORD, ctypes.c_int), m.BOOL),
@@ -225,6 +235,61 @@ class Win32APIStaticTests(unittest.TestCase):
             ctypes.POINTER(api_module.SECURITY_ATTRIBUTES),
         )
         self.assertIs(api.GetSecurityInfo.restype, api_module.DWORD)
+        native_expected = {
+            "NtSetInformationFile": (
+                (
+                    m.HANDLE,
+                    pointer(m.IO_STATUS_BLOCK),
+                    m.LPVOID,
+                    m.ULONG,
+                    ctypes.c_int,
+                ),
+                m.NTSTATUS,
+            ),
+        }
+        self.assertEqual(m.NTDLL_SIGNATURES, native_expected)
+        api.self_probe_nt_set_information_file()
+        self.assertEqual(
+            loaded,
+            [
+                ("kernel32.dll", True),
+                ("advapi32.dll", True),
+                ("ntdll.dll", True),
+            ],
+        )
+        for name, (argtypes, restype) in native_expected.items():
+            function = getattr(api, name)
+            self.assertEqual(tuple(function.argtypes), argtypes)
+            self.assertIs(function.restype, restype)
+
+    @unittest.skipUnless(sys.platform == "win32", "test process ABI requires Windows")
+    def test_process_and_token_construction_ffi_is_validation_only(self) -> None:
+        self.assertTrue(set(TEST_PROCESS_SIGNATURES).isdisjoint(api_module.WIN32_SIGNATURES))
+        production_api = WindowsFileAPI.load()
+        for name in TEST_PROCESS_SIGNATURES:
+            self.assertFalse(hasattr(production_api, name))
+
+        loaded: list[tuple[str, bool]] = []
+        real_loader = ctypes.WinDLL
+
+        def recording_loader(name: str, *, use_last_error: bool) -> object:
+            loaded.append((name, use_last_error))
+            return real_loader(name, use_last_error=use_last_error)
+
+        api = WindowsTestProcessAPI.load(_dll_loader=recording_loader)
+        self.assertEqual(
+            loaded,
+            [("kernel32.dll", True), ("advapi32.dll", True)],
+        )
+        self.assertEqual(ctypes.sizeof(STARTUPINFOW), 104)
+        self.assertEqual(ctypes.sizeof(PROCESS_INFORMATION), 24)
+        self.assertEqual(ctypes.sizeof(STARTUPINFOEXW), 112)
+        for structure in (STARTUPINFOW, PROCESS_INFORMATION, STARTUPINFOEXW):
+            self.assertEqual(structure._layout_, "ms")
+        for name, (argtypes, restype) in TEST_PROCESS_SIGNATURES.items():
+            function = getattr(api, name)
+            self.assertEqual(tuple(function.argtypes), argtypes)
+            self.assertIs(function.restype, restype)
 
 
 class Win32HandleTests(unittest.TestCase):
@@ -326,6 +391,134 @@ class Win32HandleTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.function, "CreateFileW")
         self.assertGreater(caught.exception.winerror, 0)
+
+
+@unittest.skipUnless(sys.platform == "win32", "native rename ABI requires Windows")
+class NativeRenameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = object.__new__(WindowsFileAPI)
+
+    def test_same_parent_rename_uses_class_10_null_root_and_exact_length(self) -> None:
+        calls: list[tuple[int, bool, object, int, int, bytes]] = []
+
+        def rename(
+            raw_handle: int,
+            io_status_pointer: object,
+            storage: object,
+            length: int,
+            information_class: int,
+        ) -> int:
+            information = ctypes.cast(
+                storage,
+                ctypes.POINTER(FILE_RENAME_INFORMATION),
+            ).contents
+            calls.append(
+                (
+                    raw_handle,
+                    bool(information.ReplaceIfExists),
+                    information.RootDirectory,
+                    int(length),
+                    int(information_class),
+                    ctypes.string_at(storage, int(length))[
+                        FILE_RENAME_INFORMATION.FileName.offset :
+                    ],
+                )
+            )
+            ctypes.cast(
+                io_status_pointer,
+                ctypes.POINTER(IO_STATUS_BLOCK),
+            ).contents.Status = 0
+            return 0
+
+        self.api.NtSetInformationFile = rename
+        for replace_if_exists in (False, True):
+            self.api.rename_file_same_parent(
+                41,
+                "destination.bin",
+                replace_if_exists=replace_if_exists,
+            )
+
+        encoded = "destination.bin".encode("utf-16-le")
+        exact_length = FILE_RENAME_INFORMATION.FileName.offset + len(encoded)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    41,
+                    False,
+                    None,
+                    exact_length,
+                    api_module.FILE_RENAME_INFORMATION_CLASS,
+                    encoded,
+                ),
+                (
+                    41,
+                    True,
+                    None,
+                    exact_length,
+                    api_module.FILE_RENAME_INFORMATION_CLASS,
+                    encoded,
+                ),
+            ],
+        )
+
+    def test_native_rename_rejects_non_component_names_before_call(self) -> None:
+        self.api.NtSetInformationFile = mock.Mock()
+        for component in (
+            "nested\\destination.bin",
+            "nested/destination.bin",
+            r"C:\destination.bin",
+            "destination.bin:stream",
+        ):
+            with self.subTest(component=component), self.assertRaises(ValueError):
+                self.api.rename_file_same_parent(
+                    41,
+                    component,
+                    replace_if_exists=False,
+                )
+        self.api.NtSetInformationFile.assert_not_called()
+
+    def test_ntstatus_from_return_and_io_status_block_is_not_last_error(self) -> None:
+        def failed_return(*args: object) -> int:
+            del args
+            return ctypes.c_int32(0xC000000D).value
+
+        self.api.NtSetInformationFile = failed_return
+        with self.assertRaises(NtStatusError) as caught:
+            self.api.rename_file_same_parent(
+                41,
+                "destination.bin",
+                replace_if_exists=False,
+            )
+        self.assertEqual(caught.exception.function, "NtSetInformationFile")
+        self.assertEqual(caught.exception.ntstatus, 0xC000000D)
+
+        def failed_io_status(
+            raw_handle: int,
+            io_status_pointer: object,
+            storage: object,
+            length: int,
+            information_class: int,
+        ) -> int:
+            del raw_handle, storage, length, information_class
+            ctypes.cast(
+                io_status_pointer,
+                ctypes.POINTER(IO_STATUS_BLOCK),
+            ).contents.Status = ctypes.c_int32(0xC000000D).value
+            return 0
+
+        self.api.NtSetInformationFile = failed_io_status
+        with self.assertRaises(NtStatusError) as caught:
+            self.api.rename_file_same_parent(
+                41,
+                "destination.bin",
+                replace_if_exists=False,
+            )
+        self.assertEqual(
+            caught.exception.function,
+            "NtSetInformationFile.IO_STATUS_BLOCK",
+        )
+        self.assertEqual(caught.exception.ntstatus, 0xC000000D)
 
 
 class Win32CheckedConversionTests(unittest.TestCase):

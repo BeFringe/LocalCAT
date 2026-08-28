@@ -137,16 +137,19 @@
 - **Sources Consulted**:
   - [SetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle)
   - [FILE_RENAME_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
+  - [NtSetInformationFile](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetinformationfile)
+  - [MS-FSA FileRenameInformation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa)
   - [ReplaceFileW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
   - [FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
 - **Findings**:
-  - `FILE_RENAME_INFO.RootDirectory` 允许目标相对一个 directory handle 解析；源是已打开 candidate handle，因此比再次按源 pathname 打开更适合身份绑定发布。
+  - 实机Win11反例表明，`SetFileInformationByHandle(FileRenameInfo[Ex])`无法在retained parent `share=READ`下完成同目录handle-bound命名：完整路径返回sharing violation，`RootDirectory=parent`+basename返回invalid parameter，`RootDirectory=NULL`+basename则按CWD解释。
+  - `NtSetInformationFile(FileRenameInformation)`在`RootDirectory=NULL`且名称为不含separator的单一组件时，按MS-FSA直接使用candidate open的`Open.Link.ParentFile`；实机在parent仍为`share=READ`时成功，rename后candidate handle identity与readback继续有效。该路径不需要扩大root/ancestor share，也不经过CWD或重新打开source pathname。
   - `ReplaceFileW` 能替换并保留一部分属性，但其 replacement 打开方式无 share mode，且失败码可能留下多种命名状态；它适合作为比较/回退研究，不应在未建 recovery 分类时直接替换 POSIX `os.replace`。
   - `FlushFileBuffers` 只明确保证指定 file handle 的 buffered data 被写出。`FILE_FLAG_WRITE_THROUGH` 文档说明 NTFS 会及时 flush 由操作引起的 metadata（包括 rename），但 `REPLACEFILE_WRITE_THROUGH` 明确“不支持”。
   - candidate 以 share=none 打开时，rename 后仍持有该 handle 会阻止同进程 reopen destination；正确生命周期必须是 rename、capture final facts、close candidate、再 reopen/readback。
   - commit 前关闭的 target snapshot 不是 expected-target 原子 CAS；不合作进程可在 snapshot 与 rename 之间替换目标。平台层只能提供 create-if-absent 或 owner 持排他资源锁时的 replace facts。
 - **Implications**:
-  - 建议以 `CREATE_NEW` candidate handle + file flush + `SetFileInformationByHandle(FileRenameInfo[Ex], RootDirectory=bound parent)` 作为首选原子发布探针。
+  - 同父目录发布采用`CREATE_NEW` candidate handle + file flush + `NtSetInformationFile(FileRenameInformation, RootDirectory=NULL, FileName=validated basename)`；调用前重验candidate的live parent chain与bound parent完全相同。固定结构布局/精确长度/information class/NTSTATUS映射并做arm前self-probe；不可用时零命名mutation返回`DURABILITY_UNAVAILABLE`，禁止CWD、完整路径、Win32 wrapper或跨父目录fallback。
   - ADR-025已经定义普通产品的命名success boundary：在local fixed NTFS上以`WRITE_THROUGH`、`FlushFileBuffers`、handle-bound naming、candidate close、retained readback、owner commit与terminal reproof闭合`WindowsDocumentedPublishV1`。process termination、instruction fault、应用重启与正常OS reboot验证协议恢复；它们不宣称forced-power-loss硬件认证，后者若成为产品需求须另立Spec/ADR。
 
 ### Windows 跨进程锁
@@ -286,7 +289,7 @@ W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-a
 ## Risks & Mitigations
 - **Windows share mask 自阻塞** — 为 root/intermediate/source/target/candidate/lock 定义不同 handle profiles；运行占用目标、同进程二次打开和跨进程 replace 矩阵。
 - **路径/publish proof 只在受支持NTFS成立** — 探测local fixed volume、FileId/reparse/ACL与documented flush/write-through/naming capabilities；首版只在完整前置通过的NTFS启用，其余fail closed。
-- **`SetFileInformationByHandle` failure residue** — candidate identity、journal phase、readback 和 LKG recovery 共同分类；每个 API failure point 注入测试。
+- **native same-parent naming failure residue** — candidate identity、journal phase、readback 和 LKG recovery 共同分类；固定`NtSetInformationFile` ABI/NTSTATUS映射并对每个 API failure point注入测试，不回退到路径式rename。
 - **pre-snapshot 被误当 CAS** — 仅允许 create-if-absent 或 resource lease 下 replace；记录不合作 writer threat scope，加入 instruction-boundary swap；需要强 CAS 的 owner 使用 immutable generation+journal/pointer。
 - **FileId reuse 被误当永久身份** — FileId 只比较 live handles；receipt 绑定 digest/phase/private/device-secret并在重启后重新证明，覆盖 delete/recreate reuse。
 - **协议恢复被误当硬件掉电认证** — `WindowsDocumentedPublishV1`以instruction fault、process termination、应用重启与正常OS reboot验证old/new/recovery-only；明确不宣称forced-power-loss存活，未来硬件认证必须独立治理。
@@ -303,7 +306,7 @@ W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-a
 - [Microsoft FILE_ID_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info) — Windows handle identity。
 - [Microsoft GetFinalPathNameByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew) — final resolved path evidence。
 - [Microsoft LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex) — cross-process lock/crash release。
-- [Microsoft SetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle) 与 [FILE_RENAME_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info) — handle-bound rename relative to directory handle。
+- [Microsoft NtSetInformationFile](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetinformationfile) 与 [MS-FSA FileRenameInformation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa) — candidate live parent上的同目录native rename语义；[SetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle) 与 [FILE_RENAME_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info) 仅作为已证伪的Win32 wrapper对照。
 - [Microsoft FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers) — file buffer flush boundary。
 - [Microsoft File Security](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights) — owner/DACL model。
 - [Python 3.14 `os`](https://docs.python.org/3/library/os.html) — platform availability and Windows permission limitations。
