@@ -5,11 +5,9 @@ from __future__ import annotations
 from dataclasses import fields, replace
 import hashlib
 import json
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
 
 from collaborative_chunk_contracts import (
     AssigneeRef,
@@ -53,6 +51,7 @@ from project_workspace_intake import (
     SelectedProjectDocumentsRequest,
     stage_selected_project_documents,
 )
+from platform_fs import compose_platform_file_backend
 
 
 _SOURCE_SENTINELS = (
@@ -124,6 +123,7 @@ def _write_document(root: Path, name: str, prefix: str) -> Path:
 class _RealPackageHarness:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.store_fault_phase = None
         first = _write_document(root, "alpha.json", "ALPHA")
         second = _write_document(root, "beta.json", "BETA")
         staged = stage_selected_project_documents(
@@ -188,6 +188,7 @@ class _RealPackageHarness:
         }
         self.metadata_root = root / "chunk-metadata"
         self.metadata_root.mkdir()
+        self.platform_backend = compose_platform_file_backend(self.metadata_root)
         self.manager = LocalReferenceManagerHandle("local", "acceptance-manager")
         self.chunk_issuer = _Issuer("chunk", 1)
         self.plan_issuer = _Issuer("plan", 100)
@@ -215,7 +216,13 @@ class _RealPackageHarness:
             self.metadata_root,
             filename,
             project_id=self.workspace.project_id,
+            platform_backend=self.platform_backend,
+            _fault_injector=self._store_fault,
         )
+
+    def _store_fault(self, phase: str) -> None:
+        if phase == self.store_fault_phase:
+            raise OSError("injected Chunk owner fault")
 
     def universe(self) -> ChunkWorkspaceUniverseProjection:
         return ChunkWorkspaceUniverseProjection(self.binding, self.entries)
@@ -841,14 +848,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                 name="first",
                 members=(harness.entries[0].segment,),
             )
-            real_replace = os.replace
-
-            def fail_before_target(src, dst, *args, **kwargs):
-                if dst == "first.json":
-                    raise OSError("before target")
-                return real_replace(src, dst, *args, **kwargs)
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_before_target):
+            harness.store_fault_phase = "target_before_publish"
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: topology.apply_topology(
@@ -859,6 +860,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                         expected_plan_binding=expected,
                     ),
                 )
+            finally:
+                harness.store_fault_phase = None
             report = harness.store("first.json").recover()
             self.assertIsNone(report.state)
             self.assertIsNone(harness.store("first.json").load())
@@ -876,17 +879,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                 name="forward",
                 members=(harness.entries[1].segment,),
             )
-            raised = False
-
-            def fail_after_target(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "forward.json" and not raised:
-                    raised = True
-                    raise OSError("after target")
-                return result
-
-            with patch("collaborative_chunk_store.os.replace", side_effect=fail_after_target):
+            harness.store_fault_phase = "target_after_publish"
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: topology.apply_topology(
@@ -897,6 +891,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                         expected_plan_binding=expected,
                     ),
                 )
+            finally:
+                harness.store_fault_phase = None
             report = harness.store("forward.json").recover()
             self.assertEqual(report.outcome, "rolled_forward")
             assert report.state is not None
@@ -942,20 +938,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                 chunk_id=old_id,
                 name="new",
             )
-            raised = False
-
-            def fail_after_rollback_target(src, dst, *args, **kwargs):
-                nonlocal raised
-                result = real_replace(src, dst, *args, **kwargs)
-                if dst == "rollback.json" and not raised:
-                    raised = True
-                    raise OSError("after target")
-                return result
-
-            with patch(
-                "collaborative_chunk_store.os.replace",
-                side_effect=fail_after_rollback_target,
-            ):
+            harness.store_fault_phase = "target_after_publish"
+            try:
                 self.assert_error(
                     "CHUNK.RECOVERY_REQUIRED",
                     lambda: topology.apply_topology(
@@ -966,6 +950,8 @@ class CollaborativeChunkCluster1AcceptanceTests(unittest.TestCase):
                         expected_plan_binding=expected,
                     ),
                 )
+            finally:
+                harness.store_fault_phase = None
             (harness.metadata_root / "rollback.json").write_bytes(b"unproven")
             report = harness.store("rollback.json").recover()
             self.assertEqual(report.outcome, "rolled_back")

@@ -31,6 +31,7 @@ from collaborative_chunk_store import (
 from collaborative_chunks import ChunkTopologyPublicationAuthority
 from project_workspace_contracts import SourcePresence
 from project_workspace_identity import issue_project_id
+from platform_fs import compose_platform_file_backend
 
 
 class _Issuer:
@@ -93,6 +94,7 @@ class CollaborativeChunkCluster3ConflictUndoTests(unittest.TestCase):
                 root,
                 "chunks.json",
                 project_id=self.project_id,
+                platform_backend=compose_platform_file_backend(root),
             ),
         )
         topology = authority.create_topology_service(
@@ -183,6 +185,7 @@ class CollaborativeChunkCluster3ConflictUndoTests(unittest.TestCase):
             root,
             "chunks.json",
             project_id=self.project_id,
+            platform_backend=compose_platform_file_backend(root),
         )
         store.publish(self.common, expected_metadata_digest=None)
         return self._authority(root, seed)

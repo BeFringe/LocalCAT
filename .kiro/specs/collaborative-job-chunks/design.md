@@ -94,6 +94,8 @@ Qt                                   (opaque transfer only)
 - **Composition**：`collaborative_chunk_store.py` 的业务 import graph 不得顶层导入 `fcntl`；POSIX/Windows adapter 由 composition root 注入，同一 store protocol 服务 source 与 frozen startup。
 - **Lock/publish**：Windows persistent lock artifact使用W1 exact ACL与无owner token/FileId的可重算payload；首次`CREATE_NEW` share-none初始化、two-creator与creator-crash仅允许empty/strict-prefix/full exact接管，unknown bytes fail closed，完成后必须重开普通`LOCK` profile再取得`LockFileEx` lease。candidate保持打开完成flush与journal/LKG arm后handle-relative publish，再capture final facts、close all candidate handles、retained readback、owner durable commit与terminal reproof后才报告成功。
 - **Verification**：two creator、creator crash、双进程竞争、`TerminateProcess`、candidate/readback/journal/LKG 每个 fault phase 和重新启动均进入稳定结果；无 cooperative lease 的外部 swap 只可 fail closed/recovery-required。
+- **Source delivery staging**：`1.3a`、`1.4a`、`3.2a` 只依赖已批准的 Windows platform lock/publish/composition 能力，闭合独立 metadata 与 source startup，可先形成并合入第一份 owner commit；它不打开、保存或验证 ProjectPackage。`4.4a`、`4.5a` 是后继 package-coupled 阶段，依赖 `multi-document-project-workspace` 的 Windows tasks `2.8a`、`4.4a`，在平台 C5S 使用真实 ProjectPackage public business API/bytes 完成最终 source 复验。
+- **Completion boundary**：第一阶段的 import、lock、publish 与 crash matrix 只证明 Windows source startup 和独立 metadata authority；WA-02 source owner 最终 PASS 仍要求第二阶段。两阶段可形成有序 owner commits，但不得以 mock、私有 ZIP/manifest 构造、fixture-only workspace 或 skip 填补中间依赖；frozen `1.4b`、`4.5b` 保持独立后置门。
 
 ## Critical Path 与验证锚点
 
@@ -109,6 +111,14 @@ Chunk C1/C2 complete ─────────────┘
 
 Multi-Document C4 complete + Chunk C3 complete
   → Chunk C4 Qt/current-source acceptance
+
+Windows platform C3B complete
+  → WA-02 independent metadata/source startup (1.3a, 1.4a, 3.2a)
+    → first WA-02 owner commit may merge before WA-03
+
+Multi-Document Windows ProjectPackage (2.8a, 4.4a) complete in C5S
+  → WA-02 package-coupled source acceptance (4.4a, 4.5a)
+    → final WA-02 source owner PASS
 ```
 
 隐性依赖：
@@ -117,6 +127,7 @@ Multi-Document C4 complete + Chunk C3 complete
 2. Chunk metadata 冷重开需要 C2C 的真实 ProjectPackage 先冷开并建立 current Segment Universe；不能用自建扁平 fixture 代替。
 3. `current_chunk` 搜索必须消费 Multi-Document C3 的 composite hit identity 和 matcher seam，不得对当前单 `EditorProject` search 另建并行权威。
 4. Qt 只读验收必须证明 Controller 的 mutation API 也拒绝越界写；只看到 disabled widget 不算通过。
+5. WA-02 第一阶段不依赖 ProjectPackage Windows path/publish owner；一旦验收要求打开真实 package、比较 package bytes 或运行 package-coupled Qt journey，就必须等待 `multi-document-project-workspace` `2.8a`、`4.4a`，不得由 Chunk 自造 ZIP 或 workspace fixture 代答。
 
 | Cluster | 验证目标 | 必要前置能力 |
 |---|---|---|
@@ -687,6 +698,12 @@ public error/report/log 只允许 stable code、opaque project/plan/chunk/segmen
 - 用真实双 Document ProjectPackage + 真实 local chunk metadata 冷重开验收跨文档连续/离散分工。
 - 完成键盘/窄宽布局、越界只读、stale/conflict/fault 和无 active plan 兼容验收。
 - 在 final roots 重签 current-source evidence，只同步真实落地的 Steering 事实。
+
+### WA-02 Windows Source 两阶段交付
+
+- 第一份 owner commit 收束 `1.3a`、`1.4a`、`3.2a`：业务 store 只消费共享平台端口，Windows source Qt composition 可启动，独立 metadata 的 two-creator、lock/publish、process kill 与 journal/LKG recovery 可重放。该提交可先于 WA-03 合入，但不改变 C4 的真实 ProjectPackage 完成门。
+- 第二份 owner commit 收束 `4.4a`、`4.5a`：在平台 C5S、且 Multi-Document `2.8a`、`4.4a` 已通过后，使用真实 ProjectPackage public business API/bytes 重放 package-coupled journey，并给出 WA-02 source owner 最终 PASS。
+- 两份提交之间保持明确的未完成状态；第一阶段证据不得被累计 reviewer 解释为 package-coupled 或 frozen completion，第二阶段不得借用 mock、私有 carrier 构造、fixture-only workspace 或 skip。
 
 ## 验证设计
 
