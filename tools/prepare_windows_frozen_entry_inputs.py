@@ -1050,9 +1050,6 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
                 "ucrt_libraries": _directory_input_fact(
                     sdk_lib / "ucrt/x64", "Windows SDK UCRT x64 libraries"
                 ),
-                "catalogs": _directory_input_fact(
-                    sdk_root / "Catalogs", "Windows SDK package catalogs"
-                ),
             },
         },
         "runtime": {
