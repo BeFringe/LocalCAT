@@ -99,12 +99,21 @@ class _Regular(BoundRegularFile):
     def __init__(self, payload: bytes = b"payload") -> None:
         super().__init__()
         self.payload = payload
+        self.read_at_calls: list[tuple[int, int, EntrySnapshot]] = []
 
     def _close_authority(self) -> None:
         pass
 
-    def _read_all(self) -> bytes:
-        return self.payload
+    def _read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected: EntrySnapshot,
+    ) -> bytes:
+        if expected != self._snapshot():
+            raise AssertionError("unexpected snapshot")
+        self.read_at_calls.append((offset, maximum_bytes, expected))
+        return self.payload[offset : offset + maximum_bytes]
 
     def _identity(self) -> FileObjectIdentity:
         return _identity()
@@ -832,6 +841,7 @@ class PlatformFileErrorContractTests(unittest.TestCase):
     def test_error_family_codes_and_retryability_are_stable_and_body_free(self) -> None:
         fixed = {
             PlatformFileErrorCode.CAPABILITY_UNAVAILABLE: False,
+            PlatformFileErrorCode.ENTRY_UNAVAILABLE: False,
             PlatformFileErrorCode.OUTSIDE_ROOT: False,
             PlatformFileErrorCode.REPARSE_REJECTED: False,
             PlatformFileErrorCode.IDENTITY_STALE: True,
@@ -888,6 +898,94 @@ class PlatformFileErrorContractTests(unittest.TestCase):
 
 
 class PlatformFileAuthorityContractTests(unittest.TestCase):
+    def test_regular_bounded_read_validates_shape_and_preserves_eof(self) -> None:
+        regular = _Regular(b"0123456789")
+        expected = regular.snapshot()
+        self.assertEqual(regular.read_at(2, 4, expected), b"2345")
+        self.assertEqual(regular.read_at(8, 4, expected), b"89")
+        self.assertEqual(regular.read_at(10, 1, expected), b"")
+        with self.assertRaises(ValueError):
+            regular.read_at(20, 1, expected)
+
+        for offset, maximum_bytes in (
+            (-1, 1),
+            (0, 0),
+            (0, -1),
+            (0, 64 * 1024 + 1),
+        ):
+            with self.subTest(offset=offset, maximum_bytes=maximum_bytes):
+                with self.assertRaises(ValueError):
+                    regular.read_at(offset, maximum_bytes, expected)
+        for offset, maximum_bytes in (
+            (True, 1),
+            ("0", 1),
+            (0, True),
+            (0, "1"),
+        ):
+            with self.subTest(offset=offset, maximum_bytes=maximum_bytes):
+                with self.assertRaises(TypeError):
+                    regular.read_at(
+                        offset,
+                        maximum_bytes,
+                        expected,
+                    )  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            regular.read_at(0, 1, object())  # type: ignore[arg-type]
+
+        class WrongType(_Regular):
+            def _read_at(
+                self,
+                offset: int,
+                maximum_bytes: int,
+                expected: EntrySnapshot,
+            ) -> bytes:
+                del offset, maximum_bytes, expected
+                return bytearray(b"x")  # type: ignore[return-value]
+
+        class TooLong(_Regular):
+            def _read_at(
+                self,
+                offset: int,
+                maximum_bytes: int,
+                expected: EntrySnapshot,
+            ) -> bytes:
+                del offset, expected
+                return b"x" * (maximum_bytes + 1)
+
+        class TooShort(_Regular):
+            def _read_at(
+                self,
+                offset: int,
+                maximum_bytes: int,
+                expected: EntrySnapshot,
+            ) -> bytes:
+                del offset, maximum_bytes, expected
+                return b""
+
+        with self.assertRaises(TypeError):
+            wrong = WrongType()
+            wrong.read_at(0, 1, wrong.snapshot())
+        with self.assertRaises(ValueError):
+            too_long = TooLong()
+            too_long.read_at(0, 1, too_long.snapshot())
+        with self.assertRaises(ValueError):
+            too_short = TooShort()
+            too_short.read_at(0, 1, too_short.snapshot())
+
+    def test_regular_read_all_uses_one_bounded_baseline_and_exact_eof_probe(self) -> None:
+        payload = b"x" * (64 * 1024 + 17)
+        regular = _Regular(payload)
+        expected = regular.snapshot()
+
+        self.assertEqual(regular.read_all(), payload)
+        self.assertEqual(
+            [(offset, maximum) for offset, maximum, _snapshot in regular.read_at_calls],
+            [(0, 64 * 1024), (64 * 1024, 17), (len(payload), 1)],
+        )
+        self.assertTrue(
+            all(snapshot == expected for _offset, _maximum, snapshot in regular.read_at_calls)
+        )
+
     def test_persistent_private_proof_port_validates_and_mints_only_values(self) -> None:
         service = _PersistentPrivateService()
         secret_file = _Regular(b"s" * DEVICE_SECRET_SIZE_BYTES)
@@ -1365,10 +1463,19 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
 
     def test_regular_candidate_and_pending_methods_fail_after_close(self) -> None:
         regular = _Regular()
+        regular_snapshot = regular.snapshot()
         candidate = _Candidate()
         pending = _Pending(PublishMode.CREATE_IF_ABSENT)
         for authority, operations in (
-            (regular, (regular.read_all, regular.identity, regular.snapshot)),
+            (
+                regular,
+                (
+                    lambda: regular.read_at(0, 1, regular_snapshot),
+                    regular.read_all,
+                    regular.identity,
+                    regular.snapshot,
+                ),
+            ),
             (candidate, (lambda: candidate.write_all(b"x"), candidate.flush_content, candidate.identity)),
             (
                 pending,

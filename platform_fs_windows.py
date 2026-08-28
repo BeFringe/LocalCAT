@@ -14,6 +14,7 @@ import hmac
 from pathlib import Path, PurePath
 import struct
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -200,6 +201,13 @@ class WindowsHostFacts:
 def _capability_unavailable() -> PlatformFileError:
     return PlatformFileError(
         PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+        retryable=False,
+    )
+
+
+def _entry_unavailable() -> PlatformFileError:
+    return PlatformFileError(
+        PlatformFileErrorCode.ENTRY_UNAVAILABLE,
         retryable=False,
     )
 
@@ -631,6 +639,7 @@ def _capture_handle_proof(
     expected_final_path: str | None,
     expected_kind: str | None,
     stale: bool,
+    reject_wrong_kind: bool = False,
 ) -> _WindowsHandleProof:
     try:
         standard = FILE_STANDARD_INFO()
@@ -664,6 +673,8 @@ def _capture_handle_proof(
     ):
         raise _proof_failure(stale=stale)
     if expected_kind is not None and kind != expected_kind:
+        if reject_wrong_kind:
+            raise _reparse_rejected()
         raise _proof_failure(stale=stale)
     if expected_final_path is not None and final_path != expected_final_path:
         raise _proof_failure(stale=stale) if stale else _outside_root()
@@ -828,6 +839,8 @@ def _open_entry_proof(
     expected_volume_id: bytes,
     stale: bool,
     allow_missing: bool = False,
+    entry_unavailable: bool = False,
+    reject_wrong_kind: bool = False,
 ) -> _WindowsHandleProof | None:
     handle = None
     try:
@@ -845,6 +858,7 @@ def _open_entry_proof(
                 expected_final_path=expected_final_path,
                 expected_kind=expected_kind,
                 stale=stale,
+                reject_wrong_kind=reject_wrong_kind,
             )
             _require_volume(proof.identity, expected_volume_id, stale=stale)
             return proof
@@ -853,6 +867,12 @@ def _open_entry_proof(
     except Win32CallError as error:
         if allow_missing and error.winerror in {ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND}:
             return None
+        if entry_unavailable and error.winerror in {
+            ERROR_FILE_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND,
+            ERROR_ACCESS_DENIED,
+        }:
+            raise _entry_unavailable() from None
         raise _proof_failure(stale=stale) from None
     finally:
         if handle is not None:
@@ -2498,6 +2518,7 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         "_entry_identity",
         "_maximum_component_units",
         "_fault_injector",
+        "_read_lock",
     )
 
     def __init__(
@@ -2518,6 +2539,7 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         self._entry_identity = entry_identity
         self._maximum_component_units = maximum_component_units
         self._fault_injector = fault_injector
+        self._read_lock = threading.Lock()
         try:
             self._reprove()
         except BaseException:
@@ -2564,14 +2586,33 @@ class _WindowsBoundRegularFile(BoundRegularFile):
             raise _identity_stale()
         return proof
 
-    def _read_all(self) -> bytes:
+    def _read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected_snapshot: EntrySnapshot,
+    ) -> bytes:
+        with self._read_lock:
+            return self._read_at_locked(offset, maximum_bytes, expected_snapshot)
+
+    def _read_at_locked(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected_snapshot: EntrySnapshot,
+    ) -> bytes:
         try:
             before = self._reprove().snapshot
+            if before != expected_snapshot:
+                raise _identity_stale()
+            expected_count = min(
+                maximum_bytes,
+                max(0, expected_snapshot.byte_count - offset),
+            )
             _hit_fault(self._fault_injector, "windows_before_body_read")
-            chunks: list[bytes] = []
             with self._handle.borrow() as raw:
                 distance = LARGE_INTEGER()
-                distance.QuadPart = 0
+                distance.QuadPart = offset
                 self._api.checked_bool(
                     "SetFilePointerEx",
                     self._api.SetFilePointerEx,
@@ -2580,9 +2621,24 @@ class _WindowsBoundRegularFile(BoundRegularFile):
                     None,
                     FILE_BEGIN,
                 )
-                remaining = before.byte_count
-                while remaining:
-                    requested = min(_READ_CHUNK_BYTES, remaining)
+                chunks: list[bytes] = []
+                collected = 0
+                if expected_count == 0:
+                    eof_buffer = ctypes.create_string_buffer(1)
+                    eof_read = DWORD()
+                    self._api.checked_bool(
+                        "ReadFile",
+                        self._api.ReadFile,
+                        raw,
+                        eof_buffer,
+                        1,
+                        ctypes.byref(eof_read),
+                        None,
+                    )
+                    if int(eof_read.value) != 0:
+                        raise _identity_stale()
+                while collected < expected_count:
+                    requested = expected_count - collected
                     buffer = ctypes.create_string_buffer(requested)
                     read = DWORD()
                     self._api.checked_bool(
@@ -2598,24 +2654,11 @@ class _WindowsBoundRegularFile(BoundRegularFile):
                     if count < 1 or count > requested:
                         raise _identity_stale()
                     chunks.append(buffer.raw[:count])
-                    remaining -= count
-                eof_buffer = ctypes.create_string_buffer(1)
-                eof_read = DWORD()
-                self._api.checked_bool(
-                    "ReadFile",
-                    self._api.ReadFile,
-                    raw,
-                    eof_buffer,
-                    1,
-                    ctypes.byref(eof_read),
-                    None,
-                )
-                if int(eof_read.value) != 0:
-                    raise _identity_stale()
+                    collected += count
+                payload = b"".join(chunks)
             _hit_fault(self._fault_injector, "windows_after_body_read")
-            payload = b"".join(chunks)
             after = self._reprove().snapshot
-            if before != after or len(payload) != after.byte_count:
+            if after != expected_snapshot:
                 raise _identity_stale()
             return payload
         except PlatformFileError:
@@ -2914,7 +2957,7 @@ def _publish_facts_from_retained(
     mode: PublishMode,
 ) -> PublishFacts:
     try:
-        payload = retained._read_all()
+        payload = retained.read_all()
         identity = retained._identity()
         return PublishFacts(
             mode=mode,
@@ -3089,24 +3132,29 @@ class WindowsRootedFileSystem(RootedFileSystem):
                 expected_kind="regular",
                 expected_volume_id=records[0].identity.volume_id,
                 stale=False,
+                entry_unavailable=True,
+                reject_wrong_kind=True,
             )
             if probed is None:
-                raise _capability_unavailable()
+                raise _entry_unavailable()
             _hit_fault(self._fault_injector, "windows_after_entry_probe")
-            handle = root._api.open_handle(
-                entry_path,
-                desired_access=GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                share_mode=FILE_SHARE_READ,
-                creation_disposition=OPEN_EXISTING,
-                flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
-            )
+            try:
+                handle = root._api.open_handle(
+                    entry_path,
+                    desired_access=GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    share_mode=FILE_SHARE_READ,
+                    creation_disposition=OPEN_EXISTING,
+                    flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+                )
+            except Win32CallError:
+                raise _identity_stale() from None
             with handle.borrow() as raw:
                 source = _capture_handle_proof(
                     root._api,
                     raw,
                     expected_final_path=entry_path,
                     expected_kind="regular",
-                    stale=False,
+                    stale=True,
                 )
             if (
                 not _same_object(probed.identity, source.identity)
@@ -3116,7 +3164,7 @@ class WindowsRootedFileSystem(RootedFileSystem):
             _require_volume(
                 source.identity,
                 records[0].identity.volume_id,
-                stale=False,
+                stale=True,
             )
             transferred_records = records
             transferred_handle = handle

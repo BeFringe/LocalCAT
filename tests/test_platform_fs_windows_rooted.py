@@ -781,6 +781,216 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                 self.assertEqual(source.read_all(), self.payload)
                 self.assertGreaterEqual(source.identity().link_count, 2)
 
+    def test_bounded_read_uses_exact_offsets_and_only_shortens_at_eof(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            ) as source:
+                expected = source.snapshot()
+                self.assertEqual(
+                    source.read_at(0, 64 * 1024, expected),
+                    self.payload[: 64 * 1024],
+                )
+                self.assertEqual(
+                    source.read_at(64 * 1024, 64 * 1024, expected),
+                    self.payload[64 * 1024 :],
+                )
+                self.assertEqual(source.read_at(len(self.payload), 1, expected), b"")
+                with self.assertRaises(ValueError):
+                    source.read_at(len(self.payload) + 10, 1, expected)
+
+    def test_bounded_read_rejects_wrong_baseline_and_accumulates_partial_reads(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        expected = source.snapshot()
+        wrong = type(expected)(
+            identity=expected.identity,
+            byte_count=expected.byte_count + 1,
+            modified_token=expected.modified_token,
+            reparse_free=expected.reparse_free,
+        )
+        real_read = source._api.ReadFile
+
+        def partial_read(
+            handle: int,
+            buffer: object,
+            requested: int,
+            read: object,
+            overlapped: object,
+        ) -> int:
+            return real_read(handle, buffer, min(int(requested), 97), read, overlapped)
+
+        partial_calls = 0
+
+        def zero_mid_chunk(
+            handle: int,
+            buffer: object,
+            requested: int,
+            read: object,
+            overlapped: object,
+        ) -> int:
+            nonlocal partial_calls
+            partial_calls += 1
+            if partial_calls == 1:
+                return real_read(handle, buffer, min(int(requested), 97), read, overlapped)
+            read._obj.value = 0
+            return 1
+
+        try:
+            with mock.patch.object(
+                source._api,
+                "ReadFile",
+                wraps=source._api.ReadFile,
+            ) as read_file, self.assertRaises(PlatformFileError) as stale:
+                source.read_at(0, 1024, wrong)
+            _assert_platform_error(self, stale, PlatformFileErrorCode.IDENTITY_STALE)
+            read_file.assert_not_called()
+
+            with mock.patch.object(
+                source._api,
+                "ReadFile",
+                side_effect=partial_read,
+            ):
+                self.assertEqual(source.read_at(0, 1024, expected), self.payload[:1024])
+            with mock.patch.object(
+                source._api,
+                "ReadFile",
+                side_effect=zero_mid_chunk,
+            ), self.assertRaises(PlatformFileError) as zero:
+                source.read_at(0, 1024, expected)
+            _assert_platform_error(self, zero, PlatformFileErrorCode.IDENTITY_STALE)
+        finally:
+            source.close()
+
+    def test_bounded_read_serializes_seek_and_read_across_offsets(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        expected = source.snapshot()
+        first_at_seek = threading.Event()
+        release_first = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+        seek_calls = 0
+        results: dict[int, bytes] = {}
+        failures: list[BaseException] = []
+        real_seek = source._api.SetFilePointerEx
+        real_read = source._api.ReadFile
+
+        class GateLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._guard = threading.Lock()
+                self._acquire_calls = 0
+                self.first_acquired = threading.Event()
+                self.second_acquire_entered = threading.Event()
+
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                with self._guard:
+                    self._acquire_calls += 1
+                    current = self._acquire_calls
+                if current == 2:
+                    self.second_acquire_entered.set()
+                acquired = self._lock.acquire(*args, **kwargs)
+                if current == 1 and acquired:
+                    self.first_acquired.set()
+                return acquired
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def locked(self) -> bool:
+                return self._lock.locked()
+
+            def __enter__(self) -> GateLock:
+                self.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _traceback: object,
+            ) -> None:
+                self.release()
+
+        gate = GateLock()
+        source._read_lock = gate
+
+        def interleaved_seek(*args: object) -> int:
+            nonlocal active, maximum_active, seek_calls
+            result = real_seek(*args)
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                seek_calls += 1
+                current = seek_calls
+            if current == 1:
+                first_at_seek.set()
+                if not release_first.wait(5.0):
+                    raise AssertionError("second offset read did not attempt to interleave")
+            return result
+
+        def tracked_read(*args: object) -> int:
+            nonlocal active
+            try:
+                return real_read(*args)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        def read_offset(offset: int) -> None:
+            try:
+                results[offset] = source.read_at(offset, 257, expected)
+            except BaseException as error:
+                failures.append(error)
+
+        first = threading.Thread(target=read_offset, args=(0,))
+        second = threading.Thread(target=read_offset, args=(1000,))
+        try:
+            with mock.patch.object(
+                source._api,
+                "SetFilePointerEx",
+                side_effect=interleaved_seek,
+            ), mock.patch.object(
+                source._api,
+                "ReadFile",
+                side_effect=tracked_read,
+            ):
+                first.start()
+                self.assertTrue(first_at_seek.wait(5.0))
+                self.assertTrue(gate.first_acquired.is_set())
+                second.start()
+                self.assertTrue(gate.second_acquire_entered.wait(5.0))
+                self.assertTrue(gate.locked())
+                with state_lock:
+                    self.assertEqual(seek_calls, 1)
+                    self.assertEqual(active, 1)
+                release_first.set()
+                first.join(5.0)
+                second.join(5.0)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(maximum_active, 1)
+            self.assertEqual(results[0], self.payload[:257])
+            self.assertEqual(results[1000], self.payload[1000:1257])
+        finally:
+            release_first.set()
+            first.join(5.0)
+            second.join(5.0)
+            source.close()
+
     def test_source_and_ancestor_handles_block_replacement(self) -> None:
         replacement = self.nested / "replacement.txt"
         replacement.write_bytes(b"replacement")
@@ -918,23 +1128,93 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
     def test_missing_and_directory_source_are_body_free_failures(self) -> None:
         file_system = WindowsRootedFileSystem()
         with file_system.bind_root(self.root_path) as root:
-            with self.assertRaises(PlatformFileError) as missing:
-                file_system.open_regular(
-                    root,
-                    PureWindowsPath("NestedCase", "missing.txt"),
-                )
-            with self.assertRaises(PlatformFileError) as directory:
-                file_system.open_regular(root, PureWindowsPath("NestedCase"))
+            with mock.patch.object(
+                root._api,
+                "ReadFile",
+                wraps=root._api.ReadFile,
+            ) as read_file:
+                with self.assertRaises(PlatformFileError) as missing:
+                    file_system.open_regular(
+                        root,
+                        PureWindowsPath("NestedCase", "missing.txt"),
+                    )
+                with self.assertRaises(PlatformFileError) as directory:
+                    file_system.open_regular(root, PureWindowsPath("NestedCase"))
+            read_file.assert_not_called()
         _assert_platform_error(
             self,
             missing,
-            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            PlatformFileErrorCode.ENTRY_UNAVAILABLE,
         )
         _assert_platform_error(
             self,
             directory,
-            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            PlatformFileErrorCode.REPARSE_REJECTED,
         )
+
+    def test_initial_entry_access_denied_is_not_root_capability_failure(self) -> None:
+        denied = self.nested / "denied.txt"
+        denied.write_bytes(b"denied")
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            real_open = root._api.open_handle
+
+            def deny_entry(path: str, **kwargs: object) -> object:
+                if path.endswith("\\denied.txt"):
+                    raise platform_fs_windows.Win32CallError("CreateFileW", 5)
+                return real_open(path, **kwargs)
+
+            with mock.patch.object(
+                root._api,
+                "open_handle",
+                side_effect=deny_entry,
+            ), self.assertRaises(PlatformFileError) as caught:
+                file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "denied.txt"),
+                )
+        _assert_platform_error(self, caught, PlatformFileErrorCode.ENTRY_UNAVAILABLE)
+
+    def test_entry_disappearing_after_probe_is_identity_stale(self) -> None:
+        removed = False
+
+        def remove_after_probe(phase: str) -> None:
+            nonlocal removed
+            if phase == "windows_after_entry_probe":
+                self.source.unlink()
+                removed = True
+
+        file_system = WindowsRootedFileSystem(_fault_injector=remove_after_probe)
+        with file_system.bind_root(self.root_path) as root:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+        self.assertTrue(removed)
+        _assert_platform_error(self, caught, PlatformFileErrorCode.IDENTITY_STALE)
+
+    def test_entry_becoming_directory_after_probe_is_identity_stale(self) -> None:
+        swapped = False
+
+        def replace_with_directory(phase: str) -> None:
+            nonlocal swapped
+            if phase == "windows_after_entry_probe":
+                self.source.unlink()
+                self.source.mkdir()
+                swapped = True
+
+        file_system = WindowsRootedFileSystem(
+            _fault_injector=replace_with_directory,
+        )
+        with file_system.bind_root(self.root_path) as root:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+        self.assertTrue(swapped)
+        _assert_platform_error(self, caught, PlatformFileErrorCode.IDENTITY_STALE)
 
     def test_junction_component_is_rejected_without_reading_target(self) -> None:
         outside = self.container / "Outside"

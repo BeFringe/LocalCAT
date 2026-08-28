@@ -220,10 +220,16 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
         bound = self.adapter.open_regular(root, PurePosixPath("data/source.txt"))
         root.close()
 
+        expected = bound.snapshot()
+        self.assertEqual(bound.read_at(0, 6, expected), b"sealed")
+        self.assertEqual(bound.read_at(7, 64 * 1024, expected), b"source")
+        self.assertEqual(bound.read_at(len(b"sealed source"), 1, expected), b"")
         self.assertEqual(bound.read_all(), b"sealed source")
         self.assertEqual(bound.identity().platform, "posix")
         self.assertEqual(bound.snapshot().byte_count, len(b"sealed source"))
         bound.close()
+        with self.assertRaises(PlatformFileError):
+            bound.read_at(0, 1, expected)
         with self.assertRaises(PlatformFileError):
             bound.read_all()
 
@@ -235,6 +241,76 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
                     PurePosixPath("data/source-link.txt"),
                 )
         self.assertEqual(caught.exception.code, "PLATFORM.FS.REPARSE_REJECTED")
+
+    def test_bounded_read_rejects_wrong_baseline_and_short_or_zero_pread(self) -> None:
+        import platform_fs_posix
+
+        source = self.root_path / "data" / "source.txt"
+        source.write_bytes(b"sealed source")
+        with self.adapter.bind_root(self.root_path) as root:
+            bound = self.adapter.open_regular(root, PurePosixPath("data/source.txt"))
+        expected = bound.snapshot()
+        wrong = type(expected)(
+            identity=expected.identity,
+            byte_count=expected.byte_count + 1,
+            modified_token=expected.modified_token,
+            reparse_free=expected.reparse_free,
+        )
+        real_pread = platform_fs_posix.os.pread
+        try:
+            with mock.patch.object(
+                platform_fs_posix.os,
+                "pread",
+                wraps=real_pread,
+            ) as pread, self.assertRaises(PlatformFileError) as stale:
+                bound.read_at(0, 6, wrong)
+            self.assertEqual(stale.exception.code, PlatformFileErrorCode.IDENTITY_STALE.value)
+            pread.assert_not_called()
+
+            for injected in (b"sea", b""):
+                with self.subTest(injected=injected), mock.patch.object(
+                    platform_fs_posix.os,
+                    "pread",
+                    return_value=injected,
+                ), self.assertRaises(PlatformFileError) as short:
+                    bound.read_at(0, 6, expected)
+                self.assertEqual(
+                    short.exception.code,
+                    PlatformFileErrorCode.IDENTITY_STALE.value,
+                )
+        finally:
+            bound.close()
+
+    def test_final_entry_missing_and_access_denied_are_entry_unavailable(self) -> None:
+        import platform_fs_posix
+
+        denied = self.root_path / "data" / "denied.txt"
+        denied.write_bytes(b"denied")
+        with self.adapter.bind_root(self.root_path) as root:
+            with self.assertRaises(PlatformFileError) as missing:
+                self.adapter.open_regular(root, PurePosixPath("data/missing.txt"))
+            self.assertEqual(
+                missing.exception.code,
+                PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+            )
+
+            real_open = platform_fs_posix.os.open
+
+            def deny_final(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                if path == "denied.txt":
+                    raise PermissionError(errno.EACCES, "denied")
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                platform_fs_posix.os,
+                "open",
+                side_effect=deny_final,
+            ), self.assertRaises(PlatformFileError) as denied_error:
+                self.adapter.open_regular(root, PurePosixPath("data/denied.txt"))
+            self.assertEqual(
+                denied_error.exception.code,
+                PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+            )
 
     def test_retained_file_rejects_ancestor_move_and_replacement(self) -> None:
         nested = self.root_path / "data" / "nested"
