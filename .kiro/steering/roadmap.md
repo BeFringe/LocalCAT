@@ -65,7 +65,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
 - **Now — Windows Platform Enablement governance**:
-  - ADR-020/021/022 已采纳，批准 `windows-platform-enablement` 只拥有共享平台 contracts/backends、Windows private-proof 物理表示、frozen bootstrap/build composition、amendment ledger 与 release evidence；
+  - ADR-020～025 已采纳，批准 `windows-platform-enablement` 只拥有共享平台 contracts/backends、Windows private-proof 物理表示、frozen bootstrap/build composition、amendment ledger 与 release evidence；ADR-024移除身份提供方强制环境，ADR-025以documented publish替代runtime硬件掉电profile；
   - Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI 与 Qt 继续拥有各自业务不变量，并只通过 owning branch amendment 接入；`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`；
   - Qt speaker avatar 只作为 Windows catalog 索引/解码与无匹配 fallback 回归，不改变资源语义、ignore 规则或打包 ownership；
   - Task 0 governance/design gate 闭合前不进入 runtime，最终平台线只集成一次。
@@ -78,6 +78,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - RPY 闭合后的可选跨端同步插件；
   - 特殊的多 Sheet workbook 与 XLIFF codec；
   - TMX context profile 和未来 TM Resource Editor。
+  - 若产品需要明确的突然断电存活声明，另立Windows硬件耐久资格Spec/ADR与实验室支持矩阵；不反向阻断普通source或EXE。
 - **Out of the two active lanes**:
   - 机器翻译、云端、账号、多人协作、Docker 部署和共享资源；
   - 无确认批量改写、语义向量和在线模型；
@@ -126,7 +127,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
-- [ ] `windows-platform-enablement` -- ADR-020/021/022 约束的共享平台 contracts/backends、Windows frozen bootstrap/build、consumer amendment ledger 与 source/packaged release matrix；只集成一次，不拥有相邻业务语义。Dependencies: approved ADR-020/021/022, approved owning scope, required WA-01～08 owner amendments
+- [ ] `windows-platform-enablement` -- ADR-020～025 约束的共享平台 contracts/backends、Windows frozen bootstrap/build、consumer amendment ledger 与 source/packaged release matrix；只集成一次，不拥有相邻业务语义。Dependencies: approved ADR-020～025, approved owning scope, required WA-01～08 owner amendments
 - [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [ ] `qt-editor-json-mvp-increment` -- 单 JSON 的 speaker、基础搜索/预处理/术语 CRUD 与第二阶段选项入口。Dependencies: `qt-editor-mvp`
 - [ ] `tm-storage-retrieval-index` -- SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher 和 exact/context/fuzzy。Dependencies: current exact/JSONL behavior baseline

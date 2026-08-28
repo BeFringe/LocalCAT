@@ -27,6 +27,8 @@
 - ADR-020 规定 Parser/Chunk/Project/Resource/TMX/TM 只消费 backend-neutral rooted authority、lock、bound publisher 与 opaque live identity；POSIX/Win32 primitive 只能存在于 `windows-platform-enablement` 拥有的平台 adapters/composition，不能散落进业务 owner。
 - ADR-021 只批准 Windows private-storage 的 SID/DACL/AccessCheck 与 `WindowsPrivateProof` 物理表示；Gate D/canonical envelope、generation、journal/LKG 与业务 recovery 继续归原 owner。
 - ADR-022 规定 Windows frozen 发行由单一 bootstrap/build authority 维护完整 Boot TCB、retained-handle exact-byte source loader、真实 `.py`/fixture closure 与 content-addressed onedir release evidence；CapabilityHost/Qt 不得从 frozen boolean、路径或旁置源码反向铸造能力。
+- ADR-024规定Windows private主体只按process-primary token、canonical `TokenUser` SID与ACL/MIC实际结果证明；local/domain/Entra来源不进入runtime或mandatory环境矩阵。
+- ADR-025规定普通Windows发布按local NTFS、flush/write-through、handle-bound命名、retained readback与owner recovery闭合；storage硬件profile/forced-power-loss属于未来可选资格，不阻断source或EXE发行。
 
 ## 运行环境与依赖
 
