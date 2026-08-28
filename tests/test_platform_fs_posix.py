@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from platform_fs_contracts import (
+    LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
     PlatformFileError,
@@ -121,6 +122,14 @@ class PosixAdapterStaticBoundaryTests(unittest.TestCase):
                 "mark_business_success",
             }
         )
+
+    def test_streaming_and_ledger_observation_remain_fd_bound(self) -> None:
+        source = ADAPTER_PATH.read_text(encoding="utf-8")
+        self.assertIn("os.scandir(self._directory_fd)", source)
+        self.assertIn("os.pwrite(", source)
+        self.assertIn("os.pread(", source)
+        self.assertNotIn("Path.iterdir", source)
+        self.assertNotIn("Path.glob", source)
 
     def test_flock_errno_mapping_executes_without_posix_host_import(self) -> None:
         def raising(error_number: int) -> object:
@@ -352,6 +361,144 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
                 self.assertFalse(hasattr(pending, "business_receipt"))
                 pending.close()
                 self.assertTrue(retained.closed)
+
+    def test_candidate_streams_ordered_bounded_chunks(self) -> None:
+        chunks = (b"a" * 65536, b"b" * 17, b"c" * 4096)
+        generated: list[int] = []
+
+        def stream() -> object:
+            for chunk in chunks:
+                generated.append(len(chunk))
+                yield chunk
+
+        with self.adapter.bind_root(self.root_path) as root:
+            with self.adapter.bind_parent(root, PurePosixPath("data/item.bin")) as parent:
+                candidate = parent.create_candidate(".stream.tmp", private=False)
+                facts = candidate.write_chunks(  # type: ignore[arg-type]
+                    stream(),
+                    maximum_bytes=sum(map(len, chunks)),
+                )
+                candidate.flush_content()
+                candidate.close()
+        payload = b"".join(chunks)
+        self.assertEqual(generated, [65536, 17, 4096])
+        self.assertEqual(facts.byte_count, len(payload))
+        self.assertEqual((self.root_path / "data" / ".stream.tmp").read_bytes(), payload)
+
+    def test_locked_ledger_observation_is_bounded_and_rejects_unsafe_children(self) -> None:
+        data = self.root_path / "data"
+        (data / "alpha.json").write_bytes(b"alpha")
+        (data / "beta.json").write_bytes(b"beta")
+        with self.adapter.bind_root(self.root_path) as root:
+            with self.adapter.bind_parent(root, PurePosixPath("data/item.bin")) as parent:
+                lease = self.adapter.acquire(
+                    parent,
+                    ".ledger.lock",
+                    b"ledger-v1",
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                try:
+                    observations = parent.observe_ledger_entries(
+                        lease,
+                        LedgerEnumerationLimits(16, 1024, 1024 * 1024),
+                    )
+                    names = tuple(item.name for item in observations)
+                    self.assertEqual(names, tuple(sorted(names)))
+                    self.assertIn("alpha.json", names)
+                    self.assertIn("beta.json", names)
+
+                    with self.assertRaises(PlatformFileError) as limited:
+                        parent.observe_ledger_entries(
+                            lease,
+                            LedgerEnumerationLimits(1, 1024, 1024 * 1024),
+                        )
+                    self.assertEqual(
+                        limited.exception.code,
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+                    )
+
+                    unsafe = data / "unsafe-dir"
+                    unsafe.mkdir()
+                    try:
+                        with self.assertRaises(PlatformFileError) as rejected:
+                            parent.observe_ledger_entries(
+                                lease,
+                                LedgerEnumerationLimits(16, 1024, 1024 * 1024),
+                            )
+                        self.assertEqual(
+                            rejected.exception.code,
+                            PlatformFileErrorCode.REPARSE_REJECTED.value,
+                        )
+                    finally:
+                        unsafe.rmdir()
+
+                    alias = data / "alpha-alias.json"
+                    os.link(data / "alpha.json", alias)
+                    try:
+                        with self.assertRaises(PlatformFileError) as hardlink:
+                            parent.observe_ledger_entries(
+                                lease,
+                                LedgerEnumerationLimits(16, 1024, 1024 * 1024),
+                            )
+                        self.assertEqual(
+                            hardlink.exception.code,
+                            PlatformFileErrorCode.IDENTITY_STALE.value,
+                        )
+                    finally:
+                        alias.unlink()
+
+                    hostile_name = data / "a\\b.json"
+                    hostile_name.write_bytes(b"hostile")
+                    try:
+                        with self.assertRaises(PlatformFileError) as invalid_name:
+                            parent.observe_ledger_entries(
+                                lease,
+                                LedgerEnumerationLimits(16, 1024, 1024 * 1024),
+                            )
+                        self.assertEqual(
+                            invalid_name.exception.code,
+                            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+                        )
+                    finally:
+                        hostile_name.unlink()
+                finally:
+                    lease.close()
+
+    def test_locked_ledger_observation_reproves_live_lease_at_terminal(self) -> None:
+        data = self.root_path / "data"
+        (data / "alpha.json").write_bytes(b"alpha")
+        with self.adapter.bind_root(self.root_path) as root:
+            with self.adapter.bind_parent(root, PurePosixPath("data/item.bin")) as parent:
+                lease = self.adapter.acquire(
+                    parent,
+                    ".ledger-terminal.lock",
+                    b"ledger-terminal-v1",
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                real_scandir = os.scandir
+                closed = False
+
+                def close_during_first_scan(path: object):
+                    nonlocal closed
+                    if not closed:
+                        lease.close()
+                        closed = True
+                    return real_scandir(path)
+
+                with mock.patch.object(
+                    os,
+                    "scandir",
+                    side_effect=close_during_first_scan,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    parent.observe_ledger_entries(
+                        lease,
+                        LedgerEnumerationLimits(16, 1024, 1024 * 1024),
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+                )
+                self.assertTrue(closed)
 
     def test_replace_requires_live_same_parent_posix_lease(self) -> None:
         destination = self.root_path / "data" / "item.bin"

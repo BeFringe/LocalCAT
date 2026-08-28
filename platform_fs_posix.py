@@ -13,14 +13,17 @@ import os
 from pathlib import Path, PurePath
 import stat
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
     BoundRegularFile,
     CandidateFile,
+    CandidateContentFacts,
     EntrySnapshot,
     FileObjectIdentity,
+    LedgerEntryObservation,
+    LedgerEnumerationLimits,
     LockLease,
     LockPolicy,
     LockWait,
@@ -34,6 +37,7 @@ from platform_fs_contracts import (
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    validate_relative_name,
 )
 
 
@@ -52,6 +56,7 @@ _LOCK_FLAGS = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
 _READ_CHUNK = 1024 * 1024
+_STREAM_CHUNK = 64 * 1024
 _FaultInjector = Callable[[str], None]
 
 
@@ -151,6 +156,21 @@ def _write_fd_all(descriptor: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "short POSIX write")
         offset += written
+
+
+def _digest_fd_exact(descriptor: int, byte_count: int) -> CandidateContentFacts:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < byte_count:
+        requested = min(_STREAM_CHUNK, byte_count - offset)
+        chunk = os.pread(descriptor, requested, offset)
+        if len(chunk) != requested:
+            raise OSError(errno.EIO, "short POSIX candidate readback")
+        digest.update(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, offset):
+        raise OSError(errno.EIO, "candidate grew during readback")
+    return CandidateContentFacts(offset, digest.digest())
 
 
 def _same_identity(left: FileObjectIdentity, right: FileObjectIdentity) -> bool:
@@ -402,6 +422,139 @@ class _DirectoryAuthorityMixin:
             )
         return _snapshot_from_stat(result)
 
+    def _observe_ledger_entries(
+        self,
+        lease: LockLease,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if not isinstance(lease, _PosixLockLease) or not lease._matches_parent(
+            self._directory_fds,
+            self._directory_names,
+            self._directory_identities,
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                retryable=False,
+            )
+
+        def observe_once() -> tuple[LedgerEntryObservation, ...]:
+            observations: list[LedgerEntryObservation] = []
+            total_bytes = 0
+            try:
+                with os.scandir(self._directory_fd) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        if name in {".", ".."}:
+                            continue
+                        try:
+                            name = validate_relative_name(name)
+                        except (TypeError, ValueError):
+                            raise _platform_error(
+                                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                                retryable=False,
+                            ) from None
+                        if len(observations) >= limits.maximum_entries:
+                            raise _platform_error(
+                                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                                retryable=False,
+                            )
+                        try:
+                            encoded_name = name.encode("utf-8", errors="strict")
+                        except UnicodeEncodeError:
+                            raise _platform_error(
+                                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                                retryable=False,
+                            ) from None
+                        if len(encoded_name) > limits.maximum_name_bytes:
+                            raise _platform_error(
+                                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                                retryable=False,
+                            )
+                        before = os.stat(
+                            name,
+                            dir_fd=self._directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                            raise _platform_error(
+                                PlatformFileErrorCode.REPARSE_REJECTED,
+                                retryable=False,
+                            )
+                        if before.st_nlink != 1:
+                            raise _platform_error(
+                                PlatformFileErrorCode.IDENTITY_STALE,
+                                retryable=True,
+                            )
+                        descriptor = os.open(name, _READ_FLAGS, dir_fd=self._directory_fd)
+                        try:
+                            retained = os.fstat(descriptor)
+                            after = os.stat(
+                                name,
+                                dir_fd=self._directory_fd,
+                                follow_symlinks=False,
+                            )
+                        finally:
+                            _close_fd(descriptor)
+                        before_snapshot = _snapshot_from_stat(before)
+                        retained_snapshot = _snapshot_from_stat(retained)
+                        after_snapshot = _snapshot_from_stat(after)
+                        if not (
+                            before_snapshot == retained_snapshot == after_snapshot
+                            and retained_snapshot.identity.kind == "regular"
+                            and retained_snapshot.identity.link_count == 1
+                        ):
+                            raise _platform_error(
+                                PlatformFileErrorCode.IDENTITY_STALE,
+                                retryable=True,
+                            )
+                        total_bytes += retained_snapshot.byte_count
+                        if total_bytes > limits.maximum_total_bytes:
+                            raise _platform_error(
+                                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                                retryable=False,
+                            )
+                        observations.append(
+                            LedgerEntryObservation(name, retained_snapshot)
+                        )
+            except PlatformFileError:
+                raise
+            except OSError as error:
+                raise _map_os_error(
+                    error,
+                    fallback=PlatformFileErrorCode.IDENTITY_STALE,
+                    retryable=True,
+                ) from None
+            observations.sort(key=lambda observation: observation.name)
+            return tuple(observations)
+
+        self._reprove()
+        first = observe_once()
+        self._reprove()
+        second = observe_once()
+        self._reprove()
+        if first != second:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        try:
+            terminal_lease_match = lease._matches_parent(
+                self._directory_fds,
+                self._directory_names,
+                self._directory_identities,
+            )
+        except Exception:
+            raise _platform_error(
+                PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                retryable=False,
+            ) from None
+        if not terminal_lease_match:
+            raise _platform_error(
+                PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                retryable=False,
+            )
+        return second
+
     def _create_candidate(self, name: str, *, private: bool) -> CandidateFile:
         self._reprove()
         descriptor: int | None = None
@@ -534,9 +687,7 @@ class _DirectoryAuthorityMixin:
                 named = True
             candidate._mark_named(destination)
             _hit_fault(self._fault_injector, "candidate_after_naming")
-            current = candidate._current_stat()
-            identity = _identity_from_stat(current)
-            payload = _read_fd_all(candidate._descriptor)
+            facts = candidate._publish_facts(mode)
             candidate._reprove_named_entry()
             os.fsync(self._directory_fd)
             candidate._reprove_named_entry()
@@ -561,13 +712,7 @@ class _DirectoryAuthorityMixin:
                 fallback=PlatformFileErrorCode.PUBLISH_FAILED,
                 retryable=True,
             ) from None
-        return PublishFacts(
-            mode=mode,
-            destination_identity=identity,
-            content_sha256=hashlib.sha256(payload).digest(),
-            byte_count=len(payload),
-            reparse_free=True,
-        )
+        return facts
 
     def _open_published_destination(
         self,
@@ -854,12 +999,27 @@ class _PosixBoundRegularFile(BoundRegularFile):
         return _snapshot_from_stat(self._reprove())
 
     def _publish_facts(self, mode: PublishMode) -> PublishFacts:
-        payload = self.read_all()
+        expected = self.snapshot()
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.byte_count:
+            chunk = self.read_at(
+                offset,
+                min(_STREAM_CHUNK, expected.byte_count - offset),
+                expected,
+            )
+            digest.update(chunk)
+            offset += len(chunk)
+        if self.read_at(offset, 1, expected) or self.snapshot() != expected:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
         return PublishFacts(
             mode=mode,
             destination_identity=self._identity(),
-            content_sha256=hashlib.sha256(payload).digest(),
-            byte_count=len(payload),
+            content_sha256=digest.digest(),
+            byte_count=offset,
             reparse_free=True,
         )
 
@@ -879,6 +1039,7 @@ class _PosixCandidateFile(CandidateFile):
         "_bound_identity",
         "_named_destination",
         "_fault_injector",
+        "_flushed_facts",
     )
 
     def __init__(
@@ -946,6 +1107,7 @@ class _PosixCandidateFile(CandidateFile):
         self._bound_identity = bound_identity
         self._named_destination: str | None = None
         self._fault_injector = fault_injector
+        self._flushed_facts: CandidateContentFacts | None = None
 
     def _reprove_owner(
         self,
@@ -1018,29 +1180,99 @@ class _PosixCandidateFile(CandidateFile):
     def _mark_named(self, destination: str) -> None:
         self._named_destination = destination
 
-    def _write_all(self, payload: bytes) -> None:
+    def _write_chunks(self, chunks: Iterator[bytes]) -> CandidateContentFacts:
         self._reprove_named_entry()
         try:
-            _write_fd_all(self._descriptor, payload)
+            os.ftruncate(self._descriptor, 0)
+            digest = hashlib.sha256()
+            offset = 0
+            for chunk in chunks:
+                chunk_offset = 0
+                while chunk_offset < len(chunk):
+                    written = os.pwrite(
+                        self._descriptor,
+                        chunk[chunk_offset:],
+                        offset,
+                    )
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short POSIX candidate write")
+                    chunk_offset += written
+                    offset += written
+                digest.update(chunk)
         except OSError as error:
             raise _map_os_error(
                 error,
                 fallback=PlatformFileErrorCode.PUBLISH_FAILED,
                 retryable=True,
             ) from None
-        self._reprove_named_entry()
+        proof = self._reprove_named_entry()
+        facts = CandidateContentFacts(offset, digest.digest())
+        if proof.st_size != facts.byte_count:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        self._flushed_facts = None
+        return facts
 
-    def _flush_content(self) -> None:
-        self._reprove_named_entry()
+    def _flush_content(self, expected: CandidateContentFacts) -> CandidateContentFacts:
+        before = self._reprove_named_entry()
+        if before.st_size != expected.byte_count:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
         try:
             os.fsync(self._descriptor)
+            actual = _digest_fd_exact(self._descriptor, expected.byte_count)
         except OSError as error:
             raise _map_os_error(
                 error,
                 fallback=PlatformFileErrorCode.PUBLISH_FAILED,
                 retryable=True,
             ) from None
-        self._reprove_named_entry()
+        after = self._reprove_named_entry()
+        if (
+            _snapshot_from_stat(before) != _snapshot_from_stat(after)
+            or actual != expected
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        self._flushed_facts = actual
+        return actual
+
+    def _publish_facts(self, mode: PublishMode) -> PublishFacts:
+        if self._flushed_facts is None:
+            raise _platform_error(
+                PlatformFileErrorCode.PUBLISH_FAILED,
+                retryable=True,
+            )
+        before = self._reprove_named_entry()
+        try:
+            actual = _digest_fd_exact(self._descriptor, self._flushed_facts.byte_count)
+        except OSError:
+            raise _platform_error(
+                PlatformFileErrorCode.PUBLISH_FAILED,
+                retryable=True,
+            ) from None
+        after = self._reprove_named_entry()
+        if (
+            _snapshot_from_stat(before) != _snapshot_from_stat(after)
+            or actual != self._flushed_facts
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.PUBLISH_FAILED,
+                retryable=True,
+            )
+        return PublishFacts(
+            mode=mode,
+            destination_identity=_identity_from_stat(after),
+            content_sha256=actual.content_sha256,
+            byte_count=actual.byte_count,
+            reparse_free=True,
+        )
 
     def _identity(self) -> FileObjectIdentity:
         return _identity_from_stat(self._current_stat())
