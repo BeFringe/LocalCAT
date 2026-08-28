@@ -1,6 +1,6 @@
 # 实施计划
 
-> **WA-06 Windows compatibility amendment**：`.1`只保留为已被取代的历史，以下`a`后缀任务按ADR-020/021经ADR-023补充/修订后的合同，把canonical TM的identity、V2 private proof、锁、publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
+> **WA-06 Windows compatibility amendment（current R3）**：`R1`/`R2`只保留为已被取代的历史，以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
 - [x] 1. 冻结版本化基础契约与验证夹具
 
@@ -17,10 +17,10 @@
   - _Requirements: 1.9, 2.9, 2.10, 2.11, 2.12, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
 - [ ] 1.2a 冻结 Windows 平台 identity 与 private-storage proof 合同
-  - 合同消费 ADR-020 opaque file/root/lock facts 与 ADR-021经ADR-023接管后的`WindowsPrivateProof`；`security_profile_id`与descriptor digest绑定`WindowsPrivateSecurityV2` exact owner+DACL+MIC projection，V1/unknown profile拒绝。FileId只作本次proof的一项事实，不成为跨重启永久身份或单独授权。
-  - activation、snapshot和schema publication只能消费由W1 canonical `DurabilityProfileRegistryV1`铸造的opaque capability；source必须来自rooted registry authority，frozen必须来自W3 manifest-bound bundle authority，registry/profile/evidence digest缺失、tamper、mismatch或CWD/checkout fallback均在arm前拒绝。
+  - 合同消费 ADR-020 opaque file/root/lock facts 与 ADR-021经ADR-023/024接管后的`WindowsPrivateProof`；`security_profile_id`与descriptor digest绑定`WindowsPrivateSecurityV2` exact owner+DACL+MIC projection，资格来自实际current process primary token，provider origin不持久化，V1/unknown profile拒绝。FileId只作本次proof的一项事实，不成为跨重启永久身份或单独授权。
+  - activation、snapshot、schema和export publication只消费ADR-025的正常platform publish/`PendingPublication`；pre-arm API/volume/security不足时零命名mutation并报告`DURABILITY_UNAVAILABLE`，post-arm结果不确定时进入既有recovery-required。source/frozen不加载硬件durability registry，frozen仍由W3 manifest约束其余source closure。
   - _Amendment: WA-06_
-  - _Depends: 1.2, ADR-020, ADR-021, ADR-023, windows-platform-enablement 2.1_
+  - _Depends: 1.2, ADR-020, ADR-021, ADR-023, ADR-024, ADR-025, windows-platform-enablement 2.1_
 
 - [x] 1.3 定义迁移、导出、升级和恢复结果契约
   - 固化预检计数、逐行安全诊断、成功证据、失败阶段、可重试性、资产保持证明和恢复路径
@@ -180,7 +180,7 @@
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
 - [ ] 5.6a 以 `WindowsPrivateProof` 绑定 activation journal 与恢复资产
-  - PREPARED 前复验`WindowsPrivateSecurityV2` owner/DACL/MIC projection、non-reparse root、artifact identity与exclusive process lock；proof缺失、profile/descriptor漂移或继承状态不闭合时不推进journal。
+  - PREPARED 前以current process primary token复验`WindowsPrivateSecurityV2` owner/DACL/MIC projection、non-reparse root、artifact identity与exclusive process lock；provider origin不参与资格，proof缺失、profile/descriptor漂移或继承状态不闭合时不推进journal。
   - _Amendment: WA-06_
   - _Depends: 1.2a, 5.3a, 5.6, windows-platform-enablement 3.7_
 
@@ -190,9 +190,9 @@
   - 完成时，并发查询和保存只观察切换前或切换后的完整版本，不出现空白、混合或过渡性版本
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
 
-- [ ] 5.7a 将 DB/manifest publication 接入 `BoundDirectoryPublisher`
-  - PREPARED与任何publication arm之前，必须从source-rooted或W3 frozen-manifest-bound registry authority取得匹配host/volume/cache/power facts的opaque `DurabilityProfile` capability；缺失、tamper或不匹配时阻止DB业务phase并返回durability unavailable。
-  - Windows 路径保持 DB→parent durability→reopen→manifest→generation 的既有 phase authority。每个replace执行`begin_publish`后只得到`PendingPublication`与retained destination readback authority；owner在其存活时完成readback、写入并持久化自己的journal phase、复证DB/manifest业务state，再调用`terminal_reproof`并`close`，全过程不得把preliminary facts报告为成功。
+- [ ] 5.7a 将 DB/manifest publication 接入 `PendingPublication`
+  - PREPARED与任何publication arm之前，必须按`WindowsDocumentedPublishV1`证明Windows 11 x64、local fixed NTFS及所需API/volume/security事实；缺失时零命名mutation并返回`DURABILITY_UNAVAILABLE`，不读取runtime硬件profile registry。
+  - Windows 路径保持 DB→write-through/`FlushFileBuffers`→handle-bound naming→candidate close→retained exact readback→manifest→generation 的既有 phase authority。每个replace执行`begin_publish`后只得到`PendingPublication`与retained destination readback authority；owner在其存活时完成readback、写入并持久化自己的journal phase、复证DB/manifest业务state，再调用`terminal_reproof`并`close`，全过程不得把preliminary facts报告为成功。
   - 任一owner durable phase、business reproof或terminal reproof失败都进入既有recovery-required路径；禁止用删除目标、普通rename、pathname reopen或提前关闭pending authority缩减协议。
   - _Amendment: WA-06_
   - _Depends: 5.6a, 5.7, windows-platform-enablement 3.7_
@@ -254,7 +254,7 @@
   - _Requirements: 2.3, 2.7, 2.8, 2.13, 3.1, 3.2, 3.3, 7.10, 7.11_
 
 - [ ] 5.12a 将 snapshot export family 接入 Windows bound publication
-  - arm前必须取得与目标host/volume/cache/power facts匹配且由source-rooted或W3 frozen-manifest-bound registry authority铸造的`DurabilityProfile` capability；缺失、tamper或不匹配时不得进入export业务phase。
+  - arm前必须按`WindowsDocumentedPublishV1`证明目标位于受支持的local fixed NTFS并具备write-through/flush、handle-bound naming与retained readback能力；缺失时不得进入export业务phase或产生命名mutation。
   - JSONL、adjacent manifest、receipt/ledger 与 temporary family 在同一 destination binding 和 process lock 下发布；每个replace均按`begin_publish → PendingPublication retained readback → owner durable receipt/ledger phase + family business reproof → terminal_reproof → close`闭合，所有family成员终态成立前不得返回成功。
   - 外来目标、锁冲突、readback、owner durable phase、business reproof或terminal reproof失败均保持active binding不变并进入既有recovery分类。
   - _Amendment: WA-06_
@@ -278,7 +278,7 @@
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
 - [ ] 5.14a 闭合 Windows snapshot refresh crash/recovery
-  - 对 issued、JSONL replace、manifest replace、directory durability 等价点、completion 与 cleanup 注入进程终止；只产生旧 completed pair、一致新 pair或明确 divergence。
+  - 对issued、file flush、JSONL/manifest handle-bound naming、retained readback、owner completion、terminal reproof与cleanup注入fault/process kill，并经app restart与正常OS reboot恢复；只产生旧completed pair、一致新pair或明确divergence。
   - 同时覆盖`PendingPublication`在owner durable phase前后、business reproof前后及terminal reproof/close边界的进程终止，恢复不得把preliminary platform facts或未闭合issued receipt提升为成功。
   - _Amendment: WA-06_
   - _Depends: 5.13a, 5.14_
@@ -457,7 +457,7 @@
   - _Requirements: 2.4, 2.5, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14_
 
 - [ ] 9.1a 执行 Windows 激活、双进程锁与 owner-kill 矩阵
-  - 以真实业务 API 覆盖首次激活、并发激活/查询、busy/timeout、持锁进程退出和四 journal phase kill/restart；原 JSONL 与 LKG canonical 按既有规则成套保全。
+  - 以真实业务 API 覆盖首次激活、并发激活/查询、busy/timeout、持锁进程退出、四 journal phase kill/restart、app restart与正常OS reboot；不确定时platform返回`RECOVERY_REQUIRED`，原 JSONL 与 LKG canonical 按既有规则成套保全，owner-visible结果只接受完整old、完整new或recovery-only。
   - 逐个覆盖DB与manifest的`PendingPublication` owner durable phase/business reproof/terminal reproof边界，证明preliminary facts不产生generation或公开成功。
   - _Amendment: WA-06_
   - _Depends: 5.8a, 5.9a, 9.1_
@@ -472,7 +472,7 @@
 - [ ] 9.2a 执行 Windows snapshot/private-proof 负空间矩阵
   - 覆盖 reparse/hardlink/multi-link、ancestor/parent rename/ABA、same-byte replacement、FileId复用、durable handoff缺失/损坏及每个publish/cleanup kill点。
   - private-proof闭集必须覆盖V1/unknown `security_profile_id`、descriptor digest mismatch、owner/DACL漂移、MIC缺失/额外/unknown/drift、`LABEL_SECURITY_INFORMATION`读取失败；全部在业务phase前fail closed且不改变canonical/receipt/generation。
-  - 以真实standard与elevated token分别验证正向创建/重开，以low-integrity与restricted token子进程验证owner-facing fail-closed；DACL-only `AccessCheck`成功不得代替MIC通过。
+  - 以真实current process primary standard/medium与elevated/high token分别验证正向创建/重开，以same TokenUser的low-integrity与restricted token子进程验证owner-facing fail-closed；核对TokenPrimary、canonical TokenUser SID、integrity、non-AppContainer与exact AccessCheck，DACL-only `AccessCheck`成功不得代替MIC通过。local/domain/Entra等provider来源不作为mandatory profile。
   - _Amendment: WA-06_
   - _Depends: 5.14a, 9.2_
 
@@ -503,15 +503,15 @@
   - _Requirements: 2.9, 4.2, 6.10, 7.5, 8.7, 9.12_
 
 - [ ] 9.6a 执行Windows canonical TM source完整发布验证
-  - 在源码运行时完成canonical激活、重启恢复、exact/context/fuzzy、FTS5、snapshot export/refresh、故障矩阵与current-source Core release；证明W1 registry从source-rooted authority加载，缺失/tamper/profile或evidence digest错配均在arm前阻断。任一能力缺失保持对应gate关闭，TMX产品汇合仍归WA-05/08。
+  - 在源码运行时完成canonical激活、重启恢复、exact/context/fuzzy、FTS5、snapshot export/refresh、故障矩阵与current-source Core release；以正常platform ports重放`WindowsDocumentedPublishV1`及provider-agnostic private-proof矩阵，pre-arm capability缺失必须零命名mutation，post-arm不确定进入recovery-required。任一能力缺失保持对应gate关闭，TMX产品汇合仍归WA-05/08。
   - _Amendment: WA-06_
-  - _Depends: 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, windows-platform-enablement 3.7_
+  - _Depends: 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
 - [ ] 9.6b 在ADR-022 frozen harness重放Windows canonical TM发布验证
-  - 在W3 custom spike全PASS后重放9.6a，证明W1 registry只从frozen-manifest-bound authority加载，CapabilityHost/SQLite/snapshot与Gate source closure不访问checkout且缺失/tamper均fail closed。
+  - 在W3 custom spike全PASS后重放9.6a；frozen manifest不再包含硬件durability registry输入，CapabilityHost/SQLite/snapshot仍必须服从正常platform publish、trusted source closure且不访问checkout，其他ADR-022 strict frozen要求保持不变。
   - _Amendment: WA-06_
   - _Delivery phase: frozen post-build_
-  - _Depends: 9.6a, ADR-022, ADR-023, windows-platform-enablement 7.4_
+  - _Depends: 9.6a, ADR-022, ADR-023, ADR-024, ADR-025, windows-platform-enablement 7.4_
 
 ## Implementation Notes
 

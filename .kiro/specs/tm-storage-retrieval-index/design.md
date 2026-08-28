@@ -47,12 +47,12 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - Core 可以读取中立 raw records，不得依赖 PySide6、xlwings、Controller、workspace state 或 Parser 实现。
 - Compatibility facade 可依赖新 Core ports；新 Core 不反向依赖旧 `TMEngine`。
 
-### Windows Compatibility Amendment WA-06
+### Windows Compatibility Amendment WA-06（current R3）
 
-- **ADR mapping**：follow adopted ADR-020/021 as supplemented by adopted ADR-023 decisions 2～5，其中仅V1 DACL-only security profile由V2窄范围取代。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
-- **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`BoundDirectoryPublisher`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。
-- **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
-- **Durability/FTS5**：owner在`PendingPublication` retained readback authority存活时写自身durable phase、复证业务state，再调用platform terminal reproof；运行时profile只来自W1 canonical durability registry的source rooted或frozen bundle authority。Windows restart、two-process/kill/power fault matrix与FTS5/fallback create-query-reopen分别验收，且仍服从Gate C/D与benchmark owner。
+- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`，其中V2 security profile保持、主体资格改为provider-agnostic current-primary-token事实，运行时硬件durability registry被`WindowsDocumentedPublishV1`取代。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
+- **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`BoundDirectoryAuthority.begin_publish()`产生的`PendingPublication`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。
+- **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium/high MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。资格来自实际current process primary token，standard/elevated正向及same-SID low/restricted负向分别验证；local/domain/Entra等provider origin不进入proof。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
+- **Publication/FTS5**：activation、snapshot与export在local fixed NTFS上按`WindowsDocumentedPublishV1`完成write-through/flush、handle-bound naming、retained exact readback；owner在`PendingPublication`存活时提交自身journal/receipt并复证业务state，再调用platform terminal reproof。不确定时platform返回`RECOVERY_REQUIRED`，owner在故障注入、two-process/process kill、app restart与正常OS reboot后只接受完整old、完整new或recovery-only；source/frozen均不加载硬件durability registry，frozen manifest只移除该输入而保留其他ADR-022 strict closure。FTS5/fallback create-query-reopen仍分别验收并服从Gate C/D与benchmark owner。
 
 ### Revalidation Triggers
 

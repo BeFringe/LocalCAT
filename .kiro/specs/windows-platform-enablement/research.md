@@ -8,7 +8,7 @@
   - UI 依赖、PySide6/Qt、`qwindows.dll`、真实 Qt 窗口和 SQLite FTS5/trigram 均已通过；当前阻塞不是依赖安装或 Qt 插件。
   - 源码启动被 `collaborative_chunk_store.py` 顶层 `import fcntl` 阻断；Parser 之后又会按合同返回 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE`。静态扫描命中 43 个源码/测试文件，说明这不是单文件兼容补丁。
   - Windows 的 share mode 本身是协议一部分：缺少 `FILE_SHARE_DELETE` 会阻止 rename/delete；这既能固定 rooted ancestor，也会在错误的 handle lifetime 下阻塞合法原子发布。
-  - Windows 的 `VolumeSerialNumber + 128-bit FileId` 只适合比较同时存活的 handles；FileId 删除后可能复用。W2只提供nested `WindowsPrivateProof`，Gate D compatibility与canonical phase/generation继续由各自owner envelope绑定；reparse、ACL/SID、write-through和naming durability会改变跨Spec身份/持久化表示，满足ADR候选门槛。
+  - Windows 的 `VolumeSerialNumber + 128-bit FileId` 只适合比较同时存活的 handles；FileId 删除后可能复用。W2只提供nested `WindowsPrivateProof`，Gate D compatibility与canonical phase/generation继续由各自owner envelope绑定。ADR-024把主体环境门收敛到process-primary token/SID facts；ADR-025以`WindowsDocumentedPublishV1`固定write-through、flush、handle-bound naming与recovery边界，不再以provider来源或storage硬件profile铸造authority。
   - PyInstaller可把指定模块以真实`.py`外置收集，但`SourceFileLoader` metadata仍可能对应bytecode cache；W3必须用retained-handle exact-byte loader/direct compile证明实际执行bytes，并完整列出bootstrap TCB，不能只复制data或检查origin/co_filename。
 
 ## 现场失败/通过矩阵
@@ -64,14 +64,30 @@
 
 - Task 1.4的stock顺序事实使父wrapper和Python runtime hook都不能成为W3 entry。`w3-custom-entry-plan.md`据此选择同一进程、release-owned的PyInstaller 6.22.2 `runw`下游patch，并固定E0～E11时序、pre-link/runtime/post-build manifest分层、one-shot opaque extension authority、最小Boot TCB与攻击矩阵。
 - PyInstaller官方支持用Visual C++从sdist重建Windows bootloader，且MSVC路线可生成self-contained static executable；本路线因此选择MSVC x64。Task 1.5以构建前materialized的compiler/SDK/tool与upstream/runtime摘要、patch owner/apply合同、expected native/system allowlist及exact C API目标表作为W3审批输入；Task 1.6在W1冻结后实现patch并生成绑定该输入digest的realized-build lock。
-- `tools/prepare_windows_frozen_entry_inputs.py`与`packaging/windows/frozen-entry/candidate-contract.json`已生成`candidate-input.lock.json`：candidate-input digest为`36bc2b9a9e7cd276319653d24f1c07856cc881a1f23e206d2f58f0bd2c6a3a7b`，lock文件SHA-256为`102ccb4353505d9a447709bdd2352fcab86014d49c982a99f2979e03c29ebe64`。system Windows PowerShell 5.1 wrapper在两个不同空work root从pristine source建立精确MSVC/SDK环境、核对`cl/link/rc/mt`实际解析路径并以`-j1`现场重建stock probe；Waf运行前的实际build-copy source与完整bootloader build-driver aggregate形成pre-build evidence `3792488f8b51f6854702b8a5b10983fde4b1c3377086fac661096657d12a0dc6`，tool identity、arguments、净化environment、路径/耗时归一化stdout/stderr digest与result import digest形成canonical build evidence `57d4a3b089cfd7d25a9c60496a595d9afb6c3ca22f902125db34f858f0e32547`并进入lock；三个JSON producer显式输出UTF-8/LF，使仓库规范化checkout与Windows现场生成物具有同一字节身份；两次得到byte-identical evidence与lock，七项input assertion及25项自动测试PASS。producer Python source/native base runtime、venv语义/launcher、实际`pefile` metadata、`vswhere`与生成/重放工具本身也进入摘要。
+- `tools/prepare_windows_frozen_entry_inputs.py`与`packaging/windows/frozen-entry/candidate-contract.json`已生成`candidate-input.lock.json`：candidate-input digest为`06c37c4bf251700bdb16e5b4d288b3c8474e87d637ce7a290d9c33b1586e9619`，lock文件SHA-256为`703cfcdc194c49c9631a8d38c446b67c948113beaf21669fa5482b4cd8ebc2c5`。锁定的SDK输入闭包是构建实际可达的x64 `bin`、`include`与`lib`聚合。system Windows PowerShell 5.1 wrapper在两个不同空work root从pristine source建立精确MSVC/SDK环境、核对`cl/link/rc/mt`实际解析路径并以`-j1`现场重建stock probe；Waf运行前的实际build-copy source与完整bootloader build-driver aggregate形成pre-build evidence `3792488f8b51f6854702b8a5b10983fde4b1c3377086fac661096657d12a0dc6`，tool identity、arguments、净化environment、路径/耗时归一化stdout/stderr digest与result import digest形成canonical build evidence `57d4a3b089cfd7d25a9c60496a595d9afb6c3ca22f902125db34f858f0e32547`并进入lock；三个JSON producer显式输出UTF-8/LF，使仓库规范化checkout与Windows现场生成物具有同一字节身份；两次得到byte-identical evidence与lock，七项input assertion及25项自动测试PASS。producer Python source/native base runtime、venv语义/launcher、实际`pefile` metadata、`vswhere`与生成/重放工具本身也进入摘要。
 - CPython 3.14目标表由PyInstaller PEP 741实际43-symbol路径和custom extension 19个function/1个data export组成，共63项且全部由锁定`python314.dll`导出；base binding header摘要、19个新增function签名与data export地址类型均进入exact合同，built-in注册统一使用`PyInitConfig_AddModule`。expected E0 import表从锁定stock `runw`逐symbol派生，删除`COMCTL32`和`SetDllDirectoryW`后只保留四个获批system DLL并加入rooted/identity/policy及所选MSVC代码生成所需Kernel32 API；realized import与native closure由1.6产物复核。
 - 同一materialized MSVC/SDK已从官方sdist现场构建`run/run_d/runw/runw_d`；candidate lock只把该stock rebuild的AMD64、无delay-import、exact import-table与相对官方stock的五项compiler-generated symbol delta作为1.5选择事实，不把未使用`/Brepro`的probe PE bytes当发行authority。custom patch、固定编译/链接flag、双clean build byte identity与完整能力结论仍由1.6 mandatory matrix给出。
 
 ### Implement Notes — Task 3 Windows rooted authority（2026-08-28）
 
-- `GetVolumeInformationByHandleW`可直接查询保留的目录与Volume GUID根目录handle；本机对去除尾随分隔符的Volume GUID设备路径不能直接建立同类目录authority。`FILE_ID_INFO`的64-bit volume identity与`GetVolumeInformationByHandleW`的DWORD serial保持分域，不截断比较；storage device/cache事实继续由独立host gate查询，未知事实映射为durability不可用。
+- `GetVolumeInformationByHandleW`可直接查询保留的目录与Volume GUID根目录handle；本机对去除尾随分隔符的Volume GUID设备路径不能直接建立同类目录authority。`FILE_ID_INFO`的64-bit volume identity与`GetVolumeInformationByHandleW`的DWORD serial保持分域，不截断比较；ADR-025采纳后，storage device/cache枚举不再属于普通publish host gate，`DURABILITY_UNAVAILABLE`只用于arm前local fixed NTFS/API/flush/write-through/handle-bound naming等documented capability缺失。
 - Win32文档化接口没有等价`openat(parent_handle, name)`的逐组件入口；首版因此从drive root构造Volume GUID累计路径，对每个组件执行no-follow ENTRY_PROBE并与随后保留的directory handle比较live identity，完整保留root chain，采用exact final-path spelling策略。真实junction、symlink、intermediate swap、ancestor rename与share矩阵均在正文读取前稳定关闭逃逸；本阶段不需要转向未文档化native API。
+- `CreateRestrictedToken`的默认restriction profile会同时拒绝读取；Task 3.3需要的同SID“可读但不可写/删”反例由`WRITE_RESTRICTED`精确表达，并以真实primary-token子进程验证。普通UAC limited/medium与同一TokenUser的elevated/high current-primary均完成实际读、写与删除正向控制；test-only native helper及其MSVC/SDK输入不进入runtime或发行依赖。
+- 当前Windows 11对`GetTokenInformation(TokenHasRestrictions)`接受`DWORD`容量但可能返回`ReturnLength=1`，而公开说明以`DWORD`描述结果。测试因此只接受现场1-byte形态或完整4-byte形态，并以哨兵确认1-byte调用没有越过报告长度；其他token information class仍要求各自公开的精确尺寸。
+
+### Implement Notes — Task 2.1 persistent private proof contract（2026-08-28）
+
+- Task 3.4需要的跨重启proof不能由只表示当次ACL/MIC检查的`PrivateAccessEvidence`承载。共享合同因此保留既有physical proof不变，另定义不并入`PlatformFileBackend` aggregate的`PersistentPrivateProof`：raw exact 32-byte secret派生SHA-256 key id，MAC输入为固定domain tag加排除MAC字段的canonical unsigned projection；device-secret binding独立retain source handle，同issuer exact authority经过terminal reproof后只能消费一次。真实持久文件读取前还须固定codec输入上限，生产secret authority须采用无公开状态的封闭具体类型；这两项由Task 3.4实现与复审闭合。
+
+### Implement Notes — Task 2.4 Windows persistent proof narrowing（2026-08-28）
+
+- `narrow_windows_persistent_private_proof(backend, probe_root)`只在Windows导入native adapter，要求传入对象是模块声明的exact `WindowsPlatformAdapter`且同时满足aggregate与独立persistent port；它对显式absolute root重新执行live read-only self-probe并返回同一对象。foreign/subclass/缺失shape或probe fault均归一为稳定capability failure，POSIX/unknown host不加载Windows模块。
+
+### Implement Notes — Task 0.6 ADR-024/025 activity sync（2026-08-28）
+
+- ADR-024确认LocalCAT不消费identity-provider来源：blocking evidence只按process primary token的canonical `TokenUser` SID、token type、integrity、AppContainer/session与实际ACL/MIC access facts判断。standard/elevated、同SID low-integrity/restricted、thread impersonation及service/AppContainer/impersonation边界仍是mandatory；domain/Entra仅为可用时的非阻断兼容性覆盖。
+- ADR-025确认普通Windows发布资格是`WindowsDocumentedPublishV1`，与既有POSIX fsync/directory-fsync产品合同同层：local fixed NTFS、`WRITE_THROUGH`+`FlushFileBuffers`、handle-bound naming、candidate close、retained readback、owner commit与terminal reproof。arm前能力缺失零命名mutation并返回`DURABILITY_UNAVAILABLE`；arm后不确定返回`RECOVERY_REQUIRED`。process termination、instruction fault、应用重启与正常OS reboot是blocking恢复证据；forced-power-off与硬件cache/power-protection资格只有未来独立产品声明才可重新引入。
+- 该分层只从frozen闭包删除durability registry输入；ADR-022的native entry、Boot TCB、DLL/source/fixture authority、clean build provenance与真实packaged E2E没有降级。
 
 ## Codebase Gap Analysis
 
@@ -131,7 +147,7 @@
   - commit 前关闭的 target snapshot 不是 expected-target 原子 CAS；不合作进程可在 snapshot 与 rename 之间替换目标。平台层只能提供 create-if-absent 或 owner 持排他资源锁时的 replace facts。
 - **Implications**:
   - 建议以 `CREATE_NEW` candidate handle + file flush + `SetFileInformationByHandle(FileRenameInfo[Ex], RootDirectory=bound parent)` 作为首选原子发布探针。
-  - 命名 durability 不是可以在设计中默认成立的事实；必须通过新 ADR 定义受支持 volume、success boundary，并用真实 forced-power-off/reboot 验证 old/new/recovery-only。仅 process kill/fault injection 不足以宣称 durability。
+  - ADR-025已经定义普通产品的命名success boundary：在local fixed NTFS上以`WRITE_THROUGH`、`FlushFileBuffers`、handle-bound naming、candidate close、retained readback、owner commit与terminal reproof闭合`WindowsDocumentedPublishV1`。process termination、instruction fault、应用重启与正常OS reboot验证协议恢复；它们不宣称forced-power-loss硬件认证，后者若成为产品需求须另立Spec/ADR。
 
 ### Windows 跨进程锁
 - **Context**: `collaborative_chunk_store` 和 TM activation 使用 `flock`，Windows 无 `fcntl`。
@@ -159,8 +175,8 @@
   - Windows owner 与权限由 SID/security descriptor/DACL 表示；可按 handle 用 `GetSecurityInfo` 验证。
   - default DACL 来自 access token/parent，不能在不同配置上默认为满足“device-local private”。
 - **Implications**:
-  - ADR-013/016 的 Windows 表示需新 ADR：primary-token `TokenUser`/owner SID、精确 ACE rights/order、AccessCheck/generic mapping、inheritance/protected 状态、nlink、live volume/file ID、reparse-free 及重启后 exact digest/phase/private/device-secret 重新证明。
-  - 标准/UAC 提权、本地/domain/AzureAD 用户不能靠账户名推断等价性；必须按 SID 固定允许矩阵，service/AppContainer/impersonation token 首版 fail closed。
+  - ADR-013/016 的 Windows 表示由ADR-021/023/024固定：process-primary `TokenUser`/owner SID、精确ACE rights/order、AccessCheck/generic mapping、inheritance/protected状态、nlink、live volume/file ID、reparse-free及重启后exact digest/phase/private/device-secret重新证明。
+  - 标准/UAC elevated进程按canonical SID与token shape判断，不能靠账户名或provider推断等价性；同SID low-integrity/restricted、thread impersonation和service/AppContainer/impersonation边界必须fail closed。domain/Entra环境只作optional兼容性覆盖，不进入blocking矩阵。
 
 ### Frozen-source 与 PyInstaller
 - **Context**: 基线 onedir/windowed 没有真实 `.py`、fixtures 或数据；`capability_host` 因 `capability_host.py` 不存在而 fail closed。
@@ -236,7 +252,7 @@
 ### Decision 3：锁与发布保持 handle-bound
 - **Selected Approach**: `LockFileEx`保护W1 integrity-ACL persistent single-link lock file；candidate用`CREATE_NEW`与请求的security profile创建，rename后关闭candidate再reopen/readback，并保留no-write/no-delete destination handle到owner durable commit与terminal reproof；replace只在owner-defined排他资源lock下允许。
 - **Rationale**: 崩溃释放、跨进程互斥、source identity 与 destination parent 都能绑定 handle。
-- **Trade-offs**: 平台层不提供 expected-target CAS；不合作同用户进程仍可能竞态。需要更强保护的 owner 使用 immutable generation + journal/pointer。naming durability success boundary 需要 Windows 专属 ADR 与真实 power-cut/reboot 证明；不承诺 lock fairness。
+- **Trade-offs**: 平台层不提供 expected-target CAS；不合作同用户进程仍可能竞态。需要更强保护的 owner 使用 immutable generation + journal/pointer。`WindowsDocumentedPublishV1`只声明OS文档化flush/naming与业务恢复闭合，不提供突然断电硬件认证；不承诺 lock fairness。
 
 ### Decision 4：由 W3 建立 frozen-source/bootstrap 合同
 - **Selected Approach**: PyInstaller `--onedir --windowed` + release-owned native bootloader/generated spec/hook；native entry在首次Python DLL/非KnownDLL load前固定搜索、绑定bundle并移交attestation，关键模块`module_collection_mode='py'`且无bytecode/PYZ duplicate；Python bootstrap闭合其余Boot TCB/source/fixture handles，`TrustedSourceLoader`从retained handle读取、摘要、直接编译exact bytes，再铸造`TrustedSourceAuthority`。W3治理可与W1并行，bootstrap实现必须满足已采纳W1 invariants。
@@ -256,7 +272,7 @@
 
 1. **ADR candidate W1 — Cross-platform rooted file authority, lock and durable publish boundary**
    - 改变共享 dependency/layer/composition boundary。
-   - 定义Windows live-handle identity、reparse/share mode、W1 lock integrity ACL、retained readback→owner commit→terminal reproof、非CAS threat scope、版本化`DurabilityProfile`与稳定错误族。
+   - 定义Windows live-handle identity、reparse/share mode、W1 lock integrity ACL、retained readback→owner commit→terminal reproof、非CAS threat scope与稳定错误族；其后来加入的`DurabilityProfile`/硬断电门已由ADR-025取代为`WindowsDocumentedPublishV1`。
    - 与 ADR-008/009/018/019 的 authority/atomicity/fail-closed 决策相交。
 2. **ADR candidate W2 — Windows device-local private attestation representation**
    - ADR-021最初在Windows物理表示范围部分取代ADR-013/016的POSIX uid/mode/dev/inode谓词并冻结`WindowsPrivateAclV1`；Task 0.5随后形成并获采纳的ADR-023，以包含exact owner+DACL+MIC projection的`WindowsPrivateSecurityV2`接管该物理profile。nested `WindowsPrivateProof`与Gate D/canonical owner envelopes仍保持正交。
@@ -265,15 +281,15 @@
    - 新建onedir/windowed build owner、native-entry pre-Python DLL policy、完整Boot TCB、retained-handle exact-byte `TrustedSourceLoader`、`TrustedSourceAuthority`、clean/content-addressed source/fixture closure及发行门。
    - ADR-011 仍只拥有 Feature 5/UI DTO 与 composition；W3 是新的跨 Spec frozen/source-loader contract 与长期所有权，满足候选门槛。
 
-W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-authority时序补充与V2 security profile窄范围修订正式采纳；取代/补充关系由治理分支唯一记录。`windows-platform-enablement` owning scope、`ui-mvp` 的 TMX owner 身份和 avatar 仅回归边界已由 Task 0.2 批准，WA-01～08 current R/D/T acknowledgement、ledger authority和独立Design approval均已闭合；实现从Task 1起按依赖逐簇进入，仍不得用局部能力代答最终EXE。
+W1/W2/W3 已分别作为 ADR-020/021/022 正式采纳，ADR-023也已作为pre-authority时序补充与V2 security profile窄范围修订正式采纳；ADR-024进一步取代provider环境mandatory矩阵，ADR-025取代runtime durability registry与硬断电硬件资格门。取代/补充关系由治理分支唯一记录。`windows-platform-enablement` owning scope、`ui-mvp` 的 TMX owner 身份和 avatar 仅回归边界已由 Task 0.2 批准，WA-01～08 current R/D/T acknowledgement、ledger authority和独立Design approval均已闭合；实现按依赖逐簇进入，仍不得用局部能力代答最终EXE。
 
 ## Risks & Mitigations
 - **Windows share mask 自阻塞** — 为 root/intermediate/source/target/candidate/lock 定义不同 handle profiles；运行占用目标、同进程二次打开和跨进程 replace 矩阵。
-- **路径 proof 只在 NTFS 成立** — 探测 volume/file-system capabilities；首版只在通过完整 FileId/reparse/ACL/durability probes 的本地 volume 启用，其余 fail closed。
+- **路径/publish proof 只在受支持NTFS成立** — 探测local fixed volume、FileId/reparse/ACL与documented flush/write-through/naming capabilities；首版只在完整前置通过的NTFS启用，其余fail closed。
 - **`SetFileInformationByHandle` failure residue** — candidate identity、journal phase、readback 和 LKG recovery 共同分类；每个 API failure point 注入测试。
 - **pre-snapshot 被误当 CAS** — 仅允许 create-if-absent 或 resource lease 下 replace；记录不合作 writer threat scope，加入 instruction-boundary swap；需要强 CAS 的 owner 使用 immutable generation+journal/pointer。
 - **FileId reuse 被误当永久身份** — FileId 只比较 live handles；receipt 绑定 digest/phase/private/device-secret并在重启后重新证明，覆盖 delete/recreate reuse。
-- **process fault 被误当 durability** — W1 固定 NTFS success boundary，并用批准的 disposable VM/VHD/物理 lab 执行 forced power-off/reboot；缺证据保持 NOT_VERIFIED。
+- **协议恢复被误当硬件掉电认证** — `WindowsDocumentedPublishV1`以instruction fault、process termination、应用重启与正常OS reboot验证old/new/recovery-only；明确不宣称forced-power-loss存活，未来硬件认证必须独立治理。
 - **Windows ACL 与 POSIX mode 不等价** — ADR 固定 SID/DACL 规则，按 handle 重验 owner、DACL、inheritance、nlink；不使用 `chmod(0600)` 假通过。
 - **W2 proof 形成 self-MAC 或吞并业务 envelope** — business owner先对不含proof的canonical private-context取摘要，W2只对domain-separated unsigned proof projection做HMAC；Gate D/canonical envelope仍由原owner解释和发布。
 - **Python bootstrap被误写成最早DLL authority** — native bootloader已先加载Python DLL；W3必须在native entry/首次非KnownDLL load前固定搜索、绑定bundle并以受限绝对路径加载，Python层只消费handoff attestation。
