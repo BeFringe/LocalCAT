@@ -27,6 +27,7 @@ from tests.windows_process_token_helper import (
 )
 
 from platform_fs_contracts import (
+    LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
     PlatformFileBackend,
@@ -249,6 +250,26 @@ class WindowsPersistentLockTests(unittest.TestCase):
         self._rebind()
         second = self._acquire()
         second.close()
+
+    def test_root_authority_supports_same_parent_lock_and_ledger_observation(self) -> None:
+        (self.root_path / "entry.json").write_bytes(b"entry")
+        lease = WindowsProcessFileLock().acquire(
+            self.root,
+            "root-ledger.lock",
+            EXPECTED,
+            LockPolicy(LockWait.FAIL_FAST),
+        )
+        try:
+            observations = self.root.observe_ledger_entries(
+                lease,
+                LedgerEnumerationLimits(8, 255 * 4, 1024 * 1024),
+            )
+            self.assertEqual(
+                tuple(observation.name for observation in observations),
+                ("entry.json", "root-ledger.lock"),
+            )
+        finally:
+            lease.close()
 
     def test_create_new_accepts_only_file_exists_as_existing_protocol(self) -> None:
         api = self.parent._api

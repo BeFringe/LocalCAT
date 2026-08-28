@@ -2474,7 +2474,7 @@ class WindowsProcessFileLock(ProcessFileLock):
         payload: bytes,
         policy: LockPolicy,
     ) -> LockLease:
-        if not isinstance(parent, _WindowsBoundDirectory):
+        if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
             raise _lock_unavailable()
         _validate_windows_component(
             name,
