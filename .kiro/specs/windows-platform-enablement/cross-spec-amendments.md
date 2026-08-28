@@ -61,20 +61,20 @@ ADR-020～025 promotion、Windows owning scope、WA-01～08 current R/D/T delta�
 
 ### Dispatch Authority Register
 
-`dispatch_id`是task使用的稳定amendment身份；`dispatch_request_revision`只在本register内记录同一dispatch的合同版本（`R1`、`R2`、`R3`），不复制进每个task标签。同一WA在不同dispatch group出现时必须复用该身份、owning Spec acknowledgement与ledger row。真实合同增量必须升revision并把旧request保留为`SUPERSEDED`历史，不能原地改写。当前批准只冻结已acknowledged的R/D/T请求，不预填尚未发生的commit、artifact或终态disposition。owning Spec 的`spec.json`只表达该Spec基线文档/实现状态，不能覆盖本ledger登记的current amendment revision；对Windows cluster，授权条件是“基线允许且current `dispatch_request_revision`为`ACKNOWLEDGED`或更后终态”，任何`PENDING`/`SUPERSEDED`/`BLOCKED`均优先阻断对应suffix task、merge与evidence。
+`dispatch_id`是task使用的稳定amendment身份；`dispatch_request_revision`只在本register内记录同一dispatch的合同版本（`R1`、`R2`、`R3`），不复制进每个task标签。同一WA在不同dispatch group出现时必须复用该身份、owning Spec acknowledgement与ledger row。真实合同增量必须升revision并把旧request保留为`SUPERSEDED`历史，不能原地改写。当前批准只冻结已acknowledged的R/D/T请求，不预填尚未发生的commit、artifact或终态disposition。owning Spec 的`spec.json`只表达该Spec基线文档/实现状态，不能覆盖本ledger登记的current amendment revision；对Windows cluster，授权条件是“基线允许且current `dispatch_request_revision`为`ACKNOWLEDGED`或更后终态”，任何`PENDING`/`SUPERSEDED`/`BLOCKED`均优先阻断对应suffix task、integration与evidence。
 
-| dispatch_id | dispatch_request_revision | owning_spec | lineage_branch | owner_acknowledgement | current_status |
-|---|---|---|---|---|---|
-| WA-01 | `R1` | `parser-subsystem-extraction` | `parser-rebaseline` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-02 | `R1` | `collaborative-job-chunks` | `feature/collaborative-job-chunks` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-03 | `R2` | `multi-document-project-workspace` | `feature/multi-document-project-workspace` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-04 | `R1` | `language-resource-portability` | `feature/language-resource-portability` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-05 | `R1` | `tmx-context-interchange` | `ui-mvp` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-06 | `R3` | `tm-storage-retrieval-index` | `feature5` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-07 | `R1` | `feature5-ui-integration` | `ui-mvp` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ui-mvp` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| dispatch_id | dispatch_request_revision | owning_spec | owner_acknowledgement | current_status |
+|---|---|---|---|---|
+| WA-01 | `R1` | `parser-subsystem-extraction` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
+| WA-02 | `R1` | `collaborative-job-chunks` | `ACKNOWLEDGED` | `SOURCE_COMMITTED` |
+| WA-03 | `R2` | `multi-document-project-workspace` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-04 | `R1` | `language-resource-portability` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-05 | `R1` | `tmx-context-interchange` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-06 | `R3` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
 
-Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`WindowsDocumentedPublishV1`且移除运行时硬件registry/power-lab前置的`R2`完整取代；WA-06 `R1`曾因V1不能表达MIC authority由`R2`取代，现又由纳入ADR-024 provider-agnostic主体与ADR-025正常发布边界的`R3`完整取代。WA-03 `R1`及WA-06 `R1`/`R2`均标记`SUPERSEDED`，不得驱动实现、merge或evidence。
+Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`WindowsDocumentedPublishV1`且移除运行时硬件registry/power-lab前置的`R2`完整取代；WA-06 `R1`曾因V1不能表达MIC authority由`R2`取代，现又由纳入ADR-024 provider-agnostic主体与ADR-025正常发布边界的`R3`完整取代。WA-03 `R1`及WA-06 `R1`/`R2`均标记`SUPERSEDED`，不得驱动实现、integration或evidence。
 
 ## Amendment Dispatch Table
 
@@ -142,15 +142,24 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 |---|---|
 | dispatch_id | 上表稳定 ID |
 | dispatch_request_revision | 与`dispatch_id`组成唯一R/D/T request identity的`R1`/`R2`/`R3`版本；同一WA跨group不得重发 |
-| owning_spec / lineage_branch | 人类批准的唯一 Spec/合同 authority，以及承载其 amendment 的提交血缘；branch/worktree 本身不是 owner |
-| owner_acknowledgement | owning Spec对当前request revision的稳定批准状态；提交/merge identity另行记录 |
+| owning_spec | 人类批准的唯一 Spec/合同 authority；branch/worktree不构成owner或审批身份 |
+| owner_acknowledgement | owning Spec对当前request revision的稳定批准状态 |
 | current_status | `PENDING` / `ACKNOWLEDGED` / `SOURCE_COMMITTED` / `SOURCE_MERGED_PASS` / `FROZEN_PREBUILD_COMMITTED` / `FROZEN_REVALIDATED_PASS` / `COMMITTED` / `MERGED_PASS` / `BLOCKED` / `SUPERSEDED`；source与两个frozen staged状态均为非终态，只有`MERGED_PASS`是成功终态 |
 | requirements_approval | approved revision/commit |
 | design_approval | approved revision/commit，含 ADR mapping |
 | tasks_approval | approved revision/commit，含 amendment task IDs |
-| amendment_commit | 单一可追踪 commit；禁止只记工作树 hash |
-| merged_into_windows | merge commit/parent，可达性验证 |
+| amendment_commits | 默认单一可追踪commit；只有owning R/D/T批准的依赖分期可记录按任务suffix排序的多个commit，每项都必须可达且有独立evidence；禁止只记工作树hash或patch-equivalent |
+| integrated_windows_tip | 可达 amendment commit 与 evidence 的 Windows tip |
 | evidence_manifest | portable artifact key + SHA-256；包含 R/D/T task suffix |
 | disposition | 仅在终态记录`MERGED_PASS` / `BLOCKED` / `SUPERSEDED`，不得用 `SKIPPED` 放行 required row |
+
+### Current Integration Facts
+
+| dispatch_id | revision | owning_spec | amendment_commits | integrated_windows_tip | current_status | evidence_manifest | disposition |
+|---|---|---|---|---|---|---|---|
+| WA-01 | `R1` | `parser-subsystem-extraction` | `da986925f47fe6d18cb0f316c79a70c0655808b6` (`2.5a/2.12a/5.2a/5.12a`) | `da986925f47fe6d18cb0f316c79a70c0655808b6` | `SOURCE_MERGED_PASS` | `artifacts/windows/c4s-wa01-parser/da98692/evidence-manifest.json` / `ca67939b3fa58393f15baef938a136d1040d72580c5ef5387abd8ce50954a164` | — |
+| WA-02 | `R1` | `collaborative-job-chunks` | `a0cde80aa18958b60490f60d6f0a56f24821e68b` (`1.3a/1.4a/3.2a`) | `da986925f47fe6d18cb0f316c79a70c0655808b6` | `SOURCE_COMMITTED` | `artifacts/windows/c4s-wa02-startup/a0cde80/evidence-manifest.json` / `d68561c1abc061528ecfc503d7c5d0d395cf8881a64425f00ccd6d200dad2157` | — |
+
+C4S source Qt startup evidence：`artifacts/windows/c4s-source-startup/da98692/evidence-manifest.json` / `f07469c7162423b5b08888f7a1821529bfaaf12b67602161c86925d0b8c8405f`；该结果只证明user-managed source runtime，不提升任何frozen/packaged状态。
 
 `WR-*` 记录 revalidation commit、artifact key、结果和“无 contract delta”的 owner确认。只有 ledger 全部闭合且实际代码差异仍落在获批边界内，最终 Windows Feature GO 才可进入审查。
