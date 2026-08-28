@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "localcat.windows-frozen-custom-entry-no-go.v1",
+  "title": "LocalCAT Windows frozen custom-entry NO-GO evidence",
+  "type": "object",
+  "required": [
+    "schema",
+    "status",
+    "repository_commit",
+    "candidate_input_digest",
+    "candidate_lock_sha256",
+    "host",
+    "evidence_producer",
+    "source_identity",
+    "inputs",
+    "probe",
+    "raw_artifacts",
+    "target_contract",
+    "observed_pre_e10_dynamic_modules",
+    "observed_system_provider",
+    "static_python_loader_surface",
+    "pristine_pyinstaller_path",
+    "blocker",
+    "matrix_contract",
+    "matrix",
+    "replay_projection_digest",
+    "evidence_digest"
+  ],
+  "properties": {
+    "schema": {"const": "localcat.windows-frozen-custom-entry-no-go.v1"},
+    "status": {"const": "NO_GO"},
+    "repository_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "candidate_input_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "candidate_lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "host": {"type": "object"},
+    "evidence_producer": {"type": "object"},
+    "source_identity": {"type": "object"},
+    "inputs": {"type": "object"},
+    "probe": {"type": "object"},
+    "raw_artifacts": {
+      "type": "object",
+      "required": [
+        "compile.stdout.log",
+        "compile.stderr.log",
+        "probe.stdout.log",
+        "probe.stderr.log",
+        "probe.obj",
+        "probe.exe",
+        "python314.dumpbin.log"
+      ],
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "target_contract": {"type": "object"},
+    "observed_pre_e10_dynamic_modules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["stage", "module", "path", "observed_path_role"]
+      }
+    },
+    "observed_system_provider": {"type": "object"},
+    "static_python_loader_surface": {"type": "object"},
+    "pristine_pyinstaller_path": {"type": "object"},
+    "blocker": {
+      "type": "object",
+      "required": [
+        "code",
+        "observed_fact",
+        "static_fact",
+        "stock_path_fact",
+        "required_reapproval_delta",
+        "preserved_implementation_boundary",
+        "decision"
+      ]
+    },
+    "matrix_contract": {"type": "object"},
+    "matrix": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "detail"],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"enum": ["PASS", "FAIL", "BLOCKED_NOT_RUN"]},
+          "detail": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "replay_projection_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}
