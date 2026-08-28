@@ -230,17 +230,17 @@
   - _Boundary: Windows Platform Capability Gate_
   - _Depends: 3.4, 3.6_
 
-- [ ] 4. 合并 Parser/Chunk amendments并恢复 source Qt启动
+- [x] 4. 集成 Parser/Chunk amendments并恢复 source Qt启动
 
-- [ ] 4.1 验证并合并 WA-01 Parser 与 WA-02 Chunk amendment commits
-  - 核对 owning Spec acknowledgement、lineage branch、R/D/T approvals、task suffix、commit/merge parent和portable evidence，不从其他工作树复制patch
-  - 更新ledger为 `SOURCE_MERGED_PASS`前重跑双方contract/adversarial tests；任一身份不一致停止，frozen阶段未闭合前不得写入terminal `MERGED_PASS`
-  - 完成时，Windows分支可达两个approved merge，且业务错误/状态机仍由原 owner拥有
+- [x] 4.1 验证并集成 WA-01 Parser 与 WA-02 startup amendment commits
+  - 核对 owning Spec acknowledgement、R/D/T approvals、task suffix、commit可达性和portable evidence
+  - WA-01全部source suffix通过后登记`SOURCE_MERGED_PASS`；WA-02本阶段只集成`1.3a/1.4a/3.2a`并登记`SOURCE_COMMITTED`，其真实ProjectPackage耦合的`4.4a/4.5a`等待WA-03 source后闭合。任一批准revision或commit不一致即停止，frozen阶段未闭合前不得写入terminal `MERGED_PASS`
+  - 完成时，Windows分支可达两个approved amendment commits，且业务错误/状态机仍由各自owning Spec拥有；WA-02 partial状态不得冒充完整source验收
   - _Requirements: 2.6, 3.1, 5.1, 5.3, 12.5_
-  - _Boundary: Parser and Chunk Amendment Merge_
+  - _Boundary: Parser and Chunk Amendment Integration_
   - _Depends: 0.3a, 3.7_
 
-- [ ] 4.2 验证 Parser Windows source/writer vertical slice
+- [x] 4.2 验证 Parser Windows source/writer vertical slice
   - 真实读写获授权source，执行sealed copy、codec/body-safe/stale/atomic writer/readback；所有原POSIX-only rooted adversarial cases在Windows backend运行
   - 能力不可用仍返回既有`PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE`/获批子码，且目标/正文零变更
   - 完成时，Windows source Parser通过且形成可供Project/TMX/resource消费的正式owner port，无mock/skip/现场patch；frozen复验由WA-01 5.12b与Task 7负责
@@ -248,15 +248,15 @@
   - _Boundary: Parser Windows Vertical Slice_
   - _Depends: 4.1_
 
-- [ ] 4.3 验证 collaborative chunk lock/publish/recovery vertical slice
+- [x] 4.3 验证 collaborative chunk lock/publish/recovery vertical slice
   - 证明import/controller composition不再顶层加载`fcntl`，chunk publish沿LockFileEx+publisher并保留journal/LKG/recovery codes
-  - 运行双进程竞争、target-open、kill release、rename/close/readback faults与restart recovery
-  - 完成时，唯一authority/old-new-recovery矩阵全绿且无direct POSIX primitive
+  - 运行独立metadata namespace的双进程竞争、target-open、kill release、rename/close/readback faults与restart recovery；本阶段不以未迁移ProjectPackage或自造ZIP代答
+  - 完成时，唯一authority/old-new-recovery矩阵全绿且无direct POSIX primitive；真实ProjectPackage冷开仍由WA-02 `4.4a/4.5a`在C5S闭合
   - _Requirements: 1.1, 3.1, 3.2, 4.3, 5.2, 6.3_
   - _Boundary: Collaborative Chunk Windows Vertical Slice_
   - _Depends: 4.1_
 
-- [ ] 4.4 在源码环境启动真实 LocalCAT Qt主窗口
+- [x] 4.4 在源码环境启动真实 LocalCAT Qt主窗口
   - clean CPython 3.14 x64 venv安装`requirements-ui.txt`并`pip check`；不得安装xlwings/Excel或注入兼容patch
   - 使用Qt windows plugin加载真实`qwindows.dll`、创建可见主窗口、进入事件循环并输出受控smoke marker
   - 完成时，source LocalCAT从非仓库CWD启动，不因POSIX import/capability composition退出；缺插件路径返回可诊断失败
