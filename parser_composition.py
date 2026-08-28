@@ -9,6 +9,11 @@ without importing codec, registry, or Source Boundary internals.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from platform_fs import compose_platform_file_backend as _compose_platform_file_backend
+from platform_fs_contracts import PlatformFileBackend, PlatformFileError
 
 from parser_contracts import (
     BUILTIN_FORMAT_IDS,
@@ -54,6 +59,7 @@ from parser_tmx_codec import TMX_CODEC_DESCRIPTOR as _TMX_CODEC_DESCRIPTOR
 
 
 _COMPOSITION_AUTHORITY = object()
+_PlatformBackendFactory = Callable[[Path], PlatformFileBackend]
 
 
 class ProviderConfigurationError(ContractViolation):
@@ -62,6 +68,24 @@ class ProviderConfigurationError(ContractViolation):
 
 class ParserApplicationError(ContractViolation):
     """Body-safe failure at the composition-owned Application surface."""
+
+
+def _rooted_backend(
+    factory: _PlatformBackendFactory,
+    root_text: str,
+) -> PlatformFileBackend:
+    """Compose one live rooted backend while retaining Parser failure semantics."""
+
+    try:
+        backend = factory(Path(root_text))
+    except PlatformFileError:
+        raise _ParserSourceError(
+            "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE",
+            "this platform cannot establish the required rooted file authority",
+        ) from None
+    if not isinstance(backend, PlatformFileBackend):
+        raise TypeError("platform backend factory must return PlatformFileBackend")
+    return backend
 
 
 def _preview_termbase_columns_on_snapshot(
@@ -200,6 +224,7 @@ def create_parser_application_surface(
 
     return ParserApplicationSurface(
         create_builtin_registry(providers=providers),
+        _platform_backend_factory=_compose_platform_file_backend,
         _authority=_COMPOSITION_AUTHORITY,
     )
 
@@ -207,12 +232,13 @@ def create_parser_application_surface(
 class ParserApplicationSurface:
     """Coordinate selection, sealed reads, guarded views, and canonical writes."""
 
-    __slots__ = ("_registry",)
+    __slots__ = ("_registry", "_platform_backend_factory")
 
     def __init__(
         self,
         registry: _ParserRegistry,
         *,
+        _platform_backend_factory: _PlatformBackendFactory | None = None,
         _authority: object = None,
     ) -> None:
         if _authority is not _COMPOSITION_AUTHORITY:
@@ -222,7 +248,10 @@ class ParserApplicationSurface:
             )
         if type(registry) is not _ParserRegistry:
             raise TypeError("registry must be exact ParserRegistry")
+        if not callable(_platform_backend_factory):
+            raise TypeError("platform backend factory must be callable")
         self._registry = registry
+        self._platform_backend_factory = _platform_backend_factory
 
     def select(
         self,
@@ -265,6 +294,10 @@ class ParserApplicationSurface:
             reference,
             limit_profile=descriptor.limit_profile,
             cancellation=cancellation,
+            file_system=_rooted_backend(
+                self._platform_backend_factory,
+                reference.safe_root,
+            ),
         )
         return OpenedParserInput(
             self._registry,
@@ -313,6 +346,10 @@ class ParserApplicationSurface:
             reference,
             limit_profile=descriptor.limit_profile,
             cancellation=cancellation,
+            file_system=_rooted_backend(
+                self._platform_backend_factory,
+                reference.safe_root,
+            ),
         )
         try:
             return _preview_termbase_columns_on_snapshot(
@@ -381,6 +418,7 @@ class ParserApplicationSurface:
             )
         return PreparedCanonicalWrite(
             serialized.payload,
+            _platform_backend_factory=self._platform_backend_factory,
             _authority=_COMPOSITION_AUTHORITY,
         )
 
@@ -388,12 +426,13 @@ class ParserApplicationSurface:
 class PreparedCanonicalWrite:
     """Opaque, factory-issued canonical payload authorized only for rooted writes."""
 
-    __slots__ = ("__payload", "_frozen")
+    __slots__ = ("__payload", "__platform_backend_factory", "_frozen")
 
     def __init__(
         self,
         payload: bytes,
         *,
+        _platform_backend_factory: _PlatformBackendFactory | None = None,
         _authority: object = None,
     ) -> None:
         if _authority is not _COMPOSITION_AUTHORITY:
@@ -403,7 +442,14 @@ class PreparedCanonicalWrite:
             )
         if type(payload) is not bytes:
             raise TypeError("prepared canonical payload must be exact bytes")
+        if not callable(_platform_backend_factory):
+            raise TypeError("platform backend factory must be callable")
         object.__setattr__(self, "_PreparedCanonicalWrite__payload", payload)
+        object.__setattr__(
+            self,
+            "_PreparedCanonicalWrite__platform_backend_factory",
+            _platform_backend_factory,
+        )
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -417,7 +463,14 @@ class PreparedCanonicalWrite:
 
         if type(target) is not TargetReference:
             raise TypeError("target must be exact TargetReference")
-        return _atomic_write_bytes(target, self.__payload)
+        return _atomic_write_bytes(
+            target,
+            self.__payload,
+            backend=_rooted_backend(
+                self.__platform_backend_factory,
+                target.safe_root,
+            ),
+        )
 
 
 class OpenedParserInput:
