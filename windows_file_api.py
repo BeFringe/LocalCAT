@@ -17,6 +17,7 @@ BOOLEAN = BYTE
 WORD = ctypes.c_uint16
 DWORD = ctypes.c_uint32
 LONG = ctypes.c_int32
+NTSTATUS = ctypes.c_int32
 ULONG = ctypes.c_uint32
 ULONGLONG = ctypes.c_uint64
 ULONG_PTR = ctypes.c_size_t
@@ -38,6 +39,8 @@ WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 258
 WAIT_FAILED = 0xFFFFFFFF
 DUPLICATE_SAME_ACCESS = 0x00000002
+STATUS_INVALID_HANDLE = 0xC0000008
+FILE_RENAME_INFORMATION_CLASS = 10
 
 
 class FILE_ID_128(ctypes.Structure):
@@ -132,6 +135,34 @@ class FILE_RENAME_INFO(ctypes.Structure):
     ]
 
 
+class FILE_RENAME_INFORMATION(ctypes.Structure):
+    """Native FileRenameInformation layout used by NtSetInformationFile."""
+
+    _layout_ = "ms"
+    _fields_ = [
+        ("ReplaceIfExists", BOOLEAN),
+        ("RootDirectory", HANDLE),
+        ("FileNameLength", ULONG),
+        ("FileName", ctypes.c_wchar * 1),
+    ]
+
+
+class _IO_STATUS_BLOCK_RESULT(ctypes.Union):
+    _layout_ = "ms"
+    _fields_ = [("Status", NTSTATUS), ("Pointer", LPVOID)]
+
+
+class IO_STATUS_BLOCK(ctypes.Structure):
+    _layout_ = "ms"
+    _anonymous_ = ("result",)
+    _fields_ = [("result", _IO_STATUS_BLOCK_RESULT), ("Information", ULONG_PTR)]
+
+
+class FILE_DISPOSITION_INFO(ctypes.Structure):
+    _layout_ = "ms"
+    _fields_ = [("DeleteFile", BOOLEAN)]
+
+
 class GENERIC_MAPPING(ctypes.Structure):
     _layout_ = "ms"
     _fields_ = [
@@ -209,54 +240,6 @@ class SECURITY_ATTRIBUTES(ctypes.Structure):
     ]
 
 
-class STORAGE_PROPERTY_QUERY(ctypes.Structure):
-    _layout_ = "ms"
-    _fields_ = [
-        ("PropertyId", DWORD),
-        ("QueryType", DWORD),
-        ("AdditionalParameters", BYTE * 1),
-    ]
-
-
-class STORAGE_DESCRIPTOR_HEADER(ctypes.Structure):
-    _layout_ = "ms"
-    _fields_ = [("Version", DWORD), ("Size", DWORD)]
-
-
-class STORAGE_DEVICE_DESCRIPTOR(ctypes.Structure):
-    _layout_ = "ms"
-    _fields_ = [
-        ("Version", DWORD),
-        ("Size", DWORD),
-        ("DeviceType", BYTE),
-        ("DeviceTypeModifier", BYTE),
-        ("RemovableMedia", BOOLEAN),
-        ("CommandQueueing", BOOLEAN),
-        ("VendorIdOffset", DWORD),
-        ("ProductIdOffset", DWORD),
-        ("ProductRevisionOffset", DWORD),
-        ("SerialNumberOffset", DWORD),
-        ("BusType", DWORD),
-        ("RawPropertiesLength", DWORD),
-        ("RawDeviceProperties", BYTE * 1),
-    ]
-
-
-class STORAGE_WRITE_CACHE_PROPERTY(ctypes.Structure):
-    _layout_ = "ms"
-    _fields_ = [
-        ("Version", DWORD),
-        ("Size", DWORD),
-        ("WriteCacheType", DWORD),
-        ("WriteCacheEnabled", DWORD),
-        ("WriteCacheChangeable", DWORD),
-        ("WriteThroughSupported", DWORD),
-        ("FlushCacheSupported", BOOLEAN),
-        ("UserDefinedPowerProtection", BOOLEAN),
-        ("NVCacheEnabled", BOOLEAN),
-    ]
-
-
 class Win32CallError(OSError):
     """Internal Win32 call failure; adapters normalize it before public use."""
 
@@ -266,6 +249,17 @@ class Win32CallError(OSError):
         self.function = function
         self.winerror = winerror
         super().__init__(winerror)
+
+
+class NtStatusError(OSError):
+    """Internal NTSTATUS failure; adapters normalize it before public use."""
+
+    __slots__ = ("function", "ntstatus")
+
+    def __init__(self, function: str, ntstatus: int) -> None:
+        self.function = function
+        self.ntstatus = int(ntstatus) & 0xFFFFFFFF
+        super().__init__(self.ntstatus)
 
 
 class _Win32HandleBorrow:
@@ -382,6 +376,7 @@ PPRIVILEGE_SET = ctypes.POINTER(PRIVILEGE_SET)
 # Constructor declarations are checked against it before a function is exposed.
 WIN32_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
     "CreateFileW": ((LPCWSTR, DWORD, DWORD, PSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE), HANDLE),
+    "CreateDirectoryW": ((LPCWSTR, PSECURITY_ATTRIBUTES), BOOL),
     "CloseHandle": ((HANDLE,), BOOL),
     "DuplicateHandle": ((HANDLE, HANDLE, HANDLE, PHANDLE, DWORD, BOOL, DWORD), BOOL),
     "ReadFile": ((HANDLE, LPVOID, DWORD, PDWORD, POVERLAPPED), BOOL),
@@ -389,6 +384,7 @@ WIN32_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
     "GetFileInformationByHandleEx": ((HANDLE, ctypes.c_int, LPVOID, DWORD), BOOL),
     "GetFinalPathNameByHandleW": ((HANDLE, LPWSTR, DWORD, DWORD), DWORD),
     "SetFilePointerEx": ((HANDLE, LARGE_INTEGER, ctypes.POINTER(LARGE_INTEGER), DWORD), BOOL),
+    "SetEndOfFile": ((HANDLE,), BOOL),
     "SetFileInformationByHandle": ((HANDLE, ctypes.c_int, LPVOID, DWORD), BOOL),
     "FlushFileBuffers": ((HANDLE,), BOOL),
     "LockFileEx": ((HANDLE, DWORD, DWORD, DWORD, DWORD, POVERLAPPED), BOOL),
@@ -398,7 +394,6 @@ WIN32_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
     "GetVolumeInformationW": ((LPCWSTR, LPWSTR, DWORD, PDWORD, PDWORD, PDWORD, LPWSTR, DWORD), BOOL),
     "GetVolumeInformationByHandleW": ((HANDLE, LPWSTR, DWORD, PDWORD, PDWORD, PDWORD, LPWSTR, DWORD), BOOL),
     "GetDriveTypeW": ((LPCWSTR,), UINT),
-    "DeviceIoControl": ((HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, PDWORD, POVERLAPPED), BOOL),
     "CreateEventW": ((PSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR), HANDLE),
     "WaitForSingleObject": ((HANDLE, DWORD), DWORD),
     "CancelIoEx": ((HANDLE, POVERLAPPED), BOOL),
@@ -412,6 +407,7 @@ WIN32_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
     "MapGenericMask": ((PDWORD, ctypes.POINTER(GENERIC_MAPPING)), None),
     "OpenProcessToken": ((HANDLE, DWORD, PHANDLE), BOOL),
     "DuplicateTokenEx": ((HANDLE, DWORD, PSECURITY_ATTRIBUTES, ctypes.c_int, ctypes.c_int, PHANDLE), BOOL),
+    "IsTokenRestricted": ((HANDLE,), BOOL),
     "GetTokenInformation": ((HANDLE, ctypes.c_int, LPVOID, DWORD, PDWORD), BOOL),
     "GetSecurityDescriptorControl": ((PSECURITY_DESCRIPTOR, ctypes.POINTER(WORD), PDWORD), BOOL),
     "GetAclInformation": ((PACL, LPVOID, DWORD, ctypes.c_int), BOOL),
@@ -431,6 +427,19 @@ WIN32_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
     "GetSidSubAuthority": ((PSID, DWORD), PDWORD),
 }
 
+NTDLL_SIGNATURES: dict[str, tuple[tuple[object, ...], object]] = {
+    "NtSetInformationFile": (
+        (
+            HANDLE,
+            ctypes.POINTER(IO_STATUS_BLOCK),
+            LPVOID,
+            ULONG,
+            ctypes.c_int,
+        ),
+        NTSTATUS,
+    ),
+}
+
 
 def _bind(dll: object, name: str, argtypes: list[object], restype: object) -> object:
     expected_argtypes, expected_restype = WIN32_SIGNATURES[name]
@@ -442,10 +451,78 @@ def _bind(dll: object, name: str, argtypes: list[object], restype: object) -> ob
     return function
 
 
-class WindowsFileAPI:
-    """Loaded and signature-checked Kernel32/Advapi32 function table."""
+def _bind_ntdll(
+    dll: object,
+    name: str,
+    argtypes: list[object],
+    restype: object,
+) -> object:
+    expected_argtypes, expected_restype = NTDLL_SIGNATURES[name]
+    if tuple(argtypes) != expected_argtypes or restype is not expected_restype:
+        raise RuntimeError(f"Ntdll signature declaration drift: {name}")
+    function = getattr(dll, name)
+    function.argtypes = argtypes
+    function.restype = restype
+    return function
 
-    def __init__(self, kernel32: object, advapi32: object) -> None:
+
+def _ntstatus_value(status: object) -> int:
+    value = status.value if isinstance(status, ctypes._SimpleCData) else status
+    return int(value) & 0xFFFFFFFF
+
+
+def _build_file_rename_information(
+    component: str,
+    *,
+    replace_if_exists: bool,
+) -> tuple[ctypes.Array[ctypes.c_char], int]:
+    if type(component) is not str or not component:
+        raise TypeError("component must be a non-empty exact str")
+    if type(replace_if_exists) is not bool:
+        raise TypeError("replace_if_exists must be exact bool")
+    if any(value in component for value in ("\0", "/", "\\", ":")):
+        raise ValueError("native rename accepts one relative path component")
+    try:
+        encoded = component.encode("utf-16-le")
+    except UnicodeEncodeError:
+        raise ValueError("component must be valid UTF-16") from None
+    if not encoded or len(encoded) > 0xFFFFFFFF:
+        raise ValueError("component length is outside native ABI")
+    exact_length = FILE_RENAME_INFORMATION.FileName.offset + len(encoded)
+    # The kernel receives only ``exact_length`` bytes.  Keep the local ctypes
+    # backing allocation large enough for its declared one-wchar tail even for
+    # a one-code-unit component.
+    storage = ctypes.create_string_buffer(
+        max(exact_length, ctypes.sizeof(FILE_RENAME_INFORMATION))
+    )
+    information = ctypes.cast(
+        storage,
+        ctypes.POINTER(FILE_RENAME_INFORMATION),
+    ).contents
+    information.ReplaceIfExists = int(replace_if_exists)
+    information.RootDirectory = None
+    information.FileNameLength = len(encoded)
+    ctypes.memmove(
+        ctypes.addressof(storage) + FILE_RENAME_INFORMATION.FileName.offset,
+        encoded,
+        len(encoded),
+    )
+    return storage, exact_length
+
+
+class WindowsFileAPI:
+    """Loaded and signature-checked Kernel32/Advapi32/Ntdll function table."""
+
+    def __init__(
+        self,
+        kernel32: object,
+        advapi32: object,
+        ntdll_loader: Callable[[], object],
+    ) -> None:
+        if not callable(ntdll_loader):
+            raise TypeError("ntdll_loader must be callable")
+        self._ntdll_loader = ntdll_loader
+        self._ntdll_bind_lock = threading.Lock()
         pdword = ctypes.POINTER(DWORD)
         phandle = ctypes.POINTER(HANDLE)
         poverlapped = ctypes.POINTER(OVERLAPPED)
@@ -455,6 +532,12 @@ class WindowsFileAPI:
             "CreateFileW",
             [LPCWSTR, DWORD, DWORD, psecurity_attributes, DWORD, DWORD, HANDLE],
             HANDLE,
+        )
+        self.CreateDirectoryW = _bind(
+            kernel32,
+            "CreateDirectoryW",
+            [LPCWSTR, psecurity_attributes],
+            BOOL,
         )
         self.CloseHandle = _bind(kernel32, "CloseHandle", [HANDLE], BOOL)
         self.DuplicateHandle = _bind(
@@ -487,6 +570,7 @@ class WindowsFileAPI:
             [HANDLE, LARGE_INTEGER, ctypes.POINTER(LARGE_INTEGER), DWORD],
             BOOL,
         )
+        self.SetEndOfFile = _bind(kernel32, "SetEndOfFile", [HANDLE], BOOL)
         self.SetFileInformationByHandle = _bind(
             kernel32,
             "SetFileInformationByHandle",
@@ -531,12 +615,6 @@ class WindowsFileAPI:
         )
         self.GetDriveTypeW = _bind(
             kernel32, "GetDriveTypeW", [LPCWSTR], UINT
-        )
-        self.DeviceIoControl = _bind(
-            kernel32,
-            "DeviceIoControl",
-            [HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, pdword, poverlapped],
-            BOOL,
         )
         self.CreateEventW = _bind(
             kernel32,
@@ -614,6 +692,12 @@ class WindowsFileAPI:
             advapi32,
             "DuplicateTokenEx",
             [HANDLE, DWORD, ctypes.POINTER(SECURITY_ATTRIBUTES), ctypes.c_int, ctypes.c_int, phandle],
+            BOOL,
+        )
+        self.IsTokenRestricted = _bind(
+            advapi32,
+            "IsTokenRestricted",
+            [HANDLE],
             BOOL,
         )
         self.GetTokenInformation = _bind(
@@ -702,7 +786,6 @@ class WindowsFileAPI:
             [PSID, DWORD],
             pdword,
         )
-
     @classmethod
     def load(cls, *, _dll_loader: object | None = None) -> WindowsFileAPI:
         if sys.platform != "win32":
@@ -712,7 +795,11 @@ class WindowsFileAPI:
             raise Win32CallError("WinDLL", 0)
         kernel32 = loader("kernel32.dll", use_last_error=True)
         advapi32 = loader("advapi32.dll", use_last_error=True)
-        return cls(kernel32, advapi32)
+        return cls(
+            kernel32,
+            advapi32,
+            lambda: loader("ntdll.dll", use_last_error=True),
+        )
 
     @staticmethod
     def last_error() -> int:
@@ -743,6 +830,93 @@ class WindowsFileAPI:
         value = int(status)
         if value != 0:
             raise Win32CallError(name, value)
+
+    @staticmethod
+    def checked_ntstatus_zero(name: str, status: object) -> None:
+        value = _ntstatus_value(status)
+        if value != 0:
+            raise NtStatusError(name, value)
+
+    def _nt_set_information_file(self) -> object:
+        function = getattr(self, "NtSetInformationFile", None)
+        if callable(function):
+            return function
+        with self._ntdll_bind_lock:
+            function = getattr(self, "NtSetInformationFile", None)
+            if callable(function):
+                return function
+            ntdll = self._ntdll_loader()
+            function = _bind_ntdll(
+                ntdll,
+                "NtSetInformationFile",
+                [
+                    HANDLE,
+                    ctypes.POINTER(IO_STATUS_BLOCK),
+                    LPVOID,
+                    ULONG,
+                    ctypes.c_int,
+                ],
+                NTSTATUS,
+            )
+            self.NtSetInformationFile = function
+            return function
+
+    def self_probe_nt_set_information_file(self) -> None:
+        function = self._nt_set_information_file()
+        if (
+            ctypes.sizeof(FILE_RENAME_INFORMATION) != 24
+            or FILE_RENAME_INFORMATION.ReplaceIfExists.offset != 0
+            or FILE_RENAME_INFORMATION.RootDirectory.offset != 8
+            or FILE_RENAME_INFORMATION.FileNameLength.offset != 16
+            or FILE_RENAME_INFORMATION.FileName.offset != 20
+            or ctypes.sizeof(IO_STATUS_BLOCK) != 16
+            or IO_STATUS_BLOCK.Status.offset != 0
+            or IO_STATUS_BLOCK.Information.offset != 8
+            or tuple(function.argtypes)
+            != NTDLL_SIGNATURES["NtSetInformationFile"][0]
+            or function.restype
+            is not NTDLL_SIGNATURES["NtSetInformationFile"][1]
+        ):
+            raise RuntimeError("native rename ABI self-probe failed")
+        storage, exact_length = _build_file_rename_information(
+            "__",
+            replace_if_exists=False,
+        )
+        io_status = IO_STATUS_BLOCK()
+        status = function(
+            None,
+            ctypes.byref(io_status),
+            storage,
+            exact_length,
+            FILE_RENAME_INFORMATION_CLASS,
+        )
+        value = _ntstatus_value(status)
+        if value != STATUS_INVALID_HANDLE:
+            raise NtStatusError("NtSetInformationFile.self_probe", value)
+
+    def rename_file_same_parent(
+        self,
+        raw_handle: int,
+        component: str,
+        *,
+        replace_if_exists: bool,
+    ) -> None:
+        if type(raw_handle) is not int or raw_handle in {0, INVALID_HANDLE_VALUE}:
+            raise TypeError("raw_handle must be an exact live HANDLE value")
+        storage, exact_length = _build_file_rename_information(
+            component,
+            replace_if_exists=replace_if_exists,
+        )
+        io_status = IO_STATUS_BLOCK()
+        status = self._nt_set_information_file()(
+            raw_handle,
+            ctypes.byref(io_status),
+            storage,
+            exact_length,
+            FILE_RENAME_INFORMATION_CLASS,
+        )
+        self.checked_ntstatus_zero("NtSetInformationFile", status)
+        self.checked_ntstatus_zero("NtSetInformationFile.IO_STATUS_BLOCK", io_status.Status)
 
     def checked_length(self, name: str, result: object) -> int:
         value = int(result)
@@ -792,12 +966,20 @@ class WindowsFileAPI:
         share_mode: int,
         creation_disposition: int,
         flags: int,
+        security_attributes: SECURITY_ATTRIBUTES | None = None,
     ) -> Win32Handle:
+        if security_attributes is not None and type(security_attributes) is not SECURITY_ATTRIBUTES:
+            raise TypeError("security_attributes must be exact SECURITY_ATTRIBUTES")
+        security_pointer = (
+            None
+            if security_attributes is None
+            else ctypes.byref(security_attributes)
+        )
         raw = self.CreateFileW(
             path,
             desired_access,
             share_mode,
-            None,
+            security_pointer,
             creation_disposition,
             flags,
             None,
