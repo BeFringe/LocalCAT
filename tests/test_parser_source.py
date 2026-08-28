@@ -8,6 +8,13 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests.parser_io_test_support import (
+    atomic_test_write_bytes,
+    create_test_sealed_snapshot,
+    open_test_rooted_regular_file,
+    reopen_test_sealed_snapshot,
+)
+
 
 class _FixtureMixin:
     def setUp(self) -> None:
@@ -202,11 +209,11 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
     def test_rooted_open_and_snapshot_bind_actual_bytes_once(self) -> None:
         from parser_source import create_sealed_snapshot, open_rooted_regular_file
 
-        with open_rooted_regular_file(self.source_reference()) as opened:
+        with open_test_rooted_regular_file(self.source_reference()) as opened:
             self.assertTrue(opened.is_regular_file)
             self.assertEqual(opened.relative_path, "input/nested/chapter.txt")
 
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=self.profile(),
         )
@@ -227,7 +234,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
             selected_path=str(self.source),
             display_hint="spoofed-name.json",
         )
-        spoofed_snapshot = create_sealed_snapshot(
+        spoofed_snapshot = create_test_sealed_snapshot(
             spoofed,
             limit_profile=self.profile(),
         )
@@ -282,7 +289,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         )
         for reference, code in cases:
             with self.subTest(code=code), self.assertRaises(ParserSourceError) as caught:
-                open_rooted_regular_file(reference)
+                open_test_rooted_regular_file(reference)
             self.assertEqual(caught.exception.code, code)
             self.assertNotIn("secret", str(caught.exception))
 
@@ -291,7 +298,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
 
         with mock.patch("parser_source._rooted_handles_available", return_value=False):
             with self.assertRaises(ParserSourceError) as caught:
-                open_rooted_regular_file(self.source_reference())
+                open_test_rooted_regular_file(self.source_reference())
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE")
 
     def test_snapshot_rejects_input_limit_and_fstat_drift_and_cleans_temp(self) -> None:
@@ -299,7 +306,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
 
         tiny = self.profile(max_input_bytes=2)
         with self.assertRaises(ParserSourceError) as caught:
-            create_sealed_snapshot(self.source_reference(), limit_profile=tiny)
+            create_test_sealed_snapshot(self.source_reference(), limit_profile=tiny)
         self.assertEqual(caught.exception.code, "PARSER.LIMIT.INPUT")
 
         original_fstat = os.fstat
@@ -317,7 +324,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
 
         with mock.patch("parser_source.os.fstat", side_effect=drifting_fstat):
             with self.assertRaises(ParserSourceError) as caught:
-                create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+                create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.STALE")
 
     def test_snapshot_rejects_real_source_mutation_during_its_single_copy(self) -> None:
@@ -336,14 +343,14 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
 
         with mock.patch("parser_source.os.read", side_effect=mutate_after_read):
             with self.assertRaises(ParserSourceError) as caught:
-                create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+                create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         self.assertTrue(mutated)
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.STALE")
 
     def test_sequential_leases_are_independent_offset_zero_and_non_seekable(self) -> None:
         from parser_source import create_sealed_snapshot
 
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         descriptor = self.descriptor()
         first = snapshot.lease(descriptor)
         second = snapshot.lease(descriptor)
@@ -363,7 +370,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
     def test_seekable_lease_is_single_active_and_needs_explicit_consumption_proof(self) -> None:
         from parser_source import ParserSourceError, create_sealed_snapshot
 
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         from parser_contracts import InputConsumptionPolicy
 
         descriptor = self.descriptor(
@@ -394,7 +401,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         cancelled = CancellationToken()
         cancelled.cancel()
         with self.assertRaises(ParserSourceError) as caught:
-            create_sealed_snapshot(
+            create_test_sealed_snapshot(
                 self.source_reference(),
                 limit_profile=self.profile(),
                 cancellation=cancelled,
@@ -402,7 +409,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.CANCELLED")
 
         profile = self.profile()
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=profile)
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=profile)
         expectation = snapshot.expectation
         snapshot.close()
         with self.assertRaises(ParserSourceError) as caught:
@@ -412,7 +419,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         changed_profile = self.profile()
         object.__setattr__(changed_profile, "profile_version", 2)
         with self.assertRaises(ParserSourceError) as caught:
-            reopen_sealed_snapshot(
+            reopen_test_sealed_snapshot(
                 self.source_reference(),
                 limit_profile=changed_profile,
                 expected=expectation,
@@ -421,7 +428,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
 
         self.source.write_bytes(b"changed bytes")
         with self.assertRaises(ParserSourceError) as caught:
-            reopen_sealed_snapshot(
+            reopen_test_sealed_snapshot(
                 self.source_reference(),
                 limit_profile=profile,
                 expected=expectation,
@@ -431,7 +438,7 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
     def test_snapshot_close_waits_for_active_lease_then_cleans_up(self) -> None:
         from parser_source import create_sealed_snapshot
 
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         lease = snapshot.lease(self.descriptor())
         snapshot.close()
         self.assertTrue(snapshot.release_requested)
@@ -535,7 +542,7 @@ class GuardedSessionTests(_FixtureMixin, unittest.TestCase):
     def make_snapshot(self, profile=None):
         from parser_source import create_sealed_snapshot
 
-        return create_sealed_snapshot(
+        return create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=profile or self.profile(),
         )
@@ -785,7 +792,7 @@ class GuardedSessionTests(_FixtureMixin, unittest.TestCase):
         from parser_contracts import ValidationOutcome
         from parser_source import create_sealed_snapshot, materialize, validate
 
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
         events = (self.header(), self.segment("one"), self.issue(), self.segment("two"))
         codec = _ScriptedCodec(self.descriptor(), events)
         report = validate(codec, snapshot, self.request())
@@ -812,7 +819,7 @@ class GuardedSessionTests(_FixtureMixin, unittest.TestCase):
                 self.issue("PARSER.SYNTAX.MALFORMED", fatal=True),
             ),
         )
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=profile)
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=profile)
         failed = validate(fatal_codec, snapshot, self.request())
         self.assertIs(failed.outcome, ValidationOutcome.FAILED)
         self.assertIsNone(failed.terminal)
@@ -840,7 +847,7 @@ class GuardedSessionTests(_FixtureMixin, unittest.TestCase):
         descriptor = self.descriptor(profile=profile)
         events = (self.header(), self.segment("one"), self.segment("two"))
         codec = _ScriptedCodec(descriptor, events)
-        snapshot = create_sealed_snapshot(self.source_reference(), limit_profile=profile)
+        snapshot = create_test_sealed_snapshot(self.source_reference(), limit_profile=profile)
         report = validate(codec, snapshot, self.request())
         self.assertIs(report.outcome, ValidationOutcome.SUCCESS)
         with self.assertRaises(ParserSessionError) as caught:
@@ -855,7 +862,7 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
         from parser_source import atomic_write_bytes
 
         payload = b'{"schema_version":1}'
-        receipt = atomic_write_bytes(self.target_reference(), payload)
+        receipt = atomic_test_write_bytes(self.target_reference(), payload)
         self.assertEqual(self.target.read_bytes(), payload)
         self.assertEqual(receipt.content_sha256, hashlib.sha256(payload).hexdigest())
         self.assertEqual(receipt.byte_count, len(payload))
@@ -865,30 +872,59 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
             f"{status.st_dev}:{status.st_ino}",
         )
 
-    def test_writer_failures_before_replace_preserve_target_and_issue_no_receipt(self) -> None:
+    def test_writer_failures_before_publish_preserve_target_and_issue_no_receipt(self) -> None:
         from parser_source import ParserSourceError, atomic_write_bytes
+        import platform_fs_posix
+        from platform_fs_posix import PosixPlatformAdapter
 
         payload = b"new-target"
-        cases = (
-            ("_write_all", OSError("write failed"), "PARSER.SOURCE.WRITE_FAILED"),
-            ("os.fsync", OSError("fsync failed"), "PARSER.SOURCE.WRITE_FAILED"),
-            ("_validate_temp_payload", ValueError("invalid body"), "PARSER.SOURCE.WRITE_VALIDATION_FAILED"),
-            ("os.replace", OSError("replace failed"), "PARSER.SOURCE.WRITE_FAILED"),
-        )
-        for patch_name, side_effect, expected_code in cases:
-            with self.subTest(patch_name=patch_name):
+        candidate_faults = ("_write_all", "_flush_content")
+        for method_name in candidate_faults:
+            with self.subTest(method_name=method_name), mock.patch.object(
+                platform_fs_posix._PosixCandidateFile,
+                method_name,
+                side_effect=OSError("candidate fault"),
+            ):
                 self.target.write_bytes(b"old-target")
-                qualified = patch_name if "." in patch_name else f"parser_source.{patch_name}"
-                if qualified == "os.fsync":
-                    qualified = "parser_source.os.fsync"
-                elif qualified == "os.replace":
-                    qualified = "parser_source.os.replace"
-                with mock.patch(qualified, side_effect=side_effect):
-                    with self.assertRaises(ParserSourceError) as caught:
-                        atomic_write_bytes(self.target_reference(), payload)
-                self.assertEqual(caught.exception.code, expected_code)
+                with self.assertRaises(ParserSourceError) as caught:
+                    atomic_test_write_bytes(
+                        self.target_reference(),
+                        payload,
+                        backend=PosixPlatformAdapter(),
+                    )
+                self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
                 self.assertEqual(self.target.read_bytes(), b"old-target")
                 self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
+
+        def fail_after_create(phase: str) -> None:
+            if phase == "candidate_after_create":
+                raise RuntimeError("candidate setup fault")
+
+        self.target.write_bytes(b"old-target")
+        with self.assertRaises(ParserSourceError) as caught:
+            atomic_test_write_bytes(
+                self.target_reference(),
+                payload,
+                backend=PosixPlatformAdapter(_fault_injector=fail_after_create),
+            )
+        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
+        self.assertEqual(self.target.read_bytes(), b"old-target")
+        self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
+
+        self.target.write_bytes(b"old-target")
+        with mock.patch.object(
+            platform_fs_posix.os,
+            "replace",
+            side_effect=OSError("rename fault"),
+        ), self.assertRaises(ParserSourceError) as caught:
+            atomic_test_write_bytes(
+                self.target_reference(),
+                payload,
+                backend=PosixPlatformAdapter(),
+            )
+        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
+        self.assertEqual(self.target.read_bytes(), b"old-target")
+        self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
 
     def test_writer_rejects_escape_symlink_and_non_regular_target(self) -> None:
         from parser_contracts import TargetReference
@@ -905,13 +941,18 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
         )
         for reference in cases:
             with self.subTest(reference=reference), self.assertRaises(ParserSourceError):
-                atomic_write_bytes(reference, b"new")
+                atomic_test_write_bytes(reference, b"new")
         self.assertEqual(outside.read_bytes(), b"outside")
 
     def test_wave0_fault_fixture_observes_no_authority_change_or_receipt(self) -> None:
         from parser_contracts import TargetReference
         from parser_source import ParserSourceError, atomic_write_bytes
+        from platform_fs_posix import PosixPlatformAdapter
         from tests.parser_io_test_support import ParserIOFaultFixture
+
+        def fail_before_publication(phase: str) -> None:
+            if phase == "candidate_after_create":
+                raise RuntimeError("candidate setup fault")
 
         with ParserIOFaultFixture() as fixture:
             reference = TargetReference(
@@ -920,9 +961,12 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
                 display_hint="project.json",
             )
             before = fixture.capture_authority_state()
-            with mock.patch("parser_source.os.fsync", side_effect=OSError("fault")):
-                with self.assertRaises(ParserSourceError):
-                    atomic_write_bytes(reference, b"replacement")
+            with self.assertRaises(ParserSourceError):
+                atomic_test_write_bytes(
+                    reference,
+                    b"replacement",
+                    backend=PosixPlatformAdapter(_fault_injector=fail_before_publication),
+                )
             after = fixture.capture_authority_state()
             fixture.assert_failed_preserving_authority(before, after)
 
@@ -981,7 +1025,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             self.descriptor(profile=active_profile),
             (self.header(), self.segment()),
         )
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=snapshot_profile,
         )
@@ -1000,7 +1044,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             create_sealed_snapshot,
         )
 
-        sequential_snapshot = create_sealed_snapshot(
+        sequential_snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=self.profile(),
         )
@@ -1031,7 +1075,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             xlsx_descriptor,
             (self.header(), self.segment()),
         )
-        xlsx_snapshot = create_sealed_snapshot(
+        xlsx_snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=self.profile(),
         )
@@ -1054,7 +1098,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             profile=xlsx_profile,
             consumption_policy=InputConsumptionPolicy.XLSX_PREFLIGHT_ACTIVE_SHEET,
         )
-        xlsx_snapshot = create_sealed_snapshot(
+        xlsx_snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=xlsx_profile,
         )
@@ -1134,7 +1178,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
 
         for behavior in (authority_token, partial_coverage, hostile_failure):
             with self.subTest(behavior=behavior.__name__):
-                snapshot = create_sealed_snapshot(
+                snapshot = create_test_sealed_snapshot(
                     self.source_reference(),
                     limit_profile=self.profile(),
                 )
@@ -1157,7 +1201,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
 
         for action in ("close", "abort"):
             with self.subTest(action=action):
-                snapshot = create_sealed_snapshot(
+                snapshot = create_test_sealed_snapshot(
                     self.source_reference(),
                     limit_profile=self.profile(),
                 )
@@ -1202,7 +1246,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
                 self.segment("duplicate"),
             ),
         )
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=profile,
         )
@@ -1232,7 +1276,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
                 self.segment("duplicate"),
             ),
         )
-        validation_snapshot = create_sealed_snapshot(
+        validation_snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=profile,
         )
@@ -1263,7 +1307,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             self.descriptor(profile=incomplete),
             (self.header(), self.segment()),
         )
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self.source_reference(),
             limit_profile=incomplete,
         )
@@ -1296,7 +1340,7 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
             with self.subTest(view=view):
                 descriptor = replace(base, capabilities=capabilities)
                 codec = _ScriptedCodec(descriptor, (self.header(), self.segment()))
-                snapshot = create_sealed_snapshot(
+                snapshot = create_test_sealed_snapshot(
                     self.source_reference(),
                     limit_profile=profile,
                 )
@@ -1310,37 +1354,53 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
                 self.assertEqual(codec.iter_raw_calls, 0)
                 snapshot.close()
 
-    def test_post_replace_proof_failure_is_fail_closed_without_claiming_rollback(self) -> None:
+    def test_postpublication_proof_failure_is_fail_closed_without_claiming_rollback(self) -> None:
         from parser_source import ParserSourceError, atomic_write_bytes
+        from platform_fs_posix import PosixPlatformAdapter
 
-        with mock.patch(
-            "parser_source._prove_replaced_target",
-            side_effect=ParserSourceError(
-                "PARSER.SOURCE.WRITE_PROOF_FAILED",
-                "actual replaced target proof failed",
-            ),
-        ):
-            with self.assertRaises(ParserSourceError) as caught:
-                atomic_write_bytes(self.target_reference(), b"new-target")
-        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_PROOF_FAILED")
-        # Replace already happened.  The contract is fail-closed/no receipt, not a
-        # fabricated promise that external races or post-replace proof can roll back.
+        def fail_after_retained_open(phase: str) -> None:
+            if phase == "published_after_open":
+                raise RuntimeError("retained destination proof fault")
+
+        with self.assertRaises(ParserSourceError) as caught:
+            atomic_test_write_bytes(
+                self.target_reference(),
+                b"new-target",
+                backend=PosixPlatformAdapter(_fault_injector=fail_after_retained_open),
+            )
+        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
         self.assertEqual(self.target.read_bytes(), b"new-target")
 
-    def test_zero_short_write_and_short_readback_fail_before_replace(self) -> None:
+    def test_candidate_write_and_retained_readback_fail_on_their_actual_side_of_publish(self) -> None:
         from parser_source import ParserSourceError, atomic_write_bytes
+        import platform_fs_posix
+        from platform_fs_posix import PosixPlatformAdapter
 
-        with mock.patch("parser_source.os.write", return_value=0):
-            with self.assertRaises(ParserSourceError) as caught:
-                atomic_write_bytes(self.target_reference(), b"new-target")
+        with mock.patch.object(
+            platform_fs_posix._PosixCandidateFile,
+            "_write_all",
+            side_effect=OSError("short write"),
+        ), self.assertRaises(ParserSourceError) as caught:
+            atomic_test_write_bytes(
+                self.target_reference(),
+                b"new-target",
+                backend=PosixPlatformAdapter(),
+            )
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
         self.assertEqual(self.target.read_bytes(), b"old-target")
 
-        with mock.patch("parser_source.os.pread", return_value=b""):
-            with self.assertRaises(ParserSourceError) as caught:
-                atomic_write_bytes(self.target_reference(), b"new-target")
-        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_VALIDATION_FAILED")
-        self.assertEqual(self.target.read_bytes(), b"old-target")
+        with mock.patch.object(
+            platform_fs_posix._PosixBoundRegularFile,
+            "read_all",
+            return_value=b"wrong-readback",
+        ), self.assertRaises(ParserSourceError) as caught:
+            atomic_test_write_bytes(
+                self.target_reference(),
+                b"new-target",
+                backend=PosixPlatformAdapter(),
+            )
+        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
+        self.assertEqual(self.target.read_bytes(), b"new-target")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from parser_source import (
     materialize,
     validate,
 )
+from tests.parser_io_test_support import create_test_sealed_snapshot
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "parser" / "tm"
@@ -47,7 +48,7 @@ class _NormalizedJsonFixture(unittest.TestCase):
     def _snapshot(self, payload: bytes, descriptor, name: str = "input.json"):
         path = self.root / name
         path.write_bytes(payload)
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             SourceReference(
                 safe_root=str(self.root),
                 selected_path=str(path),
@@ -273,7 +274,7 @@ class NormalizedTmJsonReaderTests(_NormalizedJsonFixture):
         input_path = self.root / "oversized.json"
         input_path.write_bytes(b'[{"source":"long","target":"target"}]')
         with self.assertRaises(ParserSourceError) as input_failure:
-            create_sealed_snapshot(
+            create_test_sealed_snapshot(
                 SourceReference(
                     safe_root=str(self.root),
                     selected_path=str(input_path),
