@@ -31,8 +31,8 @@
     "preparer": {
       "role": "candidate input producer",
       "name": "prepare_windows_frozen_entry_inputs.py",
-      "bytes": 44417,
-      "sha256": "85c708d779009ca3d8724ae9c3eb692ced876f9ddc71b77ba68a8b7ad96c51cc"
+      "bytes": 44273,
+      "sha256": "0701b5edc62f434a4a5b3cf603261630e7484cb831361117a2b2d2e750ea0f0e"
     },
     "replay_wrapper": {
       "role": "candidate input replay wrapper",
@@ -374,13 +374,6 @@
         "file_count": 8,
         "bytes": 90629762,
         "sha256": "64edbd9aabf221a6164b258475f35f9b79577bd603d2f565fb33e5b5543c9cfc"
-      },
-      "catalogs": {
-        "role": "Windows SDK package catalogs",
-        "algorithm": "localcat.directory-input-sha256.v1",
-        "file_count": 148,
-        "bytes": 4797245,
-        "sha256": "113915b6809c44708de85efcc19c7db48d5364dc83494ac8327e05875115ac48"
       }
     }
   },
@@ -1131,8 +1124,8 @@
     "contract_file": {
       "role": "frozen-entry target contract",
       "name": "candidate-contract.json",
-      "bytes": 7640,
-      "sha256": "7afca48f82dbc0bdfce7a1dff52ef8706b08fa5cf6dea694fb6d693c9acad36d"
+      "bytes": 7613,
+      "sha256": "280af2a0c190b5938157621384caaabaf32d1bb0bdc1cd51d6051a857d6f8964"
     },
     "runtime_abi": {
       "module": "_localcat_frozen_bootstrap",
@@ -1371,7 +1364,6 @@
             "CreateToolhelp32Snapshot",
             "DeleteCriticalSection",
             "DeleteFileW",
-            "DeviceIoControl",
             "EncodePointer",
             "EnterCriticalSection",
             "ExitProcess",
@@ -1592,6 +1584,6 @@
       "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
     }
   ],
-  "candidate_input_digest": "36bc2b9a9e7cd276319653d24f1c07856cc881a1f23e206d2f58f0bd2c6a3a7b",
+  "candidate_input_digest": "06c37c4bf251700bdb16e5b4d288b3c8474e87d637ce7a290d9c33b1586e9619",
   "status": "MATERIALIZED"
 }
