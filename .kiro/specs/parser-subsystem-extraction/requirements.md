@@ -25,7 +25,7 @@ RPY 不属于 Parser 首波内建 runtime。`rpy-project-codec` 作为可配置�
 
 1. Parser 的 rooted source 与 canonical target 必须消费 ADR-020 的 `RootedFileSystem` / `BoundDirectoryPublisher`；POSIX 与 Windows adapter 对外保持相同 snapshot、stale、terminal、receipt 与 body-safe error 语义。
 2. Windows source 必须由 live rooted handle、regular-file identity、ancestor/final reparse proof 与 exact bytes 共同闭合；junction/reparse、hardlink alias、ancestor/final swap 或能力缺失须在正文交付前 fail closed，禁止用 `Path.resolve()`、`lstat()` 或 pathname hash 近似授权。
-3. Windows canonical write 必须在 retained target-parent authority 内选择 `CREATE_IF_ABSENT` 或由调用 owner 持有 destination-family 排他 lease 的 `REPLACE_UNDER_LOCK`；candidate 保持打开完成 write/content flush 与 owner journal/LKG arm 后相对 bound parent rename，捕获 final facts、关闭全部 candidate handles，再以 retained destination handle完成readback、owner durable commit与terminal reproof。失败保持原目标或进入明确 recovery-required，不得仅因 `os.replace()` 返回成功而签发 receipt。
+3. Windows canonical write 必须在 retained target-parent authority 内选择 `CREATE_IF_ABSENT` 或由调用 owner 持有 destination-family 排他 lease 的 `REPLACE_UNDER_LOCK`；candidate 保持打开完成 write/content flush 后相对 bound parent rename，捕获 final facts、关闭全部 candidate handles，再以 retained destination handle 完成 exact readback 与 terminal reproof，全部成立后才签发 receipt。Parser canonical writer 保持跨进程无状态，不创建 journal/LKG 或持久 recovery authority；publication 前失败须证明原目标不变，publication 后结果无法证明时返回稳定失败且不签发 receipt。
 4. 既有 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE` 保持为无法建立等价 rooted authority 时的稳定失败；本 amendment 不把 ProjectPackage、ResourcePackage、TMX publication、Store transaction 或 frozen bootstrap 权威迁入 Parser。
 
 ## 术语

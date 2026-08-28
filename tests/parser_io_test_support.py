@@ -17,6 +17,78 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from parser_contracts import SourceReference, TargetReference
+from parser_source import (
+    SnapshotExpectation,
+    atomic_write_bytes as _atomic_write_bytes,
+    create_sealed_snapshot as _create_sealed_snapshot,
+    open_rooted_regular_file as _open_rooted_regular_file,
+    reopen_sealed_snapshot as _reopen_sealed_snapshot,
+)
+from platform_fs import compose_platform_file_backend
+from platform_fs_contracts import PlatformFileBackend, RootedFileSystem
+
+
+def _test_backend(reference: SourceReference | TargetReference) -> PlatformFileBackend:
+    return compose_platform_file_backend(Path(reference.safe_root))
+
+
+def open_test_rooted_regular_file(
+    reference: SourceReference,
+    *,
+    file_system: RootedFileSystem | None = None,
+):
+    """Compose the host adapter explicitly for low-level Parser source tests."""
+
+    selected = file_system if file_system is not None else _test_backend(reference)
+    return _open_rooted_regular_file(reference, file_system=selected)
+
+
+def create_test_sealed_snapshot(
+    reference: SourceReference,
+    *,
+    limit_profile,
+    cancellation=None,
+    file_system: RootedFileSystem | None = None,
+):
+    """Keep platform composition in test support, outside parser_source."""
+
+    selected = file_system if file_system is not None else _test_backend(reference)
+    return _create_sealed_snapshot(
+        reference,
+        limit_profile=limit_profile,
+        file_system=selected,
+        cancellation=cancellation,
+    )
+
+
+def reopen_test_sealed_snapshot(
+    reference: SourceReference,
+    *,
+    limit_profile,
+    expected: SnapshotExpectation,
+    cancellation=None,
+    file_system: RootedFileSystem | None = None,
+):
+    selected = file_system if file_system is not None else _test_backend(reference)
+    return _reopen_sealed_snapshot(
+        reference,
+        limit_profile=limit_profile,
+        expected=expected,
+        file_system=selected,
+        cancellation=cancellation,
+    )
+
+
+def atomic_test_write_bytes(
+    reference: TargetReference,
+    payload: bytes,
+    *,
+    backend: PlatformFileBackend | None = None,
+):
+    selected = backend if backend is not None else _test_backend(reference)
+    return _atomic_write_bytes(reference, payload, backend=selected)
+
 
 class FaultPoint(str, Enum):
     """Named seams required by the Wave 0 I/O adversarial harness."""
@@ -254,7 +326,7 @@ class FaultingFilesystemOps:
 
     def fsync(self, path: Path) -> None:
         self._injector.checkpoint(FaultPoint.WRITER_FSYNC)
-        with path.open("rb") as handle:
+        with path.open("r+b") as handle:
             os.fsync(handle.fileno())
 
     def replace(self, source: Path, target: Path) -> None:

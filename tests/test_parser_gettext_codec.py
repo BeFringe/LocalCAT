@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from tests.parser_io_test_support import create_test_sealed_snapshot
+
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "parser" / "project" / "payloads"
 
@@ -35,7 +37,7 @@ class _GettextFixture(unittest.TestCase):
 
         path = self.root / name
         path.write_bytes(payload)
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             SourceReference(str(self.root), str(path), name),
             limit_profile=descriptor.limit_profile,
         )

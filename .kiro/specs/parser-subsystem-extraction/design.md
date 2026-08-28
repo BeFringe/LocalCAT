@@ -75,16 +75,16 @@ Parser 只回答四类问题：这个输入按什么用途和格式读取、如�
 
 ### Windows Compatibility Amendment WA-01
 
-- **ADR mapping**：follow ADR-020；Parser 继续拥有 sealed source/canonical writer 与 `PARSER.*` 失败语义，平台层只提供 rooted identity、publisher facts 与 normalized platform errors。
+- **ADR mapping**：follow ADR-020/026；ADR-026 收窄 ADR-020 的无条件 journal/LKG 外推。Parser 继续拥有 sealed source/canonical writer 与 `PARSER.*` 失败语义，平台层只提供 rooted identity、publisher facts 与 normalized platform errors。
 - **Reader port**：`parser_source.py` 不再直接选择 POSIX/Win32 primitive；composition 注入 `RootedFileSystem`，Windows adapter 必须以 retained handles 证明 root containment、regular identity、reparse state 与 exact snapshot bytes。
-- **Writer port**：canonical serializer 仍只生成 bytes；Source Boundary明确选择`CREATE_IF_ABSENT`或在调用owner持有destination-family排他lease时使用`REPLACE_UNDER_LOCK`。candidate保持打开完成write/content flush与owner journal/LKG arm后相对bound parent rename，捕获final facts、关闭全部candidate handles，再以retained destination readback handle闭合Parser durable commit、receipt与terminal reproof。平台 failure/ambiguity 不得被折成成功或 pathname-only fallback。
-- **Verification**：source 与 frozen 两种 composition 都覆盖 junction/reparse、hardlink、ancestor/final swap、body-unread、candidate close/reopen、publish/kill/recovery；POSIX 当前合同做 parity regression。
+- **Writer port**：canonical serializer 仍只生成 bytes；Source Boundary明确选择`CREATE_IF_ABSENT`或在调用owner持有destination-family排他lease时使用`REPLACE_UNDER_LOCK`。candidate保持打开完成write/content flush后相对bound parent rename，捕获final facts、关闭全部candidate handles，再以retained destination readback handle闭合exact bytes/digest与terminal reproof，随后才签发receipt。Parser writer不创建journal/LKG或跨进程recovery authority；平台failure/ambiguity不得被折成成功或pathname-only fallback。
+- **Verification**：source 与 frozen 两种 composition 都覆盖 junction/reparse、hardlink、ancestor/final swap、body-unread、candidate close/reopen及publish/kill边界；进程终止只允许目标为完整old或完整new，未取得同进程terminal proof不得有成功receipt，遗留candidate不得按名称扫描后自动采信或清理；POSIX当前合同做parity regression。
 
 | 项目 | 处置 |
 |---|---|
 | Applicable Steering | `tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md` |
-| Applicable ADRs | ADR-015、ADR-020；相邻 ADR-009/011/012/013/014 不迁权 |
-| ADR disposition | Follow ADR-015；ADR-004/005 已被取代 |
+| Applicable ADRs | ADR-015、ADR-020、ADR-026；相邻 ADR-009/011/012/013/014 不迁权 |
+| ADR disposition | Follow ADR-015/020/026；ADR-004/005 已被取代 |
 | Scope contract | `rebaseline-plan.md` 与本规格 Requirements |
 | Steering sync | runtime 收口时只更新真实派生事实 |
 | Downstream revalidation | Integration TM owner；未来 RPY/Multi-Document consumer |
@@ -124,19 +124,21 @@ graph TB
 ```mermaid
 graph LR
     Contracts[parser contracts] --> Source[parser source]
+    PlatformContracts[platform fs contracts] --> Source
     Contracts --> Registry[parser registry]
     Contracts --> Codecs[format codecs]
     Source --> Codecs
     Registry --> Composition[parser composition]
     Codecs --> Composition
+    PlatformFactory[platform fs composition factory] --> Composition
     Composition --> Application[Application facades]
 ```
 
 - `parser_contracts.py` 只依赖标准库。
-- `parser_source.py` 只依赖标准库和 `parser_contracts.py`。
+- `parser_source.py` 只依赖标准库、`parser_contracts.py`与backend-neutral `platform_fs_contracts.py`，不自行导入或选择具体平台 adapter。
 - codec 只依赖 contracts/source；XLSX codec 可条件导入 `openpyxl`。
 - registry 只依赖 contracts，不导入具体 codec。
-- composition 是唯一内建注册点，可导入 registry 与 codecs。
+- composition 是唯一内建注册点，也是 Parser 内唯一可导入`platform_fs.py` factory并向 Source Boundary 注入`RootedFileSystem`/publisher backend 的模块。
 - Application facade 可以导入 Parser 和现有 Editor/TM/Termbase 合同。
 - Engine、Store、Qt、Controller、workspace、provider 不得被 Parser 模块导入。
 - `tm_engine.py`、`glossary_engine.py` 中的历史格式语法在消费者迁移后删除；不通过 Engine re-export Parser。
