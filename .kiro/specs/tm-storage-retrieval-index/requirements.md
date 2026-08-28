@@ -12,13 +12,15 @@ LocalCAT 面向个人译者提供完全本地的翻译记忆库。当前能力�
 - **范围外**：Qt 控件、菜单、快捷键、搜索导航和用户偏好持久化；机器翻译、语义向量、云端 TM、在线协作、账号与共享锁；项目文件解析和厂商 TMX 上下文映射。
 - **相邻期望**：Qt 产品通过既有编辑协调入口消费建议和文本匹配结果；旧 Excel 工作流继续只看到 `TM_HIT / TERMS_FOUND / NO_MATCH`；未来 Parser 或 TMX 互操作变更只能触发兼容复验，不改变本规格的用户可见语义。
 
-### Windows Compatibility Amendment WA-06
+### Windows Compatibility Amendment WA-06（current R3）
 
-1. Windows canonical TM 首次激活、generation 切换、snapshot publication、schema upgrade 与 recovery 必须消费 ADR-020经ADR-023补充后的 process lock/rooted/`PendingPublication`/durability ports，并保持 SQLite authority、reservation、journal、LKG、generation 与业务 error envelope不变；实现仍服从`windows-platform-enablement`的前置platform capability与merge依赖。
-2. Windows 私有存储资格必须按 ADR-021经ADR-023接管后的`WindowsPrivateSecurityV2`使用exact TokenUser owner、DACL、medium mandatory-integrity label/`NO_WRITE_UP`、OS access行为与嵌套`WindowsPrivateProof`；proof的`security_profile_id`和authority descriptor digest必须绑定V2 canonical owner+DACL+MIC projection。它只替代POSIX物理表示谓词，Gate D/canonical owner envelope、content/phase/generation proof不得由此省略或重铸；V1/unknown profile不得兼容读取或自动迁移。
+WA-06 `R3`依据ADR-024/025完整取代`R2`，`R1`与`R2`只保留在dispatch ledger历史，不得驱动实施或证据。
+
+1. Windows canonical TM 首次激活、generation 切换、snapshot publication、schema upgrade 与 recovery 必须消费 ADR-020/025 的 process lock、rooted authority与正常`PendingPublication`端口，并保持 SQLite authority、reservation、journal、LKG、generation 与业务 error envelope不变；实现仍服从`windows-platform-enablement`的前置platform capability与merge依赖。
+2. Windows 私有存储资格必须按 ADR-021经ADR-023/024接管后的`WindowsPrivateSecurityV2`使用provider-agnostic current process primary token事实：exact TokenUser owner、DACL、medium或high mandatory-integrity、`NO_WRITE_UP`、OS access行为与嵌套`WindowsPrivateProof`。local/domain/Entra等provider来源不是mandatory事实且不得进入persistent proof；proof的`security_profile_id`和authority descriptor digest仍绑定V2 canonical owner+DACL+MIC projection。它只替代POSIX物理表示谓词，Gate D/canonical owner envelope、content/phase/generation proof不得由此省略或重铸；V1/unknown profile不得兼容读取或自动迁移。
 3. FileId 只证明一次 live handle observation，不是永久资源身份；recreate/reuse、ACL drift、mixed proof、pending/ambiguous recovery必须 fail closed，设备本地资格只能在同一 owner envelope 内复证。
-4. SQLite FTS5/trigram 和 fallback 必须在 Windows 创建、查询、关闭、进程重开后分别验证；process kill/power-boundary结果只允许完整 old/new/recovery-required，不得以可打开 SQLite 或 FTS5 available 代替 capability gate。
-5. 本 amendment 不改变 exact/context/fuzzy/scorer、100k 门、Excel 三态或 UI；frozen bootstrap/source authority仍由相邻 Spec消费 ADR-022。
+4. SQLite FTS5/trigram 和 fallback 必须在 Windows 创建、查询、关闭、进程重开后分别验证；activation、snapshot与export消费`WindowsDocumentedPublishV1`，不确定时平台返回`RECOVERY_REQUIRED`，owner-visible durable state在fault/process kill/app restart/正常OS reboot后只允许完整old、完整new或recovery-only，不得以可打开SQLite或FTS5 available代替capability gate。
+5. source与frozen运行时均不依赖硬件`DurabilityProfile` registry；frozen manifest移除该registry输入，但ADR-022的其他strict bootstrap/source closure要求不变。本 amendment不改变exact/context/fuzzy/scorer、100k门、Excel三态或UI。
 
 ## 需求
 
