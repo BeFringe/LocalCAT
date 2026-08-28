@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -34,6 +36,7 @@ from parser_source import (
     materialize,
     validate,
 )
+from tests.parser_io_test_support import atomic_test_write_bytes, create_test_sealed_snapshot
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "parser" / "project"
@@ -62,7 +65,7 @@ class _LocalCatFixture(unittest.TestCase):
     ):
         path = self.root / name
         path.write_bytes(data)
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             SourceReference(
                 safe_root=str(self.root),
                 selected_path=str(path),
@@ -493,13 +496,13 @@ class LocalCatCanonicalSerializerTests(_LocalCatFixture):
         ).serialize_canonical(self._request())
         target = self.root / "written.json"
         target.write_bytes(b"old")
-        receipt = atomic_write_bytes(
+        receipt = atomic_test_write_bytes(
             TargetReference(str(self.root), str(target), "written.json"),
             canonical.payload,
         )
         self.assertEqual(target.read_bytes(), canonical.payload)
         self.assertEqual(receipt.byte_count, len(canonical.payload))
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             SourceReference(str(self.root), str(target), "written.json"),
             limit_profile=LOCALCAT_JSON_DESCRIPTOR.limit_profile,
         )
@@ -535,11 +538,30 @@ class LocalCatCanonicalSerializerTests(_LocalCatFixture):
         ).serialize_canonical(self._request())
         target = self.root / "protected.json"
         target.write_bytes(b"old-target")
-        with mock.patch("parser_source.os.replace", side_effect=OSError("replace failed")):
+        if os.name == "nt":
+            from platform_fs_windows import WindowsPlatformAdapter
+
+            backend = WindowsPlatformAdapter()
+            fault = mock.patch.object(
+                backend._native_api(),
+                "self_probe_nt_set_information_file",
+                side_effect=RuntimeError("publish primitive unavailable"),
+            )
+        else:
+            from platform_fs_posix import PosixPlatformAdapter
+
+            def fail_after_create(phase: str) -> None:
+                if phase == "candidate_after_create":
+                    raise RuntimeError("candidate fault")
+
+            backend = PosixPlatformAdapter(_fault_injector=fail_after_create)
+            fault = nullcontext()
+        with fault:
             with self.assertRaises(ParserSourceError) as caught:
-                atomic_write_bytes(
+                atomic_test_write_bytes(
                     TargetReference(str(self.root), str(target), "protected.json"),
                     canonical.payload,
+                    backend=backend,
                 )
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
         self.assertEqual(target.read_bytes(), b"old-target")

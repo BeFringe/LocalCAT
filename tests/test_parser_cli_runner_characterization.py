@@ -372,7 +372,12 @@ class MigratedNormalizedTMJSONContractTests(unittest.TestCase):
             actual = root / "actual.json"
             alias = root / "alias.json"
             actual.write_text('[{"source":"a","target":"b"}]', encoding="utf-8")
-            alias.symlink_to(actual)
+            try:
+                alias.symlink_to(actual)
+            except OSError as error:
+                self.skipTest(
+                    f"file symlink creation unavailable on this host ({error.errno})"
+                )
 
             with self.assertRaises(ValueError):
                 tm_json_importer.resolve_input_files([str(alias)])

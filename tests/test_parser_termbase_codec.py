@@ -11,6 +11,8 @@ import time
 import unittest
 from unittest import mock
 
+from tests.parser_io_test_support import create_test_sealed_snapshot
+
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "parser" / "termbase"
 
@@ -98,7 +100,7 @@ class _ParserFixture(unittest.TestCase):
     def _materialize(self, *, descriptor, codec, name: str, payload: bytes, columns):
         from parser_source import create_sealed_snapshot, materialize
 
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input(name, payload),
             limit_profile=descriptor.limit_profile,
         )
@@ -110,7 +112,7 @@ class _ParserFixture(unittest.TestCase):
     def _validate(self, *, descriptor, codec, name: str, payload: bytes, columns):
         from parser_source import create_sealed_snapshot, validate
 
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input(name, payload),
             limit_profile=descriptor.limit_profile,
         )
@@ -123,7 +125,7 @@ class _ParserFixture(unittest.TestCase):
         from parser_contracts import TermbaseColumnPreviewRequest
         from parser_source import create_sealed_snapshot
 
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input(name, payload),
             limit_profile=descriptor.limit_profile,
         )
@@ -543,7 +545,7 @@ class CsvTermbaseCodecTests(_ParserFixture):
         from parser_termbase_codec import CsvTermbaseCodec, TERMBASE_CSV_DESCRIPTOR
 
         token = CancellationToken()
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input("cancel.csv", _golden_bytes("csv-cancel-after-row")),
             limit_profile=TERMBASE_CSV_DESCRIPTOR.limit_profile,
         )
@@ -636,7 +638,7 @@ class CsvTermbaseCodecTests(_ParserFixture):
         original = csv.field_size_limit()
         sentinel = 65_539
         csv.field_size_limit(sentinel)
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input("restore.csv", b"First,T\nSecond,U\n"),
             limit_profile=descriptor.limit_profile,
         )
@@ -664,7 +666,7 @@ class CsvTermbaseCodecTests(_ParserFixture):
             csv.field_size_limit(original)
 
         csv.field_size_limit(sentinel)
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input("early-close.csv", b"First,T\nSecond,U\n"),
             limit_profile=descriptor.limit_profile,
         )
@@ -1044,10 +1046,17 @@ class XlsxTermbaseCodecTests(_ParserFixture):
             ],
         )
 
+        actual_import_module = codec_module.importlib.import_module
+
+        def missing_openpyxl(name: str, package: str | None = None):
+            if name == "openpyxl":
+                raise ImportError("missing")
+            return actual_import_module(name, package)
+
         with mock.patch.object(
             codec_module.importlib,
             "import_module",
-            side_effect=ImportError("missing"),
+            side_effect=missing_openpyxl,
         ):
             report = self._validate(
                 descriptor=TERMBASE_XLSX_DESCRIPTOR,
@@ -1071,7 +1080,7 @@ class XlsxTermbaseCodecTests(_ParserFixture):
         from parser_termbase_codec import XlsxTermbaseCodec, TERMBASE_XLSX_DESCRIPTOR
 
         token = CancellationToken()
-        snapshot = create_sealed_snapshot(
+        snapshot = create_test_sealed_snapshot(
             self._input("cancel.xlsx", _golden_bytes("xlsx-cancel-after-row")),
             limit_profile=TERMBASE_XLSX_DESCRIPTOR.limit_profile,
         )

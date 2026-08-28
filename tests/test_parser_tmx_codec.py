@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests.parser_io_test_support import create_test_sealed_snapshot
+
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "parser" / "tm"
 PAYLOAD_ROOT = FIXTURE_ROOT / "payloads"
@@ -63,7 +65,7 @@ class _CodecFixture(unittest.TestCase):
         descriptor = descriptor or TMX_CODEC_DESCRIPTOR
         path = self.root / "sample.tmx"
         path.write_bytes(payload)
-        return create_sealed_snapshot(
+        return create_test_sealed_snapshot(
             SourceReference(
                 safe_root=str(self.root),
                 selected_path=str(path),
@@ -378,7 +380,7 @@ class TmxSafetyAndLimitTests(_CodecFixture):
         with path.open("wb") as handle:
             handle.truncate(TMX_CODEC_DESCRIPTOR.limit_profile.max_input_bytes + 1)
         with self.assertRaises(ParserSourceError) as raised:
-            create_sealed_snapshot(
+            create_test_sealed_snapshot(
                 SourceReference(str(self.root), str(path), "too-large.tmx"),
                 limit_profile=TMX_CODEC_DESCRIPTOR.limit_profile,
             )

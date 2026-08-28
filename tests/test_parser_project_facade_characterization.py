@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +29,20 @@ from resource_repository import ResourceRepository
 
 
 class ProjectFacadeCharacterizationTests(unittest.TestCase):
+    def _create_symlink(
+        self,
+        link: Path,
+        target: str,
+        *,
+        target_is_directory: bool = False,
+    ) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as error:
+            self.skipTest(
+                f"symlink creation unavailable on this host ({error.errno})"
+            )
+
     def _write_json(self, path: Path, payload: object) -> None:
         path.write_text(
             json.dumps(payload, ensure_ascii=False),
@@ -304,7 +320,7 @@ class ProjectFacadeCharacterizationTests(unittest.TestCase):
             real = root / "real.json"
             link = root / "linked.json"
             self._write_json(real, [{"source": "Must stay behind the link"}])
-            link.symlink_to(real.name)
+            self._create_symlink(link, real.name)
 
             with self.assertRaises(ProjectError):
                 load_project(link)
@@ -503,7 +519,7 @@ class ProjectFacadeCharacterizationTests(unittest.TestCase):
             link = root / "linked.json"
             original_bytes = b'{"sentinel":"keep"}\n'
             real.write_bytes(original_bytes)
-            link.symlink_to(real.name)
+            self._create_symlink(link, real.name)
 
             with self.assertRaises(ProjectError):
                 save_project(
@@ -523,7 +539,11 @@ class ProjectFacadeCharacterizationTests(unittest.TestCase):
             real_parent = root / "real-parent"
             linked_parent = root / "linked-parent"
             real_parent.mkdir()
-            linked_parent.symlink_to(real_parent.name, target_is_directory=True)
+            self._create_symlink(
+                linked_parent,
+                real_parent.name,
+                target_is_directory=True,
+            )
             target = linked_parent / "project.json"
 
             with self.assertRaises(ProjectError):
@@ -548,16 +568,38 @@ class ProjectFacadeCharacterizationTests(unittest.TestCase):
                 name="Replacement",
                 segments=(EditorSegment(id="one", source="Source"),),
             )
+            before_candidates = tuple(root.glob(".parser-*.tmp"))
+            if os.name == "nt":
+                from platform_fs_windows import WindowsPlatformAdapter
 
-            with patch("editor_project.os.replace", side_effect=OSError("replace failed")):
+                backend = WindowsPlatformAdapter()
+                fault = patch.object(
+                    backend._native_api(),
+                    "self_probe_nt_set_information_file",
+                    side_effect=RuntimeError("publish primitive unavailable"),
+                )
+            else:
+                from platform_fs_posix import PosixPlatformAdapter
+
+                def fail_after_create(phase: str) -> None:
+                    if phase == "candidate_after_create":
+                        raise RuntimeError("candidate fault")
+
+                backend = PosixPlatformAdapter(_fault_injector=fail_after_create)
+                fault = nullcontext()
+
+            with fault, patch(
+                "parser_composition._compose_platform_file_backend",
+                return_value=backend,
+            ):
                 with self.assertRaises(ProjectError):
                     save_project(project, path)
 
             preserved_bytes = path.read_bytes()
-            remaining_names = tuple(candidate.name for candidate in root.iterdir())
+            remaining_candidates = tuple(root.glob(".parser-*.tmp"))
 
         self.assertEqual(preserved_bytes, original_bytes)
-        self.assertEqual(remaining_names, ("protected.json",))
+        self.assertEqual(remaining_candidates, before_candidates)
 
     def test_controller_installs_only_success_and_clears_dirty_only_after_save(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import os
 import struct
 import warnings
 import unittest
@@ -116,6 +117,25 @@ def _archive_bytes(
             info.compress_type = compression
             archive.writestr(info, payload)
     return output.getvalue()
+
+
+def _archive_bytes_with_raw_member_name(raw_name: str) -> bytes:
+    """Keep a hostile name byte-exact in both ZIP name records on every OS."""
+
+    normalized_name = raw_name.replace("\\", "/")
+    normalized = normalized_name.encode("utf-8", "strict")
+    raw = raw_name.encode("utf-8", "strict")
+    if len(normalized) != len(raw):
+        raise AssertionError("raw ZIP member replacement must preserve header lengths")
+    payload = _archive_bytes(
+        [(normalized_name, b"<root/>", zipfile.ZIP_STORED)]
+    )
+    if payload.count(normalized) != 2:
+        raise AssertionError("ZIP fixture must contain local and central member names")
+    patched = payload.replace(normalized, raw)
+    if patched.count(raw) != 2:
+        raise AssertionError("raw member name was not preserved in both ZIP records")
+    return patched
 
 
 def _data_descriptor_archive_bytes() -> bytes:
@@ -442,13 +462,17 @@ class XlsxArchivePreflightTests(unittest.TestCase):
 
         for unsafe in ("/absolute.xml", "../escape.xml", "a/../escape.xml", "a\\escape.xml", "a//b.xml"):
             with self.subTest(name=unsafe):
-                payload = _archive_bytes([(unsafe, b"<root/>", zipfile.ZIP_STORED)])
+                if "\\" in unsafe:
+                    payload = _archive_bytes_with_raw_member_name(unsafe)
+                    self.assertEqual(payload.count(unsafe.encode("utf-8")), 2)
+                else:
+                    payload = _archive_bytes([(unsafe, b"<root/>", zipfile.ZIP_STORED)])
                 error = _assert_code(
                     self,
                     "PARSER.XLSX.ARCHIVE_MEMBER_NAME_UNSAFE",
                     lambda payload=payload: _preflight(payload),
                 )
-                self.assertEqual(error.member_name, unsafe)
+                self.assertEqual(error.member_name, unsafe.replace(os.sep, "/"))
 
     def test_member_name_in_failure_is_bounded_and_body_safe(self) -> None:
         raw_name = "n" * (65_535 - len(".xml")) + ".xml"

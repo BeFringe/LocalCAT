@@ -96,7 +96,7 @@
   - 完成时，outside-root、symlink/reparse、non-regular 与 read failure 均在消费内容前结构化失败。
   - _Requirements: 6.6, 9.6, 9.7_
 
-- [ ] 2.5a 将 rooted opener 接入平台 `RootedFileSystem`
+- [x] 2.5a 将 rooted opener 接入平台 `RootedFileSystem`
   - Windows 实现必须以 retained root/file handle 逐段绑定并证明最终 regular file；reparse point、hardlink/multi-link、root/path replacement 与能力缺失均在消费内容前 fail closed。
   - _Amendment: WA-01_
   - _Depends: 2.5, ADR-020, windows-platform-enablement 2.1_
@@ -143,7 +143,7 @@
   - 完成时，任一注入失败都保留原目标字节且无 receipt，成功 receipt 绑定目标 identity 与 digest。
   - _Requirements: 3.9, 9.6, 10.2, 10.6_
 
-- [ ] 2.12a 执行 Windows rooted-source 对抗读取矩阵
+- [x] 2.12a 执行 Windows rooted-source 对抗读取矩阵
   - 在真实 NTFS 上覆盖 live handle、reparse point、hardlink/multi-link、ancestor/target replacement、same-byte FileId replacement、并发改写与 handle 清理；不得把 `ROOT_BINDING_UNAVAILABLE` 当作 Windows 通过结果。
   - _Amendment: WA-01_
   - _Depends: 2.5a, 2.6, 2.7, windows-platform-enablement 3.7_
@@ -317,10 +317,10 @@
   - 完成时，Source Boundary 故障矩阵在所有支持平台上通过或以 root-binding unavailable 明确 fail closed。
   - _Requirements: 6.3, 6.4, 6.6, 7.2, 8.2, 9.6, 9.7, 15.3_
 
-- [ ] 5.2a 将 canonical byte writer 接入平台 `BoundDirectoryPublisher`
-  - Windows 路径显式选择`CREATE_IF_ABSENT`或由调用owner持有排他lease的`REPLACE_UNDER_LOCK`；candidate保持打开完成write/content flush和journal/LKG arm后rename，随后capture→close all candidate handles→retained reopen/readback→owner durable commit→terminal reproof，不以pathname resolve或删旧后改名代替。
+- [x] 5.2a 将 canonical byte writer 接入平台 `BoundDirectoryPublisher`
+  - Windows 路径显式选择`CREATE_IF_ABSENT`或由调用owner持有排他lease的`REPLACE_UNDER_LOCK`；candidate保持打开完成write/content flush后rename，随后capture→close all candidate handles→retained reopen/exact readback→terminal reproof→receipt。Parser writer不创建journal/LKG或跨进程恢复状态；publish/kill边界只允许完整old或完整new，无法同进程证明终态时返回稳定失败且不签发receipt，不以pathname resolve或删旧后改名代替。
   - _Amendment: WA-01_
-  - _Depends: 2.12, ADR-020, windows-platform-enablement 2.1_
+  - _Depends: 2.12, ADR-020, ADR-026, windows-platform-enablement 2.1_
 
 - [x] 5.3 验证 limits、diagnostics、metadata 与编码边界
   - 参数化覆盖各 codec profile 的输入、字段、记录、materialization、issue、metadata 与结构深度边界。
@@ -387,8 +387,8 @@
   - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5_
   - _Depends: 5.11_
 
-- [ ] 5.12a 闭合source writer的Windows fresh completion
-  - 在源码运行时执行rooted read、canonical save、crash/recovery与clean-process reopen，证明原始`.py`、fixtures与发布资源由rooted source authority可见且失败不现场修补；完成后只交付WA-01 source阶段证据。
+- [x] 5.12a 闭合source writer的Windows fresh completion
+  - 在源码运行时执行rooted read、canonical save、process-termination old/new boundary与clean-process reopen，证明原始`.py`、fixtures与发布资源由rooted source authority可见且失败不现场修补；Parser不保留或恢复跨进程operation state，完成后只交付WA-01 source阶段证据。
   - _Amendment: WA-01_
   - _Depends: 2.12a, 5.2a, windows-platform-enablement 3.7_
 

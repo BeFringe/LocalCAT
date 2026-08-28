@@ -904,9 +904,9 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
             AllowedImportRule(
                 "source.allowed_dependencies",
                 ("parser_source",),
-                ("parser_contracts",),
+                ("parser_contracts", "platform_fs_contracts"),
                 (),
-                "source depends only on stdlib and contracts",
+                "source consumes only Parser contracts and the backend-neutral platform file port",
             ),
             AllowedImportRule(
                 "registry.allowed_dependencies",
@@ -971,10 +971,12 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
                     "parser_contracts",
                     "parser_registry",
                     "parser_source",
+                    "platform_fs",
+                    "platform_fs_contracts",
                     *PARSER_CODEC_PREFIXES,
                 ),
                 (),
-                "composition alone coordinates Source and built-in codecs for Application",
+                "composition injects the shared rooted file port and coordinates built-in codecs",
             ),
         ),
         import_rules=(

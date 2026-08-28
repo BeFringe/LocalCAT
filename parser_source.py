@@ -14,12 +14,25 @@ from enum import Enum
 import errno
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
-import stat
+import struct
 import tempfile
 import threading
 from typing import Iterator
+
+from platform_fs_contracts import (
+    BoundRegularFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    LockPolicy,
+    LockWait,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+    RootedFileSystem,
+)
 
 from parser_contracts import (
     CodecDescriptor,
@@ -53,6 +66,12 @@ from parser_contracts import (
 _COPY_CHUNK_BYTES = 64 * 1024
 _SNAPSHOT_SCHEMA_VERSION = 1
 _WRITE_RECEIPT_SCHEMA_VERSION = 1
+_WINDOWS_FILETIME_UNIX_EPOCH = 116_444_736_000_000_000
+_PARSER_LOCK_PAYLOAD = (
+    b"LOCALCAT-PROTOCOL-CONTROL-LOCK\x00"
+    b"schema=1\nresource-family=parser-canonical-write\n"
+    b"range-map=exclusive-byte-0\n"
+)
 
 
 class ParserSourceError(ContractViolation):
@@ -92,40 +111,6 @@ def _check_cancellation(cancellation: CancellationToken | None) -> None:
     if type(cancellation) is not CancellationToken:
         raise TypeError("cancellation must be an exact CancellationToken or None")
     cancellation.raise_if_cancelled()
-
-
-def _rooted_handles_available() -> bool:
-    return bool(
-        os.name == "posix"
-        and hasattr(os, "O_DIRECTORY")
-        and hasattr(os, "O_NOFOLLOW")
-        and hasattr(os, "pread")
-        and os.supports_dir_fd
-        and os.open in os.supports_dir_fd
-        and os.stat in os.supports_dir_fd
-        and os.unlink in os.supports_dir_fd
-    )
-
-
-def _require_rooted_handles() -> None:
-    if not _rooted_handles_available():
-        raise ParserSourceError(
-            "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE",
-            "this platform cannot establish the required rooted file authority",
-        )
-
-
-def _open_flags(*, directory: bool) -> int:
-    flags = os.O_RDONLY | os.O_NOFOLLOW
-    if directory:
-        flags |= os.O_DIRECTORY
-    elif hasattr(os, "O_NONBLOCK"):
-        # A FIFO/device must not block merely so Foundation can reject it after
-        # fstat.  O_NONBLOCK has no semantic effect on a regular-file snapshot.
-        flags |= os.O_NONBLOCK
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    return flags
 
 
 def _path_parts(path_text: str, *, require_absolute: bool) -> tuple[str, ...]:
@@ -178,63 +163,161 @@ def _relative_parts(safe_root: str, selected_path: str) -> tuple[str, ...]:
     return parts
 
 
-def _map_open_error(error: OSError) -> ParserSourceError:
-    if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
-        return ParserSourceError(
+def _platform_relative_path(parts: tuple[str, ...]) -> PurePosixPath | PureWindowsPath:
+    if os.name == "nt":
+        return PureWindowsPath(*parts)
+    return PurePosixPath(*parts)
+
+
+def _map_platform_source_error(error: PlatformFileError) -> ParserSourceError:
+    mapping = {
+        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value: (
+            "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE",
+            "this platform cannot establish the required rooted file authority",
+        ),
+        PlatformFileErrorCode.ENTRY_UNAVAILABLE.value: (
+            "PARSER.SOURCE.READ_FAILED",
+            "the requested rooted source entry is unavailable",
+        ),
+        PlatformFileErrorCode.OUTSIDE_ROOT.value: (
+            "PARSER.SOURCE.OUTSIDE_ROOT",
+            "the selected reference is outside the caller-provided safe root",
+        ),
+        PlatformFileErrorCode.REPARSE_REJECTED.value: (
             "PARSER.SOURCE.NOT_REGULAR",
             "the rooted reference is a link, reparse point, or non-regular object",
+        ),
+        PlatformFileErrorCode.IDENTITY_STALE.value: (
+            "PARSER.SOURCE.STALE",
+            "source identity changed while rooted authority was live",
+        ),
+    }
+    code, summary = mapping.get(
+        error.code,
+        (
+            "PARSER.SOURCE.READ_FAILED",
+            "the rooted regular file could not be read safely",
+        ),
+    )
+    return ParserSourceError(code, summary)
+
+
+def _map_platform_writer_error(error: PlatformFileError) -> ParserSourceError:
+    if error.code == PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value:
+        return ParserSourceError(
+            "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE",
+            "this platform cannot establish the required rooted target authority",
+        )
+    if error.code == PlatformFileErrorCode.OUTSIDE_ROOT.value:
+        return ParserSourceError(
+            "PARSER.SOURCE.OUTSIDE_ROOT",
+            "the selected target is outside the caller-provided safe root",
+        )
+    if error.code == PlatformFileErrorCode.REPARSE_REJECTED.value:
+        return ParserSourceError(
+            "PARSER.SOURCE.NOT_REGULAR",
+            "the rooted target is a link, reparse point, or non-regular object",
+        )
+    if error.code == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+        return ParserSourceError(
+            "PARSER.SOURCE.WRITE_FAILED",
+            "the requested rooted target entry is unavailable",
+        )
+    if error.code in {
+        PlatformFileErrorCode.IDENTITY_STALE.value,
+        PlatformFileErrorCode.RECOVERY_REQUIRED.value,
+    }:
+        return ParserSourceError(
+            "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+            "canonical publication could not be proved before a receipt was issued",
         )
     return ParserSourceError(
-        "PARSER.SOURCE.READ_FAILED",
-        "the rooted regular file could not be opened for reading",
+        "PARSER.SOURCE.WRITE_FAILED",
+        "rooted canonical publication failed before a receipt was issued",
     )
 
 
-def _open_absolute_root(safe_root: str) -> int:
-    _require_rooted_handles()
-    _path_parts(safe_root, require_absolute=True)
-    try:
-        # The caller owns safe-root selection.  Once its final component is opened
-        # no-follow, the returned dirfd is the authority anchor; target components
-        # below that retained handle are then opened one by one no-follow.  Walking
-        # ancestors from '/' would incorrectly reject ordinary platform aliases
-        # such as macOS /var -> /private/var before the caller's root is bound.
-        current = os.open(safe_root, _open_flags(directory=True))
-    except OSError as exc:
-        raise _map_open_error(exc) from exc
-    return current
+def _identity_text(identity: FileObjectIdentity) -> str:
+    if identity.platform == "posix":
+        return (
+            f"{int.from_bytes(identity.volume_id, 'big')}:"
+            f"{int.from_bytes(identity.file_id, 'big')}"
+        )
+    return f"{identity.platform}:{identity.volume_id.hex()}:{identity.file_id.hex()}"
+
+
+def _modified_time_ns(snapshot: EntrySnapshot) -> int:
+    identity = snapshot.identity
+    if identity.platform == "posix":
+        try:
+            return int(snapshot.modified_token.split(b":", 1)[0])
+        except (ValueError, IndexError):
+            pass
+    elif identity.platform == "windows" and len(snapshot.modified_token) == 20:
+        last_write, _change, _attributes = struct.unpack("<qqI", snapshot.modified_token)
+        return max(0, (last_write - _WINDOWS_FILETIME_UNIX_EPOCH) * 100)
+    raise ParserSourceError(
+        "PARSER.SOURCE.READ_FAILED",
+        "the rooted file modification token is not a supported platform fact",
+    )
 
 
 @dataclass(slots=True)
 class RootedRegularFile:
-    """An already-bound descriptor; callers cannot reopen it by pathname."""
+    """An already-bound platform authority; callers cannot reopen by pathname."""
 
-    _descriptor: int
+    _authority: BoundRegularFile
     relative_path: str
-    initial_status: os.stat_result
+    initial_snapshot: EntrySnapshot
     _closed: bool = False
 
-    @property
-    def descriptor(self) -> int:
+    def _require_open(self) -> BoundRegularFile:
         if self._closed:
             raise ParserSourceError(
                 "PARSER.SOURCE.READ_FAILED",
-                "the rooted file descriptor is already closed",
+                "the rooted file authority is already closed",
             )
-        return self._descriptor
+        return self._authority
 
     @property
     def is_regular_file(self) -> bool:
-        return stat.S_ISREG(self.initial_status.st_mode)
+        identity = self.initial_snapshot.identity
+        return identity.kind == "regular" and identity.link_count == 1
 
     @property
     def closed(self) -> bool:
         return self._closed
 
+    def read_all(self) -> bytes:
+        try:
+            return self._require_open().read_all()
+        except PlatformFileError as error:
+            raise _map_platform_source_error(error) from None
+
+    def read_at(
+        self,
+        offset: int,
+        maximum_bytes: int,
+        expected: EntrySnapshot,
+    ) -> bytes:
+        try:
+            return self._require_open().read_at(offset, maximum_bytes, expected)
+        except PlatformFileError as error:
+            raise _map_platform_source_error(error) from None
+
+    def snapshot(self) -> EntrySnapshot:
+        try:
+            return self._require_open().snapshot()
+        except PlatformFileError as error:
+            raise _map_platform_source_error(error) from None
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            os.close(self._descriptor)
+            try:
+                self._authority.close()
+            except PlatformFileError as error:
+                raise _map_platform_source_error(error) from None
 
     def __enter__(self) -> RootedRegularFile:
         return self
@@ -243,73 +326,54 @@ class RootedRegularFile:
         self.close()
 
 
-def open_rooted_regular_file(reference: SourceReference) -> RootedRegularFile:
-    """Open one source through retained per-component no-follow dirfds."""
+def open_rooted_regular_file(
+    reference: SourceReference,
+    *,
+    file_system: RootedFileSystem,
+) -> RootedRegularFile:
+    """Open one source through the shared retained rooted-file authority."""
 
     if type(reference) is not SourceReference:
         raise TypeError("reference must be exact SourceReference")
     relative_parts = _relative_parts(reference.safe_root, reference.selected_path)
-    current = _open_absolute_root(reference.safe_root)
+    root_path = Path(reference.safe_root)
+    if not isinstance(file_system, RootedFileSystem):
+        raise TypeError("file_system must implement RootedFileSystem")
+    root = None
+    bound = None
     try:
-        for component in relative_parts[:-1]:
-            try:
-                child = os.open(
-                    component,
-                    _open_flags(directory=True),
-                    dir_fd=current,
-                )
-            except OSError as exc:
-                raise _map_open_error(exc) from exc
-            os.close(current)
-            current = child
-        try:
-            descriptor = os.open(
-                relative_parts[-1],
-                _open_flags(directory=False),
-                dir_fd=current,
+        root = file_system.bind_root(root_path)
+        bound = file_system.open_regular(root, _platform_relative_path(relative_parts))
+        snapshot = bound.snapshot()
+        if (
+            snapshot.identity.kind != "regular"
+            or snapshot.identity.link_count != 1
+            or not snapshot.reparse_free
+        ):
+            raise ParserSourceError(
+                "PARSER.SOURCE.NOT_REGULAR",
+                "the rooted source is not a single-link regular file",
             )
-        except OSError as exc:
-            raise _map_open_error(exc) from exc
-    finally:
-        os.close(current)
-    try:
-        status = os.fstat(descriptor)
-    except OSError as exc:
-        os.close(descriptor)
-        raise ParserSourceError(
-            "PARSER.SOURCE.READ_FAILED",
-            "the rooted file identity could not be inspected safely",
-        ) from exc
-    if not stat.S_ISREG(status.st_mode):
-        os.close(descriptor)
-        raise ParserSourceError(
-            "PARSER.SOURCE.NOT_REGULAR",
-            "the rooted reference does not name a regular file",
+        opened = RootedRegularFile(
+            _authority=bound,
+            relative_path="/".join(relative_parts),
+            initial_snapshot=snapshot,
         )
-    return RootedRegularFile(
-        _descriptor=descriptor,
-        relative_path="/".join(relative_parts),
-        initial_status=status,
-    )
-
-
-def _stable_status_key(status: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        status.st_dev,
-        status.st_ino,
-        status.st_mode,
-        status.st_size,
-        status.st_mtime_ns,
-        status.st_ctime_ns,
-    )
+        bound = None
+        return opened
+    except ParserSourceError:
+        raise
+    except PlatformFileError as error:
+        raise _map_platform_source_error(error) from None
+    finally:
+        if bound is not None:
+            bound.close()
+        if root is not None:
+            root.close()
 
 
 def _relative_reference_digest(relative_path: str) -> str:
     return hashlib.sha256(relative_path.encode("utf-8", "strict")).hexdigest()
-
-
-def _regular_file_identity(status: os.stat_result) -> str:
-    return f"{status.st_dev}:{status.st_ino}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +526,28 @@ class SealedSourceSnapshot:
             )
         return self._temporary.fileno()
 
+    def _read_at(self, offset: int, size: int) -> bytes:
+        with self._lock:
+            if self._released or self._temporary is None:
+                raise ParserSourceError(
+                    "PARSER.SOURCE.SNAPSHOT_RELEASED",
+                    "the sealed snapshot bytes have been released",
+                )
+            try:
+                self._temporary.seek(offset)
+                payload = self._temporary.read(size)
+            except OSError as error:
+                raise ParserSourceError(
+                    "PARSER.SOURCE.READ_FAILED",
+                    "the sealed snapshot cursor could not read its bound bytes",
+                ) from error
+        if type(payload) is not bytes:
+            raise ParserSourceError(
+                "PARSER.SOURCE.READ_FAILED",
+                "the sealed snapshot cursor returned a non-byte payload",
+            )
+        return payload
+
     def __enter__(self) -> SealedSourceSnapshot:
         return self
 
@@ -543,10 +629,9 @@ class _SnapshotLeaseBase:
         try:
             while unread:
                 _check_cancellation(self._cancellation)
-                chunk = os.pread(
-                    self._snapshot._descriptor,
-                    min(unread, _COPY_CHUNK_BYTES),
+                chunk = self._snapshot._read_at(
                     self._offset,
+                    min(unread, _COPY_CHUNK_BYTES),
                 )
                 if not chunk:
                     raise ParserSourceError(
@@ -640,9 +725,10 @@ def create_sealed_snapshot(
     reference: SourceReference,
     *,
     limit_profile: LimitProfile,
+    file_system: RootedFileSystem,
     cancellation: CancellationToken | None = None,
 ) -> SealedSourceSnapshot:
-    """Copy one rooted descriptor once while hashing and proving fstat stability."""
+    """Copy one rooted authority once while proving exact platform snapshot facts."""
 
     if type(reference) is not SourceReference:
         raise TypeError("reference must be exact SourceReference")
@@ -651,9 +737,9 @@ def create_sealed_snapshot(
     _check_cancellation(cancellation)
     temporary = None
     try:
-        with open_rooted_regular_file(reference) as opened:
-            before = os.fstat(opened.descriptor)
-            if before.st_size > limit_profile.max_input_bytes:
+        with open_rooted_regular_file(reference, file_system=file_system) as opened:
+            before = opened.snapshot()
+            if before.byte_count > limit_profile.max_input_bytes:
                 raise ParserSourceError(
                     "PARSER.LIMIT.INPUT",
                     "source bytes exceed the active input limit",
@@ -661,11 +747,19 @@ def create_sealed_snapshot(
             temporary = tempfile.TemporaryFile(mode="w+b", prefix="parser-snapshot-")
             digest = hashlib.sha256()
             copied = 0
-            while True:
+            while copied < before.byte_count:
                 _check_cancellation(cancellation)
-                chunk = os.read(opened.descriptor, _COPY_CHUNK_BYTES)
+                chunk = opened.read_at(
+                    copied,
+                    min(_COPY_CHUNK_BYTES, before.byte_count - copied),
+                    before,
+                )
+                _check_cancellation(cancellation)
                 if not chunk:
-                    break
+                    raise ParserSourceError(
+                        "PARSER.SOURCE.STALE",
+                        "the rooted source ended before its proved byte count",
+                    )
                 copied += len(chunk)
                 if copied > limit_profile.max_input_bytes:
                     raise ParserSourceError(
@@ -675,8 +769,14 @@ def create_sealed_snapshot(
                 digest.update(chunk)
                 _write_all(temporary.fileno(), chunk)
             _check_cancellation(cancellation)
-            after = os.fstat(opened.descriptor)
-            if _stable_status_key(before) != _stable_status_key(after) or copied != before.st_size:
+            if opened.read_at(copied, 1, before):
+                raise ParserSourceError(
+                    "PARSER.SOURCE.STALE",
+                    "the rooted source exceeded its proved byte count",
+                )
+            _check_cancellation(cancellation)
+            terminal = opened.snapshot()
+            if before != terminal or copied != before.byte_count:
                 raise ParserSourceError(
                     "PARSER.SOURCE.STALE",
                     "source identity changed while the sealed snapshot was copied",
@@ -686,9 +786,9 @@ def create_sealed_snapshot(
             temporary.seek(0)
             identity = SourceSnapshotIdentity(
                 relative_reference_sha256=_relative_reference_digest(opened.relative_path),
-                regular_file_identity=_regular_file_identity(before),
-                original_size=before.st_size,
-                original_mtime_ns=before.st_mtime_ns,
+                regular_file_identity=_identity_text(before.identity),
+                original_size=before.byte_count,
+                original_mtime_ns=_modified_time_ns(before),
                 content_sha256=digest.hexdigest(),
                 byte_count=copied,
                 schema_version=_SNAPSHOT_SCHEMA_VERSION,
@@ -719,6 +819,7 @@ def reopen_sealed_snapshot(
     *,
     limit_profile: LimitProfile,
     expected: SnapshotExpectation,
+    file_system: RootedFileSystem,
     cancellation: CancellationToken | None = None,
 ) -> SealedSourceSnapshot:
     """Rebuild released bytes and reject any identity/profile drift before parsing."""
@@ -736,6 +837,7 @@ def reopen_sealed_snapshot(
         reference,
         limit_profile=limit_profile,
         cancellation=cancellation,
+        file_system=file_system,
     )
     if snapshot.identity != expected.identity:
         snapshot.close()
@@ -1435,223 +1537,166 @@ def materialize(
         session.close()
 
 
-def _open_rooted_target_parent(reference: TargetReference) -> tuple[int, str, str]:
-    if type(reference) is not TargetReference:
-        raise TypeError("reference must be exact TargetReference")
-    relative_parts = _relative_parts(reference.safe_root, reference.selected_path)
-    current = _open_absolute_root(reference.safe_root)
+def _cleanup_unpublished_candidate(
+    parent: object,
+    name: str | None,
+    identity: FileObjectIdentity | None,
+) -> None:
+    if name is None or identity is None:
+        return
     try:
-        for component in relative_parts[:-1]:
-            try:
-                child = os.open(
-                    component,
-                    _open_flags(directory=True),
-                    dir_fd=current,
-                )
-            except OSError as exc:
-                raise _map_open_error(exc) from exc
-            os.close(current)
-            current = child
-        target_name = relative_parts[-1]
-        try:
-            target_status = os.stat(
-                target_name,
-                dir_fd=current,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            target_status = None
-        except OSError as exc:
-            raise _map_open_error(exc) from exc
-        if target_status is not None and not stat.S_ISREG(target_status.st_mode):
-            raise ParserSourceError(
-                "PARSER.SOURCE.NOT_REGULAR",
-                "the rooted target is a link or non-regular object",
-            )
-        return current, target_name, "/".join(relative_parts)
-    except BaseException:
-        os.close(current)
-        raise
+        parent.unlink_owned(name, identity)
+    except (AttributeError, PlatformFileError):
+        pass
 
 
-def _validate_temp_payload(
-    descriptor: int,
+def atomic_write_bytes(
+    reference: TargetReference,
+    payload: bytes,
     *,
-    expected_digest: str,
-    expected_byte_count: int,
-) -> os.stat_result:
-    status = os.fstat(descriptor)
-    if not stat.S_ISREG(status.st_mode) or status.st_size != expected_byte_count:
-        raise ValueError("temporary target identity or byte count is invalid")
-    digest = hashlib.sha256()
-    offset = 0
-    while offset < expected_byte_count:
-        chunk = os.pread(
-            descriptor,
-            min(_COPY_CHUNK_BYTES, expected_byte_count - offset),
-            offset,
-        )
-        if not chunk:
-            raise ValueError("temporary target ended before its expected byte count")
-        digest.update(chunk)
-        offset += len(chunk)
-    if digest.hexdigest() != expected_digest:
-        raise ValueError("temporary target digest differs from serialized bytes")
-    return status
-
-
-def _prove_replaced_target(
-    parent_descriptor: int,
-    target_name: str,
-    *,
-    expected_digest: str,
-    expected_byte_count: int,
-) -> os.stat_result:
-    """Reopen the actual replaced target through retained authority and prove bytes."""
-
-    descriptor = None
-    try:
-        descriptor = os.open(
-            target_name,
-            _open_flags(directory=False),
-            dir_fd=parent_descriptor,
-        )
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode) or status.st_size != expected_byte_count:
-            raise ParserSourceError(
-                "PARSER.SOURCE.WRITE_PROOF_FAILED",
-                "actual replaced target identity or byte count differs from receipt input",
-            )
-        digest = hashlib.sha256()
-        offset = 0
-        while offset < expected_byte_count:
-            chunk = os.pread(
-                descriptor,
-                min(_COPY_CHUNK_BYTES, expected_byte_count - offset),
-                offset,
-            )
-            if not chunk:
-                raise ParserSourceError(
-                    "PARSER.SOURCE.WRITE_PROOF_FAILED",
-                    "actual replaced target ended before its receipt byte count",
-                )
-            digest.update(chunk)
-            offset += len(chunk)
-        if digest.hexdigest() != expected_digest:
-            raise ParserSourceError(
-                "PARSER.SOURCE.WRITE_PROOF_FAILED",
-                "actual replaced target digest differs from serialized bytes",
-            )
-        return status
-    except ParserSourceError:
-        raise
-    except OSError as exc:
-        raise ParserSourceError(
-            "PARSER.SOURCE.WRITE_PROOF_FAILED",
-            "actual replaced target could not be proven through retained authority",
-        ) from exc
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-def atomic_write_bytes(reference: TargetReference, payload: bytes) -> WriteReceipt:
-    """Replace one rooted regular-file target only after durable temp validation."""
+    backend: PlatformFileBackend,
+) -> WriteReceipt:
+    """Publish canonical bytes through the shared bound-parent lifecycle."""
 
     if type(reference) is not TargetReference:
         raise TypeError("reference must be exact TargetReference")
     if type(payload) is not bytes:
         raise TypeError("payload must be exact bytes")
-    parent_descriptor = None
-    temporary_descriptor = None
-    temporary_name = None
-    replaced = False
+    relative_parts = _relative_parts(reference.safe_root, reference.selected_path)
+    relative_path = "/".join(relative_parts)
+    root_path = Path(reference.safe_root)
+    if not isinstance(backend, PlatformFileBackend):
+        raise TypeError("backend must implement PlatformFileBackend")
+
+    root = None
+    parent = None
+    lease = None
+    candidate = None
+    pending = None
+    candidate_name: str | None = None
+    candidate_identity: FileObjectIdentity | None = None
+    cleanup_candidate = False
+    digest = hashlib.sha256(payload).digest()
+    target_name = relative_parts[-1]
+    family_token = hashlib.sha256(relative_path.encode("utf-8", "strict")).hexdigest()
     try:
-        parent_descriptor, target_name, relative_path = _open_rooted_target_parent(reference)
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
+        root = backend.bind_root(root_path)
+        parent = backend.bind_parent(root, _platform_relative_path(relative_parts))
+        root.close()
+        root = None
+
+        current = parent.inspect_entry(target_name)
+        if current is not None and (
+            current.identity.kind != "regular"
+            or current.identity.link_count != 1
+            or not current.reparse_free
+        ):
+            raise ParserSourceError(
+                "PARSER.SOURCE.NOT_REGULAR",
+                "the rooted target is not a single-link regular file",
+            )
+        if current is None:
+            mode = PublishMode.CREATE_IF_ABSENT
+        else:
+            mode = PublishMode.REPLACE_UNDER_LOCK
+            lease = backend.acquire(
+                parent,
+                f".parser-{family_token[:32]}.lock",
+                _PARSER_LOCK_PAYLOAD,
+                LockPolicy(LockWait.BLOCK),
+            )
+
         for _attempt in range(32):
-            candidate = f".parser-{secrets.token_hex(16)}.tmp"
+            candidate_name = f".parser-{family_token[:16]}-{secrets.token_hex(8)}.tmp"
             try:
-                temporary_descriptor = os.open(
-                    candidate,
-                    flags,
-                    0o600,
-                    dir_fd=parent_descriptor,
-                )
-                temporary_name = candidate
+                candidate = parent.create_candidate(candidate_name, private=False)
                 break
-            except FileExistsError:
-                continue
-        if temporary_descriptor is None or temporary_name is None:
+            except PlatformFileError as error:
+                if error.code != PlatformFileErrorCode.PUBLISH_FAILED.value:
+                    raise
+        if candidate is None:
             raise ParserSourceError(
                 "PARSER.SOURCE.WRITE_FAILED",
-                "an exclusive rooted temporary target could not be created",
+                "an exclusive rooted candidate could not be created",
             )
-        digest = hashlib.sha256(payload).hexdigest()
-        _write_all(temporary_descriptor, payload)
-        os.fsync(temporary_descriptor)
+        candidate_identity = candidate.identity()
+        cleanup_candidate = True
+        candidate.write_all(payload)
+        candidate.flush_content()
+
         try:
-            _validate_temp_payload(
-                temporary_descriptor,
-                expected_digest=digest,
-                expected_byte_count=len(payload),
+            pending = parent.begin_publish(
+                candidate,
+                target_name,
+                mode=mode,
+                lease=lease,
             )
-        except ValueError as exc:
+        except PlatformFileError as error:
+            candidate = None
+            if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                cleanup_candidate = False
+            raise
+        candidate = None
+        cleanup_candidate = False
+
+        preliminary = pending.preliminary_facts()
+        if preliminary.content_sha256 != digest or preliminary.byte_count != len(payload):
             raise ParserSourceError(
-                "PARSER.SOURCE.WRITE_VALIDATION_FAILED",
-                "temporary target validation failed before atomic replacement",
-            ) from exc
-        os.close(temporary_descriptor)
-        temporary_descriptor = None
-        os.replace(
-            temporary_name,
-            target_name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-        replaced = True
-        actual_status = _prove_replaced_target(
-            parent_descriptor,
-            target_name,
-            expected_digest=digest,
-            expected_byte_count=len(payload),
-        )
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                "published target facts differ from the canonical payload",
+            )
+        if pending.retained_destination().read_all() != payload:
+            raise ParserSourceError(
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                "published target readback differs from the canonical payload",
+            )
+        terminal = pending.terminal_reproof()
+        if terminal != preliminary:
+            raise ParserSourceError(
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                "published target terminal facts differ from preliminary facts",
+            )
         return WriteReceipt(
             target_relative_reference_sha256=_relative_reference_digest(relative_path),
-            regular_file_identity=_regular_file_identity(actual_status),
-            content_sha256=digest,
+            regular_file_identity=_identity_text(terminal.destination_identity),
+            content_sha256=digest.hex(),
             byte_count=len(payload),
             schema_version=_WRITE_RECEIPT_SCHEMA_VERSION,
         )
     except ParserSourceError:
         raise
-    except OSError as exc:
+    except PlatformFileError as error:
+        raise _map_platform_writer_error(error) from None
+    except Exception:
         raise ParserSourceError(
             "PARSER.SOURCE.WRITE_FAILED",
-            "atomic rooted byte replacement failed before a receipt was issued",
-        ) from exc
+            "rooted canonical publication failed before a receipt was issued",
+        ) from None
     finally:
-        if temporary_descriptor is not None:
+        if candidate is not None:
             try:
-                os.close(temporary_descriptor)
-            except OSError:
+                candidate.close()
+            except PlatformFileError:
                 pass
-        if (
-            not replaced
-            and temporary_name is not None
-            and parent_descriptor is not None
-        ):
+        if cleanup_candidate and parent is not None:
+            _cleanup_unpublished_candidate(parent, candidate_name, candidate_identity)
+        if pending is not None:
             try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except OSError:
+                pending.close()
+            except PlatformFileError:
                 pass
-        if parent_descriptor is not None:
+        if lease is not None:
             try:
-                os.close(parent_descriptor)
-            except OSError:
+                lease.close()
+            except PlatformFileError:
+                pass
+        if parent is not None:
+            try:
+                parent.close()
+            except PlatformFileError:
+                pass
+        if root is not None:
+            try:
+                root.close()
+            except PlatformFileError:
                 pass
