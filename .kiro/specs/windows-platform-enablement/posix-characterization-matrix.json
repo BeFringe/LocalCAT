@@ -2,8 +2,8 @@
   "schema_version": 1,
   "purpose": "迁移前唯一的 POSIX 文件系统与锁行为 oracle；业务不变量和 POSIX 实现事实必须分开解释。",
   "baseline": {
-    "commit": "810a3ab283de18a9c6244eb36006ea13ddd5903d",
-    "tree": "064687f32ce972e2d4d28901d2f7be7efe6dae62",
+    "commit": "d0a5b6c9c87a1b9f61da23b765af75c2c14b267a",
+    "tree": "ee99e104dbe7490af520017f869fb507e8f0859a",
     "relationship": "pre-platform-adapter-extraction"
   },
   "execution_policy": {
