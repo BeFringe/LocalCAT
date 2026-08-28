@@ -910,6 +910,24 @@ class PlatformFileErrorContractTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     PlatformFileError(code, retryable=retryable)  # type: ignore[arg-type]
 
+    def test_error_preserves_python_exception_runtime_protocol(self) -> None:
+        error = PlatformFileError(
+            PlatformFileErrorCode.OUTSIDE_ROOT,
+            retryable=False,
+        )
+        cause = ValueError("cause")
+        context = RuntimeError("context")
+
+        error.__traceback__ = None
+        error.__cause__ = cause
+        error.__context__ = context
+
+        self.assertIsNone(error.__traceback__)
+        self.assertIs(error.__cause__, cause)
+        self.assertIs(error.__context__, context)
+        self.assertEqual(error.code, PlatformFileErrorCode.OUTSIDE_ROOT.value)
+        self.assertIs(error.retryable, False)
+
 
 class PlatformFileAuthorityContractTests(unittest.TestCase):
     def test_regular_bounded_read_validates_shape_and_preserves_eof(self) -> None:
