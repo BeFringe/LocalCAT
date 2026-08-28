@@ -169,7 +169,7 @@
   - _Boundary: Platform Composition Factory_
   - _Depends: 2.3_
 
-- [ ] 3. 实现 Windows rooted/lock/private/publish/durability backend
+- [x] 3. 实现 Windows rooted/lock/private/publish/durability backend
 
 - [x] 3.1 实现 Win32 FFI wrapper、RAII handle 与受支持主机 Gate
   - 精确绑定CreateFileW、GetFileInformationByHandleEx、GetFinalPathNameByHandleW、SetFileInformationByHandle、FlushFileBuffers、LockFileEx/UnlockFileEx、GetSecurityInfo/AccessCheck及其结构/错误
@@ -197,7 +197,7 @@
   - _Boundary: Windows Process File Lock_
   - _Depends: 3.2_
 
-- [ ] 3.4 (P) 实现 W2 private storage 与跨重启 proof重新证明
+- [x] 3.4 (P) 实现 W2 private storage 与跨重启 proof重新证明
   - 按ADR-021经ADR-023接管、ADR-024收窄主体环境后的`WindowsPrivateSecurityV2`，对private dir/device key/attestation/candidate显式创建owner=process-primary TokenUser SID、DACL present/protected且非defaulted/auto-inherited，exact三条AceFlags=0的TokenUser/`S-1-5-18`/`S-1-5-32-544` `ACCESS_ALLOWED_ACE(FILE_ALL_ACCESS)`，并显式设置/重验单一medium `SYSTEM_MANDATORY_LABEL_ACE`+`NO_WRITE_UP` projection；在`READ_CONTROL` handle上以`LABEL_SECURITY_INFORMATION`读取label，不请求完整`SACL_SECURITY_INFORMATION`/`ACCESS_SYSTEM_SECURITY`。audit ACE分开解析，拒绝额外/漂移mandatory label及未知授权ACE/principal，V1/unknown profile不兼容读取
   - `AccessCheck`使用当前primary token复制的`SecurityImpersonation` token；`GENERIC_ALL`经file/directory mapping后必须精确为`FILE_ALL_ACCESS`且全部获准，真实同SID low-integrity/restricted子进程的open/write/delete负向矩阵必须被OS拒绝；owner先摘要不含proof的canonical private-context，W2再对proof unsigned projection做domain-separated HMAC，输出`WindowsPrivateProof`，其`security_profile_id`与authority descriptor digest绑定同一V2 canonical owner+DACL+MIC projection，再由Gate D/canonical owner分别嵌入自身envelope
   - 完成时，mandatory矩阵中standard/elevated正向、同SID low-integrity/restricted负向、thread impersonation不改变process-primary主体，以及service/AppContainer/impersonation与未知ACE/owner/tamper fail closed全部通过；domain/Entra环境仅为optional非阻断覆盖，缺少该环境不得记skip或NO-GO
@@ -205,15 +205,16 @@
   - _Boundary: Windows Private Storage and Persistent Re-attestation_
   - _Depends: 3.2_
 
-- [ ] 3.5 实现 handle-bound publish 的两个模式与精确生命周期
-  - candidate `CREATE_NEW`/share=none，完成 write+FlushFileBuffers；支持 create-if-absent与持有resource-family lease的replace-under-lock
+- [x] 3.5 实现 handle-bound publish 的两个模式与精确生命周期
+  - candidate `CREATE_NEW`/share=none，完成 write+FlushFileBuffers；同父目录命名固定使用`NtSetInformationFile(FileRenameInformation)`、`RootDirectory=NULL`与validated single-component basename，由candidate的live `Open.Link.ParentFile`承载destination directory，并在调用前重验candidate parent chain与retained bound parent为同一实例；支持create-if-absent与持有resource-family lease的replace-under-lock
+  - 固定native结构布局、`FileRenameInformation` class、精确buffer length与NTSTATUS映射并执行arm前self-probe；不可用时零命名mutation返回`DURABILITY_UNAVAILABLE`，禁止CWD/完整路径/`SetFileInformationByHandle`/跨父目录fallback
   - 由`begin_publish`返回opaque `PendingPublication`，严格执行rename→capture final facts→close every candidate handle→reopen/readback并保留no-write/no-delete destination handle→owner durable commit与business-state reproof→platform terminal identity/digest reproof→close；preliminary facts不得当success，pre-snapshot只作stale/recovery fact，不声称CAS
   - 完成时，同进程 close前reopen得到预期 sharing violation，close后成功；协作writer被lease排除，不合作instruction-boundary swap只产生检测失败/recovery-required
   - _Requirements: 3.4, 4.1, 4.3, 4.4, 4.5_
   - _Boundary: Windows Bound Publisher_
   - _Depends: 3.2, 3.3_
 
-- [ ] 3.6 实现并验证 `WindowsDocumentedPublishV1` success contract
+- [x] 3.6 实现并验证 `WindowsDocumentedPublishV1` success contract
   - 在Windows 11 x64 local fixed NTFS上固定`WRITE_THROUGH` candidate、`FlushFileBuffers`、handle-bound naming、candidate close、retained readback、owner state-machine commit与terminal reproof，不引入runtime profile registry或硬件枚举资格
   - arm前任一documented API/volume/security/reparse/FileId/flush/write-through/naming前置缺失时返回`DURABILITY_UNAVAILABLE`且零命名mutation；arm后命名、reopen/readback、owner commit或terminal reproof失败/不确定时返回`RECOVERY_REQUIRED`
   - 完成时，process termination、instruction-boundary fault、应用重启与正常OS reboot只产生完整old、完整new或owner recovery-only；不得把该矩阵宣称为forced-power-loss硬件认证
@@ -221,7 +222,7 @@
   - _Boundary: Windows Documented Publish and Reboot Recovery Gate_
   - _Depends: 3.5_
 
-- [ ] 3.7 运行共享合同与完整 Windows 对抗性矩阵
+- [x] 3.7 运行共享合同与完整 Windows 对抗性矩阵
   - 覆盖 rooted、share、lock、private、publish、identity reuse、target-open、kill、instruction fault、应用重启、正常OS reboot和resource cleanup，mandatory case不得 skip
   - 由Cumulative reviewer核对日志事实与稳定code，特别验证没有path-only proof、expected-CAS宣称、share扩大、FileId永久化或W1/W2依赖循环
   - 完成时，Windows adapter可由factory mint；任何 mandatory失败保持 capability unavailable

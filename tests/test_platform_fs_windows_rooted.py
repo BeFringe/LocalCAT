@@ -737,7 +737,7 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         self.assertTrue(all(path.startswith("\\\\?\\Volume{") for path in guid_paths))
         self.assertEqual(guid_paths[-1].split("\\")[-1], self.root_path.name)
 
-    def test_bound_parent_survives_root_close_and_mutation_stays_unavailable(self) -> None:
+    def test_bound_parent_survives_root_close_for_read_and_candidate_creation(self) -> None:
         file_system = WindowsRootedFileSystem()
         root = file_system.bind_root(self.root_path)
         parent = file_system.bind_parent(
@@ -747,13 +747,11 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         root.close()
         self.assertEqual(parent.inspect_entry("sample.txt").byte_count, len(self.payload))
         self.assertIsNone(parent.inspect_entry("missing.txt"))
-        with self.assertRaises(PlatformFileError) as caught:
-            parent.create_candidate("candidate.tmp", private=False)
-        _assert_platform_error(
-            self,
-            caught,
-            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
-        )
+        candidate = parent.create_candidate("candidate.tmp", private=False)
+        candidate.write_all(b"candidate")
+        candidate.flush_content()
+        self.assertEqual(candidate.identity().kind, "regular")
+        candidate.close()
         parent.close()
 
     def test_hostile_component_is_rejected_before_any_native_open(self) -> None:
@@ -825,6 +823,38 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         self.assertEqual(phases[0], "windows_after_entry_probe")
         self.assertIn("windows_before_body_read", phases)
         self.assertIn("windows_after_body_read", phases)
+
+    def test_probe_to_retained_in_place_rewrite_is_identity_stale(self) -> None:
+        rewritten = b"in-place-rewrite"
+        released = b"authority-released"
+        phases: list[str] = []
+
+        def rewrite(phase: str) -> None:
+            phases.append(phase)
+            if phase == "windows_after_entry_probe":
+                self.source.write_bytes(rewritten)
+
+        file_system = WindowsRootedFileSystem(_fault_injector=rewrite)
+        with file_system.bind_root(self.root_path) as root, mock.patch.object(
+            root._api,
+            "ReadFile",
+            wraps=root._api.ReadFile,
+        ) as read_file:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.IDENTITY_STALE,
+            )
+            self.assertEqual(self.source.read_bytes(), rewritten)
+            read_file.assert_not_called()
+            self.source.write_bytes(released)
+            self.assertEqual(self.source.read_bytes(), released)
+        self.assertEqual(phases, ["windows_after_entry_probe"])
 
     def test_baseexception_during_ownership_transfer_closes_every_handle(self) -> None:
         api = platform_fs_windows.WindowsFileAPI.load()

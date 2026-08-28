@@ -222,6 +222,7 @@ DEVICE_SECRET_SIZE_BYTES = 32
 DEVICE_KEY_ID_HASH_ALGORITHM = "sha256"
 DEVICE_KEY_ID_SIZE_BYTES = 32
 PRIVATE_PROOF_DIGEST_SIZE_BYTES = 32
+WINDOWS_PRIVATE_PROOF_MAX_BYTES = 4096
 
 
 class PrivateProofObjectRole(str, Enum):
@@ -372,6 +373,8 @@ def decode_windows_private_proof(serialized: bytes) -> WindowsPrivateProof:
 
     if type(serialized) is not bytes:
         raise TypeError("serialized proof must be exact bytes")
+    if len(serialized) > WINDOWS_PRIVATE_PROOF_MAX_BYTES:
+        raise ValueError("serialized private proof exceeds the input limit")
 
     class _DuplicateKeyError(ValueError):
         pass
