@@ -79,6 +79,7 @@ class _StagedResource:
     records: tuple[ResourceRecord, ...]
     warnings: tuple[ParseIssue, ...]
     source_digest: str
+    source_name_hint: str
 
 
 def _source_reference(path: Path) -> SourceReference:
@@ -151,6 +152,7 @@ def _stage_parser_resource(
         records: list[ResourceRecord] = []
         warnings: list[ParseIssue] = []
         source_digest = opened.source_identity.content_sha256
+        source_name_hint = opened.source_name_hint
         try:
             session = opened.stream()
         except ContractViolation as exc:
@@ -184,6 +186,7 @@ def _stage_parser_resource(
         records=tuple(records),
         warnings=tuple(warnings),
         source_digest=source_digest,
+        source_name_hint=source_name_hint,
     )
 
 
@@ -417,12 +420,7 @@ def import_tmx(
     """
 
     try:
-        source = _validate_input(input_path, {".tmx"})
-        # Freeze compatibility receipt provenance before the Parser opens its
-        # sealed snapshot.  The Parser still receives the unresolved lexical
-        # selection so SourceReference preserves the user's selected path;
-        # no path lookup is repeated after streaming begins.
-        receipt_source = source.resolve()
+        source = _validate_tmx_selection(input_path)
         target = target_path.expanduser().resolve()
         staged = _stage_parser_resource(
             source,
@@ -435,6 +433,7 @@ def import_tmx(
                 "TMX contains no valid units for "
                 f"{source_locale.strip()} → {target_locale.strip()}"
             )
+        receipt_source = source.parent / staged.source_name_hint
         ordered_units = tuple(staged.records)
         incoming: dict[str, dict[str, object]] = {}
         duplicate_count = 0
@@ -576,6 +575,16 @@ def _validate_input(input_path: Path, suffixes: set[str]) -> Path:
     if path.suffix.lower() not in suffixes:
         supported = ", ".join(sorted(suffixes))
         raise ImportFailure(f"unsupported import format; expected one of: {supported}")
+    return path
+
+
+def _validate_tmx_selection(input_path: Path) -> Path:
+    """Validate only lexical selection shape; Parser owns source existence/kind."""
+
+    expanded = input_path.expanduser()
+    path = expanded if expanded.is_absolute() else expanded.absolute()
+    if path.suffix.lower() != ".tmx":
+        raise ImportFailure("unsupported import format; expected one of: .tmx")
     return path
 
 
