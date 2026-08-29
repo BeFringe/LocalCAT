@@ -12,13 +12,27 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import stat
 from typing import Mapping, TypedDict
 
+from platform_fs_contracts import (
+    BoundContentFacts,
+    BoundRegularFile,
+    FileObjectIdentity,
+    OpaqueAuthority,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    RootedDirectoryAuthority,
+    RootedFileSystem,
+)
 
-CONTENT_ATTESTATION_VERSION = "tm-content-attestation-v2"
+
+LEGACY_CONTENT_ATTESTATION_VERSION = "tm-content-attestation-v2"
+PORTABLE_CONTENT_ATTESTATION_VERSION = "tm-content-attestation-v3"
+# Existing writers remain pinned to v2 until their owners migrate atomically.
+CONTENT_ATTESTATION_VERSION = LEGACY_CONTENT_ATTESTATION_VERSION
 LOGICAL_CLOSURE_VERSION = "tm-logical-closure-v2"
 SEALED_CONTENT_PHASE = "SEALED"
 ACTIVE_CONTENT_PHASE = "ACTIVE"
@@ -102,9 +116,27 @@ class ContentFileProof:
         _require_digest(self.sha256, "sha256")
 
 
+# Semantic name for the v2 POSIX dev/inode proof.  ContentFileProof remains the
+# compatibility spelling consumed by existing v2 owners.
+LegacyPosixContentFileProof = ContentFileProof
+
+
+@dataclass(frozen=True)
+class PortableContentFileProof:
+    """Persistable cross-platform content facts without live file identity."""
+
+    size: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _require_int(self.size, "size")
+        _require_digest(self.sha256, "sha256")
+
+
 _CONTENT_FILE_PROOF_FIELDS = frozenset(
     {"device", "inode", "sha256", "size"}
 )
+_PORTABLE_CONTENT_FILE_PROOF_FIELDS = frozenset({"sha256", "size"})
 
 
 def _content_file_proof_to_mapping(
@@ -134,6 +166,37 @@ def _content_file_proof_from_mapping(
         size=_require_int(values["size"], "size"),
         sha256=_require_digest(values["sha256"], "sha256"),
     )
+
+
+def _portable_content_file_proof_to_mapping(
+    proof: PortableContentFileProof,
+) -> dict[str, object]:
+    if type(proof) is not PortableContentFileProof:
+        raise TypeError("proof must be exact PortableContentFileProof")
+    return {"sha256": proof.sha256, "size": proof.size}
+
+
+def _portable_content_file_proof_from_mapping(
+    mapping: object,
+) -> PortableContentFileProof:
+    if type(mapping) is not dict:
+        raise TypeError("portable file proof must be an exact object")
+    values: dict[object, object] = mapping
+    if set(values) != _PORTABLE_CONTENT_FILE_PROOF_FIELDS:
+        raise ValueError(
+            "portable file proof fields do not match the strict codec"
+        )
+    return PortableContentFileProof(
+        size=_require_int(values["size"], "size"),
+        sha256=_require_digest(values["sha256"], "sha256"),
+    )
+
+
+def _require_attestation_version(value: object, expected: str) -> str:
+    version = _require_string(value, "attestation_version")
+    if version != expected:
+        raise ValueError("unsupported content attestation version")
+    return version
 
 
 @dataclass(frozen=True)
@@ -408,8 +471,10 @@ class SealedContentAttestation:
     attestation_digest: str
 
     def __post_init__(self) -> None:
-        if self.attestation_version != CONTENT_ATTESTATION_VERSION:
-            raise ValueError("unsupported sealed content attestation version")
+        _require_attestation_version(
+            self.attestation_version,
+            LEGACY_CONTENT_ATTESTATION_VERSION,
+        )
         if self.phase != SEALED_CONTENT_PHASE:
             raise ValueError("sealed content attestation phase is invalid")
         _require_string(self.resource_id, "resource_id")
@@ -540,10 +605,12 @@ def _sealed_content_attestation_from_mapping(
     values: dict[object, object] = mapping
     if set(values) != _SEALED_FIELDS:
         raise ValueError("sealed attestation fields do not match strict codec")
+    version = _require_attestation_version(
+        values["attestation_version"],
+        LEGACY_CONTENT_ATTESTATION_VERSION,
+    )
     return SealedContentAttestation(
-        attestation_version=_require_string(
-            values["attestation_version"], "attestation_version"
-        ),
+        attestation_version=version,
         phase=_require_string(values["phase"], "phase"),
         resource_id=_require_string(values["resource_id"], "resource_id"),
         target_identity=_require_digest(
@@ -591,8 +658,10 @@ class ActiveContentAttestation:
     attestation_digest: str
 
     def __post_init__(self) -> None:
-        if self.attestation_version != CONTENT_ATTESTATION_VERSION:
-            raise ValueError("unsupported active content attestation version")
+        _require_attestation_version(
+            self.attestation_version,
+            LEGACY_CONTENT_ATTESTATION_VERSION,
+        )
         if self.phase != ACTIVE_CONTENT_PHASE:
             raise ValueError("active content attestation phase is invalid")
         if self.attested_journal_phase != "MANIFEST_PUBLISHED":
@@ -739,10 +808,12 @@ def _active_content_attestation_from_mapping(
     values: dict[object, object] = mapping
     if set(values) != _ACTIVE_FIELDS:
         raise ValueError("active attestation fields do not match strict codec")
+    version = _require_attestation_version(
+        values["attestation_version"],
+        LEGACY_CONTENT_ATTESTATION_VERSION,
+    )
     return ActiveContentAttestation(
-        attestation_version=_require_string(
-            values["attestation_version"], "attestation_version"
-        ),
+        attestation_version=version,
         phase=_require_string(values["phase"], "phase"),
         attested_journal_phase=_require_string(
             values["attested_journal_phase"], "attested_journal_phase"
@@ -768,6 +839,401 @@ def _active_content_attestation_from_mapping(
         database=_content_file_proof_from_mapping(values["database"]),
         manifest=_content_file_proof_from_mapping(values["manifest"]),
         source=_content_file_proof_from_mapping(values["source"]),
+        semantic_facts=_semantic_facts_from_mapping(values["semantic_facts"]),
+        attestation_digest=_require_digest(
+            values["attestation_digest"], "attestation_digest"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PortableSealedContentAttestation:
+    attestation_version: str
+    phase: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    evidence_digest: str
+    database: PortableContentFileProof
+    manifest: PortableContentFileProof
+    source: PortableContentFileProof
+    semantic_facts: ContentSemanticFacts
+    attestation_digest: str
+
+    def __post_init__(self) -> None:
+        _require_attestation_version(
+            self.attestation_version,
+            PORTABLE_CONTENT_ATTESTATION_VERSION,
+        )
+        if self.phase != SEALED_CONTENT_PHASE:
+            raise ValueError("portable sealed content attestation phase is invalid")
+        _require_string(self.resource_id, "resource_id")
+        _require_digest(self.target_identity, "target_identity")
+        _require_string(self.canonical_store_id, "canonical_store_id")
+        _require_digest(self.snapshot_receipt_digest, "snapshot_receipt_digest")
+        _require_optional_generation(self.expected_prior_generation)
+        _require_digest(self.evidence_digest, "evidence_digest")
+        for value in (self.database, self.manifest, self.source):
+            if type(value) is not PortableContentFileProof:
+                raise TypeError(
+                    "portable attestation files must be exact "
+                    "PortableContentFileProof"
+                )
+        if type(self.semantic_facts) is not ContentSemanticFacts:
+            raise TypeError("semantic_facts must be exact ContentSemanticFacts")
+        _require_digest(self.attestation_digest, "attestation_digest")
+        if self.attestation_digest != _stable_digest(
+            _portable_sealed_content_payload(self, include_digest=False)
+        ):
+            raise ValueError(
+                "portable sealed content attestation digest does not close"
+            )
+
+
+class _PortableSealedContentAttestationValues(TypedDict):
+    attestation_version: str
+    phase: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    evidence_digest: str
+    database: PortableContentFileProof
+    manifest: PortableContentFileProof
+    source: PortableContentFileProof
+    semantic_facts: ContentSemanticFacts
+
+
+def _portable_sealed_content_payload(
+    attestation: PortableSealedContentAttestation,
+    *,
+    include_digest: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "attestation_version": attestation.attestation_version,
+        "canonical_store_id": attestation.canonical_store_id,
+        "database": _portable_content_file_proof_to_mapping(
+            attestation.database
+        ),
+        "evidence_digest": attestation.evidence_digest,
+        "expected_prior_generation": attestation.expected_prior_generation,
+        "manifest": _portable_content_file_proof_to_mapping(
+            attestation.manifest
+        ),
+        "phase": attestation.phase,
+        "resource_id": attestation.resource_id,
+        "semantic_facts": _semantic_facts_to_mapping(
+            attestation.semantic_facts
+        ),
+        "snapshot_receipt_digest": attestation.snapshot_receipt_digest,
+        "source": _portable_content_file_proof_to_mapping(attestation.source),
+        "target_identity": attestation.target_identity,
+    }
+    if include_digest:
+        payload["attestation_digest"] = attestation.attestation_digest
+    return payload
+
+
+def _create_portable_sealed_content_attestation(
+    *,
+    resource_id: str,
+    target_identity: str,
+    canonical_store_id: str,
+    snapshot_receipt_digest: str,
+    expected_prior_generation: int | None,
+    evidence_digest: str,
+    database: PortableContentFileProof,
+    manifest: PortableContentFileProof,
+    source: PortableContentFileProof,
+    semantic_facts: ContentSemanticFacts,
+) -> PortableSealedContentAttestation:
+    values: _PortableSealedContentAttestationValues = {
+        "attestation_version": PORTABLE_CONTENT_ATTESTATION_VERSION,
+        "phase": SEALED_CONTENT_PHASE,
+        "resource_id": resource_id,
+        "target_identity": target_identity,
+        "canonical_store_id": canonical_store_id,
+        "snapshot_receipt_digest": snapshot_receipt_digest,
+        "expected_prior_generation": expected_prior_generation,
+        "evidence_digest": evidence_digest,
+        "database": database,
+        "manifest": manifest,
+        "source": source,
+        "semantic_facts": semantic_facts,
+    }
+    provisional = object.__new__(PortableSealedContentAttestation)
+    for key, value in values.items():
+        object.__setattr__(provisional, key, value)
+    digest = _stable_digest(
+        _portable_sealed_content_payload(provisional, include_digest=False)
+    )
+    return PortableSealedContentAttestation(
+        **values,
+        attestation_digest=digest,
+    )
+
+
+def _portable_sealed_content_attestation_to_mapping(
+    attestation: PortableSealedContentAttestation,
+) -> dict[str, object]:
+    if type(attestation) is not PortableSealedContentAttestation:
+        raise TypeError(
+            "attestation must be exact PortableSealedContentAttestation"
+        )
+    return _portable_sealed_content_payload(attestation, include_digest=True)
+
+
+def _portable_sealed_content_attestation_from_mapping(
+    mapping: object,
+) -> PortableSealedContentAttestation:
+    if type(mapping) is not dict:
+        raise TypeError("portable sealed attestation must be an exact object")
+    values: dict[object, object] = mapping
+    if set(values) != _SEALED_FIELDS:
+        raise ValueError(
+            "portable sealed attestation fields do not match strict codec"
+        )
+    version = _require_attestation_version(
+        values["attestation_version"],
+        PORTABLE_CONTENT_ATTESTATION_VERSION,
+    )
+    return PortableSealedContentAttestation(
+        attestation_version=version,
+        phase=_require_string(values["phase"], "phase"),
+        resource_id=_require_string(values["resource_id"], "resource_id"),
+        target_identity=_require_digest(
+            values["target_identity"], "target_identity"
+        ),
+        canonical_store_id=_require_string(
+            values["canonical_store_id"], "canonical_store_id"
+        ),
+        snapshot_receipt_digest=_require_digest(
+            values["snapshot_receipt_digest"], "snapshot_receipt_digest"
+        ),
+        expected_prior_generation=_require_optional_generation(
+            values["expected_prior_generation"]
+        ),
+        evidence_digest=_require_digest(
+            values["evidence_digest"], "evidence_digest"
+        ),
+        database=_portable_content_file_proof_from_mapping(
+            values["database"]
+        ),
+        manifest=_portable_content_file_proof_from_mapping(
+            values["manifest"]
+        ),
+        source=_portable_content_file_proof_from_mapping(values["source"]),
+        semantic_facts=_semantic_facts_from_mapping(values["semantic_facts"]),
+        attestation_digest=_require_digest(
+            values["attestation_digest"], "attestation_digest"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PortableActiveContentAttestation:
+    attestation_version: str
+    phase: str
+    attested_journal_phase: str
+    sealed_attestation_digest: str
+    journal_id: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    generation: int
+    activation_digest: str
+    database: PortableContentFileProof
+    manifest: PortableContentFileProof
+    source: PortableContentFileProof
+    semantic_facts: ContentSemanticFacts
+    attestation_digest: str
+
+    def __post_init__(self) -> None:
+        _require_attestation_version(
+            self.attestation_version,
+            PORTABLE_CONTENT_ATTESTATION_VERSION,
+        )
+        if self.phase != ACTIVE_CONTENT_PHASE:
+            raise ValueError("portable active content attestation phase is invalid")
+        if self.attested_journal_phase != "MANIFEST_PUBLISHED":
+            raise ValueError("portable active journal phase is invalid")
+        _require_digest(self.sealed_attestation_digest, "sealed_attestation_digest")
+        _require_string(self.journal_id, "journal_id")
+        _require_string(self.resource_id, "resource_id")
+        _require_digest(self.target_identity, "target_identity")
+        _require_string(self.canonical_store_id, "canonical_store_id")
+        _require_digest(self.snapshot_receipt_digest, "snapshot_receipt_digest")
+        _require_int(self.generation, "generation")
+        _require_digest(self.activation_digest, "activation_digest")
+        for value in (self.database, self.manifest, self.source):
+            if type(value) is not PortableContentFileProof:
+                raise TypeError(
+                    "portable attestation files must be exact "
+                    "PortableContentFileProof"
+                )
+        if type(self.semantic_facts) is not ContentSemanticFacts:
+            raise TypeError("semantic_facts must be exact ContentSemanticFacts")
+        _require_digest(self.attestation_digest, "attestation_digest")
+        if self.attestation_digest != _stable_digest(
+            _portable_active_content_payload(self, include_digest=False)
+        ):
+            raise ValueError(
+                "portable active content attestation digest does not close"
+            )
+
+
+class _PortableActiveContentAttestationValues(TypedDict):
+    attestation_version: str
+    phase: str
+    attested_journal_phase: str
+    sealed_attestation_digest: str
+    journal_id: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    generation: int
+    activation_digest: str
+    database: PortableContentFileProof
+    manifest: PortableContentFileProof
+    source: PortableContentFileProof
+    semantic_facts: ContentSemanticFacts
+
+
+def _portable_active_content_payload(
+    attestation: PortableActiveContentAttestation,
+    *,
+    include_digest: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "activation_digest": attestation.activation_digest,
+        "attestation_version": attestation.attestation_version,
+        "attested_journal_phase": attestation.attested_journal_phase,
+        "canonical_store_id": attestation.canonical_store_id,
+        "database": _portable_content_file_proof_to_mapping(
+            attestation.database
+        ),
+        "generation": attestation.generation,
+        "journal_id": attestation.journal_id,
+        "manifest": _portable_content_file_proof_to_mapping(
+            attestation.manifest
+        ),
+        "phase": attestation.phase,
+        "resource_id": attestation.resource_id,
+        "sealed_attestation_digest": attestation.sealed_attestation_digest,
+        "semantic_facts": _semantic_facts_to_mapping(attestation.semantic_facts),
+        "snapshot_receipt_digest": attestation.snapshot_receipt_digest,
+        "source": _portable_content_file_proof_to_mapping(attestation.source),
+        "target_identity": attestation.target_identity,
+    }
+    if include_digest:
+        payload["attestation_digest"] = attestation.attestation_digest
+    return payload
+
+
+def _create_portable_active_content_attestation(
+    *,
+    sealed_attestation_digest: str,
+    journal_id: str,
+    resource_id: str,
+    target_identity: str,
+    canonical_store_id: str,
+    snapshot_receipt_digest: str,
+    generation: int,
+    activation_digest: str,
+    database: PortableContentFileProof,
+    manifest: PortableContentFileProof,
+    source: PortableContentFileProof,
+    semantic_facts: ContentSemanticFacts,
+) -> PortableActiveContentAttestation:
+    values: _PortableActiveContentAttestationValues = {
+        "attestation_version": PORTABLE_CONTENT_ATTESTATION_VERSION,
+        "phase": ACTIVE_CONTENT_PHASE,
+        "attested_journal_phase": "MANIFEST_PUBLISHED",
+        "sealed_attestation_digest": sealed_attestation_digest,
+        "journal_id": journal_id,
+        "resource_id": resource_id,
+        "target_identity": target_identity,
+        "canonical_store_id": canonical_store_id,
+        "snapshot_receipt_digest": snapshot_receipt_digest,
+        "generation": generation,
+        "activation_digest": activation_digest,
+        "database": database,
+        "manifest": manifest,
+        "source": source,
+        "semantic_facts": semantic_facts,
+    }
+    provisional = object.__new__(PortableActiveContentAttestation)
+    for key, value in values.items():
+        object.__setattr__(provisional, key, value)
+    digest = _stable_digest(
+        _portable_active_content_payload(provisional, include_digest=False)
+    )
+    return PortableActiveContentAttestation(
+        **values,
+        attestation_digest=digest,
+    )
+
+
+def _portable_active_content_attestation_to_mapping(
+    attestation: PortableActiveContentAttestation,
+) -> dict[str, object]:
+    if type(attestation) is not PortableActiveContentAttestation:
+        raise TypeError(
+            "attestation must be exact PortableActiveContentAttestation"
+        )
+    return _portable_active_content_payload(attestation, include_digest=True)
+
+
+def _portable_active_content_attestation_from_mapping(
+    mapping: object,
+) -> PortableActiveContentAttestation:
+    if type(mapping) is not dict:
+        raise TypeError("portable active attestation must be an exact object")
+    values: dict[object, object] = mapping
+    if set(values) != _ACTIVE_FIELDS:
+        raise ValueError(
+            "portable active attestation fields do not match strict codec"
+        )
+    version = _require_attestation_version(
+        values["attestation_version"],
+        PORTABLE_CONTENT_ATTESTATION_VERSION,
+    )
+    return PortableActiveContentAttestation(
+        attestation_version=version,
+        phase=_require_string(values["phase"], "phase"),
+        attested_journal_phase=_require_string(
+            values["attested_journal_phase"], "attested_journal_phase"
+        ),
+        sealed_attestation_digest=_require_digest(
+            values["sealed_attestation_digest"], "sealed_attestation_digest"
+        ),
+        journal_id=_require_string(values["journal_id"], "journal_id"),
+        resource_id=_require_string(values["resource_id"], "resource_id"),
+        target_identity=_require_digest(
+            values["target_identity"], "target_identity"
+        ),
+        canonical_store_id=_require_string(
+            values["canonical_store_id"], "canonical_store_id"
+        ),
+        snapshot_receipt_digest=_require_digest(
+            values["snapshot_receipt_digest"], "snapshot_receipt_digest"
+        ),
+        generation=_require_int(values["generation"], "generation"),
+        activation_digest=_require_digest(
+            values["activation_digest"], "activation_digest"
+        ),
+        database=_portable_content_file_proof_from_mapping(
+            values["database"]
+        ),
+        manifest=_portable_content_file_proof_from_mapping(
+            values["manifest"]
+        ),
+        source=_portable_content_file_proof_from_mapping(values["source"]),
         semantic_facts=_semantic_facts_from_mapping(values["semantic_facts"]),
         attestation_digest=_require_digest(
             values["attestation_digest"], "attestation_digest"
@@ -978,14 +1444,139 @@ def _revalidate_content_file(
     return observed
 
 
+def _platform_content_attestation_error_code(
+    error: PlatformFileError,
+) -> str:
+    if error.code == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+        return "CONTENT_ATTESTATION.FILE_MISSING"
+    if error.code == PlatformFileErrorCode.REPARSE_REJECTED.value:
+        return "CONTENT_ATTESTATION.FILE_UNSAFE"
+    if error.code == PlatformFileErrorCode.IDENTITY_STALE.value:
+        return "CONTENT_ATTESTATION.FILE_MUTATED"
+    return "CONTENT_ATTESTATION.CAPABILITY_UNAVAILABLE"
+
+
+class _LivePortableContentCapture(OpaqueAuthority):
+    """Owner-private live authority paired with portable persisted facts."""
+
+    __slots__ = ("__root", "__file", "__captured", "__proof")
+
+    def __init__(
+        self,
+        root: RootedDirectoryAuthority,
+        file: BoundRegularFile,
+        captured: BoundContentFacts,
+    ) -> None:
+        super().__init__()
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        if not isinstance(file, BoundRegularFile):
+            raise TypeError("file must be BoundRegularFile")
+        if type(captured) is not BoundContentFacts:
+            raise TypeError("captured must be exact BoundContentFacts")
+        self.__root = root
+        self.__file = file
+        self.__captured = captured
+        self.__proof = PortableContentFileProof(
+            size=captured.snapshot.byte_count,
+            sha256=captured.content_sha256.hex(),
+        )
+
+    def persisted_proof(self) -> PortableContentFileProof:
+        self._require_open()
+        return self.__proof
+
+    def live_identity(self) -> FileObjectIdentity:
+        return self.reprove().snapshot.identity
+
+    def reprove(self) -> BoundContentFacts:
+        self._require_open()
+        try:
+            observed = self.__file.content_facts()
+        except PlatformFileError as error:
+            raise ContentAttestationError(
+                _platform_content_attestation_error_code(error)
+            ) from None
+        if observed != self.__captured:
+            raise ContentAttestationError(
+                "CONTENT_ATTESTATION.CONTENT_MISMATCH"
+            )
+        if (
+            observed.snapshot.byte_count != self.__proof.size
+            or observed.content_sha256.hex() != self.__proof.sha256
+        ):
+            raise ContentAttestationError(
+                "CONTENT_ATTESTATION.CONTENT_MISMATCH"
+            )
+        return observed
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            self.__file.close()
+        except BaseException as error:
+            first_error = error
+        try:
+            self.__root.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+
+def _capture_platform_content_file(
+    backend: RootedFileSystem,
+    root: Path,
+    relative: PurePath,
+) -> _LivePortableContentCapture:
+    """Capture exact bytes through a retained platform-rooted authority."""
+
+    rooted: RootedDirectoryAuthority | None = None
+    bound: BoundRegularFile | None = None
+    try:
+        rooted = backend.bind_root(root)
+        bound = backend.open_regular(rooted, relative)
+        captured = bound.content_facts()
+        return _LivePortableContentCapture(rooted, bound, captured)
+    except PlatformFileError as error:
+        try:
+            if bound is not None:
+                bound.close()
+        except PlatformFileError:
+            pass
+        try:
+            if rooted is not None:
+                rooted.close()
+        except PlatformFileError:
+            pass
+        raise ContentAttestationError(
+            _platform_content_attestation_error_code(error)
+        ) from None
+    except BaseException:
+        try:
+            if bound is not None:
+                bound.close()
+        finally:
+            if rooted is not None:
+                rooted.close()
+        raise
+
+
 __all__ = [
     "ACTIVE_CONTENT_PHASE",
     "CONTENT_ATTESTATION_VERSION",
+    "LEGACY_CONTENT_ATTESTATION_VERSION",
     "LOGICAL_CLOSURE_VERSION",
+    "PORTABLE_CONTENT_ATTESTATION_VERSION",
     "SEALED_CONTENT_PHASE",
     "ActiveContentAttestation",
     "ContentAttestationError",
     "ContentFileProof",
+    "LegacyPosixContentFileProof",
+    "PortableContentFileProof",
     "ContentSemanticFacts",
+    "PortableActiveContentAttestation",
     "SealedContentAttestation",
+    "PortableSealedContentAttestation",
 ]
