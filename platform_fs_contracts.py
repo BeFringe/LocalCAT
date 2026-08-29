@@ -164,6 +164,22 @@ class EntrySnapshot(_LiveOnlyValue):
 
 
 @dataclass(frozen=True, slots=True)
+class BoundContentFacts(_LiveOnlyValue):
+    """Exact bytes observed through one live rooted file authority."""
+
+    snapshot: EntrySnapshot
+    content_sha256: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.snapshot) is not EntrySnapshot:
+            raise TypeError("snapshot must be exact EntrySnapshot")
+        if type(self.content_sha256) is not bytes:
+            raise TypeError("content_sha256 must be exact bytes")
+        if len(self.content_sha256) != hashlib.sha256().digest_size:
+            raise ValueError("content_sha256 must be an exact SHA-256 digest")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateContentFacts:
     byte_count: int
     content_sha256: bytes
@@ -651,6 +667,34 @@ class BoundRegularFile(OpaqueAuthority, ABC):
             )
         return b"".join(chunks)
 
+    def content_facts(self) -> BoundContentFacts:
+        """Hash exact bytes without materializing the complete file in memory."""
+
+        self._require_open()
+        facts = self._content_facts()
+        if type(facts) is not BoundContentFacts:
+            raise TypeError("backend content_facts must return exact BoundContentFacts")
+        return facts
+
+    def _content_facts(self) -> BoundContentFacts:
+        expected = self.snapshot()
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.byte_count:
+            maximum_bytes = min(
+                self._MAXIMUM_BOUNDED_READ_BYTES,
+                expected.byte_count - offset,
+            )
+            chunk = self.read_at(offset, maximum_bytes, expected)
+            digest.update(chunk)
+            offset += len(chunk)
+        if self.read_at(offset, 1, expected) or self.snapshot() != expected:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return BoundContentFacts(expected, digest.digest())
+
     def identity(self) -> FileObjectIdentity:
         self._require_open()
         identity = self._identity()
@@ -670,6 +714,44 @@ class BoundRegularFile(OpaqueAuthority, ABC):
 
     @abstractmethod
     def _snapshot(self) -> EntrySnapshot: ...
+
+
+class BoundSynchronizedRegularFile(BoundRegularFile, ABC):
+    """A rooted existing-file authority with a content durability operation."""
+
+    def synchronize_content(
+        self,
+        expected: BoundContentFacts,
+    ) -> BoundContentFacts:
+        self._require_open()
+        if type(expected) is not BoundContentFacts:
+            raise TypeError("expected must be exact BoundContentFacts")
+        before = self.content_facts()
+        if before != expected:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        synchronized = self._synchronize_content(before)
+        if type(synchronized) is not BoundContentFacts:
+            raise TypeError(
+                "backend synchronize_content must return exact BoundContentFacts"
+            )
+        if synchronized != before:
+            raise ValueError("backend synchronized content facts contradict the input")
+        after = self.content_facts()
+        if after != before:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return after
+
+    @abstractmethod
+    def _synchronize_content(
+        self,
+        expected: BoundContentFacts,
+    ) -> BoundContentFacts: ...
 
 
 class CandidateFile(OpaqueAuthority, ABC):
@@ -1138,6 +1220,33 @@ class RootedFileSystem(Protocol):
 
 
 @runtime_checkable
+class ExistingFileDurability(Protocol):
+    def open_existing_for_synchronization(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundSynchronizedRegularFile:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        root._require_open()
+        checked_relative = validate_relative_path(relative)
+        authority = self._open_existing_for_synchronization(root, checked_relative)
+        if not isinstance(authority, BoundSynchronizedRegularFile):
+            raise TypeError(
+                "backend synchronization open must return BoundSynchronizedRegularFile"
+            )
+        authority._require_open()
+        return authority
+
+    @abstractmethod
+    def _open_existing_for_synchronization(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundSynchronizedRegularFile: ...
+
+
+@runtime_checkable
 class ProcessFileLock(Protocol):
     def acquire(
         self,
@@ -1353,6 +1462,7 @@ class PersistentPrivateProof(Protocol):
 @runtime_checkable
 class PlatformFileBackend(
     RootedFileSystem,
+    ExistingFileDurability,
     ProcessFileLock,
     PrivateStorageProof,
     Protocol,

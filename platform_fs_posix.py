@@ -16,11 +16,14 @@ import time
 from typing import Callable, Iterator
 
 from platform_fs_contracts import (
+    BoundContentFacts,
     BoundDirectoryAuthority,
     BoundRegularFile,
+    BoundSynchronizedRegularFile,
     CandidateFile,
     CandidateContentFacts,
     EntrySnapshot,
+    ExistingFileDurability,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -44,6 +47,7 @@ from platform_fs_contracts import (
 __all__ = ["PosixPlatformAdapter"]
 
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_SYNCHRONIZED_READ_FLAGS = _READ_FLAGS
 _DIRECTORY_FLAGS = _READ_FLAGS | os.O_DIRECTORY
 _CANDIDATE_FLAGS = (
     os.O_RDWR
@@ -998,6 +1002,24 @@ class _PosixBoundRegularFile(BoundRegularFile):
     def _snapshot(self) -> EntrySnapshot:
         return _snapshot_from_stat(self._reprove())
 
+    def _content_facts(self) -> BoundContentFacts:
+        before = _snapshot_from_stat(self._reprove())
+        try:
+            actual = _digest_fd_exact(self._descriptor, before.byte_count)
+        except OSError as error:
+            raise _map_os_error(
+                error,
+                fallback=PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            ) from None
+        after = _snapshot_from_stat(self._reprove())
+        if after != before:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return BoundContentFacts(after, actual.content_sha256)
+
     def _publish_facts(self, mode: PublishMode) -> PublishFacts:
         expected = self.snapshot()
         digest = hashlib.sha256()
@@ -1027,6 +1049,56 @@ class _PosixBoundRegularFile(BoundRegularFile):
         _close_fd(self._descriptor)
         for descriptor in reversed(self._directory_fds):
             _close_fd(descriptor)
+
+
+class _PosixBoundSynchronizedRegularFile(
+    _PosixBoundRegularFile,
+    BoundSynchronizedRegularFile,
+):
+    def __init__(
+        self,
+        directory_fds: tuple[int, ...],
+        directory_names: tuple[str | None, ...],
+        descriptor: int,
+        entry_name: str,
+        fault_injector: _FaultInjector | None,
+    ) -> None:
+        super().__init__(
+            directory_fds,
+            directory_names,
+            descriptor,
+            entry_name,
+            fault_injector,
+        )
+        if self._bound_identity.link_count != 1:
+            self._close_authority()
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+
+    def _reprove(self) -> os.stat_result:
+        result = super()._reprove()
+        if _identity_from_stat(result).link_count != 1:
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return result
+
+    def _synchronize_content(
+        self,
+        expected: BoundContentFacts,
+    ) -> BoundContentFacts:
+        try:
+            os.fsync(self._descriptor)
+            os.fsync(self._directory_fds[-1])
+        except OSError:
+            raise _platform_error(
+                PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+                retryable=False,
+            ) from None
+        return expected
 
 
 class _PosixCandidateFile(CandidateFile):
@@ -1436,7 +1508,12 @@ class _PosixPrivateEvidence(PrivateAccessEvidence):
         _close_fd(self._descriptor)
 
 
-class PosixPlatformAdapter(RootedFileSystem, ProcessFileLock, PrivateStorageProof):
+class PosixPlatformAdapter(
+    RootedFileSystem,
+    ExistingFileDurability,
+    ProcessFileLock,
+    PrivateStorageProof,
+):
     """Injectable POSIX implementation of the shared low-level capabilities."""
 
     def __init__(self, *, _fault_injector: _FaultInjector | None = None) -> None:
@@ -1521,6 +1598,59 @@ class PosixPlatformAdapter(RootedFileSystem, ProcessFileLock, PrivateStorageProo
             raise _map_os_error(
                 error,
                 fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            ) from None
+
+    def _open_existing_for_synchronization(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundSynchronizedRegularFile:
+        if not isinstance(root, _PosixRootedDirectory):
+            raise _platform_error(
+                PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        components = tuple(relative.parts)
+        directories, directory_names = _open_directory_chain(
+            root,
+            components[:-1],
+        )
+        retained_directories: tuple[int, ...] | None = directories
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                components[-1],
+                _SYNCHRONIZED_READ_FLAGS,
+                dir_fd=retained_directories[-1],
+            )
+            transferred_directories = retained_directories
+            transferred_descriptor = descriptor
+            retained_directories = None
+            descriptor = None
+            return _PosixBoundSynchronizedRegularFile(
+                transferred_directories,
+                directory_names,
+                transferred_descriptor,
+                components[-1],
+                self._fault_injector,
+            )
+        except PlatformFileError:
+            if descriptor is not None:
+                _close_fd(descriptor)
+            if retained_directories is not None:
+                for item in reversed(retained_directories):
+                    _close_fd(item)
+            raise
+        except OSError as error:
+            if descriptor is not None:
+                _close_fd(descriptor)
+            if retained_directories is not None:
+                for item in reversed(retained_directories):
+                    _close_fd(item)
+            raise _map_os_error(
+                error,
+                fallback=PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
                 retryable=False,
             ) from None
 
