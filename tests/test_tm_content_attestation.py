@@ -22,6 +22,7 @@ from platform_fs_contracts import (
 from tm_content_attestation import (
     ContentFileProof,
     ContentSemanticFacts,
+    LEGACY_CONTENT_ATTESTATION_VERSION,
     LOGICAL_CLOSURE_VERSION,
     PORTABLE_CONTENT_ATTESTATION_VERSION,
     ContentAttestationError,
@@ -41,6 +42,11 @@ from tm_content_attestation import (
     _portable_content_file_proof_to_mapping,
     _portable_sealed_content_attestation_from_mapping,
     _portable_sealed_content_attestation_to_mapping,
+    _active_content_attestation_record_from_mapping,
+    _active_content_attestation_record_to_mapping,
+    _require_same_content_attestation_version,
+    _sealed_content_attestation_record_from_mapping,
+    _sealed_content_attestation_record_to_mapping,
     _sealed_content_attestation_from_mapping,
     _sealed_content_attestation_to_mapping,
     PortableContentFileProof,
@@ -657,6 +663,22 @@ class ContentAttestationCodecTests(unittest.TestCase):
             _portable_active_content_attestation_from_mapping(active_payload),
             active,
         )
+        self.assertEqual(
+            _sealed_content_attestation_record_from_mapping(sealed_payload),
+            sealed,
+        )
+        self.assertEqual(
+            _active_content_attestation_record_from_mapping(active_payload),
+            active,
+        )
+        self.assertEqual(
+            _sealed_content_attestation_record_to_mapping(sealed),
+            sealed_payload,
+        )
+        self.assertEqual(
+            _active_content_attestation_record_to_mapping(active),
+            active_payload,
+        )
 
         legacy_proof = {
             "device": 1,
@@ -673,6 +695,8 @@ class ContentAttestationCodecTests(unittest.TestCase):
             _portable_active_content_attestation_from_mapping(mixed_active_v3)
         with self.assertRaises(ValueError):
             _portable_sealed_content_attestation_from_mapping(unknown)
+        with self.assertRaises(ValueError):
+            _sealed_content_attestation_record_from_mapping(unknown)
         with self.assertRaises(ValueError):
             _sealed_content_attestation_from_mapping(sealed_payload)
         with self.assertRaises(ValueError):
@@ -728,6 +752,37 @@ class ContentAttestationCodecTests(unittest.TestCase):
             _active_content_attestation_from_mapping(v2_active_payload),
             v2_active,
         )
+        self.assertEqual(
+            _sealed_content_attestation_record_from_mapping(v2_payload),
+            v2_sealed,
+        )
+        self.assertEqual(
+            _active_content_attestation_record_from_mapping(v2_active_payload),
+            v2_active,
+        )
+        self.assertEqual(
+            _require_same_content_attestation_version(v2_sealed, v2_active),
+            v2_sealed.attestation_version,
+        )
+        self.assertEqual(
+            _require_same_content_attestation_version(sealed, active),
+            sealed.attestation_version,
+        )
+        with self.assertRaises(ValueError):
+            _require_same_content_attestation_version(v2_sealed, active)
+        with self.assertRaises(ValueError):
+            _require_same_content_attestation_version(sealed, v2_active)
+        forged_cross_family = object.__new__(type(active))
+        object.__setattr__(
+            forged_cross_family,
+            "attestation_version",
+            LEGACY_CONTENT_ATTESTATION_VERSION,
+        )
+        with self.assertRaises(ValueError):
+            _require_same_content_attestation_version(
+                v2_sealed,
+                forged_cross_family,
+            )
         with self.assertRaises(ValueError):
             _portable_sealed_content_attestation_from_mapping(v2_payload)
         with self.assertRaises(ValueError):
