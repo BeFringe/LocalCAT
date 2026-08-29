@@ -30,6 +30,8 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
+    MutableFileReservationService,
     PendingPublication,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -58,6 +60,13 @@ _CANDIDATE_FLAGS = (
 )
 _LOCK_FLAGS = (
     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+_MUTABLE_RESERVATION_FLAGS = (
+    os.O_RDONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
 )
 _READ_CHUNK = 1024 * 1024
 _STREAM_CHUNK = 64 * 1024
@@ -1051,6 +1060,90 @@ class _PosixBoundRegularFile(BoundRegularFile):
             _close_fd(descriptor)
 
 
+class _PosixMutableFileReservation(MutableFileReservation):
+    __slots__ = (
+        "_directory_fds",
+        "_directory_names",
+        "_directory_identities",
+        "_descriptor",
+        "_entry_name",
+    )
+
+    def __init__(
+        self,
+        directory_fds: tuple[int, ...],
+        directory_names: tuple[str | None, ...],
+        descriptor: int,
+        entry_name: str,
+        created_identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(created_identity)
+        self._directory_fds = directory_fds
+        self._directory_names = directory_names
+        self._directory_identities = _capture_directory_identities(directory_fds)
+        self._descriptor = descriptor
+        self._entry_name = entry_name
+        try:
+            self._reprove_identity()
+        except BaseException:
+            _close_fd(descriptor)
+            for item in reversed(directory_fds):
+                _close_fd(item)
+            raise
+
+    def _reprove_identity(self) -> FileObjectIdentity:
+        try:
+            _reprove_directory_chain(
+                self._directory_fds,
+                self._directory_names,
+                self._directory_identities,
+            )
+            descriptor_identity = _identity_from_stat(os.fstat(self._descriptor))
+            entry_stat = os.stat(
+                self._entry_name,
+                dir_fd=self._directory_fds[-1],
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise _platform_error(
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                    retryable=True,
+                )
+            entry_identity = _identity_from_stat(entry_stat)
+            if not (
+                descriptor_identity.kind == "regular"
+                and descriptor_identity.link_count == 1
+                and entry_identity.kind == "regular"
+                and entry_identity.link_count == 1
+                and _same_identity(descriptor_identity, entry_identity)
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                    retryable=True,
+                )
+            _reprove_directory_chain(
+                self._directory_fds,
+                self._directory_names,
+                self._directory_identities,
+            )
+            return descriptor_identity
+        except (TypeError, AssertionError):
+            raise
+        except PlatformFileError:
+            raise
+        except OSError as error:
+            raise _map_os_error(
+                error,
+                fallback=PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            ) from None
+
+    def _close_authority(self) -> None:
+        _close_fd(self._descriptor)
+        for descriptor in reversed(self._directory_fds):
+            _close_fd(descriptor)
+
+
 class _PosixBoundSynchronizedRegularFile(
     _PosixBoundRegularFile,
     BoundSynchronizedRegularFile,
@@ -1541,6 +1634,7 @@ class _PosixPrivateEvidence(PrivateAccessEvidence):
 
 class PosixPlatformAdapter(
     RootedFileSystem,
+    MutableFileReservationService,
     ExistingFileDurability,
     ProcessFileLock,
     PrivateStorageProof,
@@ -1713,6 +1807,91 @@ class PosixPlatformAdapter(
                 fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
                 retryable=False,
             ) from None
+
+    def _reserve_mutable_file(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> MutableFileReservation:
+        if not isinstance(parent, _DirectoryAuthorityMixin):
+            raise _platform_error(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        retained_directories: tuple[int, ...] | None = None
+        descriptor: int | None = None
+        created = False
+        try:
+            parent._reprove()
+            retained_directories = _duplicate_directory_chain(parent._directory_fds)
+            descriptor = os.open(
+                name,
+                _MUTABLE_RESERVATION_FLAGS,
+                0o600,
+                dir_fd=retained_directories[-1],
+            )
+            created = True
+            created_identity = _identity_from_stat(os.fstat(descriptor))
+            named_stat = os.stat(
+                name,
+                dir_fd=retained_directories[-1],
+                follow_symlinks=False,
+            )
+            named_identity = _identity_from_stat(named_stat)
+            if (
+                stat.S_ISLNK(named_stat.st_mode)
+                or created_identity.kind != "regular"
+                or created_identity.link_count != 1
+                or named_identity.kind != "regular"
+                or named_identity.link_count != 1
+                or not _same_identity(created_identity, named_identity)
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            transferred_directories = retained_directories
+            transferred_descriptor = descriptor
+            retained_directories = None
+            descriptor = None
+            return _PosixMutableFileReservation(
+                transferred_directories,
+                parent._directory_names,
+                transferred_descriptor,
+                name,
+                created_identity,
+            )
+        except (TypeError, AssertionError):
+            raise
+        except PlatformFileError as error:
+            if created and error.code != PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                ) from None
+            raise
+        except FileExistsError:
+            raise _platform_error(
+                PlatformFileErrorCode.ENTRY_UNAVAILABLE,
+                retryable=False,
+            ) from None
+        except OSError as error:
+            if created:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                ) from None
+            raise _map_os_error(
+                error,
+                fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            ) from None
+        finally:
+            if descriptor is not None:
+                _close_fd(descriptor)
+            if retained_directories is not None:
+                for item in reversed(retained_directories):
+                    _close_fd(item)
 
     def _acquire(
         self,

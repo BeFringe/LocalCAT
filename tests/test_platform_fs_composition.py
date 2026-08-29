@@ -16,6 +16,7 @@ from unittest import mock
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
     ExistingFileDurability,
+    MutableFileReservationService,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
@@ -137,6 +138,12 @@ class _FaultingBackend:
         raise AssertionError
 
     _open_existing_for_synchronization = open_existing_for_synchronization
+
+    def reserve_mutable_file(self, parent: object, name: str) -> object:
+        del parent, name
+        raise AssertionError
+
+    _reserve_mutable_file = reserve_mutable_file
 
     def acquire(self, parent: object, name: str, payload: bytes, policy: object) -> object:
         del parent, name, payload, policy
@@ -312,10 +319,11 @@ class CompositionStaticBoundaryTests(unittest.TestCase):
 
 
 class CompositionFactoryMatrixTests(unittest.TestCase):
-    def test_aggregate_backend_protocol_requires_all_four_service_shapes(self) -> None:
+    def test_aggregate_backend_protocol_requires_all_five_service_shapes(self) -> None:
         backend = _FaultingBackend()
         self.assertIsInstance(backend, RootedFileSystem)
         self.assertIsInstance(backend, ExistingFileDurability)
+        self.assertIsInstance(backend, MutableFileReservationService)
         self.assertIsInstance(backend, ProcessFileLock)
         self.assertIsInstance(backend, PrivateStorageProof)
         self.assertIsInstance(backend, PlatformFileBackend)
@@ -323,6 +331,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
         for missing in (
             "bind_root",
             "open_existing_for_synchronization",
+            "reserve_mutable_file",
             "acquire",
             "prove_private",
         ):
