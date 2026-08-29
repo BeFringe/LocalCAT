@@ -98,6 +98,15 @@ from tm_sqlite_store import (
 from tm_stage_sealer import StageSealError, StageSealer
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
+from platform_fs import compose_platform_file_backend
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    LockLease,
+    LockPolicy,
+    LockWait,
+    PlatformFileBackend,
+    PlatformFileError,
+)
 
 
 
@@ -939,6 +948,7 @@ class TMMigrationService:
         resource_identity: CanonicalResourceIdentity,
         canonical_store_id: str,
         coordinator: ResourceStoreCoordinator | None = None,
+        platform_backend: PlatformFileBackend | None = None,
     ) -> None:
         self._resource_identity = _snapshot_resource_identity(resource_identity)
         if type(canonical_store_id) is not str:
@@ -951,8 +961,16 @@ class TMMigrationService:
             raise TypeError(
                 "coordinator must be exact ResourceStoreCoordinator or None"
             )
+        if platform_backend is not None and not isinstance(
+            platform_backend,
+            PlatformFileBackend,
+        ):
+            raise TypeError(
+                "platform_backend must satisfy PlatformFileBackend or be None"
+            )
         self._canonical_store_id = canonical_store_id
         self._coordinator = coordinator
+        self._platform_backend = platform_backend
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity:
@@ -961,6 +979,36 @@ class TMMigrationService:
     @property
     def canonical_store_id(self) -> str:
         return self._canonical_store_id
+
+    def _acquire_initial_reservation(
+        self,
+    ) -> _InitialActivationResourceReservation:
+        """Acquire the shared platform reservation when the backend is available.
+
+        When no capability is injected on POSIX, the existing descriptor
+        implementation remains the compatibility fallback.  The
+        application-facing Windows path always composes the neutral backend
+        and retains its rooted authority for the reservation lifetime.
+        """
+
+        backend = self._platform_backend
+        if backend is None and sys.platform == "win32":
+            try:
+                backend = compose_platform_file_backend(
+                    self._resource_identity.canonical_sidecar_path.parent
+                )
+            except PlatformFileError as error:
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                ) from error
+        if backend is None:
+            return _InitialActivationResourceReservation.acquire(
+                self._resource_identity
+            )
+        return _InitialActivationResourceReservation.acquire_with_backend(
+            self._resource_identity,
+            backend,
+        )
 
     def preflight(self, source: Path) -> MigrationPreflight:
         """Stream exact source bytes and return safe, deterministic facts."""
@@ -1047,27 +1095,25 @@ class TMMigrationService:
         # durable-authority proof and the whole
         # build -> seal -> publish -> reconcile transaction.
         try:
-            reservation = _InitialActivationResourceReservation.acquire(
-                self._resource_identity
-            )
+            reservation = self._acquire_initial_reservation()
         except _InitialActivationReservationError:
             return self._initial_resource_reservation_failure(
                 coordinator=coordinator,
                 source_before=source_before,
             )
-        with reservation:
-            try:
+        try:
+            with reservation:
                 return self._activate_initial_with_resource_reservation(
                     coordinator=coordinator,
                     source=source,
                     source_before=source_before,
                     reservation=reservation,
                 )
-            except _InitialActivationReservationError:
-                return self._initial_resource_reservation_failure(
-                    coordinator=coordinator,
-                    source_before=source_before,
-                )
+        except _InitialActivationReservationError:
+            return self._initial_resource_reservation_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+            )
 
     def reattest_completed_authority(
         self,
@@ -1105,30 +1151,33 @@ class TMMigrationService:
             )
         self._validate_source_preconditions(source)
         try:
-            reservation = _InitialActivationResourceReservation.acquire(
-                self._resource_identity
-            )
+            reservation = self._acquire_initial_reservation()
         except _InitialActivationReservationError as error:
             raise MigrationPreflightError(
                 "MIGRATION.REATTESTATION_LOCK_UNAVAILABLE"
             ) from error
-        with reservation:
-            reservation.reprove()
-            preflight = _scan_jsonl(source)
-            try:
-                recovered = coordinator.reattest_completed_authority()
-            except ActivationPreparationError as error:
-                raise MigrationPreflightError(error.code) from error
-            reservation.reprove()
-            if recovered.generation is None:
-                raise MigrationPreflightError(
-                    "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+        try:
+            with reservation:
+                reservation.reprove()
+                preflight = _scan_jsonl(source)
+                try:
+                    recovered = coordinator.reattest_completed_authority()
+                except ActivationPreparationError as error:
+                    raise MigrationPreflightError(error.code) from error
+                reservation.reprove()
+                if recovered.generation is None:
+                    raise MigrationPreflightError(
+                        "MIGRATION.REATTESTATION_RUNTIME_INVALID"
+                    )
+                return self._recovered_reattestation_success_report(
+                    coordinator=coordinator,
+                    preflight=preflight,
+                    generation=recovered.generation,
                 )
-            return self._recovered_reattestation_success_report(
-                coordinator=coordinator,
-                preflight=preflight,
-                generation=recovered.generation,
-            )
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.REATTESTATION_LOCK_UNAVAILABLE"
+            ) from error
 
     def _initial_resource_reservation_failure(
         self,
@@ -4895,46 +4944,117 @@ def _deterministic_stage_ref(
 class _InitialActivationResourceReservation:
     """Persistent per-sidecar advisory lock held across initial activation.
 
-    The lock pathname is deterministic and is never unlinked or replaced.
-    Its descriptor and parent directory are retained no-follow for the full
-    scan/build/reconcile transaction.  ``flock`` ownership is released by
-    the kernel on process death; the persistent file remains reusable.
-    Unpublished stage residue from a dead owner is never reopened or reused
-    by a later fresh-nonce activation and is not a canonical authority fact.
+    The application-facing reservation is backed by the neutral platform
+    ports: its rooted directory authority and process lock lease are retained
+    for the full scan/build/reconcile transaction.  A backend-less POSIX
+    descriptor path remains available for callers that provide no platform
+    capability.  The deterministic persistent lock file is never unlinked or
+    replaced and remains reusable after process exit.
     """
 
     __slots__ = (
         "_descriptor",
+        "_backend",
         "_fcntl",
         "_identity",
         "_lock_name",
+        "_lease",
         "_parent",
         "_released",
+        "_root",
     )
 
     def __init__(
         self,
         *,
         identity: CanonicalResourceIdentity,
-        parent: _ExportParentHandle,
+        parent: _ExportParentHandle | None,
         descriptor: int,
         lock_name: str,
         fcntl_module: Any,
+        backend: PlatformFileBackend | None = None,
+        root: BoundDirectoryAuthority | None = None,
+        lease: LockLease | None = None,
     ) -> None:
         self._identity = identity
         self._parent = parent
         self._descriptor = descriptor
         self._lock_name = lock_name
         self._fcntl = fcntl_module
+        self._backend = backend
+        self._root = root
+        self._lease = lease
         self._released = False
+
+    @classmethod
+    def acquire_with_backend(
+        cls,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+    ) -> _InitialActivationResourceReservation:
+        """Acquire one reservation through the shared rooted/lock ports."""
+
+        if not isinstance(backend, PlatformFileBackend):
+            raise TypeError("backend must satisfy PlatformFileBackend")
+        root: BoundDirectoryAuthority | None = None
+        lease: LockLease | None = None
+        try:
+            root = backend.bind_root(
+                identity.canonical_sidecar_path.parent
+            )
+            root.reprove()
+            lock_name = (
+                f".{identity.canonical_sidecar_path.name}."
+                "localcat-initial-activation.lock"
+            )
+            lease = backend.acquire(
+                root,
+                lock_name,
+                cls._payload(identity),
+                LockPolicy(LockWait.FAIL_FAST),
+            )
+            reservation = cls(
+                identity=identity,
+                parent=None,
+                descriptor=-1,
+                lock_name=lock_name,
+                fcntl_module=None,
+                backend=backend,
+                root=root,
+                lease=lease,
+            )
+            reservation.reprove()
+            root = None
+            lease = None
+            return reservation
+        except PlatformFileError as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        except OSError as error:
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        finally:
+            if lease is not None:
+                try:
+                    lease.close()
+                except BaseException:
+                    pass
+            if root is not None:
+                try:
+                    root.close()
+                except BaseException:
+                    pass
 
     @classmethod
     def acquire(
         cls,
         identity: CanonicalResourceIdentity,
     ) -> _InitialActivationResourceReservation:
-        """Acquire one macOS/Linux resource lock without pathname reuse."""
+        """Acquire one POSIX resource lock without pathname reuse."""
 
+        fcntl_module: Any = None
         if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
             raise _InitialActivationReservationError(
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
@@ -5137,6 +5257,21 @@ class _InitialActivationResourceReservation:
             raise _InitialActivationReservationError(
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             )
+        if self._backend is not None:
+            try:
+                if self._root is None or self._lease is None:
+                    raise _InitialActivationReservationError(
+                        "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                    )
+                self._lease.reprove()
+                self._root.reprove()
+            except _InitialActivationReservationError:
+                raise
+            except (PlatformFileError, OSError) as error:
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                ) from error
+            return
         try:
             self._parent.reprove()
             descriptor_state = self._require_descriptor_shape(
@@ -5175,6 +5310,26 @@ class _InitialActivationResourceReservation:
         if self._released:
             return
         self._released = True
+        if self._backend is not None:
+            deferred: BaseException | None = None
+            if self._lease is not None:
+                try:
+                    self._lease.close()
+                except BaseException as error:
+                    deferred = error
+            if self._root is not None:
+                try:
+                    self._root.close()
+                except BaseException as error:
+                    if deferred is None:
+                        deferred = error
+            if deferred is not None:
+                if isinstance(deferred, (PlatformFileError, OSError)):
+                    raise _InitialActivationReservationError(
+                        "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                    ) from deferred
+                raise deferred
+            return
         deferred: BaseException | None = None
         try:
             try:

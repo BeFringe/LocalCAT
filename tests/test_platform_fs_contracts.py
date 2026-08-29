@@ -164,6 +164,13 @@ class _FaultingCandidate(_Candidate):
 
 
 class _Lease(LockLease):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reprove_calls = 0
+
+    def _reprove_lock(self) -> None:
+        self.reprove_calls += 1
+
     def _close_authority(self) -> None:
         pass
 
@@ -1492,6 +1499,18 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 with self.assertRaises((PlatformFileError, TypeError)):
                     operation()
+
+    def test_lock_lease_reprove_is_public_and_requires_live_lease(self) -> None:
+        lease = _Lease()
+        self.assertIsNone(lease.reprove())
+        self.assertEqual(lease.reprove_calls, 1)
+        lease.close()
+        with self.assertRaises(PlatformFileError) as caught:
+            lease.reprove()
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        )
 
     def test_regular_candidate_and_pending_methods_fail_after_close(self) -> None:
         regular = _Regular()
