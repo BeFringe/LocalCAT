@@ -462,6 +462,58 @@ class NativeRenameTests(unittest.TestCase):
             ],
         )
 
+    def test_exclusive_cross_parent_rename_uses_exact_root_handle_and_basename(self) -> None:
+        calls: list[tuple[int, bool, object, int, int, bytes]] = []
+
+        def rename(
+            raw_handle: int,
+            io_status_pointer: object,
+            storage: object,
+            length: int,
+            information_class: int,
+        ) -> int:
+            information = ctypes.cast(
+                storage,
+                ctypes.POINTER(FILE_RENAME_INFORMATION),
+            ).contents
+            calls.append(
+                (
+                    raw_handle,
+                    bool(information.ReplaceIfExists),
+                    information.RootDirectory,
+                    int(length),
+                    int(information_class),
+                    ctypes.string_at(storage, int(length))[
+                        FILE_RENAME_INFORMATION.FileName.offset :
+                    ],
+                )
+            )
+            ctypes.cast(
+                io_status_pointer,
+                ctypes.POINTER(IO_STATUS_BLOCK),
+            ).contents.Status = 0
+            return 0
+
+        self.api.NtSetInformationFile = rename
+        self.api.rename_file_to_parent_exclusive(41, 73, "retired.bin")
+        encoded = "retired.bin".encode("utf-16-le")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    41,
+                    False,
+                    73,
+                    FILE_RENAME_INFORMATION.FileName.offset + len(encoded),
+                    api_module.FILE_RENAME_INFORMATION_CLASS,
+                    encoded,
+                )
+            ],
+        )
+        for bad_handle in (0, api_module.INVALID_HANDLE_VALUE, True, None):
+            with self.subTest(bad_handle=bad_handle), self.assertRaises(TypeError):
+                self.api.rename_file_to_parent_exclusive(41, bad_handle, "retired.bin")
+
     def test_native_rename_rejects_non_component_names_before_call(self) -> None:
         self.api.NtSetInformationFile = mock.Mock()
         for component in (
