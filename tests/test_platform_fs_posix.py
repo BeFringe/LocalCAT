@@ -16,9 +16,12 @@ import unittest
 from unittest import mock
 
 from platform_fs_contracts import (
+    FileObjectIdentity,
     LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
+    MutableFileReservationService,
     OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -184,6 +187,114 @@ class PosixAdapterStaticBoundaryTests(unittest.TestCase):
         module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
         self.assertFalse(
             inspect.isabstract(module._PosixBoundSynchronizedRegularFile)
+        )
+
+    def test_mutable_reservation_is_create_new_rooted_and_identity_bound(self) -> None:
+        source = ADAPTER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        adapter = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "PosixPlatformAdapter"
+        )
+        self.assertIn(
+            "MutableFileReservationService",
+            {base.id for base in adapter.bases if isinstance(base, ast.Name)},
+        )
+        reserve = next(
+            node
+            for node in adapter.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_reserve_mutable_file"
+        )
+        reserve_source = ast.get_source_segment(source, reserve)
+        assert reserve_source is not None
+        for required in (
+            "_MUTABLE_RESERVATION_FLAGS",
+            "dir_fd=",
+            "_duplicate_directory_chain",
+            "_PosixMutableFileReservation",
+        ):
+            self.assertIn(required, reserve_source)
+        for forbidden in ("publish", "journal", "os.rename", "os.replace", "os.unlink"):
+            self.assertNotIn(forbidden, reserve_source)
+        self.assertIn("os.O_RDONLY", source)
+        self.assertIn("os.O_CREAT", source)
+        self.assertIn("os.O_EXCL", source)
+        self.assertIn("os.O_NOFOLLOW", source)
+
+        module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
+        self.assertTrue(isinstance(module.PosixPlatformAdapter(), MutableFileReservationService))
+        identity = FileObjectIdentity("posix", b"volume", b"file", "regular", 1)
+        reservation = object.__new__(module._PosixMutableFileReservation)
+        MutableFileReservation.__init__(reservation, identity)
+        reservation._directory_fds = (201, 202)
+        reservation._directory_names = (None, "child")
+        reservation._directory_identities = (object(), object())
+        reservation._descriptor = 101
+        reservation._entry_name = "stage.sqlite3"
+        regular_stat = types.SimpleNamespace(st_mode=0)
+
+        with mock.patch.object(
+            module,
+            "_reprove_directory_chain",
+        ) as reprove, mock.patch.object(
+            module.os,
+            "fstat",
+            return_value=object(),
+        ), mock.patch.object(
+            module.os,
+            "stat",
+            return_value=regular_stat,
+        ) as named_stat, mock.patch.object(
+            module,
+            "_identity_from_stat",
+            side_effect=(identity, identity),
+        ):
+            self.assertEqual(reservation.identity(), identity)
+        self.assertEqual(reprove.call_count, 2)
+        named_stat.assert_called_once_with(
+            "stage.sqlite3",
+            dir_fd=202,
+            follow_symlinks=False,
+        )
+
+        foreign = FileObjectIdentity("posix", b"volume", b"other", "regular", 1)
+        with mock.patch.object(
+            module,
+            "_reprove_directory_chain",
+        ), mock.patch.object(module.os, "fstat", return_value=object()), mock.patch.object(
+            module.os,
+            "stat",
+            return_value=regular_stat,
+        ), mock.patch.object(
+            module,
+            "_identity_from_stat",
+            side_effect=(identity, foreign),
+        ), self.assertRaises(PlatformFileError) as stale:
+            reservation.identity()
+        self.assertEqual(stale.exception.code, PlatformFileErrorCode.IDENTITY_STALE.value)
+
+        for programming_error in (TypeError("type"), AssertionError("assert")):
+            with self.subTest(programming_error=type(programming_error).__name__), mock.patch.object(
+                module,
+                "_reprove_directory_chain",
+                side_effect=programming_error,
+            ), self.assertRaises(type(programming_error)):
+                reservation.identity()
+
+        with mock.patch.object(module, "_close_fd") as close_fd:
+            reservation.close()
+            reservation.close()
+        self.assertEqual(
+            [call.args[0] for call in close_fd.call_args_list],
+            [101, 202, 201],
+        )
+        with self.assertRaises(PlatformFileError) as closed:
+            reservation.identity()
+        self.assertEqual(
+            closed.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
         )
 
     def test_flock_errno_mapping_executes_without_posix_host_import(self) -> None:

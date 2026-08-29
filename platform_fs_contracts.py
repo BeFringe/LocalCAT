@@ -604,6 +604,43 @@ class OpaqueAuthority(ABC):
         raise TypeError(f"{type(self).__name__} is an opaque authority")
 
 
+class MutableFileReservation(OpaqueAuthority, ABC):
+    """CREATE_NEW ownership retained while an external writer mutates the file."""
+
+    __slots__ = ("__created_identity",)
+
+    def __init__(self, created_identity: FileObjectIdentity) -> None:
+        super().__init__()
+        if type(created_identity) is not FileObjectIdentity:
+            raise TypeError("created_identity must be exact FileObjectIdentity")
+        if created_identity.kind != "regular" or created_identity.link_count != 1:
+            raise ValueError("mutable reservation requires one regular-file link")
+        self.__created_identity = created_identity
+
+    def identity(self) -> FileObjectIdentity:
+        """Reprove the retained file, origin parent and origin name as one object."""
+
+        self._require_open()
+        identity = self._reprove_identity()
+        if type(identity) is not FileObjectIdentity:
+            raise TypeError(
+                "backend reservation reproof must return exact FileObjectIdentity"
+            )
+        if (
+            identity != self.__created_identity
+            or identity.kind != "regular"
+            or identity.link_count != 1
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return identity
+
+    @abstractmethod
+    def _reprove_identity(self) -> FileObjectIdentity: ...
+
+
 class BoundRegularFile(OpaqueAuthority, ABC):
     _MAXIMUM_BOUNDED_READ_BYTES = 64 * 1024
 
@@ -1247,6 +1284,33 @@ class RootedFileSystem(Protocol):
 
 
 @runtime_checkable
+class MutableFileReservationService(Protocol):
+    def reserve_mutable_file(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> MutableFileReservation:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be BoundDirectoryAuthority")
+        parent._require_open()
+        checked_name = validate_relative_name(name)
+        reservation = self._reserve_mutable_file(parent, checked_name)
+        if not isinstance(reservation, MutableFileReservation):
+            raise TypeError(
+                "backend reservation must return MutableFileReservation"
+            )
+        reservation._require_open()
+        return reservation
+
+    @abstractmethod
+    def _reserve_mutable_file(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> MutableFileReservation: ...
+
+
+@runtime_checkable
 class ExistingFileDurability(Protocol):
     def open_existing_for_synchronization(
         self,
@@ -1489,6 +1553,7 @@ class PersistentPrivateProof(Protocol):
 @runtime_checkable
 class PlatformFileBackend(
     RootedFileSystem,
+    MutableFileReservationService,
     ExistingFileDurability,
     ProcessFileLock,
     PrivateStorageProof,

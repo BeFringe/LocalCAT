@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from platform_fs_contracts import (
     LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
+    MutableFileReservationService,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -48,6 +51,7 @@ class WindowsRootedStaticTests(unittest.TestCase):
     def test_task_3_2_mints_only_rooted_file_system_shape(self) -> None:
         rooted = WindowsRootedFileSystem()
         self.assertIsInstance(rooted, RootedFileSystem)
+        self.assertIsInstance(rooted, MutableFileReservationService)
         self.assertIsInstance(rooted, ExistingFileDurability)
         self.assertNotIsInstance(rooted, ProcessFileLock)
         self.assertNotIsInstance(rooted, PrivateStorageProof)
@@ -401,6 +405,313 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                 int(synchronization_opens[0]["desired_access"])
                 & platform_fs_windows.DELETE
             )
+
+    def test_mutable_reservation_allows_sqlite_and_ordinary_writers(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "stage.sqlite3"),
+            )
+        opened: list[dict[str, object]] = []
+        real_open = parent._api.open_handle
+
+        def recording_open(path: str, **kwargs: object):
+            opened.append({"path": path, **kwargs})
+            return real_open(path, **kwargs)
+
+        with mock.patch.object(parent._api, "open_handle", side_effect=recording_open):
+            reservation = file_system.reserve_mutable_file(parent, "stage.sqlite3")
+        parent.close()
+        created = [
+            call
+            for call in opened
+            if call.get("creation_disposition") == platform_fs_windows.CREATE_NEW
+        ]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(
+            created[0]["desired_access"],
+            platform_fs_windows.FILE_READ_ATTRIBUTES | platform_fs_windows.SYNCHRONIZE,
+        )
+        self.assertFalse(
+            int(created[0]["desired_access"])
+            & (
+                platform_fs_windows.DELETE
+                | platform_fs_windows.GENERIC_READ
+                | platform_fs_windows.GENERIC_WRITE
+            )
+        )
+        self.assertEqual(
+            created[0]["share_mode"],
+            platform_fs_windows.FILE_SHARE_READ
+            | platform_fs_windows.FILE_SHARE_WRITE
+            | platform_fs_windows.FILE_SHARE_DELETE,
+        )
+        self.assertEqual(
+            created[0]["flags"],
+            platform_fs_windows.FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        self.assertNotEqual(created[0]["flags"], platform_fs_windows.FILE_FLAG_WRITE_THROUGH)
+
+        database_path = self.nested / "stage.sqlite3"
+        try:
+            created_identity = reservation.identity()
+            self.assertIsInstance(reservation, MutableFileReservation)
+            self.assertEqual(created_identity.kind, "regular")
+            self.assertEqual(created_identity.link_count, 1)
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute("CREATE TABLE stage(value TEXT NOT NULL)")
+                connection.execute("INSERT INTO stage VALUES ('ready')")
+                connection.commit()
+                self.assertEqual(reservation.identity(), created_identity)
+            finally:
+                connection.close()
+            self.assertEqual(reservation.identity(), created_identity)
+            with database_path.open("ab") as stream:
+                stream.write(b"ordinary-writer")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.assertEqual(reservation.identity(), created_identity)
+        finally:
+            reservation.close()
+        self.assertTrue(database_path.exists())
+
+    def test_mutable_reservation_close_does_not_close_caller_parent(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "parent-owned.manifest"),
+            )
+        try:
+            reservation = file_system.reserve_mutable_file(
+                parent,
+                "parent-owned.manifest",
+            )
+            reservation.close()
+            reservation.close()
+            self.assertFalse(parent.closed)
+            self.assertIsNone(parent.reprove())
+            self.assertTrue((self.nested / "parent-owned.manifest").exists())
+        finally:
+            parent.close()
+
+    def test_mutable_reservation_post_create_operational_failure_keeps_residue(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        real_capture = platform_fs_windows._capture_handle_proof
+        injected_errors = (
+            platform_fs_windows._identity_stale(),
+            platform_fs_windows.Win32CallError("GetFileInformationByHandleEx", 5),
+        )
+        for index, injected in enumerate(injected_errors):
+            with self.subTest(injected=type(injected).__name__):
+                name = f"uncertain-{index}.sqlite3"
+                path = self.nested / name
+                with file_system.bind_root(self.root_path) as root:
+                    parent = file_system.bind_parent(
+                        root,
+                        PureWindowsPath("NestedCase", name),
+                    )
+                try:
+                    def fail_first_regular_proof(*args: object, **kwargs: object):
+                        if kwargs.get("expected_kind") == "regular":
+                            raise injected
+                        return real_capture(*args, **kwargs)
+
+                    with mock.patch.object(
+                        platform_fs_windows,
+                        "_capture_handle_proof",
+                        side_effect=fail_first_regular_proof,
+                    ), self.assertRaises(PlatformFileError) as uncertain:
+                        file_system.reserve_mutable_file(parent, name)
+                    _assert_platform_error(
+                        self,
+                        uncertain,
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    )
+                    self.assertTrue(path.exists())
+                    self.assertEqual(path.read_bytes(), b"")
+
+                    with self.assertRaises(PlatformFileError) as occupied:
+                        file_system.reserve_mutable_file(parent, name)
+                    _assert_platform_error(
+                        self,
+                        occupied,
+                        PlatformFileErrorCode.ENTRY_UNAVAILABLE,
+                    )
+                    self.assertEqual(path.read_bytes(), b"")
+                finally:
+                    parent.close()
+                    if path.exists():
+                        path.unlink()
+
+    def test_mutable_reservation_rejects_foreign_name_and_closed_use(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "stage.manifest"),
+            )
+        reservation = file_system.reserve_mutable_file(parent, "stage.manifest")
+        source = self.nested / "stage.manifest"
+        source.write_bytes(b"owner bytes")
+        created_identity = reservation.identity()
+
+        alias = self.nested / "stage-alias.manifest"
+        try:
+            os.link(source, alias)
+        except PermissionError:
+            self.assertEqual(reservation.identity(), created_identity)
+        else:
+            try:
+                with self.assertRaises(PlatformFileError) as live_linked:
+                    reservation.identity()
+                _assert_platform_error(
+                    self,
+                    live_linked,
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                )
+            finally:
+                alias.unlink()
+            self.assertEqual(reservation.identity(), created_identity)
+
+        real_capture = platform_fs_windows._capture_handle_proof
+
+        def linked_native_proof(*args: object, **kwargs: object):
+            proof = real_capture(*args, **kwargs)
+            if kwargs.get("expected_kind") == "regular":
+                linked_identity = type(proof.identity)(
+                    platform=proof.identity.platform,
+                    volume_id=proof.identity.volume_id,
+                    file_id=proof.identity.file_id,
+                    kind=proof.identity.kind,
+                    link_count=2,
+                )
+                return type(proof)(linked_identity, proof.snapshot, proof.final_path)
+            return proof
+
+        with mock.patch.object(
+            platform_fs_windows,
+            "_capture_handle_proof",
+            side_effect=linked_native_proof,
+        ), self.assertRaises(PlatformFileError) as linked:
+            reservation.identity()
+        _assert_platform_error(
+            self,
+            linked,
+            PlatformFileErrorCode.IDENTITY_STALE,
+        )
+
+        delete_handle = parent._api.open_handle(
+            str(source),
+            desired_access=(
+                platform_fs_windows.DELETE
+                | platform_fs_windows.FILE_READ_ATTRIBUTES
+                | platform_fs_windows.SYNCHRONIZE
+            ),
+            share_mode=(
+                platform_fs_windows.FILE_SHARE_READ
+                | platform_fs_windows.FILE_SHARE_WRITE
+                | platform_fs_windows.FILE_SHARE_DELETE
+            ),
+            creation_disposition=platform_fs_windows.OPEN_EXISTING,
+            flags=platform_fs_windows.FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            with delete_handle.borrow() as raw:
+                proof = platform_fs_windows._capture_handle_proof(
+                    parent._api,
+                    raw,
+                    expected_final_path=None,
+                    expected_kind="regular",
+                    stale=True,
+                )
+                self.assertEqual(proof.identity, created_identity)
+                parent._api.rename_file_same_parent(
+                    raw,
+                    "moved.manifest",
+                    replace_if_exists=False,
+                )
+        finally:
+            delete_handle.close()
+        source.write_bytes(b"foreign bytes")
+        with self.assertRaises(PlatformFileError) as stale:
+            reservation.identity()
+        _assert_platform_error(self, stale, PlatformFileErrorCode.IDENTITY_STALE)
+
+        parent.close()
+        reservation.close()
+        reservation.close()
+        self.assertTrue((self.nested / "moved.manifest").exists())
+        self.assertEqual(source.read_bytes(), b"foreign bytes")
+        with self.assertRaises(PlatformFileError) as closed:
+            reservation.identity()
+        _assert_platform_error(
+            self,
+            closed,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+        )
+
+    def test_mutable_reservation_never_adopts_an_existing_file(self) -> None:
+        existing = self.nested / "already-built.sqlite3"
+        existing.write_bytes(b"preexisting")
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "already-built.sqlite3"),
+            ) as parent:
+                with self.assertRaises(PlatformFileError) as caught:
+                    file_system.reserve_mutable_file(parent, "already-built.sqlite3")
+        _assert_platform_error(self, caught, PlatformFileErrorCode.ENTRY_UNAVAILABLE)
+        self.assertEqual(existing.read_bytes(), b"preexisting")
+
+    def test_mutable_reservation_programming_errors_propagate(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "programmer.sqlite3"),
+            )
+        try:
+            for programming_error in (
+                TypeError("type"),
+                AssertionError("assert"),
+                AttributeError("attribute"),
+            ):
+                with self.subTest(
+                    reserve=type(programming_error).__name__
+                ), mock.patch.object(
+                    platform_fs_windows,
+                    "_duplicate_directory_chain",
+                    side_effect=programming_error,
+                ), self.assertRaises(type(programming_error)):
+                    file_system.reserve_mutable_file(parent, "programmer.sqlite3")
+            self.assertFalse((self.nested / "programmer.sqlite3").exists())
+
+            reservation = file_system.reserve_mutable_file(
+                parent,
+                "programmer.sqlite3",
+            )
+            try:
+                for programming_error in (
+                    TypeError("type"),
+                    AssertionError("assert"),
+                    AttributeError("attribute"),
+                ):
+                    with self.subTest(
+                        reprove=type(programming_error).__name__
+                    ), mock.patch.object(
+                        platform_fs_windows,
+                        "_reprove_directory_chain",
+                        side_effect=programming_error,
+                    ), self.assertRaises(type(programming_error)):
+                        reservation.identity()
+            finally:
+                reservation.close()
+        finally:
+            parent.close()
 
     def test_existing_file_synchronization_flush_failure_is_body_preserving(self) -> None:
         file_system = WindowsRootedFileSystem()

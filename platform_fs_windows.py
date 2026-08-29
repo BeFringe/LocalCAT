@@ -35,6 +35,8 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
+    MutableFileReservationService,
     PendingPublication,
     PersistentPrivateProof,
     PlatformFileError,
@@ -2953,6 +2955,87 @@ class _WindowsBoundRegularFile(BoundRegularFile):
             raise _capability_unavailable() from None
 
 
+class _WindowsMutableFileReservation(MutableFileReservation):
+    __slots__ = (
+        "_api",
+        "_records",
+        "_handle",
+        "_entry_path",
+        "_created_identity",
+    )
+
+    def __init__(
+        self,
+        api: WindowsFileAPI,
+        records: tuple[_WindowsDirectoryRecord, ...],
+        handle: object,
+        entry_path: str,
+        created_identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(created_identity)
+        self._api = api
+        self._records = records
+        self._handle = handle
+        self._entry_path = entry_path
+        self._created_identity = created_identity
+        try:
+            self._reprove_identity()
+        except BaseException:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+            _close_handles_reverse(tuple(record.handle for record in records))
+            raise
+
+    def _reprove_identity(self) -> FileObjectIdentity:
+        try:
+            _reprove_directory_chain(self._api, self._records)
+            with self._handle.borrow() as raw:
+                retained = _capture_handle_proof(
+                    self._api,
+                    raw,
+                    expected_final_path=self._entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            named = _open_entry_proof(
+                self._api,
+                self._entry_path,
+                self._entry_path,
+                expected_kind="regular",
+                expected_volume_id=self._records[0].identity.volume_id,
+                stale=True,
+            )
+            if named is None or not (
+                retained.identity.link_count == 1
+                and named.identity.link_count == 1
+                and _same_object(retained.identity, self._created_identity)
+                and _same_object(named.identity, self._created_identity)
+            ):
+                raise _identity_stale()
+            _reprove_directory_chain(self._api, self._records)
+            return retained.identity
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _identity_stale() from None
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            self._handle.close()
+        except BaseException as error:
+            first_error = error
+        chain_error = _close_handles_reverse(
+            tuple(record.handle for record in self._records)
+        )
+        if first_error is not None or chain_error is not None:
+            raise _capability_unavailable() from None
+
+
 class _WindowsBoundSynchronizedRegularFile(
     _WindowsBoundRegularFile,
     BoundSynchronizedRegularFile,
@@ -3315,8 +3398,12 @@ class _WindowsPendingPublication(PendingPublication):
         return facts
 
 
-class WindowsRootedFileSystem(RootedFileSystem, ExistingFileDurability):
-    """Task 3.2 Windows rooted read capability; later services remain unavailable."""
+class WindowsRootedFileSystem(
+    RootedFileSystem,
+    MutableFileReservationService,
+    ExistingFileDurability,
+):
+    """Windows rooted reads, mutable reservations, and existing-file durability."""
 
     def __init__(
         self,
@@ -3668,6 +3755,95 @@ class WindowsRootedFileSystem(RootedFileSystem, ExistingFileDurability):
                     tuple(record.handle for record in owned_records)
                 )
             raise
+
+    def _reserve_mutable_file(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> MutableFileReservation:
+        if not isinstance(parent, _WindowsDirectoryAuthorityMixin):
+            raise _capability_unavailable()
+        component = _validate_windows_component(
+            name,
+            maximum_units=parent._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        created = False
+        try:
+            parent._reprove()
+            records = _duplicate_directory_chain(parent._api, parent._records)
+            entry_path = _append_component(
+                records[-1].expected_final_path,
+                component,
+                maximum_units=parent._maximum_component_units,
+            )
+            handle = parent._api.open_handle(
+                entry_path,
+                desired_access=FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                creation_disposition=CREATE_NEW,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            created = True
+            with handle.borrow() as raw:
+                retained = _capture_handle_proof(
+                    parent._api,
+                    raw,
+                    expected_final_path=entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            named = _open_entry_proof(
+                parent._api,
+                entry_path,
+                entry_path,
+                expected_kind="regular",
+                expected_volume_id=records[0].identity.volume_id,
+                stale=True,
+            )
+            if named is None or not (
+                retained.snapshot.byte_count == 0
+                and retained.identity.link_count == 1
+                and named.identity.link_count == 1
+                and _same_object(retained.identity, named.identity)
+            ):
+                raise _recovery_required()
+            transferred_records = records
+            transferred_handle = handle
+            records = None
+            handle = None
+            return _WindowsMutableFileReservation(
+                parent._api,
+                transferred_records,
+                transferred_handle,
+                entry_path,
+                retained.identity,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Win32CallError as error:
+            if created:
+                raise _recovery_required() from None
+            if error.winerror in {ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS}:
+                raise _entry_unavailable() from None
+            raise _capability_unavailable() from None
+        except PlatformFileError as error:
+            if created and error.code != PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                raise _recovery_required() from None
+            raise
+        except Exception:
+            if created:
+                raise _recovery_required() from None
+            raise _capability_unavailable() from None
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if records is not None:
+                _close_handles_reverse(tuple(record.handle for record in records))
 
     def _bind_parent(
         self,
