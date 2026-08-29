@@ -19,13 +19,16 @@ import time
 from typing import Callable, Iterator
 
 from platform_fs_contracts import (
+    BoundContentFacts,
     BoundDirectoryAuthority,
     BoundRegularFile,
+    BoundSynchronizedRegularFile,
     CandidateFile,
     CandidateContentFacts,
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
     EntrySnapshot,
+    ExistingFileDurability,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -2898,6 +2901,24 @@ class _WindowsBoundRegularFile(BoundRegularFile):
     def _snapshot(self) -> EntrySnapshot:
         return self._reprove().snapshot
 
+    def _content_facts(self) -> BoundContentFacts:
+        with self._read_lock:
+            try:
+                before = self._reprove()
+                actual = _read_publish_facts(
+                    self._api,
+                    self._handle,
+                    before.snapshot.byte_count,
+                )
+                after = self._reprove()
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                raise _identity_stale() from None
+            if before.snapshot != after.snapshot:
+                raise _identity_stale()
+            return BoundContentFacts(after.snapshot, actual.content_sha256)
+
     def _close_authority(self) -> None:
         first_error: BaseException | None = None
         try:
@@ -2909,6 +2930,36 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         )
         if first_error is not None or chain_error is not None:
             raise _capability_unavailable() from None
+
+
+class _WindowsBoundSynchronizedRegularFile(
+    _WindowsBoundRegularFile,
+    BoundSynchronizedRegularFile,
+):
+    __slots__ = ()
+
+    def _synchronize_content(
+        self,
+        expected: BoundContentFacts,
+    ) -> BoundContentFacts:
+        try:
+            self._reprove()
+            with self._handle.borrow() as raw:
+                self._api.checked_bool(
+                    "FlushFileBuffers",
+                    self._api.FlushFileBuffers,
+                    raw,
+                )
+            self._reprove()
+            return expected
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, PlatformFileError) and error.code == (
+                PlatformFileErrorCode.IDENTITY_STALE.value
+            ):
+                raise
+            raise _durability_unavailable() from None
 
 
 def _read_publish_facts(
@@ -3243,7 +3294,7 @@ class _WindowsPendingPublication(PendingPublication):
         return facts
 
 
-class WindowsRootedFileSystem(RootedFileSystem):
+class WindowsRootedFileSystem(RootedFileSystem, ExistingFileDurability):
     """Task 3.2 Windows rooted read capability; later services remain unavailable."""
 
     def __init__(
@@ -3456,6 +3507,135 @@ class WindowsRootedFileSystem(RootedFileSystem):
                     tuple(record.handle for record in owned_records)
                 )
             raise _capability_unavailable() from None
+        except BaseException:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise
+
+    def _open_existing_for_synchronization(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundSynchronizedRegularFile:
+        if not isinstance(root, _WindowsRootedDirectory):
+            raise _capability_unavailable()
+        components = _validated_components(
+            tuple(relative.parts),
+            maximum_units=root._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] = ()
+        owned_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        try:
+            root._reprove()
+            records = _duplicate_directory_chain(root._api, root._records)
+            owned_records = records
+            records = _open_directory_components(
+                root._api,
+                records,
+                components[:-1],
+                maximum_component_units=root._maximum_component_units,
+            )
+            owned_records = records
+            entry_path = _append_component(
+                records[-1].expected_final_path,
+                components[-1],
+                maximum_units=root._maximum_component_units,
+            )
+            probed = _open_entry_proof(
+                root._api,
+                entry_path,
+                entry_path,
+                expected_kind="regular",
+                expected_volume_id=records[0].identity.volume_id,
+                stale=False,
+                entry_unavailable=True,
+                reject_wrong_kind=True,
+            )
+            if probed is None:
+                raise _entry_unavailable()
+            if probed.identity.link_count != 1:
+                raise _identity_stale()
+            _hit_fault(
+                self._fault_injector,
+                "windows_synchronization_after_entry_probe",
+            )
+            try:
+                handle = root._api.open_handle(
+                    entry_path,
+                    desired_access=(
+                        GENERIC_READ
+                        | GENERIC_WRITE
+                        | FILE_READ_ATTRIBUTES
+                        | SYNCHRONIZE
+                    ),
+                    share_mode=FILE_SHARE_READ,
+                    creation_disposition=OPEN_EXISTING,
+                    flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+                )
+            except Win32CallError:
+                raise _durability_unavailable() from None
+            with handle.borrow() as raw:
+                source = _capture_handle_proof(
+                    root._api,
+                    raw,
+                    expected_final_path=entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                probed.identity != source.identity
+                or probed.snapshot != source.snapshot
+                or source.identity.link_count != 1
+            ):
+                raise _identity_stale()
+            _require_volume(
+                source.identity,
+                records[0].identity.volume_id,
+                stale=True,
+            )
+            transferred_records = records
+            transferred_handle = handle
+            owned_records = None
+            handle = None
+            return _WindowsBoundSynchronizedRegularFile(
+                root._api,
+                transferred_records,
+                transferred_handle,
+                entry_path,
+                source.identity,
+                root._maximum_component_units,
+                self._fault_injector,
+            )
+        except PlatformFileError:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise
+        except Exception:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise _durability_unavailable() from None
         except BaseException:
             if handle is not None:
                 try:

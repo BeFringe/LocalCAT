@@ -16,8 +16,10 @@ import unittest
 from unittest import mock
 
 from platform_fs_contracts import (
+    BoundContentFacts,
     BoundDirectoryAuthority,
     BoundRegularFile,
+    BoundSynchronizedRegularFile,
     CandidateFile,
     CandidateContentFacts,
     DEVICE_KEY_ID_HASH_ALGORITHM,
@@ -25,6 +27,7 @@ from platform_fs_contracts import (
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
     EntrySnapshot,
+    ExistingFileDurability,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -123,6 +126,19 @@ class _Regular(BoundRegularFile):
 
     def _snapshot(self) -> EntrySnapshot:
         return EntrySnapshot(_identity(), len(self.payload), b"token", True)
+
+
+class _SynchronizedRegular(_Regular, BoundSynchronizedRegularFile):
+    def __init__(self, payload: bytes = b"payload") -> None:
+        super().__init__(payload)
+        self.synchronize_calls = 0
+
+    def _synchronize_content(
+        self,
+        expected: BoundContentFacts,
+    ) -> BoundContentFacts:
+        self.synchronize_calls += 1
+        return expected
 
 
 class _Candidate(CandidateFile):
@@ -339,7 +355,7 @@ class _Directory(RootedDirectoryAuthority):
         del name, expected
 
 
-class _FileSystem(RootedFileSystem):
+class _FileSystem(RootedFileSystem, ExistingFileDurability):
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
         del root
         return _Directory()
@@ -359,6 +375,14 @@ class _FileSystem(RootedFileSystem):
     ) -> BoundDirectoryAuthority:
         del root, relative
         return _Directory()
+
+    def _open_existing_for_synchronization(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundSynchronizedRegularFile:
+        del root, relative
+        return _SynchronizedRegular()
 
 
 class _LockService(ProcessFileLock):
@@ -528,6 +552,7 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             RootedDirectoryAuthority,
             BoundDirectoryAuthority,
             BoundRegularFile,
+            BoundSynchronizedRegularFile,
             CandidateFile,
             LockLease,
             PendingPublication,
@@ -543,6 +568,11 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             RootedFileSystem.bind_root: ("self", "root"),
             RootedFileSystem.open_regular: ("self", "root", "relative"),
             RootedFileSystem.bind_parent: ("self", "root", "relative"),
+            ExistingFileDurability.open_existing_for_synchronization: (
+                "self",
+                "root",
+                "relative",
+            ),
             ProcessFileLock.acquire: ("self", "parent", "name", "payload", "policy"),
             PrivateStorageProof.create_private_directory: ("self", "parent", "name"),
             PrivateStorageProof.prove_private: ("self", "authority"),
@@ -831,8 +861,10 @@ class PlatformFileValueContractTests(unittest.TestCase):
 
     def test_entry_snapshot_and_publish_facts_are_exact_platform_facts(self) -> None:
         snapshot = EntrySnapshot(_identity(), 7, b"mtime", True)
+        content = BoundContentFacts(snapshot, _DIGEST)
         facts = _facts()
         self.assertEqual(snapshot.byte_count, 7)
+        self.assertEqual(content.content_sha256, _DIGEST)
         self.assertEqual(facts.content_sha256, _DIGEST)
         self.assertFalse(
             {"success", "phase", "generation", "compatibility", "receipt", "expected_target"}
@@ -850,6 +882,22 @@ class PlatformFileValueContractTests(unittest.TestCase):
                     EntrySnapshot(*args)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             PublishFacts(PublishMode.CREATE_IF_ABSENT, _identity(), b"short", 7, True)
+        for args in (
+            (object(), _DIGEST),
+            (snapshot, bytearray(_DIGEST)),
+            (snapshot, b"short"),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises((TypeError, ValueError)):
+                    BoundContentFacts(*args)  # type: ignore[arg-type]
+        for operation in (
+            lambda: pickle.dumps(content),
+            lambda: copy.copy(content),
+            lambda: copy.deepcopy(content),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(TypeError):
+                    operation()
 
     def test_publish_mode_is_closed(self) -> None:
         self.assertEqual(
@@ -1024,6 +1072,39 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
         self.assertTrue(
             all(snapshot == expected for _offset, _maximum, snapshot in regular.read_at_calls)
         )
+
+    def test_regular_content_facts_stream_exact_bytes_and_are_live_only(self) -> None:
+        payload = b"x" * (64 * 1024 + 17)
+        regular = _Regular(payload)
+
+        facts = regular.content_facts()
+
+        self.assertEqual(facts.snapshot, regular.snapshot())
+        self.assertEqual(facts.content_sha256, hashlib.sha256(payload).digest())
+        self.assertEqual(
+            [(offset, maximum) for offset, maximum, _snapshot in regular.read_at_calls],
+            [(0, 64 * 1024), (64 * 1024, 17), (len(payload), 1)],
+        )
+
+    def test_synchronized_regular_requires_exact_pre_and_post_content(self) -> None:
+        regular = _SynchronizedRegular(b"durable")
+        expected = regular.content_facts()
+
+        self.assertEqual(regular.synchronize_content(expected), expected)
+        self.assertEqual(regular.synchronize_calls, 1)
+        with self.assertRaises(TypeError):
+            regular.synchronize_content(object())  # type: ignore[arg-type]
+
+        stale = _SynchronizedRegular(b"before")
+        stale_expected = stale.content_facts()
+        stale.payload = b"after"
+        with self.assertRaises(PlatformFileError) as caught:
+            stale.synchronize_content(stale_expected)
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.IDENTITY_STALE.value,
+        )
+        self.assertEqual(stale.synchronize_calls, 0)
 
     def test_persistent_private_proof_port_validates_and_mints_only_values(self) -> None:
         service = _PersistentPrivateService()
@@ -1523,6 +1604,7 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
                 (
                     lambda: regular.read_at(0, 1, regular_snapshot),
                     regular.read_all,
+                    regular.content_facts,
                     regular.identity,
                     regular.snapshot,
                 ),
@@ -1864,8 +1946,17 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
         filesystem = _FileSystem()
         root = filesystem.bind_root(_ROOT)
         regular = filesystem.open_regular(root, PurePath("nested", "source.json"))
+        synchronized = filesystem.open_existing_for_synchronization(
+            root,
+            PurePath("nested", "source.json"),
+        )
         parent = filesystem.bind_parent(root, PurePath("nested", "source.json"))
         self.assertEqual(regular.read_all(), b"payload")
+        synchronized_facts = synchronized.content_facts()
+        self.assertEqual(
+            synchronized.synchronize_content(synchronized_facts),
+            synchronized_facts,
+        )
         parent.reprove()
 
         for relative in (
@@ -1879,13 +1970,25 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
                     validate_relative_path(relative)
                 with self.assertRaises((TypeError, ValueError)):
                     filesystem.open_regular(root, relative)
+                with self.assertRaises((TypeError, ValueError)):
+                    filesystem.open_existing_for_synchronization(root, relative)
         with self.assertRaises(TypeError):
             filesystem.open_regular(root, "source.json")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            filesystem.open_existing_for_synchronization(
+                root,
+                "source.json",  # type: ignore[arg-type]
+            )
 
         closed_root = filesystem.bind_root(_ROOT)
         closed_root.close()
         with self.assertRaises(PlatformFileError):
             filesystem.bind_parent(closed_root, PurePath("source.json"))
+        with self.assertRaises(PlatformFileError):
+            filesystem.open_existing_for_synchronization(
+                closed_root,
+                PurePath("source.json"),
+            )
 
         lock_service = _LockService()
         lease = lock_service.acquire(

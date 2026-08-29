@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path, PureWindowsPath
 import subprocess
@@ -13,6 +14,8 @@ from unittest import mock
 
 import platform_fs_windows
 from platform_fs_contracts import (
+    BoundSynchronizedRegularFile,
+    ExistingFileDurability,
     LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
@@ -45,6 +48,7 @@ class WindowsRootedStaticTests(unittest.TestCase):
     def test_task_3_2_mints_only_rooted_file_system_shape(self) -> None:
         rooted = WindowsRootedFileSystem()
         self.assertIsInstance(rooted, RootedFileSystem)
+        self.assertIsInstance(rooted, ExistingFileDurability)
         self.assertNotIsInstance(rooted, ProcessFileLock)
         self.assertNotIsInstance(rooted, PrivateStorageProof)
         self.assertNotIsInstance(rooted, PlatformFileBackend)
@@ -351,6 +355,117 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
+
+    def test_existing_file_synchronization_uses_dedicated_handle_profile(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            with file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            ) as source:
+                self.assertNotIsInstance(source, BoundSynchronizedRegularFile)
+                self.assertFalse(hasattr(source, "synchronize_content"))
+
+            opened: list[dict[str, object]] = []
+            real_open = root._api.open_handle
+
+            def recording_open(path: str, **kwargs: object):
+                opened.append({"path": path, **kwargs})
+                return real_open(path, **kwargs)
+
+            with mock.patch.object(root._api, "open_handle", side_effect=recording_open):
+                synchronized = file_system.open_existing_for_synchronization(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+            with synchronized:
+                expected = synchronized.content_facts()
+                self.assertEqual(expected.snapshot.byte_count, len(self.payload))
+                self.assertEqual(
+                    expected.content_sha256,
+                    hashlib.sha256(self.payload).digest(),
+                )
+                self.assertEqual(synchronized.synchronize_content(expected), expected)
+
+            synchronization_opens = [
+                call
+                for call in opened
+                if int(call.get("desired_access", 0)) & platform_fs_windows.GENERIC_WRITE
+            ]
+            self.assertEqual(len(synchronization_opens), 1)
+            self.assertEqual(
+                synchronization_opens[0]["share_mode"],
+                platform_fs_windows.FILE_SHARE_READ,
+            )
+            self.assertFalse(
+                int(synchronization_opens[0]["desired_access"])
+                & platform_fs_windows.DELETE
+            )
+
+    def test_existing_file_synchronization_flush_failure_is_body_preserving(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        before = self.source.read_bytes()
+        with file_system.bind_root(self.root_path) as root:
+            synchronized = file_system.open_existing_for_synchronization(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+            try:
+                expected = synchronized.content_facts()
+                real_checked_bool = synchronized._api.checked_bool
+
+                def fail_flush(operation: str, function: object, *args: object) -> None:
+                    if operation == "FlushFileBuffers":
+                        raise platform_fs_windows.Win32CallError(operation, 5)
+                    real_checked_bool(operation, function, *args)
+
+                with mock.patch.object(
+                    synchronized._api,
+                    "checked_bool",
+                    side_effect=fail_flush,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    synchronized.synchronize_content(expected)
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+                )
+            finally:
+                synchronized.close()
+        self.assertEqual(self.source.read_bytes(), before)
+
+    def test_synchronization_authority_rejects_multilink_and_blocks_replacement(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        alias = self.nested / "sample-alias.txt"
+        os.link(self.source, alias)
+        try:
+            with file_system.bind_root(self.root_path) as root:
+                with self.assertRaises(PlatformFileError) as caught:
+                    file_system.open_existing_for_synchronization(
+                        root,
+                        PureWindowsPath("NestedCase", "sample.txt"),
+                    )
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                )
+        finally:
+            alias.unlink()
+
+        replacement = self.nested / "replacement.txt"
+        replacement.write_bytes(self.payload)
+        with file_system.bind_root(self.root_path) as root:
+            synchronized = file_system.open_existing_for_synchronization(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+            try:
+                with self.assertRaises(PermissionError):
+                    os.replace(replacement, self.source)
+            finally:
+                synchronized.close()
+        os.replace(replacement, self.source)
 
     def _assert_concurrent_close_is_identity_stale(
         self,

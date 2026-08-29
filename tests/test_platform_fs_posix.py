@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import builtins
 import errno
+import hashlib
 import importlib.util
+import inspect
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -131,6 +133,58 @@ class PosixAdapterStaticBoundaryTests(unittest.TestCase):
         self.assertNotIn("Path.iterdir", source)
         self.assertNotIn("Path.glob", source)
 
+    def test_existing_file_durability_is_rooted_and_does_not_publish(self) -> None:
+        source = ADAPTER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        adapter = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "PosixPlatformAdapter"
+        )
+        self.assertIn(
+            "ExistingFileDurability",
+            {
+                base.id
+                for base in adapter.bases
+                if isinstance(base, ast.Name)
+            },
+        )
+        opener = next(
+            node
+            for node in adapter.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_open_existing_for_synchronization"
+        )
+        opener_source = ast.get_source_segment(source, opener)
+        assert opener_source is not None
+        self.assertIn("_open_directory_chain", opener_source)
+        self.assertIn("_SYNCHRONIZED_READ_FLAGS", opener_source)
+        self.assertIn("dir_fd=", opener_source)
+
+        authority = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_PosixBoundSynchronizedRegularFile"
+        )
+        synchronize = next(
+            node
+            for node in authority.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_synchronize_content"
+        )
+        synchronize_source = ast.get_source_segment(source, synchronize)
+        assert synchronize_source is not None
+        self.assertEqual(synchronize_source.count("os.fsync("), 2)
+        self.assertNotIn("os.replace(", synchronize_source)
+        self.assertNotIn("os.rename(", synchronize_source)
+        self.assertNotIn("os.unlink(", synchronize_source)
+
+        module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
+        self.assertFalse(
+            inspect.isabstract(module._PosixBoundSynchronizedRegularFile)
+        )
+
     def test_flock_errno_mapping_executes_without_posix_host_import(self) -> None:
         def raising(error_number: int) -> object:
             def flock(descriptor: int, operation: int) -> None:
@@ -234,6 +288,10 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
         self.assertEqual(bound.read_at(7, 64 * 1024, expected), b"source")
         self.assertEqual(bound.read_at(len(b"sealed source"), 1, expected), b"")
         self.assertEqual(bound.read_all(), b"sealed source")
+        self.assertEqual(
+            bound.content_facts().content_sha256,
+            hashlib.sha256(b"sealed source").digest(),
+        )
         self.assertEqual(bound.identity().platform, "posix")
         self.assertEqual(bound.snapshot().byte_count, len(b"sealed source"))
         bound.close()
@@ -250,6 +308,140 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
                     PurePosixPath("data/source-link.txt"),
                 )
         self.assertEqual(caught.exception.code, "PLATFORM.FS.REPARSE_REJECTED")
+
+    def test_existing_regular_synchronization_flushes_file_then_parent(self) -> None:
+        import platform_fs_posix
+
+        payload = b"sqlite stage bytes"
+        source = self.root_path / "data" / "stage.sqlite"
+        source.write_bytes(payload)
+        root = self.adapter.bind_root(self.root_path)
+        authority = self.adapter.open_existing_for_synchronization(
+            root,
+            PurePosixPath("data/stage.sqlite"),
+        )
+        root.close()
+        try:
+            expected = authority.content_facts()
+            self.assertEqual(expected.snapshot.byte_count, len(payload))
+            self.assertEqual(
+                expected.content_sha256,
+                hashlib.sha256(payload).digest(),
+            )
+            real_fsync = platform_fs_posix.os.fsync
+            with mock.patch.object(
+                platform_fs_posix.os,
+                "fsync",
+                wraps=real_fsync,
+            ) as fsync:
+                synchronized = authority.synchronize_content(expected)
+            self.assertEqual(synchronized, expected)
+            self.assertEqual(
+                [call.args[0] for call in fsync.call_args_list],
+                [authority._descriptor, authority._directory_fds[-1]],
+            )
+            self.assertEqual(source.read_bytes(), payload)
+        finally:
+            authority.close()
+
+    def test_existing_regular_synchronization_accepts_read_only_owner_artifact(
+        self,
+    ) -> None:
+        payload = b"sealed read-only stage"
+        source = self.root_path / "data" / "stage.sqlite"
+        source.write_bytes(payload)
+        source.chmod(0o444)
+        with self.adapter.bind_root(self.root_path) as root:
+            authority = self.adapter.open_existing_for_synchronization(
+                root,
+                PurePosixPath("data/stage.sqlite"),
+            )
+        try:
+            expected = authority.content_facts()
+            self.assertEqual(authority.synchronize_content(expected), expected)
+            self.assertEqual(source.read_bytes(), payload)
+        finally:
+            authority.close()
+
+    def test_existing_regular_synchronization_rejects_alias_and_stale_name(self) -> None:
+        import platform_fs_posix
+
+        source = self.root_path / "data" / "stage.sqlite"
+        source.write_bytes(b"stage")
+        alias = self.root_path / "data" / "stage-alias.sqlite"
+        os.link(source, alias)
+        with self.adapter.bind_root(self.root_path) as root:
+            with self.assertRaises(PlatformFileError) as hardlink:
+                self.adapter.open_existing_for_synchronization(
+                    root,
+                    PurePosixPath("data/stage.sqlite"),
+                )
+        self.assertEqual(
+            hardlink.exception.code,
+            PlatformFileErrorCode.IDENTITY_STALE.value,
+        )
+        alias.unlink()
+
+        with self.adapter.bind_root(self.root_path) as root:
+            authority = self.adapter.open_existing_for_synchronization(
+                root,
+                PurePosixPath("data/stage.sqlite"),
+            )
+        expected = authority.content_facts()
+        os.link(source, alias)
+        try:
+            with self.assertRaises(PlatformFileError) as linked_after_open:
+                authority.content_facts()
+            self.assertEqual(
+                linked_after_open.exception.code,
+                PlatformFileErrorCode.IDENTITY_STALE.value,
+            )
+        finally:
+            alias.unlink()
+        os.replace(source, self.root_path / "data" / "stage-owned.sqlite")
+        source.write_bytes(b"foreign")
+        try:
+            with mock.patch.object(
+                platform_fs_posix.os,
+                "fsync",
+                wraps=platform_fs_posix.os.fsync,
+            ) as fsync, self.assertRaises(PlatformFileError) as stale:
+                authority.synchronize_content(expected)
+            self.assertEqual(
+                stale.exception.code,
+                PlatformFileErrorCode.IDENTITY_STALE.value,
+            )
+            fsync.assert_not_called()
+            self.assertEqual(source.read_bytes(), b"foreign")
+        finally:
+            authority.close()
+
+    def test_existing_regular_synchronization_maps_fsync_failure(self) -> None:
+        import platform_fs_posix
+
+        source = self.root_path / "data" / "stage.sqlite"
+        source.write_bytes(b"stage")
+        with self.adapter.bind_root(self.root_path) as root:
+            authority = self.adapter.open_existing_for_synchronization(
+                root,
+                PurePosixPath("data/stage.sqlite"),
+            )
+        try:
+            expected = authority.content_facts()
+            with mock.patch.object(
+                platform_fs_posix.os,
+                "fsync",
+                side_effect=OSError(errno.EIO, "injected durability fault"),
+            ), self.assertRaises(PlatformFileError) as caught:
+                authority.synchronize_content(expected)
+            self.assertEqual(
+                caught.exception.code,
+                PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value,
+            )
+            self.assertFalse(caught.exception.retryable)
+            self.assertIsNone(caught.exception.__cause__)
+        finally:
+            authority.close()
 
     def test_bounded_read_rejects_wrong_baseline_and_short_or_zero_pread(self) -> None:
         import platform_fs_posix
