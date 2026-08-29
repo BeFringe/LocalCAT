@@ -34,6 +34,8 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
+    MutableFileReservationService,
     OpaqueAuthority,
     PendingPublication,
     PersistentPrivateProof,
@@ -200,6 +202,22 @@ class _Lease(LockLease):
         pass
 
 
+class _MutableReservation(MutableFileReservation):
+    def __init__(self, created_identity: FileObjectIdentity | None = None) -> None:
+        selected = created_identity or _identity()
+        super().__init__(selected)
+        self.observed: object = selected
+        self.reprove_calls = 0
+        self.close_calls = 0
+
+    def _reprove_identity(self) -> FileObjectIdentity:
+        self.reprove_calls += 1
+        return self.observed  # type: ignore[return-value]
+
+    def _close_authority(self) -> None:
+        self.close_calls += 1
+
+
 class _PrivateEvidence(PrivateAccessEvidence):
     def _close_authority(self) -> None:
         pass
@@ -364,7 +382,11 @@ class _Directory(RootedDirectoryAuthority):
         del name, expected
 
 
-class _FileSystem(RootedFileSystem, ExistingFileDurability):
+class _FileSystem(
+    RootedFileSystem,
+    MutableFileReservationService,
+    ExistingFileDurability,
+):
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
         del root
         return _Directory()
@@ -392,6 +414,14 @@ class _FileSystem(RootedFileSystem, ExistingFileDurability):
     ) -> BoundSynchronizedRegularFile:
         del root, relative
         return _SynchronizedRegular()
+
+    def _reserve_mutable_file(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> MutableFileReservation:
+        del parent, name
+        return _MutableReservation()
 
 
 class _LockService(ProcessFileLock):
@@ -563,6 +593,7 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             BoundRegularFile,
             BoundSynchronizedRegularFile,
             CandidateFile,
+            MutableFileReservation,
             LockLease,
             PendingPublication,
             PrivateAccessEvidence,
@@ -581,6 +612,11 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
                 "self",
                 "root",
                 "relative",
+            ),
+            MutableFileReservationService.reserve_mutable_file: (
+                "self",
+                "parent",
+                "name",
             ),
             ProcessFileLock.acquire: ("self", "parent", "name", "payload", "policy"),
             LockLease.reprove_binding: ("self", "parent", "name", "payload"),
@@ -995,6 +1031,46 @@ class PlatformFileErrorContractTests(unittest.TestCase):
 
 
 class PlatformFileAuthorityContractTests(unittest.TestCase):
+    def test_mutable_reservation_reproves_exact_created_single_link_identity(self) -> None:
+        created = _identity()
+        reservation = _MutableReservation(created)
+        self.assertEqual(reservation.identity(), created)
+        self.assertEqual(reservation.reprove_calls, 1)
+
+        reservation.observed = FileObjectIdentity(
+            platform=created.platform,
+            volume_id=created.volume_id,
+            file_id=b"x" * 16,
+            kind="regular",
+            link_count=1,
+        )
+        with self.assertRaises(PlatformFileError) as caught:
+            reservation.identity()
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.IDENTITY_STALE.value,
+        )
+
+        reservation.observed = object()
+        with self.assertRaises(TypeError):
+            reservation.identity()
+        reservation.close()
+        reservation.close()
+        self.assertEqual(reservation.close_calls, 1)
+        with self.assertRaises(PlatformFileError) as caught:
+            reservation.identity()
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        )
+
+        for invalid in (
+            FileObjectIdentity("windows", b"v", b"f" * 16, "directory", 1),
+            FileObjectIdentity("windows", b"v", b"f" * 16, "regular", 2),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _MutableReservation(invalid)
+
     def test_regular_bounded_read_validates_shape_and_preserves_eof(self) -> None:
         regular = _Regular(b"0123456789")
         expected = regular.snapshot()
@@ -2023,6 +2099,7 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             PurePath("nested", "source.json"),
         )
         parent = filesystem.bind_parent(root, PurePath("nested", "source.json"))
+        reservation = filesystem.reserve_mutable_file(parent, "stage.sqlite3")
         self.assertEqual(regular.read_all(), b"payload")
         synchronized_facts = synchronized.content_facts()
         self.assertEqual(
@@ -2030,6 +2107,15 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             synchronized_facts,
         )
         parent.reprove()
+        self.assertEqual(reservation.identity(), _identity())
+        self.assertFalse(reservation.closed)
+        reservation.close()
+
+        for invalid in ("", ".", "..", "a/b", "a\\b", "nul\0name"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                filesystem.reserve_mutable_file(parent, invalid)
+        with self.assertRaises(TypeError):
+            filesystem.reserve_mutable_file(object(), "stage.sqlite3")  # type: ignore[arg-type]
 
         for relative in (
             PurePath(),
