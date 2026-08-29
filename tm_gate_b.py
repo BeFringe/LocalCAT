@@ -26,13 +26,19 @@ import json
 import re
 from typing import Any, TypeVar
 
-from tm_content_attestation import SealedContentAttestation
+from tm_content_attestation import (
+    PortableSealedContentAttestation,
+    SealedContentAttestation,
+    SealedContentAttestationRecord,
+)
 from tm_contracts import (
     SealedStage,
     stage_validation_evidence_digest,
 )
 from tm_stage_sealer import (
     _PhysicalReadinessSnapshot,
+    _PhysicalReadinessRecord,
+    _PortablePhysicalReadinessSnapshot,
     _SealedArtifactReadinessView,
     _require_linearization_closure,
     StageSealError,
@@ -633,6 +639,8 @@ _GATE_B_CODE_MAP: dict[str, str] = {
     "STORE.FOREIGN_KEY_SCHEMA_MISMATCH": "GATE_B.SCHEMA_MISMATCH",
     "STORE.META_INCOMPLETE": "GATE_B.SCHEMA_MISMATCH",
     "STORE.DATABASE_MISSING": "GATE_B.ARTIFACT_MISSING",
+    "SEALER.ATTESTATION_UNAVAILABLE": "GATE_B.ATTESTATION_UNAVAILABLE",
+    "SEALER.ATTESTATION_INVALID": "GATE_B.ATTESTATION_INVALID",
 }
 
 
@@ -665,13 +673,20 @@ def _denial_report(error_code: str) -> GateBPhysicalReadinessReport:
 
 
 def _require_claim_closure(
-    snapshot: _PhysicalReadinessSnapshot,
-    attestation: SealedContentAttestation,
+    snapshot: _PhysicalReadinessRecord,
+    attestation: SealedContentAttestationRecord,
 ) -> None:
     """Bind the registry-owned attestation to the sealed contract claim."""
 
     claim = snapshot.evidence
-    if type(attestation) is not SealedContentAttestation:
+    pair = (type(snapshot), type(attestation))
+    if pair not in {
+        (_PhysicalReadinessSnapshot, SealedContentAttestation),
+        (
+            _PortablePhysicalReadinessSnapshot,
+            PortableSealedContentAttestation,
+        ),
+    }:
         raise _GateBFailure("GATE_B.EVIDENCE_MISMATCH")
     semantic = attestation.semantic_facts
     if (
@@ -707,8 +722,8 @@ def _require_claim_closure(
 
 
 def _grant_report(
-    snapshot: _PhysicalReadinessSnapshot,
-    attestation: SealedContentAttestation,
+    snapshot: _PhysicalReadinessRecord,
+    attestation: SealedContentAttestationRecord,
 ) -> GateBPhysicalReadinessReport:
     """Build the inspectable facts and the factory-only grant for one artifact."""
 
@@ -832,24 +847,24 @@ class GateBEvaluator:
                 snapshot = self._registry.resolve_physical_readiness(
                     sealed_stage
                 )
-            except (
-                StageSealError,
-                TypeError,
-                ValueError,
-                AttributeError,
-            ) as error:
-                raise _GateBFailure(_map_gate_b_code(error)) from error
-            if type(snapshot) is not _PhysicalReadinessSnapshot:
-                raise _GateBFailure("GATE_B.REGISTRY_MISMATCH")
-            try:
-                attestation = snapshot.sealed_content_attestation
-                _require_claim_closure(snapshot, attestation)
-                _require_linearization_closure(snapshot, attestation)
             except StageSealError as error:
                 raise _GateBFailure(_map_gate_b_code(error)) from error
-            except (TypeError, ValueError, AttributeError) as error:
-                raise _GateBFailure("GATE_B.READINESS_FAILED") from error
-            return _grant_report(snapshot, attestation)
+            if type(snapshot) not in {
+                _PhysicalReadinessSnapshot,
+                _PortablePhysicalReadinessSnapshot,
+            }:
+                raise _GateBFailure("GATE_B.REGISTRY_MISMATCH")
+            try:
+                try:
+                    attestation = snapshot.sealed_content_attestation
+                    _require_claim_closure(snapshot, attestation)
+                    _require_linearization_closure(snapshot, attestation)
+                except StageSealError as error:
+                    raise _GateBFailure(_map_gate_b_code(error)) from error
+                return _grant_report(snapshot, attestation)
+            finally:
+                if type(snapshot) is _PortablePhysicalReadinessSnapshot:
+                    snapshot.live_reproof._release()
         except _GateBFailure as failure:
             return _denial_report(failure.error_code)
 
