@@ -14,6 +14,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import tm_contracts as contract_module
+import tm_migration
 import tm_sqlite_store
 import tm_stage_sealer
 from platform_fs import compose_platform_file_backend
@@ -108,6 +109,7 @@ def _seal(
     *,
     fts5_available: bool,
     expected_prior_generation: int | None = None,
+    caller_borrow: object | None = None,
 ) -> SealedStage:
     with patch(
         "tm_sqlite_store._probe_fts5",
@@ -116,7 +118,30 @@ def _seal(
         return sealer.seal(
             stage,
             expected_prior_generation=expected_prior_generation,
+            caller_borrow=cast(Any, caller_borrow),
         )
+
+
+def _portable_sealer(
+    root: Path,
+    stage: MutableStageRef,
+    *,
+    namespace: str,
+) -> tuple[StageSealer, object, object]:
+    backend = compose_platform_file_backend(root)
+    reservation = (
+        tm_migration._InitialActivationResourceReservation.acquire_with_backend(
+            stage.resource_identity,
+            backend,
+        )
+    )
+    inputs = reservation.stage_seal_inputs()
+    sealer = StageSealer(
+        registry=SealedArtifactRegistry(registry_namespace=namespace),
+        canonical_store_id="store.primary",
+        platform=cast(Any, inputs["platform"]),
+    )
+    return sealer, reservation, inputs["caller_borrow"]
 
 
 def _registry(sealer: StageSealer) -> SealedArtifactRegistry:
@@ -195,20 +220,57 @@ class _FakeRegistry:
 
 class StageSealerHappyPathTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_missing_caller_borrow_fails_before_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, stage = _build_stage(root, fts5_available=True)
+            backend = compose_platform_file_backend(root)
+            registry = SealedArtifactRegistry(
+                registry_namespace="coordinator.portable-no-borrow"
+            )
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+                platform=cast(Any, backend),
+            )
+            with patch.object(
+                type(backend),
+                "_acquire",
+                side_effect=AssertionError("StageSealer must not acquire a lock"),
+            ) as acquire:
+                with self.assertRaisesRegex(
+                    StageSealError,
+                    "^SEALER.ATTESTATION_UNAVAILABLE$",
+                ):
+                    sealer.seal(stage)
+            acquire.assert_not_called()
+            self.assertEqual(registry._entries, {})
+            self.assertEqual(registry._reservations, {})
+            connection = sqlite3.connect(str(stage.staged_db_path))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM tm_meta "
+                        "WHERE key = 'activation_status'"
+                    ).fetchall(),
+                    [("UNPUBLISHED",)],
+                )
+            finally:
+                connection.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_post_marker_failure_is_unregistered_fail_stop(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, stage = _build_stage(root, fts5_available=True)
-            backend = compose_platform_file_backend(root)
-            sealer = StageSealer(
-                registry=SealedArtifactRegistry(
-                    registry_namespace="coordinator.portable-failure"
-                ),
-                canonical_store_id="store.primary",
-                platform=cast(Any, backend),
+            sealer, reservation, caller_borrow = _portable_sealer(
+                root,
+                stage,
+                namespace="coordinator.portable-failure",
             )
+            self.addCleanup(reservation.release)  # type: ignore[attr-defined]
             with (
                 patch(
                     "tm_stage_sealer._open_portable_stage_live_authority",
@@ -228,7 +290,10 @@ class StageSealerHappyPathTests(unittest.TestCase):
                     StageSealError,
                     "^SEALER.ATTESTATION_UNAVAILABLE$",
                 ):
-                    sealer.seal(stage)
+                    sealer.seal(
+                        stage,
+                        caller_borrow=cast(Any, caller_borrow),
+                    )
             restore.assert_not_called()
             registry = _registry(sealer)
             self.assertEqual(registry._entries, {})
@@ -244,6 +309,7 @@ class StageSealerHappyPathTests(unittest.TestCase):
                 )
             finally:
                 connection.close()
+            reservation.release()  # type: ignore[attr-defined]
 
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_source_hardlink_is_rejected_without_authority_residue(
@@ -254,17 +320,13 @@ class StageSealerHappyPathTests(unittest.TestCase):
             identity, stage = _build_stage(root, fts5_available=True)
             alias = (root / "source-hardlink.jsonl").resolve()
             os.link(identity.configured_jsonl_path, alias)
-            registry = SealedArtifactRegistry(
-                registry_namespace="coordinator.portable-hardlink"
+            sealer, reservation, caller_borrow = _portable_sealer(
+                root,
+                stage,
+                namespace="coordinator.portable-hardlink",
             )
-            sealer = StageSealer(
-                registry=registry,
-                canonical_store_id="store.primary",
-                platform=cast(
-                    Any,
-                    compose_platform_file_backend(root),
-                ),
-            )
+            self.addCleanup(reservation.release)  # type: ignore[attr-defined]
+            registry = _registry(sealer)
             with (
                 patch(
                     "tm_stage_sealer._restore_stage_unpublished"
@@ -278,7 +340,10 @@ class StageSealerHappyPathTests(unittest.TestCase):
                     StageSealError,
                     "^SEALER.ATTESTATION_INVALID$",
                 ):
-                    sealer.seal(stage)
+                    sealer.seal(
+                        stage,
+                        caller_borrow=cast(Any, caller_borrow),
+                    )
             restore.assert_not_called()
             self.assertEqual(registry._entries, {})
             self.assertEqual(registry._reservations, {})
@@ -294,6 +359,7 @@ class StageSealerHappyPathTests(unittest.TestCase):
                 )
             finally:
                 connection.close()
+            reservation.release()  # type: ignore[attr-defined]
 
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_commit_fault_after_take_closes_and_rolls_back_registry(
@@ -307,18 +373,14 @@ class StageSealerHappyPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, stage = _build_stage(root, fts5_available=True)
-            registry = SealedArtifactRegistry(
-                registry_namespace="coordinator.portable-commit-fault"
+            sealer, reservation, caller_borrow = _portable_sealer(
+                root,
+                stage,
+                namespace="coordinator.portable-commit-fault",
             )
+            self.addCleanup(reservation.release)  # type: ignore[attr-defined]
+            registry = _registry(sealer)
             registry._sealed_paths = _FailingSetDict()
-            sealer = StageSealer(
-                registry=registry,
-                canonical_store_id="store.primary",
-                platform=cast(
-                    Any,
-                    compose_platform_file_backend(root),
-                ),
-            )
             with patch(
                 "tm_sqlite_store._probe_fts5",
                 return_value=True,
@@ -327,11 +389,15 @@ class StageSealerHappyPathTests(unittest.TestCase):
                     RuntimeError,
                     "^registry placement fault$",
                 ):
-                    sealer.seal(stage)
+                    sealer.seal(
+                        stage,
+                        caller_borrow=cast(Any, caller_borrow),
+                    )
             self.assertEqual(registry._entries, {})
             self.assertEqual(registry._reservations, {})
             self.assertEqual(registry._sealed_paths, {})
             self.assertEqual(registry._used_verified_commit_nonces, set())
+            reservation.release()  # type: ignore[attr-defined]
 
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_platform_route_retains_authority_until_consume(
@@ -340,15 +406,18 @@ class StageSealerHappyPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, stage = _build_stage(root, fts5_available=True)
-            backend = compose_platform_file_backend(root)
-            sealer = StageSealer(
-                registry=SealedArtifactRegistry(
-                    registry_namespace="coordinator.portable"
-                ),
-                canonical_store_id="store.primary",
-                platform=cast(Any, backend),
+            sealer, reservation, caller_borrow = _portable_sealer(
+                root,
+                stage,
+                namespace="coordinator.portable",
             )
-            sealed = _seal(sealer, stage, fts5_available=True)
+            self.addCleanup(reservation.release)  # type: ignore[attr-defined]
+            sealed = _seal(
+                sealer,
+                stage,
+                fts5_available=True,
+                caller_borrow=caller_borrow,
+            )
             registry = _registry(sealer)
             entry = registry._entries[sealed.artifact.artifact_id]
             self.assertIs(type(entry), tm_stage_sealer._PortableRegistryEntry)
@@ -383,6 +452,7 @@ class StageSealerHappyPathTests(unittest.TestCase):
                 ActivationCapabilityState.CONSUMED,
             )
             self.assertTrue(registry.contains(sealed))
+            reservation.release()  # type: ignore[attr-defined]
 
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_close_failure_keeps_terminal_registry_state(
@@ -391,17 +461,18 @@ class StageSealerHappyPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, stage = _build_stage(root, fts5_available=True)
-            sealer = StageSealer(
-                registry=SealedArtifactRegistry(
-                    registry_namespace="coordinator.portable-close"
-                ),
-                canonical_store_id="store.primary",
-                platform=cast(
-                    Any,
-                    compose_platform_file_backend(root),
-                ),
+            sealer, reservation, caller_borrow = _portable_sealer(
+                root,
+                stage,
+                namespace="coordinator.portable-close",
             )
-            sealed = _seal(sealer, stage, fts5_available=True)
+            self.addCleanup(reservation.release)  # type: ignore[attr-defined]
+            sealed = _seal(
+                sealer,
+                stage,
+                fts5_available=True,
+                caller_borrow=caller_borrow,
+            )
             registry = _registry(sealer)
             entry = cast(
                 tm_stage_sealer._PortableRegistryEntry,
@@ -440,6 +511,7 @@ class StageSealerHappyPathTests(unittest.TestCase):
                 "^SEALER.TOKEN_NOT_ACTIVE$",
             ):
                 registry.cancel(token)
+            reservation.release()  # type: ignore[attr-defined]
 
     def test_projection_digest_uses_bounded_multichunk_readback(
         self,
