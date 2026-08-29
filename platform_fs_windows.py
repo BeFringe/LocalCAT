@@ -2373,15 +2373,8 @@ class _WindowsLockLease(LockLease):
         self._payload = payload
         self._overlapped = overlapped
 
-    def _matches_parent(
-        self,
-        api: WindowsFileAPI,
-        records: tuple[_WindowsDirectoryRecord, ...],
-    ) -> bool:
-        self._require_open()
+    def _reprove_lock(self) -> None:
         try:
-            if api is not self._api or len(records) != len(self._records):
-                return False
             payload, proof = _read_lock_payload(
                 self._api,
                 self._records,
@@ -2389,9 +2382,25 @@ class _WindowsLockLease(LockLease):
                 self._entry_path,
                 self._user_sid,
             )
-            _reprove_directory_chain(api, records)
-            if payload != self._payload or proof.identity != self._identity:
+            _reprove_directory_chain(self._api, self._records)
+            if proof.identity != self._identity or payload != self._payload:
+                raise _lock_unavailable()
+        except PlatformFileError:
+            raise _lock_unavailable() from None
+        except Exception:
+            raise _lock_unavailable() from None
+
+    def _matches_parent(
+        self,
+        api: WindowsFileAPI,
+        records: tuple[_WindowsDirectoryRecord, ...],
+    ) -> bool:
+        self._require_open()
+        try:
+            self._reprove_lock()
+            if api is not self._api or len(records) != len(self._records):
                 return False
+            _reprove_directory_chain(api, records)
             return all(
                 left.expected_final_path == right.expected_final_path
                 and left.identity == right.identity
