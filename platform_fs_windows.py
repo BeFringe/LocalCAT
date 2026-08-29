@@ -37,6 +37,7 @@ from platform_fs_contracts import (
     LockWait,
     MutableFileReservation,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     PendingPublication,
     PersistentPrivateProof,
     PlatformFileError,
@@ -49,6 +50,8 @@ from platform_fs_contracts import (
     ProcessFileLock,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
     VerifiedPrivateProof,
     WINDOWS_PRIVATE_PROOF_SCHEMA,
     WINDOWS_PRIVATE_SECURITY_PROFILE_ID,
@@ -95,6 +98,7 @@ __all__ = [
 
 FILE_READ_ATTRIBUTES = 0x0080
 FILE_LIST_DIRECTORY = 0x0001
+FILE_TRAVERSE = 0x0020
 DELETE = 0x00010000
 SYNCHRONIZE = 0x00100000
 GENERIC_READ = 0x80000000
@@ -870,6 +874,50 @@ def _open_directory_record(
         raise
 
 
+def _open_retirement_target_record(
+    api: WindowsFileAPI,
+    path: str,
+    expected_volume_id: bytes,
+    *,
+    stale: bool,
+) -> _WindowsDirectoryRecord:
+    """Open only the retirement leaf with rename-compatible sharing."""
+
+    handle = None
+    try:
+        handle = api.open_handle(
+            path,
+            desired_access=FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            creation_disposition=OPEN_EXISTING,
+            flags=FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        with handle.borrow() as raw:
+            proof = _capture_handle_proof(
+                api,
+                raw,
+                expected_final_path=path,
+                expected_kind="directory",
+                stale=stale,
+            )
+        _require_volume(proof.identity, expected_volume_id, stale=stale)
+        result = _WindowsDirectoryRecord(handle, proof.final_path, proof.identity)
+        handle = None
+        return result
+    except (TypeError, AssertionError, AttributeError):
+        raise
+    except PlatformFileError:
+        raise
+    except Win32CallError:
+        raise _proof_failure(stale=stale) from None
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+
+
 def _open_entry_proof(
     api: WindowsFileAPI,
     path: str,
@@ -1513,6 +1561,13 @@ class _WindowsRootedDirectory(
 class _WindowsBoundDirectory(
     _WindowsDirectoryAuthorityMixin,
     BoundDirectoryAuthority,
+):
+    __slots__ = _WINDOWS_DIRECTORY_AUTHORITY_SLOTS
+
+
+class _WindowsRetirementTargetDirectory(
+    _WindowsDirectoryAuthorityMixin,
+    RetirementDirectoryAuthority,
 ):
     __slots__ = _WINDOWS_DIRECTORY_AUTHORITY_SLOTS
 
@@ -3036,6 +3091,145 @@ class _WindowsMutableFileReservation(MutableFileReservation):
             raise _capability_unavailable() from None
 
 
+class _WindowsRetainedRetirement(RetainedRetirement):
+    __slots__ = (
+        "_api",
+        "_source_records",
+        "_source_name",
+        "_target_records",
+        "_target_name",
+        "_handle",
+        "_target_path",
+    )
+
+    def __init__(
+        self,
+        owned_identity: FileObjectIdentity,
+        api: WindowsFileAPI,
+        source_records: tuple[_WindowsDirectoryRecord, ...],
+        source_name: str,
+        target_records: tuple[_WindowsDirectoryRecord, ...],
+        target_name: str,
+        handle: object,
+        target_path: str,
+    ) -> None:
+        super().__init__(owned_identity)
+        self._api = api
+        self._source_records = source_records
+        self._source_name = source_name
+        self._target_records = target_records
+        self._target_name = target_name
+        self._handle = handle
+        self._target_path = target_path
+        try:
+            self._reprove_retirement()
+        except BaseException:
+            self._close_authority()
+            raise
+
+    def _reprove_retirement(self) -> EntrySnapshot:
+        try:
+            _reprove_directory_chain(self._api, self._source_records)
+            _reprove_directory_chain(self._api, self._target_records)
+            source_path = _append_component(
+                self._source_records[-1].expected_final_path,
+                self._source_name,
+                maximum_units=_MAX_EXTENDED_PATH_UTF16_UNITS,
+            )
+            source = _open_entry_proof(
+                self._api,
+                source_path,
+                source_path,
+                expected_kind=None,
+                expected_volume_id=self._source_records[0].identity.volume_id,
+                stale=True,
+                allow_missing=True,
+            )
+            if source is not None:
+                raise _recovery_required()
+            with self._handle.borrow() as raw:
+                retained = _capture_handle_proof(
+                    self._api,
+                    raw,
+                    expected_final_path=self._target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            named = _open_entry_proof(
+                self._api,
+                self._target_path,
+                self._target_path,
+                expected_kind="regular",
+                expected_volume_id=self._target_records[0].identity.volume_id,
+                stale=True,
+            )
+            if (
+                named is None
+                or retained.identity.link_count != 1
+                or named.identity.link_count != 1
+                or retained.identity != named.identity
+            ):
+                raise _recovery_required()
+            terminal_source = _open_entry_proof(
+                self._api,
+                source_path,
+                source_path,
+                expected_kind=None,
+                expected_volume_id=self._source_records[0].identity.volume_id,
+                stale=True,
+                allow_missing=True,
+            )
+            terminal_target = _open_entry_proof(
+                self._api,
+                self._target_path,
+                self._target_path,
+                expected_kind="regular",
+                expected_volume_id=self._target_records[0].identity.volume_id,
+                stale=True,
+            )
+            with self._handle.borrow() as raw:
+                terminal_retained = _capture_handle_proof(
+                    self._api,
+                    raw,
+                    expected_final_path=self._target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                terminal_source is not None
+                or terminal_target is None
+                or terminal_target.identity != retained.identity
+                or terminal_retained.identity != retained.identity
+                or terminal_target.identity.link_count != 1
+                or terminal_retained.identity.link_count != 1
+            ):
+                raise _recovery_required()
+            _reprove_directory_chain(self._api, self._source_records)
+            _reprove_directory_chain(self._api, self._target_records)
+            return terminal_retained.snapshot
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise _recovery_required() from None
+        except Exception:
+            raise _recovery_required() from None
+
+    def _close_retirement_authority(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            self._handle.close()
+        except BaseException as error:
+            first_error = error
+        source_error = _close_handles_reverse(
+            tuple(record.handle for record in self._source_records)
+        )
+        target_error = _close_handles_reverse(
+            tuple(record.handle for record in self._target_records)
+        )
+        if first_error is not None or source_error is not None or target_error is not None:
+            raise _capability_unavailable() from None
+
+
 class _WindowsBoundSynchronizedRegularFile(
     _WindowsBoundRegularFile,
     BoundSynchronizedRegularFile,
@@ -3401,6 +3595,7 @@ class _WindowsPendingPublication(PendingPublication):
 class WindowsRootedFileSystem(
     RootedFileSystem,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     ExistingFileDurability,
 ):
     """Windows rooted reads, mutable reservations, and existing-file durability."""
@@ -3844,6 +4039,286 @@ class WindowsRootedFileSystem(
                     pass
             if records is not None:
                 _close_handles_reverse(tuple(record.handle for record in records))
+
+    def _bind_or_create_child_directory(
+        self,
+        parent: BoundDirectoryAuthority | RetirementDirectoryAuthority,
+        name: str,
+    ) -> RetirementDirectoryAuthority:
+        if not isinstance(parent, _WindowsDirectoryAuthorityMixin):
+            raise _capability_unavailable()
+        component = _validate_windows_component(
+            name,
+            maximum_units=parent._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        leaf: _WindowsDirectoryRecord | None = None
+        strict_parent: _WindowsDirectoryRecord | None = None
+        created = False
+        try:
+            parent._reprove()
+            if type(parent) is _WindowsRetirementTargetDirectory:
+                strict_parent = _open_directory_record(
+                    parent._api,
+                    parent._leaf_path,
+                    parent._leaf_path,
+                    stale=True,
+                    expected_volume_id=parent._records[0].identity.volume_id,
+                )
+                if strict_parent.identity != parent._records[-1].identity:
+                    raise _identity_stale()
+            records = _duplicate_directory_chain(parent._api, parent._records)
+            path = _append_component(
+                records[-1].expected_final_path,
+                component,
+                maximum_units=parent._maximum_component_units,
+            )
+            try:
+                parent._api.checked_bool(
+                    "CreateDirectoryW",
+                    parent._api.CreateDirectoryW,
+                    path,
+                    None,
+                )
+                created = True
+                _hit_fault(self._fault_injector, "retirement_directory_after_create")
+            except Win32CallError as error:
+                if error.winerror != ERROR_ALREADY_EXISTS:
+                    raise
+            leaf = _open_retirement_target_record(
+                parent._api,
+                path,
+                records[0].identity.volume_id,
+                stale=created,
+            )
+            parent._reprove()
+            if (
+                strict_parent is not None
+                and strict_parent.identity != parent._records[-1].identity
+            ):
+                raise _identity_stale()
+            transferred_records = records + (leaf,)
+            records = None
+            leaf = None
+            return _WindowsRetirementTargetDirectory(
+                parent._api,
+                transferred_records,
+                parent._maximum_component_units,
+                self._fault_injector,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            if created:
+                raise _recovery_required() from None
+            raise
+        except Exception:
+            raise (
+                _recovery_required() if created else _capability_unavailable()
+            ) from None
+        finally:
+            if strict_parent is not None:
+                try:
+                    strict_parent.handle.close()
+                except BaseException:
+                    pass
+            if leaf is not None:
+                try:
+                    leaf.handle.close()
+                except BaseException:
+                    pass
+            if records is not None:
+                _close_handles_reverse(tuple(record.handle for record in records))
+
+    def _retire_owned_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        reservation: MutableFileReservation,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if (
+            not isinstance(source_parent, _WindowsDirectoryAuthorityMixin)
+            or type(target_parent) is not _WindowsRetirementTargetDirectory
+            or type(reservation) is not _WindowsMutableFileReservation
+            or source_parent._api is not target_parent._api
+            or reservation._api is not source_parent._api
+        ):
+            raise _capability_unavailable()
+        if (
+            reservation._entry_path
+            != _append_component(
+                source_parent._leaf_path,
+                source_name,
+                maximum_units=source_parent._maximum_component_units,
+            )
+            or len(reservation._records) != len(source_parent._records)
+            or any(
+                left.expected_final_path != right.expected_final_path
+                or left.identity != right.identity
+                for left, right in zip(
+                    reservation._records,
+                    source_parent._records,
+                    strict=True,
+                )
+            )
+        ):
+            raise _identity_stale()
+        reservation._require_open()
+        _reprove_directory_chain(reservation._api, reservation._records)
+        with reservation._handle.borrow() as raw_reservation:
+            live_reservation = _capture_handle_proof(
+                reservation._api,
+                raw_reservation,
+                expected_final_path=None,
+                expected_kind="regular",
+                stale=True,
+            )
+        owned = reservation._created_identity
+        if live_reservation.identity != owned or owned.link_count != 1:
+            raise _identity_stale()
+        armed = False
+        move_handle = None
+        source_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        target_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        retained: _WindowsRetainedRetirement | None = None
+        try:
+            source_parent._reprove()
+            target_parent._reprove()
+            source_path = reservation._entry_path
+            target_path = _append_component(
+                target_parent._leaf_path,
+                target_name,
+                maximum_units=target_parent._maximum_component_units,
+            )
+            source = source_parent.inspect_entry(source_name)
+            target = target_parent.inspect_entry(target_name)
+            move_path: str
+            if source is not None and source.identity == owned and target is None:
+                move_path = source_path
+            elif source is None and target is not None and target.identity == owned:
+                move_path = target_path
+                armed = True
+            else:
+                raise _recovery_required()
+            move_handle = source_parent._api.open_handle(
+                move_path,
+                desired_access=DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE,
+                creation_disposition=OPEN_EXISTING,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            with move_handle.borrow() as raw_move:
+                move_proof = _capture_handle_proof(
+                    source_parent._api,
+                    raw_move,
+                    expected_final_path=move_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+                if move_proof.identity != owned or owned.link_count != 1:
+                    raise _recovery_required()
+                if not armed:
+                    _hit_fault(self._fault_injector, "retirement_before_arm")
+                    armed = True
+                    with target_parent._records[-1].handle.borrow() as raw_target_parent:
+                        source_parent._api.rename_file_to_parent_exclusive(
+                            raw_move,
+                            raw_target_parent,
+                            target_name,
+                        )
+                    _hit_fault(self._fault_injector, "retirement_after_arm")
+            move_handle.close()
+            move_handle = source_parent._api.open_handle(
+                target_path,
+                desired_access=GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                share_mode=FILE_SHARE_READ,
+                creation_disposition=OPEN_EXISTING,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            )
+            with move_handle.borrow() as raw_retained:
+                retained_proof = _capture_handle_proof(
+                    source_parent._api,
+                    raw_retained,
+                    expected_final_path=target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            with reservation._handle.borrow() as raw_creator:
+                live_creator = _capture_handle_proof(
+                    source_parent._api,
+                    raw_creator,
+                    expected_final_path=None,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                retained_proof.identity != owned
+                or live_creator.identity != owned
+                or retained_proof.identity != live_creator.identity
+                or retained_proof.identity.link_count != 1
+                or live_creator.identity.link_count != 1
+            ):
+                raise _recovery_required()
+            source_records = _duplicate_directory_chain(
+                source_parent._api,
+                source_parent._records,
+            )
+            target_records = _duplicate_directory_chain(
+                target_parent._api,
+                target_parent._records,
+            )
+            retained = _WindowsRetainedRetirement(
+                owned,
+                source_parent._api,
+                source_records,
+                source_name,
+                target_records,
+                target_name,
+                move_handle,
+                target_path,
+            )
+            source_records = None
+            target_records = None
+            move_handle = None
+            retained.reprove()
+            retained._accept_reservation_transfer(reservation)
+            result = retained
+            retained = None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Win32CallError as error:
+            if armed:
+                raise _recovery_required() from None
+            if error.winerror == ERROR_SHARING_VIOLATION:
+                raise _entry_unavailable() from None
+            raise _capability_unavailable() from None
+        except PlatformFileError:
+            if armed:
+                raise _recovery_required() from None
+            raise
+        except Exception:
+            raise (
+                _recovery_required() if armed else _capability_unavailable()
+            ) from None
+        finally:
+            if retained is not None:
+                try:
+                    retained.close()
+                except BaseException:
+                    pass
+            if move_handle is not None:
+                try:
+                    move_handle.close()
+                except BaseException:
+                    pass
+            for records_to_close in (source_records, target_records):
+                if records_to_close is not None:
+                    _close_handles_reverse(
+                        tuple(record.handle for record in records_to_close)
+                    )
 
     def _bind_parent(
         self,

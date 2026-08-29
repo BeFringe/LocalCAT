@@ -569,6 +569,12 @@ class OpaqueAuthority(ABC):
                 retryable=False,
             )
 
+    def _mark_authority_transferred(self) -> None:
+        """Transfer close ownership without invoking the backend close hook."""
+
+        self._require_open()
+        self.__closed = True
+
     def close(self) -> None:
         if self.__closed:
             return
@@ -639,6 +645,107 @@ class MutableFileReservation(OpaqueAuthority, ABC):
 
     @abstractmethod
     def _reprove_identity(self) -> FileObjectIdentity: ...
+
+
+class RetainedRetirement(OpaqueAuthority, ABC):
+    """Live proof that one owned file now occupies the exact retirement name.
+
+    The authority is intentionally non-serializable.  It retains both namespace
+    positions so callers can reconcile an interrupted exclusive move without
+    authorizing from a historical identity value alone.
+    """
+
+    __slots__ = ("__owned_identity", "__transferred_reservation")
+
+    def __init__(self, owned_identity: FileObjectIdentity) -> None:
+        super().__init__()
+        if type(owned_identity) is not FileObjectIdentity:
+            raise TypeError("owned_identity must be exact FileObjectIdentity")
+        if owned_identity.kind != "regular" or owned_identity.link_count != 1:
+            raise ValueError("retirement requires one regular-file link")
+        self.__owned_identity = owned_identity
+        self.__transferred_reservation: MutableFileReservation | None = None
+
+    def _accept_reservation_transfer(
+        self,
+        reservation: MutableFileReservation,
+    ) -> None:
+        self._require_open()
+        if not isinstance(reservation, MutableFileReservation):
+            raise TypeError("reservation must be MutableFileReservation")
+        reservation._require_open()
+        if self.__transferred_reservation is not None:
+            raise TypeError("retirement already owns a reservation")
+        self.__transferred_reservation = reservation
+        try:
+            reservation._mark_authority_transferred()
+        except BaseException:
+            if not reservation.closed:
+                self.__transferred_reservation = None
+            raise
+
+    def reprove(self) -> EntrySnapshot:
+        self._require_open()
+        snapshot = self._reprove_retirement()
+        if type(snapshot) is not EntrySnapshot:
+            raise TypeError("backend retirement reproof must return exact EntrySnapshot")
+        if (
+            snapshot.identity != self.__owned_identity
+            or snapshot.identity.kind != "regular"
+            or snapshot.identity.link_count != 1
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return snapshot
+
+    @abstractmethod
+    def _reprove_retirement(self) -> EntrySnapshot: ...
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            self._close_retirement_authority()
+        except BaseException as error:
+            first_error = error
+        reservation = self.__transferred_reservation
+        self.__transferred_reservation = None
+        if reservation is not None:
+            try:
+                reservation._close_authority()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    @abstractmethod
+    def _close_retirement_authority(self) -> None: ...
+
+
+class RetirementDirectoryAuthority(OpaqueAuthority, ABC):
+    """Dedicated namespace authority that cannot publish or mint other capabilities."""
+
+    def reprove(self) -> None:
+        self._require_open()
+        result = self._reprove()
+        if result is not None:
+            raise TypeError("backend retirement-directory reproof must return None")
+
+    @abstractmethod
+    def _reprove(self) -> None: ...
+
+    def inspect_entry(self, name: str) -> EntrySnapshot | None:
+        self._require_open()
+        checked_name = validate_relative_name(name)
+        snapshot = self._inspect_entry(checked_name)
+        if snapshot is not None and type(snapshot) is not EntrySnapshot:
+            raise TypeError("backend inspect_entry must return EntrySnapshot or None")
+        return snapshot
+
+    @abstractmethod
+    def _inspect_entry(self, name: str) -> EntrySnapshot | None: ...
 
 
 class BoundRegularFile(OpaqueAuthority, ABC):
@@ -1311,6 +1418,80 @@ class MutableFileReservationService(Protocol):
 
 
 @runtime_checkable
+class OwnedNamespaceRetirement(Protocol):
+    """Create rooted retirement directories and exclusively move an owned file."""
+
+    def bind_or_create_child_directory(
+        self,
+        parent: BoundDirectoryAuthority | RetirementDirectoryAuthority,
+        name: str,
+    ) -> RetirementDirectoryAuthority:
+        if not isinstance(
+            parent,
+            (BoundDirectoryAuthority, RetirementDirectoryAuthority),
+        ):
+            raise TypeError("parent must be a bound or retirement directory authority")
+        parent._require_open()
+        checked_name = validate_relative_name(name)
+        authority = self._bind_or_create_child_directory(parent, checked_name)
+        if not isinstance(authority, RetirementDirectoryAuthority):
+            raise TypeError("backend child bind must return RetirementDirectoryAuthority")
+        authority._require_open()
+        return authority
+
+    @abstractmethod
+    def _bind_or_create_child_directory(
+        self,
+        parent: BoundDirectoryAuthority | RetirementDirectoryAuthority,
+        name: str,
+    ) -> RetirementDirectoryAuthority: ...
+
+    def retire_owned_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        reservation: MutableFileReservation,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if not isinstance(source_parent, BoundDirectoryAuthority):
+            raise TypeError("source_parent must be BoundDirectoryAuthority")
+        if not isinstance(target_parent, RetirementDirectoryAuthority):
+            raise TypeError("target_parent must be RetirementDirectoryAuthority")
+        source_parent._require_open()
+        target_parent._require_open()
+        checked_source = validate_relative_name(source_name)
+        checked_target = validate_relative_name(target_name)
+        if not isinstance(reservation, MutableFileReservation):
+            raise TypeError("reservation must be MutableFileReservation")
+        reservation._require_open()
+        authority = self._retire_owned_exclusive(
+            source_parent,
+            checked_source,
+            reservation,
+            target_parent,
+            checked_target,
+        )
+        if not isinstance(authority, RetainedRetirement):
+            raise TypeError("backend retirement must return RetainedRetirement")
+        authority._require_open()
+        if not reservation.closed:
+            authority.close()
+            raise TypeError("backend retirement must consume the reservation")
+        return authority
+
+    @abstractmethod
+    def _retire_owned_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        reservation: MutableFileReservation,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement: ...
+
+
+@runtime_checkable
 class ExistingFileDurability(Protocol):
     def open_existing_for_synchronization(
         self,
@@ -1554,6 +1735,7 @@ class PersistentPrivateProof(Protocol):
 class PlatformFileBackend(
     RootedFileSystem,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     ExistingFileDurability,
     ProcessFileLock,
     PrivateStorageProof,

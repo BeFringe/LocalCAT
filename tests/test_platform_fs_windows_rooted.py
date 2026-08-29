@@ -22,6 +22,7 @@ from platform_fs_contracts import (
     LockWait,
     MutableFileReservation,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -29,6 +30,8 @@ from platform_fs_contracts import (
     ProcessFileLock,
     PublishMode,
     RootedFileSystem,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
 )
 from platform_fs_windows import WindowsPlatformAdapter, WindowsRootedFileSystem
 from windows_file_api import Win32Handle
@@ -52,6 +55,7 @@ class WindowsRootedStaticTests(unittest.TestCase):
         rooted = WindowsRootedFileSystem()
         self.assertIsInstance(rooted, RootedFileSystem)
         self.assertIsInstance(rooted, MutableFileReservationService)
+        self.assertIsInstance(rooted, OwnedNamespaceRetirement)
         self.assertIsInstance(rooted, ExistingFileDurability)
         self.assertNotIsInstance(rooted, ProcessFileLock)
         self.assertNotIsInstance(rooted, PrivateStorageProof)
@@ -476,6 +480,400 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         finally:
             reservation.close()
         self.assertTrue(database_path.exists())
+
+    def test_owned_retirement_moves_to_dedicated_child_and_retains_exact_authority(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source_parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "stage.sqlite3"),
+            )
+        opened: list[dict[str, object]] = []
+        real_open = source_parent._api.open_handle
+
+        def recording_open(path: str, **kwargs: object):
+            opened.append({"path": path, **kwargs})
+            return real_open(path, **kwargs)
+
+        reservation = file_system.reserve_mutable_file(source_parent, "stage.sqlite3")
+        (self.nested / "stage.sqlite3").write_bytes(b"stage")
+        try:
+            with mock.patch.object(
+                source_parent._api,
+                "open_handle",
+                side_effect=recording_open,
+            ):
+                target_parent = file_system.bind_or_create_child_directory(
+                    source_parent,
+                    "quarantine",
+                )
+            try:
+                self.assertIsInstance(target_parent, RetirementDirectoryAuthority)
+                self.assertFalse(hasattr(target_parent, "create_candidate"))
+                self.assertFalse(hasattr(target_parent, "begin_publish"))
+                target_leaf_opens = [
+                    call
+                    for call in opened
+                    if str(call["path"]).endswith("\\quarantine")
+                    and call.get("desired_access")
+                    == (
+                        platform_fs_windows.FILE_TRAVERSE
+                        | platform_fs_windows.FILE_READ_ATTRIBUTES
+                        | platform_fs_windows.SYNCHRONIZE
+                    )
+                ]
+                self.assertEqual(len(target_leaf_opens), 1)
+                self.assertEqual(
+                    target_leaf_opens[0]["share_mode"],
+                    platform_fs_windows.FILE_SHARE_READ
+                    | platform_fs_windows.FILE_SHARE_WRITE
+                    | platform_fs_windows.FILE_SHARE_DELETE,
+                )
+                creator_captures: list[int] = []
+                real_capture = platform_fs_windows._capture_handle_proof
+
+                def recording_capture(*args: object, **kwargs: object):
+                    if (
+                        kwargs.get("expected_final_path") is None
+                        and kwargs.get("expected_kind") == "regular"
+                    ):
+                        creator_captures.append(1)
+                    return real_capture(*args, **kwargs)
+
+                with mock.patch.object(
+                    platform_fs_windows,
+                    "_capture_handle_proof",
+                    side_effect=recording_capture,
+                ):
+                    retained = file_system.retire_owned_exclusive(
+                        source_parent,
+                        "stage.sqlite3",
+                        reservation,
+                        target_parent,
+                        "stage.sqlite3",
+                    )
+                self.assertIsInstance(retained, RetainedRetirement)
+                self.assertTrue(reservation.closed)
+                self.assertEqual(len(creator_captures), 2)
+                try:
+                    snapshot = retained.reprove()
+                    self.assertEqual(snapshot.byte_count, 5)
+                    self.assertFalse((self.nested / "stage.sqlite3").exists())
+                    self.assertEqual(
+                        (self.nested / "quarantine" / "stage.sqlite3").read_bytes(),
+                        b"stage",
+                    )
+                finally:
+                    retained.close()
+            finally:
+                target_parent.close()
+        finally:
+            if not reservation.closed:
+                reservation.close()
+            source_parent.close()
+
+    def test_owned_retirement_reconciles_after_arm_without_losing_creator_handle(self) -> None:
+        fired = False
+
+        def fault(point: str) -> None:
+            nonlocal fired
+            if point == "retirement_after_arm" and not fired:
+                fired = True
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+
+        file_system = WindowsRootedFileSystem(_fault_injector=fault)
+        with file_system.bind_root(self.root_path) as root:
+            source_parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "fault.sqlite3"),
+            )
+        reservation = file_system.reserve_mutable_file(source_parent, "fault.sqlite3")
+        (self.nested / "fault.sqlite3").write_bytes(b"recoverable")
+        target_parent = file_system.bind_or_create_child_directory(
+            source_parent,
+            "fault-quarantine",
+        )
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.retire_owned_exclusive(
+                    source_parent,
+                    "fault.sqlite3",
+                    reservation,
+                    target_parent,
+                    "fault.sqlite3",
+                )
+            _assert_platform_error(self, caught, PlatformFileErrorCode.RECOVERY_REQUIRED)
+            self.assertFalse(reservation.closed)
+            self.assertFalse((self.nested / "fault.sqlite3").exists())
+            self.assertEqual(
+                (self.nested / "fault-quarantine" / "fault.sqlite3").read_bytes(),
+                b"recoverable",
+            )
+            retained = file_system.retire_owned_exclusive(
+                source_parent,
+                "fault.sqlite3",
+                reservation,
+                target_parent,
+                "fault.sqlite3",
+            )
+            try:
+                self.assertTrue(reservation.closed)
+                self.assertEqual(retained.reprove().byte_count, len(b"recoverable"))
+            finally:
+                retained.close()
+        finally:
+            if not reservation.closed:
+                reservation.close()
+            target_parent.close()
+            source_parent.close()
+
+    def test_nested_retirement_child_pins_special_parent_during_create(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source_parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "unused.bin"),
+            )
+        outer = file_system.bind_or_create_child_directory(
+            source_parent,
+            "outer-quarantine",
+        )
+        outer_path = self.nested / "outer-quarantine"
+        moved_path = self.nested / "foreign-swap"
+        blocked: list[bool] = []
+        real_checked_bool = outer._api.checked_bool
+
+        def attempt_parent_rename(
+            operation: str,
+            function: object,
+            *args: object,
+        ) -> None:
+            if operation == "CreateDirectoryW":
+                try:
+                    os.rename(outer_path, moved_path)
+                except PermissionError:
+                    blocked.append(True)
+                else:
+                    blocked.append(False)
+                    os.rename(moved_path, outer_path)
+            real_checked_bool(operation, function, *args)
+
+        try:
+            with mock.patch.object(
+                outer._api,
+                "checked_bool",
+                side_effect=attempt_parent_rename,
+            ):
+                inner = file_system.bind_or_create_child_directory(outer, "attempt")
+            try:
+                self.assertEqual(blocked, [True])
+                self.assertTrue((outer_path / "attempt").is_dir())
+            finally:
+                inner.close()
+        finally:
+            outer.close()
+            source_parent.close()
+
+    def test_retirement_child_post_create_failure_rebinds_same_directory(self) -> None:
+        fired = False
+
+        def fault(point: str) -> None:
+            nonlocal fired
+            if point == "retirement_directory_after_create" and not fired:
+                fired = True
+                raise PlatformFileError(
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                    retryable=True,
+                )
+
+        file_system = WindowsRootedFileSystem(_fault_injector=fault)
+        with file_system.bind_root(self.root_path) as root:
+            parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "unused.bin"),
+            )
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.bind_or_create_child_directory(parent, "retry-quarantine")
+            _assert_platform_error(self, caught, PlatformFileErrorCode.RECOVERY_REQUIRED)
+            self.assertTrue((self.nested / "retry-quarantine").is_dir())
+            rebound = file_system.bind_or_create_child_directory(
+                parent,
+                "retry-quarantine",
+            )
+            try:
+                self.assertIsNone(rebound.reprove())
+                self.assertFalse(hasattr(rebound, "begin_publish"))
+            finally:
+                rebound.close()
+        finally:
+            parent.close()
+
+    def test_owned_retirement_native_collision_never_replaces_foreign_target(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source_parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "collision.sqlite3"),
+            )
+        reservation = file_system.reserve_mutable_file(
+            source_parent,
+            "collision.sqlite3",
+        )
+        source_path = self.nested / "collision.sqlite3"
+        source_path.write_bytes(b"owner")
+        target_parent = file_system.bind_or_create_child_directory(
+            source_parent,
+            "collision-quarantine",
+        )
+        target_path = self.nested / "collision-quarantine" / "collision.sqlite3"
+        real_rename = source_parent._api.rename_file_to_parent_exclusive
+
+        def collide_then_rename(*args: object, **kwargs: object) -> None:
+            target_path.write_bytes(b"foreign")
+            real_rename(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                source_parent._api,
+                "rename_file_to_parent_exclusive",
+                side_effect=collide_then_rename,
+            ), self.assertRaises(PlatformFileError) as caught:
+                file_system.retire_owned_exclusive(
+                    source_parent,
+                    "collision.sqlite3",
+                    reservation,
+                    target_parent,
+                    "collision.sqlite3",
+                )
+            _assert_platform_error(self, caught, PlatformFileErrorCode.RECOVERY_REQUIRED)
+            self.assertFalse(reservation.closed)
+            self.assertEqual(reservation.identity().kind, "regular")
+            self.assertEqual(source_path.read_bytes(), b"owner")
+            self.assertEqual(target_path.read_bytes(), b"foreign")
+        finally:
+            reservation.close()
+            target_parent.close()
+            source_parent.close()
+
+    def test_owned_retirement_waits_for_sqlite_writer_without_consuming_reservation(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source_parent = file_system.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "live.sqlite3"),
+            )
+        reservation = file_system.reserve_mutable_file(source_parent, "live.sqlite3")
+        target_parent = file_system.bind_or_create_child_directory(
+            source_parent,
+            "live-quarantine",
+        )
+        database = self.nested / "live.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE live(value TEXT NOT NULL)")
+            connection.execute("INSERT INTO live VALUES ('held')")
+            connection.commit()
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.retire_owned_exclusive(
+                    source_parent,
+                    "live.sqlite3",
+                    reservation,
+                    target_parent,
+                    "live.sqlite3",
+                )
+            _assert_platform_error(self, caught, PlatformFileErrorCode.ENTRY_UNAVAILABLE)
+            self.assertFalse(reservation.closed)
+            self.assertEqual(reservation.identity().kind, "regular")
+            self.assertTrue(database.exists())
+        finally:
+            connection.close()
+        try:
+            retained = file_system.retire_owned_exclusive(
+                source_parent,
+                "live.sqlite3",
+                reservation,
+                target_parent,
+                "live.sqlite3",
+            )
+            retained.close()
+            self.assertTrue(reservation.closed)
+        finally:
+            if not reservation.closed:
+                reservation.close()
+            target_parent.close()
+            source_parent.close()
+
+    def test_owned_retirement_programmer_faults_propagate_before_mutation(self) -> None:
+        for index, programming_error in enumerate(
+            (
+                TypeError("type"),
+                AssertionError("assert"),
+                AttributeError("attribute"),
+            )
+        ):
+            with self.subTest(programming_error=type(programming_error).__name__):
+                file_system = WindowsRootedFileSystem()
+                with file_system.bind_root(self.root_path) as root:
+                    parent = file_system.bind_parent(
+                        root,
+                        PureWindowsPath("NestedCase", f"program-{index}.sqlite3"),
+                    )
+                try:
+                    with mock.patch.object(
+                        platform_fs_windows,
+                        "_duplicate_directory_chain",
+                        side_effect=programming_error,
+                    ), self.assertRaises(type(programming_error)):
+                        file_system.bind_or_create_child_directory(
+                            parent,
+                            f"program-quarantine-{index}",
+                        )
+                    self.assertFalse(
+                        (self.nested / f"program-quarantine-{index}").exists()
+                    )
+                finally:
+                    parent.close()
+
+                def fault(point: str) -> None:
+                    if point == "retirement_before_arm":
+                        raise programming_error
+
+                file_system = WindowsRootedFileSystem(_fault_injector=fault)
+                with file_system.bind_root(self.root_path) as root:
+                    parent = file_system.bind_parent(
+                        root,
+                        PureWindowsPath("NestedCase", f"retire-{index}.sqlite3"),
+                    )
+                reservation = file_system.reserve_mutable_file(
+                    parent,
+                    f"retire-{index}.sqlite3",
+                )
+                source_path = self.nested / f"retire-{index}.sqlite3"
+                source_path.write_bytes(b"owner")
+                target = file_system.bind_or_create_child_directory(
+                    parent,
+                    f"retire-quarantine-{index}",
+                )
+                try:
+                    with self.assertRaises(type(programming_error)):
+                        file_system.retire_owned_exclusive(
+                            parent,
+                            f"retire-{index}.sqlite3",
+                            reservation,
+                            target,
+                            f"retire-{index}.sqlite3",
+                        )
+                    self.assertFalse(reservation.closed)
+                    self.assertEqual(source_path.read_bytes(), b"owner")
+                    self.assertIsNone(target.inspect_entry(f"retire-{index}.sqlite3"))
+                finally:
+                    reservation.close()
+                    target.close()
+                    parent.close()
 
     def test_mutable_reservation_close_does_not_close_caller_parent(self) -> None:
         file_system = WindowsRootedFileSystem()

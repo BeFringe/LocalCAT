@@ -36,6 +36,7 @@ from platform_fs_contracts import (
     LockWait,
     MutableFileReservation,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     OpaqueAuthority,
     PendingPublication,
     PersistentPrivateProof,
@@ -52,6 +53,8 @@ from platform_fs_contracts import (
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
     VerifiedPrivateProof,
     WINDOWS_PRIVATE_PROOF_DOMAIN_TAG,
     WINDOWS_PRIVATE_PROOF_SCHEMA,
@@ -216,6 +219,64 @@ class _MutableReservation(MutableFileReservation):
 
     def _close_authority(self) -> None:
         self.close_calls += 1
+
+
+class _TransferFaultReservation(_MutableReservation):
+    def _mark_authority_transferred(self) -> None:
+        super()._mark_authority_transferred()
+        raise KeyboardInterrupt("after transfer state")
+
+
+class _RetirementDirectory(RetirementDirectoryAuthority):
+    def _reprove(self) -> None:
+        pass
+
+    def _inspect_entry(self, name: str) -> EntrySnapshot | None:
+        del name
+        return None
+
+    def _close_authority(self) -> None:
+        pass
+
+
+class _RetainedRetirement(RetainedRetirement):
+    def __init__(self, identity: FileObjectIdentity) -> None:
+        super().__init__(identity)
+        self.observed = EntrySnapshot(identity, 7, b"token", True)
+        self.close_calls = 0
+        self.fail_close = False
+
+    def _reprove_retirement(self) -> EntrySnapshot:
+        return self.observed
+
+    def _close_retirement_authority(self) -> None:
+        self.close_calls += 1
+        if self.fail_close:
+            raise RuntimeError("retirement close fault")
+
+
+class _RetirementService(OwnedNamespaceRetirement):
+    def _bind_or_create_child_directory(
+        self,
+        parent: BoundDirectoryAuthority | RetirementDirectoryAuthority,
+        name: str,
+    ) -> RetirementDirectoryAuthority:
+        del parent, name
+        return _RetirementDirectory()
+
+    def _retire_owned_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        reservation: MutableFileReservation,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        del source_parent, source_name, target_parent, target_name
+        identity = reservation.identity()
+        result = _RetainedRetirement(identity)
+        result._accept_reservation_transfer(reservation)
+        return result
 
 
 class _PrivateEvidence(PrivateAccessEvidence):
@@ -594,6 +655,8 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             BoundSynchronizedRegularFile,
             CandidateFile,
             MutableFileReservation,
+            RetirementDirectoryAuthority,
+            RetainedRetirement,
             LockLease,
             PendingPublication,
             PrivateAccessEvidence,
@@ -617,6 +680,19 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
                 "self",
                 "parent",
                 "name",
+            ),
+            OwnedNamespaceRetirement.bind_or_create_child_directory: (
+                "self",
+                "parent",
+                "name",
+            ),
+            OwnedNamespaceRetirement.retire_owned_exclusive: (
+                "self",
+                "source_parent",
+                "source_name",
+                "reservation",
+                "target_parent",
+                "target_name",
             ),
             ProcessFileLock.acquire: ("self", "parent", "name", "payload", "policy"),
             LockLease.reprove_binding: ("self", "parent", "name", "payload"),
@@ -1031,6 +1107,73 @@ class PlatformFileErrorContractTests(unittest.TestCase):
 
 
 class PlatformFileAuthorityContractTests(unittest.TestCase):
+    def test_owned_retirement_consumes_reservation_and_retains_exact_identity(self) -> None:
+        service = _RetirementService()
+        source_parent = _Directory()
+        target_parent = service.bind_or_create_child_directory(
+            source_parent,
+            "quarantine",
+        )
+        reservation = _MutableReservation()
+        retained = service.retire_owned_exclusive(
+            source_parent,
+            "stage.sqlite3",
+            reservation,
+            target_parent,
+            "stage.sqlite3",
+        )
+        self.assertTrue(reservation.closed)
+        self.assertEqual(reservation.close_calls, 0)
+        reservation.close()
+        self.assertEqual(reservation.close_calls, 0)
+        self.assertEqual(retained.reprove().identity, _identity())
+        retained.observed = EntrySnapshot(
+            FileObjectIdentity("windows", b"volume", b"x" * 16, "regular", 1),
+            7,
+            b"token",
+            True,
+        )
+        with self.assertRaises(PlatformFileError) as caught:
+            retained.reprove()
+        self.assertEqual(caught.exception.code, PlatformFileErrorCode.IDENTITY_STALE.value)
+        retained.close()
+        retained.close()
+        self.assertEqual(retained.close_calls, 1)
+        self.assertEqual(reservation.close_calls, 1)
+        target_parent.close()
+        source_parent.close()
+
+    def test_retirement_close_fault_still_releases_transferred_reservation_once(self) -> None:
+        identity = _identity()
+        reservation = _MutableReservation(identity)
+        retained = _RetainedRetirement(identity)
+        retained._accept_reservation_transfer(reservation)
+        retained.fail_close = True
+        with self.assertRaisesRegex(RuntimeError, "retirement close fault"):
+            retained.close()
+        self.assertTrue(retained.closed)
+        self.assertTrue(reservation.closed)
+        self.assertEqual(retained.close_calls, 1)
+        self.assertEqual(reservation.close_calls, 1)
+
+    def test_transfer_state_fault_keeps_closed_reservation_owned_until_retained_close(self) -> None:
+        identity = _identity()
+        reservation = _TransferFaultReservation(identity)
+        retained = _RetainedRetirement(identity)
+        with self.assertRaisesRegex(KeyboardInterrupt, "after transfer state"):
+            retained._accept_reservation_transfer(reservation)
+        self.assertTrue(reservation.closed)
+        reservation.close()
+        self.assertEqual(reservation.close_calls, 0)
+        retained.close()
+        retained.close()
+        self.assertEqual(retained.close_calls, 1)
+        self.assertEqual(reservation.close_calls, 1)
+        retained.close()
+        reservation.close()
+        self.assertEqual(retained.close_calls, 1)
+        self.assertEqual(reservation.close_calls, 1)
+
     def test_mutable_reservation_reproves_exact_created_single_link_identity(self) -> None:
         created = _identity()
         reservation = _MutableReservation(created)

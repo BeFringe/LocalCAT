@@ -17,6 +17,7 @@ from platform_fs_contracts import (
     BoundDirectoryAuthority,
     ExistingFileDurability,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
@@ -144,6 +145,25 @@ class _FaultingBackend:
         raise AssertionError
 
     _reserve_mutable_file = reserve_mutable_file
+
+    def bind_or_create_child_directory(self, parent: object, name: str) -> object:
+        del parent, name
+        raise AssertionError
+
+    _bind_or_create_child_directory = bind_or_create_child_directory
+
+    def retire_owned_exclusive(
+        self,
+        source_parent: object,
+        source_name: str,
+        reservation: object,
+        target_parent: object,
+        target_name: str,
+    ) -> object:
+        del source_parent, source_name, reservation, target_parent, target_name
+        raise AssertionError
+
+    _retire_owned_exclusive = retire_owned_exclusive
 
     def acquire(self, parent: object, name: str, payload: bytes, policy: object) -> object:
         del parent, name, payload, policy
@@ -319,11 +339,12 @@ class CompositionStaticBoundaryTests(unittest.TestCase):
 
 
 class CompositionFactoryMatrixTests(unittest.TestCase):
-    def test_aggregate_backend_protocol_requires_all_five_service_shapes(self) -> None:
+    def test_aggregate_backend_protocol_requires_all_six_service_shapes(self) -> None:
         backend = _FaultingBackend()
         self.assertIsInstance(backend, RootedFileSystem)
         self.assertIsInstance(backend, ExistingFileDurability)
         self.assertIsInstance(backend, MutableFileReservationService)
+        self.assertIsInstance(backend, OwnedNamespaceRetirement)
         self.assertIsInstance(backend, ProcessFileLock)
         self.assertIsInstance(backend, PrivateStorageProof)
         self.assertIsInstance(backend, PlatformFileBackend)
@@ -332,6 +353,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
             "bind_root",
             "open_existing_for_synchronization",
             "reserve_mutable_file",
+            "retire_owned_exclusive",
             "acquire",
             "prove_private",
         ):

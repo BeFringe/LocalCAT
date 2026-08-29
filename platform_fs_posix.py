@@ -7,13 +7,15 @@ primitives.  Composition imports it only after selecting a POSIX host.
 from __future__ import annotations
 
 import errno
+import ctypes
 import fcntl
 import hashlib
 import os
 from pathlib import Path, PurePath
 import stat
+import sys
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator, cast
 
 from platform_fs_contracts import (
     BoundContentFacts,
@@ -32,6 +34,7 @@ from platform_fs_contracts import (
     LockWait,
     MutableFileReservation,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     PendingPublication,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -42,6 +45,8 @@ from platform_fs_contracts import (
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
     validate_relative_name,
 )
 
@@ -198,6 +203,43 @@ def _same_identity(left: FileObjectIdentity, right: FileObjectIdentity) -> bool:
 def _hit_fault(injector: _FaultInjector | None, point: str) -> None:
     if injector is not None:
         injector(point)
+
+
+def _rename_owned_exclusive_at(
+    source_dirfd: int,
+    source_name: str,
+    target_dirfd: int,
+    target_name: str,
+) -> None:
+    if sys.platform == "darwin":
+        symbol = "renameatx_np"
+        flag = 0x00000004
+    elif sys.platform.startswith("linux"):
+        symbol = "renameat2"
+        flag = 0x00000001
+    else:
+        raise OSError(errno.ENOTSUP, "exclusive rooted rename is unavailable")
+    try:
+        function = cast(Any, getattr(ctypes.CDLL(None, use_errno=True), symbol))
+    except (AttributeError, OSError) as error:
+        raise OSError(errno.ENOTSUP, "exclusive rooted rename is unavailable") from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(
+        source_dirfd,
+        os.fsencode(source_name),
+        target_dirfd,
+        os.fsencode(target_name),
+        flag,
+    ) != 0:
+        raise OSError(ctypes.get_errno() or errno.EIO, "exclusive rooted rename failed")
 
 
 def _normalize_lock_platform_error(error: PlatformFileError) -> PlatformFileError:
@@ -823,6 +865,13 @@ class _PosixBoundDirectory(_DirectoryAuthorityMixin, BoundDirectoryAuthority):
     __slots__ = _DIRECTORY_AUTHORITY_SLOTS
 
 
+class _PosixRetirementDirectory(
+    _DirectoryAuthorityMixin,
+    RetirementDirectoryAuthority,
+):
+    __slots__ = _DIRECTORY_AUTHORITY_SLOTS
+
+
 def _duplicate_directory_chain(descriptors: tuple[int, ...]) -> tuple[int, ...]:
     duplicates: list[int] = []
     try:
@@ -1067,6 +1116,7 @@ class _PosixMutableFileReservation(MutableFileReservation):
         "_directory_identities",
         "_descriptor",
         "_entry_name",
+        "_created_identity",
     )
 
     def __init__(
@@ -1083,6 +1133,7 @@ class _PosixMutableFileReservation(MutableFileReservation):
         self._directory_identities = _capture_directory_identities(directory_fds)
         self._descriptor = descriptor
         self._entry_name = entry_name
+        self._created_identity = created_identity
         try:
             self._reprove_identity()
         except BaseException:
@@ -1142,6 +1193,157 @@ class _PosixMutableFileReservation(MutableFileReservation):
         _close_fd(self._descriptor)
         for descriptor in reversed(self._directory_fds):
             _close_fd(descriptor)
+
+
+class _PosixRetainedRetirement(RetainedRetirement):
+    __slots__ = (
+        "_source_fds",
+        "_source_names",
+        "_source_identities",
+        "_source_name",
+        "_target_fds",
+        "_target_names",
+        "_target_identities",
+        "_target_name",
+        "_descriptor",
+    )
+
+    def __init__(
+        self,
+        owned_identity: FileObjectIdentity,
+        source_fds: tuple[int, ...],
+        source_names: tuple[str | None, ...],
+        source_name: str,
+        target_fds: tuple[int, ...],
+        target_names: tuple[str | None, ...],
+        target_name: str,
+        descriptor: int,
+    ) -> None:
+        super().__init__(owned_identity)
+        self._source_fds = source_fds
+        self._source_names = source_names
+        self._source_identities = _capture_directory_identities(source_fds)
+        self._source_name = source_name
+        self._target_fds = target_fds
+        self._target_names = target_names
+        self._target_identities = _capture_directory_identities(target_fds)
+        self._target_name = target_name
+        self._descriptor = descriptor
+        try:
+            self._reprove_retirement()
+        except BaseException:
+            self._close_authority()
+            raise
+
+    def _reprove_retirement(self) -> EntrySnapshot:
+        try:
+            _reprove_directory_chain(
+                self._source_fds,
+                self._source_names,
+                self._source_identities,
+            )
+            _reprove_directory_chain(
+                self._target_fds,
+                self._target_names,
+                self._target_identities,
+            )
+            try:
+                os.stat(
+                    self._source_name,
+                    dir_fd=self._source_fds[-1],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            retained = os.fstat(self._descriptor)
+            named = os.stat(
+                self._target_name,
+                dir_fd=self._target_fds[-1],
+                follow_symlinks=False,
+            )
+            retained_identity = _identity_from_stat(retained)
+            named_identity = _identity_from_stat(named)
+            if (
+                stat.S_ISLNK(named.st_mode)
+                or retained_identity.link_count != 1
+                or named_identity.link_count != 1
+                or not _same_identity(retained_identity, named_identity)
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            snapshot = _snapshot_from_stat(retained)
+            try:
+                os.stat(
+                    self._source_name,
+                    dir_fd=self._source_fds[-1],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            _reprove_directory_chain(
+                self._source_fds,
+                self._source_names,
+                self._source_identities,
+            )
+            _reprove_directory_chain(
+                self._target_fds,
+                self._target_names,
+                self._target_identities,
+            )
+            terminal_retained = os.fstat(self._descriptor)
+            terminal_named = os.stat(
+                self._target_name,
+                dir_fd=self._target_fds[-1],
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(terminal_named.st_mode)
+                or not _same_identity(
+                    _identity_from_stat(terminal_retained),
+                    retained_identity,
+                )
+                or not _same_identity(
+                    _identity_from_stat(terminal_named),
+                    retained_identity,
+                )
+                or _identity_from_stat(terminal_retained).link_count != 1
+                or _identity_from_stat(terminal_named).link_count != 1
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            return _snapshot_from_stat(terminal_retained)
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise _platform_error(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            ) from None
+        except OSError:
+            raise _platform_error(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            ) from None
+
+    def _close_retirement_authority(self) -> None:
+        _close_fd(self._descriptor)
+        for descriptors in (self._source_fds, self._target_fds):
+            for descriptor in reversed(descriptors):
+                _close_fd(descriptor)
 
 
 class _PosixBoundSynchronizedRegularFile(
@@ -1635,6 +1837,7 @@ class _PosixPrivateEvidence(PrivateAccessEvidence):
 class PosixPlatformAdapter(
     RootedFileSystem,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     ExistingFileDurability,
     ProcessFileLock,
     PrivateStorageProof,
@@ -1892,6 +2095,227 @@ class PosixPlatformAdapter(
             if retained_directories is not None:
                 for item in reversed(retained_directories):
                     _close_fd(item)
+
+    def _bind_or_create_child_directory(
+        self,
+        parent: BoundDirectoryAuthority | RetirementDirectoryAuthority,
+        name: str,
+    ) -> RetirementDirectoryAuthority:
+        if not isinstance(parent, _DirectoryAuthorityMixin):
+            raise _platform_error(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        retained: tuple[int, ...] | None = None
+        child: int | None = None
+        created = False
+        try:
+            parent._reprove()
+            retained = _duplicate_directory_chain(parent._directory_fds)
+            try:
+                os.mkdir(name, 0o700, dir_fd=retained[-1])
+                created = True
+                _hit_fault(self._fault_injector, "retirement_directory_after_create")
+            except FileExistsError:
+                pass
+            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=retained[-1])
+            child_identity = _identity_from_stat(os.fstat(child))
+            named = os.stat(name, dir_fd=retained[-1], follow_symlinks=False)
+            if (
+                stat.S_ISLNK(named.st_mode)
+                or child_identity.kind != "directory"
+                or not _same_identity(child_identity, _identity_from_stat(named))
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED if created else PlatformFileErrorCode.REPARSE_REJECTED,
+                    retryable=created,
+                )
+            if created:
+                os.fsync(retained[-1])
+                parent._reprove()
+            result_fds = retained + (child,)
+            result_names = parent._directory_names + (name,)
+            retained = None
+            child = None
+            return _PosixRetirementDirectory(
+                result_fds,
+                result_names,
+                self._fault_injector,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            if created:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                ) from None
+            raise
+        except OSError as error:
+            raise _map_os_error(
+                error,
+                fallback=(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED
+                    if created
+                    else PlatformFileErrorCode.CAPABILITY_UNAVAILABLE
+                ),
+                retryable=created,
+            ) from None
+        finally:
+            if child is not None:
+                _close_fd(child)
+            if retained is not None:
+                for descriptor in reversed(retained):
+                    _close_fd(descriptor)
+
+    def _retire_owned_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        reservation: MutableFileReservation,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if (
+            not isinstance(source_parent, _DirectoryAuthorityMixin)
+            or type(target_parent) is not _PosixRetirementDirectory
+            or type(reservation) is not _PosixMutableFileReservation
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        if (
+            reservation._entry_name != source_name
+            or reservation._directory_names != source_parent._directory_names
+            or len(reservation._directory_identities)
+            != len(source_parent._directory_identities)
+            or not all(
+                _same_identity(left, right)
+                for left, right in zip(
+                    reservation._directory_identities,
+                    source_parent._directory_identities,
+                    strict=True,
+                )
+            )
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        reservation._require_open()
+        _reprove_directory_chain(
+            reservation._directory_fds,
+            reservation._directory_names,
+            reservation._directory_identities,
+        )
+        owned = reservation._created_identity
+        live_identity = _identity_from_stat(os.fstat(reservation._descriptor))
+        if (
+            live_identity.kind != "regular"
+            or live_identity.link_count != 1
+            or not _same_identity(live_identity, owned)
+        ):
+            raise _platform_error(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        armed = False
+        source_fds: tuple[int, ...] | None = None
+        target_fds: tuple[int, ...] | None = None
+        descriptor: int | None = None
+        retained: _PosixRetainedRetirement | None = None
+        try:
+            source_parent._reprove()
+            target_parent._reprove()
+            source_entry = source_parent.inspect_entry(source_name)
+            target_entry = target_parent.inspect_entry(target_name)
+            if source_entry is not None and source_entry.identity == owned and target_entry is None:
+                _hit_fault(self._fault_injector, "retirement_before_arm")
+                armed = True
+                _rename_owned_exclusive_at(
+                    source_parent._directory_fd,
+                    source_name,
+                    target_parent._directory_fd,
+                    target_name,
+                )
+                _hit_fault(self._fault_injector, "retirement_after_arm")
+                os.fsync(source_parent._directory_fd)
+                if target_parent._directory_fd != source_parent._directory_fd:
+                    os.fsync(target_parent._directory_fd)
+            elif not (
+                source_entry is None
+                and target_entry is not None
+                and target_entry.identity == owned
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            else:
+                armed = True
+            source_fds = _duplicate_directory_chain(source_parent._directory_fds)
+            target_fds = _duplicate_directory_chain(target_parent._directory_fds)
+            descriptor = os.open(target_name, _READ_FLAGS, dir_fd=target_fds[-1])
+            if not _same_identity(_identity_from_stat(os.fstat(descriptor)), owned):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            retained = _PosixRetainedRetirement(
+                owned,
+                source_fds,
+                source_parent._directory_names,
+                source_name,
+                target_fds,
+                target_parent._directory_names,
+                target_name,
+                descriptor,
+            )
+            source_fds = None
+            target_fds = None
+            descriptor = None
+            retained.reprove()
+            terminal_creator = _identity_from_stat(os.fstat(reservation._descriptor))
+            terminal_target = _identity_from_stat(os.fstat(retained._descriptor))
+            if (
+                terminal_creator.link_count != 1
+                or terminal_target.link_count != 1
+                or not _same_identity(terminal_creator, owned)
+                or not _same_identity(terminal_target, owned)
+                or not _same_identity(terminal_creator, terminal_target)
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            retained._accept_reservation_transfer(reservation)
+            result = retained
+            retained = None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            if armed:
+                raise _platform_error(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                ) from None
+            raise
+        except Exception:
+            raise _platform_error(
+                PlatformFileErrorCode.RECOVERY_REQUIRED if armed else PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=armed,
+            ) from None
+        finally:
+            if retained is not None:
+                retained.close()
+            if descriptor is not None:
+                _close_fd(descriptor)
+            for descriptors in (source_fds, target_fds):
+                if descriptors is not None:
+                    for item in reversed(descriptors):
+                        _close_fd(item)
 
     def _acquire(
         self,
