@@ -873,6 +873,33 @@ class LockLease(OpaqueAuthority, ABC):
     @abstractmethod
     def _reprove_lock(self) -> None: ...
 
+    def reprove_binding(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        """Reprove this lease against one exact live parent/name/payload binding."""
+
+        self._require_open()
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be BoundDirectoryAuthority")
+        parent._require_open()
+        checked_name = validate_relative_name(name)
+        if type(payload) is not bytes:
+            raise TypeError("lock payload must be exact bytes")
+        result = self._reprove_binding(parent, checked_name, payload)
+        if result is not None:
+            raise TypeError("backend lock binding reproof must return None")
+
+    @abstractmethod
+    def _reprove_binding(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+    ) -> None: ...
+
 
 class PendingPublication(OpaqueAuthority, ABC):
     __slots__ = ("__preliminary_facts", "__retained_destination")

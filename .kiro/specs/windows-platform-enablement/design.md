@@ -243,6 +243,9 @@ class PendingPublication(Protocol):
     def terminal_reproof(self) -> PublishFacts: ...
     def close(self) -> None: ...
 
+class LockLease(Protocol):
+    def reprove_binding(self, parent: BoundDirectoryAuthority, name: str, payload: bytes) -> None: ...
+
 class ProcessFileLock(Protocol):
     def acquire(self, parent: BoundDirectoryAuthority, name: str, payload: bytes, policy: LockPolicy) -> LockLease: ...
 
@@ -346,6 +349,7 @@ stateDiagram-v2
 
 ### Lock Flow
 - persistent lock file 使用 W1 自有的 protocol-control integrity ACL profile、显式medium mandatory-integrity label/`NO_WRITE_UP`、deterministic basename、single-link与identity payload；文件从不unlink/replace。DACL与mandatory-label SACL projection分别handle-bound重验；audit ACE不参与discretionary或MIC授权，额外/漂移mandatory label fail closed。该profile只保护锁协议完整性，不铸造W2 attestation private proof，因此W1不反向依赖W2。
+- `LockLease.reprove_binding`只对调用方给出的live rooted parent、exact basename与exact payload复证当前lease绑定；它不转移lease或parent ownership，也不代替owner的业务reservation生命周期。
 - payload固定为可重算的`ProtocolControlLockPayloadV1`（magic/schema/resource-family digest/range-map digest），不保存随机token或跨重启FileId。首次creator以`CREATE_NEW`+`INIT` share-none handle一次写入、flush、handle-readback后关闭。并发loser得到规范化`ERROR_FILE_EXISTS`后先以普通`LOCK` profile执行`OPEN_EXISTING`：若sharing violation，才把INIT creator/recoverer视为初始化进行中并bounded retry；若open成功，则在该handle上复证root/entry/exact DACL/MIC/single-link并读取payload，完整expected bytes直接进入普通flush/readback与`LockFileEx`路径。空或expected strict-prefix必须先关闭普通handle，再争抢`OPEN_EXISTING`+`INIT` share-none handle；取得后重新复证全部安全事实与bytes，只有仍为空/strict-prefix才确定性rewrite/flush/readback，若已完整则只补flush/readback，unknown/超长/非前缀则`LOCK_UNAVAILABLE`。两名recoverer由INIT share-none open互斥；完成后关闭INIT并重新用普通LOCK profile打开。任何未识别create/open状态fail closed，载体从不unlink/replace。
 - bootstrap serialization 与 long-lived resource lock 使用不同 byte ranges 或不同 lock objects，防止一个 active resource 阻塞同目录其他资源初始化。
 - `LockFileEx` 默认阻塞/timeout policy 由 caller contract 给出；release 先 `UnlockFileEx` 后 close，进程终止依赖 OS eventual unlock。
