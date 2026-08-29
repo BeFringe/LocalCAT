@@ -741,7 +741,10 @@ class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
                 "tests/test_parser_project_facade_characterization.py",
                 "editor_project.create_parser_application_surface",
             ),
-            ("tests/test_parser_wave4_safety.py", "parser_source.os.replace"),
+            (
+                "tests/test_parser_wave4_safety.py",
+                "parser_source.tempfile.TemporaryFile",
+            ),
             ("tests/test_workspace_state.py", "workspace_state.os.replace"),
             ("tests/test_qt_bootstrap.py", "qt_editor.sys.platform"),
             (

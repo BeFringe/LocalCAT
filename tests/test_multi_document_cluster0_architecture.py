@@ -268,6 +268,8 @@ _WORKSPACE_INTAKE_LOCAL_IMPORT_ALLOWLIST = frozenset(
     {
         "parser_composition",
         "parser_contracts",
+        "platform_fs",
+        "platform_fs_contracts",
         "project_workspace_contracts",
         "project_workspace_identity",
     }
@@ -284,6 +286,8 @@ _WORKSPACE_PACKAGE_MODULE = "project_package"
 _WORKSPACE_PACKAGE_LOCAL_IMPORT_ALLOWLIST = frozenset(
     {
         "parser_contracts",
+        "platform_fs",
+        "platform_fs_contracts",
         "project_save",
         "project_workspace",
         "project_workspace_contracts",
