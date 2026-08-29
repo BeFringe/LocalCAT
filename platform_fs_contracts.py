@@ -778,7 +778,18 @@ class CandidateFile(OpaqueAuthority, ABC):
 
 
 class LockLease(OpaqueAuthority, ABC):
-    pass
+    """One retained process-lock lease with an explicit proof boundary."""
+
+    def reprove(self) -> None:
+        """Reprove the handle-bound lock while retaining its ownership."""
+
+        self._require_open()
+        result = self._reprove_lock()
+        if result is not None:
+            raise TypeError("backend lock reproof must return None")
+
+    @abstractmethod
+    def _reprove_lock(self) -> None: ...
 
 
 class PendingPublication(OpaqueAuthority, ABC):
