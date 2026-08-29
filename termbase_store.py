@@ -6,11 +6,9 @@ import csv
 from dataclasses import dataclass
 import hashlib
 import io
-import os
-import tempfile
 import uuid
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from editor_contracts import (
     LegacyTermRow,
@@ -25,11 +23,35 @@ from editor_contracts import (
     TermRecordLocator,
     TermRowKind,
 )
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    CandidateFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    LockLease,
+    LockPolicy,
+    LockWait,
+    PendingPublication,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+)
+from resource_platform_io import (
+    bind_rooted_regular,
+    digest_bound,
+    iter_bound_chunks,
+    platform_relative_path,
+    read_bound_all,
+)
 
 
 _V1_MARKER = TermRowKind.V1.value
 _BOOLEAN_VALUES = {"false": False, "true": True}
 _MutationCounts = tuple[int, int, int, int, int]
+_MAX_TERMBASE_BYTES = 512 * 1024 * 1024
+_TERMBASE_LOCK_PREFIX = b"localcat.termbase.lock.v1\0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,11 +137,23 @@ class _CapturingLineIterator:
 class TermbaseStore:
     """Read and prepare atomic mutations for one mixed CSV termbase."""
 
-    def __init__(self) -> None:
+    def __init__(self, backend: PlatformFileBackend | None = None) -> None:
+        if backend is not None and not isinstance(backend, PlatformFileBackend):
+            raise TypeError("termbase backend must satisfy PlatformFileBackend")
+        self._backend = backend
         self._prepared_counts: dict[PreparedTermMutation, _MutationCounts] = {}
         self._commit_outcomes: dict[
             PreparedTermMutation,
             TermCommitOutcome,
+        ] = {}
+        self._prepared_artifacts: dict[
+            PreparedTermMutation,
+            tuple[FileObjectIdentity | None, FileObjectIdentity | None],
+        ] = {}
+        self._prepared_sources: dict[PreparedTermMutation, EntrySnapshot] = {}
+        self._portable_artifacts: dict[
+            tuple[Path, str],
+            FileObjectIdentity,
         ] = {}
 
     def commit(self, prepared: PreparedTermMutation) -> TermCommitOutcome:
@@ -145,15 +179,27 @@ class TermbaseStore:
                     safe_detail="Prepare the termbase change again before retrying.",
                 ),
             )
-
         try:
-            recovery_bytes = recovery_path.read_bytes()
-        except OSError:
+            recovery_bytes, recovery_snapshot = self._read_bound_snapshot(recovery_path)
+        except (PlatformFileError, OSError):
             return self._remember_outcome(
                 prepared,
                 _not_committed_outcome(
                     prepared,
                     "RECOVERY_READ_FAILED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
+        issued_identities = self._prepared_artifacts.get(prepared)
+        if (
+            issued_identities is None
+            or issued_identities[1] != recovery_snapshot.identity
+        ):
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "RECOVERY_CHANGED",
                     "Prepare the termbase change again before retrying.",
                 ),
             )
@@ -168,9 +214,11 @@ class TermbaseStore:
             )
 
         try:
-            staged_bytes = prepared.staged_path.read_bytes()
+            staged_bytes, staged_snapshot = self._read_bound_snapshot(
+                prepared.staged_path
+            )
             staged_records = self._records_from_bytes(staged_bytes)
-        except (OSError, TermbaseValidationError):
+        except (PlatformFileError, OSError, TermbaseValidationError):
             return self._remember_outcome(
                 prepared,
                 _not_committed_outcome(
@@ -188,11 +236,30 @@ class TermbaseStore:
                     "Prepare the termbase change again before retrying.",
                 ),
             )
+        if issued_identities[0] != staged_snapshot.identity:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "STAGED_CHANGED",
+                    "Prepare the termbase change again before retrying.",
+                ),
+            )
         staged_digest = hashlib.sha256(staged_bytes).hexdigest()
 
+        expected_source = self._prepared_sources.get(prepared)
+        if expected_source is None:
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "SOURCE_CHANGED",
+                    "Reload the termbase and retry.",
+                ),
+            )
         try:
-            source_digest = _digest_path(resource_path)
-        except OSError:
+            source_bytes, source_snapshot = self._read_bound_snapshot(resource_path)
+        except (PlatformFileError, OSError):
             return self._remember_outcome(
                 prepared,
                 _not_committed_outcome(
@@ -201,7 +268,10 @@ class TermbaseStore:
                     "Reload the termbase and retry.",
                 ),
             )
-        if source_digest != prepared.base_digest:
+        if (
+            source_snapshot != expected_source
+            or hashlib.sha256(source_bytes).hexdigest() != prepared.base_digest
+        ):
             return self._remember_outcome(
                 prepared,
                 _not_committed_outcome(
@@ -211,47 +281,20 @@ class TermbaseStore:
                 ),
             )
 
-        try:
-            os.replace(prepared.staged_path, resource_path)
-        except OSError:
-            return self._remember_outcome(
-                prepared,
-                _not_committed_outcome(
-                    prepared,
-                    "REPLACE_FAILED",
-                    "Retry the change or discard its prepared artifacts.",
-                ),
-            )
+        backend = self._platform_backend(resource_path)
+        owner_commit_started = False
+        owner_committed = False
+        committed_outcome: TermCommitOutcome | None = None
 
-        try:
-            _fsync_directory(resource_path.parent)
-        except OSError:
-            return self._rollback_after_commit_failure(
-                prepared=prepared,
-                recovery_bytes=recovery_bytes,
-                error_code="DIRECTORY_FSYNC_FAILED",
-            )
-        except Exception:
-            rollback = self._rollback_after_commit_failure(
-                prepared=prepared,
-                recovery_bytes=recovery_bytes,
-                error_code="DIRECTORY_FSYNC_FAILED",
-            )
-            if rollback.state is TermCommitState.ROLLED_BACK:
-                raise
-            return rollback
-
-        try:
-            committed_digest = _digest_path(resource_path)
+        def commit_owner(_identity: FileObjectIdentity) -> None:
+            nonlocal owner_commit_started, owner_committed, committed_outcome
+            owner_commit_started = True
+            committed_digest = self._digest_resource(resource_path)
             if committed_digest != staged_digest:
-                raise _TermCommitVerificationError(
-                    "committed digest mismatch"
-                )
+                raise _TermCommitVerificationError("committed digest mismatch")
             committed_records = self.list_records(resource_path)
             if committed_records != prepared.candidate_records:
-                raise _TermCommitVerificationError(
-                    "committed records mismatch"
-                )
+                raise _TermCommitVerificationError("committed records mismatch")
             old_records = self._records_from_bytes(recovery_bytes)
             counts = self._prepared_counts.get(
                 prepared,
@@ -272,8 +315,81 @@ class TermbaseStore:
                 imported=counts[3],
                 overwritten=counts[4],
             )
+            try:
+                _unlink_exact(backend, prepared.staged_path, staged_snapshot.identity)
+                self._prepared_artifacts[prepared] = (None, recovery_snapshot.identity)
+            except PlatformFileError:
+                committed_outcome = self._remember_outcome(
+                    prepared,
+                    _indeterminate_outcome(prepared, "STAGED_CLEANUP_FAILED"),
+                )
+                owner_committed = True
+                return
+            committed_outcome = self._remember_outcome(
+                prepared,
+                TermCommitOutcome(
+                    state=TermCommitState.COMMITTED,
+                    report=report,
+                    error_code=None,
+                    retryable=False,
+                    recovery_path=recovery_path,
+                    quarantined=False,
+                    safe_detail=None,
+                ),
+            )
+            owner_committed = True
+
+        try:
+            _publish_bytes(
+                backend,
+                resource_path,
+                staged_bytes,
+                replace=True,
+                private=True,
+                expected_before_digest=prepared.base_digest,
+                owner_commit=commit_owner,
+            )
+        except PlatformFileError as error:
+            if owner_committed:
+                return self._remember_outcome(
+                    prepared,
+                    _indeterminate_outcome(prepared, "TERMINAL_REPROOF_FAILED"),
+                )
+            if owner_commit_started:
+                return self._rollback_after_commit_failure(
+                    prepared=prepared,
+                    recovery_bytes=recovery_bytes,
+                    error_code="COMMIT_VERIFICATION_FAILED",
+                )
+            if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                return self._remember_outcome(
+                    prepared,
+                    _indeterminate_outcome(prepared, "REPLACE_INDETERMINATE"),
+                )
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "REPLACE_FAILED",
+                    "Retry the change or discard its prepared artifacts.",
+                ),
+            )
+        except OSError:
+            if owner_commit_started:
+                return self._rollback_after_commit_failure(
+                    prepared=prepared,
+                    recovery_bytes=recovery_bytes,
+                    error_code="COMMIT_VERIFICATION_FAILED",
+                )
+            return self._remember_outcome(
+                prepared,
+                _not_committed_outcome(
+                    prepared,
+                    "REPLACE_FAILED",
+                    "Retry the change or discard its prepared artifacts.",
+                ),
+            )
         except (
-            OSError,
             TermbaseValidationError,
             _TermCommitVerificationError,
         ):
@@ -283,27 +399,20 @@ class TermbaseStore:
                 error_code="COMMIT_VERIFICATION_FAILED",
             )
         except Exception:
-            rollback = self._rollback_after_commit_failure(
-                prepared=prepared,
-                recovery_bytes=recovery_bytes,
-                error_code="COMMIT_VERIFICATION_FAILED",
-            )
-            if rollback.state is TermCommitState.ROLLED_BACK:
-                raise
-            return rollback
+            if owner_commit_started:
+                rollback = self._rollback_after_commit_failure(
+                    prepared=prepared,
+                    recovery_bytes=recovery_bytes,
+                    error_code="COMMIT_VERIFICATION_FAILED",
+                )
+                if rollback.state is TermCommitState.ROLLED_BACK:
+                    raise
+                return rollback
+            raise
 
-        return self._remember_outcome(
-            prepared,
-            TermCommitOutcome(
-                state=TermCommitState.COMMITTED,
-                report=report,
-                error_code=None,
-                retryable=False,
-                recovery_path=recovery_path,
-                quarantined=False,
-                safe_detail=None,
-            ),
-        )
+        if committed_outcome is None:
+            raise AssertionError("termbase owner commit did not issue an outcome")
+        return committed_outcome
 
     def discard(self, prepared: PreparedTermMutation) -> None:
         _validate_prepared_mutation(prepared)
@@ -316,12 +425,18 @@ class TermbaseStore:
                 "committed or indeterminate term mutation cannot be discarded"
             )
 
-        prepared.staged_path.unlink(missing_ok=True)
-        if prepared.recovery_path is not None:
-            prepared.recovery_path.unlink(missing_ok=True)
-        _fsync_directory(prepared.resource_path.parent)
+        backend = self._platform_backend(prepared.resource_path)
+        identities = self._prepared_artifacts.get(prepared)
+        if identities is None:
+            raise ValueError("prepared term mutation has no owned artifacts")
+        if identities[0] is not None:
+            _unlink_exact(backend, prepared.staged_path, identities[0])
+        if prepared.recovery_path is not None and identities[1] is not None:
+            _unlink_exact(backend, prepared.recovery_path, identities[1])
         _ = self._prepared_counts.pop(prepared, None)
         _ = self._commit_outcomes.pop(prepared, None)
+        _ = self._prepared_artifacts.pop(prepared, None)
+        _ = self._prepared_sources.pop(prepared, None)
 
     def finalize(
         self,
@@ -348,9 +463,20 @@ class TermbaseStore:
                 warning_code=None,
             )
 
+        identities = self._prepared_artifacts.get(prepared)
+        if identities is None or identities[1] is None:
+            return TermCleanupReport(
+                cleaned=False,
+                recovery_path=recovery_path,
+                warning_code="RECOVERY_DELETE_FAILED",
+            )
         try:
-            recovery_path.unlink()
-        except OSError:
+            _unlink_exact(
+                self._platform_backend(recovery_path),
+                recovery_path,
+                identities[1],
+            )
+        except PlatformFileError:
             return TermCleanupReport(
                 cleaned=False,
                 recovery_path=recovery_path,
@@ -359,6 +485,8 @@ class TermbaseStore:
 
         _ = self._prepared_counts.pop(prepared, None)
         _ = self._commit_outcomes.pop(prepared, None)
+        _ = self._prepared_artifacts.pop(prepared, None)
+        _ = self._prepared_sources.pop(prepared, None)
         return TermCleanupReport(
             cleaned=True,
             recovery_path=None,
@@ -380,53 +508,57 @@ class TermbaseStore:
         recovery_bytes: bytes,
         error_code: str,
     ) -> TermCommitOutcome:
-        rollback_path: Path | None = None
-        try:
-            rollback_path = _write_durable_temp(
-                prepared.resource_path.parent,
-                f".{prepared.resource_path.name}.rollback-",
-                recovery_bytes,
+        rollback_outcome: TermCommitOutcome | None = None
+
+        def commit_rollback(_identity: FileObjectIdentity) -> None:
+            nonlocal rollback_outcome
+            try:
+                restored_digest = self._digest_resource(prepared.resource_path)
+            except (PlatformFileError, OSError) as error:
+                raise _TermCommitVerificationError(
+                    "rollback digest unavailable"
+                ) from error
+            if restored_digest != prepared.base_digest:
+                raise _TermCommitVerificationError("rollback digest mismatch")
+            rollback_outcome = self._remember_outcome(
+                prepared,
+                _failed_outcome(
+                    state=TermCommitState.ROLLED_BACK,
+                    error_code=error_code,
+                    retryable=True,
+                    recovery_path=prepared.recovery_path,
+                    safe_detail="The previous bytes were restored; retry the change.",
+                ),
             )
-            os.replace(rollback_path, prepared.resource_path)
-            rollback_path = None
-            _fsync_directory(prepared.resource_path.parent)
+
+        try:
+            staged_bytes, _snapshot = self._read_bound_snapshot(prepared.staged_path)
+            _publish_bytes(
+                self._platform_backend(prepared.resource_path),
+                prepared.resource_path,
+                recovery_bytes,
+                replace=True,
+                private=True,
+                expected_before_digest=hashlib.sha256(staged_bytes).hexdigest(),
+                owner_commit=commit_rollback,
+            )
+        except _TermCommitVerificationError:
+            return self._remember_outcome(
+                prepared,
+                _indeterminate_outcome(
+                    prepared,
+                    "ROLLBACK_VERIFICATION_FAILED",
+                ),
+            )
         except Exception:
-            _cleanup_prepare_artifacts(rollback_path)
-            _best_effort_fsync_directory(prepared.resource_path.parent)
             return self._remember_outcome(
                 prepared,
                 _indeterminate_outcome(prepared, "ROLLBACK_FAILED"),
             )
 
-        try:
-            restored_digest = _digest_path(prepared.resource_path)
-        except OSError:
-            return self._remember_outcome(
-                prepared,
-                _indeterminate_outcome(
-                    prepared,
-                    "ROLLBACK_VERIFICATION_FAILED",
-                ),
-            )
-        if restored_digest != prepared.base_digest:
-            return self._remember_outcome(
-                prepared,
-                _indeterminate_outcome(
-                    prepared,
-                    "ROLLBACK_VERIFICATION_FAILED",
-                ),
-            )
-
-        return self._remember_outcome(
-            prepared,
-            _failed_outcome(
-                state=TermCommitState.ROLLED_BACK,
-                error_code=error_code,
-                retryable=True,
-                recovery_path=prepared.recovery_path,
-                safe_detail="The previous bytes were restored; retry the change.",
-            ),
-        )
+        if rollback_outcome is None:
+            raise AssertionError("termbase rollback did not commit an outcome")
+        return rollback_outcome
 
     def prepare_create(
         self,
@@ -436,7 +568,7 @@ class TermbaseStore:
         if not isinstance(draft, TermDraft):
             raise TypeError("term draft must be a TermDraft")
         path = _absolute_resource_path(path)
-        original, base_digest, records = self._read_snapshot(path)
+        original, base_digest, records, source_snapshot = self._read_snapshot(path)
         conflicting_ordinal = _source_ordinal(records, draft.source)
         if conflicting_ordinal is not None:
             raise TermbaseValidationError(
@@ -468,6 +600,7 @@ class TermbaseStore:
             path=path,
             original=original,
             base_digest=base_digest,
+            source_snapshot=source_snapshot,
             candidate_rows=candidate_rows,
         )
         self._prepared_counts[prepared] = (1, 0, 0, 0, 0)
@@ -482,7 +615,7 @@ class TermbaseStore:
         if not isinstance(draft, TermDraft):
             raise TypeError("term draft must be a TermDraft")
         path = _absolute_resource_path(path)
-        original, base_digest, records = self._read_snapshot(path)
+        original, base_digest, records, source_snapshot = self._read_snapshot(path)
         row_ordinal, current = _locate_current_record(
             records,
             base_digest,
@@ -519,6 +652,7 @@ class TermbaseStore:
             path=path,
             original=original,
             base_digest=base_digest,
+            source_snapshot=source_snapshot,
             candidate_rows=candidate_rows,
         )
         self._prepared_counts[prepared] = (0, 1, 0, 0, 0)
@@ -530,7 +664,7 @@ class TermbaseStore:
         locator: TermRecordLocator,
     ) -> PreparedTermMutation:
         path = _absolute_resource_path(path)
-        original, base_digest, records = self._read_snapshot(path)
+        original, base_digest, records, source_snapshot = self._read_snapshot(path)
         row_ordinal, _ = _locate_current_record(
             records,
             base_digest,
@@ -543,6 +677,7 @@ class TermbaseStore:
             path=path,
             original=original,
             base_digest=base_digest,
+            source_snapshot=source_snapshot,
             candidate_rows=candidate_rows,
         )
         self._prepared_counts[prepared] = (0, 0, 1, 0, 0)
@@ -561,7 +696,7 @@ class TermbaseStore:
             raise TermbaseValidationError("EMPTY_IMPORT")
 
         path = _absolute_resource_path(path)
-        original, base_digest, records = self._read_snapshot(path)
+        original, base_digest, records, source_snapshot = self._read_snapshot(path)
         incoming_targets: dict[str, str] = {}
         first_input_order: list[str] = []
         for row in rows:
@@ -585,6 +720,7 @@ class TermbaseStore:
             path=path,
             original=original,
             base_digest=base_digest,
+            source_snapshot=source_snapshot,
             candidate_rows=candidate_rows,
         )
         imported = len(incoming_targets)
@@ -604,11 +740,13 @@ class TermbaseStore:
         """Validate one exact owner-canonical CSV/v1 snapshot without mutation."""
 
         source = _absolute_resource_path(source)
-        payload = source.read_bytes()
+        payload, source_snapshot = self._read_bound_snapshot(source)
         records = self._records_from_bytes(payload)
         canonical = _serialize_rows(_rows_from_records(records))
         if payload != canonical:
             raise TermbaseValidationError("NON_CANONICAL_SNAPSHOT")
+        if source_snapshot.byte_count != len(payload):
+            raise TermbaseValidationError("SOURCE_CHANGED")
         return _portable_snapshot_facts(
             payload,
             records,
@@ -630,9 +768,7 @@ class TermbaseStore:
         destination = _absolute_resource_path(destination)
         if source == destination:
             raise ValueError("portable snapshot destination must differ from source")
-        if destination.exists():
-            raise FileExistsError(destination)
-        original, source_digest, records = self._read_snapshot(source)
+        original, source_digest, records, source_snapshot = self._read_snapshot(source)
         payload = _serialize_rows(_rows_from_records(records))
         if hashlib.sha256(original).hexdigest() != source_digest:
             raise AssertionError("termbase snapshot digest changed in memory")
@@ -641,12 +777,25 @@ class TermbaseStore:
             records,
             source_baseline_digest=source_digest,
         )
+        published_identity: FileObjectIdentity | None = None
+        backend = self._platform_backend(source)
         try:
-            _write_new_durable_file(destination, payload)
-            if _digest_path(source) != source_digest:
+            published_identity = _publish_bytes(
+                backend,
+                destination,
+                payload,
+                replace=False,
+                private=True,
+            )
+            if (
+                self._snapshot_resource(source) != source_snapshot
+                or self._digest_resource(source) != source_digest
+            ):
                 raise TermbaseValidationError("SOURCE_CHANGED")
             validated = self.validate_portable_snapshot(destination)
             if (
+                self._snapshot_resource(destination).identity != published_identity
+                or
                 validated.payload_digest != facts.payload_digest
                 or validated.payload_byte_count != facts.payload_byte_count
                 or validated.record_count != facts.record_count
@@ -655,10 +804,31 @@ class TermbaseStore:
             ):
                 raise TermbaseValidationError("SNAPSHOT_VERIFY_FAILED")
         except BaseException:
-            destination.unlink(missing_ok=True)
-            _best_effort_fsync_directory(destination.parent)
+            if published_identity is not None:
+                _unlink_exact(backend, destination, published_identity)
             raise
+        if published_identity is None:
+            raise AssertionError("portable snapshot publication lost its identity")
+        self._portable_artifacts[(destination, facts.payload_digest)] = published_identity
         return facts
+
+    def discard_portable_snapshot(
+        self,
+        path: Path,
+        snapshot: TermbasePortableSnapshot,
+    ) -> None:
+        """Delete only a private export artifact issued by this store instance."""
+
+        if type(snapshot) is not TermbasePortableSnapshot:
+            raise TypeError("portable termbase snapshot must be exact")
+        path = _absolute_resource_path(path)
+        identity = self._portable_artifacts.pop(
+            (path, snapshot.payload_digest),
+            None,
+        )
+        if identity is None:
+            raise ValueError("portable snapshot artifact is not owned by this store")
+        _unlink_exact(self._platform_backend(path), path, identity)
 
     def prepare_snapshot_replace(
         self,
@@ -669,16 +839,17 @@ class TermbaseStore:
 
         path = _absolute_resource_path(path)
         source = _absolute_resource_path(source)
-        source_payload = source.read_bytes()
+        source_payload, _source_snapshot = self._read_bound_snapshot(source)
         source_records = self._records_from_bytes(source_payload)
         if source_payload != _serialize_rows(_rows_from_records(source_records)):
             raise TermbaseValidationError("NON_CANONICAL_SNAPSHOT")
-        original, base_digest, _current = self._read_snapshot(path)
+        original, base_digest, _current, source_snapshot = self._read_snapshot(path)
         prepared = self._prepare_artifacts(
             action="snapshot_replace",
             path=path,
             original=original,
             base_digest=base_digest,
+            source_snapshot=source_snapshot,
             candidate_rows=_rows_from_records(source_records),
         )
         self._prepared_counts[prepared] = (0, 0, 0, len(source_records), 0)
@@ -687,15 +858,55 @@ class TermbaseStore:
     def list_records(self, path: Path) -> tuple[TermRecord, ...]:
         """Return a fully validated immutable snapshot in file order."""
 
-        return self._records_from_bytes(path.read_bytes())
+        payload, _snapshot = self._read_bound_snapshot(_absolute_resource_path(path))
+        return self._records_from_bytes(payload)
 
     def _read_snapshot(
         self,
         path: Path,
-    ) -> tuple[bytes, str, tuple[TermRecord, ...]]:
-        original = path.read_bytes()
+    ) -> tuple[bytes, str, tuple[TermRecord, ...], EntrySnapshot]:
+        original, snapshot = self._read_bound_snapshot(path)
         file_digest = hashlib.sha256(original).hexdigest()
-        return original, file_digest, self._records_from_bytes(original)
+        return original, file_digest, self._records_from_bytes(original), snapshot
+
+    def _read_bound_snapshot(self, path: Path) -> tuple[bytes, EntrySnapshot]:
+        backend = self._platform_backend(path)
+        source = bind_rooted_regular(backend, path)
+        try:
+            snapshot = source.snapshot()
+            payload = read_bound_all(
+                source,
+                snapshot,
+                maximum_bytes=_MAX_TERMBASE_BYTES,
+            )
+            return payload, snapshot
+        finally:
+            source.close()
+
+    def _digest_resource(self, path: Path) -> str:
+        backend = self._platform_backend(path)
+        source = bind_rooted_regular(backend, path)
+        try:
+            snapshot = source.snapshot()
+            return digest_bound(source, snapshot).hex()
+        finally:
+            source.close()
+
+    def _snapshot_resource(self, path: Path) -> EntrySnapshot:
+        source = bind_rooted_regular(self._platform_backend(path), path)
+        try:
+            return source.snapshot()
+        finally:
+            source.close()
+
+    def _platform_backend(self, path: Path) -> PlatformFileBackend:
+        backend = self._backend
+        if backend is None:
+            from platform_fs import compose_platform_file_backend
+
+            backend = compose_platform_file_backend(path.parent)
+            self._backend = backend
+        return backend
 
     def _records_from_bytes(self, original: bytes) -> tuple[TermRecord, ...]:
         file_digest = hashlib.sha256(original).hexdigest()
@@ -762,25 +973,39 @@ class TermbaseStore:
         path: Path,
         original: bytes,
         base_digest: str,
+        source_snapshot: EntrySnapshot,
         candidate_rows: list[list[str]],
     ) -> PreparedTermMutation:
         candidate_bytes = _serialize_rows(candidate_rows)
         candidate_records = self._records_from_bytes(candidate_bytes)
         recovery_path: Path | None = None
         staged_path: Path | None = None
+        recovery_identity: FileObjectIdentity | None = None
+        staged_identity: FileObjectIdentity | None = None
+        prepared: PreparedTermMutation | None = None
+        backend = self._platform_backend(path)
         try:
-            recovery_path = _write_durable_temp(
-                path.parent,
-                f".{path.name}.recovery-",
+            recovery_path = path.with_name(
+                f".{path.name}.recovery-{uuid.uuid4().hex}.tmp"
+            )
+            recovery_identity = _publish_bytes(
+                backend,
+                recovery_path,
                 original,
+                replace=False,
+                private=True,
             )
-            staged_path = _write_durable_temp(
-                path.parent,
-                f".{path.name}.staged-",
+            staged_path = path.with_name(
+                f".{path.name}.staged-{uuid.uuid4().hex}.tmp"
+            )
+            staged_identity = _publish_bytes(
+                backend,
+                staged_path,
                 candidate_bytes,
+                replace=False,
+                private=True,
             )
-            _fsync_directory(path.parent)
-            return PreparedTermMutation(
+            prepared = PreparedTermMutation(
                 action=action,
                 resource_path=path,
                 base_digest=base_digest,
@@ -788,9 +1013,28 @@ class TermbaseStore:
                 recovery_path=recovery_path,
                 candidate_records=candidate_records,
             )
+            self._prepared_artifacts[prepared] = (
+                staged_identity,
+                recovery_identity,
+            )
+            if self._snapshot_resource(path) != source_snapshot:
+                raise TermbaseValidationError("SOURCE_CHANGED")
+            self._prepared_sources[prepared] = source_snapshot
+            return prepared
         except BaseException:
-            _cleanup_prepare_artifacts(staged_path, recovery_path)
-            _best_effort_fsync_directory(path.parent)
+            if prepared is not None:
+                _ = self._prepared_artifacts.pop(prepared, None)
+                _ = self._prepared_sources.pop(prepared, None)
+            if staged_path is not None and staged_identity is not None:
+                try:
+                    _unlink_exact(backend, staged_path, staged_identity)
+                except PlatformFileError:
+                    pass
+            if recovery_path is not None and recovery_identity is not None:
+                try:
+                    _unlink_exact(backend, recovery_path, recovery_identity)
+                except PlatformFileError:
+                    pass
             raise
 
     @staticmethod
@@ -859,18 +1103,14 @@ def _format_bool(value: bool) -> str:
 
 
 def _absolute_resource_path(path: Path) -> Path:
-    if not isinstance(path, Path):
-        raise TypeError("term resource path must be a Path")
-    return Path(os.path.abspath(path))
+    if type(path) is not type(Path()) or not path.is_absolute():
+        raise TypeError("term resource path must be an absolute concrete Path")
+    return path
 
 
 def _validate_prepared_mutation(prepared: object) -> None:
     if not isinstance(prepared, PreparedTermMutation):
         raise TypeError("prepared term mutation must be a PreparedTermMutation")
-
-
-def _digest_path(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _failed_outcome(
@@ -1037,62 +1277,155 @@ def _portable_snapshot_facts(
     )
 
 
-def _write_new_durable_file(path: Path, payload: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
+def _publish_bytes(
+    backend: PlatformFileBackend,
+    destination: Path,
+    payload: bytes,
+    *,
+    replace: bool,
+    private: bool,
+    expected_before_digest: str | None = None,
+    owner_commit: Callable[[FileObjectIdentity], None] | None = None,
+) -> FileObjectIdentity:
+    if len(payload) > _MAX_TERMBASE_BYTES:
+        raise TermbaseValidationError("TERMBASE_LIMIT_EXCEEDED")
+    root = None
+    parent = None
+    lease = None
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+    candidate_identity: FileObjectIdentity | None = None
+    digest = hashlib.sha256(payload).digest()
+    candidate_name = f".termbase-{uuid.uuid4().hex}.tmp"
     try:
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise
-    _fsync_directory(path.parent)
-
-
-def _write_durable_temp(directory: Path, prefix: str, data: bytes) -> Path:
-    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, dir=directory)
-    artifact_path = Path(raw_path)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            _ = stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        artifact_path.unlink(missing_ok=True)
-        raise
-    return artifact_path
-
-
-def _fsync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _cleanup_prepare_artifacts(*paths: Path | None) -> None:
-    for path in paths:
-        if path is not None:
+        root = backend.bind_root(destination.parent)
+        parent = backend.bind_parent(root, platform_relative_path(destination.name))
+        observed = parent.inspect_entry(destination.name)
+        if replace and observed is None:
+            raise FileNotFoundError(destination)
+        if not replace and observed is not None:
+            raise FileExistsError(destination)
+        if replace:
+            lease = backend.acquire(
+                parent,
+                _termbase_lock_name(destination.name),
+                _TERMBASE_LOCK_PREFIX
+                + hashlib.sha256(destination.name.encode("utf-8", "strict")).digest(),
+                LockPolicy(LockWait.BLOCK),
+            )
+        if parent.inspect_entry(destination.name) != observed:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        if expected_before_digest is not None:
+            if not replace or observed is None:
+                raise ValueError("expected prior digest requires replacement")
+            before = backend.open_regular(
+                root,
+                platform_relative_path(destination.name),
+            )
             try:
-                path.unlink(missing_ok=True)
-            except OSError:
+                before_snapshot = before.snapshot()
+                if (
+                    before_snapshot != observed
+                    or digest_bound(before, before_snapshot).hex()
+                    != expected_before_digest
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                        retryable=True,
+                    )
+            finally:
+                before.close()
+        candidate = parent.create_candidate(candidate_name, private=private)
+        candidate_identity = candidate.identity()
+        written = candidate.write_chunks(
+            _byte_chunks(payload),
+            maximum_bytes=_MAX_TERMBASE_BYTES,
+        )
+        candidate.flush_content()
+        pending = parent.begin_publish(
+            candidate,
+            destination.name,
+            mode=(
+                PublishMode.REPLACE_UNDER_LOCK
+                if replace
+                else PublishMode.CREATE_IF_ABSENT
+            ),
+            lease=lease if replace else None,
+        )
+        candidate = None
+        candidate_identity = None
+        facts = pending.preliminary_facts()
+        retained = pending.retained_destination()
+        snapshot = retained.snapshot()
+        if (
+            written.content_sha256 != digest
+            or written.byte_count != len(payload)
+            or facts.content_sha256 != digest
+            or facts.byte_count != len(payload)
+            or snapshot.byte_count != len(payload)
+            or digest_bound(retained, snapshot) != digest
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            )
+        if replace and owner_commit is None:
+            raise TypeError("termbase replacement requires owner commit callback")
+        if owner_commit is not None:
+            owner_commit(facts.destination_identity)
+        if pending.terminal_reproof() != facts:
+            raise PlatformFileError(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            )
+        return facts.destination_identity
+    finally:
+        _close_authorities(pending, candidate)
+        if candidate_identity is not None and parent is not None:
+            try:
+                parent.unlink_owned(candidate_name, candidate_identity)
+            except PlatformFileError:
                 pass
+        _close_authorities(lease, parent, root)
 
 
-def _best_effort_fsync_directory(directory: Path) -> None:
+def _unlink_exact(
+    backend: PlatformFileBackend,
+    path: Path,
+    identity: FileObjectIdentity,
+) -> None:
+    root = None
+    parent = None
     try:
-        _fsync_directory(directory)
-    except OSError:
-        pass
+        root = backend.bind_root(path.parent)
+        parent = backend.bind_parent(root, platform_relative_path(path.name))
+        parent.unlink_owned(path.name, identity)
+    finally:
+        _close_authorities(parent, root)
+
+
+def _termbase_lock_name(destination_name: str) -> str:
+    digest = hashlib.sha256(destination_name.encode("utf-8", "strict")).hexdigest()
+    return f".termbase-{digest[:32]}.lock"
+
+
+def _byte_chunks(payload: bytes) -> tuple[bytes, ...]:
+    return tuple(
+        payload[offset : offset + 64 * 1024]
+        for offset in range(0, len(payload), 64 * 1024)
+    )
+
+
+def _close_authorities(*authorities: object) -> None:
+    for authority in authorities:
+        if authority is not None:
+            try:
+                authority.close()  # type: ignore[attr-defined]
+            except PlatformFileError:
+                pass
 
 
 def _validate_strict_csv_record(raw_record: str, row_ordinal: int) -> None:

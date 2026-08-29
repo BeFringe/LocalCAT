@@ -4,17 +4,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import os
 from pathlib import Path
-import stat
+import secrets
 from typing import Callable, TypeVar
-from uuid import uuid4
 
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    CandidateFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    LockLease,
+    LockPolicy,
+    LockWait,
+    PendingPublication,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+    RootedDirectoryAuthority,
+)
 from resource_package_contracts import ResourcePortabilityError
+from resource_platform_io import (
+    bind_rooted_regular,
+    digest_bound,
+    iter_bound_chunks,
+    platform_relative_path,
+)
 
 
 _ValidationT = TypeVar("_ValidationT")
-_COPY_CHUNK = 1024 * 1024
+_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+_LOCK_PREFIX = b"localcat.resource-artifact.lock.v1\0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,352 +44,400 @@ class ResourceArtifactPublication:
     destination_after_digest: str
 
 
-@dataclass(frozen=True, slots=True)
-class _DestinationFact:
-    digest: str
-    identity: tuple[int, int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
-class _ParentFact:
-    device: int
-    inode: int
-
-
 class ResourceArtifactSaveService:
-    """Publish one validated same-directory candidate with proven rollback."""
+    """Publish one validated candidate through the shared rooted lifecycle."""
+
+    def __init__(self, backend: PlatformFileBackend | None = None) -> None:
+        if backend is not None and not isinstance(backend, PlatformFileBackend):
+            raise TypeError("resource artifact backend must satisfy PlatformFileBackend")
+        self._backend = backend
 
     def publish(
         self,
         candidate: Path,
         destination: Path,
         validator: Callable[[Path], _ValidationT],
+        *,
+        owner_commit: Callable[[ResourceArtifactPublication, _ValidationT], None],
     ) -> tuple[ResourceArtifactPublication, _ValidationT]:
-        if not isinstance(candidate, Path) or not candidate.is_absolute():
-            raise TypeError("artifact candidate must be an absolute Path")
-        if not isinstance(destination, Path) or not destination.is_absolute():
-            raise TypeError("artifact destination must be an absolute Path")
+        if type(candidate) is not type(Path()) or not candidate.is_absolute():
+            raise TypeError("artifact candidate must be an absolute concrete Path")
+        if type(destination) is not type(Path()) or not destination.is_absolute():
+            raise TypeError("artifact destination must be an absolute concrete Path")
         if candidate.parent != destination.parent or candidate == destination:
             raise ValueError("artifact candidate must share the destination directory")
         if not callable(validator):
             raise TypeError("artifact validator must be callable")
-        parent_fact = _parent_fact(destination.parent)
-        parent_descriptor = _open_bound_parent(destination.parent, parent_fact)
+        if not callable(owner_commit):
+            raise TypeError("artifact owner commit must be callable")
+        backend = self._backend
+        if backend is None:
+            from platform_fs import compose_platform_file_backend
+
+            try:
+                backend = compose_platform_file_backend(destination.parent)
+            except PlatformFileError as error:
+                raise _map_platform_error(error, published=False) from None
+
+        source: BoundRegularFile | None = None
+        source_root: RootedDirectoryAuthority | None = None
+        source_parent: BoundDirectoryAuthority | None = None
+        root: RootedDirectoryAuthority | None = None
+        parent: BoundDirectoryAuthority | None = None
+        lease: LockLease | None = None
+        pending: PendingPublication | None = None
+        lkg_name: str | None = None
+        lkg_identity: FileObjectIdentity | None = None
+        published = False
+        before: EntrySnapshot | None = None
+        before_digest: str | None = None
+        output_candidate: CandidateFile | None = None
+        output_candidate_name: str | None = None
+        output_candidate_identity: FileObjectIdentity | None = None
+        owner_commit_started = False
+        preserve_recovery = False
         try:
-            candidate_fact = _regular_file_fact_at(parent_descriptor, candidate.name)
+            source = bind_rooted_regular(backend, candidate)
+            source_snapshot = source.snapshot()
+            if source_snapshot.byte_count > _MAX_ARTIFACT_BYTES:
+                raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
+            source_digest = digest_bound(source, source_snapshot)
+            source_root = backend.bind_root(candidate.parent)
+            source_parent = backend.bind_parent(
+                source_root,
+                platform_relative_path(candidate.name),
+            )
+            if source_parent.inspect_entry(candidate.name) != source_snapshot:
+                raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_CHANGED")
             try:
                 validator(candidate)
             except Exception as error:
                 raise ResourcePortabilityError(
                     "RESOURCE.EXPORT.VALIDATION_FAILED"
                 ) from error
-            before = _optional_regular_file_fact_at(
-                parent_descriptor,
-                destination.name,
+            if (
+                source.snapshot() != source_snapshot
+                or source_parent.inspect_entry(candidate.name) != source_snapshot
+            ):
+                raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_CHANGED")
+
+            root = backend.bind_root(destination.parent)
+            parent = backend.bind_parent(root, platform_relative_path(destination.name))
+            lease = backend.acquire(
+                parent,
+                _lock_name(destination.name),
+                _lock_payload(destination.name),
+                LockPolicy(LockWait.BLOCK),
             )
-            recovery_name: str | None = None
-            published = False
-            try:
-                if before is not None:
-                    recovery_name = f".{destination.name}.{uuid4().hex}.lkg"
-                    _copy_new_file_at(
-                        parent_descriptor,
-                        destination.name,
-                        recovery_name,
-                    )
-                    if (
-                        _regular_file_fact_at(parent_descriptor, recovery_name).digest
-                        != before.digest
-                    ):
-                        raise ResourcePortabilityError("RESOURCE.EXPORT.STAGE_FAILED")
-                _require_parent(destination.parent, parent_fact)
-                if (
-                    _optional_regular_file_fact_at(
-                        parent_descriptor,
-                        destination.name,
-                    )
-                    != before
-                ):
-                    raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-                if (
-                    _regular_file_fact_at(parent_descriptor, candidate.name)
-                    != candidate_fact
-                ):
-                    raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_CHANGED")
-                os.replace(
-                    candidate.name,
-                    destination.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                )
-                published = True
-                os.fsync(parent_descriptor)
-                _require_parent(destination.parent, parent_fact)
+            before = parent.inspect_entry(destination.name)
+            _require_safe_snapshot(before)
+            if before is not None:
+                prior = backend.open_regular(root, platform_relative_path(destination.name))
                 try:
-                    validation = validator(destination)
-                except Exception as error:
-                    raise ResourcePortabilityError(
-                        "RESOURCE.EXPORT.VALIDATION_FAILED"
-                    ) from error
-                _require_parent(destination.parent, parent_fact)
-                after = _regular_file_fact_at(parent_descriptor, destination.name)
-                if after.digest != candidate_fact.digest:
-                    raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
-                if recovery_name is not None:
-                    os.unlink(recovery_name, dir_fd=parent_descriptor)
-                    recovery_name = None
-                    os.fsync(parent_descriptor)
-                return (
-                    ResourceArtifactPublication(
-                        destination_before_digest=(
-                            None if before is None else before.digest
-                        ),
-                        destination_after_digest=after.digest,
-                    ),
-                    validation,
-                )
-            except BaseException as primary:
-                if published:
+                    if prior.snapshot() != before:
+                        raise ResourcePortabilityError(
+                            "RESOURCE.EXPORT.DESTINATION_STALE"
+                        )
+                    before_digest = digest_bound(prior, before).hex()
+                    lkg_name = _temporary_name(destination.name, "lkg")
+                    lkg_candidate = _candidate_from_bound(parent, lkg_name, prior, before)
+                    lkg_pending = parent.begin_publish(
+                        lkg_candidate,
+                        lkg_name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
                     try:
-                        observed = _optional_regular_file_fact_at(
-                            parent_descriptor,
-                            destination.name,
-                        )
-                        if observed is None or observed.digest != candidate_fact.digest:
-                            raise ResourcePortabilityError(
-                                "RESOURCE.EXPORT.RECOVERY_REQUIRED"
-                            )
-                        if recovery_name is None:
-                            os.unlink(destination.name, dir_fd=parent_descriptor)
-                        else:
-                            os.replace(
-                                recovery_name,
-                                destination.name,
-                                src_dir_fd=parent_descriptor,
-                                dst_dir_fd=parent_descriptor,
-                            )
-                            recovery_name = None
-                        os.fsync(parent_descriptor)
-                        restored = _optional_regular_file_fact_at(
-                            parent_descriptor,
-                            destination.name,
-                        )
+                        lkg_facts = lkg_pending.preliminary_facts()
+                        lkg_retained = lkg_pending.retained_destination()
+                        lkg_snapshot = lkg_retained.snapshot()
                         if (
-                            (before is None and restored is not None)
-                            or (
-                                before is not None
-                                and (
-                                    restored is None
-                                    or restored.digest != before.digest
-                                )
-                            )
+                            lkg_facts.content_sha256.hex() != before_digest
+                            or lkg_snapshot.byte_count != before.byte_count
+                            or digest_bound(lkg_retained, lkg_snapshot)
+                            != lkg_facts.content_sha256
+                            or lkg_pending.terminal_reproof() != lkg_facts
                         ):
                             raise ResourcePortabilityError(
-                                "RESOURCE.EXPORT.RECOVERY_REQUIRED"
+                                "RESOURCE.EXPORT.STAGE_FAILED"
                             )
-                    except BaseException as rollback_error:
-                        raise ResourcePortabilityError(
-                            "RESOURCE.EXPORT.RECOVERY_REQUIRED"
-                        ) from rollback_error
-                if recovery_name is not None:
-                    if (
-                        _optional_regular_file_fact_at(
-                            parent_descriptor,
-                            recovery_name,
-                        )
-                        is not None
-                    ):
-                        os.unlink(recovery_name, dir_fd=parent_descriptor)
-                        os.fsync(parent_descriptor)
-                if isinstance(primary, ResourcePortabilityError):
-                    raise primary
+                        lkg_identity = lkg_facts.destination_identity
+                    finally:
+                        lkg_pending.close()
+                finally:
+                    prior.close()
+
+            if parent.inspect_entry(destination.name) != before:
+                raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
+            output_candidate_name = _temporary_name(destination.name, "candidate")
+            output_candidate = _candidate_from_bound(
+                parent,
+                output_candidate_name,
+                source,
+                source_snapshot,
+            )
+            output_candidate_identity = output_candidate.identity()
+            mode = PublishMode.CREATE_IF_ABSENT if before is None else PublishMode.REPLACE_UNDER_LOCK
+            try:
+                pending = parent.begin_publish(
+                    output_candidate,
+                    destination.name,
+                    mode=mode,
+                    lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+                )
+            except PlatformFileError as error:
+                if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                    published = True
+                    preserve_recovery = True
+                raise
+            output_candidate = None
+            output_candidate_identity = None
+            published = True
+            facts = pending.preliminary_facts()
+            retained = pending.retained_destination()
+            retained_snapshot = retained.snapshot()
+            if (
+                facts.content_sha256 != source_digest
+                or facts.byte_count != source_snapshot.byte_count
+                or retained_snapshot.byte_count != source_snapshot.byte_count
+                or digest_bound(retained, retained_snapshot) != source_digest
+            ):
+                raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+            try:
+                if parent.inspect_entry(destination.name) != retained_snapshot:
+                    raise ResourcePortabilityError(
+                        "RESOURCE.EXPORT.RECOVERY_REQUIRED"
+                    )
+                validation = validator(destination)
+            except Exception as error:
                 raise ResourcePortabilityError(
-                    "RESOURCE.EXPORT.PUBLICATION_FAILED"
-                ) from primary
+                    "RESOURCE.EXPORT.VALIDATION_FAILED"
+                ) from error
+            if parent.inspect_entry(destination.name) != retained_snapshot:
+                raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+            publication = ResourceArtifactPublication(
+                destination_before_digest=before_digest,
+                destination_after_digest=source_digest.hex(),
+            )
+            owner_commit_started = True
+            owner_commit(publication, validation)
+            if (
+                parent.inspect_entry(destination.name) != retained_snapshot
+                or pending.terminal_reproof() != facts
+            ):
+                raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+            if lkg_name is not None and lkg_identity is not None:
+                parent.unlink_owned(lkg_name, lkg_identity)
+                lkg_name = None
+                lkg_identity = None
+            return publication, validation
+        except BaseException as primary:
+            if (
+                published
+                and not owner_commit_started
+                and pending is not None
+                and parent is not None
+                and lease is not None
+            ):
+                try:
+                    _restore_bound_publication(
+                        backend,
+                        root,
+                        parent,
+                        lease,
+                        pending,
+                        destination.name,
+                        before,
+                        lkg_name,
+                    )
+                except BaseException as rollback_error:
+                    raise ResourcePortabilityError(
+                        "RESOURCE.EXPORT.RECOVERY_REQUIRED"
+                    ) from rollback_error
+            elif published:
+                preserve_recovery = True
+            if isinstance(primary, ResourcePortabilityError):
+                raise primary
+            if isinstance(primary, PlatformFileError):
+                raise _map_platform_error(primary, published=published) from None
+            raise ResourcePortabilityError(
+                "RESOURCE.EXPORT.PUBLICATION_FAILED"
+            ) from primary
         finally:
-            os.close(parent_descriptor)
+            if (
+                not preserve_recovery
+                and lkg_name is not None
+                and lkg_identity is not None
+                and parent is not None
+            ):
+                try:
+                    parent.unlink_owned(lkg_name, lkg_identity)
+                except PlatformFileError:
+                    pass
+            if output_candidate is not None:
+                try:
+                    output_candidate.close()
+                except PlatformFileError:
+                    pass
+            if (
+                not preserve_recovery
+                and output_candidate_name is not None
+                and output_candidate_identity is not None
+                and parent is not None
+            ):
+                try:
+                    parent.unlink_owned(
+                        output_candidate_name,
+                        output_candidate_identity,
+                    )
+                except PlatformFileError:
+                    pass
+            for authority in (
+                pending,
+                lease,
+                parent,
+                root,
+                source_parent,
+                source_root,
+                source,
+            ):
+                if authority is not None:
+                    try:
+                        authority.close()
+                    except PlatformFileError:
+                        pass
 
 
-def _optional_regular_file_fact(path: Path) -> _DestinationFact | None:
-    try:
-        return _regular_file_fact(path)
-    except FileNotFoundError:
-        return None
-
-
-def _optional_regular_file_fact_at(
-    parent_descriptor: int,
+def _candidate_from_bound(
+    parent: BoundDirectoryAuthority,
     name: str,
-) -> _DestinationFact | None:
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+) -> CandidateFile:
+    candidate: CandidateFile | None = None
+    identity: FileObjectIdentity | None = None
     try:
-        return _regular_file_fact_at(parent_descriptor, name)
-    except FileNotFoundError:
-        return None
-
-
-def _regular_file_fact(path: Path) -> _DestinationFact:
-    initial = os.lstat(path)
-    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    digest = hashlib.sha256()
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        while True:
-            chunk = os.read(descriptor, _COPY_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-        final = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    first_identity = (
-        initial.st_dev,
-        initial.st_ino,
-        initial.st_size,
-        initial.st_mtime_ns,
-    )
-    final_identity = (
-        final.st_dev,
-        final.st_ino,
-        final.st_size,
-        final.st_mtime_ns,
-    )
-    if first_identity != final_identity:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    return _DestinationFact(digest.hexdigest(), final_identity)
-
-
-def _regular_file_fact_at(parent_descriptor: int, name: str) -> _DestinationFact:
-    initial = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    descriptor = os.open(
-        name,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-        dir_fd=parent_descriptor,
-    )
-    digest = hashlib.sha256()
-    try:
-        while True:
-            chunk = os.read(descriptor, _COPY_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-        final = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    first_identity = (
-        initial.st_dev,
-        initial.st_ino,
-        initial.st_size,
-        initial.st_mtime_ns,
-    )
-    final_identity = (
-        final.st_dev,
-        final.st_ino,
-        final.st_size,
-        final.st_mtime_ns,
-    )
-    if first_identity != final_identity:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    return _DestinationFact(digest.hexdigest(), final_identity)
-
-
-def _copy_new_file(source: Path, destination: Path) -> None:
-    source_descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        destination_descriptor = os.open(
-            destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
+        candidate = parent.create_candidate(name, private=False)
+        identity = candidate.identity()
+        facts = candidate.write_chunks(
+            iter_bound_chunks(source, snapshot),
+            maximum_bytes=_MAX_ARTIFACT_BYTES,
         )
-        try:
-            while True:
-                chunk = os.read(source_descriptor, _COPY_CHUNK)
-                if not chunk:
-                    break
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(destination_descriptor, view)
-                    view = view[written:]
-            os.fsync(destination_descriptor)
-        finally:
-            os.close(destination_descriptor)
-    finally:
-        os.close(source_descriptor)
-    _fsync_directory(destination.parent)
+        if facts.byte_count != snapshot.byte_count:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_CHANGED")
+        candidate.flush_content()
+        return candidate
+    except BaseException:
+        if candidate is not None:
+            candidate.close()
+        if identity is not None:
+            try:
+                parent.unlink_owned(name, identity)
+            except PlatformFileError:
+                pass
+        raise
 
 
-def _copy_new_file_at(
-    parent_descriptor: int,
-    source_name: str,
+def _restore_bound_publication(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority | None,
+    parent: BoundDirectoryAuthority,
+    lease: LockLease,
+    pending: PendingPublication,
     destination_name: str,
+    before: EntrySnapshot | None,
+    lkg_name: str | None,
 ) -> None:
-    source_descriptor = os.open(
-        source_name,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent_descriptor,
-    )
+    if root is None:
+        raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+    published = pending.preliminary_facts()
+    observed = parent.inspect_entry(destination_name)
+    if observed is None or observed.identity != published.destination_identity:
+        raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+    pending.close()
+    if before is None:
+        parent.unlink_owned(destination_name, published.destination_identity)
+        if parent.inspect_entry(destination_name) is not None:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        return
+    if lkg_name is None:
+        raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+    lkg = backend.open_regular(root, platform_relative_path(lkg_name))
     try:
-        destination_descriptor = os.open(
+        lkg_snapshot = lkg.snapshot()
+        parent.unlink_owned(destination_name, published.destination_identity)
+        if parent.inspect_entry(destination_name) is not None:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        rollback_candidate = _candidate_from_bound(
+            parent,
+            _temporary_name(destination_name, "rollback"),
+            lkg,
+            lkg_snapshot,
+        )
+        rollback = parent.begin_publish(
+            rollback_candidate,
             destination_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=parent_descriptor,
+            mode=PublishMode.CREATE_IF_ABSENT,
+            lease=None,
         )
         try:
-            while True:
-                chunk = os.read(source_descriptor, _COPY_CHUNK)
-                if not chunk:
-                    break
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(destination_descriptor, view)
-                    view = view[written:]
-            os.fsync(destination_descriptor)
+            facts = rollback.preliminary_facts()
+            retained = rollback.retained_destination()
+            retained_snapshot = retained.snapshot()
+            lkg_digest = digest_bound(lkg, lkg_snapshot)
+            if (
+                facts.content_sha256 != lkg_digest
+                or retained_snapshot.byte_count != lkg_snapshot.byte_count
+                or digest_bound(retained, retained_snapshot) != lkg_digest
+                or rollback.terminal_reproof() != facts
+            ):
+                raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
         finally:
-            os.close(destination_descriptor)
+            rollback.close()
     finally:
-        os.close(source_descriptor)
-    os.fsync(parent_descriptor)
+        lkg.close()
 
 
-def _parent_fact(path: Path) -> _ParentFact:
-    status = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISDIR(status.st_mode):
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    return _ParentFact(status.st_dev, status.st_ino)
-
-
-def _open_bound_parent(path: Path, expected: _ParentFact) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, flags)
-    status = os.fstat(descriptor)
-    if (
-        not stat.S_ISDIR(status.st_mode)
-        or (status.st_dev, status.st_ino) != (expected.device, expected.inode)
+def _require_safe_snapshot(snapshot: EntrySnapshot | None) -> None:
+    if snapshot is not None and (
+        snapshot.identity.kind != "regular"
+        or snapshot.identity.link_count != 1
+        or not snapshot.reparse_free
     ):
-        os.close(descriptor)
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    return descriptor
-
-
-def _require_parent(path: Path, expected: _ParentFact) -> None:
-    observed = _parent_fact(path)
-    if observed != expected:
         raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _lock_name(destination_name: str) -> str:
+    digest = hashlib.sha256(destination_name.encode("utf-8", "strict")).hexdigest()
+    return f".resource-artifact-{digest[:32]}.lock"
+
+
+def _lock_payload(destination_name: str) -> bytes:
+    return _LOCK_PREFIX + hashlib.sha256(
+        destination_name.encode("utf-8", "strict")
+    ).digest()
+
+
+def _temporary_name(destination_name: str, role: str) -> str:
+    digest = hashlib.sha256(destination_name.encode("utf-8", "strict")).hexdigest()
+    return f".resource-{role}-{digest[:16]}-{secrets.token_hex(8)}.tmp"
+
+
+def _map_platform_error(
+    error: PlatformFileError,
+    *,
+    published: bool,
+) -> ResourcePortabilityError:
+    if published or error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+        return ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+    if error.code in {
+        PlatformFileErrorCode.IDENTITY_STALE.value,
+        PlatformFileErrorCode.REPARSE_REJECTED.value,
+        PlatformFileErrorCode.OUTSIDE_ROOT.value,
+        PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+    }:
+        return ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
+    return ResourcePortabilityError("RESOURCE.EXPORT.PUBLICATION_FAILED")
 
 
 __all__ = [

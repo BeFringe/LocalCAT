@@ -15,6 +15,7 @@ OWNED = (
     "resource_package_contracts.py",
     "resource_package.py",
     "resource_artifact_save.py",
+    "resource_platform_io.py",
     "resource_receipt_ledger.py",
     "resource_portability.py",
     "tm_resource_port.py",
@@ -38,6 +39,10 @@ FORBIDDEN = {
     "resource_artifact_save.py": (
         "editor_", "project_package", "qt_", "resource_repository",
         "termbase_store", "tm_",
+    ),
+    "resource_platform_io.py": (
+        "editor_", "platform_fs_posix", "platform_fs_windows", "project_",
+        "qt_", "resource_", "sync_", "termbase_", "tm_", "tmx_",
     ),
     "resource_receipt_ledger.py": (
         "editor_", "project_package", "qt_", "resource_repository",

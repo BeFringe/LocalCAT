@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+import subprocess
 import struct
 import tempfile
 import unittest
@@ -80,8 +82,21 @@ class ResourcePackageCarrierTests(unittest.TestCase):
 
             clean = root / "clean.localcat-resource"
             write_resource_package(clean, self._manifest(payload), source)
-            alias = root / "alias.localcat-resource"
-            alias.symlink_to(clean)
+            if os.name == "nt":
+                target = root / "junction-target"
+                target.mkdir()
+                aliased_package = target / clean.name
+                aliased_package.write_bytes(clean.read_bytes())
+                junction = root / "junction"
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+                    check=True,
+                    capture_output=True,
+                )
+                alias = junction / clean.name
+            else:
+                alias = root / "alias.localcat-resource"
+                alias.symlink_to(clean)
             with self.assertRaises(ResourcePortabilityError) as caught:
                 open_resource_package(alias)
             self.assertEqual(caught.exception.code, "RESOURCE.PACKAGE.SOURCE_UNSAFE")
@@ -96,6 +111,34 @@ class ResourcePackageCarrierTests(unittest.TestCase):
             with self.assertRaises(ResourcePortabilityError):
                 write_resource_package(destination, manifest, source)
             self.assertFalse(destination.exists())
+
+    def test_retained_package_reproves_parent_path_identity(self) -> None:
+        payload = b"{}\n"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "tm.jsonl"
+            package = root / "package.localcat-resource"
+            replacement = root / "replacement.localcat-resource"
+            source.write_bytes(payload)
+            write_resource_package(package, self._manifest(payload), source)
+            replacement.write_bytes(package.read_bytes())
+
+            with open_resource_package(package) as sealed:
+                if os.name == "nt":
+                    with self.assertRaises(PermissionError):
+                        replacement.replace(package)
+                    sealed.reprove()
+                else:
+                    replacement.replace(package)
+                    with self.assertRaises(ResourcePortabilityError) as caught:
+                        sealed.reprove()
+                    self.assertEqual(
+                        caught.exception.code,
+                        "RESOURCE.IMPORT.SOURCE_STALE",
+                    )
+
+            if os.name == "nt":
+                replacement.replace(package)
 
     def test_raw_profile_rejects_header_flag_method_crc_extra_and_prefix_mutations(self) -> None:
         payload = b"{}\n"

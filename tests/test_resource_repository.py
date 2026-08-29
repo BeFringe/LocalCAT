@@ -171,7 +171,7 @@ class ResourceRepositoryTest(unittest.TestCase):
 
             with patch.object(
                 repository,
-                "_write_registry",
+                "_write_registry_bound",
                 side_effect=ResourceError("registry unavailable"),
             ):
                 with self.assertRaisesRegex(ResourceError, "registry unavailable"):
@@ -179,6 +179,38 @@ class ResourceRepositoryTest(unittest.TestCase):
 
             self.assertEqual(resource.path.read_bytes(), original)
             self.assertEqual(repository.get(resource.id), resource)
+
+    def test_delete_rereads_registry_under_lock_before_removing_one_resource(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "app-data"
+            first = ResourceRepository(config_dir)
+            stale_peer = ResourceRepository(config_dir)
+            removed = first.create_resource("Removed", ResourceKind.TERMBASE)
+            retained = stale_peer.create_resource("Retained", ResourceKind.TERMBASE)
+
+            first.delete_resource(removed.id)
+
+            cold = ResourceRepository(config_dir)
+            self.assertEqual(cold.list_resources(), (retained,))
+            self.assertTrue(retained.path.exists())
+
+    def test_delete_rejects_multilink_managed_target_without_registry_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = ResourceRepository(Path(temp_dir) / "app-data")
+            resource = repository.create_resource("Keep", ResourceKind.TERMBASE)
+            alias = resource.path.with_name("alias.csv")
+            alias.hardlink_to(resource.path)
+
+            with self.assertRaises(ResourceError):
+                repository.delete_resource(resource.id)
+
+            self.assertEqual(repository.get(resource.id), resource)
+            self.assertTrue(resource.path.exists())
+            self.assertTrue(alias.exists())
 
     def test_corrupt_registry_is_reported_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
