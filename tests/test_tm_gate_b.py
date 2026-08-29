@@ -16,6 +16,7 @@ from unittest.mock import patch
 import tm_contracts as contract_module
 import tm_gate_b
 import tm_stage_sealer
+import tm_migration
 from platform_fs import compose_platform_file_backend
 from tm_content_attestation import SealedContentAttestation
 from tm_contracts import (
@@ -214,10 +215,17 @@ class GateBHappyPathTests(unittest.TestCase):
                 fts5_available=True,
             )
             registry = _registry()
+            backend = compose_platform_file_backend(root)
+            reservation = (
+                tm_migration._InitialActivationResourceReservation
+                .acquire_with_backend(stage.resource_identity, backend)
+            )
+            self.addCleanup(reservation.release)
+            inputs = reservation.stage_seal_inputs()
             sealer = StageSealer(
                 registry=registry,
                 canonical_store_id="store.primary",
-                platform=cast(Any, compose_platform_file_backend(root)),
+                platform=cast(Any, inputs["platform"]),
             )
             with patch(
                 "tm_sqlite_store._probe_fts5",
@@ -226,6 +234,7 @@ class GateBHappyPathTests(unittest.TestCase):
                 sealed = sealer.seal(
                     stage,
                     expected_prior_generation=0,
+                    caller_borrow=cast(Any, inputs["caller_borrow"]),
                 )
             entry = cast(
                 tm_stage_sealer._PortableRegistryEntry,
@@ -305,6 +314,7 @@ class GateBHappyPathTests(unittest.TestCase):
             )
             registry.cancel(token)
             self.assertTrue(live_authority.closed)
+            reservation.release()
 
     def test_gate_b_rehashes_attested_files_without_semantic_rescan(
         self,

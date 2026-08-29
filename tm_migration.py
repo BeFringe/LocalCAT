@@ -95,17 +95,21 @@ from tm_sqlite_store import (
     unique_character_ngrams,
     validate_candidate_proof_index,
 )
-from tm_stage_sealer import StageSealError, StageSealer
+from tm_stage_sealer import (
+    _CallerHeldSealBorrow,
+    _create_caller_held_seal_borrow,
+    StageSealError,
+)
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
 from platform_fs import compose_platform_file_backend
 from platform_fs_contracts import (
-    BoundDirectoryAuthority,
     LockLease,
     LockPolicy,
     LockWait,
     PlatformFileBackend,
     PlatformFileError,
+    RootedDirectoryAuthority,
 )
 
 
@@ -1370,6 +1374,7 @@ class TMMigrationService:
                 mutable_stage,
                 canonical_store_id=self._canonical_store_id,
                 expected_prior_generation=None,
+                **reservation.stage_seal_inputs(),
             )
             stage_label = "PREPARE"
             reservation.reprove()
@@ -4962,6 +4967,7 @@ class _InitialActivationResourceReservation:
         "_parent",
         "_released",
         "_root",
+        "_stage_borrow_minted",
     )
 
     def __init__(
@@ -4973,7 +4979,7 @@ class _InitialActivationResourceReservation:
         lock_name: str,
         fcntl_module: Any,
         backend: PlatformFileBackend | None = None,
-        root: BoundDirectoryAuthority | None = None,
+        root: RootedDirectoryAuthority | None = None,
         lease: LockLease | None = None,
     ) -> None:
         self._identity = identity
@@ -4985,6 +4991,7 @@ class _InitialActivationResourceReservation:
         self._root = root
         self._lease = lease
         self._released = False
+        self._stage_borrow_minted = False
 
     @classmethod
     def acquire_with_backend(
@@ -4996,7 +5003,7 @@ class _InitialActivationResourceReservation:
 
         if not isinstance(backend, PlatformFileBackend):
             raise TypeError("backend must satisfy PlatformFileBackend")
-        root: BoundDirectoryAuthority | None = None
+        root: RootedDirectoryAuthority | None = None
         lease: LockLease | None = None
         try:
             root = backend.bind_root(
@@ -5303,6 +5310,32 @@ class _InitialActivationResourceReservation:
             raise _InitialActivationReservationError(
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             ) from error
+
+    def stage_seal_inputs(self) -> dict[str, object]:
+        """Mint one non-closing portable seal borrow from the held reservation."""
+
+        if self._backend is None:
+            return {"platform": None, "caller_borrow": None}
+        if (
+            self._released
+            or self._root is None
+            or self._lease is None
+            or self._stage_borrow_minted
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        self.reprove()
+        borrow: _CallerHeldSealBorrow = _create_caller_held_seal_borrow(
+            identity=self._identity,
+            platform=self._backend,
+            root=self._root,
+            lease=self._lease,
+            lock_name=self._lock_name,
+            lock_payload=self._payload(self._identity),
+        )
+        self._stage_borrow_minted = True
+        return {"platform": self._backend, "caller_borrow": borrow}
 
     def release(self) -> None:
         """Release advisory ownership; never unlink the persistent file."""

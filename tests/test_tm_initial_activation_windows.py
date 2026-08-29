@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -12,13 +13,15 @@ import unittest
 from unittest import mock
 
 import tm_migration
+import tm_stage_sealer
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationReport,
     SnapshotReceipt,
 )
 from tm_migration import TMMigrationService
-from tm_sqlite_store import ResourceStoreCoordinator
+from tm_gate_b import GateBEvaluator
+from tm_sqlite_store import ActivationPreparationError, ResourceStoreCoordinator
 
 
 SOURCE_BYTES = (
@@ -80,6 +83,242 @@ def _success_report(
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
 class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
     """Reservation seam evidence; full activation remains a later blocker."""
+
+    def _portable_sealed_stage(
+        self,
+        service: TMMigrationService,
+        coordinator: ResourceStoreCoordinator,
+        identity: CanonicalResourceIdentity,
+    ) -> tuple[object, object, object]:
+        with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
+            build = service.build_mutable_stage(identity.configured_jsonl_path)
+        stage = build.mutable_stage
+        if stage is None:
+            raise AssertionError("expected one mutable stage")
+        reservation = service._acquire_initial_reservation()
+        inputs = reservation.stage_seal_inputs()
+        with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
+            sealed = coordinator._seal_stage(
+                stage,
+                canonical_store_id="store.primary",
+                expected_prior_generation=None,
+                **inputs,
+            )
+        return reservation, sealed, coordinator._sealed_registry
+
+    def test_real_reservation_spans_seal_two_gate_b_and_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            try:
+                entry = registry._entries[sealed.artifact.artifact_id]
+                self.assertIs(
+                    type(entry),
+                    tm_stage_sealer._PortableRegistryEntry,
+                )
+                live_authority = entry.live_authority
+                self.assertIsNotNone(live_authority)
+                binding_calls: list[tuple[object, str, bytes]] = []
+                lease_type = type(reservation._lease)
+                real_reprove_binding = lease_type.reprove_binding
+
+                def record_binding(
+                    lease: object,
+                    parent: object,
+                    name: str,
+                    payload: bytes,
+                ) -> None:
+                    binding_calls.append((parent, name, payload))
+                    real_reprove_binding(lease, parent, name, payload)
+
+                with mock.patch.object(
+                    lease_type,
+                    "reprove_binding",
+                    new=record_binding,
+                ):
+                    for _pass in range(2):
+                        report = GateBEvaluator(
+                            registry=registry._readiness_view()
+                        ).evaluate(sealed)
+                        self.assertTrue(report.granted)
+                        self.assertIsNotNone(report.grant)
+                        reservation.reprove()
+                    token = registry.issue_token(
+                        sealed,
+                        current_generation=None,
+                    )
+                    registry.cancel(token)
+                self.assertGreaterEqual(len(binding_calls), 4)
+                self.assertTrue(
+                    all(
+                        parent is reservation._root
+                        and name == reservation._lock_name
+                        and payload
+                        == tm_migration._InitialActivationResourceReservation._payload(
+                            identity
+                        )
+                        for parent, name, payload in binding_calls
+                    )
+                )
+                self.assertTrue(live_authority.closed)
+                self.assertFalse(reservation._root.closed)
+                self.assertFalse(reservation._lease.closed)
+                reservation.reprove()
+            finally:
+                reservation.release()
+
+    def test_lock_tamper_denies_gate_b_without_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            try:
+                lock_path = root / (
+                    f".{identity.canonical_sidecar_path.name}."
+                    "localcat-initial-activation.lock"
+                )
+                lock_path.write_bytes(b"tampered-lock-payload")
+                report = GateBEvaluator(
+                    registry=registry._readiness_view()
+                ).evaluate(sealed)
+                self.assertFalse(report.granted)
+                self.assertIsNone(report.grant)
+                self.assertEqual(
+                    report.error_code,
+                    "GATE_B.ATTESTATION_UNAVAILABLE",
+                )
+                registry.retire_unissued_portable(sealed)
+            finally:
+                try:
+                    reservation.release()
+                except tm_migration._InitialActivationReservationError:
+                    pass
+
+    def test_first_gate_b_denial_retires_portable_entry_before_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            entry = registry._entries[sealed.artifact.artifact_id]
+            live_authority = entry.live_authority
+            try:
+                with mock.patch.object(
+                    tm_stage_sealer._PortableAuthorityBorrow,
+                    "reprove",
+                    side_effect=tm_stage_sealer.StageSealError(
+                        "SEALER.ARTIFACT_MUTATED"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ActivationPreparationError,
+                        "^ACTIVATION.GATE_B_DENIED$",
+                    ):
+                        coordinator.activate(sealed)
+                self.assertEqual(registry._entries, {})
+                self.assertEqual(registry._sealed_paths, {})
+                self.assertEqual(registry._portable_borrows, {})
+                self.assertTrue(live_authority.closed)
+                self.assertFalse(reservation._root.closed)
+                self.assertFalse(reservation._lease.closed)
+                reservation.reprove()
+            finally:
+                reservation.release()
+
+    def test_unreserved_import_rebuild_and_schema_seal_before_marker(self) -> None:
+        for operation in ("import", "rebuild", "schema"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    identity = _identity(root)
+                    coordinator = ResourceStoreCoordinator(
+                        canonical_store_id="store.primary",
+                        resource_identity=identity,
+                    )
+                    service = TMMigrationService(
+                        resource_identity=identity,
+                        canonical_store_id="store.primary",
+                        coordinator=coordinator,
+                    )
+                    with mock.patch(
+                        "tm_sqlite_store._probe_fts5",
+                        return_value=True,
+                    ):
+                        build = service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+                    stage = build.mutable_stage
+                    if stage is None:
+                        raise AssertionError("expected one mutable stage")
+                    with self.assertRaisesRegex(
+                        tm_stage_sealer.StageSealError,
+                        "^SEALER.ATTESTATION_UNAVAILABLE$",
+                    ):
+                        coordinator._seal_stage(
+                            stage,
+                            canonical_store_id="store.primary",
+                            expected_prior_generation=(
+                                0 if operation != "import" else None
+                            ),
+                            schema_upgrade=(operation == "schema"),
+                        )
+                    connection = sqlite3.connect(
+                        str(stage.staged_db_path)
+                    )
+                    try:
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT value FROM tm_meta "
+                                "WHERE key = 'activation_status'"
+                            ).fetchall(),
+                            [("UNPUBLISHED",)],
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(coordinator._sealed_registry._entries, {})
+                    self.assertEqual(
+                        coordinator._sealed_registry._reservations,
+                        {},
+                    )
 
     def test_owner_activation_reservation_seam_returns_exact_report(self) -> None:
         """The seam is reached; the downstream baseline is not masked here."""
