@@ -1245,10 +1245,23 @@ def _require_binding_transition(
     for document_id in current_by_id.keys() & incoming_by_id.keys():
         previous = current_by_id[document_id]
         next_value = incoming_by_id[document_id]
+        previous_identity = previous.source_identity
+        next_identity = next_value.source_identity
+        windows_observation_matches = (
+            previous_identity.regular_file_identity.startswith(
+                "windows-observation:"
+            )
+            and next_identity.regular_file_identity.startswith(
+                "windows-observation:"
+            )
+            and previous_identity.content_sha256 == next_identity.content_sha256
+            and previous_identity.byte_count == next_identity.byte_count
+        )
         if (
             previous.source_ref != next_value.source_ref
-            and previous.source_identity.regular_file_identity
-            != next_value.source_identity.regular_file_identity
+            and previous_identity.regular_file_identity
+            != next_identity.regular_file_identity
+            and not windows_observation_matches
         ):
             _fail("PROJECT.RECONCILE.INPUT_INVALID")
     mapping_changed = frozenset(current_by_ref.items()) != frozenset(

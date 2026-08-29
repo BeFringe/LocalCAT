@@ -102,6 +102,9 @@ Project workspace ───────────────> ProjectPackage
 - **ADR mapping**：follow ADR-020。Project owner 保留 ADR-018/019 carrier、receipt、LKG、dirty/baseline 和 recovery decisions；platform ports 替代本地 `dir_fd`/`O_NOFOLLOW`/directory-fsync helpers。
 - **Intake/save ports**：selected-files intake 消费 `RootedFileSystem` 的 retained root/file authorities；ProjectPackage save/import 消费 `ProcessFileLock` 与 `BoundDirectoryPublisher`，不把 Windows FileId 或 path 变成持久项目身份。
 - **Success boundary**：candidate cold validation、owner-lease publication、retained destination readback、durable Project state commit 和 terminal reproof 缺一不可；share violation 或不合作进程造成的 late drift 映射为现有 stale/recovery family。
+- **Bounded authority lifetime**：intake在整批terminal前保留root与全部live file handles；package validate/member reopen每次从fresh retained handle重算artifact digest，read/write chunk至多64 KiB，deterministic ZIP只落入anonymous bounded spool，不由`bytes`或临时pathname承载authority。
+- **Owner recovery split**：platform只提供root/lock/candidate/publish事实；Project owner以target hash派生闭集journal/LKG/candidate名称，只按精确名称恢复且不扫描候选。历史FileId仅记录为non-authoritative observation，receipt、dirty/baseline和old/new/recovery裁决不下沉到platform或Parser。
+- **Composition boundary**：`project_workspace_intake`与`project_package`低层入口只消费backend-neutral contracts；production Application composition选择`platform_fs` backend并注入Controller，Qt不直接导入ProjectPackage或platform filesystem authority。
 - **Verification**：真实 ProjectPackage 覆盖 save/reopen byte+digest parity、target-open rejection、concurrent writers、junction/swap、process kill与匹配 profile 的 power-boundary old/new/recovery-only matrix；POSIX carrier golden 保持不变。
 
 ## Critical Path 与验证锚点
