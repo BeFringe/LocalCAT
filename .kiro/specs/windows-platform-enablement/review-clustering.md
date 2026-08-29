@@ -30,7 +30,7 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 
 | Cluster | Tasks | 共享心智模型 / 验证目标 | impl | review |
 |---|---|---|---|---|
-| **C0 — Governance, ownership and dispatch** | 0.1～0.6 | ADR-020～025正式promotion/取代关系、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
+| **C0 — Governance, ownership and dispatch** | 0.1～0.7 | ADR-020～026正式promotion/取代关系、Windows ownership、WA/WR派发、merge ledger schema、独立设计反例与NO-GO/GO边界 | `medium` | `high` |
 | **C1S — Baseline and route evidence** | 1.1～1.4 | b925b80现场矩阵、portable evidence schema、Windows API inventory与stock native-entry NO-GO；只关闭source主线的调查前置，不宣称W3可行 | `high` | `xhigh` |
 | **C1F — W3 custom entry feasibility** | 1.5～1.6 | custom in-process entry/toolchain/ABI/TCB reapproval与最小TrustedSourceLoader spike；1.6按`2.1→2.2→2.3→2.4→3.1→3.2`进入 | `xhigh` | `xhigh` |
 | **C2 — Shared contracts and POSIX parity** | 2.1～2.4 | opaque authority/identity/lock/publish/private contracts、POSIX characterization/extraction、composition fail-closed | `high` | `high` |
