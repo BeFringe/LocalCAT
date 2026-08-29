@@ -666,8 +666,7 @@ class ResourcePortabilityService:
                     def commit_created_resource(
                         applied_snapshot: PortableResourceSnapshot,
                     ) -> None:
-                        nonlocal owner_published, pending_started, receipt
-                        owner_published = True
+                        nonlocal owner_published, receipt
                         receipt = _import_receipt(
                             operation_id=preview.operation_id,
                             report=report,
@@ -676,10 +675,9 @@ class ResourcePortabilityService:
                             snapshot=applied_snapshot,
                             durable_state=ResourceDurableState.COMMITTED,
                         )
-                        self._ledger.mark_receipt_ready(receipt)
+                        self._mark_pending_receipt_ready(receipt)
+                        owner_published = True
                         self.repository.publish_prepared_create(prepared_create)
-                        self._ledger.commit(receipt)
-                        pending_started = False
 
                     applied = self._apply_owner_snapshot(
                         destination,
@@ -692,6 +690,8 @@ class ResourcePortabilityService:
                         raise AssertionError(
                             "created resource owner commit did not issue receipt"
                         )
+                    self._commit_ready_receipt(receipt)
+                    pending_started = False
                 else:
                     applied = self._apply_owner_snapshot(
                         destination,
@@ -708,8 +708,8 @@ class ResourcePortabilityService:
                         snapshot=applied,
                         durable_state=ResourceDurableState.COMMITTED,
                     )
-                    self._ledger.mark_receipt_ready(receipt)
-                    self._ledger.commit(receipt)
+                    self._mark_pending_receipt_ready(receipt)
+                    self._commit_ready_receipt(receipt)
                     pending_started = False
             return ResourcePackageImportResult(
                 receipt=receipt,
