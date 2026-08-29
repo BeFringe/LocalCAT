@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any
 import unittest
 from unittest.mock import patch
 
+import platform_fs_windows
+import tm_migration
 from tm_contracts import (
     AssetKind,
     AssetPreservationEvidence,
@@ -79,6 +83,19 @@ def _fresh_service(
         canonical_store_id="store.primary",
         coordinator=coordinator,
     )
+
+
+def _remove_windows_initial_artifacts(root: Path) -> None:
+    for path in root.glob(".localcat-migration.initial-*"):
+        path.unlink()
+    quarantine_root = root / ".localcat-activation-quarantine-v1"
+    if not quarantine_root.exists():
+        return
+    for attempt_directory in quarantine_root.iterdir():
+        for path in attempt_directory.iterdir():
+            os.unlink("\\\\?\\" + str(path))
+        os.rmdir("\\\\?\\" + str(attempt_directory))
+    os.rmdir("\\\\?\\" + str(quarantine_root))
 
 
 def _ambiguous_failure() -> MigrationFailure:
@@ -281,15 +298,81 @@ class MigrationAuthorityFailureContractTests(unittest.TestCase):
 
 
 class InitialActivationRecoveryTests(unittest.TestCase):
+    def test_legacy_post_seal_failure_does_not_use_portable_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, coordinator, service = _fixture(root)
+            source_digest = tm_migration._try_file_digest(
+                identity.configured_jsonl_path
+            )
+            if source_digest is None:
+                raise AssertionError("expected source digest")
+            stage = tm_migration._deterministic_stage_ref(
+                identity,
+                source_digest=source_digest,
+                stage_prefix="migration",
+                path_salt="initial-legacy-routing",
+            )
+            attempt = tm_migration._InitialStageAttempt(
+                stage=stage,
+                parent_identity=(1, 1),
+                quarantine_dir=root / "quarantine",
+            )
+            registry_type = type(coordinator._sealed_registry)
+            with (
+                patch.object(
+                    registry_type,
+                    "retire_unissued_portable",
+                    side_effect=AssertionError("portable retirement used"),
+                ) as retire,
+                patch(
+                    "tm_migration._cleanup_initial_unpublished_stage"
+                ) as cleanup,
+                patch(
+                    "tm_migration._require_proven_initial_legacy_state"
+                ) as prove_legacy,
+            ):
+                outcome = service._reconcile_initial_activation_failure(
+                    MigrationPreflightError(
+                        "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
+                    ),
+                    stage_label="PREPARE",
+                    source_before=source_digest,
+                    preflight=None,
+                    attempt=attempt,
+                    sealed=object(),
+                    prepared=None,
+                    activation_attempted=False,
+                    coordinator=coordinator,
+                )
+
+            retire.assert_not_called()
+            cleanup.assert_called_once_with(attempt)
+            prove_legacy.assert_called_once()
+            self.assertIs(type(outcome), MigrationFailure)
+            self.assertEqual(
+                outcome.error_code,
+                "MIGRATION.INITIAL_STAGE_UNAVAILABLE",
+            )
+
     def test_stage_freeze_programmer_type_error_crosses_public_seam(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, _coordinator, service = _fixture(Path(temporary))
-            with patch(
-                "tm_migration._ExportParentHandle.bind",
-                side_effect=TypeError("programmer stage freeze type"),
-            ):
+            target = (
+                patch.object(
+                    platform_fs_windows.WindowsPlatformAdapter,
+                    "_reserve_mutable_file",
+                    side_effect=TypeError("programmer stage freeze type"),
+                )
+                if sys.platform == "win32"
+                else patch(
+                    "tm_migration._ExportParentHandle.bind",
+                    side_effect=TypeError("programmer stage freeze type"),
+                )
+            )
+            with target:
                 with self.assertRaisesRegex(
                     TypeError,
                     "programmer stage freeze type",
@@ -302,16 +385,25 @@ class InitialActivationRecoveryTests(unittest.TestCase):
     def test_cleanup_programmer_type_error_crosses_public_seam(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
+            cleanup_target = (
+                patch.object(
+                    platform_fs_windows.WindowsPlatformAdapter,
+                    "_retire_owned_exclusive",
+                    side_effect=TypeError("programmer cleanup type"),
+                )
+                if sys.platform == "win32"
+                else patch(
+                    "tm_migration._exclusive_initial_quarantine_move",
+                    side_effect=TypeError("programmer cleanup type"),
+                )
+            )
             with (
                 patch.object(
                     coordinator,
                     "_seal_stage",
                     side_effect=StageSealError("SEALER.STAGE_INVALID"),
                 ),
-                patch(
-                    "tm_migration._exclusive_initial_quarantine_move",
-                    side_effect=TypeError("programmer cleanup type"),
-                ),
+                cleanup_target,
             ):
                 with self.assertRaisesRegex(
                     TypeError,
@@ -321,6 +413,8 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
+            if sys.platform == "win32":
+                _remove_windows_initial_artifacts(Path(temporary))
 
     def test_legacy_rehydrate_programmer_errors_cross_public_seam(self) -> None:
         for programmer_error in (
@@ -330,6 +424,19 @@ class InitialActivationRecoveryTests(unittest.TestCase):
             with self.subTest(programmer_error=type(programmer_error).__name__):
                 with tempfile.TemporaryDirectory() as temporary:
                     identity, coordinator, service = _fixture(Path(temporary))
+                    rehydrate_target = (
+                        patch.object(
+                            platform_fs_windows.WindowsPlatformAdapter,
+                            "_open_regular",
+                            side_effect=programmer_error,
+                        )
+                        if sys.platform == "win32"
+                        else patch.object(
+                            ResourceStoreCoordinator,
+                            "rehydrate_runtime_authority",
+                            side_effect=programmer_error,
+                        )
+                    )
                     with (
                         patch.object(
                             coordinator,
@@ -338,11 +445,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                                 "SEALER.STAGE_INVALID"
                             ),
                         ),
-                        patch.object(
-                            ResourceStoreCoordinator,
-                            "rehydrate_runtime_authority",
-                            side_effect=programmer_error,
-                        ),
+                        rehydrate_target,
                     ):
                         with self.assertRaisesRegex(
                             type(programmer_error),
@@ -352,6 +455,8 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                                 identity.configured_jsonl_path,
                                 identity.resource_id,
                             )
+                    if sys.platform == "win32":
+                        _remove_windows_initial_artifacts(Path(temporary))
 
     def test_programmer_errors_are_never_normalized_as_authority_outcomes(
         self,
@@ -389,6 +494,13 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                         identity.resource_id,
                     )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "legacy post-publication seam is not the Windows pre-journal route",
+    )
+    def test_legacy_post_publication_programmer_error_crosses_public_seam(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
             real_publish = coordinator.publish_activation

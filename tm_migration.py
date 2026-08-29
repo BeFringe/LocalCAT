@@ -10,7 +10,7 @@ import importlib
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 import sqlite3
 import stat
 import sys
@@ -107,8 +107,12 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    MutableFileReservation,
     PlatformFileBackend,
     PlatformFileError,
+    PlatformFileErrorCode,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
     RootedDirectoryAuthority,
 )
 
@@ -222,11 +226,17 @@ class _InitialStageAttempt:
     """Private ownership closure for one first-activation stage attempt."""
 
     stage: MutableStageRef
-    parent_identity: tuple[int, int]
+    parent_identity: tuple[int, int] | None
     quarantine_dir: Path
     stage_identity: _CreatedFileIdentity | None = None
     manifest_identity: _CreatedFileIdentity | None = None
     primary_error: Exception | None = None
+    platform_backend: PlatformFileBackend | None = None
+    platform_parent: RootedDirectoryAuthority | None = None
+    stage_reservation: MutableFileReservation | None = None
+    manifest_reservation: MutableFileReservation | None = None
+    stage_retirement: RetainedRetirement | None = None
+    manifest_retirement: RetainedRetirement | None = None
 
 
 class _ExportParentHandle(snapshot_artifacts_module._ExportParentHandle):
@@ -1118,6 +1128,15 @@ class TMMigrationService:
                 coordinator=coordinator,
                 source_before=source_before,
             )
+        except MigrationPreflightError as error:
+            if error.error_code != "MIGRATION.INITIAL_RECOVERY_REQUIRED":
+                raise
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=None,
+                published_generation=None,
+            )
 
     def reattest_completed_authority(
         self,
@@ -1310,6 +1329,7 @@ class TMMigrationService:
         attempt: _InitialStageAttempt | None = None
         sealed: SealedStage | None = None
         prepared: _ActivationPreparation | None = None
+        activation_attempted = False
         stage_label = "BUILD"
         try:
             reservation.reprove()
@@ -1329,6 +1349,7 @@ class TMMigrationService:
             attempt = _freeze_initial_stage_attempt(
                 attempt_stage,
                 path_salt=path_salt,
+                resource_reservation=reservation,
             )
             initial_stage, _stage_identity, _manifest_identity = (
                 self._build_stage(
@@ -1360,24 +1381,29 @@ class TMMigrationService:
                 raise MigrationPreflightError(
                     "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
                 )
-            stage_identities = _capture_initial_stage_identities(mutable_stage)
-            if (
-                attempt.stage_identity != stage_identities[0]
-                or attempt.manifest_identity != stage_identities[1]
-            ):
-                raise MigrationPreflightError(
-                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
-                )
+            _reprove_initial_stage_ownership(attempt)
             stage_label = "SEAL"
             reservation.reprove()
             sealed = coordinator._seal_stage(
                 mutable_stage,
                 canonical_store_id=self._canonical_store_id,
                 expected_prior_generation=None,
-                **reservation.stage_seal_inputs(),
+                **reservation.stage_seal_inputs(attempt),
             )
             stage_label = "PREPARE"
             reservation.reprove()
+            if attempt.platform_backend is not None:
+                # The portable journal/terminal schema is deliberately not
+                # part of this pre-journal slice.  Stop before token issuance
+                # or any v2 journal consumer can observe a portable physical
+                # snapshot; reconciliation first retires the registry-owned
+                # synchronization handles and then retires the exact CREATE_NEW
+                # pair through the platform namespace authority.
+                raise ActivationPreparationError(
+                    "ACTIVATION.ATTESTATION_UNAVAILABLE",
+                    retryable=False,
+                )
+            activation_attempted = True
             prepared = coordinator.activate(sealed)
             stage_label = "JOURNAL"
             reservation.reprove()
@@ -1401,8 +1427,13 @@ class TMMigrationService:
                 generation=generation,
             )
         except Exception as error:
-            if not _is_initial_activation_operational_error(error):
+            if not (
+                _is_initial_activation_operational_error(error)
+                or isinstance(error, _InitialActivationReservationError)
+            ):
                 raise
+            if attempt is None:
+                attempt = reservation._initial_attempt
             try:
                 failure = self._reconcile_initial_activation_failure(
                     error,
@@ -1410,7 +1441,9 @@ class TMMigrationService:
                     source_before=source_before,
                     preflight=preflight,
                     attempt=attempt,
+                    sealed=sealed,
                     prepared=prepared,
+                    activation_attempted=activation_attempted,
                     coordinator=coordinator,
                 )
             except Exception as reconciliation_error:
@@ -1437,6 +1470,27 @@ class TMMigrationService:
             )
             reservation.reprove()
             return outcome
+        finally:
+            active_error = sys.exception()
+            terminal_attempt = (
+                attempt
+                if attempt is not None
+                else reservation._initial_attempt
+            )
+            try:
+                if terminal_attempt is not None:
+                    try:
+                        _close_initial_stage_attempt_authorities(terminal_attempt)
+                    except MigrationPreflightError as close_error:
+                        if not (
+                            close_error.error_code
+                            == "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                            and type(active_error)
+                            in (TypeError, AssertionError, AttributeError)
+                        ):
+                            raise
+            finally:
+                reservation._initial_attempt = None
 
     def _recover_existing_initial_activation(
         self,
@@ -1936,7 +1990,9 @@ class TMMigrationService:
         source_before: str,
         preflight: MigrationPreflight | None,
         attempt: _InitialStageAttempt | None,
+        sealed: SealedStage | None,
         prepared: _ActivationPreparation | None,
+        activation_attempted: bool,
         coordinator: ResourceStoreCoordinator,
     ) -> MigrationFailure | None:
         """Return a legacy-safe failure only from fully proven states.
@@ -1966,6 +2022,28 @@ class TMMigrationService:
             return None
         durable_or_cancelled_attempt = False
         if durable_phase is None:
+            if (
+                sealed is not None
+                and prepared is None
+                and attempt is not None
+                and attempt.platform_backend is not None
+            ):
+                try:
+                    retired = coordinator._sealed_registry.retire_unissued_portable(
+                        sealed
+                    )
+                    if not retired and not activation_attempted:
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                        )
+                except Exception as reconciliation_error:
+                    if not _is_initial_activation_operational_error(
+                        reconciliation_error
+                    ):
+                        raise
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+                    ) from reconciliation_error
             if prepared is not None:
                 try:
                     coordinator.cancel_prepared_activation(prepared)
@@ -4541,7 +4619,17 @@ class TMMigrationService:
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
             )
-        if stage.staged_db_path.exists() or stage.manifest_temp_path.exists():
+        platform_initial = (
+            initial_attempt is not None
+            and initial_attempt.platform_backend is not None
+        )
+        if (
+            not platform_initial
+            and (
+                stage.staged_db_path.exists()
+                or stage.manifest_temp_path.exists()
+            )
+        ):
             _validate_reusable_stage(
                 stage,
                 canonical_store_id=canonical_store_id,
@@ -4556,9 +4644,23 @@ class TMMigrationService:
         initialize_stage_schema(
             stage,
             canonical_store_id=canonical_store_id,
+            _caller_reservation=(
+                initial_attempt.stage_reservation
+                if platform_initial and initial_attempt is not None
+                else None
+            ),
+            _caller_parent=(
+                initial_attempt.platform_parent
+                if platform_initial and initial_attempt is not None
+                else None
+            ),
         )
-        stage_identity = _created_file_identity(stage.staged_db_path)
-        if initial_attempt is not None:
+        stage_identity = (
+            None
+            if platform_initial
+            else _created_file_identity(stage.staged_db_path)
+        )
+        if initial_attempt is not None and not platform_initial:
             initial_attempt.stage_identity = stage_identity
         manifest_identity: _CreatedFileIdentity | None = None
         try:
@@ -4616,12 +4718,28 @@ class TMMigrationService:
                 receipt=receipt,
                 receipt_digest=snapshot_receipt_digest(receipt),
             )
-            manifest_identity = _write_new_file(
-                stage.manifest_temp_path,
-                contract_to_json(manifest).encode("utf-8"),
-            )
-            if initial_attempt is not None:
-                initial_attempt.manifest_identity = manifest_identity
+            manifest_payload = contract_to_json(manifest).encode("utf-8")
+            if platform_initial:
+                if (
+                    initial_attempt is None
+                    or initial_attempt.manifest_reservation is None
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                    )
+                _write_reserved_initial_manifest(
+                    stage.manifest_temp_path,
+                    manifest_payload,
+                    initial_attempt.platform_parent,
+                    initial_attempt.manifest_reservation,
+                )
+            else:
+                manifest_identity = _write_new_file(
+                    stage.manifest_temp_path,
+                    manifest_payload,
+                )
+                if initial_attempt is not None:
+                    initial_attempt.manifest_identity = manifest_identity
         except BaseException as primary_error:
             if initial_attempt is not None:
                 if isinstance(primary_error, Exception):
@@ -4968,6 +5086,7 @@ class _InitialActivationResourceReservation:
         "_released",
         "_root",
         "_stage_borrow_minted",
+        "_initial_attempt",
     )
 
     def __init__(
@@ -4992,6 +5111,7 @@ class _InitialActivationResourceReservation:
         self._lease = lease
         self._released = False
         self._stage_borrow_minted = False
+        self._initial_attempt: _InitialStageAttempt | None = None
 
     @classmethod
     def acquire_with_backend(
@@ -5311,7 +5431,10 @@ class _InitialActivationResourceReservation:
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             ) from error
 
-    def stage_seal_inputs(self) -> dict[str, object]:
+    def stage_seal_inputs(
+        self,
+        attempt: _InitialStageAttempt | None = None,
+    ) -> dict[str, object]:
         """Mint one non-closing portable seal borrow from the held reservation."""
 
         if self._backend is None:
@@ -5326,14 +5449,39 @@ class _InitialActivationResourceReservation:
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             )
         self.reprove()
-        borrow: _CallerHeldSealBorrow = _create_caller_held_seal_borrow(
-            identity=self._identity,
-            platform=self._backend,
-            root=self._root,
-            lease=self._lease,
-            lock_name=self._lock_name,
-            lock_payload=self._payload(self._identity),
-        )
+        if attempt is not None:
+            if type(attempt) is not _InitialStageAttempt:
+                raise TypeError("attempt must be exact initial stage attempt")
+            if (
+                attempt is not self._initial_attempt
+                or attempt.platform_backend is not self._backend
+                or attempt.platform_parent is not self._root
+                or attempt.stage_reservation is None
+                or attempt.manifest_reservation is None
+            ):
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                )
+        try:
+            borrow: _CallerHeldSealBorrow = _create_caller_held_seal_borrow(
+                identity=self._identity,
+                platform=self._backend,
+                root=self._root,
+                lease=self._lease,
+                lock_name=self._lock_name,
+                lock_payload=self._payload(self._identity),
+                stage=None if attempt is None else attempt.stage,
+                database_reservation=(
+                    None if attempt is None else attempt.stage_reservation
+                ),
+                manifest_reservation=(
+                    None if attempt is None else attempt.manifest_reservation
+                ),
+            )
+        except PlatformFileError as error:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+            ) from error
         self._stage_borrow_minted = True
         return {"platform": self._backend, "caller_borrow": borrow}
 
@@ -5612,6 +5760,50 @@ def _write_new_file(path: Path, payload: bytes) -> _CreatedFileIdentity:
         os.close(descriptor)
 
 
+def _write_reserved_initial_manifest(
+    path: Path,
+    payload: bytes,
+    parent: RootedDirectoryAuthority | None,
+    reservation: MutableFileReservation,
+) -> None:
+    """Write one initial manifest while its exact CREATE_NEW pin remains live."""
+
+    if parent is None:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        )
+    try:
+        parent.reprove()
+        owned = reservation.identity()
+        named = parent.inspect_entry(path.name)
+        if named is None or named.identity != owned:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+            )
+        with path.open("r+b") as stream:
+            stream.seek(0)
+            stream.truncate(0)
+            stream.write(payload)
+            stream.flush()
+        owned_after = reservation.identity()
+        named_after = parent.inspect_entry(path.name)
+        if owned_after != owned or named_after is None or named_after.identity != owned:
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+            )
+        parent.reprove()
+    except MigrationPreflightError:
+        raise
+    except PlatformFileError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        ) from error
+    except OSError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.MANIFEST_TEMP_CONFLICT"
+        ) from error
+
+
 def _remove_created_file(
     path: Path,
     expected: _CreatedFileIdentity,
@@ -5731,10 +5923,97 @@ def _capture_initial_stage_identities(
     return (identities[0], identities[1])
 
 
+def _reprove_initial_stage_ownership(attempt: _InitialStageAttempt) -> None:
+    """Reprove the exact initial pair without persisting platform identities."""
+
+    if attempt.platform_backend is None:
+        stage_identities = _capture_initial_stage_identities(attempt.stage)
+        if (
+            attempt.stage_identity != stage_identities[0]
+            or attempt.manifest_identity != stage_identities[1]
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+            )
+        return
+    parent = attempt.platform_parent
+    stage_reservation = attempt.stage_reservation
+    manifest_reservation = attempt.manifest_reservation
+    if (
+        parent is None
+        or stage_reservation is None
+        or manifest_reservation is None
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        )
+    try:
+        parent.reprove()
+        for path, reservation in zip(
+            (
+                attempt.stage.staged_db_path,
+                attempt.stage.manifest_temp_path,
+            ),
+            (stage_reservation, manifest_reservation),
+            strict=True,
+        ):
+            owned = reservation.identity()
+            named = parent.inspect_entry(path.name)
+            if named is None or named.identity != owned:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+        parent.reprove()
+    except MigrationPreflightError:
+        raise
+    except PlatformFileError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+        ) from error
+
+
+def _close_initial_stage_attempt_authorities(
+    attempt: _InitialStageAttempt,
+) -> None:
+    """Close every live build/retirement authority exactly once."""
+
+    first_error: BaseException | None = None
+    for retirement_name, reservation_name in (
+        ("stage_retirement", "stage_reservation"),
+        ("manifest_retirement", "manifest_reservation"),
+    ):
+        retirement = cast(
+            RetainedRetirement | None,
+            getattr(attempt, retirement_name),
+        )
+        reservation = cast(
+            MutableFileReservation | None,
+            getattr(attempt, reservation_name),
+        )
+        try:
+            if retirement is not None:
+                retirement.close()
+            elif reservation is not None:
+                reservation.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        finally:
+            setattr(attempt, retirement_name, None)
+            setattr(attempt, reservation_name, None)
+    if first_error is not None:
+        if isinstance(first_error, (PlatformFileError, OSError)):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            ) from first_error
+        raise first_error
+
+
 def _freeze_initial_stage_attempt(
     stage: MutableStageRef,
     *,
     path_salt: str,
+    resource_reservation: _InitialActivationResourceReservation | None = None,
 ) -> _InitialStageAttempt:
     """Freeze an absent attempt namespace and its exact parent identity."""
 
@@ -5753,6 +6032,74 @@ def _freeze_initial_stage_attempt(
             f"{stage.manifest_temp_path.name}\0{path_salt}"
         ).encode("utf-8")
     ).hexdigest()
+    if resource_reservation is not None:
+        if type(resource_reservation) is not _InitialActivationResourceReservation:
+            raise TypeError(
+                "resource_reservation must be exact initial reservation or None"
+            )
+        backend = resource_reservation._backend
+        root = resource_reservation._root
+        if backend is not None:
+            if root is None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                )
+            attempt = _InitialStageAttempt(
+                stage=stage,
+                parent_identity=None,
+                quarantine_dir=(
+                    stage.staged_db_path.parent
+                    / ".localcat-activation-quarantine-v1"
+                    / f"initial-{token}"
+                ),
+                platform_backend=backend,
+                platform_parent=root,
+            )
+            resource_reservation._initial_attempt = attempt
+            try:
+                resource_reservation.reprove()
+                for path in (
+                    stage.staged_db_path,
+                    stage.manifest_temp_path,
+                ):
+                    if root.inspect_entry(path.name) is not None:
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_STAGE_CONFLICT"
+                        )
+                resource_reservation.reprove()
+                attempt.stage_reservation = backend.reserve_mutable_file(
+                    root,
+                    stage.staged_db_path.name,
+                )
+                attempt.stage_reservation.identity()
+                attempt.manifest_reservation = backend.reserve_mutable_file(
+                    root,
+                    stage.manifest_temp_path.name,
+                )
+                attempt.manifest_reservation.identity()
+                resource_reservation.reprove()
+                return attempt
+            except BaseException as error:
+                try:
+                    _cleanup_initial_unpublished_stage(attempt)
+                except BaseException as caught:
+                    if isinstance(caught, Exception) and (
+                        _is_initial_activation_operational_error(caught)
+                        or isinstance(caught, PlatformFileError)
+                    ):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                        ) from caught
+                    raise
+                if isinstance(error, PlatformFileError):
+                    code = (
+                        "MIGRATION.INITIAL_STAGE_CONFLICT"
+                        if error.code
+                        == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value
+                        else "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                    )
+                    raise MigrationPreflightError(code) from error
+                raise
     try:
         with _ExportParentHandle.bind(stage.staged_db_path) as parent:
             parent.reprove()
@@ -5915,6 +6262,9 @@ def _cleanup_initial_unpublished_stage(
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
         )
+    if attempt.platform_backend is not None:
+        _cleanup_platform_initial_unpublished_stage(attempt)
+        return
     try:
         with _ExportParentHandle.bind(
             attempt.stage.staged_db_path
@@ -6008,6 +6358,123 @@ def _cleanup_initial_unpublished_stage(
         ) from error
 
 
+def _cleanup_platform_initial_unpublished_stage(
+    attempt: _InitialStageAttempt,
+) -> None:
+    """Retire exact CREATE_NEW pins through the neutral namespace port."""
+
+    backend = attempt.platform_backend
+    parent = attempt.platform_parent
+    if backend is None or parent is None:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+        )
+    quarantine_root: RetirementDirectoryAuthority | None = None
+    quarantine_attempt: RetirementDirectoryAuthority | None = None
+    try:
+        parent.reprove()
+        owns_any = any(
+            value is not None
+            for value in (
+                attempt.stage_reservation,
+                attempt.manifest_reservation,
+                attempt.stage_retirement,
+                attempt.manifest_retirement,
+            )
+        )
+        if owns_any:
+            quarantine_root = backend.bind_or_create_child_directory(
+                parent,
+                attempt.quarantine_dir.parent.name,
+            )
+            quarantine_attempt = backend.bind_or_create_child_directory(
+                quarantine_root,
+                attempt.quarantine_dir.name,
+            )
+        for path, reservation_name, retirement_name in (
+            (
+                attempt.stage.staged_db_path,
+                "stage_reservation",
+                "stage_retirement",
+            ),
+            (
+                attempt.stage.manifest_temp_path,
+                "manifest_reservation",
+                "manifest_retirement",
+            ),
+        ):
+            reservation = cast(
+                MutableFileReservation | None,
+                getattr(attempt, reservation_name),
+            )
+            retirement = cast(
+                RetainedRetirement | None,
+                getattr(attempt, retirement_name),
+            )
+            if retirement is not None:
+                retirement.reprove()
+                if parent.inspect_entry(path.name) is not None:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                    )
+                continue
+            if reservation is None:
+                if parent.inspect_entry(path.name) is not None:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                    )
+                if (
+                    quarantine_attempt is not None
+                    and quarantine_attempt.inspect_entry(path.name) is not None
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                    )
+                continue
+            if quarantine_attempt is None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                )
+            retirement = backend.retire_owned_exclusive(
+                parent,
+                path.name,
+                reservation,
+                quarantine_attempt,
+                path.name,
+            )
+            setattr(attempt, retirement_name, retirement)
+            retirement.reprove()
+            if parent.inspect_entry(path.name) is not None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                )
+        parent.reprove()
+        if quarantine_attempt is not None:
+            quarantine_attempt.reprove()
+    except MigrationPreflightError:
+        raise
+    except PlatformFileError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+        ) from error
+    finally:
+        first_error: BaseException | None = None
+        for authority in (quarantine_attempt, quarantine_root):
+            if authority is None:
+                continue
+            try:
+                authority.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            if isinstance(first_error, (PlatformFileError, OSError)):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_CLEANUP_UNPROVEN"
+                ) from first_error
+            raise first_error
+
+
 def _require_proven_initial_legacy_state(
     *,
     coordinator: ResourceStoreCoordinator,
@@ -6017,6 +6484,14 @@ def _require_proven_initial_legacy_state(
 ) -> None:
     """Cold-reprove the only state from which legacy may safely continue."""
 
+    if attempt is not None and attempt.platform_backend is not None:
+        _require_proven_initial_platform_legacy_state(
+            coordinator=coordinator,
+            source_digest=source_digest,
+            attempt=attempt,
+            activation_retired_attempt=activation_retired_attempt,
+        )
+        return
     identity = coordinator._resource_identity
     source_proof = _strict_locator_proof(
         identity.configured_jsonl_path,
@@ -6081,69 +6556,229 @@ def _require_proven_initial_legacy_state(
             "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
         )
     if attempt is not None:
-        try:
-            with _ExportParentHandle.bind(
-                attempt.stage.staged_db_path
-            ) as parent:
-                if parent.identity != attempt.parent_identity:
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-                    )
-                parent.reprove()
-                for path in (
-                    attempt.stage.staged_db_path,
-                    attempt.stage.manifest_temp_path,
-                ):
-                    try:
-                        parent.lstat(path.name)
-                    except FileNotFoundError:
-                        continue
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-                    )
-        except MigrationPreflightError:
-            raise
-        except Exception as error:
-            if not _is_initial_activation_operational_error(error):
-                raise
-            raise MigrationPreflightError(
-                "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-            ) from error
-        if not activation_retired_attempt:
-            for path, expected in zip(
-                (
-                    attempt.stage.staged_db_path,
-                    attempt.stage.manifest_temp_path,
-                ),
-                (attempt.stage_identity, attempt.manifest_identity),
-                strict=True,
-            ):
-                target = attempt.quarantine_dir / path.name
-                if expected is None:
-                    if _lstat_any_entry(target):
-                        raise MigrationPreflightError(
-                            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-                        )
-                    continue
-                try:
-                    observed = os.lstat(target)
-                except OSError as error:
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-                    ) from error
-                if (
-                    not stat.S_ISREG(observed.st_mode)
-                    or observed.st_nlink != 1
-                    or (observed.st_dev, observed.st_ino)
-                    != (expected.device, expected.inode)
-                ):
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
-                    )
+        _require_proven_initial_posix_attempt_state(
+            attempt,
+            activation_retired_attempt=activation_retired_attempt,
+        )
     if _strict_locator_proof(identity.configured_jsonl_path, source_digest) is None:
         raise MigrationPreflightError(
             "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
         )
+
+
+def _require_proven_initial_platform_legacy_state(
+    *,
+    coordinator: ResourceStoreCoordinator,
+    source_digest: str,
+    attempt: _InitialStageAttempt,
+    activation_retired_attempt: bool,
+) -> None:
+    """Reprove a Windows/source-profile legacy state through live rooted ports."""
+
+    backend = attempt.platform_backend
+    parent = attempt.platform_parent
+    identity = coordinator._resource_identity
+    if (
+        backend is None
+        or parent is None
+        or identity.configured_jsonl_path.parent
+        != identity.canonical_sidecar_path.parent
+        or activation_retired_attempt
+    ):
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        )
+    source = None
+    quarantine_root: RetirementDirectoryAuthority | None = None
+    quarantine_attempt: RetirementDirectoryAuthority | None = None
+    try:
+        parent.reprove()
+        source = backend.open_regular(
+            parent,
+            PurePath(identity.configured_jsonl_path.name),
+        )
+        first_source = source.content_facts()
+        if (
+            first_source.snapshot.identity.link_count != 1
+            or first_source.content_sha256.hex() != source_digest
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+            )
+        prohibited = (
+            identity.canonical_sidecar_path,
+            identity.snapshot_manifest_path,
+            _activation_journal_path(identity),
+            _activation_journal_temp_path(_activation_journal_path(identity)),
+            _activation_lineage_marker_path(identity),
+            _activation_lineage_marker_temp_path(
+                _activation_lineage_marker_path(identity)
+            ),
+            _activation_terminal_temp_path(_activation_terminal_path(identity)),
+        )
+        for path in prohibited:
+            if path.parent != identity.canonical_sidecar_path.parent:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
+            if parent.inspect_entry(path.name) is not None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
+        if (
+            coordinator.state != "READY"
+            or coordinator.current_generation is not None
+            or coordinator.active_store_path is not None
+            or coordinator.durable_activation_phase is not None
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+            )
+        for path in (
+            attempt.stage.staged_db_path,
+            attempt.stage.manifest_temp_path,
+        ):
+            if parent.inspect_entry(path.name) is not None:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
+        if not activation_retired_attempt:
+            quarantine_root = backend.bind_or_create_child_directory(
+                parent,
+                attempt.quarantine_dir.parent.name,
+            )
+            quarantine_attempt = backend.bind_or_create_child_directory(
+                quarantine_root,
+                attempt.quarantine_dir.name,
+            )
+            for path, retirement in (
+                (
+                    attempt.stage.staged_db_path,
+                    attempt.stage_retirement,
+                ),
+                (
+                    attempt.stage.manifest_temp_path,
+                    attempt.manifest_retirement,
+                ),
+            ):
+                if retirement is not None:
+                    retirement.reprove()
+                elif quarantine_attempt.inspect_entry(path.name) is not None:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    )
+        terminal_source = source.content_facts()
+        if (
+            terminal_source.snapshot.identity != first_source.snapshot.identity
+            or terminal_source.content_sha256 != first_source.content_sha256
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+            )
+        parent.reprove()
+    except MigrationPreflightError:
+        raise
+    except PlatformFileError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        ) from error
+    finally:
+        active_error = sys.exception()
+        first_close_error: BaseException | None = None
+        for authority in (quarantine_attempt, quarantine_root):
+            if authority is not None:
+                try:
+                    authority.close()
+                except BaseException as error:
+                    if first_close_error is None:
+                        first_close_error = error
+        if source is not None:
+            try:
+                source.close()
+            except BaseException as error:
+                if first_close_error is None:
+                    first_close_error = error
+        if first_close_error is not None:
+            if isinstance(first_close_error, (PlatformFileError, OSError)):
+                if active_error is None or (
+                    isinstance(active_error, Exception)
+                    and _is_initial_activation_operational_error(active_error)
+                ):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    ) from first_close_error
+            else:
+                raise first_close_error
+
+
+def _require_proven_initial_posix_attempt_state(
+    attempt: _InitialStageAttempt,
+    *,
+    activation_retired_attempt: bool,
+) -> None:
+    """Preserve the legacy POSIX rooted-handle rollback proof unchanged."""
+
+    if attempt.parent_identity is None:
+        raise MigrationPreflightError("MIGRATION.INITIAL_ROLLBACK_UNPROVEN")
+    try:
+        with _ExportParentHandle.bind(
+            attempt.stage.staged_db_path
+        ) as parent:
+            if parent.identity != attempt.parent_identity:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
+            parent.reprove()
+            for path in (
+                attempt.stage.staged_db_path,
+                attempt.stage.manifest_temp_path,
+            ):
+                try:
+                    parent.lstat(path.name)
+                except FileNotFoundError:
+                    continue
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
+    except MigrationPreflightError:
+        raise
+    except Exception as error:
+        if not _is_initial_activation_operational_error(error):
+            raise
+        raise MigrationPreflightError(
+            "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+        ) from error
+    if not activation_retired_attempt:
+        for path, expected in zip(
+            (
+                attempt.stage.staged_db_path,
+                attempt.stage.manifest_temp_path,
+            ),
+            (attempt.stage_identity, attempt.manifest_identity),
+            strict=True,
+        ):
+            target = attempt.quarantine_dir / path.name
+            if expected is None:
+                if _lstat_any_entry(target):
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                    )
+                continue
+            try:
+                observed = os.lstat(target)
+            except OSError as error:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                ) from error
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink != 1
+                or (observed.st_dev, observed.st_ino)
+                != (expected.device, expected.inode)
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_ROLLBACK_UNPROVEN"
+                )
 
 
 def _initial_activation_error_code(error: Exception) -> str:

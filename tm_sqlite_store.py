@@ -84,6 +84,11 @@ from tm_content_attestation import (
     ContentFileProof,
     _capture_content_file,
 )
+from platform_fs_contracts import (
+    MutableFileReservation,
+    PlatformFileError,
+    RootedDirectoryAuthority,
+)
 
 
 from tm_activation_journal import (
@@ -10347,6 +10352,8 @@ def initialize_stage_schema(
     *,
     canonical_store_id: str,
     _legacy_schema: bool = False,
+    _caller_reservation: MutableFileReservation | None = None,
+    _caller_parent: RootedDirectoryAuthority | None = None,
 ) -> SQLiteSchemaSnapshot:
     """Create a new unpublished stage; never create the canonical path.
 
@@ -10361,17 +10368,45 @@ def initialize_stage_schema(
     _require_identity(canonical_store_id, "canonical_store_id")
     path = validated_stage.staged_db_path
     runtime = detect_sqlite_runtime()
-    reservation = _reserve_stage_file(
-        path,
-        expected_parent=(
-            validated_stage.resource_identity.canonical_sidecar_path.parent
-        ),
-    )
+    if (_caller_reservation is None) != (_caller_parent is None):
+        raise TypeError(
+            "caller reservation and parent must be supplied together"
+        )
+    if _caller_reservation is not None:
+        if not isinstance(_caller_reservation, MutableFileReservation):
+            raise TypeError(
+                "_caller_reservation must be MutableFileReservation or None"
+            )
+        if not isinstance(_caller_parent, RootedDirectoryAuthority):
+            raise TypeError(
+                "_caller_parent must be RootedDirectoryAuthority or None"
+            )
+    reservation = None
+    if _caller_reservation is None:
+        reservation = _reserve_stage_file(
+            path,
+            expected_parent=(
+                validated_stage.resource_identity.canonical_sidecar_path.parent
+            ),
+        )
+    else:
+        _reprove_caller_stage_reservation(
+            path,
+            _caller_parent,
+            _caller_reservation,
+        )
     try:
         with _open_configured_connection(
             path,
             expected_file=reservation,
+            require_existing=_caller_reservation is not None,
         ) as connection:
+            if _caller_reservation is not None:
+                _reprove_caller_stage_reservation(
+                    path,
+                    _caller_parent,
+                    _caller_reservation,
+                )
             connection.execute("BEGIN IMMEDIATE")
             schema_statements = (
                 _LEGACY_SCHEMA_STATEMENTS
@@ -10407,14 +10442,48 @@ def initialize_stage_schema(
                 tuple(sorted(meta.items())),
             )
             connection.commit()
-        return inspect_stage_schema(
+            if _caller_reservation is not None:
+                _reprove_caller_stage_reservation(
+                    path,
+                    _caller_parent,
+                    _caller_reservation,
+                )
+        inspected = inspect_stage_schema(
             validated_stage,
             canonical_store_id=canonical_store_id,
             _allow_legacy_schema=_legacy_schema,
         )
+        if _caller_reservation is not None:
+            _reprove_caller_stage_reservation(
+                path,
+                _caller_parent,
+                _caller_reservation,
+            )
+        return inspected
     except Exception:
-        _remove_reserved_stage_file(path, reservation)
+        if reservation is not None:
+            _remove_reserved_stage_file(path, reservation)
         raise
+
+
+def _reprove_caller_stage_reservation(
+    path: Path,
+    parent: RootedDirectoryAuthority,
+    reservation: MutableFileReservation,
+) -> None:
+    """Close one owner-private SQLite pathname around a live CREATE_NEW pin."""
+
+    try:
+        parent.reprove()
+        owned = reservation.identity()
+        named = parent.inspect_entry(path.name)
+        if named is None or named.identity != owned:
+            raise SQLiteStoreSchemaError("STORE.STAGE_PATH_UNSAFE")
+        parent.reprove()
+    except SQLiteStoreSchemaError:
+        raise
+    except PlatformFileError as error:
+        raise SQLiteStoreSchemaError("STORE.STAGE_PATH_UNSAFE") from error
 
 
 def inspect_stage_schema(

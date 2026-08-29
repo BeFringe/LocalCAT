@@ -20,6 +20,7 @@ from platform_fs_contracts import (
     BoundSynchronizedRegularFile,
     ExistingFileDurability,
     LockLease,
+    MutableFileReservation,
     OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -135,6 +136,9 @@ class _CallerHeldSealBorrow:
         "__platform",
         "__root",
         "__released",
+        "__stage",
+        "__database_reservation",
+        "__manifest_reservation",
     )
 
     def __init__(
@@ -146,6 +150,9 @@ class _CallerHeldSealBorrow:
         lease: LockLease,
         lock_name: str,
         lock_payload: bytes,
+        stage: MutableStageRef | None,
+        database_reservation: MutableFileReservation | None,
+        manifest_reservation: MutableFileReservation | None,
         _factory_key: object,
     ) -> None:
         if _factory_key is not _CALLER_HELD_SEAL_BORROW_FACTORY_KEY:
@@ -162,6 +169,21 @@ class _CallerHeldSealBorrow:
             raise TypeError("lock name must be a non-empty exact string")
         if type(lock_payload) is not bytes or not lock_payload:
             raise TypeError("lock payload must be non-empty exact bytes")
+        if (stage is None) != (database_reservation is None) or (
+            stage is None
+        ) != (manifest_reservation is None):
+            raise TypeError(
+                "stage and creator reservations must be supplied together"
+            )
+        if stage is not None:
+            if type(stage) is not MutableStageRef:
+                raise TypeError("stage must be exact MutableStageRef or None")
+            if not isinstance(database_reservation, MutableFileReservation):
+                raise TypeError("database reservation must be live authority")
+            if not isinstance(manifest_reservation, MutableFileReservation):
+                raise TypeError("manifest reservation must be live authority")
+            database_reservation.identity()
+            manifest_reservation.identity()
         self.__identity = identity
         self.__lease = lease
         self.__lock_name = lock_name
@@ -169,6 +191,9 @@ class _CallerHeldSealBorrow:
         self.__platform = platform
         self.__root = root
         self.__released = False
+        self.__stage = stage
+        self.__database_reservation = database_reservation
+        self.__manifest_reservation = manifest_reservation
 
     def _require_stage(
         self,
@@ -187,6 +212,8 @@ class _CallerHeldSealBorrow:
             != self.__identity.canonical_sidecar_path.parent
         ):
             raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        if self.__stage is not None and stage != self.__stage:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
 
     def reprove(
         self,
@@ -196,6 +223,23 @@ class _CallerHeldSealBorrow:
         self._require_stage(platform, stage)
         try:
             self.__root.reprove()
+            if self.__stage is not None:
+                for name, reservation in (
+                    (
+                        stage.staged_db_path.name,
+                        self.__database_reservation,
+                    ),
+                    (
+                        stage.manifest_temp_path.name,
+                        self.__manifest_reservation,
+                    ),
+                ):
+                    if reservation is None:
+                        raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                    owned = reservation.identity()
+                    named = self.__root.inspect_entry(name)
+                    if named is None or named.identity != owned:
+                        raise StageSealError("SEALER.ARTIFACT_MUTATED")
             self.__lease.reprove_binding(
                 self.__root,
                 self.__lock_name,
@@ -217,6 +261,18 @@ class _CallerHeldSealBorrow:
             PurePath(name),
         )
         try:
+            if self.__stage is not None:
+                reservation = (
+                    self.__database_reservation
+                    if name == stage.staged_db_path.name
+                    else self.__manifest_reservation
+                    if name == stage.manifest_temp_path.name
+                    else None
+                )
+                if reservation is None:
+                    raise StageSealError("SEALER.RESERVATION_MISMATCH")
+                if opened.identity() != reservation.identity():
+                    raise StageSealError("SEALER.ARTIFACT_MUTATED")
             self.reprove(platform, stage)
         except BaseException:
             try:
@@ -254,6 +310,9 @@ def _create_caller_held_seal_borrow(
     lease: LockLease,
     lock_name: str,
     lock_payload: bytes,
+    stage: MutableStageRef | None = None,
+    database_reservation: MutableFileReservation | None = None,
+    manifest_reservation: MutableFileReservation | None = None,
 ) -> _CallerHeldSealBorrow:
     return _CallerHeldSealBorrow(
         identity=identity,
@@ -262,6 +321,9 @@ def _create_caller_held_seal_borrow(
         lease=lease,
         lock_name=lock_name,
         lock_payload=lock_payload,
+        stage=stage,
+        database_reservation=database_reservation,
+        manifest_reservation=manifest_reservation,
         _factory_key=_CALLER_HELD_SEAL_BORROW_FACTORY_KEY,
     )
 
@@ -3777,6 +3839,11 @@ class _SealedArtifactRegistry:
                 raise StageSealError("SEALER.TOKEN_ALREADY_ISSUED")
             if current_generation != entry.stage.expected_prior_generation:
                 raise StageSealError("SEALER.GENERATION_MISMATCH")
+            if type(entry) is _PortableRegistryEntry:
+                live_authority = entry.live_authority
+                if live_authority is None:
+                    raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                live_authority.reprove()
             nonce = entry.stage.activation_nonce
             if nonce in self._claimed_nonces:
                 raise StageSealError("SEALER.NONCE_REPLAY")
