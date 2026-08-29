@@ -516,7 +516,7 @@ def _compose_editor_controller(repository: object):
     from datetime import datetime, timezone
 
     from capability_host import compose_capability_host
-    from editor_controller import EditorController
+    from editor_controller import compose_project_enabled_editor_controller
     from editor_tm_adapter import EditorTMAdapter
     from resource_repository import ResourceRepository
     from tm_application_composition import TMResourceResolver, TMRuntimeHost
@@ -533,7 +533,7 @@ def _compose_editor_controller(repository: object):
         resolver=TMResourceResolver(),
         configs=repository.list_resources(),
     )
-    controller = EditorController(
+    controller = compose_project_enabled_editor_controller(
         repository,
         tm_adapter=EditorTMAdapter(
             runtime_host=runtime_host,
