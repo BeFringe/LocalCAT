@@ -327,6 +327,63 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 _MIXED_TERMS,
             )
 
+    @unittest.skipUnless(os.name == "nt", "Windows terminal reproof behavior")
+    def test_create_terminal_failure_does_not_commit_success_receipt(self) -> None:
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+        from platform_fs_windows import _WindowsPendingPublication
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_repo = ResourceRepository(root / "source-app")
+            source = source_repo.create_resource("Terms", ResourceKind.TERMBASE)
+            source.path.write_bytes(_MIXED_TERMS)
+            package = root / "terms.localcat-resource"
+            ResourcePortabilityService(source_repo).export_package(source.id, package)
+
+            destination_repo = ResourceRepository(root / "destination-app")
+            service = ResourcePortabilityService(destination_repo)
+            preview = service.preview_resource_package_import(
+                package,
+                ResourceImportMode.CREATE_NEW,
+                new_resource_name="Imported terms",
+            )
+            original_terminal = _WindowsPendingPublication._terminal_reproof
+
+            def fail_created_destination_terminal(
+                pending: object,
+                retained: object,
+                preliminary: object,
+            ) -> object:
+                entry_path = Path(retained._entry_path)  # type: ignore[attr-defined]
+                if entry_path.suffix.lower() == ".csv":
+                    ready = service._ledger.list_pending()
+                    if ready and ready[0].phase is ResourcePendingPhase.RECEIPT_READY:
+                        raise PlatformFileError(
+                            PlatformFileErrorCode.RECOVERY_REQUIRED,
+                            retryable=True,
+                        )
+                return original_terminal(pending, retained, preliminary)
+
+            with patch.object(
+                _WindowsPendingPublication,
+                "_terminal_reproof",
+                new=fail_created_destination_terminal,
+            ):
+                with self.assertRaises(ResourcePortabilityError) as caught:
+                    service.apply_resource_package_import(preview)
+
+            self.assertEqual(
+                caught.exception.code,
+                "RESOURCE.IMPORT.RECOVERY_REQUIRED",
+            )
+            self.assertEqual(service._ledger.list_receipts(), ())
+            pending = service._ledger.list_pending()
+            self.assertEqual(len(pending), 1)
+            self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
+            resources = destination_repo.list_resources()
+            self.assertEqual(len(resources), 1)
+            self.assertEqual(resources[0].path.read_bytes(), _MIXED_TERMS)
+
     def test_preview_rejects_source_or_destination_inode_replacement_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
