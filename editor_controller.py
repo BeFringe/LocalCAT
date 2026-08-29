@@ -1230,9 +1230,16 @@ class EditorController:
         repository: ResourceRepository,
         workspace_state: WorkspaceStateRepository | None = None,
         tm_adapter: EditorTMAdapter | None = None,
+        workspace_package_service: ProjectPackageService | None = None,
+        workspace_file_system: object | None = None,
     ) -> None:
         if tm_adapter is not None and type(tm_adapter) is not EditorTMAdapter:
             raise TypeError("TM adapter must be EditorTMAdapter")
+        if (
+            workspace_package_service is not None
+            and type(workspace_package_service) is not ProjectPackageService
+        ):
+            raise TypeError("workspace package service must be ProjectPackageService")
         self.repository = repository
         self.workspace_state = workspace_state or WorkspaceStateRepository(
             repository.config_dir
@@ -1288,7 +1295,10 @@ class EditorController:
         self._project: EditorProject | None = None
         self._workspace_service: ProjectWorkspaceService | None = None
         self._workspace_save_service: ProjectSaveService | None = None
-        self._workspace_package_service = ProjectPackageService()
+        self._workspace_package_service = (
+            workspace_package_service or ProjectPackageService()
+        )
+        self._workspace_file_system = workspace_file_system
         self._workspace_persistence_binding: ProjectPackagePersistenceBinding | None = None
         self._workspace_flat_segments: tuple[FlatProjectSegment, ...] = ()
         self._workspace_global_index = 0
@@ -1991,6 +2001,7 @@ class EditorController:
                         source_locale=source_locale,
                         target_locale=target_locale,
                     ),
+                    file_system=self._workspace_file_system,
                 )
                 staging_service = ProjectWorkspaceService(
                     staged.workspace,
@@ -2541,7 +2552,10 @@ class EditorController:
                 raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
             self._issued_workspace_reconciliation = None
             try:
-                revalidated = revalidate_staged_selected_documents(staged)
+                revalidated = revalidate_staged_selected_documents(
+                    staged,
+                    file_system=self._workspace_file_system,
+                )
                 token = reconciliation_service.prepare_reconciliation(
                     preview.operation_id,
                     decisions=decisions,
@@ -6273,6 +6287,24 @@ class EditorController:
             if not isinstance(target, str) or not target.strip():
                 raise ValueError(f"translation memory line {line_number} has no target")
         return TMEngine(str(path))
+
+
+def compose_project_enabled_editor_controller(
+    repository: ResourceRepository,
+    *,
+    tm_adapter: EditorTMAdapter | None = None,
+) -> EditorController:
+    """Compose Project-owned Windows filesystem ports at the Application edge."""
+
+    from platform_fs import compose_platform_file_backend
+
+    backend = compose_platform_file_backend(repository.config_dir)
+    return EditorController(
+        repository,
+        tm_adapter=tm_adapter,
+        workspace_package_service=ProjectPackageService(backend=backend),
+        workspace_file_system=backend,
+    )
 
 if __name__ == "__main__":
     import tempfile

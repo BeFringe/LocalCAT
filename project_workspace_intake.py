@@ -1,8 +1,8 @@
 """Application-owned explicit selected-files intake for project workspaces.
 
-Only the caller-provided tuple is opened.  The module retains one root dirfd for
-the whole batch, pre-binds every selected regular file without following links,
-and then delegates all format grammar and terminal proof to the Parser surface.
+Only the caller-provided tuple is opened.  The module retains one neutral rooted
+authority for the whole batch, pre-binds every selected regular file without
+following links, and delegates only format grammar to the Parser surface.
 """
 
 from __future__ import annotations
@@ -11,8 +11,9 @@ from dataclasses import dataclass, replace
 import hashlib
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
+import struct
 
 from parser_composition import create_parser_application_surface
 from parser_contracts import (
@@ -34,6 +35,13 @@ from parser_contracts import (
     TargetPresence,
     TerminalSuccess,
     TranslationState,
+)
+from platform_fs_contracts import (
+    BoundRegularFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    PlatformFileError,
+    RootedFileSystem,
 )
 from project_workspace_contracts import (
     MAX_PROJECT_DOCUMENTS,
@@ -134,14 +142,77 @@ class SelectedProjectDocumentsRequest:
 class _BoundSelectedFile:
     source_ref: str
     selected_path: Path
-    descriptor: int
-    initial_status: os.stat_result
+    authority: BoundRegularFile
+    initial_snapshot: EntrySnapshot
 
     def close(self) -> None:
-        if self.descriptor >= 0:
-            descriptor = self.descriptor
-            self.descriptor = -1
-            os.close(descriptor)
+        self.authority.close()
+
+
+_WINDOWS_FILETIME_UNIX_EPOCH = 116_444_736_000_000_000
+
+
+def _relative_path(source_ref: str):
+    pure_type = PureWindowsPath if os.name == "nt" else PurePosixPath
+    return pure_type(*source_ref.split("/"))
+
+
+def _identity_text(identity: FileObjectIdentity) -> str:
+    if identity.platform == "posix":
+        return (
+            f"{int.from_bytes(identity.volume_id, 'big')}:"
+            f"{int.from_bytes(identity.file_id, 'big')}"
+        )
+    return f"{identity.platform}:{identity.volume_id.hex()}:{identity.file_id.hex()}"
+
+
+def _modified_time_ns(snapshot: EntrySnapshot) -> int:
+    if snapshot.identity.platform == "posix":
+        try:
+            return int(snapshot.modified_token.split(b":", 1)[0])
+        except (ValueError, IndexError):
+            pass
+    elif snapshot.identity.platform == "windows" and len(snapshot.modified_token) == 20:
+        last_write, _change, _attributes = struct.unpack("<qqI", snapshot.modified_token)
+        return max(0, (last_write - _WINDOWS_FILETIME_UNIX_EPOCH) * 100)
+    _fail("PROJECT.INTAKE.SOURCE_UNSAFE")
+
+
+def _snapshot_digest(authority: BoundRegularFile, expected: EntrySnapshot) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < expected.byte_count:
+        block = authority.read_at(
+            offset,
+            min(64 * 1024, expected.byte_count - offset),
+            expected,
+        )
+        if not block:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        digest.update(block)
+        offset += len(block)
+    if authority.read_at(offset, 1, expected):
+        _fail("PROJECT.INTAKE.SOURCE_STALE")
+    return digest.hexdigest()
+
+
+def _origin_binding_source_identity(
+    source_ref: str,
+    identity: SourceSnapshotIdentity,
+) -> SourceSnapshotIdentity:
+    if not identity.regular_file_identity.startswith("windows:"):
+        return identity
+    # ADR-020 forbids a historical Windows FileId from authorizing a later
+    # reopen or recovery.  Persist only an explicitly non-authoritative,
+    # ref-scoped observation; every operation rebinds the root and proves
+    # content plus live file facts again.
+    return replace(
+        identity,
+        regular_file_identity=(
+            "windows-observation:"
+            + hashlib.sha256(source_ref.encode("utf-8", errors="strict")).hexdigest()
+        ),
+    )
 
 
 def _open_flags(*, directory: bool) -> int:
@@ -459,10 +530,12 @@ def _issue_staged(
     )
 
 
-def stage_selected_project_documents(
+def stage_selected_project_documents_with_file_system(
     root: Path,
     selected_paths: tuple[Path, ...],
     request: SelectedProjectDocumentsRequest,
+    *,
+    file_system: RootedFileSystem,
 ) -> StagedSelectedProjectDocuments:
     """Stage exactly the selected project documents without scanning the root."""
 
@@ -485,9 +558,22 @@ def stage_selected_project_documents(
             _fail("PROJECT.INTAKE.INPUT_INVALID")
         formats.append(format_id)
 
-    root_descriptor, root_device, root_inode = _root_identity(root_path)
+    backend = file_system
+    if not isinstance(backend, RootedFileSystem):
+        raise TypeError("file_system must implement RootedFileSystem")
+    root_authority = None
     bound: list[_BoundSelectedFile] = []
     try:
+        root_authority = backend.bind_root(root_path)
+        root_authority.reprove()
+        if os.name == "nt":
+            # Root FileId is intentionally not persisted as later authority.
+            # Every intake instead proves the live rooted authority plus every
+            # selected file generation from scratch.
+            root_device, root_inode = 0, 0
+        else:
+            root_status = os.stat(root_path, follow_symlinks=False)
+            root_device, root_inode = root_status.st_dev, root_status.st_ino
         project_id, assigned_ids, binding_revision = _validate_existing_binding(
             request,
             root=root_path,
@@ -495,16 +581,23 @@ def stage_selected_project_documents(
             root_inode=root_inode,
             source_refs=source_refs,
         )
-        observed_file_ids: set[tuple[int, int]] = set()
+        observed_file_ids: set[FileObjectIdentity] = set()
         for source_ref, selected_path in selected:
-            descriptor, status = _open_below_root(root_descriptor, source_ref)
-            file_id = (status.st_dev, status.st_ino)
+            authority = backend.open_regular(
+                root_authority,
+                _relative_path(source_ref),
+            )
+            snapshot = authority.snapshot()
+            file_id = snapshot.identity
+            if snapshot.identity.link_count != 1 or not snapshot.reparse_free:
+                authority.close()
+                _fail("PROJECT.INTAKE.SOURCE_UNSAFE")
             if file_id in observed_file_ids:
-                os.close(descriptor)
+                authority.close()
                 _fail("PROJECT.WORKSPACE.IDENTITY_DUPLICATE")
             observed_file_ids.add(file_id)
             bound.append(
-                _BoundSelectedFile(source_ref, selected_path, descriptor, status)
+                _BoundSelectedFile(source_ref, selected_path, authority, snapshot)
             )
 
         if request.origin_binding is not None and request.rename_mappings:
@@ -519,11 +612,10 @@ def stage_selected_project_documents(
                 if mapping is None:
                     continue
                 previous = previous_by_ref[mapping.old_source_ref]
-                current_regular_identity = (
-                    f"{bound_file.initial_status.st_dev}:"
-                    f"{bound_file.initial_status.st_ino}"
+                current_regular_identity = _identity_text(
+                    bound_file.initial_snapshot.identity
                 )
-                if (
+                if os.name != "nt" and (
                     previous.document_id != mapping.document_id
                     or previous.source_identity.regular_file_identity
                     != current_regular_identity
@@ -570,7 +662,7 @@ def stage_selected_project_documents(
                 raise
             except ContractViolation as error:
                 raise ProjectWorkspaceError("PROJECT.INTAKE.INPUT_INVALID") from error
-            expected = bound_file.initial_status
+            expected = bound_file.initial_snapshot
             if (
                 source_identity.relative_reference_sha256
                 != hashlib.sha256(
@@ -578,41 +670,74 @@ def stage_selected_project_documents(
                 ).hexdigest()
                 or
                 source_identity.regular_file_identity
-                != f"{expected.st_dev}:{expected.st_ino}"
-                or source_identity.original_size != expected.st_size
-                or source_identity.original_mtime_ns != expected.st_mtime_ns
+                != _identity_text(expected.identity)
+                or source_identity.original_size != expected.byte_count
+                or source_identity.original_mtime_ns != _modified_time_ns(expected)
             ):
                 _fail("PROJECT.INTAKE.SOURCE_STALE")
+            if request.origin_binding is not None and os.name == "nt":
+                rename = next(
+                    (
+                        item
+                        for item in request.rename_mappings
+                        if item.new_source_ref == bound_file.source_ref
+                    ),
+                    None,
+                )
+                if rename is not None:
+                    previous = next(
+                        item
+                        for item in request.origin_binding.documents
+                        if item.source_ref == rename.old_source_ref
+                    )
+                    if (
+                        previous.document_id != rename.document_id
+                        or previous.source_identity.content_sha256
+                        != source_identity.content_sha256
+                        or previous.source_identity.byte_count != source_identity.byte_count
+                    ):
+                        _fail("PROJECT.RECONCILE.INPUT_INVALID")
             documents.append(document)
-            source_identities.append(source_identity)
+            binding_source_identity = _origin_binding_source_identity(
+                bound_file.source_ref,
+                source_identity,
+            )
+            source_identities.append(binding_source_identity)
             binding_documents.append(
                 OriginBindingDocument(
                     source_ref=bound_file.source_ref,
                     document_id=document.document_id,
                     format_id=document.format_id,
                     codec_identity=document.codec_identity,
-                    source_identity=source_identity,
+                    source_identity=binding_source_identity,
                 )
             )
 
-        _revalidate_root(root_path, root_device, root_inode)
+        root_authority.reprove()
         for bound_file, identity in zip(bound, source_identities, strict=True):
             try:
-                final_status = os.fstat(bound_file.descriptor)
-            except OSError:
+                terminal = bound_file.authority.snapshot()
+                if (
+                    terminal != bound_file.initial_snapshot
+                    or _snapshot_digest(
+                        bound_file.authority,
+                        bound_file.initial_snapshot,
+                    )
+                    != identity.content_sha256
+                ):
+                    _fail("PROJECT.INTAKE.SOURCE_STALE")
+                rebound = backend.open_regular(
+                    root_authority,
+                    _relative_path(bound_file.source_ref),
+                )
+                try:
+                    if rebound.snapshot() != bound_file.initial_snapshot:
+                        _fail("PROJECT.INTAKE.SOURCE_STALE")
+                finally:
+                    rebound.close()
+            except PlatformFileError:
                 _fail("PROJECT.INTAKE.SOURCE_STALE")
-            if (
-                _status_key(final_status) != _status_key(bound_file.initial_status)
-                or _descriptor_digest(bound_file.descriptor) != identity.content_sha256
-            ):
-                _fail("PROJECT.INTAKE.SOURCE_STALE")
-        retained_root_status = os.fstat(root_descriptor)
-        if (
-            not stat.S_ISDIR(retained_root_status.st_mode)
-            or (retained_root_status.st_dev, retained_root_status.st_ino)
-            != (root_device, root_inode)
-        ):
-            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        root_authority.reprove()
 
         workspace = ProjectWorkspace(
             schema_version=1,
@@ -641,12 +766,38 @@ def stage_selected_project_documents(
         return _issue_staged(workspace, binding, tuple(source_identities))
     except ProjectWorkspaceError:
         raise
+    except PlatformFileError as error:
+        raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
     except OSError as error:
         raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
     finally:
         for item in bound:
             item.close()
-        os.close(root_descriptor)
+        if root_authority is not None:
+            root_authority.close()
+
+
+def stage_selected_project_documents(
+    root: Path,
+    selected_paths: tuple[Path, ...],
+    request: SelectedProjectDocumentsRequest,
+    *,
+    file_system: RootedFileSystem | None = None,
+) -> StagedSelectedProjectDocuments:
+    """Compatibility Application facade; low-level intake is explicitly injected."""
+
+    if file_system is None:
+        from platform_fs import compose_platform_file_backend
+
+        selected = compose_platform_file_backend(_absolute_root(root))
+    else:
+        selected = file_system
+    return stage_selected_project_documents_with_file_system(
+        root,
+        selected_paths,
+        request,
+        file_system=selected,
+    )
 
 
 def _workspace_rebind_document_ids(
@@ -823,6 +974,8 @@ def stage_workspace_rebind(
 
 def revalidate_staged_selected_documents(
     staged: StagedSelectedProjectDocuments,
+    *,
+    file_system: RootedFileSystem | None = None,
 ) -> StagedSelectedProjectDocuments:
     """Reparse the exact selected binding for preview/apply stale proof.
 
@@ -846,6 +999,7 @@ def revalidate_staged_selected_documents(
             origin_binding=binding,
             expected_binding_revision=binding.revision,
         ),
+        file_system=file_system,
     )
 
 
@@ -856,5 +1010,6 @@ __all__ = (
     "StagedSelectedProjectDocuments",
     "revalidate_staged_selected_documents",
     "stage_selected_project_documents",
+    "stage_selected_project_documents_with_file_system",
     "stage_workspace_rebind",
 )

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import importlib
+import os
 from pathlib import Path
 import tempfile
 from types import ModuleType
@@ -234,7 +235,11 @@ def _binding(workspace: ProjectWorkspace) -> OriginBinding:
         schema_version=1,
         project_id=workspace.project_id,
         profile_version="explicit-selected-files-v1",
-        absolute_root="/virtual/localcat-selected-sources",
+        absolute_root=(
+            r"C:\virtual\localcat-selected-sources"
+            if os.name == "nt"
+            else "/virtual/localcat-selected-sources"
+        ),
         root_device=41,
         root_inode=43,
         revision=1,

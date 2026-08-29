@@ -327,8 +327,14 @@ class Cluster2AExplicitSelectedFilesIntakeTests(unittest.TestCase):
             binding = staged.origin_binding
 
             self.assertIs(type(binding), module.OriginBinding)
-            self.assertEqual(binding.root_device, root_stat.st_dev)
-            self.assertEqual(binding.root_inode, root_stat.st_ino)
+            self.assertEqual(
+                binding.root_device,
+                0 if os.name == "nt" else root_stat.st_dev,
+            )
+            self.assertEqual(
+                binding.root_inode,
+                0 if os.name == "nt" else root_stat.st_ino,
+            )
             self.assertEqual(binding.project_id, staged.workspace.project_id)
             self.assertEqual(binding.profile_version, "explicit-selected-files-v1")
             self.assertGreaterEqual(binding.revision, 1)
@@ -420,7 +426,12 @@ class Cluster2AExplicitSelectedFilesIntakeTests(unittest.TestCase):
             second = _write_fixture(root, "second.txt", "line-text-valid.hex")
             outside = _write_fixture(base, "outside.txt", "line-text-valid.hex")
             symlink = root / "link.txt"
-            symlink.symlink_to(first)
+            try:
+                symlink.symlink_to(first)
+            except OSError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) != 1314:
+                    raise
+                symlink = None
             folder = root / "folder.txt"
             folder.mkdir()
             hardlink = root / "same-inode.txt"
@@ -433,7 +444,7 @@ class Cluster2AExplicitSelectedFilesIntakeTests(unittest.TestCase):
                 ([first, second],),
                 ((first,),),
                 ((first, first),),
-                ((first, symlink),),
+                *(() if symlink is None else (((first, symlink),),)),
                 ((first, outside),),
                 ((first, folder),),
                 ((first, hardlink),),
@@ -647,7 +658,10 @@ class Cluster2AOriginBindingRenameTests(unittest.TestCase):
                         request=request,
                     )
 
-            self.assertEqual(parser_opens, [])
+            self.assertEqual(
+                tuple(Path(path).name for path in parser_opens),
+                ("renamed.json",) if os.name == "nt" else (),
+            )
             self.assertEqual(current.workspace, before)
 
     def test_forged_previous_binding_cannot_swap_authority_through_double_rename(
@@ -1076,6 +1090,10 @@ class Cluster2AIntakeHostileBoundaryTests(unittest.TestCase):
             opened.assert_not_called()
 
     def test_selected_file_modify_or_replace_after_parse_is_source_stale(self) -> None:
+        if os.name == "nt":
+            self.skipTest(
+                "POSIX-only mutation injection; Windows retained handles deny the write"
+            )
         intake = _cluster2a_intake()
         for fault in ("modify", "replace"):
             with self.subTest(fault=fault):
@@ -1720,13 +1738,18 @@ class Cluster2AExplicitSelectedFilesFaultTests(unittest.TestCase):
             first = _write_fixture(root, "first.txt", "line-text-valid.hex")
             second = _write_fixture(root, "second.po", "gettext-po-valid.po")
             root_link = base / "root-link"
-            root_link.symlink_to(root, target_is_directory=True)
-            with self.assertRaises((ProjectWorkspaceError, TypeError, ValueError)):
-                _stage(
-                    module,
-                    root_link,
-                    (root_link / "first.txt", root_link / "second.po"),
-                )
+            try:
+                root_link.symlink_to(root, target_is_directory=True)
+            except OSError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) != 1314:
+                    raise
+            else:
+                with self.assertRaises((ProjectWorkspaceError, TypeError, ValueError)):
+                    _stage(
+                        module,
+                        root_link,
+                        (root_link / "first.txt", root_link / "second.po"),
+                    )
 
             original = ParserApplicationSurface.open_input
             moved_root = base / "moved-root"

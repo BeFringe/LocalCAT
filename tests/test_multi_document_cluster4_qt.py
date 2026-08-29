@@ -1036,20 +1036,39 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         before_identity = self.controller.current_workspace_identity
         before_document_id = self.controller.current_workspace_document_id
         before_global_index = self.controller.workspace_global_index
-        real_unlink = project_package_module._unlink_in_bound_parent
         failed = False
+        if os.name == "nt":
+            port_type = project_package_module._WindowsProjectPackagePersistencePort
+            real_unlink = port_type._unlink
 
-        def fail_first_journal_cleanup(path, expected, **kwargs):
-            nonlocal failed
-            if "localcat-save-journal-v1" in path.name and not failed:
-                failed = True
-                raise OSError("DO_NOT_RENDER_RECOVERY_FAULT_BODY")
-            return real_unlink(path, expected, **kwargs)
+            def fail_first_journal_cleanup(port, path):
+                nonlocal failed
+                if path == port._journal and not failed:
+                    failed = True
+                    raise OSError("DO_NOT_RENDER_RECOVERY_FAULT_BODY")
+                return real_unlink(port, path)
 
-        with mock.patch(
-            "project_package._unlink_in_bound_parent",
-            side_effect=fail_first_journal_cleanup,
-        ):
+            fault_patch = mock.patch.object(
+                port_type,
+                "_unlink",
+                new=fail_first_journal_cleanup,
+            )
+        else:
+            real_unlink = project_package_module._unlink_in_bound_parent
+
+            def fail_first_journal_cleanup(path, expected, **kwargs):
+                nonlocal failed
+                if "localcat-save-journal-v1" in path.name and not failed:
+                    failed = True
+                    raise OSError("DO_NOT_RENDER_RECOVERY_FAULT_BODY")
+                return real_unlink(path, expected, **kwargs)
+
+            fault_patch = mock.patch(
+                "project_package._unlink_in_bound_parent",
+                side_effect=fail_first_journal_cleanup,
+            )
+
+        with fault_patch:
             self.assertFalse(self.window.save_workspace_project_package())
 
         self.assertTrue(failed)

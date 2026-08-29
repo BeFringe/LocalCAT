@@ -173,6 +173,10 @@ def _rewrite_member_and_crc(
 
 
 class Cluster2CSealedArtifactTests(unittest.TestCase):
+    @unittest.skipIf(
+        os.name == "nt",
+        "requires POSIX writable-open sharing; Windows retained handle rejects the rewrite",
+    )
     def test_same_inode_same_length_rewrite_during_validate_never_returns_report(self) -> None:
         module = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +216,10 @@ class Cluster2CSealedArtifactTests(unittest.TestCase):
 
 
 class Cluster2CParentBindingTests(unittest.TestCase):
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX _port_copy_regular; WA-03 re-proves destination content/identity",
+    )
     def test_overwrite_rejects_same_bytes_on_a_new_destination_inode(self) -> None:
         module = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -275,6 +283,10 @@ class Cluster2CParentBindingTests(unittest.TestCase):
             self.assertIsNot(result.save_report.journal_state, SaveJournalState.COMMITTED)
             self.assertIsNone(result.receipt)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX _port_validate_artifact; WA-03 covers retained publication faults",
+    )
     def test_first_save_unknown_postpublication_target_requires_recovery(self) -> None:
         module = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -325,6 +337,10 @@ class Cluster2CParentBindingTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"unknown concurrent target")
             self.assertIsNone(result.receipt)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX _unlink_in_bound_parent; WA-03 covers owner journal cleanup",
+    )
     def test_terminal_cleanup_failure_is_cold_recoverable_after_lkg_removal(self) -> None:
         module = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -401,6 +417,10 @@ class Cluster2CParentBindingTests(unittest.TestCase):
             self.assertFalse(recovered.recovery_required)
             self.assertIsNone(module.ProjectPackageService().inspect_recovery(target))
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "uses POSIX directory rename sharing; Windows rooted preview stale cases run elsewhere",
+    )
     def test_preview_binds_real_parents_and_rename_replacement_is_zero_mutation(self) -> None:
         module = _module()
         with tempfile.TemporaryDirectory() as directory:

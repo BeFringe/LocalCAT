@@ -517,6 +517,10 @@ class Cluster2CPublicColdRecoveryTests(unittest.TestCase):
             raise AssertionError("unsupported recovery phase")
         return module, target, lkg_bytes, edited_workspace
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX os.open/os.replace; WA-03 uses real process termination",
+    )
     def test_fresh_service_recovers_staging_publishing_and_published(self) -> None:
         expected = {
             RecoveryPhase.STAGING: (
@@ -811,6 +815,10 @@ class Cluster2CSameProjectImportAndReceiptTests(unittest.TestCase):
             ) as reader:
                 self.assertEqual(_stream_bytes(reader), new_payload)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX os.replace; Windows owner publish faults are covered by WA-03",
+    )
     def test_same_project_preview_uses_six_states_and_stale_or_failure_is_zero_active_mutation(
         self,
     ) -> None:
