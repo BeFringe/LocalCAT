@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -131,6 +132,68 @@ def _qt_startup(app_data: Path, result: Path) -> None:
     _write_result(result, {"outcome": "ok", "platform": sys.platform})
 
 
+def _package_adapter(package: Path, app_data: Path):
+    from qt_editor import _compose_chunk_controller, _compose_editor_controller
+    from resource_repository import ResourceRepository
+
+    repository = ResourceRepository(app_data)
+    controller, _composition = _compose_editor_controller(repository)
+    adapter = _compose_chunk_controller(controller, repository)
+    adapter.open_project_package(package)
+    return adapter
+
+
+def _package_create(
+    package: Path,
+    app_data: Path,
+    result: Path,
+) -> None:
+    adapter = _package_adapter(package, app_data)
+    selected = []
+    seen_documents = set()
+    for choice in adapter.segment_choices():
+        if choice.identity.document_id in seen_documents:
+            continue
+        selected.append(choice.identity)
+        seen_documents.add(choice.identity.document_id)
+    if len(selected) < 2:
+        raise AssertionError("package acceptance requires two documents")
+    receipt = adapter.apply_mutation(
+        adapter.preview_create_chunk("Windows package slice", tuple(selected))
+    )
+    view = adapter.project_view()
+    _write_result(
+        result,
+        {
+            "chunk_count": len(view.chunks),
+            "chunk_name": view.chunks[0].name,
+            "member_count": view.chunks[0].member_count,
+            "operation_id": receipt.operation_id,
+            "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+            "project_id": view.project_id,
+        },
+    )
+
+
+def _package_open(
+    package: Path,
+    app_data: Path,
+    result: Path,
+) -> None:
+    adapter = _package_adapter(package, app_data)
+    view = adapter.project_view()
+    _write_result(
+        result,
+        {
+            "chunk_count": len(view.chunks),
+            "chunk_name": None if not view.chunks else view.chunks[0].name,
+            "member_count": 0 if not view.chunks else view.chunks[0].member_count,
+            "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+            "project_id": view.project_id,
+        },
+    )
+
+
 def main() -> int:
     mode = sys.argv[1]
     if mode == "seed":
@@ -148,6 +211,18 @@ def main() -> int:
         _load(Path(sys.argv[2]), Path(sys.argv[3]))
     elif mode == "qt-startup":
         _qt_startup(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif mode == "package-create":
+        _package_create(
+            Path(sys.argv[2]),
+            Path(sys.argv[3]),
+            Path(sys.argv[4]),
+        )
+    elif mode == "package-open":
+        _package_open(
+            Path(sys.argv[2]),
+            Path(sys.argv[3]),
+            Path(sys.argv[4]),
+        )
     else:
         raise ValueError("unknown worker mode")
     return 0
