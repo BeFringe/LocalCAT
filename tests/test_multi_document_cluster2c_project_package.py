@@ -487,6 +487,10 @@ class Cluster2COpaqueMemberAndRecoveryTests(unittest.TestCase):
             self.assertNotIn(str(root), str(failure.exception))
             self.assertNotIn("secret", str(failure.exception))
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "injects POSIX os.replace; Windows publish faults are covered by WA-03",
+    )
     def test_replace_failure_preserves_last_known_good_package(self) -> None:
         module = _cluster2c()
         with tempfile.TemporaryDirectory() as directory:

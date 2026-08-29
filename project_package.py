@@ -15,6 +15,7 @@ import io
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import secrets
 import stat
@@ -26,7 +27,23 @@ import zipfile
 import zlib
 
 from parser_contracts import CodecIdentity
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    CandidateFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    LockLease,
+    LockPolicy,
+    LockWait,
+    PendingPublication,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+)
 from project_save import (
+    CleanPersistenceRejection,
     PendingRecoveryFacts,
     ProjectRecoveryReport,
     ProjectSaveReport,
@@ -120,6 +137,16 @@ _DOS_DATE_1980_01_01 = 33
 _VERSION_MADE_BY_UNIX_20 = (3 << 8) | 20
 _VERSION_NEEDED_STORED = 10
 _REGULAR_0644_EXTERNAL = (stat.S_IFREG | 0o644) << 16
+_PROJECT_PACKAGE_LOCK_PAYLOAD = b"localcat.project-package.lock.v1\n"
+
+
+def _windows_owner_stem(target_name: str) -> str:
+    """Return one target-specific, component-length-safe owner-state stem."""
+
+    if type(target_name) is not str or not target_name:
+        raise TypeError("Windows owner state requires a target name")
+    target_key = target_name.casefold().encode("utf-8", errors="strict")
+    return ".localcat-project-" + hashlib.sha256(target_key).hexdigest()
 
 
 def _fail(code: str) -> None:
@@ -892,15 +919,184 @@ class _Blob:
             stream.close()
 
 
+class _RootedBlobReader:
+    """Sequential owner blob reader over a retained rooted file authority."""
+
+    __slots__ = (
+        "_backend",
+        "_root",
+        "_source",
+        "_relative",
+        "_snapshot",
+        "_expected_sha256",
+        "_expected_count",
+        "_offset",
+        "_digest",
+        "_closed",
+    )
+
+    def __init__(
+        self,
+        backend: PlatformFileBackend,
+        root: object,
+        source: BoundRegularFile,
+        relative: object,
+        snapshot: EntrySnapshot,
+        *,
+        expected_sha256: str,
+        expected_count: int,
+    ) -> None:
+        self._backend = backend
+        self._root = root
+        self._source = source
+        self._relative = relative
+        self._snapshot = snapshot
+        self._expected_sha256 = expected_sha256
+        self._expected_count = expected_count
+        self._offset = 0
+        self._digest = hashlib.sha256()
+        self._closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("rooted blob reader is closed")
+        if type(size) is not int:
+            raise TypeError("blob read size must be exact int")
+        remaining = self._expected_count - self._offset
+        requested = remaining if size < 0 else min(size, remaining)
+        chunks: list[bytes] = []
+        left = requested
+        while left:
+            count = min(64 * 1024, left)
+            block = self._source.read_at(
+                self._offset,
+                count,
+                self._snapshot,
+            )
+            if not block:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            chunks.append(block)
+            self._digest.update(block)
+            self._offset += len(block)
+            left -= len(block)
+        if self._offset == self._expected_count:
+            self._verify_complete()
+        return b"".join(chunks)
+
+    def _verify_complete(self) -> None:
+        if (
+            self._offset != self._expected_count
+            or self._digest.hexdigest() != self._expected_sha256
+            or self._source.read_at(self._offset, 1, self._snapshot)
+            or self._source.snapshot() != self._snapshot
+        ):
+            _fail("PROJECT.PACKAGE.SOURCE_STALE")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        rebound = None
+        try:
+            while self._offset < self._expected_count:
+                self.read(min(64 * 1024, self._expected_count - self._offset))
+            self._verify_complete()
+            self._root.reprove()
+            rebound = self._backend.open_regular(self._root, self._relative)
+            if rebound.snapshot() != self._snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_STALE") from error
+        finally:
+            if rebound is not None:
+                rebound.close()
+            try:
+                self._source.close()
+            finally:
+                self._root.close()
+                self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+
 @dataclass(frozen=True, slots=True)
 class _ParentFacts:
     device: int
     inode: int
 
 
+def _platform_relative(name: str):
+    pure_type = PureWindowsPath if os.name == "nt" else PurePosixPath
+    return pure_type(name)
+
+
+def _platform_file_facts(snapshot: EntrySnapshot, digest: str) -> _FileFacts:
+    identity = snapshot.identity
+    modified = int.from_bytes(snapshot.modified_token, "big", signed=False)
+    return _FileFacts(
+        int.from_bytes(identity.volume_id, "big", signed=False),
+        int.from_bytes(identity.file_id, "big", signed=False),
+        snapshot.byte_count,
+        modified,
+        digest,
+    )
+
+
+class _BoundedReadAtSource:
+    """pread-like view that never asks a platform handle for over 64 KiB."""
+
+    __slots__ = ("authority", "expected")
+
+    def __init__(self, authority: BoundRegularFile, expected: EntrySnapshot) -> None:
+        self.authority = authority
+        self.expected = expected
+
+    def read_at(self, count: int, offset: int) -> bytes:
+        if type(count) is not int or type(offset) is not int or count < 0 or offset < 0:
+            raise TypeError("bounded read arguments are invalid")
+        if offset > self.expected.byte_count:
+            _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        remaining = min(count, self.expected.byte_count - offset)
+        chunks: list[bytes] = []
+        cursor = offset
+        while remaining:
+            requested = min(64 * 1024, remaining)
+            block = self.authority.read_at(cursor, requested, self.expected)
+            if not block:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            chunks.append(block)
+            cursor += len(block)
+            remaining -= len(block)
+        return b"".join(chunks)
+
+
+class _SeekableReadAtSource:
+    """Read-at view over an owner-held anonymous seekable snapshot."""
+
+    __slots__ = ("stream", "byte_count")
+
+    def __init__(self, stream: BinaryIO, byte_count: int) -> None:
+        self.stream = stream
+        self.byte_count = byte_count
+
+    def read_at(self, count: int, offset: int) -> bytes:
+        if offset < 0 or count < 0 or offset > self.byte_count:
+            _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        self.stream.seek(offset)
+        return self.stream.read(min(count, self.byte_count - offset))
+
+
 def _canonical_user_path(path: Path) -> Path:
     if not isinstance(path, Path) or not path.is_absolute() or not path.name:
         _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
+    if os.name == "nt":
+        try:
+            return Path(os.path.abspath(os.fspath(path)))
+        except (OSError, RuntimeError) as error:
+            raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_UNSAFE") from error
     try:
         parent = path.parent.resolve(strict=True)
     except (OSError, RuntimeError) as error:
@@ -1017,6 +1213,47 @@ def _unlink_in_bound_parent(
         os.fsync(parent)
 
 
+def _open_rooted_blob_path(
+    path: Path,
+    backend: PlatformFileBackend,
+    *,
+    expected_sha256: str,
+    expected_byte_count: int,
+) -> _RootedBlobReader:
+    root = None
+    source = None
+    try:
+        root = backend.bind_root(path.parent)
+        relative = _platform_relative(path.name)
+        source = backend.open_regular(root, relative)
+        snapshot = source.snapshot()
+        if (
+            snapshot.identity.link_count != 1
+            or not snapshot.reparse_free
+            or snapshot.byte_count != expected_byte_count
+        ):
+            _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        reader = _RootedBlobReader(
+            backend,
+            root,
+            source,
+            relative,
+            snapshot,
+            expected_sha256=expected_sha256,
+            expected_count=expected_byte_count,
+        )
+        root = None
+        source = None
+        return reader
+    except PlatformFileError as error:
+        raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_UNSAFE") from error
+    finally:
+        if source is not None:
+            source.close()
+        if root is not None:
+            root.close()
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectPackageBlobSource:
     document_id: str
@@ -1025,6 +1262,11 @@ class ProjectPackageBlobSource:
     expected_sha256: str
     expected_byte_count: int
     _file_facts: _FileFacts = field(init=False, repr=False)
+    _platform_backend: PlatformFileBackend | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         validate_document_id(self.document_id)
@@ -1039,8 +1281,27 @@ class ProjectPackageBlobSource:
         if self.expected_byte_count > MAX_CODEC_PRIVATE_MEMBER_BYTES:
             _fail("PROJECT.PACKAGE.LIMIT_EXCEEDED")
         object.__setattr__(self, "path", _canonical_user_path(self.path))
-        descriptor, facts = _open_regular(self.path, include_digest=True)
-        os.close(descriptor)
+        if os.name == "nt":
+            backend = self._platform_backend
+            if backend is None:
+                from platform_fs import compose_platform_file_backend
+
+                backend = compose_platform_file_backend(self.path.parent)
+                object.__setattr__(self, "_platform_backend", backend)
+            with _open_rooted_blob_path(
+                self.path,
+                backend,
+                expected_sha256=self.expected_sha256,
+                expected_byte_count=self.expected_byte_count,
+            ) as reader:
+                digest, count = _stream_digest(
+                    reader,
+                    expected_count=self.expected_byte_count,
+                )
+            facts = _FileFacts(0, 0, count, 0, digest)
+        else:
+            descriptor, facts = _open_regular(self.path, include_digest=True)
+            os.close(descriptor)
         if (
             facts.digest != self.expected_sha256
             or facts.size != self.expected_byte_count
@@ -1057,6 +1318,7 @@ class ProjectPackageBlobSource:
         path: Path,
         expected_sha256: str,
         expected_byte_count: int,
+        backend: PlatformFileBackend | None = None,
     ) -> ProjectPackageBlobSource:
         return cls(
             document_id=document_id,
@@ -1064,9 +1326,26 @@ class ProjectPackageBlobSource:
             path=path,
             expected_sha256=expected_sha256,
             expected_byte_count=expected_byte_count,
+            _platform_backend=backend,
         )
 
     def _blob(self) -> _Blob:
+        if self._platform_backend is not None:
+            def open_rooted_source() -> BinaryIO:
+                return _open_rooted_blob_path(
+                    self.path,
+                    self._platform_backend,
+                    expected_sha256=self.expected_sha256,
+                    expected_byte_count=self.expected_byte_count,
+                )
+
+            return _Blob(
+                self.member_path,
+                self.expected_sha256,
+                self.expected_byte_count,
+                open_rooted_source,
+            )
+
         def open_source() -> BinaryIO:
             descriptor, facts = _open_regular(self.path, include_digest=True)
             if facts != self._file_facts:
@@ -1183,11 +1462,32 @@ def _stream_digest(stream: BinaryIO, *, expected_count: int | None = None) -> tu
     return hasher.hexdigest(), count
 
 
-def _artifact_digest(descriptor: int, byte_count: int) -> str:
+def _source_pread(
+    source: int | bytes | _BoundedReadAtSource | _SeekableReadAtSource,
+    count: int,
+    offset: int,
+) -> bytes:
+    if type(source) is bytes:
+        return source[offset : offset + count]
+    if type(source) is _BoundedReadAtSource:
+        return source.read_at(count, offset)
+    if type(source) is _SeekableReadAtSource:
+        return source.read_at(count, offset)
+    return os.pread(source, count, offset)
+
+
+def _artifact_digest(
+    descriptor: int | bytes | _BoundedReadAtSource | _SeekableReadAtSource,
+    byte_count: int,
+) -> str:
     digest = hashlib.sha256()
     offset = 0
     while offset < byte_count:
-        block = os.pread(descriptor, min(_COPY_BYTES, byte_count - offset), offset)
+        block = _source_pread(
+            descriptor,
+            min(_COPY_BYTES, byte_count - offset),
+            offset,
+        )
         if not block:
             _fail("PROJECT.PACKAGE.DIGEST_MISMATCH")
         digest.update(block)
@@ -1228,10 +1528,13 @@ def _require_path_snapshot(path: Path, expected: _FileFacts) -> None:
         os.close(descriptor)
 
 
-def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]:
+def _parse_raw_zip(
+    descriptor: int | bytes | _BoundedReadAtSource | _SeekableReadAtSource,
+    artifact_size: int,
+) -> tuple[_RawEntry, ...]:
     if artifact_size < _EOCD.size or artifact_size > MAX_PACKAGE_ARTIFACT_BYTES:
         _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
-    eocd_bytes = os.pread(descriptor, _EOCD.size, artifact_size - _EOCD.size)
+    eocd_bytes = _source_pread(descriptor, _EOCD.size, artifact_size - _EOCD.size)
     if len(eocd_bytes) != _EOCD.size:
         _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
     try:
@@ -1253,7 +1556,7 @@ def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]
     local_entries: list[_RawEntry] = []
     offset = 0
     while offset < central_offset:
-        header = os.pread(descriptor, _LOCAL_HEADER.size, offset)
+        header = _source_pread(descriptor, _LOCAL_HEADER.size, offset)
         if len(header) != _LOCAL_HEADER.size:
             _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
         try:
@@ -1285,7 +1588,11 @@ def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]
             or uncompressed > MAX_PACKAGE_PHYSICAL_MEMBER_BYTES
         ):
             _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
-        name_bytes = os.pread(descriptor, name_count, offset + _LOCAL_HEADER.size)
+        name_bytes = _source_pread(
+            descriptor,
+            name_count,
+            offset + _LOCAL_HEADER.size,
+        )
         try:
             name = name_bytes.decode("ascii", errors="strict")
         except UnicodeError as error:
@@ -1303,7 +1610,7 @@ def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]
     central_entries: list[_RawEntry] = []
     offset = central_offset
     for _index in range(total):
-        header = os.pread(descriptor, _CENTRAL_HEADER.size, offset)
+        header = _source_pread(descriptor, _CENTRAL_HEADER.size, offset)
         if len(header) != _CENTRAL_HEADER.size:
             _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
         try:
@@ -1346,7 +1653,7 @@ def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]
         ):
             _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
         name_offset = offset + _CENTRAL_HEADER.size
-        name_bytes = os.pread(descriptor, name_count, name_offset)
+        name_bytes = _source_pread(descriptor, name_count, name_offset)
         try:
             name = name_bytes.decode("ascii", errors="strict")
         except UnicodeError as error:
@@ -1380,7 +1687,7 @@ def _parse_raw_zip(descriptor: int, artifact_size: int) -> tuple[_RawEntry, ...]
 
 
 def _read_entry(
-    descriptor: int,
+    descriptor: int | bytes | _BoundedReadAtSource | _SeekableReadAtSource,
     entry: _RawEntry,
     *,
     materialize: bool,
@@ -1390,7 +1697,7 @@ def _read_entry(
     count = 0
     output = bytearray() if materialize else None
     while count < entry.byte_count:
-        block = os.pread(
+        block = _source_pread(
             descriptor,
             min(_COPY_BYTES, entry.byte_count - count),
             entry.data_offset + count,
@@ -1494,6 +1801,120 @@ class _StoredMemberReader:
             self._closed = True
 
     def __enter__(self) -> _StoredMemberReader:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+
+class _PlatformStoredMemberReader:
+    """Member reader retaining the rooted package generation to terminal proof."""
+
+    __slots__ = (
+        "_root",
+        "_source",
+        "_snapshot",
+        "_path_name",
+        "_reader",
+        "_entry",
+        "_expected_digest",
+        "_offset",
+        "_buffer",
+        "_crc",
+        "_digest",
+        "_closed",
+    )
+
+    def __init__(
+        self,
+        root: object,
+        source: BoundRegularFile,
+        snapshot: EntrySnapshot,
+        path_name: str,
+        entry: _RawEntry,
+        *,
+        expected_digest: str,
+    ) -> None:
+        self._root = root
+        self._source = source
+        self._snapshot = snapshot
+        self._path_name = path_name
+        self._reader = _BoundedReadAtSource(source, snapshot)
+        self._entry = entry
+        self._expected_digest = expected_digest
+        self._offset = 0
+        self._buffer = b""
+        self._crc = 0
+        self._digest = hashlib.sha256()
+        self._closed = False
+
+    def readable(self) -> bool:
+        return not self._closed
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("member reader is closed")
+        if type(size) is not int:
+            raise TypeError("member read size must be exact int")
+        remaining = self._entry.byte_count - self._offset
+        requested = remaining if size < 0 else min(size, remaining)
+        if requested == 0:
+            self._verify_complete()
+            return b""
+        output = bytearray()
+        while len(output) < requested:
+            if not self._buffer:
+                fetch = min(
+                    64 * 1024,
+                    self._entry.byte_count - self._offset,
+                )
+                self._buffer = self._reader.read_at(
+                    fetch,
+                    self._entry.data_offset + self._offset,
+                )
+                if len(self._buffer) != fetch:
+                    _fail("PROJECT.PACKAGE.DIGEST_MISMATCH")
+            consumed = min(requested - len(output), len(self._buffer))
+            output.extend(self._buffer[:consumed])
+            self._buffer = self._buffer[consumed:]
+            self._offset += consumed
+        payload = bytes(output)
+        self._crc = zlib.crc32(payload, self._crc)
+        self._digest.update(payload)
+        if self._offset == self._entry.byte_count:
+            self._verify_complete()
+        return payload
+
+    def _verify_complete(self) -> None:
+        if (
+            self._offset != self._entry.byte_count
+            or self._crc & 0xFFFFFFFF != self._entry.crc32
+            or self._digest.hexdigest() != self._expected_digest
+        ):
+            _fail("PROJECT.PACKAGE.DIGEST_MISMATCH")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            while self._offset < self._entry.byte_count:
+                self.read(min(64 * 1024, self._entry.byte_count - self._offset))
+            self._verify_complete()
+            if self._source.snapshot() != self._snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            self._root.reprove()
+            if self._root.inspect_entry(self._path_name) != self._snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_STALE") from error
+        finally:
+            try:
+                self._source.close()
+            finally:
+                self._root.close()
+                self._closed = True
+
+    def __enter__(self):
         return self
 
     def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
@@ -1845,18 +2266,20 @@ class OpenedProjectPackage:
     _file_facts: _FileFacts
     _entries: tuple[_RawEntry, ...]
     _member_digests: tuple[ProjectPackageMemberDigest, ...]
+    _platform_backend: PlatformFileBackend | None = field(default=None, repr=False)
 
     @property
     def persistence_binding(self) -> ProjectPackagePersistenceBinding:
+        transient_platform_identity = self._platform_backend is not None
         return ProjectPackagePersistenceBinding(
             path=self.path,
             project_id=self.workspace.project_id,
             artifact_digest=self.validation.artifact_digest,
             workspace_content_digest=self.validation.workspace_content_digest,
-            device=self._file_facts.device,
-            inode=self._file_facts.inode,
+            device=0 if transient_platform_identity else self._file_facts.device,
+            inode=0 if transient_platform_identity else self._file_facts.inode,
             byte_count=self._file_facts.size,
-            mtime_ns=self._file_facts.mtime_ns,
+            mtime_ns=0 if transient_platform_identity else self._file_facts.mtime_ns,
         )
 
     def create_workspace_service(
@@ -1951,9 +2374,51 @@ class OpenedProjectPackage:
     @contextmanager
     def _open_member_unchecked(
         self, member_path: str
-    ) -> Iterator[_StoredMemberReader]:
+    ) -> Iterator[object]:
         requested = _validate_physical_member_name(member_path)
         reference = self._member_reference(requested)
+        if self._platform_backend is not None:
+            entry = next((item for item in self._entries if item.name == requested), None)
+            if entry is None or entry.byte_count != reference.byte_count:
+                _fail("PROJECT.PACKAGE.MEMBER_INVALID")
+            root = None
+            source = None
+            try:
+                root = self._platform_backend.bind_root(self.path.parent)
+                source = self._platform_backend.open_regular(
+                    root,
+                    PureWindowsPath(self.path.name),
+                )
+                snapshot = source.snapshot()
+                reader_source = _BoundedReadAtSource(source, snapshot)
+                observed_digest = _artifact_digest(
+                    reader_source,
+                    snapshot.byte_count,
+                )
+                if (
+                    observed_digest != self.validation.artifact_digest
+                    or snapshot.byte_count != self.validation.artifact_byte_count
+                ):
+                    _fail("PROJECT.PACKAGE.SOURCE_STALE")
+                reader = _PlatformStoredMemberReader(
+                    root,
+                    source,
+                    snapshot,
+                    self.path.name,
+                    entry,
+                    expected_digest=reference.sha256,
+                )
+                root = None
+                source = None
+                yield reader
+            finally:
+                if source is not None:
+                    source.close()
+                if root is not None:
+                    root.close()
+                if "reader" in locals():
+                    reader.close()
+            return
         descriptor, facts = _open_regular(self.path, include_digest=True)
         if facts != self._file_facts:
             os.close(descriptor)
@@ -1980,7 +2445,7 @@ class OpenedProjectPackage:
         member_path: str,
         *,
         codec_identity: CodecIdentity | None = None,
-    ) -> Iterator[_StoredMemberReader]:
+    ) -> Iterator[object]:
         requested = _validate_physical_member_name(member_path)
         private_manifest_document = next(
             (
@@ -2069,27 +2534,89 @@ class PreparedProjectPackageImport:
         validate_sha256(self.workspace_content_digest)
 
 
-def _validate_artifact(path: Path) -> OpenedProjectPackage:
-    source_descriptor, facts = _open_regular(path, include_digest=True)
-    sealed = tempfile.TemporaryFile(mode="w+b")
-    descriptor = sealed.fileno()
-    try:
-        offset = 0
-        while offset < facts.size:
-            block = os.pread(
-                source_descriptor,
-                min(_COPY_BYTES, facts.size - offset),
-                offset,
+def _validate_artifact(
+    path: Path,
+    *,
+    sealed_snapshot: BinaryIO | None = None,
+    backend: PlatformFileBackend | None = None,
+    bound_source: BoundRegularFile | None = None,
+    bound_snapshot: EntrySnapshot | None = None,
+) -> OpenedProjectPackage:
+    source_descriptor = -1
+    sealed = None
+    root_authority = None
+    source_authority = None
+    source_snapshot = None
+    borrowed_bound_source = bound_source is not None
+    if borrowed_bound_source:
+        if bound_source is None or type(bound_snapshot) is not EntrySnapshot:
+            raise TypeError("bound package validation requires an exact snapshot")
+        descriptor = _BoundedReadAtSource(bound_source, bound_snapshot)
+        facts = _platform_file_facts(
+            bound_snapshot,
+            _artifact_digest(descriptor, bound_snapshot.byte_count),
+        )
+        source_authority = bound_source
+        source_snapshot = bound_snapshot
+    elif sealed_snapshot is not None:
+        if not all(hasattr(sealed_snapshot, name) for name in ("read", "seek", "tell")):
+            raise TypeError("sealed package snapshot must be seekable")
+        sealed_snapshot.seek(0, os.SEEK_END)
+        byte_count = sealed_snapshot.tell()
+        sealed_snapshot.seek(0)
+        descriptor = _SeekableReadAtSource(sealed_snapshot, byte_count)
+        facts = _FileFacts(
+            0,
+            0,
+            byte_count,
+            0,
+            _artifact_digest(descriptor, byte_count),
+        )
+    elif os.name == "nt":
+        if backend is None:
+            raise TypeError("Windows package validation requires a platform backend")
+        try:
+            root_authority = backend.bind_root(path.parent)
+            source_authority = backend.open_regular(
+                root_authority,
+                PureWindowsPath(path.name),
             )
-            if not block:
-                _fail("PROJECT.PACKAGE.SOURCE_STALE")
-            written = 0
-            while written < len(block):
-                count = os.write(descriptor, block[written:])
-                if count <= 0:
-                    raise OSError("sealed package snapshot write failed")
-                written += count
-            offset += len(block)
+            source_snapshot = source_authority.snapshot()
+            if (
+                source_snapshot.byte_count > MAX_PACKAGE_ARTIFACT_BYTES
+                or source_snapshot.identity.link_count != 1
+                or not source_snapshot.reparse_free
+            ):
+                _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
+            descriptor = _BoundedReadAtSource(source_authority, source_snapshot)
+            digest = _artifact_digest(descriptor, source_snapshot.byte_count)
+            facts = _platform_file_facts(source_snapshot, digest)
+        except ProjectWorkspaceError:
+            raise
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_UNSAFE") from error
+    else:
+        source_descriptor, facts = _open_regular(path, include_digest=True)
+        sealed = tempfile.TemporaryFile(mode="w+b")
+        descriptor = sealed.fileno()
+    try:
+        if source_descriptor >= 0:
+            offset = 0
+            while offset < facts.size:
+                block = os.pread(
+                    source_descriptor,
+                    min(_COPY_BYTES, facts.size - offset),
+                    offset,
+                )
+                if not block:
+                    _fail("PROJECT.PACKAGE.SOURCE_STALE")
+                written = 0
+                while written < len(block):
+                    count = os.write(descriptor, block[written:])
+                    if count <= 0:
+                        raise OSError("sealed package snapshot write failed")
+                    written += count
+                offset += len(block)
         if _artifact_digest(descriptor, facts.size) != facts.digest:
             _fail("PROJECT.PACKAGE.SOURCE_STALE")
         entries = _parse_raw_zip(descriptor, facts.size)
@@ -2248,8 +2775,18 @@ def _validate_artifact(path: Path) -> OpenedProjectPackage:
         # retained regular-file generation.  Re-check after the final member
         # read so an equal-size in-place rewrite cannot bind A's digest to B's
         # workspace facts.
-        _require_descriptor_snapshot(source_descriptor, facts)
-        _require_path_snapshot(path, facts)
+        if source_descriptor >= 0:
+            _require_descriptor_snapshot(source_descriptor, facts)
+            _require_path_snapshot(path, facts)
+        elif source_authority is not None and root_authority is not None:
+            if source_authority.snapshot() != source_snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            root_authority.reprove()
+            if root_authority.inspect_entry(path.name) != source_snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+        elif source_authority is not None:
+            if source_authority.snapshot() != source_snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
         segment_count = sum(len(document.source_segments) for document in documents)
         report = ProjectPackageValidationReport(
             artifact_digest=facts.digest,
@@ -2273,13 +2810,24 @@ def _validate_artifact(path: Path) -> OpenedProjectPackage:
             facts,
             entries,
             tuple(sorted(member_digests, key=lambda item: _member_order_key(item.path))),
+            backend,
         )
     finally:
-        sealed.close()
-        os.close(source_descriptor)
+        if sealed is not None:
+            sealed.close()
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if source_authority is not None and not borrowed_bound_source:
+            source_authority.close()
+        if root_authority is not None:
+            root_authority.close()
 
 
-def _open_bound_source(binding: OriginBinding, document: ProjectDocument) -> BinaryIO:
+def _open_bound_source(
+    binding: OriginBinding,
+    document: ProjectDocument,
+    backend: PlatformFileBackend | None,
+) -> BinaryIO:
     bound = next(
         (item for item in binding.documents if item.document_id == document.document_id),
         None,
@@ -2287,6 +2835,47 @@ def _open_bound_source(binding: OriginBinding, document: ProjectDocument) -> Bin
     if bound is None or bound.source_ref != document.source_ref:
         _fail("PROJECT.PACKAGE.SOURCE_STALE")
     root_path = Path(binding.absolute_root)
+    if os.name == "nt":
+        if backend is None:
+            raise TypeError("Windows source packaging requires a platform backend")
+        root = None
+        source = None
+        try:
+            root = backend.bind_root(root_path)
+            source = backend.open_regular(
+                root,
+                PureWindowsPath(*document.source_ref.split("/")),
+            )
+            snapshot = source.snapshot()
+            expected = bound.source_identity
+            if (
+                snapshot.identity.link_count != 1
+                or not snapshot.reparse_free
+                or snapshot.byte_count != expected.original_size
+            ):
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            relative = PureWindowsPath(*document.source_ref.split("/"))
+            reader = _RootedBlobReader(
+                backend,
+                root,
+                source,
+                relative,
+                snapshot,
+                expected_sha256=expected.content_sha256,
+                expected_count=expected.byte_count,
+            )
+            root = None
+            source = None
+            return reader
+        except ProjectWorkspaceError:
+            raise
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.PACKAGE.SOURCE_STALE") from error
+        finally:
+            if source is not None:
+                source.close()
+            if root is not None:
+                root.close()
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
     try:
         root_descriptor = os.open(root_path, flags)
@@ -2337,7 +2926,11 @@ def _open_bound_source(binding: OriginBinding, document: ProjectDocument) -> Bin
         os.close(root_descriptor)
 
 
-def _source_blob(binding: OriginBinding, document: ProjectDocument) -> _Blob:
+def _source_blob(
+    binding: OriginBinding,
+    document: ProjectDocument,
+    backend: PlatformFileBackend | None,
+) -> _Blob:
     bound = next(
         (item for item in binding.documents if item.document_id == document.document_id),
         None,
@@ -2350,7 +2943,7 @@ def _source_blob(binding: OriginBinding, document: ProjectDocument) -> _Blob:
         path,
         identity.content_sha256,
         identity.byte_count,
-        lambda: _open_bound_source(binding, document),
+        lambda: _open_bound_source(binding, document, backend),
     )
 
 
@@ -2422,16 +3015,15 @@ def _write_blob(archive: zipfile.ZipFile, blob: _Blob) -> None:
             _fail("PROJECT.PACKAGE.SOURCE_STALE")
 
 
-def _build_package_candidate(
-    path: Path,
+def _package_blobs(
     workspace: ProjectWorkspace,
     origin_binding: OriginBinding | None,
     private_sources: tuple[ProjectPackageBlobSource, ...],
     *,
+    backend: PlatformFileBackend | None = None,
     last_known_good_package: OpenedProjectPackage | None = None,
     additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
-    destination_parent_facts: _ParentFacts | None = None,
-) -> ProjectPackageValidationReport:
+) -> tuple[_Blob, ...]:
     if type(workspace) is not ProjectWorkspace:
         raise TypeError("package candidate requires exact workspace")
     if origin_binding is not None and type(origin_binding) is not OriginBinding:
@@ -2535,7 +3127,7 @@ def _build_package_candidate(
                 lkg_entry.source_member,
             )
         elif origin_binding is not None:
-            source_blob = _source_blob(origin_binding, document)
+            source_blob = _source_blob(origin_binding, document, backend)
         else:
             _fail("PROJECT.PACKAGE.SOURCE_STALE")
         private_reference = None
@@ -2618,6 +3210,75 @@ def _build_package_candidate(
     )
     if len(blobs) > MAX_PACKAGE_MEMBERS:
         _fail("PROJECT.PACKAGE.LIMIT_EXCEEDED")
+    return blobs
+
+
+def _build_package_snapshot(
+    path: Path,
+    workspace: ProjectWorkspace,
+    origin_binding: OriginBinding | None,
+    private_sources: tuple[ProjectPackageBlobSource, ...],
+    *,
+    backend: PlatformFileBackend | None = None,
+    last_known_good_package: OpenedProjectPackage | None = None,
+    additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+) -> tuple[BinaryIO, ProjectPackageValidationReport]:
+    blobs = _package_blobs(
+            workspace,
+            origin_binding,
+            private_sources,
+            backend=backend,
+            last_known_good_package=last_known_good_package,
+            additional_package_sources=additional_package_sources,
+    )
+    output = tempfile.TemporaryFile(mode="w+b", prefix="project-package-")
+    try:
+        with zipfile.ZipFile(
+            output,
+            mode="w",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=False,
+            strict_timestamps=True,
+        ) as archive:
+            archive.comment = b""
+            for blob in blobs:
+                _write_blob(archive, blob)
+        output.flush()
+        os.fsync(output.fileno())
+        output.seek(0, os.SEEK_END)
+        if output.tell() > MAX_PACKAGE_ARTIFACT_BYTES:
+            _fail("PROJECT.PACKAGE.LIMIT_EXCEEDED")
+        output.seek(0)
+        validation = _validate_artifact(
+            path,
+            sealed_snapshot=output,
+        ).validation
+        output.seek(0)
+        return output, validation
+    except BaseException:
+        output.close()
+        raise
+
+
+def _build_package_candidate(
+    path: Path,
+    workspace: ProjectWorkspace,
+    origin_binding: OriginBinding | None,
+    private_sources: tuple[ProjectPackageBlobSource, ...],
+    *,
+    backend: PlatformFileBackend | None = None,
+    last_known_good_package: OpenedProjectPackage | None = None,
+    additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+    destination_parent_facts: _ParentFacts | None = None,
+) -> ProjectPackageValidationReport:
+    blobs = _package_blobs(
+        workspace,
+        origin_binding,
+        private_sources,
+        backend=backend,
+        last_known_good_package=last_known_good_package,
+        additional_package_sources=additional_package_sources,
+    )
     facts = destination_parent_facts or _bind_parent(path)
     with _bound_parent_descriptor(path, facts) as parent:
         fd = os.open(
@@ -2753,6 +3414,9 @@ class _PackageCandidate:
     phase: RecoveryPhase
     parent_device: int
     parent_inode: int
+    platform_candidate: CandidateFile | None = None
+    pending_publication: PendingPublication | None = None
+    candidate_snapshot: BinaryIO | None = None
 
 
 def _journal_payload(handle: _PackageCandidate) -> bytes:
@@ -2823,7 +3487,7 @@ def _write_journal(handle: _PackageCandidate) -> None:
             raise
 
 
-class _ProjectPackagePersistencePort:
+class _PosixProjectPackagePersistencePort:
     """C2C adapter for the carrier-neutral C2B save state machine."""
 
     def __init__(
@@ -3361,6 +4025,865 @@ class _ProjectPackagePersistencePort:
         return workspace
 
 
+def _snapshot_chunks(snapshot: BinaryIO, byte_count: int) -> Iterator[bytes]:
+    snapshot.seek(0)
+    remaining = byte_count
+    while remaining:
+        block = snapshot.read(min(64 * 1024, remaining))
+        if type(block) is not bytes or not block:
+            raise OSError("package snapshot ended early")
+        remaining -= len(block)
+        yield block
+    if snapshot.read(1):
+        raise OSError("package snapshot exceeded its proved byte count")
+    snapshot.seek(0)
+
+
+class _WindowsProjectPackagePersistencePort:
+    """Project-owned journal/LKG transaction over neutral Windows file ports."""
+
+    def __init__(
+        self,
+        target: Path,
+        origin_binding: OriginBinding | None,
+        private_sources: tuple[ProjectPackageBlobSource, ...],
+        *,
+        backend: PlatformFileBackend,
+        persistence_binding: ProjectPackagePersistenceBinding | None = None,
+        additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+        allow_cross_project_lkg: bool = False,
+    ) -> None:
+        if not isinstance(target, Path) or not target.is_absolute() or not target.name:
+            _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
+        if not isinstance(backend, PlatformFileBackend):
+            raise TypeError("Windows package port requires PlatformFileBackend")
+        self._target = _canonical_user_path(target)
+        self._backend = backend
+        self._binding = origin_binding
+        self._private_sources = private_sources
+        self._persistence_binding = persistence_binding
+        self._additional_package_sources = additional_package_sources
+        self._allow_cross_project_lkg = allow_cross_project_lkg
+        self._root = backend.bind_root(self._target.parent)
+        self._parent = backend.bind_parent(
+            self._root,
+            PureWindowsPath(self._target.name),
+        )
+        self._lease: LockLease | None = None
+        self._owner_stem = _windows_owner_stem(self._target.name)
+        self._journal = self._target.with_name(self._owner_stem + ".journal-v1")
+        self._handles: dict[str, _PackageCandidate] = {}
+        self._closed = False
+        self.destination_before_digest: str | None = None
+        self.committed_opened: OpenedProjectPackage | None = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            for handle in self._handles.values():
+                self._close_retained_handles(handle)
+            self._release_lease()
+        finally:
+            try:
+                self._parent.close()
+            finally:
+                self._root.close()
+                self._closed = True
+
+    def _paths(self, operation_id: str) -> tuple[Path, Path]:
+        return (
+            self._target.with_name(f"{self._owner_stem}.{operation_id}.candidate"),
+            self._target.with_name(f"{self._owner_stem}.{operation_id}.lkg"),
+        )
+
+    def _ensure_lease(self) -> LockLease:
+        if self._lease is None or self._lease.closed:
+            lock_name = self._owner_stem + ".lock"
+            try:
+                self._lease = self._backend.acquire(
+                    self._parent,
+                    lock_name,
+                    _PROJECT_PACKAGE_LOCK_PAYLOAD,
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+            except PlatformFileError as error:
+                if error.code in {
+                    PlatformFileErrorCode.LOCK_CONTENDED.value,
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+                }:
+                    raise CleanPersistenceRejection(
+                        "package owner lease is unavailable"
+                    ) from error
+                raise
+        return self._lease
+
+    def _release_lease(self) -> None:
+        if self._lease is not None:
+            self._lease.close()
+            self._lease = None
+
+    def _require(self, value: object) -> _PackageCandidate:
+        if type(value) is not _PackageCandidate:
+            raise OSError("invalid package candidate")
+        retained = self._handles.get(value.operation_id)
+        if retained is not value:
+            raise OSError("foreign package candidate")
+        return value
+
+    def _entry(self, path: Path) -> EntrySnapshot | None:
+        self._parent.reprove()
+        return self._parent.inspect_entry(path.name)
+
+    def _unlink(self, path: Path) -> None:
+        observed = self._entry(path)
+        if observed is not None:
+            self._parent.unlink_owned(path.name, observed.identity)
+
+    def _read_small(self, path: Path) -> bytes:
+        source = self._backend.open_regular(
+            self._root,
+            PureWindowsPath(path.name),
+        )
+        try:
+            snapshot = source.snapshot()
+            if snapshot.byte_count > MAX_PACKAGE_MANIFEST_BYTES:
+                raise OSError("owner state is oversized")
+            reader = _BoundedReadAtSource(source, snapshot)
+            payload = reader.read_at(snapshot.byte_count, 0)
+            if source.snapshot() != snapshot or self._entry(path) != snapshot:
+                raise OSError("owner state changed during read")
+            return payload
+        finally:
+            source.close()
+
+    def _publish_bytes(self, path: Path, payload: bytes) -> None:
+        lease = self._ensure_lease()
+        temporary = path.with_name(path.name + ".next")
+        self._unlink(temporary)
+        candidate = self._parent.create_candidate(temporary.name, private=True)
+        pending = None
+        try:
+            candidate.write_all(payload)
+            candidate.flush_content()
+            mode = (
+                PublishMode.CREATE_IF_ABSENT
+                if self._entry(path) is None
+                else PublishMode.REPLACE_UNDER_LOCK
+            )
+            pending = self._parent.begin_publish(
+                candidate,
+                path.name,
+                mode=mode,
+                lease=None if mode is PublishMode.CREATE_IF_ABSENT else lease,
+            )
+            candidate = None
+            retained = pending.retained_destination()
+            snapshot = retained.snapshot()
+            reader = _BoundedReadAtSource(retained, snapshot)
+            observed = reader.read_at(snapshot.byte_count, 0)
+            if observed != payload or pending.terminal_reproof().content_sha256 != hashlib.sha256(payload).digest():
+                raise OSError("owner state publication readback mismatch")
+        except PlatformFileError as error:
+            raise OSError("owner state publication failed") from error
+        finally:
+            if candidate is not None:
+                try:
+                    identity = candidate.identity()
+                except Exception:
+                    identity = None
+                candidate.close()
+                if identity is not None:
+                    try:
+                        self._parent.unlink_owned(temporary.name, identity)
+                    except PlatformFileError:
+                        pass
+            if pending is not None:
+                pending.close()
+
+    def _write_journal(self, handle: _PackageCandidate) -> None:
+        self._publish_bytes(handle.journal_path, _journal_payload(handle))
+
+    def _validate_path(self, path: Path) -> OpenedProjectPackage:
+        try:
+            return _validate_artifact(path, backend=self._backend)
+        except ProjectWorkspaceError as error:
+            raise OSError("package artifact validation failed") from error
+
+    def _write_candidate_snapshot(
+        self,
+        path: Path,
+        snapshot: BinaryIO,
+        byte_count: int,
+        *,
+        private: bool,
+    ) -> CandidateFile:
+        self._unlink(path)
+        candidate = self._parent.create_candidate(path.name, private=private)
+        try:
+            candidate.write_chunks(
+                _snapshot_chunks(snapshot, byte_count),
+                maximum_bytes=MAX_PACKAGE_ARTIFACT_BYTES,
+            )
+            candidate.flush_content()
+            return candidate
+        except BaseException:
+            try:
+                identity = candidate.identity()
+            except Exception:
+                identity = None
+            candidate.close()
+            if identity is not None:
+                try:
+                    self._parent.unlink_owned(path.name, identity)
+                except PlatformFileError:
+                    pass
+            raise
+
+    def _copy_artifact(self, source_path: Path, destination_path: Path) -> None:
+        source = self._backend.open_regular(
+            self._root,
+            PureWindowsPath(source_path.name),
+        )
+        candidate = None
+        pending = None
+        try:
+            source_snapshot = source.snapshot()
+            self._unlink(destination_path)
+            temporary = destination_path.with_name(destination_path.name + ".next")
+            self._unlink(temporary)
+            candidate = self._parent.create_candidate(temporary.name, private=True)
+
+            def chunks() -> Iterator[bytes]:
+                offset = 0
+                while offset < source_snapshot.byte_count:
+                    block = source.read_at(
+                        offset,
+                        min(64 * 1024, source_snapshot.byte_count - offset),
+                        source_snapshot,
+                    )
+                    offset += len(block)
+                    yield block
+                if source.read_at(offset, 1, source_snapshot):
+                    raise OSError("artifact copy source exceeded expected size")
+
+            written = candidate.write_chunks(
+                chunks(),
+                maximum_bytes=MAX_PACKAGE_ARTIFACT_BYTES,
+            )
+            candidate.flush_content()
+            if source.snapshot() != source_snapshot or self._entry(source_path) != source_snapshot:
+                raise OSError("artifact copy source changed")
+            pending = self._parent.begin_publish(
+                candidate,
+                destination_path.name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            terminal = pending.terminal_reproof()
+            if terminal.content_sha256 != written.content_sha256:
+                raise OSError("artifact copy terminal digest mismatch")
+        except PlatformFileError as error:
+            raise OSError("artifact copy failed") from error
+        finally:
+            source.close()
+            if candidate is not None:
+                candidate.close()
+            if pending is not None:
+                pending.close()
+
+    def _clean_residue(self, handle: _PackageCandidate) -> None:
+        self._close_retained_handles(handle)
+        self._unlink(handle.candidate_path)
+        self._unlink(handle.lkg_path)
+        self._unlink(handle.journal_path.with_name(handle.journal_path.name + ".next"))
+        self._unlink(handle.lkg_path.with_name(handle.lkg_path.name + ".next"))
+        self._unlink(handle.candidate_path.with_name(handle.candidate_path.name + ".rollback"))
+        self._unlink(handle.candidate_path.with_name(handle.candidate_path.name + ".recovery"))
+        self._unlink(handle.journal_path)
+
+    @staticmethod
+    def _close_retained_handles(handle: _PackageCandidate) -> None:
+        if handle.pending_publication is not None:
+            handle.pending_publication.close()
+            handle.pending_publication = None
+        if handle.platform_candidate is not None:
+            handle.platform_candidate.close()
+            handle.platform_candidate = None
+        if handle.candidate_snapshot is not None:
+            handle.candidate_snapshot.close()
+            handle.candidate_snapshot = None
+
+    def inspect_pending_recovery(self) -> object | None:
+        try:
+            self._ensure_lease()
+            if self._entry(self._journal) is None:
+                self._unlink(self._journal.with_name(self._journal.name + ".next"))
+                return None
+            value = _require_keys(
+                _decode_canonical_json(self._read_small(self._journal), manifest=True),
+                frozenset(
+                    {
+                        "schema",
+                        "operation_id",
+                        "project_id",
+                        "phase",
+                        "candidate_artifact_digest",
+                        "candidate_workspace_digest",
+                        "last_known_good_artifact_digest",
+                        "last_known_good_workspace_digest",
+                        "parent_device",
+                        "parent_inode",
+                    }
+                ),
+                manifest=True,
+            )
+            operation_id = _operation_id(value["operation_id"])
+            phase = RecoveryPhase(value["phase"])
+            candidate_digest = value["candidate_artifact_digest"]
+            workspace_digest = value["candidate_workspace_digest"]
+            validate_project_id(value["project_id"])
+            validate_sha256(workspace_digest)
+            if candidate_digest is not None:
+                validate_sha256(candidate_digest)
+            lkg_workspace_digest = value["last_known_good_workspace_digest"]
+            if lkg_workspace_digest is not None:
+                validate_sha256(lkg_workspace_digest)
+            if (
+                _exact_nonnegative_int(
+                    value["parent_device"],
+                    code="PROJECT.PACKAGE.MANIFEST_INVALID",
+                )
+                != 0
+                or _exact_nonnegative_int(
+                    value["parent_inode"],
+                    code="PROJECT.PACKAGE.MANIFEST_INVALID",
+                )
+                != 0
+            ):
+                raise ValueError("Windows journal persisted a live parent identity")
+        except (PlatformFileError, ProjectWorkspaceError, TypeError, ValueError) as error:
+            raise OSError("package recovery journal is invalid") from error
+        existing = self._handles.get(operation_id)
+        if existing is not None and existing.phase is phase:
+            return existing
+        candidate_path, lkg_path = self._paths(operation_id)
+        candidate_opened = None
+        if phase is not RecoveryPhase.STAGING:
+            if candidate_digest is None:
+                raise OSError("complete candidate digest is missing")
+            possible = (
+                (self._target, candidate_path)
+                if phase is RecoveryPhase.PUBLISHING
+                else (
+                    (self._target,)
+                    if phase in {RecoveryPhase.PUBLISHED, RecoveryPhase.COMMIT_UNCERTAIN}
+                    else (candidate_path,)
+                )
+            )
+            matches: list[OpenedProjectPackage] = []
+            for path in possible:
+                if self._entry(path) is None:
+                    continue
+                try:
+                    opened = self._validate_path(path)
+                except OSError:
+                    continue
+                if opened.validation.artifact_digest == candidate_digest:
+                    matches.append(opened)
+            if len(matches) > 1 or (
+                not matches and phase is not RecoveryPhase.PUBLISHING
+            ):
+                raise OSError("recovery candidate cannot be uniquely proved")
+            candidate_opened = None if not matches else matches[0]
+            if (
+                candidate_opened is not None
+                and workspace_content_digest_v1(candidate_opened.workspace)
+                != workspace_digest
+            ):
+                raise OSError("recovery candidate workspace mismatch")
+        lkg_digest = value["last_known_good_artifact_digest"]
+        lkg_workspace = None
+        if lkg_digest is not None:
+            validate_sha256(lkg_digest)
+            for path in (lkg_path, self._target):
+                if self._entry(path) is None:
+                    continue
+                try:
+                    opened = self._validate_path(path)
+                except OSError:
+                    continue
+                if opened.validation.artifact_digest == lkg_digest:
+                    lkg_workspace = opened.workspace
+                    break
+            if lkg_workspace is None and phase is not RecoveryPhase.COMMIT_UNCERTAIN:
+                raise OSError("last known good package is missing")
+            if (
+                lkg_workspace is not None
+                and workspace_content_digest_v1(lkg_workspace)
+                != lkg_workspace_digest
+            ):
+                raise OSError("last known good workspace digest mismatch")
+        elif lkg_workspace_digest is not None:
+            raise OSError("last known good workspace digest has no artifact")
+        if phase is RecoveryPhase.PUBLISHING and candidate_opened is None:
+            target_facts = self._entry(self._target)
+            if lkg_digest is None:
+                if target_facts is not None:
+                    raise OSError("rollback-only recovery target is not absent")
+            else:
+                if (
+                    target_facts is None
+                    or self._validate_path(self._target).validation.artifact_digest
+                    != lkg_digest
+                ):
+                    raise OSError("rollback-only recovery target is not the LKG")
+        handle = _PackageCandidate(
+            operation_id=operation_id,
+            target=self._target,
+            candidate_path=candidate_path,
+            lkg_path=lkg_path,
+            journal_path=self._journal,
+            project_id=value["project_id"],
+            candidate_workspace=(None if candidate_opened is None else candidate_opened.workspace),
+            candidate_workspace_digest=workspace_digest,
+            last_known_good_workspace=lkg_workspace,
+            candidate_artifact_digest=candidate_digest,
+            last_known_good_artifact_digest=lkg_digest,
+            requested_document_ids=(
+                ()
+                if candidate_opened is None
+                else tuple(item.document_id for item in candidate_opened.workspace.documents)
+            ),
+            phase=phase,
+            parent_device=0,
+            parent_inode=0,
+        )
+        if value["schema"] != "localcat-project-package-journal-v1":
+            raise OSError("package recovery schema mismatch")
+        self._handles[operation_id] = handle
+        return handle
+
+    def stage_candidate(
+        self,
+        *,
+        operation_id: str,
+        candidate_workspace: ProjectWorkspace,
+        last_known_good_workspace: ProjectWorkspace | None,
+        requested_document_ids: tuple[str, ...],
+    ) -> object:
+        self._ensure_lease()
+        if self._entry(self._journal) is not None:
+            raise OSError("pending recovery exists")
+        opened_lkg = None
+        lkg_digest = None
+        if last_known_good_workspace is None:
+            if self._entry(self._target) is not None:
+                raise OSError("destination exists without durable baseline")
+        else:
+            opened_lkg = self._validate_path(self._target)
+            if opened_lkg.workspace != last_known_good_workspace:
+                raise OSError("durable baseline destination is stale")
+            if (
+                self._persistence_binding is None
+                or opened_lkg.validation.artifact_digest
+                != self._persistence_binding.artifact_digest
+            ):
+                raise OSError("durable package binding is stale")
+            lkg_digest = opened_lkg.validation.artifact_digest
+        self.destination_before_digest = lkg_digest
+        candidate_path, lkg_path = self._paths(operation_id)
+        handle = _PackageCandidate(
+            operation_id=operation_id,
+            target=self._target,
+            candidate_path=candidate_path,
+            lkg_path=lkg_path,
+            journal_path=self._journal,
+            project_id=candidate_workspace.project_id,
+            candidate_workspace=candidate_workspace,
+            candidate_workspace_digest=workspace_content_digest_v1(candidate_workspace),
+            last_known_good_workspace=last_known_good_workspace,
+            candidate_artifact_digest=None,
+            last_known_good_artifact_digest=lkg_digest,
+            requested_document_ids=requested_document_ids,
+            phase=RecoveryPhase.STAGING,
+            parent_device=0,
+            parent_inode=0,
+        )
+        self._handles[operation_id] = handle
+        try:
+            self._write_journal(handle)
+            snapshot, validation = _build_package_snapshot(
+                candidate_path,
+                candidate_workspace,
+                self._binding,
+                self._private_sources,
+                backend=self._backend,
+                last_known_good_package=(
+                    opened_lkg
+                    if opened_lkg is None
+                    or opened_lkg.workspace.project_id
+                    == candidate_workspace.project_id
+                    else None
+                ),
+                additional_package_sources=self._additional_package_sources,
+            )
+            handle.candidate_snapshot = snapshot
+            handle.candidate_artifact_digest = validation.artifact_digest
+            handle.platform_candidate = self._write_candidate_snapshot(
+                candidate_path,
+                snapshot,
+                validation.artifact_byte_count,
+                private=False,
+            )
+            handle.phase = RecoveryPhase.STAGED
+            self._write_journal(handle)
+            return handle
+        except Exception as error:
+            try:
+                self._clean_residue(handle)
+            except Exception:
+                pass
+            finally:
+                self._release_lease()
+            raise OSError("package candidate staging failed") from error
+
+    def validate_candidate(self, candidate_handle: object) -> None:
+        handle = self._require(candidate_handle)
+        if handle.candidate_snapshot is None or handle.candidate_artifact_digest is None:
+            raise OSError("candidate snapshot is incomplete")
+        validation = _validate_artifact(
+            handle.candidate_path,
+            sealed_snapshot=handle.candidate_snapshot,
+        )
+        if (
+            validation.workspace != handle.candidate_workspace
+            or validation.validation.artifact_digest != handle.candidate_artifact_digest
+        ):
+            raise OSError("candidate cold validation mismatch")
+
+    def arm_publication(self, candidate_handle: object) -> None:
+        handle = self._require(candidate_handle)
+        if handle.phase is not RecoveryPhase.STAGED:
+            raise OSError("candidate phase is invalid")
+        if handle.last_known_good_workspace is not None:
+            self._copy_artifact(handle.target, handle.lkg_path)
+            opened = self._validate_path(handle.lkg_path)
+            if opened.validation.artifact_digest != handle.last_known_good_artifact_digest:
+                raise OSError("last known good copy mismatch")
+        handle.phase = RecoveryPhase.ARMED
+        self._write_journal(handle)
+
+    def publish_candidate(self, candidate_handle: object) -> None:
+        handle = self._require(candidate_handle)
+        if handle.phase is not RecoveryPhase.ARMED or handle.platform_candidate is None:
+            raise OSError("candidate phase is invalid")
+        if handle.last_known_good_workspace is None:
+            if self._entry(handle.target) is not None:
+                raise OSError("destination appeared after publication arm")
+            mode = PublishMode.CREATE_IF_ABSENT
+        else:
+            current = self._validate_path(handle.target)
+            if current.validation.artifact_digest != handle.last_known_good_artifact_digest:
+                raise OSError("destination changed after publication arm")
+            mode = PublishMode.REPLACE_UNDER_LOCK
+        handle.phase = RecoveryPhase.PUBLISHING
+        self._write_journal(handle)
+        try:
+            handle.pending_publication = self._parent.begin_publish(
+                handle.platform_candidate,
+                handle.target.name,
+                mode=mode,
+                lease=(None if mode is PublishMode.CREATE_IF_ABSENT else self._ensure_lease()),
+            )
+            handle.platform_candidate = None
+            handle.phase = RecoveryPhase.PUBLISHED
+            self._write_journal(handle)
+        except PlatformFileError as error:
+            handle.platform_candidate = None
+            raise OSError("package publication failed") from error
+
+    def readback_candidate(self, candidate_handle: object) -> ProjectWorkspace:
+        handle = self._require(candidate_handle)
+        if handle.candidate_artifact_digest is None:
+            raise OSError("candidate artifact is incomplete")
+        if handle.pending_publication is not None:
+            retained = handle.pending_publication.retained_destination()
+            snapshot = retained.snapshot()
+            opened = _validate_artifact(
+                handle.target,
+                backend=self._backend,
+                bound_source=retained,
+                bound_snapshot=snapshot,
+            )
+        else:
+            opened = self._validate_path(handle.target)
+        if opened.validation.artifact_digest != handle.candidate_artifact_digest:
+            raise OSError("candidate artifact readback mismatch")
+        self.committed_opened = opened
+        return opened.workspace
+
+    def commit_candidate(self, candidate_handle: object) -> None:
+        handle = self._require(candidate_handle)
+        if handle.phase is not RecoveryPhase.PUBLISHED or handle.pending_publication is None:
+            raise OSError("candidate phase is invalid")
+        handle.phase = RecoveryPhase.COMMIT_UNCERTAIN
+        self._write_journal(handle)
+        opened = self.readback_candidate(handle)
+        del opened
+        terminal = handle.pending_publication.terminal_reproof()
+        if terminal.content_sha256.hex() != handle.candidate_artifact_digest:
+            raise OSError("terminal package digest mismatch")
+        handle.pending_publication.close()
+        handle.pending_publication = None
+        self._clean_residue(handle)
+        self._release_lease()
+
+    def rollback_candidate(self, candidate_handle: object) -> ProjectWorkspace | None:
+        handle = self._require(candidate_handle)
+        if handle.pending_publication is not None:
+            handle.pending_publication.close()
+            handle.pending_publication = None
+        candidate_is_target = False
+        if self._entry(handle.target) is not None and handle.candidate_artifact_digest is not None:
+            try:
+                candidate_is_target = (
+                    self._validate_path(handle.target).validation.artifact_digest
+                    == handle.candidate_artifact_digest
+                )
+            except OSError:
+                raise OSError("rollback target cannot be identified") from None
+        if candidate_is_target:
+            if handle.last_known_good_workspace is None:
+                self._unlink(handle.target)
+            else:
+                # Re-stream the proved LKG into a publishable candidate.
+                source = self._backend.open_regular(
+                    self._root,
+                    PureWindowsPath(handle.lkg_path.name),
+                )
+                replacement = None
+                pending = None
+                try:
+                    snapshot = source.snapshot()
+                    replacement = self._parent.create_candidate(
+                        handle.candidate_path.name + ".rollback",
+                        private=False,
+                    )
+
+                    def chunks() -> Iterator[bytes]:
+                        offset = 0
+                        while offset < snapshot.byte_count:
+                            block = source.read_at(
+                                offset,
+                                min(64 * 1024, snapshot.byte_count - offset),
+                                snapshot,
+                            )
+                            offset += len(block)
+                            yield block
+
+                    replacement.write_chunks(chunks(), maximum_bytes=MAX_PACKAGE_ARTIFACT_BYTES)
+                    replacement.flush_content()
+                    if source.read_at(snapshot.byte_count, 1, snapshot):
+                        raise OSError("rollback source exceeded expected size")
+                    if (
+                        source.snapshot() != snapshot
+                        or self._entry(handle.lkg_path) != snapshot
+                    ):
+                        raise OSError("rollback source changed")
+                    pending = self._parent.begin_publish(
+                        replacement,
+                        handle.target.name,
+                        mode=PublishMode.REPLACE_UNDER_LOCK,
+                        lease=self._ensure_lease(),
+                    )
+                    replacement = None
+                    terminal = pending.terminal_reproof()
+                    if terminal.content_sha256.hex() != handle.last_known_good_artifact_digest:
+                        raise OSError("rollback terminal digest mismatch")
+                finally:
+                    if replacement is not None:
+                        replacement.close()
+                    if pending is not None:
+                        pending.close()
+                    source.close()
+        observed = handle.last_known_good_workspace
+        if observed is None:
+            if self._entry(handle.target) is not None:
+                raise OSError("rollback failed to restore absent destination")
+        elif self._validate_path(handle.target).workspace != observed:
+            raise OSError("rollback readback mismatch")
+        self._clean_residue(handle)
+        self._release_lease()
+        return observed
+
+    def describe_pending_recovery(self, recovery_handle: object) -> PendingRecoveryFacts:
+        handle = self._require(recovery_handle)
+        return PendingRecoveryFacts(
+            operation_id=handle.operation_id,
+            project_id=handle.project_id,
+            phase=handle.phase,
+            candidate_digest=handle.candidate_workspace_digest,
+            last_known_good_digest=(
+                None
+                if handle.last_known_good_workspace is None
+                else workspace_content_digest_v1(handle.last_known_good_workspace)
+            ),
+        )
+
+    def read_recovery_last_known_good(self, recovery_handle: object) -> ProjectWorkspace | None:
+        return self._require(recovery_handle).last_known_good_workspace
+
+    def read_recovery_candidate(self, recovery_handle: object) -> ProjectWorkspace:
+        handle = self._require(recovery_handle)
+        if handle.candidate_workspace is None:
+            raise OSError("recovery candidate is unavailable")
+        return handle.candidate_workspace
+
+    def complete_pending_commit(self, recovery_handle: object) -> ProjectWorkspace:
+        handle = self._require(recovery_handle)
+        if handle.phase not in {
+            RecoveryPhase.PUBLISHING,
+            RecoveryPhase.PUBLISHED,
+            RecoveryPhase.COMMIT_UNCERTAIN,
+        }:
+            raise OSError("pending candidate was not published")
+        target_matches = False
+        if self._entry(handle.target) is not None:
+            target_matches = (
+                self._validate_path(handle.target).validation.artifact_digest
+                == handle.candidate_artifact_digest
+            )
+        if not target_matches:
+            if self._entry(handle.candidate_path) is None:
+                raise OSError("recovery candidate is missing")
+            source = self._backend.open_regular(
+                self._root,
+                PureWindowsPath(handle.candidate_path.name),
+            )
+            replacement = None
+            pending = None
+            try:
+                snapshot = source.snapshot()
+                replacement_path = handle.candidate_path.with_name(
+                    handle.candidate_path.name + ".recovery"
+                )
+                self._unlink(replacement_path)
+                replacement = self._parent.create_candidate(replacement_path.name, private=False)
+
+                def chunks() -> Iterator[bytes]:
+                    offset = 0
+                    while offset < snapshot.byte_count:
+                        block = source.read_at(
+                            offset,
+                            min(64 * 1024, snapshot.byte_count - offset),
+                            snapshot,
+                        )
+                        offset += len(block)
+                        yield block
+
+                replacement.write_chunks(chunks(), maximum_bytes=MAX_PACKAGE_ARTIFACT_BYTES)
+                replacement.flush_content()
+                if source.read_at(snapshot.byte_count, 1, snapshot):
+                    raise OSError("recovery source exceeded expected size")
+                if (
+                    source.snapshot() != snapshot
+                    or self._entry(handle.candidate_path) != snapshot
+                ):
+                    raise OSError("recovery source changed")
+                mode = (
+                    PublishMode.CREATE_IF_ABSENT
+                    if self._entry(handle.target) is None
+                    else PublishMode.REPLACE_UNDER_LOCK
+                )
+                pending = self._parent.begin_publish(
+                    replacement,
+                    handle.target.name,
+                    mode=mode,
+                    lease=None if mode is PublishMode.CREATE_IF_ABSENT else self._ensure_lease(),
+                )
+                replacement = None
+                terminal = pending.terminal_reproof()
+                if terminal.content_sha256.hex() != handle.candidate_artifact_digest:
+                    raise OSError("recovery terminal digest mismatch")
+            finally:
+                if replacement is not None:
+                    replacement.close()
+                if pending is not None:
+                    pending.close()
+                source.close()
+        opened = self._validate_path(handle.target)
+        if opened.validation.artifact_digest != handle.candidate_artifact_digest:
+            raise OSError("recovery commit readback mismatch")
+        self._clean_residue(handle)
+        self._release_lease()
+        return opened.workspace
+
+    def rollback_pending(self, recovery_handle: object) -> ProjectWorkspace | None:
+        return self.rollback_candidate(recovery_handle)
+
+    def abandon_staged_copy(self, recovery_handle: object) -> ProjectWorkspace | None:
+        handle = self._require(recovery_handle)
+        if handle.phase not in {
+            RecoveryPhase.STAGING,
+            RecoveryPhase.STAGED,
+            RecoveryPhase.ARMED,
+        }:
+            raise OSError("published package cannot be abandoned")
+        workspace = handle.last_known_good_workspace
+        self._clean_residue(handle)
+        self._release_lease()
+        return workspace
+
+
+def _ProjectPackagePersistencePort(
+    target: Path,
+    origin_binding: OriginBinding | None,
+    private_sources: tuple[ProjectPackageBlobSource, ...],
+    *,
+    backend: PlatformFileBackend | None = None,
+    persistence_binding: ProjectPackagePersistenceBinding | None = None,
+    additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+    allow_cross_project_lkg: bool = False,
+):
+    if os.name == "nt":
+        if backend is None:
+            raise TypeError("Windows package persistence requires a platform backend")
+        return _WindowsProjectPackagePersistencePort(
+            target,
+            origin_binding,
+            private_sources,
+            backend=backend,
+            persistence_binding=persistence_binding,
+            additional_package_sources=additional_package_sources,
+            allow_cross_project_lkg=allow_cross_project_lkg,
+        )
+    return _PosixProjectPackagePersistencePort(
+        target,
+        origin_binding,
+        private_sources,
+        persistence_binding=persistence_binding,
+        additional_package_sources=additional_package_sources,
+        allow_cross_project_lkg=allow_cross_project_lkg,
+    )
+
+
+def _close_package_port(port: object) -> None:
+    close = getattr(port, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class _ImportPlan:
     operation_id: str
@@ -3392,7 +4915,10 @@ class _PreparedImportPlan:
 class ProjectPackageService:
     """Public Application surface for ProjectPackage v1."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, backend: PlatformFileBackend | None = None) -> None:
+        if backend is not None and not isinstance(backend, PlatformFileBackend):
+            raise TypeError("backend must implement PlatformFileBackend")
+        self._backend = backend
         self._import_plans: dict[str, _ImportPlan] = {}
         self._prepared_import_plans: dict[str, _PreparedImportPlan] = {}
         self._recovery_ports: dict[
@@ -3407,11 +4933,50 @@ class ProjectPackageService:
             ],
         ] = {}
 
+    def _backend_for(self, path: Path) -> PlatformFileBackend | None:
+        if os.name != "nt":
+            return None
+        from platform_fs import compose_platform_file_backend
+
+        return (
+            compose_platform_file_backend(path.parent)
+            if self._backend is None
+            else self._backend
+        )
+
+    def _platform_entry_facts(self, path: Path) -> _FileFacts | None:
+        backend = self._backend_for(path)
+        if backend is None:
+            if not path.exists():
+                return None
+            descriptor, facts = _open_regular(path, include_digest=True)
+            os.close(descriptor)
+            return facts
+        root = backend.bind_root(path.parent)
+        source = None
+        try:
+            observed = root.inspect_entry(path.name)
+            if observed is None:
+                return None
+            source = backend.open_regular(root, PureWindowsPath(path.name))
+            snapshot = source.snapshot()
+            reader = _BoundedReadAtSource(source, snapshot)
+            digest = _artifact_digest(reader, snapshot.byte_count)
+            if source.snapshot() != snapshot or root.inspect_entry(path.name) != snapshot:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            return _platform_file_facts(snapshot, digest)
+        finally:
+            if source is not None:
+                source.close()
+            root.close()
+
     def validate(self, source: Path) -> ProjectPackageValidationReport:
-        return _validate_artifact(_selected_user_path(source)).validation
+        path = _selected_user_path(source)
+        return _validate_artifact(path, backend=self._backend_for(path)).validation
 
     def open(self, source: Path) -> OpenedProjectPackage:
-        return _validate_artifact(_selected_user_path(source))
+        path = _selected_user_path(source)
+        return _validate_artifact(path, backend=self._backend_for(path))
 
     def inspect_recovery(
         self,
@@ -3420,12 +4985,19 @@ class ProjectPackageService:
         if not isinstance(destination, Path):
             raise TypeError("destination must be pathlib.Path")
         target = _selected_user_path(destination)
-        port = _ProjectPackagePersistencePort(target, None, ())
+        port = _ProjectPackagePersistencePort(
+            target,
+            None,
+            (),
+            backend=self._backend_for(target),
+        )
         try:
             handle = port.inspect_pending_recovery()
         except OSError as error:
+            _close_package_port(port)
             raise ProjectWorkspaceError("PROJECT.PACKAGE.RECOVERY_REQUIRED") from error
         if handle is None:
+            _close_package_port(port)
             return None
         facts = port.describe_pending_recovery(handle)
         actions = (
@@ -3436,14 +5008,22 @@ class ProjectPackageService:
                 RecoveryPhase.ARMED,
             }
             else (
-                (RecoveryAction.COMPLETE_COMMIT,)
+                (RecoveryAction.ROLLBACK,)
                 if (
-                    facts.phase is RecoveryPhase.COMMIT_UNCERTAIN
+                    facts.phase is RecoveryPhase.PUBLISHING
                     and type(handle) is _PackageCandidate
-                    and handle.last_known_good_artifact_digest is not None
-                    and handle.last_known_good_workspace is None
+                    and handle.candidate_workspace is None
                 )
-                else (RecoveryAction.COMPLETE_COMMIT, RecoveryAction.ROLLBACK)
+                else (
+                    (RecoveryAction.COMPLETE_COMMIT,)
+                    if (
+                        facts.phase is RecoveryPhase.COMMIT_UNCERTAIN
+                        and type(handle) is _PackageCandidate
+                        and handle.last_known_good_artifact_digest is not None
+                        and handle.last_known_good_workspace is None
+                    )
+                    else (RecoveryAction.COMPLETE_COMMIT, RecoveryAction.ROLLBACK)
+                )
             )
         )
         self._recovery_ports[facts.operation_id] = (
@@ -3478,48 +5058,53 @@ class ProjectPackageService:
             _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
         port = plan[1]
         try:
-            handle = port.inspect_pending_recovery()
-            if handle is None:
-                raise OSError("recovery journal disappeared")
-            facts = port.describe_pending_recovery(handle)
-            if (
-                facts.operation_id != operation_id
-                or facts.phase is not plan[2]
-                or facts.candidate_digest != plan[3]
-                or facts.last_known_good_digest != plan[4]
-            ):
-                raise OSError("recovery preview is stale")
-            if choice is RecoveryAction.COMPLETE_COMMIT:
-                recovered = port.complete_pending_commit(handle)
-                state = SaveJournalState.COMMITTED
-            elif choice is RecoveryAction.ROLLBACK:
-                recovered = port.rollback_pending(handle)
-                state = SaveJournalState.ROLLED_BACK
-            else:
-                recovered = port.abandon_staged_copy(handle)
-                state = SaveJournalState.CLEAN
-            if port.inspect_pending_recovery() is not None:
-                raise OSError("recovery cleanup is incomplete")
-        except OSError:
+            try:
+                handle = port.inspect_pending_recovery()
+                if handle is None:
+                    raise OSError("recovery journal disappeared")
+                facts = port.describe_pending_recovery(handle)
+                if (
+                    facts.operation_id != operation_id
+                    or facts.phase is not plan[2]
+                    or facts.candidate_digest != plan[3]
+                    or facts.last_known_good_digest != plan[4]
+                ):
+                    raise OSError("recovery preview is stale")
+                if choice is RecoveryAction.COMPLETE_COMMIT:
+                    recovered = port.complete_pending_commit(handle)
+                    state = SaveJournalState.COMMITTED
+                elif choice is RecoveryAction.ROLLBACK:
+                    recovered = port.rollback_pending(handle)
+                    state = SaveJournalState.ROLLED_BACK
+                else:
+                    recovered = port.abandon_staged_copy(handle)
+                    state = SaveJournalState.CLEAN
+                if port.inspect_pending_recovery() is not None:
+                    raise OSError("recovery cleanup is incomplete")
+            except OSError:
+                return ProjectRecoveryReport(
+                    operation_id=operation_id,
+                    action=choice,
+                    journal_state=SaveJournalState.RECOVERY_REQUIRED,
+                    workspace_content_digest=plan[4],
+                    recovery_required=True,
+                    retryable=True,
+                    safe_code="PROJECT.SAVE.RECOVERY_REQUIRED",
+                )
             return ProjectRecoveryReport(
                 operation_id=operation_id,
                 action=choice,
-                journal_state=SaveJournalState.RECOVERY_REQUIRED,
-                workspace_content_digest=plan[4],
-                recovery_required=True,
-                retryable=True,
-                safe_code="PROJECT.SAVE.RECOVERY_REQUIRED",
+                journal_state=state,
+                workspace_content_digest=(
+                    None
+                    if recovered is None
+                    else workspace_content_digest_v1(recovered)
+                ),
+                recovery_required=False,
+                retryable=False,
             )
-        return ProjectRecoveryReport(
-            operation_id=operation_id,
-            action=choice,
-            journal_state=state,
-            workspace_content_digest=(
-                None if recovered is None else workspace_content_digest_v1(recovered)
-            ),
-            recovery_required=False,
-            retryable=False,
-        )
+        finally:
+            _close_package_port(port)
 
     @staticmethod
     def _export_receipt(
@@ -3585,18 +5170,22 @@ class ProjectPackageService:
             target,
             clone.origin_binding,
             codec_private_sources,
+            backend=self._backend_for(target),
         )
-        report = disposable.save_workspace(port)
-        receipt = self._export_receipt(
-            report,
-            port,
-            operation_kind=ProjectPackageOperationKind.EXPORT_COPY,
-        )
-        if receipt is None:
-            if report.recovery_required:
-                _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
-            _fail("PROJECT.PACKAGE.APPLY_FAILED")
-        return receipt
+        try:
+            report = disposable.save_workspace(port)
+            receipt = self._export_receipt(
+                report,
+                port,
+                operation_kind=ProjectPackageOperationKind.EXPORT_COPY,
+            )
+            if receipt is None:
+                if report.recovery_required:
+                    _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
+                _fail("PROJECT.PACKAGE.APPLY_FAILED")
+            return receipt
+        finally:
+            _close_package_port(port)
 
     def save_workspace(
         self,
@@ -3624,20 +5213,24 @@ class ProjectPackageService:
             target,
             save_service.workspace_service.origin_binding,
             codec_private_sources,
+            backend=self._backend_for(target),
             persistence_binding=persistence_binding,
         )
-        report = save_service.save_workspace(port)
-        receipt = self._export_receipt(
-            report,
-            port,
-            operation_kind=ProjectPackageOperationKind.SAVE,
-        )
-        binding = (
-            None
-            if port.committed_opened is None
-            else port.committed_opened.persistence_binding
-        )
-        return ProjectPackageExportResult(report, receipt, binding)
+        try:
+            report = save_service.save_workspace(port)
+            receipt = self._export_receipt(
+                report,
+                port,
+                operation_kind=ProjectPackageOperationKind.SAVE,
+            )
+            binding = (
+                None
+                if port.committed_opened is None
+                else port.committed_opened.persistence_binding
+            )
+            return ProjectPackageExportResult(report, receipt, binding)
+        finally:
+            _close_package_port(port)
 
     def save_document(
         self,
@@ -3665,20 +5258,24 @@ class ProjectPackageService:
             target,
             save_service.workspace_service.origin_binding,
             codec_private_sources,
+            backend=self._backend_for(target),
             persistence_binding=persistence_binding,
         )
-        report = save_service.save_document(document_id, port)
-        receipt = self._export_receipt(
-            report,
-            port,
-            operation_kind=ProjectPackageOperationKind.SAVE,
-        )
-        binding = (
-            None
-            if port.committed_opened is None
-            else port.committed_opened.persistence_binding
-        )
-        return ProjectPackageExportResult(report, receipt, binding)
+        try:
+            report = save_service.save_document(document_id, port)
+            receipt = self._export_receipt(
+                report,
+                port,
+                operation_kind=ProjectPackageOperationKind.SAVE,
+            )
+            binding = (
+                None
+                if port.committed_opened is None
+                else port.committed_opened.persistence_binding
+            )
+            return ProjectPackageExportResult(report, receipt, binding)
+        finally:
+            _close_package_port(port)
 
     def export_workspace(
         self,
@@ -3712,9 +5309,16 @@ class ProjectPackageService:
             raise TypeError("package paths must be pathlib.Path")
         source_path = _selected_user_path(source)
         destination_path = _selected_user_path(destination)
-        source_parent_facts = _bind_parent(source_path)
-        destination_parent_facts = _bind_parent(destination_path)
-        opened = _validate_artifact(source_path)
+        if os.name == "nt":
+            source_parent_facts = _ParentFacts(0, 0)
+            destination_parent_facts = _ParentFacts(0, 0)
+        else:
+            source_parent_facts = _bind_parent(source_path)
+            destination_parent_facts = _bind_parent(destination_path)
+        opened = _validate_artifact(
+            source_path,
+            backend=self._backend_for(source_path),
+        )
         if workspace_service is not None and type(
             workspace_service
         ) is not ProjectWorkspaceService:
@@ -3723,22 +5327,16 @@ class ProjectPackageService:
             type(item) is not ReconciliationAssociation for item in associations
         ):
             raise TypeError("associations must be an exact tuple")
-        source_descriptor, source_facts = _open_regular(
-            source_path,
-            include_digest=True,
-        )
-        os.close(source_descriptor)
-        destination_facts = None
+        source_facts = opened._file_facts
+        destination_facts = self._platform_entry_facts(destination_path)
         destination_project_id = None
         destination_opened = None
-        if destination_path.exists():
-            destination_descriptor, destination_facts = _open_regular(
-                destination_path,
-                include_digest=True,
-            )
-            os.close(destination_descriptor)
+        if destination_facts is not None:
             try:
-                destination_opened = _validate_artifact(destination_path)
+                destination_opened = _validate_artifact(
+                    destination_path,
+                    backend=self._backend_for(destination_path),
+                )
                 destination_project_id = destination_opened.workspace.project_id
             except ProjectWorkspaceError:
                 destination_project_id = None
@@ -3862,8 +5460,18 @@ class ProjectPackageService:
         )
         return preview
 
-    @staticmethod
-    def _require_import_plan_files_current(plan: _ImportPlan) -> None:
+    def _require_import_plan_files_current(self, plan: _ImportPlan) -> None:
+        if os.name == "nt":
+            source_facts = self._platform_entry_facts(plan.source)
+            if source_facts != plan.source_facts:
+                _fail("PROJECT.PACKAGE.SOURCE_STALE")
+            destination_facts = self._platform_entry_facts(plan.destination)
+            if plan.destination_facts is None:
+                if destination_facts is not None:
+                    _fail("PROJECT.PACKAGE.DESTINATION_STALE")
+            elif destination_facts != plan.destination_facts:
+                _fail("PROJECT.PACKAGE.DESTINATION_STALE")
+            return
         _require_parent(
             plan.source,
             plan.source_parent_facts,
@@ -4042,19 +5650,23 @@ class ProjectPackageService:
                 plan.destination,
                 candidate_service.origin_binding,
                 (),
+                backend=self._backend_for(plan.destination),
                 persistence_binding=persistence_binding,
                 additional_package_sources=(plan.opened,),
             )
-            report = save_service.save_workspace(port)
-            if report.journal_state is not SaveJournalState.COMMITTED:
-                _fail(
-                    "PROJECT.PACKAGE.RECOVERY_REQUIRED"
-                    if report.recovery_required
-                    else "PROJECT.PACKAGE.APPLY_FAILED"
-                )
-            installed = port.committed_opened
-            if installed is None:
-                _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
+            try:
+                report = save_service.save_workspace(port)
+                if report.journal_state is not SaveJournalState.COMMITTED:
+                    _fail(
+                        "PROJECT.PACKAGE.RECOVERY_REQUIRED"
+                        if report.recovery_required
+                        else "PROJECT.PACKAGE.APPLY_FAILED"
+                    )
+                installed = port.committed_opened
+                if installed is None:
+                    _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")
+            finally:
+                _close_package_port(port)
             validation = installed.validation
             mode = plan.preview.mode
             receipt = ProjectPackageImportReceipt(
@@ -4106,6 +5718,7 @@ class ProjectPackageService:
             plan.destination,
             None,
             (),
+            backend=self._backend_for(plan.destination),
             persistence_binding=plan.destination_opened.persistence_binding,
             additional_package_sources=(plan.opened,),
             allow_cross_project_lkg=True,
@@ -4146,6 +5759,8 @@ class ProjectPackageService:
                             "PROJECT.PACKAGE.APPLY_FAILED"
                         ) from error
             raise ProjectWorkspaceError("PROJECT.PACKAGE.RECOVERY_REQUIRED") from error
+        finally:
+            _close_package_port(port)
         installed = port.committed_opened
         if installed is None:
             _fail("PROJECT.PACKAGE.RECOVERY_REQUIRED")

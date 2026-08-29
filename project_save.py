@@ -91,6 +91,12 @@ class SaveJournalState(Enum):
     RECOVERY_REQUIRED = "recovery_required"
 
 
+class CleanPersistenceRejection(OSError):
+    """Owner port proved that no publication or recovery state was created."""
+
+    pass
+
+
 class RecoveryAction(Enum):
     COMPLETE_COMMIT = "complete_commit"
     ROLLBACK = "rollback"
@@ -881,6 +887,19 @@ class ProjectSaveService:
 
         try:
             existing_recovery = port.inspect_pending_recovery()
+        except CleanPersistenceRejection:
+            return self._failure_report(
+                operation_id,
+                scope,
+                initial_revision,
+                candidate,
+                lkg,
+                requested_document_ids,
+                changed_document_ids,
+                "PROJECT.SAVE.STAGE_FAILED",
+                SaveJournalState.CLEAN,
+                recovery_required=False,
+            )
         except OSError:
             existing_recovery = object()
         if existing_recovery is not None:
@@ -1486,6 +1505,7 @@ class ProjectSaveService:
 
 
 __all__ = (
+    "CleanPersistenceRejection",
     "DocumentOriginWriteState",
     "DocumentSaveResult",
     "DocumentSaveStatus",

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -916,6 +917,10 @@ class Cluster1LegacyJsonAdapterTests(unittest.TestCase):
                 "NUL.json",
             ):
                 with self.subTest(unsafe_basename=unsafe_basename):
+                    if os.name == "nt":
+                        # Win32 cannot create these path components as ordinary
+                        # files, so this POSIX promotion fixture is inapplicable.
+                        continue
                     unsafe_path = Path(temporary) / unsafe_basename
                     unsafe_path.write_text(
                         json.dumps(
