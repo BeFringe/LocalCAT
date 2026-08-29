@@ -183,9 +183,18 @@ class _Lease(LockLease):
     def __init__(self) -> None:
         super().__init__()
         self.reprove_calls = 0
+        self.binding_calls: list[tuple[BoundDirectoryAuthority, str, bytes]] = []
 
     def _reprove_lock(self) -> None:
         self.reprove_calls += 1
+
+    def _reprove_binding(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        self.binding_calls.append((parent, name, payload))
 
     def _close_authority(self) -> None:
         pass
@@ -574,6 +583,7 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
                 "relative",
             ),
             ProcessFileLock.acquire: ("self", "parent", "name", "payload", "policy"),
+            LockLease.reprove_binding: ("self", "parent", "name", "payload"),
             PrivateStorageProof.create_private_directory: ("self", "parent", "name"),
             PrivateStorageProof.prove_private: ("self", "authority"),
             PersistentPrivateProof.bind_device_secret: ("self", "secret_file"),
@@ -1590,6 +1600,68 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             lease.reprove()
         self.assertEqual(
             caught.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        )
+
+    def test_lock_lease_binding_reproof_validates_exact_live_inputs_and_return(self) -> None:
+        lease = _Lease()
+        parent = _Directory()
+
+        self.assertIsNone(
+            lease.reprove_binding(parent, "resource.lock", b"payload")
+        )
+        self.assertEqual(
+            lease.binding_calls,
+            [(parent, "resource.lock", b"payload")],
+        )
+
+        for call in (
+            lambda: lease.reprove_binding(object(), "resource.lock", b"payload"),
+            lambda: lease.reprove_binding(
+                parent,
+                PurePath("resource.lock"),  # type: ignore[arg-type]
+                b"payload",
+            ),
+            lambda: lease.reprove_binding(
+                parent,
+                "resource.lock",
+                bytearray(b"payload"),  # type: ignore[arg-type]
+            ),
+        ):
+            with self.subTest(call=call), self.assertRaises(TypeError):
+                call()
+        for invalid in ("", ".", "..", "a/b", "a\\b", "nul\0name"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                lease.reprove_binding(parent, invalid, b"payload")
+        self.assertEqual(len(lease.binding_calls), 1)
+
+        closed_parent = _Directory()
+        closed_parent.close()
+        with self.assertRaises(PlatformFileError) as caught_parent:
+            lease.reprove_binding(closed_parent, "resource.lock", b"payload")
+        self.assertEqual(
+            caught_parent.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        )
+
+        class WrongReturn(_Lease):
+            def _reprove_binding(
+                self,
+                parent: BoundDirectoryAuthority,
+                name: str,
+                payload: bytes,
+            ) -> None:
+                del parent, name, payload
+                return object()  # type: ignore[return-value]
+
+        with self.assertRaises(TypeError):
+            WrongReturn().reprove_binding(parent, "resource.lock", b"payload")
+
+        lease.close()
+        with self.assertRaises(PlatformFileError) as caught_lease:
+            lease.reprove_binding(parent, "resource.lock", b"payload")
+        self.assertEqual(
+            caught_lease.exception.code,
             PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
         )
 

@@ -251,6 +251,91 @@ class WindowsPersistentLockTests(unittest.TestCase):
         second = self._acquire()
         second.close()
 
+    def test_lease_binding_reproof_requires_exact_live_parent_name_and_payload(self) -> None:
+        lease = self._acquire()
+        (self.root_path / "other").mkdir()
+        other_parent = self.rooted_fs.bind_parent(
+            self.root,
+            PureWindowsPath("other", "entry.bin"),
+        )
+        closed_parent = self.rooted_fs.bind_parent(
+            self.root,
+            PureWindowsPath("resource.lock"),
+        )
+        closed_parent.close()
+        try:
+            self.assertIsNone(
+                lease.reprove_binding(self.parent, "resource.lock", EXPECTED)
+            )
+            for parent, name, payload in (
+                (other_parent, "resource.lock", EXPECTED),
+                (self.parent, "other.lock", EXPECTED),
+                (self.parent, "resource.lock", b"other"),
+            ):
+                with self.subTest(
+                    parent=type(parent).__name__,
+                    name=name,
+                    payload=payload,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    lease.reprove_binding(parent, name, payload)
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                )
+
+            with self.assertRaises(PlatformFileError) as caught_closed_parent:
+                lease.reprove_binding(closed_parent, "resource.lock", EXPECTED)
+            _assert_platform_error(
+                self,
+                caught_closed_parent,
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+
+            for programming_error in (
+                TypeError("programmer type fault"),
+                AssertionError("programmer assertion fault"),
+            ):
+                with self.subTest(
+                    programming_error=type(programming_error).__name__
+                ), mock.patch.object(
+                    type(lease),
+                    "_reprove_lock",
+                    side_effect=programming_error,
+                ), self.assertRaises(type(programming_error)):
+                    lease.reprove_binding(self.parent, "resource.lock", EXPECTED)
+        finally:
+            other_parent.close()
+            lease.close()
+
+        with self.assertRaises(PlatformFileError) as caught_closed_lease:
+            lease.reprove_binding(self.parent, "resource.lock", EXPECTED)
+        _assert_platform_error(
+            self,
+            caught_closed_lease,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+        )
+
+    def test_lease_binding_reproof_detects_live_payload_tamper(self) -> None:
+        lease = self._acquire()
+        (self.root_path / "resource.lock").write_bytes(b"foreign")
+
+        with self.assertRaises(PlatformFileError) as caught:
+            lease.reprove_binding(self.parent, "resource.lock", EXPECTED)
+        _assert_platform_error(
+            self,
+            caught,
+            PlatformFileErrorCode.LOCK_UNAVAILABLE,
+        )
+        with self.assertRaises(PlatformFileError) as caught_close:
+            lease.close()
+        _assert_platform_error(
+            self,
+            caught_close,
+            PlatformFileErrorCode.LOCK_UNAVAILABLE,
+        )
+        self.assertTrue(lease.closed)
+
     def test_root_authority_supports_same_parent_lock_and_ledger_observation(self) -> None:
         (self.root_path / "entry.json").write_bytes(b"entry")
         lease = WindowsProcessFileLock().acquire(
