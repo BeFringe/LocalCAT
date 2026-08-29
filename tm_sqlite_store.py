@@ -82,10 +82,13 @@ from tm_content_attestation import (
     ActiveContentAttestation,
     ContentAttestationError,
     ContentFileProof,
+    PortableSealedContentAttestation,
     _capture_content_file,
 )
 from platform_fs_contracts import (
     MutableFileReservation,
+    PersistentPrivateProof,
+    PlatformFileBackend,
     PlatformFileError,
     RootedDirectoryAuthority,
 )
@@ -120,6 +123,10 @@ from tm_activation_journal import (
     _PHASE_SEQUENCE,
     _PriorActivationRef,
     _PriorAssetCapture,
+    _PortableActivationJournalRecord,
+    _PortableActivationJournalUnsigned,
+    _PortablePreparedJournalHandle,
+    _CallerHeldPortableJournalBorrow,
     _ROLLBACK_ELIGIBLE_ERROR_CODES,
     _RecoveryBackupAsset,
     _SQLiteGenerationView,
@@ -142,6 +149,10 @@ from tm_activation_journal import (
     _close_activation_journal,
     _create_recovery_backup,
     _create_recovery_backups,
+    _PORTABLE_ACTIVATION_JOURNAL_PHASE,
+    _PORTABLE_ACTIVATION_JOURNAL_VERSION,
+    _portable_activation_private_directory_name,
+    _WindowsPortablePreparedJournalOwner,
     _decode_activation_journal_record,
     _decode_journal_bool,
     _decode_journal_digest,
@@ -3438,6 +3449,242 @@ class ResourceStoreCoordinator:
             return _publish_activation_journal(
                 _CoordinatorStorePort(self),
                 preparation,
+            )
+
+    def publish_portable_prepared_activation(
+        self,
+        preparation: _ActivationPreparation,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> _PortablePreparedJournalHandle:
+        """Publish only one Windows v3 PREPARED owner envelope.
+
+        This seam is intentionally separate from the historical v2 writer.
+        It leaves the coordinator ACTIVATING and does not publish, cancel, or
+        recover the canonical DB/manifest pair.
+        """
+
+        if type(preparation) is not _ActivationPreparation:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PREPARATION_INVALID",
+                retryable=False,
+            )
+        if not isinstance(platform, PlatformFileBackend):
+            raise TypeError("platform must satisfy PlatformFileBackend")
+        if not isinstance(persistent_private, PersistentPrivateProof):
+            raise TypeError(
+                "persistent_private must satisfy PersistentPrivateProof"
+            )
+        if persistent_private is not platform:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            )
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("caller_borrow must be the exact portable borrow")
+
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not preparation
+                or self._cleanup_reservation is not None
+                or self._cleanup_in_progress
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_STATE_INVALID",
+                    retryable=True,
+                )
+            stage = preparation._sealed_stage
+            token = preparation._token
+            physical = preparation._physical_snapshot
+            stage_sealer = importlib.import_module("tm_stage_sealer")
+            portable_snapshot_type = getattr(
+                stage_sealer,
+                "_PortablePhysicalReadinessSnapshot",
+            )
+            stage_seal_error = getattr(stage_sealer, "StageSealError")
+            if type(physical) is not portable_snapshot_type:
+                raise ActivationPreparationError(
+                    "ACTIVATION.ATTESTATION_UNAVAILABLE",
+                    retryable=False,
+                )
+            try:
+                contract_module._validate_activation_token_for_stage(
+                    token,
+                    stage,
+                )
+                physical.live_reproof.reprove()
+                caller_borrow.reprove(platform, self._resource_identity)
+            except stage_seal_error as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                    retryable=False,
+                ) from error
+            except ValueError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                ) from error
+            sealed_attestation = physical.sealed_content_attestation
+            if type(sealed_attestation) is not PortableSealedContentAttestation:
+                raise ActivationPreparationError(
+                    "ACTIVATION.ATTESTATION_UNAVAILABLE",
+                    retryable=False,
+                )
+            evidence = physical.evidence
+            receipt = evidence.source_binding.receipt
+            identity = self._resource_identity
+            if (
+                preparation.expected_prior_generation is not None
+                or preparation.prior_canonical_store_id is not None
+                or preparation.had_prior_canonical
+                or preparation.prior_manifest_absent
+                or preparation._prior_view is not None
+                or preparation._backup_assets
+                or physical.registry_namespace
+                != token.registry_namespace
+                or physical.artifact_id != token.artifact_id
+                or physical.artifact_seal_digest
+                != token.artifact_seal_digest
+                or physical.sealed_stage_digest != token.sealed_stage_digest
+                or physical.resource_id != identity.resource_id
+                or physical.target_identity != identity.target_identity
+                or physical.canonical_store_id != self._canonical_store_id
+                or physical.canonical_store_id != token.canonical_store_id
+                or physical.snapshot_receipt_digest
+                != token.snapshot_receipt_digest
+                or physical.expected_prior_generation is not None
+                or physical.mutable_stage.resource_identity != identity
+                or sealed_attestation.resource_id != physical.resource_id
+                or sealed_attestation.target_identity
+                != physical.target_identity
+                or sealed_attestation.canonical_store_id
+                != physical.canonical_store_id
+                or sealed_attestation.snapshot_receipt_digest
+                != physical.snapshot_receipt_digest
+                or sealed_attestation.expected_prior_generation is not None
+                or sealed_attestation.evidence_digest
+                != contract_module.stage_validation_evidence_digest(evidence)
+                or sealed_attestation.database.sha256
+                != evidence.stage_file_digest
+                or sealed_attestation.manifest.sha256
+                != evidence.manifest_temp_digest
+                or sealed_attestation.source.sha256 != receipt.jsonl_digest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            private_directory_name = (
+                _portable_activation_private_directory_name(identity)
+            )
+            unsigned = _PortableActivationJournalUnsigned(
+                journal_version=_PORTABLE_ACTIVATION_JOURNAL_VERSION,
+                closure="PENDING",
+                phase=_PORTABLE_ACTIVATION_JOURNAL_PHASE,
+                journal_id=f"journal.{preparation.preparation_id}",
+                preparation_id=preparation.preparation_id,
+                registry_namespace=physical.registry_namespace,
+                token_id=token.token_id,
+                token_version=token.token_version,
+                activation_nonce=token.activation_nonce,
+                artifact_id=physical.artifact_id,
+                artifact_seal_digest=physical.artifact_seal_digest,
+                sealed_stage_digest=physical.sealed_stage_digest,
+                resource_id=physical.resource_id,
+                target_identity=physical.target_identity,
+                canonical_store_id=physical.canonical_store_id,
+                expected_prior_generation=None,
+                gate_b_grant_digest=preparation.gate_b_grant_digest,
+                evidence_digest=sealed_attestation.evidence_digest,
+                snapshot_receipt_digest=physical.snapshot_receipt_digest,
+                stage_db_digest=evidence.stage_file_digest,
+                manifest_temp_digest=evidence.manifest_temp_digest,
+                source_jsonl_digest=receipt.jsonl_digest,
+                new_receipt_id=receipt.snapshot_id,
+                new_manifest_digest=evidence.manifest_temp_digest,
+                candidate_stage_db_name=(
+                    physical.mutable_stage.staged_db_path.name
+                ),
+                candidate_manifest_temp_name=(
+                    physical.mutable_stage.manifest_temp_path.name
+                ),
+                private_directory_name=private_directory_name,
+                device_key_name="device.key",
+                journal_name="activation-journal-v3.json",
+                terminal_name="activation-terminal-v3.json",
+                lock_payload_digest=caller_borrow.lock_payload_digest(),
+                sealed_content_attestation=sealed_attestation,
+                active_content_attestation=None,
+            )
+
+            def reprove_physical_owner_authority() -> None:
+                fresh = self._sealed_registry.resolve_physical_readiness(stage)
+                if type(fresh) is not portable_snapshot_type:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                        retryable=False,
+                    )
+                try:
+                    if replace(
+                        fresh,
+                        live_reproof=physical.live_reproof,
+                    ) != physical:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                            retryable=False,
+                        )
+                    fresh.live_reproof.reprove()
+                finally:
+                    fresh.live_reproof._release()
+
+            def owner_reprove() -> None:
+                if (
+                    self._state != "ACTIVATING"
+                    or self._preparation is not preparation
+                    or self._cleanup_reservation is not None
+                    or self._cleanup_in_progress
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_STATE_INVALID",
+                        retryable=True,
+                    )
+                try:
+                    contract_module._validate_activation_token_for_stage(
+                        preparation._token,
+                        preparation._sealed_stage,
+                    )
+                    reprove_physical_owner_authority()
+                    caller_borrow.reprove(platform, identity)
+                except stage_seal_error as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                        retryable=False,
+                    ) from error
+                except ValueError as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                        retryable=False,
+                    ) from error
+
+            def owner_commit(record: _PortableActivationJournalRecord) -> None:
+                if record.unsigned != unsigned:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                        retryable=False,
+                    )
+                owner_reprove()
+
+            return _WindowsPortablePreparedJournalOwner.publish(
+                identity=identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                caller_borrow=caller_borrow,
+                unsigned=unsigned,
+                owner_reprove=owner_reprove,
+                owner_commit=owner_commit,
             )
 
     def _advance_activation_journal(

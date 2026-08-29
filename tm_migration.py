@@ -26,6 +26,7 @@ from tm_activation_journal import (
     _activation_lineage_marker_temp_path,
     _activation_terminal_path,
     _activation_terminal_temp_path,
+    _create_caller_held_portable_journal_borrow,
     _lstat_any_entry,
     _require_quarantine_directory,
 )
@@ -102,7 +103,10 @@ from tm_stage_sealer import (
 )
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
-from platform_fs import compose_platform_file_backend
+from platform_fs import (
+    compose_platform_file_backend,
+    narrow_windows_persistent_private_proof,
+)
 from platform_fs_contracts import (
     LockLease,
     LockPolicy,
@@ -5086,6 +5090,7 @@ class _InitialActivationResourceReservation:
         "_released",
         "_root",
         "_stage_borrow_minted",
+        "_journal_borrow_minted",
         "_initial_attempt",
     )
 
@@ -5111,6 +5116,7 @@ class _InitialActivationResourceReservation:
         self._lease = lease
         self._released = False
         self._stage_borrow_minted = False
+        self._journal_borrow_minted = False
         self._initial_attempt: _InitialStageAttempt | None = None
 
     @classmethod
@@ -5484,6 +5490,51 @@ class _InitialActivationResourceReservation:
             ) from error
         self._stage_borrow_minted = True
         return {"platform": self._backend, "caller_borrow": borrow}
+
+    def portable_journal_inputs(self) -> dict[str, object]:
+        """Mint one non-closing v3 journal borrow from the held W1 owner."""
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+            or self._journal_borrow_minted
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        self.reprove()
+        try:
+            persistent_private = narrow_windows_persistent_private_proof(
+                self._backend,
+                self._identity.canonical_sidecar_path.parent,
+            )
+            if persistent_private is not self._backend:
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+            borrow = _create_caller_held_portable_journal_borrow(
+                identity=self._identity,
+                backend=self._backend,
+                root=self._root,
+                lease=self._lease,
+                lock_name=self._lock_name,
+                lock_payload=self._payload(self._identity),
+            )
+            borrow.reprove(self._backend, self._identity)
+        except PlatformFileError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            ) from error
+        self._journal_borrow_minted = True
+        return {
+            "platform": self._backend,
+            "persistent_private": persistent_private,
+            "caller_borrow": borrow,
+        }
 
     def release(self) -> None:
         """Release advisory ownership; never unlink the persistent file."""
