@@ -159,6 +159,7 @@
   - 初始激活的调用方 reservation 是 platform backend、sidecar-parent root 与 `LockLease` 的唯一 owner；StageSealer 不得自取锁，只消费绑定同一 resource/backend 的 non-closing borrow。DB/manifest 必须复用 borrow root，source 使用独立 rooted handle；borrow 随 registry live authority 贯穿 seal、两次 Gate B 与 token terminal，terminal 只撤销 borrow而不关闭 base root/lease。
   - 缺少或错配 borrow、lock/root 漂移、跨进程 replay 或 foreign handle 必须在 portable registry/`SEALED` mutation 前拒绝；首轮 Gate B 或 token 发行前失败须退休未发行 portable entry。尚无 caller-held reservation 的 Windows import/rebuild/schema upgrade 继续 fail closed，不得由 StageSealer 临时补锁。
   - 未发布stage的DB/manifest通过`ExistingFileDurability`持有专用同步authority：Windows在同一handle上执行`FlushFileBuffers`并复证exact content/live identity与parent/root，parent reproof不宣称directory fsync；同步或复证缺失/漂移时不得登记sealed registry，冷重开只允许重建或保持unavailable。canonical publication仍归5.7a。
+  - 首次激活的initial-stage attempt必须唯一持有DB/manifest两个`CREATE_NEW` reservation；SQLite build writers（schema、batch、receipt）与manifest writer只借用且不close/unlink，StageSealer打开同步handle后逐一证明其identity等于对应creator reservation。pre-journal失败若已铸造registry authority则先退休该未发行authority，再以`OwnedNamespaceRetirement`将实际已创建的exact owner无覆盖移入嵌套quarantine；partial pair只处理已取得的owner，retained retirement保留至legacy/source与双namespace终态复证后唯一关闭。此闭环不得提前授权journal/private/canonical publication或Windows import/rebuild/schema upgrade。
   - _Amendment: WA-06_
   - _Depends: 1.2a, 5.3, windows-platform-enablement 3.7_
 
