@@ -293,3 +293,4 @@ Cluster 0 治理/characterization
 
 - `2.4a`：CSV/v1 direct publication 在 owner receipt callback 返回前保持 `PendingPublication`；ambiguous replace 保留 LKG/candidate。
 - `3.4a`：`SealedResourcePackage.reprove()` 同时复证 retained file 与 pathname/parent entry identity。
+- `4.4a`：Termbase create在`PendingPublication`存活时只推进owner durable READY/registry事实，terminal reproof成功后才完成receipt ledger；delete在同一owner lock内重读registry并经rooted identity/unlink seam发布；Termbase commit复证live source identity。
