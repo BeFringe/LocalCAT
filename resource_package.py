@@ -12,6 +12,15 @@ import stat
 import struct
 from typing import BinaryIO, Iterator
 
+from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    EntrySnapshot,
+    PlatformFileBackend,
+    PlatformFileError,
+    PublishMode,
+    RootedDirectoryAuthority,
+)
 from resource_package_contracts import (
     MAX_ARTIFACT_BYTES,
     MAX_MANIFEST_BYTES,
@@ -22,6 +31,13 @@ from resource_package_contracts import (
     ResourcePortabilityError,
     manifest_from_bytes,
     manifest_to_bytes,
+)
+from resource_platform_io import (
+    BoundRegularFileStream,
+    bind_rooted_regular,
+    digest_bound,
+    iter_bound_chunks,
+    platform_relative_path as _platform_relative_path,
 )
 
 
@@ -37,7 +53,7 @@ _DOS_TIME = 0
 _DOS_DATE = 33
 _EXTERNAL_ATTRIBUTES = (stat.S_IFREG | 0o644) << 16
 _MANIFEST_NAME = b"manifest.json"
-_COPY_CHUNK = 1024 * 1024
+_BOUND_READ_CHUNK = 64 * 1024
 _NATIVE_PATH_TYPE = type(Path())
 
 
@@ -55,41 +71,59 @@ class SealedResourcePackage:
 
     __slots__ = (
         "_artifact_digest",
-        "_fd",
-        "_identity",
+        "_backend",
+        "_source",
+        "_snapshot",
         "_payload",
-        "_source_path",
+        "_parent",
+        "_root",
         "manifest",
+        "_source_name",
         "validation",
     )
 
     def __init__(
         self,
         *,
-        fd: int,
-        identity: tuple[int, int, int, int],
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        parent: BoundDirectoryAuthority,
+        source: BoundRegularFile,
+        source_name: str,
+        snapshot: EntrySnapshot,
         artifact_digest: str,
-        source_path: Path,
         manifest: ResourcePackageManifest,
         validation: ResourcePackageValidationReport,
         payload: _CarrierMember,
     ) -> None:
-        self._fd = fd
-        self._identity = identity
+        self._backend = backend
+        self._root: RootedDirectoryAuthority | None = root
+        self._parent: BoundDirectoryAuthority | None = parent
+        self._source: BoundRegularFile | None = source
+        self._source_name = source_name
+        self._snapshot = snapshot
         self._artifact_digest = artifact_digest
-        self._source_path = source_path
         self.manifest = manifest
         self.validation = validation
         self._payload = payload
 
     @property
     def closed(self) -> bool:
-        return self._fd < 0
+        return self._source is None
 
     def close(self) -> None:
-        if self._fd >= 0:
-            os.close(self._fd)
-            self._fd = -1
+        source = self._source
+        parent = self._parent
+        root = self._root
+        self._source = None
+        self._parent = None
+        self._root = None
+        for authority in (source, parent, root):
+            if authority is not None:
+                try:
+                    authority.close()
+                except PlatformFileError:
+                    pass
 
     def __enter__(self) -> SealedResourcePackage:
         if self.closed:
@@ -102,24 +136,14 @@ class SealedResourcePackage:
     def reprove(self) -> None:
         """Reprove the retained file identity and complete bytes before apply."""
 
-        fd = self._require_open()
-        try:
-            observed = _fd_identity(fd)
-            path_info = os.lstat(self._source_path)
-            path_identity = (
-                path_info.st_dev,
-                path_info.st_ino,
-                path_info.st_size,
-                path_info.st_mtime_ns,
-            )
-        except (OSError, ResourcePortabilityError) as error:
-            raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE") from error
+        source = self._require_open()
+        parent = self._parent
+        if parent is None:
+            raise ValueError("sealed ResourcePackage is closed")
         if (
-            not stat.S_ISREG(path_info.st_mode)
-            or path_info.st_nlink != 1
-            or path_identity != self._identity
-            or observed != self._identity
-            or _digest_fd(fd) != self._artifact_digest
+            source.snapshot() != self._snapshot
+            or parent.inspect_entry(self._source_name) != self._snapshot
+            or digest_bound(source, self._snapshot).hex() != self._artifact_digest
         ):
             raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE")
 
@@ -128,36 +152,81 @@ class SealedResourcePackage:
 
         if type(destination) is not _NATIVE_PATH_TYPE or not destination.is_absolute():
             raise TypeError("payload destination must be an absolute Path")
-        fd = self._require_open()
-        output = _open_new_regular(destination)
-        digest = hashlib.sha256()
-        crc = 0
-        remaining = self._payload.byte_count
+        source = self._require_open()
+        root = None
+        parent = None
+        candidate = None
+        pending = None
+        candidate_name = (
+            f".resource-payload-{hashlib.sha256(destination.name.encode('utf-8')).hexdigest()[:16]}-{os.urandom(8).hex()}.tmp"
+        )
+        candidate_identity = None
         try:
-            os.lseek(fd, self._payload.data_offset, os.SEEK_SET)
-            while remaining:
-                chunk = os.read(fd, min(_COPY_CHUNK, remaining))
-                if not chunk:
-                    raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-                _write_all(output, chunk)
-                digest.update(chunk)
-                crc = binascii.crc32(chunk, crc)
-                remaining -= len(chunk)
-            os.fsync(output)
+            root = self._backend.bind_root(destination.parent)
+            parent = self._backend.bind_parent(
+                root,
+                _platform_relative_path(destination.name),
+            )
+            if parent.inspect_entry(destination.name) is not None:
+                raise ResourcePortabilityError("RESOURCE.EXPORT.STAGE_FAILED")
+            candidate = parent.create_candidate(candidate_name, private=True)
+            candidate_identity = candidate.identity()
+            facts = candidate.write_chunks(
+                iter_bound_chunks(
+                    source,
+                    self._snapshot,
+                    start=self._payload.data_offset,
+                    length=self._payload.byte_count,
+                ),
+                maximum_bytes=MAX_PAYLOAD_BYTES,
+            )
+            if (
+                facts.content_sha256.hex() != self.validation.payload_digest
+                or facts.byte_count != self._payload.byte_count
+            ):
+                raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
+            candidate.flush_content()
+            pending = parent.begin_publish(
+                candidate,
+                destination.name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            candidate_identity = None
+            preliminary = pending.preliminary_facts()
+            retained = pending.retained_destination()
+            retained_snapshot = retained.snapshot()
+            if (
+                preliminary.content_sha256 != facts.content_sha256
+                or preliminary.byte_count != facts.byte_count
+                or retained_snapshot.byte_count != facts.byte_count
+                or digest_bound(retained, retained_snapshot) != facts.content_sha256
+                or pending.terminal_reproof() != preliminary
+            ):
+                raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
+            self.reprove()
         except BaseException:
-            os.close(output)
-            destination.unlink(missing_ok=True)
+            if candidate is not None:
+                candidate.close()
+            if candidate_identity is not None and parent is not None:
+                try:
+                    parent.unlink_owned(candidate_name, candidate_identity)
+                except PlatformFileError:
+                    pass
+            if pending is not None and parent is not None:
+                identity = pending.preliminary_facts().destination_identity
+                pending.close()
+                pending = None
+                try:
+                    parent.unlink_owned(destination.name, identity)
+                except PlatformFileError:
+                    pass
             raise
-        os.close(output)
-        _fsync_directory(destination.parent)
-        if (
-            digest.hexdigest() != self.validation.payload_digest
-            or crc & 0xFFFFFFFF != self._payload.crc32
-        ):
-            destination.unlink(missing_ok=True)
-            _fsync_directory(destination.parent)
-            raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
-        self.reprove()
+        finally:
+            for authority in (pending, parent, root):
+                if authority is not None:
+                    authority.close()
 
     def transfer_metadata(self) -> ResourcePackageTransferMetadata:
         report = self.validation
@@ -174,47 +243,59 @@ class SealedResourcePackage:
         )
 
     def transfer_artifact(self) -> ResourcePackageArtifact:
-        """Detach a path-free immutable artifact port from this sealed source."""
+        """Transfer the exact retained authority into a path-free artifact port."""
 
+        self.reprove()
+        source = self._require_open()
+        self._source = None
+        parent = self._parent
+        root = self._root
+        self._parent = None
+        self._root = None
+        for authority in (parent, root):
+            if authority is not None:
+                authority.close()
         return ResourcePackageArtifact(
-            fd=os.dup(self._require_open()),
-            identity=self._identity,
+            source=source,
+            snapshot=self._snapshot,
             artifact_digest=self._artifact_digest,
             metadata=self.transfer_metadata(),
         )
 
-    def _require_open(self) -> int:
-        if self._fd < 0:
+    def _require_open(self) -> BoundRegularFile:
+        source = self._source
+        if source is None:
             raise ValueError("sealed ResourcePackage is closed")
-        return self._fd
+        return source
 
 
 class ResourcePackageArtifact:
     """Path-free bounded byte source for a future provider/sync consumer."""
 
-    __slots__ = ("_artifact_digest", "_fd", "_identity", "metadata")
+    __slots__ = ("_artifact_digest", "_snapshot", "_source", "metadata")
 
     def __init__(
         self,
         *,
-        fd: int,
-        identity: tuple[int, int, int, int],
+        source: BoundRegularFile,
+        snapshot: EntrySnapshot,
         artifact_digest: str,
         metadata: ResourcePackageTransferMetadata,
     ) -> None:
-        self._fd = fd
-        self._identity = identity
+        self._source: BoundRegularFile | None = source
+        self._snapshot = snapshot
         self._artifact_digest = artifact_digest
         self.metadata = metadata
 
     @property
     def closed(self) -> bool:
-        return self._fd < 0
+        return self._source is None
 
     def close(self) -> None:
-        if self._fd >= 0:
-            os.close(self._fd)
-            self._fd = -1
+        source = self._source
+        if source is not None:
+            self._source = None
+            source.close()
 
     def __enter__(self) -> ResourcePackageArtifact:
         self._reprove()
@@ -228,172 +309,197 @@ class ResourcePackageArtifact:
         """Yield only the retained validated artifact bytes, never a local path."""
 
         self._reprove()
-        descriptor = os.dup(self._fd)
-        handle = os.fdopen(descriptor, "rb", closefd=True)
+        source = self._require_open()
+        handle = BoundRegularFileStream(source, self._snapshot)
         try:
-            handle.seek(0)
             yield handle
         finally:
             handle.close()
 
     def _reprove(self) -> None:
-        if self._fd < 0:
-            raise ValueError("ResourcePackage artifact is closed")
+        source = self._require_open()
         if (
-            _fd_identity(self._fd) != self._identity
-            or _digest_fd(self._fd) != self._artifact_digest
+            source.snapshot() != self._snapshot
+            or digest_bound(source, self._snapshot).hex() != self._artifact_digest
             or self.metadata.artifact_sha256 != self._artifact_digest
-            or self.metadata.artifact_byte_count != self._identity[2]
+            or self.metadata.artifact_byte_count != self._snapshot.byte_count
         ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE")
+
+    def _require_open(self) -> BoundRegularFile:
+        source = self._source
+        if source is None:
+            raise ValueError("ResourcePackage artifact is closed")
+        return source
 
 
 def write_resource_package(
     destination: Path,
     manifest: ResourcePackageManifest,
     payload_source: Path,
+    *,
+    backend: PlatformFileBackend | None = None,
 ) -> ResourcePackageValidationReport:
     """Write one canonical ResourcePackage to a new caller-owned path."""
 
     _require_absolute_path(destination, "package destination")
     _require_absolute_path(payload_source, "package payload source")
     manifest_bytes = manifest_to_bytes(manifest)
-    source_fd = _open_existing_regular(payload_source)
-    destination_fd = -1
+    resolved_backend = _platform_backend(backend, destination.parent)
+    payload = bind_rooted_regular(resolved_backend, payload_source)
+    root = None
+    parent = None
+    candidate = None
+    pending = None
+    candidate_name: str | None = None
+    candidate_identity = None
     try:
-        source_identity = _fd_identity(source_fd)
-        payload_digest, payload_crc, payload_size = _measure_fd(
-            source_fd,
-            MAX_PAYLOAD_BYTES,
+        payload_snapshot = payload.snapshot()
+        payload_digest, payload_crc = _measure_bound_payload(
+            payload,
+            payload_snapshot,
         )
+        payload_size = payload_snapshot.byte_count
         if (
             payload_digest != manifest.payload.sha256
             or payload_size != manifest.payload.byte_count
         ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
-        destination_fd = _open_new_regular(destination)
-        entries: list[_CarrierMember] = []
-        offset = 0
-        manifest_crc = binascii.crc32(manifest_bytes) & 0xFFFFFFFF
-        offset = _write_local_member(
-            destination_fd,
-            offset,
-            _MANIFEST_NAME,
-            manifest_crc,
-            len(manifest_bytes),
-            lambda output: _write_all(output, manifest_bytes),
-            entries,
-        )
-
-        def copy_payload(output: int) -> None:
-            os.lseek(source_fd, 0, os.SEEK_SET)
-            digest = hashlib.sha256()
-            crc = 0
-            copied = 0
-            while copied < payload_size:
-                chunk = os.read(source_fd, min(_COPY_CHUNK, payload_size - copied))
-                if not chunk:
-                    raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-                _write_all(output, chunk)
-                digest.update(chunk)
-                crc = binascii.crc32(chunk, crc)
-                copied += len(chunk)
-            if (
-                digest.hexdigest() != payload_digest
-                or crc & 0xFFFFFFFF != payload_crc
-                or _fd_identity(source_fd) != source_identity
-            ):
-                raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_CHANGED")
-
-        offset = _write_local_member(
-            destination_fd,
-            offset,
+        chunks, artifact_size = _package_chunks(
+            manifest_bytes,
             manifest.payload.path.encode("utf-8"),
+            payload,
+            payload_snapshot,
             payload_crc,
-            payload_size,
-            copy_payload,
-            entries,
         )
-        central_offset = offset
-        for member in entries:
-            central = _CENTRAL.pack(
-                _CENTRAL_SIGNATURE,
-                _VERSION_MADE_BY,
-                _VERSION_NEEDED,
-                0,
-                0,
-                _DOS_TIME,
-                _DOS_DATE,
-                member.crc32,
-                member.byte_count,
-                member.byte_count,
-                len(member.name),
-                0,
-                0,
-                0,
-                0,
-                _EXTERNAL_ATTRIBUTES,
-                member.local_offset,
-            )
-            _write_all(destination_fd, central)
-            _write_all(destination_fd, member.name)
-            offset += len(central) + len(member.name)
-        central_size = offset - central_offset
-        eocd = _EOCD.pack(
-            _EOCD_SIGNATURE,
-            0,
-            0,
-            2,
-            2,
-            central_size,
-            central_offset,
-            0,
-        )
-        _write_all(destination_fd, eocd)
-        offset += len(eocd)
-        if offset > MAX_ARTIFACT_BYTES:
+        if artifact_size > MAX_ARTIFACT_BYTES:
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-        os.fsync(destination_fd)
-        os.close(destination_fd)
-        destination_fd = -1
-        _fsync_directory(destination.parent)
+        root = resolved_backend.bind_root(destination.parent)
+        parent = resolved_backend.bind_parent(
+            root,
+            _platform_relative_path(destination.name),
+        )
+        if parent.inspect_entry(destination.name) is not None:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.STAGE_FAILED")
+        candidate_name = f".resource-package-{hashlib.sha256(destination.name.encode('utf-8')).hexdigest()[:16]}-{os.urandom(8).hex()}.tmp"
+        candidate = parent.create_candidate(candidate_name, private=False)
+        candidate_identity = candidate.identity()
+        written = candidate.write_chunks(chunks, maximum_bytes=MAX_ARTIFACT_BYTES)
+        if written.byte_count != artifact_size:
+            raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
+        candidate.flush_content()
+        pending = parent.begin_publish(
+            candidate,
+            destination.name,
+            mode=PublishMode.CREATE_IF_ABSENT,
+            lease=None,
+        )
+        candidate = None
+        candidate_identity = None
+        preliminary = pending.preliminary_facts()
+        retained = pending.retained_destination()
+        retained_snapshot = retained.snapshot()
+        if (
+            preliminary.content_sha256 != written.content_sha256
+            or preliminary.byte_count != written.byte_count
+            or retained_snapshot.byte_count != written.byte_count
+            or digest_bound(retained, retained_snapshot) != written.content_sha256
+            or parent.inspect_entry(destination.name) != retained_snapshot
+        ):
+            raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
+        with open_resource_package(destination, backend=resolved_backend) as sealed:
+            report = sealed.validation
+        if (
+            report.artifact_digest != written.content_sha256.hex()
+            or report.artifact_byte_count != written.byte_count
+            or parent.inspect_entry(destination.name) != retained_snapshot
+            or pending.terminal_reproof() != preliminary
+        ):
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        return report
     except BaseException:
-        if destination_fd >= 0:
-            os.close(destination_fd)
-        destination.unlink(missing_ok=True)
+        if candidate is not None:
+            candidate.close()
+        if pending is not None and parent is not None:
+            published_identity = pending.preliminary_facts().destination_identity
+            pending.close()
+            pending = None
+            try:
+                parent.unlink_owned(destination.name, published_identity)
+            except PlatformFileError:
+                pass
+        if (
+            candidate_name is not None
+            and candidate_identity is not None
+            and parent is not None
+        ):
+            try:
+                parent.unlink_owned(candidate_name, candidate_identity)
+            except PlatformFileError:
+                pass
         raise
     finally:
-        os.close(source_fd)
+        for authority in (pending, parent, root, payload):
+            if authority is not None:
+                authority.close()
 
-    with open_resource_package(destination) as sealed:
-        return sealed.validation
 
-
-def open_resource_package(source: Path) -> SealedResourcePackage:
+def open_resource_package(
+    source: Path,
+    *,
+    backend: PlatformFileBackend | None = None,
+) -> SealedResourcePackage:
     """Open, raw-validate and retain one exact ResourcePackage artifact."""
 
     _require_absolute_path(source, "package source")
-    fd = _open_existing_regular(source)
+    root = None
+    parent = None
+    opened = None
     try:
-        identity = _fd_identity(fd)
-        artifact_size = identity[2]
+        resolved_backend = _platform_backend(backend, source.parent)
+        root = resolved_backend.bind_root(source.parent)
+        parent = resolved_backend.bind_parent(
+            root,
+            _platform_relative_path(source.name),
+        )
+        opened = resolved_backend.open_regular(
+            root,
+            _platform_relative_path(source.name),
+        )
+    except PlatformFileError:
+        for authority in (opened, parent, root):
+            if authority is not None:
+                authority.close()
+        raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE") from None
+    try:
+        snapshot = opened.snapshot()
+        artifact_size = snapshot.byte_count
         if artifact_size > MAX_ARTIFACT_BYTES or artifact_size < _EOCD.size:
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-        members = _parse_carrier(fd, artifact_size)
+        members = _parse_carrier(opened, snapshot)
         manifest_member, payload_member = members
-        manifest_bytes = _read_member_bytes(fd, manifest_member, MAX_MANIFEST_BYTES)
+        manifest_bytes = _read_member_bytes(
+            opened,
+            snapshot,
+            manifest_member,
+            MAX_MANIFEST_BYTES,
+        )
         manifest = manifest_from_bytes(manifest_bytes)
         expected_payload_name = manifest.payload.path.encode("utf-8")
         if payload_member.name != expected_payload_name:
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-        payload_digest, payload_crc = _digest_member(fd, payload_member)
+        payload_digest, payload_crc = _digest_bound_member(
+            opened,
+            snapshot,
+            payload_member,
+        )
         if (
             payload_digest != manifest.payload.sha256
             or payload_member.byte_count != manifest.payload.byte_count
             or payload_crc != payload_member.crc32
         ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
-        artifact_digest = _digest_fd(fd)
+        artifact_digest = digest_bound(opened, snapshot).hex()
         report = ResourcePackageValidationReport(
             artifact_digest=artifact_digest,
             artifact_byte_count=artifact_size,
@@ -409,70 +515,155 @@ def open_resource_package(source: Path) -> SealedResourcePackage:
             v1_record_count=manifest.profile_counts.v1_record_count,
             safe_issues=(),
         )
-        if _fd_identity(fd) != identity:
+        if (
+            opened.snapshot() != snapshot
+            or parent.inspect_entry(source.name) != snapshot
+        ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE")
         return SealedResourcePackage(
-            fd=fd,
-            identity=identity,
+            backend=resolved_backend,
+            root=root,
+            parent=parent,
+            source=opened,
+            source_name=source.name,
+            snapshot=snapshot,
             artifact_digest=artifact_digest,
-            source_path=source,
             manifest=manifest,
             validation=report,
             payload=payload_member,
         )
     except BaseException:
-        os.close(fd)
+        for authority in (opened, parent, root):
+            if authority is not None:
+                authority.close()
         raise
 
 
-def validate_resource_package(source: Path) -> ResourcePackageValidationReport:
-    with open_resource_package(source) as sealed:
+def validate_resource_package(
+    source: Path,
+    *,
+    backend: PlatformFileBackend | None = None,
+) -> ResourcePackageValidationReport:
+    with open_resource_package(source, backend=backend) as sealed:
         return sealed.validation
 
 
-def _write_local_member(
-    fd: int,
-    offset: int,
-    name: bytes,
-    crc32: int,
-    byte_count: int,
-    writer: object,
-    entries: list[_CarrierMember],
-) -> int:
-    if not callable(writer):
-        raise TypeError("member writer must be callable")
-    header = _LOCAL.pack(
+def _measure_bound_payload(
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+) -> tuple[str, int]:
+    if snapshot.byte_count > MAX_PAYLOAD_BYTES:
+        raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
+    digest = hashlib.sha256()
+    crc = 0
+    for chunk in iter_bound_chunks(source, snapshot):
+        digest.update(chunk)
+        crc = binascii.crc32(chunk, crc)
+    return digest.hexdigest(), crc & 0xFFFFFFFF
+
+
+def _package_chunks(
+    manifest_bytes: bytes,
+    payload_name: bytes,
+    payload: BoundRegularFile,
+    payload_snapshot: EntrySnapshot,
+    payload_crc: int,
+) -> tuple[Iterator[bytes], int]:
+    manifest_crc = binascii.crc32(manifest_bytes) & 0xFFFFFFFF
+    first = _CarrierMember(
+        name=_MANIFEST_NAME,
+        crc32=manifest_crc,
+        byte_count=len(manifest_bytes),
+        local_offset=0,
+        data_offset=_LOCAL.size + len(_MANIFEST_NAME),
+    )
+    second_offset = first.data_offset + first.byte_count
+    second = _CarrierMember(
+        name=payload_name,
+        crc32=payload_crc,
+        byte_count=payload_snapshot.byte_count,
+        local_offset=second_offset,
+        data_offset=second_offset + _LOCAL.size + len(payload_name),
+    )
+    central_offset = second.data_offset + second.byte_count
+    central_parts = tuple(_central_bytes(member) for member in (first, second))
+    central_size = sum(len(item) for item in central_parts)
+    eocd = _EOCD.pack(
+        _EOCD_SIGNATURE,
+        0,
+        0,
+        2,
+        2,
+        central_size,
+        central_offset,
+        0,
+    )
+    artifact_size = central_offset + central_size + len(eocd)
+
+    def chunks() -> Iterator[bytes]:
+        yield from _bounded_chunks(_local_header(first))
+        yield from _bounded_chunks(first.name)
+        yield from _bounded_chunks(manifest_bytes)
+        yield from _bounded_chunks(_local_header(second))
+        yield from _bounded_chunks(second.name)
+        yield from iter_bound_chunks(payload, payload_snapshot)
+        for central in central_parts:
+            yield from _bounded_chunks(central)
+        yield from _bounded_chunks(eocd)
+
+    return chunks(), artifact_size
+
+
+def _local_header(member: _CarrierMember) -> bytes:
+    return _LOCAL.pack(
         _LOCAL_SIGNATURE,
         _VERSION_NEEDED,
         0,
         0,
         _DOS_TIME,
         _DOS_DATE,
-        crc32,
-        byte_count,
-        byte_count,
-        len(name),
+        member.crc32,
+        member.byte_count,
+        member.byte_count,
+        len(member.name),
         0,
     )
-    _write_all(fd, header)
-    _write_all(fd, name)
-    data_offset = offset + len(header) + len(name)
-    writer(fd)
-    entries.append(
-        _CarrierMember(
-            name=name,
-            crc32=crc32,
-            byte_count=byte_count,
-            local_offset=offset,
-            data_offset=data_offset,
-        )
-    )
-    return data_offset + byte_count
 
 
-def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _CarrierMember]:
+def _central_bytes(member: _CarrierMember) -> bytes:
+    return _CENTRAL.pack(
+        _CENTRAL_SIGNATURE,
+        _VERSION_MADE_BY,
+        _VERSION_NEEDED,
+        0,
+        0,
+        _DOS_TIME,
+        _DOS_DATE,
+        member.crc32,
+        member.byte_count,
+        member.byte_count,
+        len(member.name),
+        0,
+        0,
+        0,
+        0,
+        _EXTERNAL_ATTRIBUTES,
+        member.local_offset,
+    ) + member.name
+
+
+def _bounded_chunks(payload: bytes) -> Iterator[bytes]:
+    for offset in range(0, len(payload), _BOUND_READ_CHUNK):
+        yield payload[offset : offset + _BOUND_READ_CHUNK]
+
+
+def _parse_carrier(
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+) -> tuple[_CarrierMember, _CarrierMember]:
+    artifact_size = snapshot.byte_count
     eocd_offset = artifact_size - _EOCD.size
-    eocd = _read_exact_at(fd, eocd_offset, _EOCD.size)
+    eocd = _read_exact_bound(source, snapshot, eocd_offset, _EOCD.size)
     values = _EOCD.unpack(eocd)
     if values[:5] != (_EOCD_SIGNATURE, 0, 0, 2, 2) or values[7] != 0:
         raise ResourcePortabilityError("RESOURCE.PACKAGE.FORMAT_UNSUPPORTED")
@@ -482,7 +673,7 @@ def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _Carrie
     cursor = central_offset
     central_members: list[_CarrierMember] = []
     for _index in range(2):
-        fixed = _read_exact_at(fd, cursor, _CENTRAL.size)
+        fixed = _read_exact_bound(source, snapshot, cursor, _CENTRAL.size)
         item = _CENTRAL.unpack(fixed)
         if (
             item[0] != _CENTRAL_SIGNATURE
@@ -495,7 +686,12 @@ def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _Carrie
         ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
         name_length = item[10]
-        name = _read_exact_at(fd, cursor + _CENTRAL.size, name_length)
+        name = _read_exact_bound(
+            source,
+            snapshot,
+            cursor + _CENTRAL.size,
+            name_length,
+        )
         central_members.append(
             _CarrierMember(
                 name=name,
@@ -522,7 +718,12 @@ def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _Carrie
     for central, expected_name in zip(central_members, expected_names, strict=True):
         if central.local_offset != expected_offset:
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-        fixed = _read_exact_at(fd, central.local_offset, _LOCAL.size)
+        fixed = _read_exact_bound(
+            source,
+            snapshot,
+            central.local_offset,
+            _LOCAL.size,
+        )
         item = _LOCAL.unpack(fixed)
         if (
             item[0] != _LOCAL_SIGNATURE
@@ -534,7 +735,12 @@ def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _Carrie
             or item[10] != 0
         ):
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-        name = _read_exact_at(fd, central.local_offset + _LOCAL.size, item[9])
+        name = _read_exact_bound(
+            source,
+            snapshot,
+            central.local_offset + _LOCAL.size,
+            item[9],
+        )
         if name != central.name or name != expected_name:
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
         data_offset = central.local_offset + _LOCAL.size + len(name)
@@ -552,106 +758,74 @@ def _parse_carrier(fd: int, artifact_size: int) -> tuple[_CarrierMember, _Carrie
     return local_members[0], local_members[1]
 
 
-def _read_member_bytes(fd: int, member: _CarrierMember, limit: int) -> bytes:
+def _read_member_bytes(
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+    member: _CarrierMember,
+    limit: int,
+) -> bytes:
     if member.byte_count > limit:
         raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-    payload = _read_exact_at(fd, member.data_offset, member.byte_count)
+    payload = _read_exact_bound(
+        source,
+        snapshot,
+        member.data_offset,
+        member.byte_count,
+    )
     if binascii.crc32(payload) & 0xFFFFFFFF != member.crc32:
         raise ResourcePortabilityError("RESOURCE.PACKAGE.DIGEST_MISMATCH")
     return payload
 
 
-def _digest_member(fd: int, member: _CarrierMember) -> tuple[str, int]:
+def _digest_bound_member(
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+    member: _CarrierMember,
+) -> tuple[str, int]:
     if member.byte_count > MAX_PAYLOAD_BYTES:
         raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-    os.lseek(fd, member.data_offset, os.SEEK_SET)
     remaining = member.byte_count
+    offset = member.data_offset
     digest = hashlib.sha256()
     crc = 0
     while remaining:
-        chunk = os.read(fd, min(_COPY_CHUNK, remaining))
+        chunk = source.read_at(
+            offset,
+            min(_BOUND_READ_CHUNK, remaining),
+            snapshot,
+        )
         if not chunk:
             raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
         digest.update(chunk)
         crc = binascii.crc32(chunk, crc)
         remaining -= len(chunk)
+        offset += len(chunk)
     return digest.hexdigest(), crc & 0xFFFFFFFF
 
 
-def _measure_fd(fd: int, limit: int) -> tuple[str, int, int]:
-    size = os.fstat(fd).st_size
-    if size > limit:
-        raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
-    digest, crc = _digest_member(
-        fd,
-        _CarrierMember(b"payload", 0, size, 0, 0),
-    )
-    return digest, crc, size
-
-
-def _digest_fd(fd: int) -> str:
-    size = os.fstat(fd).st_size
-    digest, _crc = _digest_member(
-        fd,
-        _CarrierMember(b"artifact", 0, size, 0, 0),
-    )
-    return digest
-
-
-def _fd_identity(fd: int) -> tuple[int, int, int, int]:
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE")
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
-
-
-def _open_existing_regular(path: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = -1
-    try:
-        fd = os.open(path, flags)
-        _fd_identity(fd)
-        return fd
-    except (OSError, ResourcePortabilityError) as error:
-        if fd >= 0:
-            os.close(fd)
-        raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE") from error
-
-
-def _open_new_regular(path: Path) -> int:
-    _require_absolute_path(path, "new artifact")
-    try:
-        return os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-    except OSError as error:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.STAGE_FAILED") from error
-
-
-def _read_exact_at(fd: int, offset: int, size: int) -> bytes:
+def _read_exact_bound(
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+    offset: int,
+    size: int,
+) -> bytes:
     if type(offset) is not int or type(size) is not int or offset < 0 or size < 0:
         raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
-    os.lseek(fd, offset, os.SEEK_SET)
+    if offset + size > snapshot.byte_count:
+        raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
     chunks: list[bytes] = []
+    cursor = offset
     remaining = size
     while remaining:
-        chunk = os.read(fd, remaining)
-        if not chunk:
-            raise ResourcePortabilityError("RESOURCE.PACKAGE.MEMBER_INVALID")
+        chunk = source.read_at(
+            cursor,
+            min(_BOUND_READ_CHUNK, remaining),
+            snapshot,
+        )
         chunks.append(chunk)
+        cursor += len(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
-
-
-def _write_all(fd: int, payload: bytes) -> None:
-    view = memoryview(payload)
-    while view:
-        written = os.write(fd, view)
-        if written <= 0:
-            raise OSError("short write")
-        view = view[written:]
 
 
 def _require_absolute_path(path: object, name: str) -> None:
@@ -659,12 +833,17 @@ def _require_absolute_path(path: object, name: str) -> None:
         raise TypeError(f"{name} must be an absolute Path")
 
 
-def _fsync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _platform_backend(
+    backend: PlatformFileBackend | None,
+    probe_root: Path,
+) -> PlatformFileBackend:
+    if backend is not None:
+        if not isinstance(backend, PlatformFileBackend):
+            raise TypeError("resource package backend must satisfy PlatformFileBackend")
+        return backend
+    from platform_fs import compose_platform_file_backend
+
+    return compose_platform_file_backend(probe_root)
 
 
 __all__ = [

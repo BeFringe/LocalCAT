@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from editor_contracts import ResourceKind
 from editor_controller import _initial_tm_activation_service
@@ -14,8 +16,11 @@ from resource_package_contracts import (
     ResourceOperationKind,
     ResourcePayloadProfile,
     ResourcePortabilityError,
+    ResourceRecoveryAction,
+    ResourceRecoveryDisposition,
 )
 from resource_portability import ResourcePortabilityService
+from resource_receipt_ledger import ResourcePendingPhase
 from resource_repository import ResourceRepository
 from tm_contracts import MigrationReport, TMRecordDraft
 from tm_engine import TMEngine
@@ -28,6 +33,91 @@ _MIXED_TERMS = (
 
 
 class ResourcePortabilityExportTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows terminal reproof behavior")
+    def test_outer_terminal_failure_retains_ready_export_for_fresh_manual_recovery(
+        self,
+    ) -> None:
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+        from platform_fs_windows import _WindowsPendingPublication
+
+        original_terminal = _WindowsPendingPublication._terminal_reproof
+        for operation in ("direct", "package"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                repository = ResourceRepository(root / "app")
+                resource = repository.create_resource("Terms", ResourceKind.TERMBASE)
+                resource.path.write_bytes(_MIXED_TERMS)
+                service = ResourcePortabilityService(repository)
+                destination = root / (
+                    "terms.csv"
+                    if operation == "direct"
+                    else "terms.localcat-resource"
+                )
+                ready_marked = False
+                real_mark_ready = service._mark_pending_receipt_ready
+
+                def observe_ready(receipt: object) -> None:
+                    nonlocal ready_marked
+                    real_mark_ready(receipt)
+                    ready_marked = True
+
+                def fail_outer_terminal(
+                    pending: object,
+                    retained: object,
+                    preliminary: object,
+                ) -> object:
+                    if ready_marked:
+                        raise PlatformFileError(
+                            PlatformFileErrorCode.RECOVERY_REQUIRED,
+                            retryable=True,
+                        )
+                    return original_terminal(pending, retained, preliminary)
+
+                with (
+                    patch.object(
+                        service,
+                        "_mark_pending_receipt_ready",
+                        side_effect=observe_ready,
+                    ),
+                    patch.object(
+                        _WindowsPendingPublication,
+                        "_terminal_reproof",
+                        new=fail_outer_terminal,
+                    ),
+                ):
+                    with self.assertRaises(ResourcePortabilityError):
+                        if operation == "direct":
+                            service.export_direct(resource.id, destination)
+                        else:
+                            service.export_package(resource.id, destination)
+
+                self.assertTrue(ready_marked)
+                self.assertTrue(destination.exists())
+                self.assertEqual(service._ledger.list_receipts(), ())
+                pending = service._ledger.list_pending()
+                self.assertEqual(len(pending), 1)
+                self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
+
+                cold = ResourcePortabilityService(
+                    ResourceRepository(root / "app")
+                )
+                preview = cold.inspect_resource_portability_recovery()[0]
+                self.assertIs(
+                    preview.disposition,
+                    ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                )
+                with self.assertRaises(ResourcePortabilityError) as caught:
+                    cold.recover_resource_portability(
+                        preview,
+                        ResourceRecoveryAction.COMPLETE,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "RESOURCE.RECOVERY.DECISION_INVALID",
+                )
+                self.assertEqual(len(cold._ledger.list_pending()), 1)
+                self.assertEqual(cold._ledger.list_receipts(), ())
+
     def test_termbase_direct_and_package_use_identical_profile_payload(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -194,6 +284,49 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             post = service.export_direct(created_resource.id, exported)
             self.assertEqual(post.receipt.record_count, created.receipt.record_count)
 
+    @unittest.skipUnless(os.name == "nt", "Windows retained-handle behavior")
+    def test_create_registry_commit_precedes_destination_terminal_close(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_repo = ResourceRepository(root / "source-app")
+            source = source_repo.create_resource("Terms", ResourceKind.TERMBASE)
+            source.path.write_bytes(_MIXED_TERMS)
+            package = root / "terms.localcat-resource"
+            ResourcePortabilityService(source_repo).export_package(source.id, package)
+
+            destination_repo = ResourceRepository(root / "destination-app")
+            service = ResourcePortabilityService(destination_repo)
+            preview = service.preview_resource_package_import(
+                package,
+                ResourceImportMode.CREATE_NEW,
+                new_resource_name="Imported terms",
+            )
+            real_publish = destination_repo.publish_prepared_create
+            owner_called = False
+
+            def observe_registry_commit(prepared: object) -> object:
+                nonlocal owner_called
+                owner_called = True
+                resource = prepared.resource
+                replacement = resource.path.with_name("replacement.csv")
+                replacement.write_bytes(resource.path.read_bytes())
+                with self.assertRaises(PermissionError):
+                    replacement.replace(resource.path)
+                return real_publish(prepared)
+
+            with patch.object(
+                destination_repo,
+                "publish_prepared_create",
+                side_effect=observe_registry_commit,
+            ):
+                result = service.apply_resource_package_import(preview)
+
+            self.assertTrue(owner_called)
+            self.assertEqual(
+                destination_repo.get(result.destination_resource_id).path.read_bytes(),
+                _MIXED_TERMS,
+            )
+
     def test_preview_rejects_source_or_destination_inode_replacement_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
@@ -231,10 +364,19 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             package_bytes = package.read_bytes()
             package_replacement = root / "replacement.localcat-resource"
             package_replacement.write_bytes(package_bytes)
-            package_replacement.replace(package)
-            with self.assertRaises(ResourcePortabilityError) as stale_source:
-                service.apply_resource_package_import(create_preview)
-            self.assertEqual(stale_source.exception.code, "RESOURCE.IMPORT.SOURCE_STALE")
+            if os.name == "nt":
+                with self.assertRaises(PermissionError):
+                    package_replacement.replace(package)
+                service.cancel_resource_package_import(create_preview)
+                self.assertEqual(package.read_bytes(), package_bytes)
+            else:
+                package_replacement.replace(package)
+                with self.assertRaises(ResourcePortabilityError) as stale_source:
+                    service.apply_resource_package_import(create_preview)
+                self.assertEqual(
+                    stale_source.exception.code,
+                    "RESOURCE.IMPORT.SOURCE_STALE",
+                )
 
     def test_create_preview_rejects_same_bytes_new_registry_inode(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

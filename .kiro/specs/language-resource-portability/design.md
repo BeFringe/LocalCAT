@@ -82,7 +82,7 @@ ResourcePackage 可以复用或后续抽取以下无语义原语：
 ### Windows Compatibility Amendment WA-04
 
 - **ADR mapping**：follow ADR-020/022。Resource owner 保留 payload/profile/carrier/preview/apply/receipt/repository lifecycle；platform/bootstrap 只交付 rooted/publish facts 与 bundle resource authority。
-- **Port migration**：`resource_artifact_save.py`、`resource_package.py`、`resource_portability.py`、`resource_receipt_ledger.py` 与 `resource_repository.py` 消费 `RootedFileSystem`、`ProcessFileLock`、`BoundDirectoryPublisher`，不再内嵌 POSIX dirfd/flock/fsync 分支。
+- **Port migration**：`resource_platform_io.py` 提供无业务语义的 retained-file stream/digest/copy 辅助；`resource_artifact_save.py`、`resource_package.py`、`resource_portability.py`、`resource_receipt_ledger.py`、`resource_repository.py` 与 `termbase_store.py` 消费 `RootedFileSystem`、`ProcessFileLock`、`BoundDirectoryPublisher`，不再内嵌 POSIX dirfd/flock/fsync 分支。
 - **Frozen resources**：package/profile data 的 relative layout 由 ADR-022 manifest 与 trusted bundle root 解析；Resource 模块不从 CWD、checkout absolute path 或待验证 `__file__` 推断发行数据。
 - **Verification**：direct/package export→validate→preview→create/replace→cold reopen 覆盖 Windows junction/swap/share/kill/recovery 和 non-repo CWD；最终由 TM/Termbase owner reader 与 receipt 闭合，不以 ZIP 可打开代替。
 
@@ -111,6 +111,7 @@ flowchart LR
 |---|---|
 | `resource_package_contracts.py` | leaf enums/DTO/limits/receipt codec; no Store/Qt/project imports |
 | `resource_package.py` | strict ZIP raw reader/writer、logical manifest codec、sealed package handle |
+| `resource_platform_io.py` | retained regular-file bounded stream/digest/copy；不持有 manifest/profile/resource 语义 |
 | `resource_portability.py` | profile dispatch、direct/package export、validate/preview/apply/recovery coordination |
 | `resource_receipt_ledger.py` | generic exact receipt persistence and path-free pending recovery inventory; no resource grammar/provider authority |
 | `tm_resource_port.py` | narrow adapter over public TM export/import/rebuild facts; no JSONL grammar |
@@ -126,6 +127,8 @@ flowchart LR
 Cluster 1 在首个 direct export 宣称成功前，必须先落地通用 `ResourceOperationReceipt` exact codec、`ResourceReceiptLedger`、绑定目标的 artifact publication/LKG 与 path-free pending recovery inventory。这些基座同时服务 direct JSONL/CSV 和后续 ResourcePackage export，只记录有界操作证据，不解析 TM/Termbase 记录，不取得任何 canonical resource authority。
 
 Cluster 3 不再重建通用 receipt codec/ledger 或 artifact publication；它只在 C1 基座上增加 import/apply pending-operation 状态机，以处理 owner 已发布但 registry/runtime/receipt/cleanup 未完成的冷恢复。Pending facts/LKG/stage 始终留在本地，不进入 transferable receipt metadata。
+
+Windows ledger listing 只消费 platform 返回的有界 observation；每个候选仍须按相对名从同一 rooted authority 重新打开并复证 exact snapshot 后才能解码。Observation 既不是 receipt authority，也不是删除、替换或 CAS 授权。
 
 ## Profile Contracts
 
@@ -559,6 +562,10 @@ STAGED -> VALIDATED -> LKG_READY -> PUBLISHED -> READBACK_PROVEN
 Cluster 1 先用该基座闭合 direct export 与通用 artifact publication/receipt finalization；Cluster 2 package export 复用同一 codec/ledger/publication seam。Cluster 3 只向 `pending/` 增加 import/apply 的 owner-publication、registry/runtime switch 与 receipt-finalization phase，不新建第二 ledger authority。
 
 `ResourceReceiptLedger` 已作为 v1 持久 owner 冻结；不允许将 receipt 只留在 Qt 内存中而仍声称 durable。
+
+本地恢复物的 owner 边界保持分离：`ResourceArtifactSaveService` 只拥有单个外部 destination 的 candidate/LKG，`TermbaseStore` 只拥有术语 snapshot 的 stage/recovery，`ResourceReceiptLedger` 只拥有 pending/receipt，`ResourceRepository` 只拥有 managed resource identity 与 registry publication。任一 observation 或 success receipt 都不能替代另一 owner 的 exact identity proof。
+
+Windows source-lane acceptance 的 cold reopen 是退出当前进程后由 fresh process 重建 Repository、ledger 与 owner reader；OS reboot 可作为开发/候选环境的补充兼容证据，但不成为最终用户首次运行或日常操作的前置步骤。
 
 ## Error Semantics
 

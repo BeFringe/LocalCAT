@@ -109,7 +109,7 @@ Cluster 0 治理/characterization
 - [ ] 2.4a 将 direct artifact source/destination 接入平台端口
   - JSONL destination family 与 CSV/v1 publication 在 Windows 上使用 retained root/parent binding、`ProcessFileLock` 与 `BoundDirectoryPublisher`；不得绕过 owner snapshot/receipt 闭合。
   - _Amendment: WA-04_
-  - _Depends: 2.4, ADR-020, WA-01, windows-platform-enablement 2.1_
+  - _Depends: 2.4, ADR-020, WA-01, WA-06, windows-platform-enablement 2.1_
 
 - [x] 2.5 闭合 direct export fault/cold-reopen matrix
   - 覆盖 source drift、parent/destination replacement、same-bytes/new-inode、stage/fsync/replace/readback/ledger/cleanup 故障，以及重启后 receipt-ready complete/manual recovery inventory。
@@ -209,7 +209,7 @@ Cluster 0 治理/characterization
 - [ ] 4.4a 将 package apply/Repository publication 接入 Windows 恢复协议
   - create/replace 在同一 repository binding 与进程锁下协调 owner publication、registry/runtime switch、receipt 与 pending recovery；未知阶段保持 prior resource 和人工恢复事实。
   - _Amendment: WA-04_
-  - _Depends: 4.4, 3.4a, windows-platform-enablement 3.7_
+  - _Depends: 4.4, 3.4a, WA-06, windows-platform-enablement 3.7_
 
 - [x] 4.5 闭合 preview/apply/recovery fault matrix
   - source/package/profile adapter/destination/resource graph/generation/revision/baseline 在 preview 后变化的零 mutation。
@@ -257,7 +257,7 @@ Cluster 0 治理/characterization
 - [ ] 5.4a 执行 Windows direct/package hostile 与业务 journey
   - 从真实 active TM 和 mixed termbase 完成 direct/package export、validate、create/replace apply、冷重开，并重放 source/destination replacement、锁与 crash matrix。
   - _Amendment: WA-04_
-  - _Depends: 2.5a, 4.4a, 5.4, WA-01, windows-platform-enablement 3.7_
+  - _Depends: 2.5a, 4.4a, 5.4, WA-01, WA-06, windows-platform-enablement 3.7_
 
 - [x] 5.5 完成治理收尾
   - 只在 final runtime roots 冻结后机械重签 current-source inventory/evidence，不用旧结果纯重签。
@@ -288,3 +288,8 @@ Cluster 0 治理/characterization
 - 把 ProjectPackage/ResourcePackage 改成共同 manifest/base service/identity/merge authority。
 - 将 TMX、context/provenance/loss semantics、provider、sync conflict、Fuzzy 或 CONTEXT UI 抢跑进本规格。
 - 用“ZIP 可打开”、“文件已复制”或内存 fixture 代替最终 TM/Termbase 业务 reader 冷重开验收。
+
+## Implement Notes
+
+- `2.4a`：CSV/v1 direct publication 在 owner receipt callback 返回前保持 `PendingPublication`；ambiguous replace 保留 LKG/candidate。
+- `3.4a`：`SealedResourcePackage.reprove()` 同时复证 retained file 与 pathname/parent entry identity。

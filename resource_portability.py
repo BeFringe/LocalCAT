@@ -4,15 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
-import os
 from pathlib import Path
-import shutil
-import stat
 import tempfile
+from typing import Callable
 from uuid import uuid4
 
 from editor_contracts import ResourceConfig, ResourceKind, TermCommitState
-from resource_artifact_save import ResourceArtifactSaveService
+from platform_fs_contracts import (
+    BoundRegularFile,
+    CandidateFile,
+    EntrySnapshot,
+    FileObjectIdentity,
+    PendingPublication,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PublishMode,
+)
+from resource_artifact_save import (
+    ResourceArtifactPublication,
+    ResourceArtifactSaveService,
+)
 from resource_package import (
     SealedResourcePackage,
     open_resource_package,
@@ -52,6 +64,12 @@ from resource_receipt_ledger import (
     ResourceReceiptLedger,
 )
 from resource_repository import ResourceError, ResourceRepository
+from resource_platform_io import (
+    bind_rooted_regular,
+    digest_bound,
+    iter_bound_chunks,
+    platform_relative_path,
+)
 from termbase_store import TermbasePortableSnapshot, TermbaseStore
 from tm_resource_port import TMResourceSnapshotPort
 
@@ -63,7 +81,7 @@ class _PreparedResourceImport:
     registry_baseline: _RepositoryBaseline
     target: ResourceConfig | None
     target_digest: str | None
-    target_identity: tuple[int, int, int, int] | None
+    target_snapshot: EntrySnapshot | None
     target_owner_baseline: tuple[str, int, int, int] | None
     new_resource_name: str | None
 
@@ -72,7 +90,7 @@ class _PreparedResourceImport:
 class _RepositoryBaseline:
     resources: tuple[ResourceConfig, ...]
     registry_digest: str
-    registry_identity: tuple[int, int, int, int]
+    registry_snapshot: EntrySnapshot
 
 
 class ResourcePortabilityService:
@@ -91,10 +109,15 @@ class ResourcePortabilityService:
         if type(repository) is not ResourceRepository:
             raise TypeError("resource portability repository must be exact")
         self.repository = repository
-        self._termbase = termbase_store or TermbaseStore()
+        self._termbase = termbase_store or TermbaseStore(repository.platform_backend)
         self._tm = tm_port or TMResourceSnapshotPort()
-        self._ledger = ledger or ResourceReceiptLedger(repository.config_dir)
-        self._artifact_save = artifact_save or ResourceArtifactSaveService()
+        self._ledger = ledger or ResourceReceiptLedger(
+            repository.config_dir,
+            repository.platform_backend,
+        )
+        self._artifact_save = artifact_save or ResourceArtifactSaveService(
+            repository.platform_backend
+        )
         if tmx_payload_handler is not None:
             if not isinstance(tmx_payload_handler, ResourcePackagePayloadHandler):
                 raise TypeError("TMX package payload handler must satisfy its port")
@@ -123,10 +146,10 @@ class ResourcePortabilityService:
         resource = self._resource(resource_id)
         destination = _absolute_destination(destination)
         operation_id = uuid4().hex
-        before_digest = _optional_digest(destination)
+        before_digest = _optional_digest(self.repository.platform_backend, destination)
         if resource.kind is ResourceKind.TRANSLATION_MEMORY:
             snapshot = self._tm.export_snapshot(resource, destination)
-            after_digest = _digest_path(destination)
+            after_digest = _digest_path(self.repository.platform_backend, destination)
             if after_digest != snapshot.payload_digest:
                 raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
             receipt = self._receipt(
@@ -142,7 +165,10 @@ class ResourcePortabilityService:
             self._arm_after_owner_publication(receipt)
         else:
             candidate = _candidate_path(destination, "csv")
+            term_snapshot: TermbasePortableSnapshot | None = None
             armed = False
+            owner_phase_started = False
+            receipt: ResourceOperationReceipt | None = None
             try:
                 term_snapshot = self._termbase.export_portable_snapshot(
                     resource.path,
@@ -162,28 +188,54 @@ class ResourcePortabilityService:
                 )
                 self._ledger.begin(_recovery_receipt(expected))
                 armed = True
-                publication, cold = self._artifact_save.publish(
+                def commit_direct_owner(
+                    publication: object,
+                    cold: object,
+                ) -> None:
+                    nonlocal owner_phase_started, receipt
+                    owner_phase_started = True
+                    if not isinstance(publication, ResourceArtifactPublication):
+                        raise TypeError("resource artifact publication must be exact")
+                    if type(cold) is not TermbasePortableSnapshot:
+                        raise TypeError("termbase cold validation must be exact")
+                    if cold.payload_digest != snapshot.payload_digest:
+                        raise ResourcePortabilityError(
+                            "RESOURCE.EXPORT.VALIDATION_FAILED"
+                        )
+                    receipt = replace(
+                        expected,
+                        destination_before_digest=(
+                            publication.destination_before_digest
+                        ),
+                        destination_after_digest=(
+                            publication.destination_after_digest
+                        ),
+                    )
+                    self._mark_pending_receipt_ready(receipt)
+
+                self._artifact_save.publish(
                     candidate,
                     destination,
                     self._termbase.validate_portable_snapshot,
+                    owner_commit=commit_direct_owner,
                 )
-                before_digest = publication.destination_before_digest
-                after_digest = publication.destination_after_digest
-                if cold.payload_digest != snapshot.payload_digest:
-                    raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
-                receipt = replace(
-                    expected,
-                    destination_before_digest=before_digest,
-                    destination_after_digest=after_digest,
-                )
-                self._complete_pending_receipt(receipt)
+                if receipt is None:
+                    raise AssertionError("direct export owner commit did not issue receipt")
+                self._commit_ready_receipt(receipt)
                 armed = False
             except BaseException as error:
-                if armed:
+                if armed and not owner_phase_started:
                     self._resolve_failed_pending(operation_id, error)
                 raise
             finally:
-                candidate.unlink(missing_ok=True)
+                if term_snapshot is not None:
+                    try:
+                        self._termbase.discard_portable_snapshot(
+                            candidate,
+                            term_snapshot,
+                        )
+                    except (PlatformFileError, ValueError):
+                        pass
         return ResourceExportOutcome(receipt=receipt, destination_preserved=True)
 
     def export_package(
@@ -228,8 +280,12 @@ class ResourcePortabilityService:
             ),
         )
         package_candidate = _candidate_path(destination, "resource-package")
+        package_candidate_snapshot: EntrySnapshot | None = None
         companion: Path | None = None
+        term_snapshot: TermbasePortableSnapshot | None = None
         armed = False
+        owner_phase_started = False
+        receipt: ResourceOperationReceipt | None = None
         try:
             if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
                 handler = self._require_tmx_payload_handler()
@@ -250,6 +306,11 @@ class ResourcePortabilityService:
                 package_candidate,
                 manifest,
                 payload,
+                backend=self.repository.platform_backend,
+            )
+            package_candidate_snapshot = _file_snapshot(
+                self.repository.platform_backend,
+                package_candidate,
             )
             candidate_report = self.validate_resource_package(package_candidate)
             expected = self._receipt(
@@ -259,46 +320,82 @@ class ResourcePortabilityService:
                 snapshot=snapshot,
                 package_digest=candidate_report.artifact_digest,
                 destination_resource_id=None,
-                destination_before_digest=_optional_digest(destination),
+                destination_before_digest=_optional_digest(
+                    self.repository.platform_backend,
+                    destination,
+                ),
                 destination_after_digest=candidate_report.artifact_digest,
             )
             self._ledger.begin(_recovery_receipt(expected))
             armed = True
-            publication, carrier_report = self._artifact_save.publish(
+            def commit_package_owner(
+                publication: object,
+                carrier_report: object,
+            ) -> None:
+                nonlocal owner_phase_started, receipt
+                owner_phase_started = True
+                if not isinstance(publication, ResourceArtifactPublication):
+                    raise TypeError("resource artifact publication must be exact")
+                if type(carrier_report) is not ResourcePackageValidationReport:
+                    raise TypeError("package cold validation must be exact")
+                if carrier_report != candidate_report:
+                    raise ResourcePortabilityError(
+                        "RESOURCE.EXPORT.VALIDATION_FAILED"
+                    )
+                if (
+                    carrier_report.artifact_digest
+                    != publication.destination_after_digest
+                    or carrier_report.payload_digest != snapshot.payload_digest
+                    or carrier_report.record_count != snapshot.record_count
+                    or carrier_report.safe_issues != snapshot.safe_issues
+                ):
+                    raise ResourcePortabilityError(
+                        "RESOURCE.EXPORT.VALIDATION_FAILED"
+                    )
+                receipt = self._receipt(
+                    operation_id=operation_id,
+                    operation_kind=ResourceOperationKind.EXPORT_PACKAGE,
+                    resource=resource,
+                    snapshot=snapshot,
+                    package_digest=carrier_report.artifact_digest,
+                    destination_resource_id=None,
+                    destination_before_digest=(
+                        publication.destination_before_digest
+                    ),
+                    destination_after_digest=carrier_report.artifact_digest,
+                )
+                self._mark_pending_receipt_ready(receipt)
+
+            self._artifact_save.publish(
                 package_candidate,
                 destination,
                 self.validate_resource_package,
+                owner_commit=commit_package_owner,
             )
-            if carrier_report != candidate_report:
-                raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
-            report = carrier_report
-            if (
-                report.artifact_digest != publication.destination_after_digest
-                or report.payload_digest != snapshot.payload_digest
-                or report.record_count != snapshot.record_count
-                or report.safe_issues != snapshot.safe_issues
-            ):
-                raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED")
-            receipt = self._receipt(
-                operation_id=operation_id,
-                operation_kind=ResourceOperationKind.EXPORT_PACKAGE,
-                resource=resource,
-                snapshot=snapshot,
-                package_digest=report.artifact_digest,
-                destination_resource_id=None,
-                destination_before_digest=publication.destination_before_digest,
-                destination_after_digest=report.artifact_digest,
-            )
-            self._complete_pending_receipt(receipt)
+            if receipt is None:
+                raise AssertionError("package export owner commit did not issue receipt")
+            self._commit_ready_receipt(receipt)
             armed = False
             return ResourceExportOutcome(receipt=receipt, destination_preserved=True)
         except BaseException as error:
-            if armed:
+            if armed and not owner_phase_started:
                 self._resolve_failed_pending(operation_id, error)
             raise
         finally:
-            payload.unlink(missing_ok=True)
-            package_candidate.unlink(missing_ok=True)
+            if term_snapshot is not None:
+                try:
+                    self._termbase.discard_portable_snapshot(payload, term_snapshot)
+                except (PlatformFileError, ValueError):
+                    pass
+            if package_candidate_snapshot is not None:
+                try:
+                    _unlink_snapshot(
+                        self.repository.platform_backend,
+                        package_candidate,
+                        package_candidate_snapshot,
+                    )
+                except PlatformFileError:
+                    pass
             if companion is not None:
                 companion.unlink(missing_ok=True)
 
@@ -307,7 +404,10 @@ class ResourcePortabilityService:
         source: Path,
     ) -> ResourcePackageValidationReport:
         source = _absolute_destination(source)
-        with open_resource_package(source) as sealed:
+        with open_resource_package(
+            source,
+            backend=self.repository.platform_backend,
+        ) as sealed:
             report, _owner = self._validate_sealed(sealed)
             return report
 
@@ -322,7 +422,10 @@ class ResourcePortabilityService:
         if type(mode) is not ResourceImportMode:
             raise TypeError("resource import mode must be exact")
         source = _absolute_destination(source)
-        sealed = open_resource_package(source)
+        sealed = open_resource_package(
+            source,
+            backend=self.repository.platform_backend,
+        )
         try:
             if not resource_package_capability(
                 ResourcePackageSourceScope.MANAGED_RESOURCE,
@@ -336,7 +439,7 @@ class ResourcePortabilityService:
             report, _owner = self._validate_sealed(sealed)
             target: ResourceConfig | None = None
             target_digest: str | None = None
-            target_identity: tuple[int, int, int, int] | None = None
+            target_snapshot: EntrySnapshot | None = None
             target_owner_baseline: tuple[str, int, int, int] | None = None
             if mode is ResourceImportMode.REPLACE_SELECTED:
                 if type(destination_resource_id) is not str or not destination_resource_id:
@@ -345,8 +448,14 @@ class ResourcePortabilityService:
                 expected_kind = _editor_kind(report.resource_kind)
                 if target.kind is not expected_kind:
                     raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
-                target_digest = _digest_path(target.path)
-                target_identity = _file_identity(target.path)
+                target_digest = _digest_path(
+                    self.repository.platform_backend,
+                    target.path,
+                )
+                target_snapshot = _file_snapshot(
+                    self.repository.platform_backend,
+                    target.path,
+                )
                 if target.kind is ResourceKind.TRANSLATION_MEMORY:
                     target_owner_baseline = self._tm.destination_baseline(target)
                 destination_exists = True
@@ -382,7 +491,7 @@ class ResourcePortabilityService:
                 registry_baseline=_repository_baseline(self.repository),
                 target=target,
                 target_digest=target_digest,
-                target_identity=target_identity,
+                target_snapshot=target_snapshot,
                 target_owner_baseline=target_owner_baseline,
                 new_resource_name=resolved_name,
             )
@@ -488,8 +597,16 @@ class ResourcePortabilityService:
                 current = self.repository.get(plan.target.id)
                 if (
                     current != plan.target
-                    or _file_identity(current.path) != plan.target_identity
-                    or _digest_path(current.path) != plan.target_digest
+                    or _file_snapshot(
+                        self.repository.platform_backend,
+                        current.path,
+                    )
+                    != plan.target_snapshot
+                    or _digest_path(
+                        self.repository.platform_backend,
+                        current.path,
+                    )
+                    != plan.target_digest
                 ):
                     raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
                 if plan.target_owner_baseline is not None:
@@ -544,26 +661,56 @@ class ResourcePortabilityService:
                 else:
                     self._ledger.begin(template, import_mode=preview.mode)
                 pending_started = True
-                applied = self._apply_owner_snapshot(
-                    destination,
-                    payload,
-                    owner,
-                    create=preview.mode is ResourceImportMode.CREATE_NEW,
-                )
-                owner_published = True
-                receipt = _import_receipt(
-                    operation_id=preview.operation_id,
-                    report=report,
-                    destination=destination,
-                    before_digest=before_digest,
-                    snapshot=applied,
-                    durable_state=ResourceDurableState.COMMITTED,
-                )
-                self._ledger.mark_receipt_ready(receipt)
+                receipt: ResourceOperationReceipt | None = None
                 if prepared_create is not None:
-                    self.repository.publish_prepared_create(prepared_create)
-                self._ledger.commit(receipt)
-                pending_started = False
+                    def commit_created_resource(
+                        applied_snapshot: PortableResourceSnapshot,
+                    ) -> None:
+                        nonlocal owner_published, pending_started, receipt
+                        owner_published = True
+                        receipt = _import_receipt(
+                            operation_id=preview.operation_id,
+                            report=report,
+                            destination=destination,
+                            before_digest=before_digest,
+                            snapshot=applied_snapshot,
+                            durable_state=ResourceDurableState.COMMITTED,
+                        )
+                        self._ledger.mark_receipt_ready(receipt)
+                        self.repository.publish_prepared_create(prepared_create)
+                        self._ledger.commit(receipt)
+                        pending_started = False
+
+                    applied = self._apply_owner_snapshot(
+                        destination,
+                        payload,
+                        owner,
+                        create=True,
+                        create_owner_commit=commit_created_resource,
+                    )
+                    if receipt is None:
+                        raise AssertionError(
+                            "created resource owner commit did not issue receipt"
+                        )
+                else:
+                    applied = self._apply_owner_snapshot(
+                        destination,
+                        payload,
+                        owner,
+                        create=False,
+                    )
+                    owner_published = True
+                    receipt = _import_receipt(
+                        operation_id=preview.operation_id,
+                        report=report,
+                        destination=destination,
+                        before_digest=before_digest,
+                        snapshot=applied,
+                        durable_state=ResourceDurableState.COMMITTED,
+                    )
+                    self._ledger.mark_receipt_ready(receipt)
+                    self._ledger.commit(receipt)
+                    pending_started = False
             return ResourcePackageImportResult(
                 receipt=receipt,
                 destination_resource_id=destination.id,
@@ -573,7 +720,7 @@ class ResourcePortabilityService:
                 try:
                     self.repository.cancel_prepared_create(
                         prepared_create,
-                        remove_owned_file=True,
+                        remove_owned_file=False,
                     )
                 except ResourceError:
                     pass
@@ -610,8 +757,12 @@ class ResourcePortabilityService:
             pending.phase is ResourcePendingPhase.RECEIPT_READY
             and receipt.operation_kind is not ResourceOperationKind.IMPORT_PACKAGE
         ):
-            disposition = ResourceRecoveryDisposition.COMPLETE_AVAILABLE
-            reasons = ("RESOURCE.RECOVERY.RECEIPT_READY",)
+            if self._ready_export_receipt_is_durable(receipt):
+                disposition = ResourceRecoveryDisposition.COMPLETE_AVAILABLE
+                reasons = ("RESOURCE.RECOVERY.RECEIPT_READY",)
+            else:
+                disposition = ResourceRecoveryDisposition.MANUAL_REQUIRED
+                reasons = ("RESOURCE.RECOVERY.EXPORT_OWNER_REQUIRED",)
         elif pending.phase is ResourcePendingPhase.MANUAL_REQUIRED:
             disposition = ResourceRecoveryDisposition.MANUAL_REQUIRED
             reasons = ("RESOURCE.RECOVERY.MANUAL_REQUIRED",)
@@ -645,13 +796,21 @@ class ResourcePortabilityService:
                     ResourceRecoveryDisposition.MANUAL_REQUIRED,
                     ("RESOURCE.RECOVERY.DESTINATION_UNKNOWN",),
                 )
-            path = (self.repository.managed_dir / pending.destination_relative_path).resolve()
+            path = self.repository.managed_dir / pending.destination_relative_path
+            if path.parent != self.repository.managed_dir:
+                return (
+                    ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                    ("RESOURCE.RECOVERY.DESTINATION_UNKNOWN",),
+                )
             try:
                 configured = self.repository.get(destination_id)
             except ResourceError:
                 configured = None
             if configured is not None:
-                if configured.path == path and _safe_digest(path) == receipt.destination_after_digest:
+                if configured.path == path and _safe_digest(
+                    self.repository.platform_backend,
+                    path,
+                ) == receipt.destination_after_digest:
                     return (
                         ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
                         ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
@@ -660,12 +819,27 @@ class ResourcePortabilityService:
                     ResourceRecoveryDisposition.MANUAL_REQUIRED,
                     ("RESOURCE.RECOVERY.DESTINATION_CHANGED",),
                 )
-            if not path.exists():
+            try:
+                observed = _entry_snapshot(
+                    self.repository.platform_backend,
+                    path,
+                )
+            except PlatformFileError:
+                observed = False
+            if observed is None:
                 return (
                     ResourceRecoveryDisposition.ROLLBACK_AVAILABLE,
                     ("RESOURCE.RECOVERY.CREATE_NOT_PUBLISHED",),
                 )
-            if _safe_digest(path) == receipt.destination_after_digest:
+            if observed is False:
+                return (
+                    ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                    ("RESOURCE.RECOVERY.DESTINATION_CHANGED",),
+                )
+            if _safe_digest(
+                self.repository.platform_backend,
+                path,
+            ) == receipt.destination_after_digest:
                 return (
                     ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
                     ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
@@ -677,7 +851,10 @@ class ResourcePortabilityService:
         if pending.import_mode is ResourceImportMode.REPLACE_SELECTED:
             try:
                 configured = self.repository.get(destination_id)
-                digest = _safe_digest(configured.path)
+                digest = _safe_digest(
+                    self.repository.platform_backend,
+                    configured.path,
+                )
             except ResourceError:
                 digest = None
             if digest == receipt.destination_after_digest:
@@ -704,6 +881,8 @@ class ResourcePortabilityService:
             and pending.receipt.operation_kind is not ResourceOperationKind.IMPORT_PACKAGE
         ):
             receipt = pending.receipt
+            if not self._ready_export_receipt_is_durable(receipt):
+                raise ResourcePortabilityError("RESOURCE.RECOVERY.DECISION_INVALID")
             self._ledger.commit(receipt)
             return receipt
         receipt = pending.receipt
@@ -803,19 +982,56 @@ class ResourcePortabilityService:
         owner: PortableResourceSnapshot,
         *,
         create: bool,
+        create_owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
     ) -> PortableResourceSnapshot:
         if owner.profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
             raise ResourcePortabilityError("RESOURCE.IMPORT.PROFILE_UNSUPPORTED")
         if destination.kind is ResourceKind.TRANSLATION_MEMORY:
-            return (
+            applied = (
                 self._tm.create_snapshot(destination, payload, owner)
                 if create
                 else self._tm.replace_snapshot(destination, payload, owner)
             )
+            if create:
+                if create_owner_commit is None:
+                    raise TypeError("create owner commit callback is required")
+                create_owner_commit(applied)
+            elif create_owner_commit is not None:
+                raise ValueError("replace owner cannot receive create commit callback")
+            return applied
         if create:
-            _copy_new_file(payload, destination.path)
-            facts = self._termbase.validate_portable_snapshot(destination.path)
+            applied_snapshot: PortableResourceSnapshot | None = None
+
+            def commit_created(_identity: FileObjectIdentity) -> None:
+                nonlocal applied_snapshot
+                facts = self._termbase.validate_portable_snapshot(destination.path)
+                applied_snapshot = _portable_term_snapshot(facts)
+                if (
+                    applied_snapshot.payload_digest != owner.payload_digest
+                    or applied_snapshot.record_count != owner.record_count
+                    or applied_snapshot.legacy_record_count
+                    != owner.legacy_record_count
+                    or applied_snapshot.v1_record_count != owner.v1_record_count
+                ):
+                    raise ResourcePortabilityError(
+                        "RESOURCE.IMPORT.COLD_REOPEN_FAILED"
+                    )
+                if create_owner_commit is None:
+                    raise TypeError("create owner commit callback is required")
+                create_owner_commit(applied_snapshot)
+
+            _copy_new_bound(
+                self.repository.platform_backend,
+                payload,
+                destination.path,
+                owner_commit=commit_created,
+            )
+            if applied_snapshot is None:
+                raise AssertionError("created owner snapshot was not committed")
+            applied = applied_snapshot
         else:
+            if create_owner_commit is not None:
+                raise ValueError("replace owner cannot receive create commit callback")
             prepared = self._termbase.prepare_snapshot_replace(
                 destination.path,
                 payload,
@@ -832,7 +1048,7 @@ class ResourcePortabilityService:
             cleanup = self._termbase.finalize(prepared, outcome)
             if not cleanup.cleaned:
                 raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
-        applied = _portable_term_snapshot(facts)
+            applied = _portable_term_snapshot(facts)
         if (
             applied.payload_digest != owner.payload_digest
             or applied.record_count != owner.record_count
@@ -862,9 +1078,12 @@ class ResourcePortabilityService:
             self._tm.reprove_snapshot(resource, snapshot)
             return
         try:
-            current_digest = _digest_path(resource.path)
-        except (OSError, ValueError) as error:
-            raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE") from error
+            current_digest = _digest_path(
+                self.repository.platform_backend,
+                resource.path,
+            )
+        except (PlatformFileError, ValueError):
+            raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE") from None
         if current_digest != snapshot.source_baseline_digest:
             raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE")
 
@@ -939,6 +1158,43 @@ class ResourcePortabilityService:
             except ResourcePortabilityError:
                 pass
             raise ResourcePortabilityError("RESOURCE.RECEIPT.RECOVERY_REQUIRED") from error
+
+    def _mark_pending_receipt_ready(
+        self,
+        receipt: ResourceOperationReceipt,
+    ) -> None:
+        """Persist owner facts without minting success before outer terminal proof."""
+
+        try:
+            self._ledger.mark_receipt_ready(receipt)
+        except ResourcePortabilityError as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.RECEIPT.RECOVERY_REQUIRED"
+            ) from error
+
+    def _commit_ready_receipt(
+        self,
+        receipt: ResourceOperationReceipt,
+    ) -> None:
+        """Append success only after the artifact publisher returned terminal facts."""
+
+        try:
+            self._ledger.commit(receipt)
+        except ResourcePortabilityError as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.RECEIPT.RECOVERY_REQUIRED"
+            ) from error
+
+    def _ready_export_receipt_is_durable(
+        self,
+        receipt: ResourceOperationReceipt,
+    ) -> bool:
+        """Require an exact success entry before path-free export cleanup."""
+
+        try:
+            return self._ledger.get(receipt.operation_id) == receipt
+        except ResourcePortabilityError:
+            return False
 
     def _resolve_failed_pending(
         self,
@@ -1122,18 +1378,11 @@ def _manifest_for_snapshot(snapshot: PortableResourceSnapshot) -> ResourcePackag
 
 
 def _absolute_destination(path: Path) -> Path:
-    if not isinstance(path, Path):
-        raise TypeError("resource artifact path must be a Path")
-    expanded = path.expanduser()
-    if not expanded.is_absolute():
-        expanded = Path.cwd() / expanded
-    try:
-        parent = expanded.parent.resolve(strict=True)
-    except OSError as error:
-        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE") from error
-    if expanded.name in ("", ".", ".."):
+    if type(path) is not type(Path()) or not path.is_absolute():
+        raise TypeError("resource artifact path must be an absolute concrete Path")
+    if path.name in ("", ".", ".."):
         raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE")
-    return parent / expanded.name
+    return path
 
 
 def _candidate_path(destination: Path, suffix: str) -> Path:
@@ -1142,41 +1391,96 @@ def _candidate_path(destination: Path, suffix: str) -> Path:
     )
 
 
-def _optional_digest(path: Path) -> str | None:
+def _optional_digest(
+    backend: PlatformFileBackend,
+    path: Path,
+) -> str | None:
     try:
-        return _digest_path(path)
-    except FileNotFoundError:
-        return None
+        return _digest_path(backend, path)
+    except PlatformFileError as error:
+        if error.code == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+            return None
+        raise ResourcePortabilityError("RESOURCE.EXPORT.DESTINATION_STALE") from None
 
 
-def _digest_path(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _safe_digest(path: Path) -> str | None:
+def _digest_path(backend: PlatformFileBackend, path: Path) -> str:
+    source = bind_rooted_regular(backend, path)
     try:
-        _file_identity(path)
-        return _digest_path(path)
-    except (OSError, ResourcePortabilityError):
+        snapshot = source.snapshot()
+        return digest_bound(source, snapshot).hex()
+    finally:
+        source.close()
+
+
+def _safe_digest(backend: PlatformFileBackend, path: Path) -> str | None:
+    try:
+        return _digest_path(backend, path)
+    except (PlatformFileError, ResourcePortabilityError):
         return None
 
 
 def _repository_baseline(repository: ResourceRepository) -> _RepositoryBaseline:
     try:
+        source = bind_rooted_regular(
+            repository.platform_backend,
+            repository.registry_path,
+        )
+        try:
+            snapshot = source.snapshot()
+            digest = digest_bound(source, snapshot).hex()
+        finally:
+            source.close()
         return _RepositoryBaseline(
             resources=repository.list_resources(),
-            registry_digest=_digest_path(repository.registry_path),
-            registry_identity=_file_identity(repository.registry_path),
+            registry_digest=digest,
+            registry_snapshot=snapshot,
         )
-    except (OSError, ResourcePortabilityError) as error:
-        raise ResourcePortabilityError("RESOURCE.IMPORT.PREVIEW_STALE") from error
+    except (PlatformFileError, ResourcePortabilityError):
+        raise ResourcePortabilityError("RESOURCE.IMPORT.PREVIEW_STALE") from None
 
 
-def _file_identity(path: Path) -> tuple[int, int, int, int]:
-    info = os.lstat(path)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+def _file_snapshot(
+    backend: PlatformFileBackend,
+    path: Path,
+) -> EntrySnapshot:
+    source = bind_rooted_regular(backend, path)
+    try:
+        return source.snapshot()
+    finally:
+        source.close()
+
+
+def _entry_snapshot(
+    backend: PlatformFileBackend,
+    path: Path,
+) -> EntrySnapshot | None:
+    root = None
+    parent = None
+    try:
+        root = backend.bind_root(path.parent)
+        parent = backend.bind_parent(root, platform_relative_path(path.name))
+        return parent.inspect_entry(path.name)
+    finally:
+        for authority in (parent, root):
+            if authority is not None:
+                authority.close()
+
+
+def _unlink_snapshot(
+    backend: PlatformFileBackend,
+    path: Path,
+    snapshot: EntrySnapshot,
+) -> None:
+    root = None
+    parent = None
+    try:
+        root = backend.bind_root(path.parent)
+        parent = backend.bind_parent(root, platform_relative_path(path.name))
+        parent.unlink_owned(path.name, snapshot.identity)
+    finally:
+        for authority in (parent, root):
+            if authority is not None:
+                authority.close()
 
 
 def _editor_kind(kind: PortableResourceKind) -> ResourceKind:
@@ -1189,16 +1493,80 @@ def _editor_kind(kind: PortableResourceKind) -> ResourceKind:
     )
 
 
-def _copy_new_file(source: Path, destination: Path) -> None:
-    with source.open("rb") as input_handle, destination.open("xb") as output_handle:
-        shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
-        output_handle.flush()
-        os.fsync(output_handle.fileno())
-    descriptor = os.open(destination.parent, os.O_RDONLY)
+def _copy_new_bound(
+    backend: PlatformFileBackend,
+    source_path: Path,
+    destination: Path,
+    *,
+    owner_commit: Callable[[FileObjectIdentity], None],
+) -> FileObjectIdentity:
+    source = bind_rooted_regular(backend, source_path)
+    root = None
+    parent = None
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+    candidate_identity: FileObjectIdentity | None = None
+    candidate_name = f".resource-create-{uuid4().hex}.tmp"
     try:
-        os.fsync(descriptor)
+        source_snapshot = source.snapshot()
+        source_digest = digest_bound(source, source_snapshot)
+        root = backend.bind_root(destination.parent)
+        parent = backend.bind_parent(root, platform_relative_path(destination.name))
+        if parent.inspect_entry(destination.name) is not None:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
+        candidate = parent.create_candidate(candidate_name, private=True)
+        candidate_identity = candidate.identity()
+        written = candidate.write_chunks(
+            iter_bound_chunks(source, source_snapshot),
+            maximum_bytes=source_snapshot.byte_count,
+        )
+        candidate.flush_content()
+        pending = parent.begin_publish(
+            candidate,
+            destination.name,
+            mode=PublishMode.CREATE_IF_ABSENT,
+            lease=None,
+        )
+        candidate = None
+        candidate_identity = None
+        facts = pending.preliminary_facts()
+        retained = pending.retained_destination()
+        retained_snapshot = retained.snapshot()
+        if (
+            written.content_sha256 != source_digest
+            or written.byte_count != source_snapshot.byte_count
+            or facts.content_sha256 != source_digest
+            or facts.byte_count != source_snapshot.byte_count
+            or retained_snapshot.byte_count != source_snapshot.byte_count
+            or digest_bound(retained, retained_snapshot) != source_digest
+        ):
+            raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+        owner_commit(facts.destination_identity)
+        if pending.terminal_reproof() != facts:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+        return facts.destination_identity
+    except PlatformFileError as error:
+        if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED") from None
+        raise ResourcePortabilityError("RESOURCE.IMPORT.APPLY_FAILED") from None
     finally:
-        os.close(descriptor)
+        for authority in (pending, candidate):
+            if authority is not None:
+                try:
+                    authority.close()
+                except PlatformFileError:
+                    pass
+        if candidate_identity is not None and parent is not None:
+            try:
+                parent.unlink_owned(candidate_name, candidate_identity)
+            except PlatformFileError:
+                pass
+        for authority in (parent, root, source):
+            if authority is not None:
+                try:
+                    authority.close()
+                except PlatformFileError:
+                    pass
 
 
 __all__ = ["ResourcePortabilityService"]
