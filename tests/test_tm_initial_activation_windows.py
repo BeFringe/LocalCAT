@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
@@ -14,11 +15,17 @@ import unittest
 from unittest import mock
 
 import tm_migration
+import tm_activation_journal
 import tm_sqlite_store
 import tm_stage_sealer
 import platform_fs_windows
 from platform_fs import compose_platform_file_backend
-from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+from platform_fs_contracts import (
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PrivateProofContext,
+    PrivateProofObjectRole,
+)
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationReport,
@@ -94,6 +101,20 @@ def _remove_long_quarantine(root: Path) -> None:
             os.unlink("\\\\?\\" + str(path))
         os.rmdir("\\\\?\\" + str(attempt_directory))
     os.rmdir("\\\\?\\" + str(quarantine_root))
+
+
+def _release_portable_test_authorities(
+    coordinator: ResourceStoreCoordinator,
+    preparation: object | None,
+    reservation: object,
+) -> None:
+    """Test-only release; never projects cancellation as product recovery."""
+
+    try:
+        if preparation is not None:
+            coordinator._sealed_registry.cancel(preparation._token)
+    finally:
+        reservation.release()
 
 
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
@@ -196,6 +217,569 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                 reservation.reprove()
             finally:
                 reservation.release()
+
+    def test_real_private_owner_publishes_only_portable_prepared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                handle = coordinator.publish_portable_prepared_activation(
+                    preparation,
+                    **owner_inputs,
+                )
+
+                self.assertEqual(coordinator.state, "ACTIVATING")
+                self.assertIsNone(coordinator.current_generation)
+                self.assertIsNone(coordinator.active_store_path)
+                self.assertFalse(identity.canonical_sidecar_path.exists())
+                private_root = root / handle.private_directory_name
+                key_path = private_root / "device.key"
+                journal_path = private_root / handle.journal_name
+                self.assertEqual(len(key_path.read_bytes()), 32)
+                journal_bytes = journal_path.read_bytes()
+                disk_record = (
+                    tm_activation_journal._parse_portable_activation_journal_bytes(
+                        journal_bytes
+                    )
+                )
+                self.assertEqual(disk_record, handle._record)
+                self.assertEqual(disk_record.unsigned.phase, "PREPARED")
+                self.assertFalse(
+                    (private_root / "activation-terminal-v3.json").exists()
+                )
+                self.assertEqual(
+                    sorted(path.name for path in private_root.iterdir()),
+                    ["activation-journal-v3.json", "device.key"],
+                )
+                platform = owner_inputs["platform"]
+                persistent_private = owner_inputs["persistent_private"]
+                caller_borrow = owner_inputs["caller_borrow"]
+                caller_borrow.reprove(platform, identity)
+                private_parent = platform.bind_parent(
+                    reservation._root,
+                    PurePath(
+                        handle.private_directory_name,
+                        "private-proof-placeholder",
+                    ),
+                )
+                private_evidence = platform.prove_private(private_parent)
+                key_file = platform.open_regular(
+                    reservation._root,
+                    PurePath(handle.private_directory_name, "device.key"),
+                )
+                secret = persistent_private.bind_device_secret(key_file)
+                try:
+                    tampered_proof = replace(
+                        disk_record.private_directory_proof,
+                        device_secret_mac=b"x" * 32,
+                    )
+                    tampered_record = (
+                        tm_activation_journal._create_portable_activation_journal_record(
+                            disk_record.unsigned,
+                            tampered_proof,
+                        )
+                    )
+                    reparsed = (
+                        tm_activation_journal._parse_portable_activation_journal_bytes(
+                            tm_activation_journal._serialize_portable_activation_journal_record(
+                                tampered_record
+                            )
+                        )
+                    )
+                    self.assertEqual(reparsed, tampered_record)
+                    context = PrivateProofContext(
+                        PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                        tm_activation_journal._portable_activation_owner_context_sha256(
+                            disk_record.unsigned
+                        ),
+                    )
+                    with self.assertRaises(PlatformFileError) as caught:
+                        persistent_private.verify(
+                            private_evidence,
+                            secret,
+                            reparsed.private_directory_proof,
+                            context,
+                        )
+                    self.assertEqual(
+                        caught.exception.code,
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+                    )
+                finally:
+                    secret.close()
+                    key_file.close()
+                    private_evidence.close()
+                    private_parent.close()
+                self.assertEqual(
+                    coordinator._sealed_registry._portable_borrows,
+                    {},
+                )
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_existing_private_namespace_requires_fresh_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                owner_parent = owner_inputs["platform"].bind_parent(
+                    reservation._root,
+                    PurePath(private_name),
+                )
+                private = owner_inputs["platform"].create_private_directory(
+                    owner_parent,
+                    private_name,
+                )
+                private.close()
+                owner_parent.close()
+                (root / private_name / "foreign.bin").write_bytes(b"foreign")
+
+                with self.assertRaises(ActivationPreparationError) as caught:
+                    coordinator.publish_portable_prepared_activation(
+                        preparation,
+                        **owner_inputs,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertEqual(
+                    sorted(path.name for path in (root / private_name).iterdir()),
+                    ["foreign.bin"],
+                )
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_w2_narrowing_failure_is_not_reported_as_lock_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            service = _service(identity)
+            reservation = service._acquire_initial_reservation()
+            try:
+                with mock.patch(
+                    "tm_migration.narrow_windows_persistent_private_proof",
+                    side_effect=PlatformFileError(
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                        retryable=False,
+                    ),
+                ):
+                    with self.assertRaises(ActivationPreparationError) as caught:
+                        reservation.portable_journal_inputs()
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                )
+                self.assertFalse(
+                    any(
+                        path.name.startswith(".localcat-activation-private-v1.")
+                        for path in root.iterdir()
+                    )
+                )
+                reservation.reprove()
+            finally:
+                reservation.release()
+
+    def test_pre_arm_authority_failure_leaves_no_private_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                borrow_type = type(preparation._physical_snapshot.live_reproof)
+                with mock.patch.object(
+                    borrow_type,
+                    "reprove",
+                    side_effect=tm_stage_sealer.StageSealError(
+                        "SEALER.ARTIFACT_MUTATED"
+                    ),
+                ):
+                    with self.assertRaises(ActivationPreparationError) as caught:
+                        coordinator.publish_portable_prepared_activation(
+                            preparation,
+                            **owner_inputs,
+                        )
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.JOURNAL_ASSET_MUTATED",
+                )
+                self.assertFalse((root / private_name).exists())
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_pre_arm_programmer_error_passes_through_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                borrow_type = type(preparation._physical_snapshot.live_reproof)
+                programmer_error = TypeError("test programmer boundary")
+                with mock.patch.object(
+                    borrow_type,
+                    "reprove",
+                    side_effect=programmer_error,
+                ):
+                    with self.assertRaises(TypeError) as caught:
+                        coordinator.publish_portable_prepared_activation(
+                            preparation,
+                            **owner_inputs,
+                        )
+                self.assertIs(caught.exception, programmer_error)
+                self.assertFalse((root / private_name).exists())
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_key_and_journal_arm_uncertainty_preserve_exact_residue(self) -> None:
+        for target_publish, expected_names in (
+            (1, ["device.key"]),
+            (2, ["activation-journal-v3.json", "device.key"]),
+        ):
+            with self.subTest(target_publish=target_publish):
+                enabled = False
+                publish_count = 0
+
+                def fault(phase: str) -> None:
+                    nonlocal publish_count
+                    if enabled and phase == "publish_after_rename":
+                        publish_count += 1
+                        if publish_count == target_publish:
+                            raise OSError("test publication uncertainty")
+
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    identity = _identity(root)
+                    backend = platform_fs_windows.WindowsPlatformAdapter(
+                        _fault_injector=fault
+                    )
+                    coordinator = ResourceStoreCoordinator(
+                        canonical_store_id="store.primary",
+                        resource_identity=identity,
+                    )
+                    service = TMMigrationService(
+                        resource_identity=identity,
+                        canonical_store_id="store.primary",
+                        coordinator=coordinator,
+                        platform_backend=backend,
+                    )
+                    reservation, sealed, _registry = self._portable_sealed_stage(
+                        service,
+                        coordinator,
+                        identity,
+                    )
+                    preparation = None
+                    try:
+                        preparation = coordinator.activate(sealed)
+                        owner_inputs = reservation.portable_journal_inputs()
+                        private_name = (
+                            tm_activation_journal._portable_activation_private_directory_name(
+                                identity
+                            )
+                        )
+                        enabled = True
+                        with self.assertRaises(
+                            ActivationPreparationError
+                        ) as caught:
+                            coordinator.publish_portable_prepared_activation(
+                                preparation,
+                                **owner_inputs,
+                            )
+                        enabled = False
+                        self.assertEqual(
+                            caught.exception.code,
+                            "ACTIVATION.RECOVERY_REQUIRED",
+                        )
+                        self.assertEqual(
+                            sorted(
+                                path.name
+                                for path in (root / private_name).iterdir()
+                            ),
+                            expected_names,
+                        )
+                        reservation.reprove()
+                    finally:
+                        enabled = False
+                        _release_portable_test_authorities(
+                            coordinator,
+                            preparation,
+                            reservation,
+                        )
+
+    def test_unpublished_owned_candidate_is_closed_then_unlinked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                with mock.patch.object(
+                    platform_fs_windows._WindowsCandidateFile,
+                    "_flush_content",
+                    side_effect=PlatformFileError(
+                        PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+                        retryable=False,
+                    ),
+                ):
+                    with self.assertRaises(ActivationPreparationError) as caught:
+                        coordinator.publish_portable_prepared_activation(
+                            preparation,
+                            **owner_inputs,
+                        )
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertEqual(list((root / private_name).iterdir()), [])
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_journal_terminal_failure_requires_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                with mock.patch.object(
+                    platform_fs_windows._WindowsPendingPublication,
+                    "_terminal_reproof",
+                    side_effect=PlatformFileError(
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                        retryable=True,
+                    ),
+                ):
+                    with self.assertRaises(ActivationPreparationError) as caught:
+                        coordinator.publish_portable_prepared_activation(
+                            preparation,
+                            **owner_inputs,
+                        )
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertEqual(
+                    sorted(path.name for path in (root / private_name).iterdir()),
+                    ["activation-journal-v3.json", "device.key"],
+                )
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_owner_reproof_drift_before_journal_arm_preserves_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                private_name = (
+                    tm_activation_journal._portable_activation_private_directory_name(
+                        identity
+                    )
+                )
+                borrow_type = type(preparation._physical_snapshot.live_reproof)
+                real_reprove = borrow_type.reprove
+                calls = 0
+
+                def fail_fourth(borrow: object) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 4:
+                        raise tm_stage_sealer.StageSealError(
+                            "SEALER.ARTIFACT_MUTATED"
+                        )
+                    real_reprove(borrow)
+
+                with mock.patch.object(
+                    borrow_type,
+                    "reprove",
+                    new=fail_fourth,
+                ):
+                    with self.assertRaises(ActivationPreparationError) as caught:
+                        coordinator.publish_portable_prepared_activation(
+                            preparation,
+                            **owner_inputs,
+                        )
+                self.assertEqual(calls, 4)
+                self.assertEqual(
+                    caught.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertEqual(
+                    sorted(path.name for path in (root / private_name).iterdir()),
+                    ["device.key"],
+                )
+                reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
 
     def test_stage_specific_creator_pair_spans_gate_b_token_and_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

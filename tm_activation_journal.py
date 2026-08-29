@@ -10,13 +10,14 @@ and never imports ``tm_sqlite_store`` or ``SQLiteTMStore``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import os
 import stat
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import tm_contracts as contract_module
 from tm_content_attestation import (
@@ -32,7 +33,19 @@ from tm_content_attestation import (
     _sealed_content_attestation_record_to_mapping,
 )
 from platform_fs_contracts import (
+    DEVICE_SECRET_SIZE_BYTES,
+    BoundDirectoryAuthority,
+    CandidateFile,
+    LockLease,
+    PendingPublication,
+    PersistentPrivateProof,
+    PlatformFileBackend,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PrivateProofContext,
     PrivateProofObjectRole,
+    PublishMode,
+    RootedDirectoryAuthority,
     WindowsPrivateProof,
     decode_windows_private_proof,
     encode_windows_private_proof,
@@ -4742,3 +4755,629 @@ def _parse_portable_activation_journal_bytes(
             "ACTIVATION.JOURNAL_PARSE_INVALID", retryable=False
         )
     return record
+
+
+_PORTABLE_JOURNAL_BORROW_FACTORY_KEY = object()
+_PORTABLE_JOURNAL_HANDLE_FACTORY_KEY = object()
+_PORTABLE_KEY_CANDIDATE_SUFFIX = ".candidate"
+_PORTABLE_JOURNAL_CANDIDATE_SUFFIX = ".candidate"
+
+
+def _portable_activation_private_directory_name(
+    identity: CanonicalResourceIdentity,
+) -> str:
+    if type(identity) is not CanonicalResourceIdentity:
+        raise TypeError("portable journal identity is invalid")
+    return f".localcat-activation-private-v1.{identity.target_identity}"
+
+
+class _CallerHeldPortableJournalBorrow:
+    """Non-closing view of the initial-activation root and W1 lease."""
+
+    __slots__ = (
+        "__backend",
+        "__claimed",
+        "__identity",
+        "__lease",
+        "__lock_name",
+        "__lock_payload",
+        "__root",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        lock_name: str,
+        lock_payload: bytes,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_JOURNAL_BORROW_FACTORY_KEY:
+            raise TypeError("portable journal borrow requires the owner factory")
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("portable journal identity is invalid")
+        if not isinstance(backend, PlatformFileBackend):
+            raise TypeError("portable journal backend is invalid")
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("portable journal root is invalid")
+        if not isinstance(lease, LockLease):
+            raise TypeError("portable journal lease is invalid")
+        if type(lock_name) is not str or not lock_name:
+            raise TypeError("portable journal lock name is invalid")
+        if type(lock_payload) is not bytes or not lock_payload:
+            raise TypeError("portable journal lock payload is invalid")
+        self.__identity = identity
+        self.__backend = backend
+        self.__claimed = False
+        self.__root = root
+        self.__lease = lease
+        self.__lock_name = lock_name
+        self.__lock_payload = lock_payload
+
+    def reprove(
+        self,
+        backend: PlatformFileBackend,
+        identity: CanonicalResourceIdentity,
+    ) -> None:
+        if backend is not self.__backend or identity != self.__identity:
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        self.__lease.reprove_binding(
+            self.__root,
+            self.__lock_name,
+            self.__lock_payload,
+        )
+        self.__root.reprove()
+
+    def _authorities(
+        self,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        identity: CanonicalResourceIdentity,
+    ) -> tuple[RootedDirectoryAuthority, LockLease]:
+        if self.__claimed:
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        self.reprove(backend, identity)
+        if persistent_private is not backend:
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        self.__claimed = True
+        return self.__root, self.__lease
+
+    def lock_payload_digest(self) -> str:
+        return hashlib.sha256(self.__lock_payload).hexdigest()
+
+    def __reduce__(self) -> object:
+        raise TypeError("portable journal borrow is non-serializable")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("portable journal borrow is non-serializable")
+
+    def __copy__(self) -> object:
+        raise TypeError("portable journal borrow is non-copyable")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        del memo
+        raise TypeError("portable journal borrow is non-copyable")
+
+
+def _create_caller_held_portable_journal_borrow(
+    *,
+    identity: CanonicalResourceIdentity,
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    lease: LockLease,
+    lock_name: str,
+    lock_payload: bytes,
+) -> _CallerHeldPortableJournalBorrow:
+    if not isinstance(backend, PersistentPrivateProof):
+        raise PlatformFileError(
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            retryable=False,
+        )
+    return _CallerHeldPortableJournalBorrow(
+        identity=identity,
+        backend=backend,
+        root=root,
+        lease=lease,
+        lock_name=lock_name,
+        lock_payload=lock_payload,
+        _factory_key=_PORTABLE_JOURNAL_BORROW_FACTORY_KEY,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _PortablePreparedJournalHandle:
+    """Code-only proof that one exact v3 PREPARED record reached terminal reproof."""
+
+    preparation_id: str
+    record_digest: str
+    private_directory_name: str
+    journal_name: str
+    _record: _PortableActivationJournalRecord = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        record: _PortableActivationJournalRecord,
+        *,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_JOURNAL_HANDLE_FACTORY_KEY:
+            raise TypeError("portable journal handle requires the owner factory")
+        if type(record) is not _PortableActivationJournalRecord:
+            raise TypeError("portable journal record is invalid")
+        object.__setattr__(self, "preparation_id", record.unsigned.preparation_id)
+        object.__setattr__(self, "record_digest", record.record_digest)
+        object.__setattr__(
+            self,
+            "private_directory_name",
+            record.unsigned.private_directory_name,
+        )
+        object.__setattr__(self, "journal_name", record.unsigned.journal_name)
+        object.__setattr__(self, "_record", record)
+
+
+def _portable_activation_owner_error(
+    error: PlatformFileError | OSError,
+    *,
+    namespace_armed: bool,
+    publication_armed: bool,
+) -> ActivationPreparationError:
+    if isinstance(error, PlatformFileError):
+        if (
+            error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value
+            or namespace_armed
+            or publication_armed
+        ):
+            return ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if error.code in {
+            PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+            PlatformFileErrorCode.OUTSIDE_ROOT.value,
+            PlatformFileErrorCode.REPARSE_REJECTED.value,
+            PlatformFileErrorCode.IDENTITY_STALE.value,
+            PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value,
+        }:
+            return ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            )
+        if (
+            error.code == PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value
+            and not namespace_armed
+            and not publication_armed
+        ):
+            return ActivationPreparationError(
+                "ACTIVATION.DURABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+    if namespace_armed or publication_armed:
+        return ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    return ActivationPreparationError(
+        "ACTIVATION.DURABILITY_UNAVAILABLE",
+        retryable=False,
+    )
+
+
+def _close_portable_journal_authorities(
+    authorities: list[object],
+) -> BaseException | None:
+    first_error: BaseException | None = None
+    for authority in reversed(authorities):
+        close = getattr(authority, "close", None)
+        if close is None:
+            if first_error is None:
+                first_error = TypeError("portable journal authority cannot close")
+            continue
+        try:
+            close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
+def _unlink_unpublished_portable_candidate(
+    parent: BoundDirectoryAuthority,
+    name: str,
+    candidate: CandidateFile,
+) -> None:
+    identity = candidate.identity()
+    close_error: BaseException | None = None
+    try:
+        candidate.close()
+    except BaseException as error:
+        close_error = error
+    try:
+        parent.unlink_owned(name, identity)
+    except BaseException as error:
+        if close_error is None:
+            close_error = error
+    if close_error is not None:
+        raise close_error
+
+
+class _WindowsPortablePreparedJournalOwner:
+    """One-shot W2 owner for a private device key and durable v3 PREPARED."""
+
+    @staticmethod
+    def publish(
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        unsigned: _PortableActivationJournalUnsigned,
+        owner_reprove: Callable[[], None],
+        owner_commit: Callable[[_PortableActivationJournalRecord], None],
+    ) -> _PortablePreparedJournalHandle:
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("portable journal identity is invalid")
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("portable journal borrow is invalid")
+        if type(unsigned) is not _PortableActivationJournalUnsigned:
+            raise TypeError("portable journal unsigned record is invalid")
+        if not callable(owner_reprove):
+            raise TypeError("portable journal owner reproof must be callable")
+        if not callable(owner_commit):
+            raise TypeError("portable journal owner commit must be callable")
+        if unsigned.resource_id != identity.resource_id or (
+            unsigned.target_identity != identity.target_identity
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+        expected_private_directory_name = (
+            _portable_activation_private_directory_name(identity)
+        )
+        if (
+            unsigned.private_directory_name != expected_private_directory_name
+            or unsigned.device_key_name != "device.key"
+            or unsigned.journal_name != "activation-journal-v3.json"
+            or unsigned.terminal_name != "activation-terminal-v3.json"
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                retryable=False,
+            )
+
+        namespace_armed = False
+        publication_armed = False
+        authorities: list[object] = []
+        key_candidate: CandidateFile | None = None
+        journal_candidate: CandidateFile | None = None
+        key_pending: PendingPublication | None = None
+        journal_pending: PendingPublication | None = None
+        owner_parent: BoundDirectoryAuthority | None = None
+        private_parent: BoundDirectoryAuthority | None = None
+        active_error: BaseException | None = None
+        result: _PortablePreparedJournalHandle | None = None
+        try:
+            root, _lease = caller_borrow._authorities(
+                backend,
+                persistent_private,
+                identity,
+            )
+            if unsigned.lock_payload_digest != caller_borrow.lock_payload_digest():
+                raise ActivationPreparationError(
+                    "ACTIVATION.JOURNAL_CLOSURE_INVALID",
+                    retryable=False,
+                )
+            owner_reprove()
+            owner_parent = backend.bind_parent(
+                root,
+                PurePath(unsigned.private_directory_name),
+            )
+            authorities.append(owner_parent)
+            private_snapshot = owner_parent.inspect_entry(
+                unsigned.private_directory_name
+            )
+            if private_snapshot is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            private_parent = backend.create_private_directory(
+                owner_parent,
+                unsigned.private_directory_name,
+            )
+            namespace_armed = True
+            authorities.append(private_parent)
+            private_evidence = backend.prove_private(private_parent)
+            authorities.append(private_evidence)
+            caller_borrow.reprove(backend, identity)
+
+            key_candidate_name = (
+                unsigned.device_key_name + _PORTABLE_KEY_CANDIDATE_SUFFIX
+            )
+            journal_candidate_name = (
+                unsigned.journal_name + _PORTABLE_JOURNAL_CANDIDATE_SUFFIX
+            )
+            for residue_name in (
+                key_candidate_name,
+                journal_candidate_name,
+                unsigned.journal_name,
+                unsigned.terminal_name,
+            ):
+                if private_parent.inspect_entry(residue_name) is not None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+
+            if private_parent.inspect_entry(unsigned.device_key_name) is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            key_bytes = os.urandom(DEVICE_SECRET_SIZE_BYTES)
+            key_candidate = private_parent.create_candidate(
+                key_candidate_name,
+                private=True,
+            )
+            key_candidate.write_all(key_bytes)
+            key_candidate.flush_content()
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            key_candidate_identity = key_candidate.identity()
+            try:
+                key_pending = private_parent.begin_publish(
+                    key_candidate,
+                    unsigned.device_key_name,
+                    mode=PublishMode.CREATE_IF_ABSENT,
+                    lease=None,
+                )
+            except (PlatformFileError, OSError) as error:
+                key_candidate = None
+                if (
+                    isinstance(error, PlatformFileError)
+                    and error.code in {
+                        PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value,
+                        PlatformFileErrorCode.PUBLISH_FAILED.value,
+                    }
+                ):
+                    try:
+                        private_parent.unlink_owned(
+                            key_candidate_name,
+                            key_candidate_identity,
+                        )
+                    except (PlatformFileError, OSError):
+                        namespace_armed = True
+                raise
+            key_candidate = None
+            publication_armed = True
+            authorities.append(key_pending)
+            key_file = key_pending.retained_destination()
+
+            key_identity = key_file.identity()
+            if (
+                key_identity.kind != "regular"
+                or key_identity.link_count != 1
+                or len(key_bytes) != DEVICE_SECRET_SIZE_BYTES
+                or key_file.read_all() != key_bytes
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                    retryable=False,
+                )
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+            caller_borrow.reprove(backend, identity)
+
+            context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                _portable_activation_owner_context_sha256(unsigned),
+            )
+            proof = persistent_private.mint(
+                private_evidence,
+                secret,
+                context,
+            )
+            record = _create_portable_activation_journal_record(unsigned, proof)
+            expected_bytes = _serialize_portable_activation_journal_record(record)
+
+            journal_candidate = private_parent.create_candidate(
+                journal_candidate_name,
+                private=True,
+            )
+            journal_candidate.write_all(expected_bytes)
+            journal_candidate.flush_content()
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            journal_candidate_identity = journal_candidate.identity()
+            try:
+                journal_pending = private_parent.begin_publish(
+                    journal_candidate,
+                    unsigned.journal_name,
+                    mode=PublishMode.CREATE_IF_ABSENT,
+                    lease=None,
+                )
+            except (PlatformFileError, OSError) as error:
+                journal_candidate = None
+                if (
+                    isinstance(error, PlatformFileError)
+                    and error.code in {
+                        PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value,
+                        PlatformFileErrorCode.PUBLISH_FAILED.value,
+                    }
+                ):
+                    try:
+                        private_parent.unlink_owned(
+                            journal_candidate_name,
+                            journal_candidate_identity,
+                        )
+                    except (PlatformFileError, OSError):
+                        publication_armed = True
+                raise
+            journal_candidate = None
+            publication_armed = True
+            authorities.append(journal_pending)
+            journal_file = journal_pending.retained_destination()
+            journal_identity = journal_file.identity()
+            if (
+                journal_identity.kind != "regular"
+                or journal_identity.link_count != 1
+                or journal_file.read_all() != expected_bytes
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            journal_evidence = backend.prove_private(journal_file)
+            authorities.append(journal_evidence)
+            disk_record = _parse_portable_activation_journal_bytes(
+                journal_file.read_all()
+            )
+            verified = persistent_private.verify(
+                private_evidence,
+                secret,
+                disk_record.private_directory_proof,
+                context,
+            )
+            authorities.append(verified)
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            owner_result = owner_commit(disk_record)
+            if owner_result is not None:
+                raise TypeError("portable journal owner commit must return None")
+
+            journal_evidence.close()
+            authorities.remove(journal_evidence)
+            owner_reprove()
+            caller_borrow.reprove(backend, identity)
+            terminal_journal_bytes = journal_file.read_all()
+            if terminal_journal_bytes != expected_bytes or (
+                _parse_portable_activation_journal_bytes(terminal_journal_bytes)
+                != disk_record
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            fresh_journal_evidence = backend.prove_private(journal_file)
+            authorities.append(fresh_journal_evidence)
+            if (
+                journal_pending.terminal_reproof()
+                != journal_pending.preliminary_facts()
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            journal_pending.close()
+            authorities.remove(journal_pending)
+            journal_pending = None
+            caller_borrow.reprove(backend, identity)
+
+            if key_pending is not None:
+                key_evidence.close()
+                authorities.remove(key_evidence)
+                owner_reprove()
+                caller_borrow.reprove(backend, identity)
+                terminal_key_identity = key_file.identity()
+                if (
+                    terminal_key_identity.kind != "regular"
+                    or terminal_key_identity.link_count != 1
+                    or key_file.read_all() != key_bytes
+                    or len(key_bytes) != DEVICE_SECRET_SIZE_BYTES
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                fresh_key_evidence = backend.prove_private(key_file)
+                authorities.append(fresh_key_evidence)
+                secret.reprove()
+                if key_pending.terminal_reproof() != key_pending.preliminary_facts():
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                key_pending.close()
+                authorities.remove(key_pending)
+                key_pending = None
+            caller_borrow.reprove(backend, identity)
+            persistent_private.consume_verified(verified, context)
+            authorities.remove(verified)
+            result = _PortablePreparedJournalHandle(
+                disk_record,
+                _factory_key=_PORTABLE_JOURNAL_HANDLE_FACTORY_KEY,
+            )
+        except ActivationPreparationError as error:
+            active_error = (
+                ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+                if namespace_armed or publication_armed
+                else error
+            )
+        except (PlatformFileError, OSError) as error:
+            active_error = _portable_activation_owner_error(
+                error,
+                namespace_armed=namespace_armed,
+                publication_armed=publication_armed,
+            )
+        except BaseException as error:
+            active_error = error
+        finally:
+            for candidate, name in (
+                (journal_candidate, None if journal_candidate is None else unsigned.journal_name + _PORTABLE_JOURNAL_CANDIDATE_SUFFIX),
+                (key_candidate, None if key_candidate is None else unsigned.device_key_name + _PORTABLE_KEY_CANDIDATE_SUFFIX),
+            ):
+                if candidate is not None and name is not None:
+                    try:
+                        if private_parent is None:
+                            raise AssertionError(
+                                "portable candidate has no private parent"
+                            )
+                        _unlink_unpublished_portable_candidate(
+                            private_parent,
+                            name,
+                            candidate,
+                        )
+                    except BaseException as cleanup_error:
+                        if active_error is None:
+                            active_error = cleanup_error
+                        elif isinstance(active_error, (PlatformFileError, OSError)):
+                            active_error = ActivationPreparationError(
+                                "ACTIVATION.RECOVERY_REQUIRED",
+                                retryable=True,
+                            )
+            close_error = _close_portable_journal_authorities(authorities)
+            if active_error is None and close_error is not None:
+                if isinstance(close_error, (PlatformFileError, OSError)):
+                    active_error = ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                else:
+                    active_error = close_error
+        if active_error is not None:
+            raise active_error
+        if result is None:
+            raise AssertionError("portable journal owner produced no handle")
+        return result
