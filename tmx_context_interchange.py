@@ -6,9 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
-import stat
 from xml.parsers import expat
 from xml.sax.saxutils import escape, quoteattr
 
@@ -38,6 +36,7 @@ from tmx_context_contracts import (
     TmxSafeIssue,
     TmxScopeBinding,
 )
+from tmx_platform_io import read_rooted_all
 
 
 _ISSUE_LIMIT = 32
@@ -65,42 +64,6 @@ class _ParserColdFacts:
 
 class _LocaleInventoryAbort(Exception):
     pass
-
-
-def _read_bounded_regular(path: Path) -> bytes:
-    try:
-        observed = path.lstat()
-    except OSError as exc:
-        raise TmxContextError("TMX.COLD_READ_FAILED", "staged TMX could not be inspected") from exc
-    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-        raise TmxContextError("TMX.COLD_SOURCE_UNSAFE", "staged TMX must be a single-link regular file")
-    if observed.st_size > _MAX_INPUT_BYTES:
-        raise TmxContextError("TMX.PAYLOAD_LIMIT", "staged TMX exceeds the active profile limit")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise TmxContextError("TMX.COLD_READ_FAILED", "staged TMX could not be opened safely") from exc
-    try:
-        pinned = os.fstat(fd)
-        if (pinned.st_dev, pinned.st_ino) != (observed.st_dev, observed.st_ino):
-            raise TmxContextError("TMX.COLD_SOURCE_STALE", "staged TMX changed during inspection")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, 64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > _MAX_INPUT_BYTES:
-                raise TmxContextError("TMX.PAYLOAD_LIMIT", "staged TMX exceeds the active profile limit")
-            chunks.append(chunk)
-        after = os.fstat(fd)
-        if (after.st_size, after.st_mtime_ns) != (pinned.st_size, pinned.st_mtime_ns):
-            raise TmxContextError("TMX.COLD_SOURCE_STALE", "staged TMX changed while being read")
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
 
 
 def _inventory_effective_locales(data: bytes) -> TmxEffectiveLocales:
@@ -609,9 +572,6 @@ def cold_validate_tmx_file(path: Path, proof: TmxPayloadProof) -> None:
         raise TypeError("cold validation path must be an absolute Path")
     if type(proof) is not TmxPayloadProof:
         raise TypeError("proof must be exact TmxPayloadProof")
-    data = _read_bounded_regular(path)
-    if hashlib.sha256(data).hexdigest() != proof.payload_digest:
-        raise TmxContextError("TMX.COLD_DIGEST_MISMATCH", "staged TMX digest does not match preview")
     facts = _collect_parser_cold_facts(path, proof.effective_locales)
     if facts.payload_digest != proof.payload_digest:
         raise TmxContextError("TMX.COLD_DIGEST_MISMATCH", "Parser snapshot digest does not match preview")
@@ -631,7 +591,13 @@ def inspect_tmx_payload(path: Path) -> TmxPayloadProof:
 
     if not isinstance(path, Path) or not path.is_absolute():
         raise TypeError("TMX inspection path must be an absolute Path")
-    data = _read_bounded_regular(path)
+    try:
+        data = read_rooted_all(path, maximum_bytes=_MAX_INPUT_BYTES)
+    except Exception as exc:
+        raise TmxContextError(
+            "TMX.COLD_READ_FAILED",
+            "staged TMX could not be opened through rooted authority",
+        ) from exc
     payload_digest = hashlib.sha256(data).hexdigest()
     locales = _inventory_effective_locales(data)
     facts = _collect_parser_cold_facts(path, locales)

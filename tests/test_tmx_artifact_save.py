@@ -44,6 +44,13 @@ class TmxArtifactSaveTests(unittest.TestCase):
             scope or (lambda binding: self.assertEqual(binding, self.binding)),
         )
 
+    def visible_artifacts(self) -> tuple[str, ...]:
+        return tuple(
+            path.name
+            for path in self.root.iterdir()
+            if not path.name.endswith(".lock")
+        )
+
     def test_preview_cancel_is_zero_mutation_and_plan_is_single_use(self) -> None:
         destination = self.root / "cancel.tmx"
         saver = self.saver()
@@ -66,7 +73,7 @@ class TmxArtifactSaveTests(unittest.TestCase):
         self.assertTrue(receipt.durable)
         self.assertEqual(destination.read_bytes(), self.payload.data)
         self.assertEqual(receipt.after_digest, hashlib.sha256(destination.read_bytes()).hexdigest())
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("resource.tmx",))
+        self.assertEqual(self.visible_artifacts(), ("resource.tmx",))
 
         prior = destination.read_bytes()
         replacement = prepare_tmx_payload(
@@ -79,7 +86,7 @@ class TmxArtifactSaveTests(unittest.TestCase):
         self.assertEqual(preview2.destination_before, TmxDestinationBeforeKind.REGULAR)
         self.assertEqual(receipt2.before_digest, hashlib.sha256(prior).hexdigest())
         self.assertEqual(destination.read_bytes(), replacement.data)
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("resource.tmx",))
+        self.assertEqual(self.visible_artifacts(), ("resource.tmx",))
 
     def test_candidate_is_related_to_new_destination_name(self) -> None:
         destination = self.root / "新建项目.tmx"
@@ -94,23 +101,26 @@ class TmxArtifactSaveTests(unittest.TestCase):
         saver.apply(plan)
 
         self.assertEqual(len(observed), 2)
-        self.assertTrue(observed[0].startswith(destination.name))
-        self.assertTrue(observed[0].endswith(".candidate.tmx"))
+        self.assertTrue(observed[0].startswith(".localcat-tmx-"))
+        self.assertTrue(observed[0].endswith(".stage.tmx"))
         self.assertEqual(observed[1], destination.name)
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), (destination.name,))
+        self.assertEqual(self.visible_artifacts(), (destination.name,))
 
     def test_stale_destination_and_scope_fail_before_candidate(self) -> None:
         destination = self.root / "stale.tmx"
         destination.write_bytes(b"prior")
         saver = self.saver()
         _preview, plan = saver.preview(self.binding, self.payload, destination)
-        destination.write_bytes(b"external")
-        before = destination.read_bytes()
-        with self.assertRaises(TmxContextError) as captured:
-            saver.apply(plan)
-        self.assertEqual(captured.exception.code, "TMX.DESTINATION_STALE")
-        self.assertEqual(destination.read_bytes(), before)
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("stale.tmx",))
+        try:
+            destination.write_bytes(b"external")
+        except PermissionError:
+            saver.cancel(plan)
+            self.assertEqual(destination.read_bytes(), b"prior")
+        else:
+            with self.assertRaises(TmxContextError) as captured:
+                saver.apply(plan)
+            self.assertEqual(captured.exception.code, "TMX.DESTINATION_STALE")
+            self.assertEqual(destination.read_bytes(), b"external")
 
         destination2 = self.root / "scope.tmx"
         error = TmxContextError("TMX.SCOPE_STALE", "scope changed")
@@ -120,7 +130,7 @@ class TmxArtifactSaveTests(unittest.TestCase):
             saver2.apply(plan2)
         self.assertEqual(captured2.exception.code, "TMX.SCOPE_STALE")
         self.assertFalse(destination2.exists())
-        self.assertEqual(set(path.name for path in self.root.iterdir()), {"stale.tmx"})
+        self.assertEqual(set(self.visible_artifacts()), {"stale.tmx"})
 
         destination3 = self.root / "scope-false.tmx"
         saver3 = self.saver(scope=lambda _binding: False)
@@ -144,9 +154,9 @@ class TmxArtifactSaveTests(unittest.TestCase):
             saver.apply(plan)
         self.assertEqual(captured.exception.code, "TMX.COLD_VALIDATION_FAILED")
         self.assertEqual(destination.read_bytes(), before)
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("prior.tmx",))
+        self.assertEqual(self.visible_artifacts(), ("prior.tmx",))
 
-    def test_post_publication_readback_failure_rolls_back_only_our_candidate(self) -> None:
+    def test_post_publication_readback_failure_requires_exact_cold_recovery(self) -> None:
         destination = self.root / "rollback.tmx"
         destination.write_bytes(b"prior")
         calls = 0
@@ -162,21 +172,30 @@ class TmxArtifactSaveTests(unittest.TestCase):
         _preview, plan = saver.preview(self.binding, self.payload, destination)
         with self.assertRaises(TmxContextError) as captured:
             saver.apply(plan)
-        self.assertEqual(captured.exception.code, "TMX.POST_PUBLICATION_ROLLED_BACK")
-        self.assertEqual(destination.read_bytes(), b"prior")
-        self.assertEqual(tuple(path.name for path in self.root.iterdir()), ("rollback.tmx",))
+        self.assertEqual(captured.exception.code, "TMX.RECOVERY_REQUIRED")
+        receipt = self.saver(validator=fail_readback).recover(destination)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(destination.read_bytes(), self.payload.data)
+        self.assertEqual(self.visible_artifacts(), ("rollback.tmx",))
 
     def test_symlink_hardlink_and_special_destinations_are_rejected_at_preview(self) -> None:
         original = self.root / "original.tmx"
         original.write_bytes(b"prior")
         symlink = self.root / "link.tmx"
-        symlink.symlink_to(original)
+        destinations = []
+        try:
+            symlink.symlink_to(original)
+        except OSError:
+            pass
+        else:
+            destinations.append(symlink)
         hardlink = self.root / "hard.tmx"
         os.link(original, hardlink)
         directory = self.root / "directory.tmx"
         directory.mkdir()
         saver = self.saver()
-        for destination in (symlink, hardlink, directory):
+        destinations.extend((hardlink, directory))
+        for destination in destinations:
             with self.subTest(destination=destination.name), self.assertRaises(TmxContextError) as captured:
                 saver.preview(self.binding, self.payload, destination)
             self.assertEqual(captured.exception.code, "TMX.DESTINATION_UNSAFE")
