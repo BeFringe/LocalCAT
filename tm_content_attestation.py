@@ -1241,6 +1241,89 @@ def _portable_active_content_attestation_from_mapping(
     )
 
 
+SealedContentAttestationRecord = (
+    SealedContentAttestation | PortableSealedContentAttestation
+)
+ActiveContentAttestationRecord = (
+    ActiveContentAttestation | PortableActiveContentAttestation
+)
+
+
+def _sealed_content_attestation_record_to_mapping(
+    attestation: SealedContentAttestationRecord,
+) -> dict[str, object]:
+    if type(attestation) is SealedContentAttestation:
+        return _sealed_content_attestation_to_mapping(attestation)
+    if type(attestation) is PortableSealedContentAttestation:
+        return _portable_sealed_content_attestation_to_mapping(attestation)
+    raise TypeError("sealed attestation record type is unsupported")
+
+
+def _sealed_content_attestation_record_from_mapping(
+    mapping: object,
+) -> SealedContentAttestationRecord:
+    if type(mapping) is not dict:
+        raise TypeError("sealed attestation record must be an exact object")
+    version = mapping.get("attestation_version")
+    if type(version) is not str:
+        raise TypeError("attestation_version must be a built-in string")
+    if version == LEGACY_CONTENT_ATTESTATION_VERSION:
+        return _sealed_content_attestation_from_mapping(mapping)
+    if version == PORTABLE_CONTENT_ATTESTATION_VERSION:
+        return _portable_sealed_content_attestation_from_mapping(mapping)
+    raise ValueError("unsupported content attestation version")
+
+
+def _active_content_attestation_record_to_mapping(
+    attestation: ActiveContentAttestationRecord,
+) -> dict[str, object]:
+    if type(attestation) is ActiveContentAttestation:
+        return _active_content_attestation_to_mapping(attestation)
+    if type(attestation) is PortableActiveContentAttestation:
+        return _portable_active_content_attestation_to_mapping(attestation)
+    raise TypeError("active attestation record type is unsupported")
+
+
+def _active_content_attestation_record_from_mapping(
+    mapping: object,
+) -> ActiveContentAttestationRecord:
+    if type(mapping) is not dict:
+        raise TypeError("active attestation record must be an exact object")
+    version = mapping.get("attestation_version")
+    if type(version) is not str:
+        raise TypeError("attestation_version must be a built-in string")
+    if version == LEGACY_CONTENT_ATTESTATION_VERSION:
+        return _active_content_attestation_from_mapping(mapping)
+    if version == PORTABLE_CONTENT_ATTESTATION_VERSION:
+        return _portable_active_content_attestation_from_mapping(mapping)
+    raise ValueError("unsupported content attestation version")
+
+
+def _require_same_content_attestation_version(
+    sealed: SealedContentAttestationRecord,
+    active: ActiveContentAttestationRecord,
+) -> str:
+    pair = (type(sealed), type(active))
+    if pair == (SealedContentAttestation, ActiveContentAttestation):
+        return LEGACY_CONTENT_ATTESTATION_VERSION
+    if pair == (
+        PortableSealedContentAttestation,
+        PortableActiveContentAttestation,
+    ):
+        return PORTABLE_CONTENT_ATTESTATION_VERSION
+    if type(sealed) not in {
+        SealedContentAttestation,
+        PortableSealedContentAttestation,
+    }:
+        raise TypeError("sealed attestation record type is unsupported")
+    if type(active) not in {
+        ActiveContentAttestation,
+        PortableActiveContentAttestation,
+    }:
+        raise TypeError("active attestation record type is unsupported")
+    raise ValueError("sealed and active attestation families do not match")
+
+
 def _normalized_absolute_path(path: Path) -> Path:
     if type(path) is not _NATIVE_PATH_TYPE:
         raise TypeError("path must be an exact native Path")
@@ -1565,6 +1648,7 @@ def _capture_platform_content_file(
 
 __all__ = [
     "ACTIVE_CONTENT_PHASE",
+    "ActiveContentAttestationRecord",
     "CONTENT_ATTESTATION_VERSION",
     "LEGACY_CONTENT_ATTESTATION_VERSION",
     "LOGICAL_CLOSURE_VERSION",
@@ -1575,6 +1659,7 @@ __all__ = [
     "ContentFileProof",
     "LegacyPosixContentFileProof",
     "PortableContentFileProof",
+    "SealedContentAttestationRecord",
     "ContentSemanticFacts",
     "PortableActiveContentAttestation",
     "SealedContentAttestation",

@@ -23,8 +23,20 @@ import unittest
 from unittest.mock import patch
 
 import tm_contracts as contract_module
-from tm_activation_journal import _ensure_activation_lineage_marker
-from tm_content_attestation import _create_active_content_attestation
+from tm_activation_journal import (
+    _ACTIVATION_JOURNAL_VERSION,
+    _activation_terminal_path,
+    _activation_terminal_temp_path,
+    _ensure_activation_lineage_marker,
+    _write_activation_journal,
+    _write_activation_terminal,
+)
+from tm_content_attestation import (
+    PortableActiveContentAttestation,
+    PortableSealedContentAttestation,
+    SealedContentAttestation,
+    _create_active_content_attestation,
+)
 from tm_contracts import (
     ActivationCapabilityState,
     CanonicalResourceIdentity,
@@ -1984,6 +1996,100 @@ class ActivationJournalFaultInjectionTests(unittest.TestCase):
 
 
 class ActivationJournalParseTests(unittest.TestCase):
+    def test_portable_attestation_is_rejected_before_journal_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            portable_sealed = object.__new__(
+                PortableSealedContentAttestation
+            )
+            forged = object.__new__(_ActivationJournalRecord)
+            object.__setattr__(
+                forged,
+                "sealed_content_attestation",
+                portable_sealed,
+            )
+            object.__setattr__(
+                forged,
+                "journal_version",
+                _ACTIVATION_JOURNAL_VERSION,
+            )
+            object.__setattr__(forged, "active_content_attestation", None)
+
+            target = (root / "portable-journal.json").resolve()
+            with self.assertRaises(ActivationPreparationError) as raised:
+                _write_activation_journal(
+                    forged,
+                    target,
+                    expected_final_identity=None,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.ATTESTATION_UNAVAILABLE",
+            )
+            self.assertFalse(target.exists())
+            self.assertFalse(_activation_journal_temp_path(target).exists())
+            terminal = _activation_terminal_path(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                _write_activation_terminal(identity, forged)
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.ATTESTATION_UNAVAILABLE",
+            )
+            self.assertFalse(terminal.exists())
+            self.assertFalse(
+                _activation_terminal_temp_path(terminal).exists()
+            )
+            with self.assertRaises(TypeError):
+                forged.__post_init__()
+
+            legacy_sealed = object.__new__(SealedContentAttestation)
+            portable_active = object.__new__(
+                PortableActiveContentAttestation
+            )
+            object.__setattr__(
+                forged,
+                "sealed_content_attestation",
+                legacy_sealed,
+            )
+            object.__setattr__(
+                forged,
+                "active_content_attestation",
+                portable_active,
+            )
+            for writer in (
+                lambda: _write_activation_journal(
+                    forged,
+                    target,
+                    expected_final_identity=None,
+                ),
+                lambda: _write_activation_terminal(identity, forged),
+            ):
+                with self.subTest(writer=writer):
+                    with self.assertRaises(
+                        ActivationPreparationError
+                    ) as raised:
+                        writer()
+                    self.assertEqual(
+                        raised.exception.code,
+                        "ACTIVATION.ATTESTATION_UNAVAILABLE",
+                    )
+            self.assertFalse(target.exists())
+            self.assertFalse(_activation_journal_temp_path(target).exists())
+            self.assertFalse(terminal.exists())
+            self.assertFalse(
+                _activation_terminal_temp_path(terminal).exists()
+            )
+
+            object.__setattr__(forged, "sealed_content_attestation", object())
+            object.__setattr__(forged, "active_content_attestation", None)
+            with self.assertRaises(TypeError):
+                _write_activation_journal(
+                    forged,
+                    target,
+                    expected_final_identity=None,
+                )
+
     def _mutated(self, payload: bytes, kind: str) -> bytes:
         decoded = json.loads(payload.decode("utf-8"))
         if kind == "byte_mutation":
