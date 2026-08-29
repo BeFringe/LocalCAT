@@ -1,6 +1,6 @@
 # 实施计划
 
-> **APPROVED FOR STAGED IMPLEMENTATION**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。ADR-020～025、`windows-platform-enablement` owning scope、WA-01～08 current R/D/T request、ledger与独立Design review均已闭合；ADR-024/025的活动合同同步由Task 0.6记录。从Task 1起仍必须逐项满足task/merge/evidence依赖，任何早期局部通过都不构成Windows Feature GO。owner 指 Spec/合同 authority；branch 只记录提交血缘，worktree/Agent/thread 都不是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，但不能借此跨越各 Spec 审批门。实施/累计复审节奏见 `review-clustering.md`。
+> **APPROVED FOR STAGED IMPLEMENTATION**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。ADR-020～026、`windows-platform-enablement` owning scope、WA-01～08 current R/D/T request、ledger与独立Design review均已闭合；ADR-024/025的活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。从Task 1起仍必须逐项满足task/merge/evidence依赖，任何早期局部通过都不构成Windows Feature GO。owner 指 Spec/合同 authority；branch 只记录提交血缘，worktree/Agent/thread 都不是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，但不能借此跨越各 Spec 审批门。实施/累计复审节奏见 `review-clustering.md`。
 
 - [x] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
 
@@ -76,6 +76,14 @@
   - _Requirements: 4.2, 4.3, 6.6, 8.6, 11.2, 12.2, 12.6, 12.7_
   - _Boundary: Windows Token and Documented Publish Governance Closure_
   - _Depends: 0.5_
+
+- [x] 0.7 采纳ADR-026并收窄Parser发布状态边界
+  - 保留ADR-020的rooted source、retained readback、publisher facts与terminal reproof；取代其对Parser无条件外推owner journal/LKG的部分
+  - WA-01保持单文件、无状态canonical writer，不借Windows restart/recovery矩阵新增Parser持久子系统；Project/Resource/Chunk/TM/TMX各自的journal/LKG/ledger仍归原owning Spec
+  - 完成时ADR索引、WA-01 Design/Tasks、cross-Spec ledger与review cluster均指向同一取代关系，且不改变WA-01 request revision
+  - _Requirements: 2.1, 2.6, 5.1, 12.5_
+  - _Boundary: Parser Stateless Publication Governance Closure_
+  - _Depends: 0.6_
 
 - [x] 1S. 建立可移植 baseline、日志模型与 stock frozen 路线裁决
 
@@ -266,7 +274,7 @@
 
 - [ ] 5. 合并 Project/Resource/TMX amendments并完成持久化 vertical slices
 
-- [ ] 5.1 验证并合并 WA-03 Project、WA-04 Resource、WA-05 TMX commits
+- [x] 5.1 验证并合并 WA-03 Project、WA-04 Resource、WA-05 TMX commits
   - 核对owner/approvals/task suffix/commit/merge/evidence；WA-05 owner必须与任务0.2一致
   - 合并后重跑共享rooted/publish contract和各owner业务baseline，ledger仅在fresh pass后标`SOURCE_MERGED_PASS`；frozen阶段未闭合前不得写入terminal `MERGED_PASS`
   - 完成时，三个consumer都通过platform port且无重复Windows filesystem实现
@@ -274,7 +282,7 @@
   - _Boundary: Persistence Amendment Merge_
   - _Depends: 0.3b, 4.4_
 
-- [ ] 5.2 完成Project保存、退出、重开与deterministic carrier验证
+- [x] 5.2 完成Project保存、退出、重开与deterministic carrier验证
   - 保存真实项目并重新打开相同protected content/metadata；跨进程重启重新证明authority，不复用内存身份
   - 覆盖junction/ancestor swap/target-open/双进程竞争、deterministic ZIP members、LKG和fault/reboot recovery
   - 完成时，canonical bytes/digest与old/new/recovery结果满足ADR-018/019且无部分覆盖
@@ -288,7 +296,7 @@
   - 完成时，resource/termbase结果、bytes与portable receipts可重启复核
   - _Requirements: 2.2, 4.3, 5.1, 5.3, 7.3_
   - _Boundary: Windows Resource Portability_
-  - _Depends: 5.1_
+  - _Depends: 5.1, 6.2_
 
 - [ ] 5.4 (P) 完成TMX获授权导入、canonical保存与重启验证
   - 从真实rooted source导入有效TMX，保持locale normalization/conflict rules/准确count并保存canonical target
@@ -296,7 +304,7 @@
   - 完成时，source TMX journey全绿并交付frozen阶段可复用的owner port，无import count伪成功；packaged复验由WA-05 5.4a与Task 7负责
   - _Requirements: 2.2, 9.1, 9.2, 9.4_
   - _Boundary: Windows TMX Import and Persistence_
-  - _Depends: 5.1_
+  - _Depends: 5.1, 6.2_
 
 - [ ] 5.5 运行Project/Resource/TMX组合并发、崩溃与documented publish恢复矩阵
   - 在owner resource lease下重放save/import/export instruction faults、process termination、uncooperative target swap、opened-target rejection、应用重启和正常OS reboot recovery
@@ -314,7 +322,7 @@
   - 完成时，Core business authority仍归`tm-storage-retrieval-index`，Windows分支只提供platform能力和source merge evidence；ledger记录`SOURCE_MERGED_PASS`，frozen复验后才可进入terminal状态
   - _Requirements: 5.1, 8.1, 8.3, 8.4, 8.5, 8.6, 12.5_
   - _Boundary: TM Core Amendment Merge_
-  - _Depends: 0.3b, 3.7, 5.5_
+  - _Depends: 0.3b, 3.7, 5.2_
 
 - [ ] 6.2 完成TM首次激活、双进程唯一authority与restart recovery
   - 激活合法source，序列化bootstrap/reservation，发布唯一canonical SQLite generation并打开精确published store
@@ -326,11 +334,11 @@
 
 - [ ] 6.3 验证W2 attestation、FileId reuse与device-local恢复
   - restart时由Gate D/canonical owner分别重验自身compatibility或generation/phase envelope、exact bytes/digest及nested `WindowsPrivateProof`/device-secret MAC；历史Volume/FileId只作反例/diagnostic
-  - 覆盖delete/recreate复用、owner/ACE/inheritance/link/reparse/volume/tamper、standard/elevated、同SID low-integrity/restricted与service/AppContainer/impersonation边界；domain/Entra环境仅作optional兼容性覆盖，不可证明的mandatory token shape则fail closed且不回落legacy
+  - 覆盖delete/recreate复用、owner/ACE/inheritance/link/reparse/volume/tamper、standard/elevated、同SID low-integrity/restricted与service/AppContainer/impersonation边界；不可证明的mandatory token shape fail closed且不回落legacy
   - 完成时，合法authority恢复，任何弱路径/token/identity替代均被拒绝
   - _Requirements: 8.2, 8.4, 8.5, 8.6, 12.6_
   - _Boundary: Windows TM Attestation Re-proof_
-  - _Depends: 6.2_
+  - _Depends: 6.2, 5.5_
 
 - [ ] 6.4 完成SQLite FTS5/trigram真实创建、查询、关闭与重开
   - 在Windows source runtime对canonical store创建实际FTS5/trigram schema，写入数据、执行MATCH/排序，关闭进程后重开同一published authority查询
