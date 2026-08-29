@@ -12,7 +12,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 - **Owning spec**：`windows-platform-enablement`；Governance owner 已批准其只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence，并同步到 `.kiro/steering/spec-ownership.md`/`roadmap.md`。
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
-- **审批状态**：ADR-020～025、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已批准；ADR-024/025对主体环境矩阵与发布耐久门的后续取代关系由Task 0.6同步，实施仍仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
+- **审批状态**：ADR-020～026、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已批准；ADR-024/025对主体环境矩阵与发布耐久门的后续取代关系由Task 0.6同步，ADR-026对Parser发布状态的收窄由Task 0.7同步；实施仍仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
 - **交付路线**：Windows source compatibility 与 ADR-022 frozen distribution 是两个累计验收阶段。source 阶段可先形成依赖用户管理 CPython 3.14 x64、venv、`requirements-ui.txt` 与受审 source tree 的本地运行入口；它不铸造 `TrustedSourceAuthority`、不满足 Requirement 10～12，也不改变 frozen 最终发行门。W3 custom in-process entry 的规划可与 source 平台迁移并行，gate-quality spike 在 W1 rooted contract 冻结后、任何 frozen consumer merge前完成。
 
 ## 需求
