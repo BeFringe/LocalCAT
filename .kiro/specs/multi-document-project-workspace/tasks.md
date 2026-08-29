@@ -171,7 +171,6 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 ### Cluster 3 完成门
 
 - application 只消费 Cluster 1–2 已批准 contracts；失败不丢失 dirty、identity 或恢复信息。
-- 独立对抗审查已重放候选准备失败、prepared capability 回收、durable import/session 单点切换、legacy exact DTO 与旧单 JSON journeys，Tasks 3.1–3.4 全部 GO。
 - C0 runtime source digest 的预期漂移保留到 Cluster 4 final roots 后重签；不得把该后续证据门提前算作 Cluster 3 完成。
 - 独立提交：`feat(workspace): 接入多文档应用会话`。
 - Cluster 3 独立对抗 review 通过后才进入 Cluster 4。
