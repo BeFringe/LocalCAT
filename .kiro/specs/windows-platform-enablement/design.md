@@ -22,7 +22,7 @@
 ## Boundary Commitments
 
 ### This Spec Owns
-- `RootedFileSystem`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
+- `RootedFileSystem`、`MutableFileReservationService`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
 - Windows 11 native handle implementation、支持 volume capability gate、Win32 error normalization 和平台专属反例 harness。
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
@@ -216,6 +216,13 @@ class RootedFileSystem(Protocol):
     def open_regular(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundRegularFile: ...
     def bind_parent(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundDirectoryAuthority: ...
 
+class MutableFileReservation(Protocol):
+    def identity(self) -> FileObjectIdentity: ...
+    def close(self) -> None: ...
+
+class MutableFileReservationService(Protocol):
+    def reserve_mutable_file(self, parent: BoundDirectoryAuthority, name: str) -> MutableFileReservation: ...
+
 class ExistingFileDurability(Protocol):
     def open_existing_for_synchronization(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundSynchronizedRegularFile: ...
 
@@ -262,6 +269,7 @@ class PersistentPrivateProof(Protocol):
 
 **Invariants**:
 - 所有 authority objects 都是 context-managed、不可序列化、关闭后不可复用。
+- `MutableFileReservationService`只通过bound parent下的`CREATE_NEW`铸造owner authority，不提供对既有文件的bind/adopt入口。reservation保留origin parent chain、basename与创建时identity；每次`identity()`同时复证retained file仍live/regular/single-link且origin name仍指向同一对象。它只允许SQLite或普通external writer通过pathname修改同一文件，不提供write/publish/journal/rename/unlink；关闭只释放reservation持有的handles，不删除文件或关闭调用方parent。创建后、authority返回前若平台操作性复证失败，映射`RECOVERY_REQUIRED`并保留待owner显式恢复的命名残留，禁止按pathname删除可能已被替换的entry；`TypeError`、`AssertionError`、`AttributeError`等programmer fault仍原样穿透。
 - `CandidateFile.write_chunks`是one-shot、每块至多64 KiB且受调用方总字节上限约束的流式写入口；`write_all`只是兼容委托。`observe_ledger_entries`只在同父目录live lease下返回有界、排序的namespace observations；这些observations不是authority或CAS，owner必须逐项rooted reopen并复证后才能读取或提交业务状态。
 - `PendingPublication` 是跨越业务 owner durable commit 的opaque、context-managed低层authority，不是业务receipt。`begin_publish`不得返回success；owner必须使用其retained destination完成readback，自行提交并复证业务state，再调用platform `terminal_reproof`，最后关闭。平台不解释或持久化owner phase/generation/compatibility。
 - `ExistingFileDurability`只同步已由owner写成的既有regular file：同一retained authority先后复证exact identity/content并执行平台文件持久化，不得rename/unlink或改变namespace。POSIX实现执行file fsync后parent directory fsync；Windows实现执行同一file handle的`FlushFileBuffers`并复证parent/root live authority，parent reproof不冒充directory fsync。
@@ -283,6 +291,7 @@ Task 3.1 的host probe只返回诊断性的`WindowsHostFacts`，不提前铸造�
 | ROOT / INTERMEDIATE | list/read attributes/synchronize | **仅 READ；无 WRITE/DELETE** | BACKUP_SEMANTICS + OPEN_REPARSE_POINT | 全 rooted operation；拒绝 writable/rename handle 并固定 ancestor |
 | SOURCE | generic read + read attributes | READ，**无 WRITE/DELETE** | OPEN_REPARSE_POINT + SEQUENTIAL_SCAN | sealed copy；阻止并发 overwrite/rename |
 | ENTRY_PROBE | read attributes/synchronize | READ + WRITE + DELETE | OPEN_REPARSE_POINT | 仅提供观察事实；commit 前关闭，不构成 CAS |
+| MUTABLE_RESERVATION | read attributes + synchronize，**无 DELETE/write** | READ + WRITE + DELETE | CREATE_NEW + OPEN_REPARSE_POINT | 保留创建identity与origin parent/name；允许SQLite/普通writer并存，swap后拒绝采纳，不负责publish/retirement |
 | CANDIDATE | read + write + delete + synchronize | none | CREATE_NEW + OPEN_REPARSE_POINT + WRITE_THROUGH | 写/flush/handle-relative rename 全程同一 handle |
 | LOCK | read + write + synchronize | READ + WRITE，**无 DELETE** | OPEN_REPARSE_POINT | persistent lock file + `LockFileEx` |
 
