@@ -17,8 +17,9 @@ Parser TMX reader ─> prop-preserving ResourceRecord ─> semantic TM importer 
 
 ### Windows Compatibility Amendment WA-05
 
-- **ADR mapping**：follow ADR-020/022。TMX 保留 payload grammar、scope/loss、canonical writer 与 direct receipt；Parser 提供 sealed source，platform 提供 `BoundDirectoryPublisher`，packaging 提供 trusted bundle root。
-- **Source/writer**：import 不新增 Windows XML reader；`tmx_artifact_save.py` 的 dirfd/fsync implementation 改为注入 platform ports，owner仍负责 locale/scope/canonical byte validation和recovery classification。
+- **ADR mapping**：follow ADR-020/022/025。TMX 保留 payload grammar、scope/loss、canonical writer 与 direct receipt；Parser 提供 sealed source，platform 提供 `BoundDirectoryPublisher`，packaging 提供 trusted bundle root。
+- **Source/writer**：import 不新增 Windows XML reader；direct publication 由 TMX-owned state machine 消费 rooted authority、bound candidate 与 process lock，owner仍负责 locale/scope/canonical byte validation和recovery classification。
+- **Recovery evidence**：journal 分为 armed/staged/receipt-ready；success 顺序固定为 target retained readback、receipt-ready journal durable commit、`PendingPublication` terminal namespace reproof。process termination 后以 fresh rooted digest、LKG 与 Parser cold validation分类 prior/after事实，durability遵循共享 publisher contract。
 - **Frozen journey**：packaged import/export 从 trusted source/bundle authority 获取声明的 fixtures/resources，不从 CWD 或 checkout 推断；ResourcePackage profile仍通过既有 handler边界组合。
 - **Verification**：hostile source zero mutation、canonical byte/reopen、target-before preservation、publish/readback/restart recovery 与 clean-user packaged journey全部使用真实业务 reader/writer。
 
@@ -48,9 +49,9 @@ Parser TMX reader ─> prop-preserving ResourceRecord ─> semantic TM importer 
 
 Coordinator 按 exact segment identity join，产生 ordered units 与 source binding。Preview 时捕获；apply 前重签并 exact compare。它不解析 TMX 或 ResourcePackage。
 
-### `tmx_artifact_save.py`
+### `tmx_artifact_save.py` / `tmx_bound_artifact_save.py` / `tmx_platform_io.py`
 
-direct `.tmx` 的 carrier-neutral destination binding、candidate/LKG、fsync、atomic replace、readback 和 recovery。它只抛 TMX domain error，不返回 Resource/ProjectPackage receipt。
+`tmx_artifact_save.py` 保持 direct saver 的公开导入面；bound implementation 拥有 destination binding、persistent family lock、candidate/LKG/journal、atomic publish、readback 和 cold recovery，bounded I/O 只消费 platform rooted handles。它只抛 TMX domain error，不返回 Resource/ProjectPackage receipt。
 
 ### Parser / Import adaptation
 

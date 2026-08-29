@@ -93,7 +93,7 @@ class TmxContextContractTests(unittest.TestCase):
             safe_issues=(),
             effective_locales=payload.proof.effective_locales,
             profile_id=payload.proof.profile_id,
-            destination=Path("/tmp/export.tmx"),
+            destination=Path(__file__).resolve().with_name("export.tmx"),
             destination_before=TmxDestinationBeforeKind.ABSENT,
             destination_before_digest=None,
         )
