@@ -10,8 +10,10 @@ module-private primitives for Tasks 5.7-5.9 and are exercised only here.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import fields, replace
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -25,17 +27,37 @@ from unittest.mock import patch
 import tm_contracts as contract_module
 from tm_activation_journal import (
     _ACTIVATION_JOURNAL_VERSION,
+    _PORTABLE_ACTIVATION_JOURNAL_PHASE,
+    _PORTABLE_ACTIVATION_JOURNAL_VERSION,
+    _PortableActivationJournalRecord,
+    _PortableActivationJournalUnsigned,
     _activation_terminal_path,
     _activation_terminal_temp_path,
+    _create_portable_activation_journal_record,
     _ensure_activation_lineage_marker,
+    _parse_portable_activation_journal_bytes,
+    _portable_activation_owner_context_sha256,
+    _serialize_portable_activation_journal_record,
     _write_activation_journal,
     _write_activation_terminal,
 )
 from tm_content_attestation import (
+    ContentFileProof,
+    ContentSemanticFacts,
+    LOGICAL_CLOSURE_VERSION,
+    PortableContentFileProof,
     PortableActiveContentAttestation,
     PortableSealedContentAttestation,
     SealedContentAttestation,
     _create_active_content_attestation,
+    _create_portable_sealed_content_attestation,
+    _create_sealed_content_attestation,
+)
+from platform_fs_contracts import (
+    PrivateProofObjectRole,
+    WINDOWS_PRIVATE_PROOF_SCHEMA,
+    WINDOWS_PRIVATE_SECURITY_PROFILE_ID,
+    WindowsPrivateProof,
 )
 from tm_contracts import (
     ActivationCapabilityState,
@@ -2413,6 +2435,388 @@ class ActivationJournalDiagnosticsTests(unittest.TestCase):
                 ):
                     self.assertNotIn(forbidden, rendered_error)
             coordinator.cancel_prepared_activation(prepared)
+
+
+class PortableActivationJournalCodecTests(unittest.TestCase):
+    def _unsigned(self) -> _PortableActivationJournalUnsigned:
+        file_proof = PortableContentFileProof(
+            size=8,
+            sha256=hashlib.sha256(b"attested").hexdigest(),
+        )
+        semantic = ContentSemanticFacts(
+            schema_version=2,
+            schema_digest="1" * 64,
+            fold_version="fold-v1",
+            index_version="candidate-v1",
+            candidate_index_kind="FTS5_TRIGRAM",
+            fts5_available=True,
+            sqlite_runtime_version="3.0",
+            unicode_runtime_version="15.0",
+            journal_mode="delete",
+            synchronous="FULL",
+            foreign_keys=True,
+            busy_timeout_ms=5000,
+            wal_enabled=False,
+            extension_loading_enabled=False,
+            record_count=3,
+            receipt_boundary_record_count=1,
+            origin_batch_count=1,
+            origin_batch_id="migration." + "2" * 64,
+            origin_batch_kind="migration",
+            exported_revision=1,
+            fts_count=3,
+            receipt_boundary_fts_count=1,
+            gram_counts=((1, 1), (2, 0)),
+            exact_parity_digest="3" * 64,
+            logical_closure_version=LOGICAL_CLOSURE_VERSION,
+            logical_closure_digest="4" * 64,
+        )
+        sealed = _create_portable_sealed_content_attestation(
+            resource_id="tm.primary",
+            target_identity="5" * 64,
+            canonical_store_id="store.primary",
+            snapshot_receipt_digest="6" * 64,
+            expected_prior_generation=None,
+            evidence_digest="7" * 64,
+            database=file_proof,
+            manifest=file_proof,
+            source=file_proof,
+            semantic_facts=semantic,
+        )
+        return _PortableActivationJournalUnsigned(
+            journal_version=_PORTABLE_ACTIVATION_JOURNAL_VERSION,
+            closure="PENDING",
+            phase=_PORTABLE_ACTIVATION_JOURNAL_PHASE,
+            journal_id="journal.preparation.test",
+            preparation_id="preparation.test",
+            registry_namespace="registry.test",
+            token_id="token.test",
+            token_version="activation-token-v1",
+            activation_nonce="nonce.test",
+            artifact_id="artifact.test",
+            artifact_seal_digest="8" * 64,
+            sealed_stage_digest="9" * 64,
+            resource_id="tm.primary",
+            target_identity="5" * 64,
+            canonical_store_id="store.primary",
+            expected_prior_generation=None,
+            gate_b_grant_digest="a" * 64,
+            evidence_digest="7" * 64,
+            snapshot_receipt_digest="6" * 64,
+            stage_db_digest=file_proof.sha256,
+            manifest_temp_digest=file_proof.sha256,
+            source_jsonl_digest=file_proof.sha256,
+            new_receipt_id="snapshot.test",
+            new_manifest_digest=file_proof.sha256,
+            candidate_stage_db_name="stage.sqlite3",
+            candidate_manifest_temp_name="stage.manifest.tmp",
+            private_directory_name=".localcat-private-test",
+            device_key_name="device.key",
+            journal_name="activation-journal-v3.json",
+            terminal_name="activation-terminal-v3.json",
+            lock_payload_digest="b" * 64,
+            sealed_content_attestation=sealed,
+            active_content_attestation=None,
+        )
+
+    def _proof(
+        self,
+        unsigned: _PortableActivationJournalUnsigned,
+        *,
+        mac: bytes = b"m" * 32,
+    ) -> WindowsPrivateProof:
+        return WindowsPrivateProof(
+            schema=WINDOWS_PRIVATE_PROOF_SCHEMA,
+            object_role=PrivateProofObjectRole.PRIVATE_DIRECTORY,
+            security_profile_id=WINDOWS_PRIVATE_SECURITY_PROFILE_ID,
+            owner_sid_sha256=b"o" * 32,
+            authority_descriptor_sha256=b"d" * 32,
+            owner_context_sha256=_portable_activation_owner_context_sha256(
+                unsigned
+            ),
+            device_key_id=b"k" * 32,
+            device_secret_mac=mac,
+        )
+
+    def _legacy_v2_golden_record(self) -> _ActivationJournalRecord:
+        root = (
+            Path("C:/localcat-v2-golden")
+            if os.name == "nt"
+            else Path("/localcat-v2-golden")
+        )
+        database = ContentFileProof(
+            device=11,
+            inode=101,
+            size=17,
+            sha256="1" * 64,
+        )
+        manifest = ContentFileProof(
+            device=11,
+            inode=102,
+            size=19,
+            sha256="2" * 64,
+        )
+        source = ContentFileProof(
+            device=11,
+            inode=103,
+            size=23,
+            sha256="3" * 64,
+        )
+        portable = self._unsigned().sealed_content_attestation
+        sealed = _create_sealed_content_attestation(
+            resource_id="tm.primary",
+            target_identity="4" * 64,
+            canonical_store_id="store.primary",
+            snapshot_receipt_digest="5" * 64,
+            expected_prior_generation=None,
+            evidence_digest="6" * 64,
+            database=database,
+            manifest=manifest,
+            source=source,
+            semantic_facts=portable.semantic_facts,
+        )
+        return _ActivationJournalRecord(
+            journal_id="journal.golden.v2",
+            journal_version=_ACTIVATION_JOURNAL_VERSION,
+            journal_path=root / "activation-journal.json",
+            phase=_ActivationJournalPhase.PREPARED,
+            preparation_id="preparation.golden.v2",
+            registry_namespace="registry.golden.v2",
+            token_id="token.golden.v2",
+            token_version="activation-token-v1",
+            activation_nonce="nonce.golden.v2",
+            artifact_id="artifact.golden.v2",
+            artifact_seal_digest="7" * 64,
+            sealed_stage_digest="8" * 64,
+            resource_id="tm.primary",
+            target_identity="4" * 64,
+            canonical_store_id="store.primary",
+            prior_canonical_store_id=None,
+            expected_prior_generation=None,
+            prior_generation=None,
+            gate_b_grant_digest="9" * 64,
+            evidence_digest="6" * 64,
+            snapshot_receipt_digest="5" * 64,
+            stage_db_digest=database.sha256,
+            manifest_temp_digest=manifest.sha256,
+            source_jsonl_digest=source.sha256,
+            new_receipt_id="snapshot.golden.v2",
+            new_manifest_path=root / "tm.primary.manifest.json",
+            new_manifest_digest=manifest.sha256,
+            candidate_stage_db_path=root / "stage.sqlite3",
+            candidate_manifest_temp_path=root / "stage.manifest.tmp",
+            candidate_stage_db_identity=(database.device, database.inode),
+            candidate_manifest_temp_identity=(
+                manifest.device,
+                manifest.inode,
+            ),
+            source_jsonl_identity=(source.device, source.inode),
+            had_prior_canonical=False,
+            prior_manifest_absent=False,
+            prior_binding_snapshot_id=None,
+            prior_receipt_digest=None,
+            prior_manifest_digest=None,
+            prior_db_path=None,
+            prior_manifest_path=None,
+            prior_db_digest=None,
+            prior_db_identity=None,
+            prior_manifest_identity=None,
+            prior_db_backup_path=None,
+            prior_manifest_backup_path=None,
+            prior_db_backup_digest=None,
+            prior_manifest_backup_digest=None,
+            prior_db_backup_identity=None,
+            prior_manifest_backup_identity=None,
+            sealed_content_attestation=sealed,
+            active_content_attestation=None,
+        )
+
+    def test_v3_round_trip_is_strict_portable_and_canonical(self) -> None:
+        unsigned = self._unsigned()
+        record = _create_portable_activation_journal_record(
+            unsigned,
+            self._proof(unsigned),
+        )
+        serialized = _serialize_portable_activation_journal_record(record)
+        self.assertEqual(
+            _parse_portable_activation_journal_bytes(serialized),
+            record,
+        )
+        mapping = json.loads(serialized)
+        forbidden_keys = {
+            "device", "dev", "inode", "st_dev", "st_ino", "file_id",
+            "fileid", "volume", "volume_id", "volume_serial",
+        }
+
+        def inspect_portable(value: object) -> None:
+            if type(value) is dict:
+                for key, child in value.items():
+                    self.assertNotIn(key.lower(), forbidden_keys)
+                    inspect_portable(child)
+            elif type(value) is list:
+                for child in value:
+                    inspect_portable(child)
+            elif type(value) is str:
+                self.assertFalse(value.startswith("/"))
+                self.assertNotIn(":\\", value)
+
+        inspect_portable(mapping)
+        self.assertEqual(_ACTIVATION_JOURNAL_VERSION, "activation-journal-v2")
+
+    def test_owner_context_excludes_proof_but_binds_every_owner_fact(self) -> None:
+        unsigned = self._unsigned()
+        original_context = _portable_activation_owner_context_sha256(unsigned)
+        changed = replace(unsigned, token_id="token.changed")
+        self.assertNotEqual(
+            original_context,
+            _portable_activation_owner_context_sha256(changed),
+        )
+        first = _create_portable_activation_journal_record(
+            unsigned,
+            self._proof(unsigned, mac=b"a" * 32),
+        )
+        second = _create_portable_activation_journal_record(
+            unsigned,
+            self._proof(unsigned, mac=b"b" * 32),
+        )
+        self.assertEqual(
+            first.private_directory_proof.owner_context_sha256,
+            second.private_directory_proof.owner_context_sha256,
+        )
+        self.assertNotEqual(first.record_digest, second.record_digest)
+        with self.assertRaises(ValueError):
+            _PortableActivationJournalRecord(
+                unsigned=changed,
+                private_directory_proof=first.private_directory_proof,
+                record_digest=first.record_digest,
+            )
+
+    def test_v3_rejects_unknown_duplicate_and_noncanonical_payloads(self) -> None:
+        unsigned = self._unsigned()
+        record = _create_portable_activation_journal_record(
+            unsigned,
+            self._proof(unsigned),
+        )
+        serialized = _serialize_portable_activation_journal_record(record)
+        mapping = json.loads(serialized)
+        tampered_context = {
+            **mapping,
+            "private_directory_proof": {
+                **mapping["private_directory_proof"],
+                "owner_context_sha256": "0" * 64,
+            },
+        }
+        tampered_mac = {
+            **mapping,
+            "private_directory_proof": {
+                **mapping["private_directory_proof"],
+                "device_secret_mac": "1" * 64,
+            },
+        }
+        for malformed in (
+            {**mapping, "unknown": True},
+            {key: value for key, value in mapping.items() if key != "phase"},
+            {**mapping, "record_digest": "0" * 64},
+            tampered_context,
+            tampered_mac,
+        ):
+            with self.subTest(fields=set(malformed)):
+                with self.assertRaises(ActivationPreparationError):
+                    _parse_portable_activation_journal_bytes(
+                        json.dumps(
+                            malformed,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+        duplicate = serialized.replace(
+            b'{"activation_nonce":',
+            b'{"activation_nonce":"duplicate","activation_nonce":',
+            1,
+        )
+        with self.assertRaises(ActivationPreparationError):
+            _parse_portable_activation_journal_bytes(duplicate)
+        with self.assertRaises(ActivationPreparationError):
+            _parse_portable_activation_journal_bytes(serialized[:-1])
+        with self.assertRaises(ActivationPreparationError):
+            _parse_portable_activation_journal_bytes(
+                serialized[:-1] + b"\r\n"
+            )
+        with self.assertRaises(ActivationPreparationError):
+            _parse_portable_activation_journal_bytes(
+                json.dumps(mapping, indent=2, sort_keys=True).encode("utf-8")
+                + b"\n"
+            )
+
+    def test_v3_rejects_nonfirst_legacy_and_wrong_role_inputs(self) -> None:
+        unsigned = self._unsigned()
+        with self.assertRaises(ValueError):
+            replace(unsigned, expected_prior_generation=0)
+
+        legacy_file = ContentFileProof(
+            device=11,
+            inode=101,
+            size=8,
+            sha256="1" * 64,
+        )
+        legacy = _create_sealed_content_attestation(
+            resource_id=unsigned.resource_id,
+            target_identity=unsigned.target_identity,
+            canonical_store_id=unsigned.canonical_store_id,
+            snapshot_receipt_digest=unsigned.snapshot_receipt_digest,
+            expected_prior_generation=None,
+            evidence_digest=unsigned.evidence_digest,
+            database=legacy_file,
+            manifest=legacy_file,
+            source=legacy_file,
+            semantic_facts=unsigned.sealed_content_attestation.semantic_facts,
+        )
+        with self.assertRaises(TypeError):
+            replace(unsigned, sealed_content_attestation=legacy)
+
+        directory_proof = self._proof(unsigned)
+        wrong_role = replace(
+            directory_proof,
+            object_role=PrivateProofObjectRole.ATTESTATION,
+        )
+        with self.assertRaises(ValueError):
+            _create_portable_activation_journal_record(unsigned, wrong_role)
+
+    def test_v2_main_and_terminal_share_static_golden_bytes(self) -> None:
+        record = self._legacy_v2_golden_record()
+        main_bytes = _serialize_activation_journal_record(record).encode("utf-8")
+        expected_golden = {
+            "nt": (
+                4259,
+                "9032a1968ea99fcb9ac2be3e7e24d68f864b56086b2292686792108305f54cd0",
+            ),
+            "posix": (
+                4243,
+                "6307f2ed246c2e32b17f2d9aac2ed2d1a0a774470e844938781bf1731d50b6b9",
+            ),
+        }
+        expected_length, expected_sha256 = expected_golden[os.name]
+        self.assertEqual(len(main_bytes), expected_length)
+        self.assertEqual(hashlib.sha256(main_bytes).hexdigest(), expected_sha256)
+        reparsed = _parse_activation_journal_bytes(
+            main_bytes,
+            expected_journal_path=record.journal_path,
+        )
+        self.assertEqual(reparsed, record)
+        terminal_bytes = _serialize_activation_journal_record(reparsed).encode(
+            "utf-8"
+        )
+        self.assertEqual(terminal_bytes, main_bytes)
+
+        for writer in (_write_activation_journal, _write_activation_terminal):
+            calls = {
+                node.func.id
+                for node in ast.walk(ast.parse(inspect.getsource(writer)))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            }
+            self.assertIn("_serialize_activation_journal_record", calls)
 
 
 if __name__ == "__main__":

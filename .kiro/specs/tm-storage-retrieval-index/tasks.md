@@ -184,6 +184,7 @@
 
 - [ ] 5.6a 以 `WindowsPrivateProof` 绑定 activation journal 与恢复资产
   - PREPARED 前以current process primary token复验`WindowsPrivateSecurityV2` owner/DACL/MIC projection、non-reparse root、artifact identity与exclusive process lock；provider origin不参与资格，proof缺失、profile/descriptor漂移或继承状态不闭合时不推进journal。
+  - Windows 首次激活使用独立严格 v3 `PREPARED`/`CANCELLED` codec：unsigned owner projection排除nested proof与`record_digest`，private-directory proof绑定其context digest，最外层digest覆盖完整proof；仅持久化portable attestation、owner事实与basename，禁止绝对路径和volume/FileId/device/inode。v2 writer/parser/terminal bytes保持独立不变，mixed-version拒绝；目录proof不得替代journal `private=True` candidate在pending retained destination上的逐对象private/content/identity复证。
   - _Amendment: WA-06_
   - _Depends: 1.2a, 5.3a, 5.6, windows-platform-enablement 3.7_
 

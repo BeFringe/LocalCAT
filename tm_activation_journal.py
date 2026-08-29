@@ -14,7 +14,7 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 
@@ -28,6 +28,14 @@ from tm_content_attestation import (
     _active_content_attestation_to_mapping,
     _sealed_content_attestation_from_mapping,
     _sealed_content_attestation_to_mapping,
+    _sealed_content_attestation_record_from_mapping,
+    _sealed_content_attestation_record_to_mapping,
+)
+from platform_fs_contracts import (
+    PrivateProofObjectRole,
+    WindowsPrivateProof,
+    decode_windows_private_proof,
+    encode_windows_private_proof,
 )
 from tm_contracts import (
     CanonicalResourceIdentity,
@@ -4378,3 +4386,359 @@ def _validate_activation_journal_record(
             raise ValueError(
                 "first activation journal must explicitly encode absence"
             )
+
+
+# The portable codec is deliberately separate from the historical v2 codec
+# above. None of the v2 field sets, serializers, parsers, or golden bytes are
+# shared with or widened by this schema.
+_PORTABLE_ACTIVATION_JOURNAL_VERSION = "activation-journal-v3"
+_PORTABLE_ACTIVATION_JOURNAL_PHASE = "PREPARED"
+_PORTABLE_ACTIVATION_JOURNAL_CLOSURES = frozenset({"PENDING", "CANCELLED"})
+_PORTABLE_ACTIVATION_JOURNAL_MAX_BYTES = 256 * 1024
+
+
+def _portable_activation_canonical_json(mapping: dict[str, object]) -> bytes:
+    return json.dumps(
+        mapping,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _require_portable_activation_string(value: object, field_name: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{field_name} must be a non-empty built-in string")
+    return value
+
+
+def _require_portable_activation_digest(value: object, field_name: str) -> str:
+    result = _require_portable_activation_string(value, field_name)
+    if len(result) != 64 or any(
+        character not in "0123456789abcdef" for character in result
+    ):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+    return result
+
+
+def _require_portable_activation_basename(value: object, field_name: str) -> str:
+    result = _require_portable_activation_string(value, field_name)
+    if (
+        result in {".", ".."}
+        or "/" in result
+        or "\\" in result
+        or Path(result).name != result
+    ):
+        raise ValueError(f"{field_name} must be one normalized basename")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableActivationJournalUnsigned:
+    """Portable PREPARED owner facts before the nested W2 proof is minted."""
+
+    journal_version: str
+    closure: str
+    phase: str
+    journal_id: str
+    preparation_id: str
+    registry_namespace: str
+    token_id: str
+    token_version: str
+    activation_nonce: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    expected_prior_generation: int | None
+    gate_b_grant_digest: str
+    evidence_digest: str
+    snapshot_receipt_digest: str
+    stage_db_digest: str
+    manifest_temp_digest: str
+    source_jsonl_digest: str
+    new_receipt_id: str
+    new_manifest_digest: str
+    candidate_stage_db_name: str
+    candidate_manifest_temp_name: str
+    private_directory_name: str
+    device_key_name: str
+    journal_name: str
+    terminal_name: str
+    lock_payload_digest: str
+    sealed_content_attestation: PortableSealedContentAttestation
+    active_content_attestation: None
+
+    def __post_init__(self) -> None:
+        if self.journal_version != _PORTABLE_ACTIVATION_JOURNAL_VERSION:
+            raise ValueError("portable activation journal version is unsupported")
+        if self.closure not in _PORTABLE_ACTIVATION_JOURNAL_CLOSURES:
+            raise ValueError("portable activation journal closure is invalid")
+        if self.phase != _PORTABLE_ACTIVATION_JOURNAL_PHASE:
+            raise ValueError("portable activation journal phase is invalid")
+        for field_name in (
+            "journal_id", "preparation_id", "registry_namespace", "token_id",
+            "token_version", "activation_nonce", "artifact_id", "resource_id",
+            "canonical_store_id", "new_receipt_id",
+        ):
+            _require_portable_activation_string(getattr(self, field_name), field_name)
+        for field_name in (
+            "artifact_seal_digest", "sealed_stage_digest", "target_identity",
+            "gate_b_grant_digest", "evidence_digest", "snapshot_receipt_digest",
+            "stage_db_digest", "manifest_temp_digest", "source_jsonl_digest",
+            "new_manifest_digest", "lock_payload_digest",
+        ):
+            _require_portable_activation_digest(getattr(self, field_name), field_name)
+        for field_name in (
+            "candidate_stage_db_name", "candidate_manifest_temp_name",
+            "private_directory_name", "device_key_name", "journal_name",
+            "terminal_name",
+        ):
+            _require_portable_activation_basename(getattr(self, field_name), field_name)
+        if self.expected_prior_generation is not None:
+            raise ValueError("portable first activation must not carry a prior generation")
+        if self.active_content_attestation is not None:
+            raise ValueError("PREPARED must not carry an active content attestation")
+        if type(self.sealed_content_attestation) is not PortableSealedContentAttestation:
+            raise TypeError(
+                "portable activation journal requires exact portable sealed attestation"
+            )
+
+
+_PORTABLE_ACTIVATION_UNSIGNED_FIELDS = frozenset(
+    item.name for item in fields(_PortableActivationJournalUnsigned)
+)
+_PORTABLE_ACTIVATION_RECORD_FIELDS = (
+    _PORTABLE_ACTIVATION_UNSIGNED_FIELDS
+    | {"private_directory_proof", "record_digest"}
+)
+
+
+def _portable_activation_unsigned_to_mapping(
+    unsigned: _PortableActivationJournalUnsigned,
+) -> dict[str, object]:
+    if type(unsigned) is not _PortableActivationJournalUnsigned:
+        raise TypeError("portable journal unsigned facts are invalid")
+    return {
+        "activation_nonce": unsigned.activation_nonce,
+        "active_content_attestation": None,
+        "artifact_id": unsigned.artifact_id,
+        "artifact_seal_digest": unsigned.artifact_seal_digest,
+        "candidate_manifest_temp_name": unsigned.candidate_manifest_temp_name,
+        "candidate_stage_db_name": unsigned.candidate_stage_db_name,
+        "canonical_store_id": unsigned.canonical_store_id,
+        "closure": unsigned.closure,
+        "device_key_name": unsigned.device_key_name,
+        "evidence_digest": unsigned.evidence_digest,
+        "expected_prior_generation": unsigned.expected_prior_generation,
+        "gate_b_grant_digest": unsigned.gate_b_grant_digest,
+        "journal_id": unsigned.journal_id,
+        "journal_name": unsigned.journal_name,
+        "journal_version": unsigned.journal_version,
+        "lock_payload_digest": unsigned.lock_payload_digest,
+        "manifest_temp_digest": unsigned.manifest_temp_digest,
+        "new_manifest_digest": unsigned.new_manifest_digest,
+        "new_receipt_id": unsigned.new_receipt_id,
+        "phase": unsigned.phase,
+        "preparation_id": unsigned.preparation_id,
+        "private_directory_name": unsigned.private_directory_name,
+        "registry_namespace": unsigned.registry_namespace,
+        "resource_id": unsigned.resource_id,
+        "sealed_content_attestation": _sealed_content_attestation_record_to_mapping(
+            unsigned.sealed_content_attestation
+        ),
+        "sealed_stage_digest": unsigned.sealed_stage_digest,
+        "snapshot_receipt_digest": unsigned.snapshot_receipt_digest,
+        "source_jsonl_digest": unsigned.source_jsonl_digest,
+        "stage_db_digest": unsigned.stage_db_digest,
+        "target_identity": unsigned.target_identity,
+        "terminal_name": unsigned.terminal_name,
+        "token_id": unsigned.token_id,
+        "token_version": unsigned.token_version,
+    }
+
+
+def _portable_activation_owner_context_sha256(
+    unsigned: _PortableActivationJournalUnsigned,
+) -> bytes:
+    """Digest owner facts only: neither nested proof nor record digest."""
+
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_activation_unsigned_to_mapping(unsigned)
+        )
+    ).digest()
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableActivationJournalRecord:
+    unsigned: _PortableActivationJournalUnsigned
+    private_directory_proof: WindowsPrivateProof
+    record_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.unsigned) is not _PortableActivationJournalUnsigned:
+            raise TypeError("portable activation unsigned facts are invalid")
+        if type(self.private_directory_proof) is not WindowsPrivateProof:
+            raise TypeError("portable activation private proof is invalid")
+        if self.private_directory_proof.object_role is not PrivateProofObjectRole.PRIVATE_DIRECTORY:
+            raise ValueError("portable activation proof must bind private directory")
+        if (
+            self.private_directory_proof.owner_context_sha256
+            != _portable_activation_owner_context_sha256(self.unsigned)
+        ):
+            raise ValueError("portable activation proof owner context does not close")
+        _require_portable_activation_digest(self.record_digest, "record_digest")
+        if self.record_digest != _portable_activation_record_digest(
+            self.unsigned, self.private_directory_proof
+        ):
+            raise ValueError("portable activation record digest does not close")
+
+
+def _portable_activation_proof_to_mapping(
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    value = json.loads(encode_windows_private_proof(proof).decode("utf-8"))
+    if type(value) is not dict:
+        raise TypeError("private proof encoder did not return an object")
+    return value
+
+
+def _portable_activation_proof_from_mapping(mapping: object) -> WindowsPrivateProof:
+    if type(mapping) is not dict:
+        raise TypeError("private directory proof must be an exact object")
+    return decode_windows_private_proof(_portable_activation_canonical_json(mapping))
+
+
+def _portable_activation_record_payload(
+    unsigned: _PortableActivationJournalUnsigned,
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    mapping = _portable_activation_unsigned_to_mapping(unsigned)
+    mapping["private_directory_proof"] = _portable_activation_proof_to_mapping(proof)
+    return mapping
+
+
+def _portable_activation_record_digest(
+    unsigned: _PortableActivationJournalUnsigned,
+    proof: WindowsPrivateProof,
+) -> str:
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_activation_record_payload(unsigned, proof)
+        )
+    ).hexdigest()
+
+
+def _create_portable_activation_journal_record(
+    unsigned: _PortableActivationJournalUnsigned,
+    proof: WindowsPrivateProof,
+) -> _PortableActivationJournalRecord:
+    return _PortableActivationJournalRecord(
+        unsigned=unsigned,
+        private_directory_proof=proof,
+        record_digest=_portable_activation_record_digest(unsigned, proof),
+    )
+
+
+def _serialize_portable_activation_journal_record(
+    record: _PortableActivationJournalRecord,
+) -> bytes:
+    if type(record) is not _PortableActivationJournalRecord:
+        raise TypeError("portable activation journal record is invalid")
+    mapping = _portable_activation_record_payload(
+        record.unsigned, record.private_directory_proof
+    )
+    mapping["record_digest"] = record.record_digest
+    return _portable_activation_canonical_json(mapping) + b"\n"
+
+
+def _parse_portable_activation_journal_bytes(
+    serialized: bytes,
+) -> _PortableActivationJournalRecord:
+    if type(serialized) is not bytes:
+        raise TypeError("portable activation journal bytes must be exact bytes")
+    if not serialized or len(serialized) > _PORTABLE_ACTIVATION_JOURNAL_MAX_BYTES:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID", retryable=False
+        )
+
+    class _DuplicatePortableKey(ValueError):
+        pass
+
+    def reject_constant(value: str) -> None:
+        del value
+        raise ValueError("non-finite JSON number is not allowed")
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        mapping: dict[str, object] = {}
+        for key, value in pairs:
+            if key in mapping:
+                raise _DuplicatePortableKey(key)
+            mapping[key] = value
+        return mapping
+
+    try:
+        mapping = json.loads(
+            serialized.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=strict_object,
+        )
+        if type(mapping) is not dict or set(mapping) != _PORTABLE_ACTIVATION_RECORD_FIELDS:
+            raise ValueError("portable journal fields are invalid")
+        unsigned = _PortableActivationJournalUnsigned(
+            journal_version=mapping["journal_version"],
+            closure=mapping["closure"],
+            phase=mapping["phase"],
+            journal_id=mapping["journal_id"],
+            preparation_id=mapping["preparation_id"],
+            registry_namespace=mapping["registry_namespace"],
+            token_id=mapping["token_id"],
+            token_version=mapping["token_version"],
+            activation_nonce=mapping["activation_nonce"],
+            artifact_id=mapping["artifact_id"],
+            artifact_seal_digest=mapping["artifact_seal_digest"],
+            sealed_stage_digest=mapping["sealed_stage_digest"],
+            resource_id=mapping["resource_id"],
+            target_identity=mapping["target_identity"],
+            canonical_store_id=mapping["canonical_store_id"],
+            expected_prior_generation=mapping["expected_prior_generation"],
+            gate_b_grant_digest=mapping["gate_b_grant_digest"],
+            evidence_digest=mapping["evidence_digest"],
+            snapshot_receipt_digest=mapping["snapshot_receipt_digest"],
+            stage_db_digest=mapping["stage_db_digest"],
+            manifest_temp_digest=mapping["manifest_temp_digest"],
+            source_jsonl_digest=mapping["source_jsonl_digest"],
+            new_receipt_id=mapping["new_receipt_id"],
+            new_manifest_digest=mapping["new_manifest_digest"],
+            candidate_stage_db_name=mapping["candidate_stage_db_name"],
+            candidate_manifest_temp_name=mapping["candidate_manifest_temp_name"],
+            private_directory_name=mapping["private_directory_name"],
+            device_key_name=mapping["device_key_name"],
+            journal_name=mapping["journal_name"],
+            terminal_name=mapping["terminal_name"],
+            lock_payload_digest=mapping["lock_payload_digest"],
+            sealed_content_attestation=_sealed_content_attestation_record_from_mapping(
+                mapping["sealed_content_attestation"]
+            ),
+            active_content_attestation=mapping["active_content_attestation"],
+        )
+        record = _PortableActivationJournalRecord(
+            unsigned=unsigned,
+            private_directory_proof=_portable_activation_proof_from_mapping(
+                mapping["private_directory_proof"]
+            ),
+            record_digest=mapping["record_digest"],
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID", retryable=False
+        ) from error
+    if _serialize_portable_activation_journal_record(record) != serialized:
+        raise ActivationPreparationError(
+            "ACTIVATION.JOURNAL_PARSE_INVALID", retryable=False
+        )
+    return record
