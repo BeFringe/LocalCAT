@@ -475,11 +475,17 @@ def _build_file_rename_information(
     component: str,
     *,
     replace_if_exists: bool,
+    root_directory: int | None = None,
 ) -> tuple[ctypes.Array[ctypes.c_char], int]:
     if type(component) is not str or not component:
         raise TypeError("component must be a non-empty exact str")
     if type(replace_if_exists) is not bool:
         raise TypeError("replace_if_exists must be exact bool")
+    if root_directory is not None and (
+        type(root_directory) is not int
+        or root_directory in {0, INVALID_HANDLE_VALUE}
+    ):
+        raise TypeError("root_directory must be an exact live HANDLE value or None")
     if any(value in component for value in ("\0", "/", "\\", ":")):
         raise ValueError("native rename accepts one relative path component")
     try:
@@ -500,7 +506,7 @@ def _build_file_rename_information(
         ctypes.POINTER(FILE_RENAME_INFORMATION),
     ).contents
     information.ReplaceIfExists = int(replace_if_exists)
-    information.RootDirectory = None
+    information.RootDirectory = root_directory
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(storage) + FILE_RENAME_INFORMATION.FileName.offset,
@@ -906,6 +912,36 @@ class WindowsFileAPI:
         storage, exact_length = _build_file_rename_information(
             component,
             replace_if_exists=replace_if_exists,
+        )
+        io_status = IO_STATUS_BLOCK()
+        status = self._nt_set_information_file()(
+            raw_handle,
+            ctypes.byref(io_status),
+            storage,
+            exact_length,
+            FILE_RENAME_INFORMATION_CLASS,
+        )
+        self.checked_ntstatus_zero("NtSetInformationFile", status)
+        self.checked_ntstatus_zero("NtSetInformationFile.IO_STATUS_BLOCK", io_status.Status)
+
+    def rename_file_to_parent_exclusive(
+        self,
+        raw_handle: int,
+        target_parent_raw_handle: int,
+        component: str,
+    ) -> None:
+        """Move an open file beneath one retained directory HANDLE, without replace."""
+
+        for label, value in (
+            ("raw_handle", raw_handle),
+            ("target_parent_raw_handle", target_parent_raw_handle),
+        ):
+            if type(value) is not int or value in {0, INVALID_HANDLE_VALUE}:
+                raise TypeError(f"{label} must be an exact live HANDLE value")
+        storage, exact_length = _build_file_rename_information(
+            component,
+            replace_if_exists=False,
+            root_directory=target_parent_raw_handle,
         )
         io_status = IO_STATUS_BLOCK()
         status = self._nt_set_information_file()(

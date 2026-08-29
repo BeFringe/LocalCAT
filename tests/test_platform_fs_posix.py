@@ -22,10 +22,12 @@ from platform_fs_contracts import (
     LockWait,
     MutableFileReservation,
     MutableFileReservationService,
+    OwnedNamespaceRetirement,
     OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
     PublishMode,
+    RetirementDirectoryAuthority,
 )
 
 
@@ -187,6 +189,45 @@ class PosixAdapterStaticBoundaryTests(unittest.TestCase):
         module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
         self.assertFalse(
             inspect.isabstract(module._PosixBoundSynchronizedRegularFile)
+        )
+
+    def test_owned_retirement_is_dirfd_bound_and_no_replace_only(self) -> None:
+        source = ADAPTER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        adapter = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "PosixPlatformAdapter"
+        )
+        self.assertIn(
+            "OwnedNamespaceRetirement",
+            {base.id for base in adapter.bases if isinstance(base, ast.Name)},
+        )
+        retirement = next(
+            node
+            for node in adapter.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_owned_exclusive"
+        )
+        retirement_source = ast.get_source_segment(source, retirement)
+        assert retirement_source is not None
+        for required in (
+            "_rename_owned_exclusive_at",
+            "_PosixRetainedRetirement",
+            "_accept_reservation_transfer",
+            "os.fsync(",
+        ):
+            self.assertIn(required, retirement_source)
+        self.assertNotIn("os.rename(", retirement_source)
+        self.assertNotIn("os.replace(", retirement_source)
+        self.assertIn('symbol = "renameatx_np"', source)
+        self.assertIn('symbol = "renameat2"', source)
+        module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
+        backend = module.PosixPlatformAdapter()
+        self.assertIsInstance(backend, OwnedNamespaceRetirement)
+        self.assertFalse(inspect.isabstract(module._PosixRetirementDirectory))
+        self.assertTrue(
+            issubclass(module._PosixRetirementDirectory, RetirementDirectoryAuthority)
         )
 
     def test_mutable_reservation_is_create_new_rooted_and_identity_bound(self) -> None:

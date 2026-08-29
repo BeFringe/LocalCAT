@@ -22,7 +22,7 @@
 ## Boundary Commitments
 
 ### This Spec Owns
-- `RootedFileSystem`、`MutableFileReservationService`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
+- `RootedFileSystem`、`MutableFileReservationService`、`OwnedNamespaceRetirement`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
 - Windows 11 native handle implementation、支持 volume capability gate、Win32 error normalization 和平台专属反例 harness。
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
@@ -223,6 +223,19 @@ class MutableFileReservation(Protocol):
 class MutableFileReservationService(Protocol):
     def reserve_mutable_file(self, parent: BoundDirectoryAuthority, name: str) -> MutableFileReservation: ...
 
+class RetirementDirectoryAuthority(Protocol):
+    def reprove(self) -> None: ...
+    def inspect_entry(self, name: str) -> EntrySnapshot | None: ...
+    def close(self) -> None: ...
+
+class RetainedRetirement(Protocol):
+    def reprove(self) -> EntrySnapshot: ...
+    def close(self) -> None: ...
+
+class OwnedNamespaceRetirement(Protocol):
+    def bind_or_create_child_directory(self, parent: BoundDirectoryAuthority | RetirementDirectoryAuthority, name: str) -> RetirementDirectoryAuthority: ...
+    def retire_owned_exclusive(self, source_parent: BoundDirectoryAuthority, source_name: str, reservation: MutableFileReservation, target_parent: RetirementDirectoryAuthority, target_name: str) -> RetainedRetirement: ...
+
 class ExistingFileDurability(Protocol):
     def open_existing_for_synchronization(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundSynchronizedRegularFile: ...
 
@@ -292,6 +305,9 @@ Task 3.1 的host probe只返回诊断性的`WindowsHostFacts`，不提前铸造�
 | SOURCE | generic read + read attributes | READ，**无 WRITE/DELETE** | OPEN_REPARSE_POINT + SEQUENTIAL_SCAN | sealed copy；阻止并发 overwrite/rename |
 | ENTRY_PROBE | read attributes/synchronize | READ + WRITE + DELETE | OPEN_REPARSE_POINT | 仅提供观察事实；commit 前关闭，不构成 CAS |
 | MUTABLE_RESERVATION | read attributes + synchronize，**无 DELETE/write** | READ + WRITE + DELETE | CREATE_NEW + OPEN_REPARSE_POINT | 保留创建identity与origin parent/name；允许SQLite/普通writer并存，swap后拒绝采纳，不负责publish/retirement |
+| RETIREMENT_TARGET | traverse + read attributes + synchronize | READ + WRITE + DELETE | BACKUP_SEMANTICS + OPEN_REPARSE_POINT | 仅专用target leaf；nested child mutation期间另持share-READ strict pin；不能作为publish/private parent |
+| RETIREMENT_MOVE | delete + read attributes + synchronize | READ + WRITE，**无 DELETE** | OPEN_REPARSE_POINT | 短生命周期no-clobber move；命名后立即关闭，reservation主handle继续固定creator |
+| RETAINED_READ | generic read + read attributes + synchronize | READ，**无 WRITE/DELETE** | OPEN_REPARSE_POINT + SEQUENTIAL_SCAN | target最终read-only reproof；与live reservation creator handle完成三方identity handoff |
 | CANDIDATE | read + write + delete + synchronize | none | CREATE_NEW + OPEN_REPARSE_POINT + WRITE_THROUGH | 写/flush/handle-relative rename 全程同一 handle |
 | LOCK | read + write + synchronize | READ + WRITE，**无 DELETE** | OPEN_REPARSE_POINT | persistent lock file + `LockFileEx` |
 
@@ -355,6 +371,14 @@ stateDiagram-v2
 - 协作进程受同一 lease 协议排除；不合作的同用户进程仍可能在 pre-snapshot 与 rename 前竞态。需要 stronger-than-lease 语义的 owner 必须使用 immutable generation + journal/pointer commit；任一 terminal reproof 不一致进入 `RECOVERY_REQUIRED`。
 - `WindowsDocumentedPublishV1` success requires local fixed NTFS、content `WRITE_THROUGH`/`FlushFileBuffers`、handle-relative rename、candidate close、retained readback、owner durable state-machine commit与terminal reproof。arm前任一必要能力缺失返回`DURABILITY_UNAVAILABLE`且零命名mutation；arm后任一失败或不确定返回`RECOVERY_REQUIRED`。
 - API ambiguous/failure states不由 platform adapter 擅自删除；adapter returns facts，现有 journal/LKG owner 分类 recovery。
+
+### Owned Namespace Retirement
+
+- `OwnedNamespaceRetirement`是独立于publish/private的窄能力：调用方先以`MutableFileReservation`的CREATE_NEW live handle证明文件所有权，再将同一对象原子、no-clobber地移入专用retirement namespace。目标目录由独立`RetirementDirectoryAuthority`表示，只公开`reprove/inspect_entry/close`；它不能创建candidate、publish、枚举ledger或铸造private proof。
+- `bind_or_create_child_directory`可逐层建立/绑定retirement目录。POSIX使用retained dirfd和`mkdirat/openat`，仅在真实创建后fsync exact parent并终端复证；Windows不宣称目录fsync。Windows只有目标叶HANDLE使用`FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`及share read/write/delete；root、普通ancestor与publish parent profile不放宽。若在专用目标叶下继续创建子目录，操作期间另持share-read strict directory HANDLE并核对同一FileId，阻止reprove与`CreateDirectoryW`之间父目录被rename/swap。
+- POSIX move仅使用Darwin `renameatx_np(RENAME_EXCL)`或Linux `renameat2(RENAME_NOREPLACE)`的两个retained dirfd；无普通rename/check-then-rename fallback。Windows仅使用`NtSetInformationFile(FileRenameInformation)` class 10，`RootDirectory`为retained target-leaf HANDLE、`FileName`为已验证单basename且`ReplaceIfExists=false`；不得使用NULL root、absolute path、`MoveFileEx`或replace模式代答。
+- Windows reservation主HANDLE在整个handoff保持live。DELETE handle只用于move并在命名后关闭；随后以最终read-only profile重开target，将target handle identity、reservation主handle的再次live capture与creator identity三方精确比较并要求single-link，再执行source absent/target exact/source absent+target exact/双parent terminal sandwich。成功时`RetainedRetirement`原子接管reservation的close ownership；失败时arm前reservation仍可用，arm后返回`RECOVERY_REQUIRED`并可凭同一live reservation在source/target两个位置幂等reconcile。
+- 该能力不持久化FileId、不接收裸historical identity授权、不产生business receipt、不替代`PublishMode/PendingPublication`，也不声明directory durability。创建后、move arm后或两位置不确定的operational失败均为`RECOVERY_REQUIRED`；`TypeError/AssertionError/AttributeError`等程序错误保持穿透。
 
 ### Lock Flow
 - persistent lock file 使用 W1 自有的 protocol-control integrity ACL profile、显式medium mandatory-integrity label/`NO_WRITE_UP`、deterministic basename、single-link与identity payload；文件从不unlink/replace。DACL与mandatory-label SACL projection分别handle-bound重验；audit ACE不参与discretionary或MIC授权，额外/漂移mandatory label fail closed。该profile只保护锁协议完整性，不铸造W2 attestation private proof，因此W1不反向依赖W2。
