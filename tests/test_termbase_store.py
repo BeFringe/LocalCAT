@@ -20,6 +20,8 @@ from editor_contracts import (
     TermMatchPolicy,
     TermRowKind,
 )
+from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+import termbase_store as termbase_module
 from termbase_store import TermbaseStore, TermbaseValidationError
 
 
@@ -241,20 +243,18 @@ class TermbaseStoreTests(unittest.TestCase):
         original = b"\xef\xbb\xbfLegacy,\xe6\x97\xa7\xe8\xaf\x91\r\n"
         self.path.write_bytes(original)
 
-        with patch("termbase_store.os.fsync") as fsync:
-            prepared = self.store.prepare_create(
-                self.path,
-                TermDraft(
-                    source="New source",
-                    target="新译",
-                    match_case=True,
-                    whole_word=False,
-                ),
-            )
+        prepared = self.store.prepare_create(
+            self.path,
+            TermDraft(
+                source="New source",
+                target="新译",
+                match_case=True,
+                whole_word=False,
+            ),
+        )
 
         self.assertEqual(prepared.action, "create")
         self.assert_prepared_artifacts(prepared, original)
-        self.assertEqual(fsync.call_count, 3)
         self.assertEqual(len(prepared.candidate_records), 2)
         created = prepared.candidate_records[-1]
         self.assertIs(created.locator.row_kind, TermRowKind.V1)
@@ -470,9 +470,19 @@ class TermbaseStoreTests(unittest.TestCase):
         original = b"Source,target\n"
         self.path.write_bytes(original)
 
+        real_publish = termbase_module._publish_bytes
+        publish_calls = 0
+
+        def fail_staged_publication(*args: object, **kwargs: object) -> object:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                raise OSError("injected stage publication failure")
+            return real_publish(*args, **kwargs)
+
         with patch(
-            "termbase_store.os.fsync",
-            side_effect=(None, None, OSError("injected"), None),
+            "termbase_store._publish_bytes",
+            side_effect=fail_staged_publication,
         ):
             with self.assertRaises(OSError):
                 self.store.prepare_create(
@@ -483,28 +493,22 @@ class TermbaseStoreTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(tuple(self.path.parent.iterdir()), (self.path,))
 
-    def test_prepare_accepts_relative_resource_path_without_leaking_artifacts(
+    def test_prepare_rejects_relative_resource_path_without_leaking_artifacts(
         self,
     ) -> None:
         original = b"Source,target\n"
         self.path.write_bytes(original)
         before_stat = self.source_stat(self.path)
-        relative_path = Path(os.path.relpath(self.path, Path.cwd()))
+        relative_path = Path("terms.csv")
 
-        prepared = self.store.prepare_create(
-            relative_path,
-            TermDraft("New", "value"),
-        )
+        with self.assertRaises(TypeError):
+            self.store.prepare_create(
+                relative_path,
+                TermDraft("New", "value"),
+            )
 
-        recovery_path = prepared.recovery_path
-        self.assertIsNotNone(recovery_path)
-        assert recovery_path is not None
-        self.assertTrue(prepared.resource_path.is_absolute())
-        self.assertTrue(prepared.staged_path.is_absolute())
-        self.assertTrue(recovery_path.is_absolute())
-        self.assertEqual(prepared.resource_path, self.path)
-        self.assert_prepared_artifacts(prepared, original)
         self.assertEqual(self.source_stat(self.path), before_stat)
+        self.assertEqual(tuple(self.path.parent.iterdir()), (self.path,))
 
     def test_prepare_contract_construction_failure_cleans_durable_artifacts(
         self,
@@ -614,14 +618,64 @@ class TermbaseStoreTests(unittest.TestCase):
         self.assertEqual(tuple(self.path.parent.iterdir()), (self.path,))
         self.assertEqual(self.path.read_bytes(), externally_changed)
 
+    def test_same_bytes_new_source_identity_is_not_committed(self) -> None:
+        original = b"Source,old\n"
+        self.path.write_bytes(original)
+        prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
+        replacement = self.path.with_name("replacement.csv")
+        replacement.write_bytes(original)
+        replacement.replace(self.path)
+
+        outcome = self.store.commit(prepared)
+
+        self.assertIs(outcome.state, TermCommitState.NOT_COMMITTED)
+        self.assertEqual(outcome.error_code, "SOURCE_CHANGED")
+        self.assertEqual(self.path.read_bytes(), original)
+        self.store.discard(prepared)
+
+    @unittest.skipUnless(os.name == "nt", "Windows retained-handle behavior")
+    def test_outcome_commit_precedes_pending_destination_terminal_close(self) -> None:
+        self.path.write_bytes(b"Source,old\n")
+        prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
+        replacement = self.path.with_name("replacement.csv")
+        owner_called = False
+        real_remember = self.store._remember_outcome
+
+        def observe_owner_commit(
+            issued: PreparedTermMutation,
+            outcome: TermCommitOutcome,
+        ) -> TermCommitOutcome:
+            nonlocal owner_called
+            if outcome.state is TermCommitState.COMMITTED:
+                owner_called = True
+                replacement.write_bytes(self.path.read_bytes())
+                with self.assertRaises(PermissionError):
+                    replacement.replace(self.path)
+            return real_remember(issued, outcome)
+
+        with patch.object(
+            self.store,
+            "_remember_outcome",
+            side_effect=observe_owner_commit,
+        ):
+            outcome = self.store.commit(prepared)
+
+        self.assertIs(outcome.state, TermCommitState.COMMITTED)
+        self.assertTrue(owner_called)
+        replacement.replace(self.path)
+        self.store.finalize(prepared, outcome)
+
     def test_replace_failure_is_not_committed_and_preserves_old_bytes(self) -> None:
         original = b"Source,old\n"
         self.path.write_bytes(original)
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
 
         with patch(
-            "termbase_store.os.replace",
-            side_effect=OSError("injected replace failure"),
+            "termbase_store._publish_bytes",
+            side_effect=PlatformFileError(
+                PlatformFileErrorCode.PUBLISH_FAILED,
+                retryable=True,
+            ),
         ):
             outcome = self.store.commit(prepared)
 
@@ -631,7 +685,7 @@ class TermbaseStoreTests(unittest.TestCase):
         self.assertTrue(prepared.staged_path.exists())
         self.assertTrue(self.recovery_path(prepared).exists())
 
-    def test_post_replace_directory_fsync_failure_rolls_back_old_bytes(
+    def test_unknown_platform_replace_state_is_indeterminate(
         self,
     ) -> None:
         original = b"Source,old\n"
@@ -639,63 +693,51 @@ class TermbaseStoreTests(unittest.TestCase):
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
 
         with patch(
-            "termbase_store._fsync_directory",
-            side_effect=(OSError("injected commit fsync failure"), None),
+            "termbase_store._publish_bytes",
+            side_effect=PlatformFileError(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            ),
         ):
             outcome = self.store.commit(prepared)
 
-        self.assertIs(outcome.state, TermCommitState.ROLLED_BACK)
-        self.assertEqual(outcome.error_code, "DIRECTORY_FSYNC_FAILED")
-        self.assertTrue(outcome.retryable)
+        self.assertIs(outcome.state, TermCommitState.INDETERMINATE)
+        self.assertEqual(outcome.error_code, "REPLACE_INDETERMINATE")
+        self.assertFalse(outcome.retryable)
         self.assertIsNone(outcome.report)
-        self.assertFalse(outcome.quarantined)
+        self.assertTrue(outcome.quarantined)
         self.assertEqual(self.path.read_bytes(), original)
         self.assertTrue(self.recovery_path(prepared).exists())
-        self.store.discard(prepared)
-        self.assertEqual(tuple(self.path.parent.iterdir()), (self.path,))
 
     def test_post_replace_programmer_faults_rollback_before_propagating(
         self,
     ) -> None:
-        cases = ("directory_fsync", "committed_digest")
-        for case in cases:
-            with self.subTest(case=case):
-                store = TermbaseStore()
-                path = self.path.parent / f"{case}.csv"
-                original = b"Source,old\n"
-                path.write_bytes(original)
-                prepared = store.prepare_create(
-                    path,
-                    TermDraft("New", "value"),
-                )
-                if case == "directory_fsync":
-                    injected = patch(
-                        "termbase_store._fsync_directory",
-                        side_effect=(
-                            TypeError("programmer fsync fault"),
-                            None,
-                        ),
-                    )
-                    message = "programmer fsync fault"
-                else:
-                    injected = patch(
-                        "termbase_store._digest_path",
-                        side_effect=(
-                            prepared.base_digest,
-                            TypeError("programmer digest fault"),
-                            prepared.base_digest,
-                        ),
-                    )
-                    message = "programmer digest fault"
+        store = TermbaseStore()
+        path = self.path.parent / "programmer-fault.csv"
+        original = b"Source,old\n"
+        path.write_bytes(original)
+        prepared = store.prepare_create(
+            path,
+            TermDraft("New", "value"),
+        )
+        with (
+            patch.object(
+                store,
+                "_digest_resource",
+                side_effect=(
+                    TypeError("programmer digest fault"),
+                    prepared.base_digest,
+                ),
+            ),
+            self.assertRaisesRegex(TypeError, "programmer digest fault"),
+        ):
+            store.commit(prepared)
 
-                with injected, self.assertRaisesRegex(TypeError, message):
-                    store.commit(prepared)
-
-                self.assertEqual(path.read_bytes(), original)
-                recovery = prepared.recovery_path
-                self.assertIsNotNone(recovery)
-                assert recovery is not None
-                self.assertTrue(recovery.exists())
+        self.assertEqual(path.read_bytes(), original)
+        recovery = prepared.recovery_path
+        self.assertIsNotNone(recovery)
+        assert recovery is not None
+        self.assertTrue(recovery.exists())
 
     def test_programmer_fault_stays_indeterminate_when_rollback_is_unproven(
         self,
@@ -706,25 +748,27 @@ class TermbaseStoreTests(unittest.TestCase):
             self.path,
             TermDraft("New", "value"),
         )
-        real_replace = os.replace
-        replace_calls = 0
+        real_publish = termbase_module._publish_bytes
+        publish_calls = 0
 
-        def fail_rollback_replace(source: Path, target: Path) -> None:
-            nonlocal replace_calls
-            replace_calls += 1
-            if replace_calls == 1:
-                real_replace(source, target)
-                return
+        def fail_rollback_publication(*args: object, **kwargs: object) -> object:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                return real_publish(*args, **kwargs)
             raise OSError("injected rollback failure")
 
         with (
-            patch(
-                "termbase_store._fsync_directory",
-                side_effect=(TypeError("programmer fsync fault"), None),
+            patch.object(
+                self.store,
+                "_digest_resource",
+                side_effect=(
+                    TypeError("programmer digest fault"),
+                ),
             ),
             patch(
-                "termbase_store.os.replace",
-                side_effect=fail_rollback_replace,
+                "termbase_store._publish_bytes",
+                side_effect=fail_rollback_publication,
             ),
         ):
             outcome = self.store.commit(prepared)
@@ -740,25 +784,25 @@ class TermbaseStoreTests(unittest.TestCase):
         original = b"Source,old\n"
         self.path.write_bytes(original)
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
-        real_replace = os.replace
-        replace_calls = 0
+        real_publish = termbase_module._publish_bytes
+        publish_calls = 0
 
-        def fail_rollback_replace(source: Path, target: Path) -> None:
-            nonlocal replace_calls
-            replace_calls += 1
-            if replace_calls == 1:
-                real_replace(source, target)
-                return
+        def fail_rollback_publication(*args: object, **kwargs: object) -> object:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                return real_publish(*args, **kwargs)
             raise OSError("injected rollback failure")
 
         with (
-            patch(
-                "termbase_store._fsync_directory",
-                side_effect=OSError("injected commit fsync failure"),
+            patch.object(
+                self.store,
+                "_digest_resource",
+                side_effect=("0" * 64,),
             ),
             patch(
-                "termbase_store.os.replace",
-                side_effect=fail_rollback_replace,
+                "termbase_store._publish_bytes",
+                side_effect=fail_rollback_publication,
             ),
         ):
             outcome = self.store.commit(prepared)
@@ -778,17 +822,33 @@ class TermbaseStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.finalize(prepared, outcome)
 
-    def test_rollback_directory_fsync_failure_is_indeterminate(self) -> None:
+    def test_rollback_platform_failure_is_indeterminate(self) -> None:
         original = b"Source,old\n"
         self.path.write_bytes(original)
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
 
-        with patch(
-            "termbase_store._fsync_directory",
-            side_effect=(
-                OSError("injected commit fsync failure"),
-                OSError("injected rollback fsync failure"),
-                None,
+        real_publish = termbase_module._publish_bytes
+        publish_calls = 0
+
+        def fail_rollback_publication(*args: object, **kwargs: object) -> object:
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                return real_publish(*args, **kwargs)
+            raise PlatformFileError(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=False,
+            )
+
+        with (
+            patch.object(
+                self.store,
+                "_digest_resource",
+                side_effect=("0" * 64,),
+            ),
+            patch(
+                "termbase_store._publish_bytes",
+                side_effect=fail_rollback_publication,
             ),
         ):
             outcome = self.store.commit(prepared)
@@ -806,13 +866,10 @@ class TermbaseStoreTests(unittest.TestCase):
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
 
         with (
-            patch(
-                "termbase_store._fsync_directory",
-                side_effect=(OSError("injected commit fsync failure"), None),
-            ),
-            patch(
-                "termbase_store._digest_path",
-                side_effect=(prepared.base_digest, "0" * 64),
+            patch.object(
+                self.store,
+                "_digest_resource",
+                side_effect=("0" * 64, "f" * 64),
             ),
         ):
             outcome = self.store.commit(prepared)
@@ -830,10 +887,10 @@ class TermbaseStoreTests(unittest.TestCase):
         self.path.write_bytes(original)
         prepared = self.store.prepare_create(self.path, TermDraft("New", "value"))
 
-        with patch(
-            "termbase_store._digest_path",
+        with patch.object(
+            self.store,
+            "_digest_resource",
             side_effect=(
-                prepared.base_digest,
                 "0" * 64,
                 prepared.base_digest,
             ),
@@ -887,10 +944,12 @@ class TermbaseStoreTests(unittest.TestCase):
         committed = self.store.commit(prepared)
         committed_bytes = self.path.read_bytes()
 
-        with patch.object(
-            Path,
-            "unlink",
-            side_effect=OSError("injected cleanup failure"),
+        with patch(
+            "termbase_store._unlink_exact",
+            side_effect=PlatformFileError(
+                PlatformFileErrorCode.PUBLISH_FAILED,
+                retryable=True,
+            ),
         ):
             cleanup = self.store.finalize(prepared, committed)
 
