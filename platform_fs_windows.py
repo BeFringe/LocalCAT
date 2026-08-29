@@ -2349,6 +2349,7 @@ class _WindowsLockLease(LockLease):
         "_records",
         "_handle",
         "_entry_path",
+        "_entry_name",
         "_identity",
         "_user_sid",
         "_payload",
@@ -2361,6 +2362,7 @@ class _WindowsLockLease(LockLease):
         records: tuple[_WindowsDirectoryRecord, ...],
         handle: object,
         entry_path: str,
+        entry_name: str,
         identity: FileObjectIdentity,
         user_sid: bytes,
         payload: bytes,
@@ -2371,6 +2373,7 @@ class _WindowsLockLease(LockLease):
         self._records = records
         self._handle = handle
         self._entry_path = entry_path
+        self._entry_name = entry_name
         self._identity = identity
         self._user_sid = user_sid
         self._payload = payload
@@ -2388,6 +2391,8 @@ class _WindowsLockLease(LockLease):
             _reprove_directory_chain(self._api, self._records)
             if proof.identity != self._identity or payload != self._payload:
                 raise _lock_unavailable()
+        except (TypeError, AssertionError):
+            raise
         except PlatformFileError:
             raise _lock_unavailable() from None
         except Exception:
@@ -2409,10 +2414,25 @@ class _WindowsLockLease(LockLease):
                 and left.identity == right.identity
                 for left, right in zip(self._records, records, strict=True)
             )
+        except (TypeError, AssertionError):
+            raise
         except PlatformFileError:
             raise _lock_unavailable() from None
         except Exception:
             raise _lock_unavailable() from None
+
+    def _reprove_binding(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
+            raise _lock_unavailable()
+        if name != self._entry_name or payload != self._payload:
+            raise _lock_unavailable()
+        if not self._matches_parent(parent._api, parent._records):
+            raise _lock_unavailable()
 
     def _close_authority(self) -> None:
         failed = False
@@ -2648,6 +2668,7 @@ class WindowsProcessFileLock(ProcessFileLock):
                 transferred_records,
                 transferred_handle,
                 entry_path,
+                name,
                 final_proof.identity,
                 user_sid,
                 payload,

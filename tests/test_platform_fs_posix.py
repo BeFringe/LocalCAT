@@ -19,6 +19,7 @@ from platform_fs_contracts import (
     LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
+    OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
     PublishMode,
@@ -257,6 +258,84 @@ class PosixAdapterStaticBoundaryTests(unittest.TestCase):
             [call.args[0] for call in close_fd.call_args_list],
             [101, 202, 201],
         )
+
+    def test_lock_binding_reproof_uses_retained_chain_name_and_payload(self) -> None:
+        module = self._load_with_fake_fcntl(lambda descriptor, operation: None)
+
+        def parent(
+            fds: tuple[int, ...],
+            names: tuple[str | None, ...],
+            identities: tuple[object, ...],
+        ):
+            result = object.__new__(module._PosixBoundDirectory)
+            OpaqueAuthority.__init__(result)
+            result._directory_fds = fds
+            result._directory_names = names
+            result._directory_identities = identities
+            result._fault_injector = None
+            return result
+
+        expected_parent = parent((201, 202), (None, "child"), (object(), object()))
+        other_parent = parent((301,), (None,), (object(),))
+        lease = module._PosixLockLease(
+            101,
+            (401, 402),
+            (None, "child"),
+            (object(), object()),
+            "resource.lock",
+            object(),
+            b"payload",
+        )
+
+        with mock.patch.object(
+            module._PosixLockLease,
+            "_matches_parent",
+            return_value=True,
+        ) as matches:
+            self.assertIsNone(
+                lease.reprove_binding(expected_parent, "resource.lock", b"payload")
+            )
+        matches.assert_called_once_with(
+            expected_parent._directory_fds,
+            expected_parent._directory_names,
+            expected_parent._directory_identities,
+        )
+
+        for name, payload in (
+            ("other.lock", b"payload"),
+            ("resource.lock", b"other"),
+        ):
+            with self.subTest(name=name, payload=payload), self.assertRaises(
+                PlatformFileError
+            ) as caught:
+                lease.reprove_binding(expected_parent, name, payload)
+            self.assertEqual(
+                caught.exception.code,
+                PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+            )
+
+        with mock.patch.object(
+            module._PosixLockLease,
+            "_matches_parent",
+            return_value=False,
+        ), self.assertRaises(PlatformFileError) as caught_parent:
+            lease.reprove_binding(other_parent, "resource.lock", b"payload")
+        self.assertEqual(
+            caught_parent.exception.code,
+            PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+        )
+
+        for programming_error in (TypeError("type"), AssertionError("assert")):
+            with self.subTest(programming_error=type(programming_error).__name__), mock.patch.object(
+                module._PosixLockLease,
+                "_matches_parent",
+                side_effect=programming_error,
+            ), self.assertRaises(type(programming_error)):
+                lease.reprove_binding(
+                    expected_parent,
+                    "resource.lock",
+                    b"payload",
+                )
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX runtime evidence requires macOS or Linux")

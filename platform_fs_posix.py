@@ -1474,6 +1474,37 @@ class _PosixLockLease(LockLease):
             )
         )
 
+    def _reprove_binding(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        try:
+            if type(parent) not in {_PosixRootedDirectory, _PosixBoundDirectory}:
+                raise _platform_error(
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                    retryable=False,
+                )
+            if name != self._entry_name or payload != self._payload:
+                raise _platform_error(
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                    retryable=False,
+                )
+            if not self._matches_parent(
+                parent._directory_fds,
+                parent._directory_names,
+                parent._directory_identities,
+            ):
+                raise _platform_error(
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                    retryable=False,
+                )
+        except (TypeError, AssertionError):
+            raise
+        except PlatformFileError as error:
+            raise _normalize_lock_platform_error(error) from None
+
     def _close_authority(self) -> None:
         unlock_error: PlatformFileError | None = None
         try:
