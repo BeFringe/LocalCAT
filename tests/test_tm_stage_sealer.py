@@ -16,6 +16,11 @@ from unittest.mock import patch
 import tm_contracts as contract_module
 import tm_sqlite_store
 import tm_stage_sealer
+from platform_fs import compose_platform_file_backend
+from tm_content_attestation import (
+    PortableSealedContentAttestation,
+    _portable_sealed_content_attestation_to_mapping,
+)
 from tm_contracts import (
     SNAPSHOT_MANIFEST_VERSION,
     ActivationCapabilityState,
@@ -189,6 +194,253 @@ class _FakeRegistry:
 
 
 class StageSealerHappyPathTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_post_marker_failure_is_unregistered_fail_stop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, stage = _build_stage(root, fts5_available=True)
+            backend = compose_platform_file_backend(root)
+            sealer = StageSealer(
+                registry=SealedArtifactRegistry(
+                    registry_namespace="coordinator.portable-failure"
+                ),
+                canonical_store_id="store.primary",
+                platform=cast(Any, backend),
+            )
+            with (
+                patch(
+                    "tm_stage_sealer._open_portable_stage_live_authority",
+                    side_effect=StageSealError(
+                        "SEALER.ATTESTATION_UNAVAILABLE"
+                    ),
+                ),
+                patch(
+                    "tm_stage_sealer._restore_stage_unpublished"
+                ) as restore,
+                patch(
+                    "tm_sqlite_store._probe_fts5",
+                    return_value=True,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    StageSealError,
+                    "^SEALER.ATTESTATION_UNAVAILABLE$",
+                ):
+                    sealer.seal(stage)
+            restore.assert_not_called()
+            registry = _registry(sealer)
+            self.assertEqual(registry._entries, {})
+            self.assertEqual(registry._reservations, {})
+            connection = sqlite3.connect(str(stage.staged_db_path))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM tm_meta "
+                        "WHERE key = 'activation_status'"
+                    ).fetchall(),
+                    [("SEALED",)],
+                )
+            finally:
+                connection.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_source_hardlink_is_rejected_without_authority_residue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, stage = _build_stage(root, fts5_available=True)
+            alias = (root / "source-hardlink.jsonl").resolve()
+            os.link(identity.configured_jsonl_path, alias)
+            registry = SealedArtifactRegistry(
+                registry_namespace="coordinator.portable-hardlink"
+            )
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+                platform=cast(
+                    Any,
+                    compose_platform_file_backend(root),
+                ),
+            )
+            with (
+                patch(
+                    "tm_stage_sealer._restore_stage_unpublished"
+                ) as restore,
+                patch(
+                    "tm_sqlite_store._probe_fts5",
+                    return_value=True,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    StageSealError,
+                    "^SEALER.ATTESTATION_INVALID$",
+                ):
+                    sealer.seal(stage)
+            restore.assert_not_called()
+            self.assertEqual(registry._entries, {})
+            self.assertEqual(registry._reservations, {})
+            self.assertEqual(registry._portable_borrows, {})
+            connection = sqlite3.connect(str(stage.staged_db_path))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM tm_meta "
+                        "WHERE key = 'activation_status'"
+                    ).fetchall(),
+                    [("SEALED",)],
+                )
+            finally:
+                connection.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_commit_fault_after_take_closes_and_rolls_back_registry(
+        self,
+    ) -> None:
+        class _FailingSetDict(dict[tuple[str, str], str]):
+            def __setitem__(self, key: tuple[str, str], value: str) -> None:
+                del key, value
+                raise RuntimeError("registry placement fault")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, stage = _build_stage(root, fts5_available=True)
+            registry = SealedArtifactRegistry(
+                registry_namespace="coordinator.portable-commit-fault"
+            )
+            registry._sealed_paths = _FailingSetDict()
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+                platform=cast(
+                    Any,
+                    compose_platform_file_backend(root),
+                ),
+            )
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=True,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^registry placement fault$",
+                ):
+                    sealer.seal(stage)
+            self.assertEqual(registry._entries, {})
+            self.assertEqual(registry._reservations, {})
+            self.assertEqual(registry._sealed_paths, {})
+            self.assertEqual(registry._used_verified_commit_nonces, set())
+
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_platform_route_retains_authority_until_consume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, stage = _build_stage(root, fts5_available=True)
+            backend = compose_platform_file_backend(root)
+            sealer = StageSealer(
+                registry=SealedArtifactRegistry(
+                    registry_namespace="coordinator.portable"
+                ),
+                canonical_store_id="store.primary",
+                platform=cast(Any, backend),
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            registry = _registry(sealer)
+            entry = registry._entries[sealed.artifact.artifact_id]
+            self.assertIs(type(entry), tm_stage_sealer._PortableRegistryEntry)
+            portable = cast(
+                tm_stage_sealer._PortableRegistryEntry,
+                entry,
+            )
+            self.assertIs(
+                type(portable.sealed_content_attestation),
+                PortableSealedContentAttestation,
+            )
+            mapping = _portable_sealed_content_attestation_to_mapping(
+                portable.sealed_content_attestation
+            )
+            for name in ("database", "manifest", "source"):
+                self.assertEqual(set(cast(dict[str, object], mapping[name])), {
+                    "sha256",
+                    "size",
+                })
+            live_authority = portable.live_authority
+            self.assertIsNotNone(live_authority)
+            assert live_authority is not None
+            self.assertFalse(live_authority.closed)
+            token = registry.issue_token(
+                sealed,
+                current_generation=None,
+            )
+            registry.consume(token)
+            self.assertTrue(live_authority.closed)
+            self.assertIs(
+                registry.state(sealed),
+                ActivationCapabilityState.CONSUMED,
+            )
+            self.assertTrue(registry.contains(sealed))
+
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_close_failure_keeps_terminal_registry_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, stage = _build_stage(root, fts5_available=True)
+            sealer = StageSealer(
+                registry=SealedArtifactRegistry(
+                    registry_namespace="coordinator.portable-close"
+                ),
+                canonical_store_id="store.primary",
+                platform=cast(
+                    Any,
+                    compose_platform_file_backend(root),
+                ),
+            )
+            sealed = _seal(sealer, stage, fts5_available=True)
+            registry = _registry(sealer)
+            entry = cast(
+                tm_stage_sealer._PortableRegistryEntry,
+                registry._entries[sealed.artifact.artifact_id],
+            )
+            live_authority = entry.live_authority
+            assert live_authority is not None
+            token = registry.issue_token(sealed, current_generation=None)
+            real_close = type(live_authority)._close_authority
+
+            def close_then_fail(
+                authority: tm_stage_sealer._PortableStageLiveAuthority,
+            ) -> None:
+                real_close(authority)
+                raise RuntimeError("close fault")
+
+            with patch.object(
+                type(live_authority),
+                "_close_authority",
+                close_then_fail,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "^close fault$"):
+                    registry.cancel(token)
+            self.assertTrue(live_authority.closed)
+            self.assertIs(
+                registry.state(sealed),
+                ActivationCapabilityState.CANCELLED,
+            )
+            terminal = cast(
+                tm_stage_sealer._PortableRegistryEntry,
+                registry._entries[sealed.artifact.artifact_id],
+            )
+            self.assertIsNone(terminal.live_authority)
+            with self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.TOKEN_NOT_ACTIVE$",
+            ):
+                registry.cancel(token)
+
     def test_projection_digest_uses_bounded_multichunk_readback(
         self,
     ) -> None:

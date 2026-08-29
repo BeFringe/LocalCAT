@@ -6,21 +6,36 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import sqlite3
 import stat
 import threading
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, runtime_checkable
 import uuid
 
 import tm_contracts as contract_module
+from platform_fs_contracts import (
+    BoundContentFacts,
+    BoundRegularFile,
+    BoundSynchronizedRegularFile,
+    ExistingFileDurability,
+    OpaqueAuthority,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    RootedDirectoryAuthority,
+    RootedFileSystem,
+)
 from tm_content_attestation import (
     ContentAttestationError,
     ContentFileProof,
     ContentSemanticFacts,
     LOGICAL_CLOSURE_VERSION,
+    PortableContentFileProof,
+    PortableSealedContentAttestation,
     SealedContentAttestation,
+    SealedContentAttestationRecord,
     _capture_content_file,
+    _create_portable_sealed_content_attestation,
     _create_sealed_content_attestation,
     _revalidate_content_file,
 )
@@ -74,6 +89,346 @@ class StageSealError(RuntimeError):
             raise TypeError("error_code must be a built-in string")
         self.error_code = error_code
         super().__init__(error_code)
+
+
+@runtime_checkable
+class _StageSealerPlatform(
+    RootedFileSystem,
+    ExistingFileDurability,
+    Protocol,
+):
+    """Owner-local platform surface for retained stage-file authority."""
+
+
+def _portable_stage_error(error: PlatformFileError) -> StageSealError:
+    if error.code == PlatformFileErrorCode.IDENTITY_STALE.value:
+        return StageSealError("SEALER.ARTIFACT_MUTATED")
+    if error.code in {
+        PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+        PlatformFileErrorCode.REPARSE_REJECTED.value,
+    }:
+        return StageSealError("SEALER.ATTESTATION_INVALID")
+    return StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+
+
+def _portable_proof(facts: BoundContentFacts) -> PortableContentFileProof:
+    if type(facts) is not BoundContentFacts:
+        raise TypeError("content facts must be exact BoundContentFacts")
+    return PortableContentFileProof(
+        size=facts.snapshot.byte_count,
+        sha256=facts.content_sha256.hex(),
+    )
+
+
+class _PortableStageLiveAuthority(OpaqueAuthority):
+    """Registry-owned live roots and files behind one portable attestation."""
+
+    __slots__ = (
+        "__database_root",
+        "__database_name",
+        "__database",
+        "__database_facts",
+        "__manifest_root",
+        "__manifest_name",
+        "__manifest",
+        "__manifest_facts",
+        "__source_root",
+        "__source_name",
+        "__source",
+        "__source_facts",
+    )
+
+    def __init__(
+        self,
+        *,
+        database_root: RootedDirectoryAuthority,
+        database_name: str,
+        database: BoundSynchronizedRegularFile,
+        database_facts: BoundContentFacts,
+        manifest_root: RootedDirectoryAuthority,
+        manifest_name: str,
+        manifest: BoundSynchronizedRegularFile,
+        manifest_facts: BoundContentFacts,
+        source_root: RootedDirectoryAuthority,
+        source_name: str,
+        source: BoundRegularFile,
+        source_facts: BoundContentFacts,
+    ) -> None:
+        super().__init__()
+        if not isinstance(database_root, RootedDirectoryAuthority):
+            raise TypeError("database_root must be rooted authority")
+        if not isinstance(database, BoundSynchronizedRegularFile):
+            raise TypeError("database must be synchronized regular authority")
+        if not isinstance(manifest_root, RootedDirectoryAuthority):
+            raise TypeError("manifest_root must be rooted authority")
+        if not isinstance(manifest, BoundSynchronizedRegularFile):
+            raise TypeError("manifest must be synchronized regular authority")
+        if not isinstance(source_root, RootedDirectoryAuthority):
+            raise TypeError("source_root must be rooted authority")
+        if not isinstance(source, BoundRegularFile):
+            raise TypeError("source must be regular authority")
+        for facts in (database_facts, manifest_facts, source_facts):
+            if type(facts) is not BoundContentFacts:
+                raise TypeError("content facts must be exact BoundContentFacts")
+            if facts.snapshot.identity.link_count != 1:
+                raise StageSealError("SEALER.ATTESTATION_INVALID")
+        for name in (database_name, manifest_name, source_name):
+            if type(name) is not str or not name:
+                raise TypeError("entry name must be a non-empty exact string")
+        self.__database_root = database_root
+        self.__database_name = database_name
+        self.__database = database
+        self.__database_facts = database_facts
+        self.__manifest_root = manifest_root
+        self.__manifest_name = manifest_name
+        self.__manifest = manifest
+        self.__manifest_facts = manifest_facts
+        self.__source_root = source_root
+        self.__source_name = source_name
+        self.__source = source
+        self.__source_facts = source_facts
+
+    def persisted_proofs(
+        self,
+    ) -> tuple[
+        PortableContentFileProof,
+        PortableContentFileProof,
+        PortableContentFileProof,
+    ]:
+        self._require_open()
+        return (
+            _portable_proof(self.__database_facts),
+            _portable_proof(self.__manifest_facts),
+            _portable_proof(self.__source_facts),
+        )
+
+    def manifest_bytes(self) -> bytes:
+        self._require_open()
+        try:
+            payload = self.__manifest.read_all()
+        except PlatformFileError as error:
+            raise _portable_stage_error(error) from None
+        if hashlib.sha256(payload).digest() != self.__manifest_facts.content_sha256:
+            raise StageSealError("SEALER.ARTIFACT_MUTATED")
+        return payload
+
+    def reprove(self) -> None:
+        try:
+            self._require_open()
+            for root in (
+                self.__database_root,
+                self.__manifest_root,
+                self.__source_root,
+            ):
+                root.reprove()
+            observed = (
+                self.__database.content_facts(),
+                self.__manifest.content_facts(),
+                self.__source.content_facts(),
+            )
+            entries = (
+                self.__database_root.inspect_entry(self.__database_name),
+                self.__manifest_root.inspect_entry(self.__manifest_name),
+                self.__source_root.inspect_entry(self.__source_name),
+            )
+        except PlatformFileError as error:
+            raise _portable_stage_error(error) from None
+        if observed != (
+            self.__database_facts,
+            self.__manifest_facts,
+            self.__source_facts,
+        ):
+            raise StageSealError("SEALER.ARTIFACT_MUTATED")
+        if entries != tuple(facts.snapshot for facts in observed):
+            raise StageSealError("SEALER.ARTIFACT_MUTATED")
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        for authority in (
+            self.__source,
+            self.__source_root,
+            self.__manifest,
+            self.__manifest_root,
+            self.__database,
+            self.__database_root,
+        ):
+            try:
+                authority.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+
+class _PortableAuthorityTransfer(OpaqueAuthority):
+    """Single-take owner envelope used only across the registry commit call."""
+
+    __slots__ = ("__live",)
+
+    def __init__(self, live: _PortableStageLiveAuthority) -> None:
+        super().__init__()
+        if type(live) is not _PortableStageLiveAuthority:
+            raise TypeError("portable live authority must be exact")
+        live._require_open()
+        self.__live: _PortableStageLiveAuthority | None = live
+
+    def reprove_owned(self) -> None:
+        self._require_open()
+        live = self.__live
+        if live is None:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        live.reprove()
+
+    def persisted_proofs(
+        self,
+    ) -> tuple[
+        PortableContentFileProof,
+        PortableContentFileProof,
+        PortableContentFileProof,
+    ]:
+        self._require_open()
+        live = self.__live
+        if live is None:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        return live.persisted_proofs()
+
+    def take(self) -> _PortableStageLiveAuthority:
+        self._require_open()
+        live = self.__live
+        if live is None:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        self.__live = None
+        return live
+
+    def _close_authority(self) -> None:
+        live = self.__live
+        self.__live = None
+        if live is not None:
+            live.close()
+
+
+_PORTABLE_AUTHORITY_BORROW_FACTORY_KEY = object()
+
+
+class _PortableAuthorityBorrow:
+    """Registry-minted reproof-only façade; it cannot close the owner."""
+
+    __slots__ = ("__registry", "__artifact_id", "__nonce")
+
+    def __init__(
+        self,
+        registry: _SealedArtifactRegistry,
+        artifact_id: str,
+        nonce: str,
+        *,
+        _factory_key: object,
+    ) -> None:
+        if _factory_key is not _PORTABLE_AUTHORITY_BORROW_FACTORY_KEY:
+            raise TypeError("portable authority borrow is private")
+        if type(registry) is not _SealedArtifactRegistry:
+            raise TypeError("portable borrow registry must be exact")
+        if type(artifact_id) is not str or not artifact_id:
+            raise TypeError("portable borrow artifact id is invalid")
+        if type(nonce) is not str or not nonce.startswith(
+            "portable-borrow."
+        ):
+            raise TypeError("portable borrow nonce is invalid")
+        self.__registry = registry
+        self.__artifact_id = artifact_id
+        self.__nonce = nonce
+
+    def reprove(self) -> None:
+        self.__registry._reprove_portable_borrow(self)
+
+    def _release(self) -> None:
+        self.__registry._release_portable_borrow(self)
+
+    def __reduce__(self) -> object:
+        raise TypeError("portable authority borrow is non-serializable")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("portable authority borrow is non-serializable")
+
+
+def _close_portable_stage_authorities(
+    authorities: list[OpaqueAuthority],
+) -> None:
+    first_error: BaseException | None = None
+    for authority in reversed(authorities):
+        try:
+            authority.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _open_portable_stage_live_authority(
+    platform: _StageSealerPlatform,
+    stage: MutableStageRef,
+) -> _PortableStageLiveAuthority:
+    opened: list[OpaqueAuthority] = []
+    try:
+        database_root = platform.bind_root(stage.staged_db_path.parent)
+        opened.append(database_root)
+        database = platform.open_existing_for_synchronization(
+            database_root,
+            PurePath(stage.staged_db_path.name),
+        )
+        opened.append(database)
+        manifest_root = platform.bind_root(stage.manifest_temp_path.parent)
+        opened.append(manifest_root)
+        manifest = platform.open_existing_for_synchronization(
+            manifest_root,
+            PurePath(stage.manifest_temp_path.name),
+        )
+        opened.append(manifest)
+        source_path = stage.resource_identity.configured_jsonl_path
+        source_root = platform.bind_root(source_path.parent)
+        opened.append(source_root)
+        source = platform.open_regular(
+            source_root,
+            PurePath(source_path.name),
+        )
+        opened.append(source)
+
+        database_facts = database.content_facts()
+        manifest_facts = manifest.content_facts()
+        source_facts = source.content_facts()
+        database_facts = database.synchronize_content(database_facts)
+        manifest_facts = manifest.synchronize_content(manifest_facts)
+        live = _PortableStageLiveAuthority(
+            database_root=database_root,
+            database_name=stage.staged_db_path.name,
+            database=database,
+            database_facts=database_facts,
+            manifest_root=manifest_root,
+            manifest_name=stage.manifest_temp_path.name,
+            manifest=manifest,
+            manifest_facts=manifest_facts,
+            source_root=source_root,
+            source_name=source_path.name,
+            source=source,
+            source_facts=source_facts,
+        )
+        live.reprove()
+        opened.clear()
+        return live
+    except PlatformFileError as error:
+        try:
+            _close_portable_stage_authorities(opened)
+        except BaseException:
+            pass
+        raise _portable_stage_error(error) from None
+    except BaseException:
+        try:
+            _close_portable_stage_authorities(opened)
+        except BaseException:
+            pass
+        raise
 
 
 @dataclass(frozen=True)
@@ -130,6 +485,26 @@ class _RegistryReservation:
             str(self.mutable.staged_db_path),
             str(self.mutable.manifest_temp_path),
         )
+
+
+@dataclass(frozen=True)
+class _PortableRegistryReservation:
+    """Path-key reservation whose identity authority arrives by live handle."""
+
+    reservation_id: str
+    mutable: MutableStageRef
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (
+            str(self.mutable.staged_db_path),
+            str(self.mutable.manifest_temp_path),
+        )
+
+
+type _RegistryReservationRecord = (
+    _RegistryReservation | _PortableRegistryReservation
+)
 
 
 _VERIFIED_SEAL_COMMIT_FACTORY_KEY = object()
@@ -208,6 +583,92 @@ def _create_verified_seal_commit_capability(
     return capability
 
 
+_PORTABLE_VERIFIED_SEAL_COMMIT_FACTORY_KEY = object()
+
+
+@dataclass(frozen=True, init=False)
+class _PortableVerifiedSealCommitCapability:
+    """Single-use portable commit carrying the retained live authority."""
+
+    registry_namespace: str
+    registry_authority: object
+    reservation: _PortableRegistryReservation
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
+    attestation: PortableSealedContentAttestation
+    authority_transfer: _PortableAuthorityTransfer
+    nonce: str
+    _factory_key: object
+
+    def __post_init__(self) -> None:
+        if self._factory_key is not _PORTABLE_VERIFIED_SEAL_COMMIT_FACTORY_KEY:
+            raise TypeError("portable verified seal capability is private")
+        if type(self.registry_namespace) is not str:
+            raise TypeError("registry namespace must be a built-in string")
+        if not self.registry_namespace.strip():
+            raise ValueError("registry namespace must not be empty")
+        if type(self.registry_authority) is not object:
+            raise TypeError("registry authority must be exact")
+        if type(self.reservation) is not _PortableRegistryReservation:
+            raise TypeError("portable reservation must be exact")
+        if type(self.evidence) is not StageValidationEvidence:
+            raise TypeError("evidence must be exact")
+        if type(self.generation) is not GenerationExpectation:
+            raise TypeError("generation must be exact")
+        if type(self.attestation) is not PortableSealedContentAttestation:
+            raise TypeError("portable attestation must be exact")
+        if type(self.authority_transfer) is not _PortableAuthorityTransfer:
+            raise TypeError("portable authority transfer must be exact")
+        self.authority_transfer._require_open()
+        if type(self.nonce) is not str or not self.nonce.startswith(
+            "portable-verified-seal."
+        ):
+            raise ValueError("portable verified seal nonce is invalid")
+
+
+def _create_portable_verified_seal_commit_capability(
+    registry: _SealedArtifactRegistry,
+    reservation: _PortableRegistryReservation,
+    evidence: StageValidationEvidence,
+    generation: GenerationExpectation,
+    attestation: PortableSealedContentAttestation,
+    authority_transfer: _PortableAuthorityTransfer,
+) -> _PortableVerifiedSealCommitCapability:
+    if type(registry) is not _SealedArtifactRegistry:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    if type(reservation) is not _PortableRegistryReservation:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    if type(attestation) is not PortableSealedContentAttestation:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    if type(authority_transfer) is not _PortableAuthorityTransfer:
+        raise StageSealError("SEALER.TYPE_INVALID")
+    try:
+        claim = _snapshot_evidence(evidence)
+        expected_generation = _snapshot_generation(generation)
+    except (TypeError, ValueError) as error:
+        raise StageSealError("SEALER.TYPE_INVALID") from error
+    capability = object.__new__(_PortableVerifiedSealCommitCapability)
+    object.__setattr__(capability, "registry_namespace", registry.registry_namespace)
+    object.__setattr__(capability, "registry_authority", registry._commit_authority)
+    object.__setattr__(capability, "reservation", reservation)
+    object.__setattr__(capability, "evidence", claim)
+    object.__setattr__(capability, "generation", expected_generation)
+    object.__setattr__(capability, "attestation", attestation)
+    object.__setattr__(capability, "authority_transfer", authority_transfer)
+    object.__setattr__(
+        capability,
+        "nonce",
+        f"portable-verified-seal.{uuid.uuid4().hex}",
+    )
+    object.__setattr__(
+        capability,
+        "_factory_key",
+        _PORTABLE_VERIFIED_SEAL_COMMIT_FACTORY_KEY,
+    )
+    capability.__post_init__()
+    return capability
+
+
 @dataclass(frozen=True)
 class _RegistryEntry:
     mutable: MutableStageRef
@@ -217,6 +678,19 @@ class _RegistryEntry:
     manifest_identity: _ArtifactFileIdentity
     sealed_content_attestation: SealedContentAttestation
     token: contract_module._ActivationToken | None = None
+
+
+@dataclass(frozen=True)
+class _PortableRegistryEntry:
+    mutable: MutableStageRef
+    stage: SealedStage
+    state: ActivationCapabilityState
+    sealed_content_attestation: PortableSealedContentAttestation
+    live_authority: _PortableStageLiveAuthority | None
+    token: contract_module._ActivationToken | None = None
+
+
+type _RegistryEntryRecord = _RegistryEntry | _PortableRegistryEntry
 
 
 @dataclass(frozen=True)
@@ -238,6 +712,31 @@ class _PhysicalReadinessSnapshot:
     database_identity: _ArtifactFileIdentity
     manifest_identity: _ArtifactFileIdentity
     sealed_content_attestation: SealedContentAttestation
+
+
+@dataclass(frozen=True)
+class _PortablePhysicalReadinessSnapshot:
+    """Portable readiness borrows, but never owns, the registry live bundle."""
+
+    registry_namespace: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    snapshot_receipt_digest: str
+    expected_prior_generation: int | None
+    mutable_stage: MutableStageRef
+    evidence: StageValidationEvidence
+    generation: GenerationExpectation
+    sealed_content_attestation: PortableSealedContentAttestation
+    live_reproof: _PortableAuthorityBorrow
+
+
+type _PhysicalReadinessRecord = (
+    _PhysicalReadinessSnapshot | _PortablePhysicalReadinessSnapshot
+)
 
 
 def _content_semantic_facts(facts: _StageFacts) -> ContentSemanticFacts:
@@ -334,6 +833,31 @@ def _build_sealed_content_attestation(
         )
     except ContentAttestationError as error:
         raise StageSealError("SEALER.ATTESTATION_FAILED") from error
+
+
+def _build_portable_sealed_content_attestation(
+    facts: _StageFacts,
+    evidence: StageValidationEvidence,
+    generation: GenerationExpectation,
+    live_authority: _PortableStageLiveAuthority,
+) -> PortableSealedContentAttestation:
+    if type(live_authority) is not _PortableStageLiveAuthority:
+        raise TypeError("portable live authority must be exact")
+    database, manifest, source = live_authority.persisted_proofs()
+    return _create_portable_sealed_content_attestation(
+        resource_id=facts.resource_id,
+        target_identity=facts.target_identity,
+        canonical_store_id=facts.receipt.canonical_store_id,
+        snapshot_receipt_digest=evidence.snapshot_receipt_digest,
+        expected_prior_generation=generation.expected_prior_generation,
+        evidence_digest=contract_module.stage_validation_evidence_digest(
+            evidence
+        ),
+        database=database,
+        manifest=manifest,
+        source=source,
+        semantic_facts=_content_semantic_facts(facts),
+    )
 
 
 def _snapshot_str(value: object, field_name: str) -> str:
@@ -2001,6 +2525,41 @@ def _file_sha256(
         os.close(descriptor)
 
 
+def _decode_verified_manifest(
+    payload: bytes,
+    receipt: SnapshotReceipt,
+    *,
+    upgrade_manifest: bool = False,
+) -> tuple[str, SnapshotManifest]:
+    if type(payload) is not bytes:
+        raise TypeError("manifest payload must be exact bytes")
+    try:
+        decoded = contract_from_json(payload.decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError) as error:
+        raise StageSealError("SEALER.MANIFEST_INVALID") from error
+    if type(decoded) is not SnapshotManifest:
+        raise StageSealError("SEALER.MANIFEST_INVALID")
+    manifest = decoded
+    if (
+        manifest.manifest_version != SNAPSHOT_MANIFEST_VERSION
+        or type(manifest.snapshot_kind) is not SnapshotKind
+        or manifest.receipt != receipt
+        or manifest.receipt_digest
+        != snapshot_receipt_digest(manifest.receipt)
+    ):
+        raise StageSealError("SEALER.MANIFEST_MISMATCH")
+    if not upgrade_manifest and manifest.snapshot_kind is not (
+        SnapshotKind.MIGRATION_SOURCE
+    ):
+        raise StageSealError("SEALER.MANIFEST_MISMATCH")
+    if upgrade_manifest and manifest.snapshot_kind not in {
+        SnapshotKind.MIGRATION_SOURCE,
+        SnapshotKind.EXPLICIT_EXPORT,
+    }:
+        raise StageSealError("SEALER.MANIFEST_MISMATCH")
+    return hashlib.sha256(payload).hexdigest(), manifest
+
+
 def _verify_manifest_at_digest(
     path: Path,
     expected: _ArtifactFileIdentity,
@@ -2035,34 +2594,14 @@ def _verify_manifest_at_digest(
         raise StageSealError("SEALER.DIGEST_UNREADABLE") from error
     finally:
         os.close(descriptor)
-    try:
-        decoded = contract_from_json(payload.decode("utf-8"))
-    except (UnicodeDecodeError, TypeError, ValueError) as error:
-        raise StageSealError("SEALER.MANIFEST_INVALID") from error
-    if type(decoded) is not SnapshotManifest:
-        raise StageSealError("SEALER.MANIFEST_INVALID")
-    manifest = decoded
-    if (
-        manifest.manifest_version != SNAPSHOT_MANIFEST_VERSION
-        or type(manifest.snapshot_kind) is not SnapshotKind
-        or manifest.receipt != receipt
-        or manifest.receipt_digest
-        != snapshot_receipt_digest(manifest.receipt)
-    ):
-        raise StageSealError("SEALER.MANIFEST_MISMATCH")
-    if not upgrade_manifest and manifest.snapshot_kind is not (
-        SnapshotKind.MIGRATION_SOURCE
-    ):
-        raise StageSealError("SEALER.MANIFEST_MISMATCH")
-    if upgrade_manifest and manifest.snapshot_kind not in {
-        SnapshotKind.MIGRATION_SOURCE,
-        SnapshotKind.EXPLICIT_EXPORT,
-    }:
-        raise StageSealError("SEALER.MANIFEST_MISMATCH")
-    return hashlib.sha256(bytes(payload)).hexdigest(), manifest
+    return _decode_verified_manifest(
+        bytes(payload),
+        receipt,
+        upgrade_manifest=upgrade_manifest,
+    )
 
 
-def _verify_sealed_stage(
+def _verify_sealed_stage_semantics(
     stage: MutableStageRef,
     *,
     record_count: int,
@@ -2070,17 +2609,8 @@ def _verify_sealed_stage(
     receipt_count: int,
     fts5_available: bool,
     expected_candidate_projection_digest: str,
-    database_identity: _ArtifactFileIdentity,
-    database_proof: ContentFileProof,
     expected_closure_digest: str,
 ) -> None:
-    """Bind the post-fsync sealed bytes to the complete validated semantics."""
-
-    _require_identity_unchanged(
-        stage.staged_db_path,
-        database_identity,
-        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
-    )
     connection = _open_stage_read_connection(stage.staged_db_path)
     try:
         connection.execute("BEGIN")
@@ -2142,6 +2672,38 @@ def _verify_sealed_stage(
             raise
     finally:
         connection.close()
+
+
+def _verify_sealed_stage(
+    stage: MutableStageRef,
+    *,
+    record_count: int,
+    origin_batch_count: int,
+    receipt_count: int,
+    fts5_available: bool,
+    expected_candidate_projection_digest: str,
+    database_identity: _ArtifactFileIdentity,
+    database_proof: ContentFileProof,
+    expected_closure_digest: str,
+) -> None:
+    """Bind legacy post-fsync bytes to the complete validated semantics."""
+
+    _require_identity_unchanged(
+        stage.staged_db_path,
+        database_identity,
+        unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
+    )
+    _verify_sealed_stage_semantics(
+        stage,
+        record_count=record_count,
+        origin_batch_count=origin_batch_count,
+        receipt_count=receipt_count,
+        fts5_available=fts5_available,
+        expected_candidate_projection_digest=(
+            expected_candidate_projection_digest
+        ),
+        expected_closure_digest=expected_closure_digest,
+    )
     try:
         _revalidate_content_file(stage.staged_db_path, database_proof)
     except ContentAttestationError as error:
@@ -2236,8 +2798,8 @@ def _require_generation_closure(
 
 
 def _require_linearization_closure(
-    snapshot: _PhysicalReadinessSnapshot,
-    attestation: SealedContentAttestation,
+    snapshot: _PhysicalReadinessRecord,
+    attestation: SealedContentAttestationRecord,
 ) -> None:
     """Terminal closure at the Gate B linearization point, before the grant.
 
@@ -2249,7 +2811,18 @@ def _require_linearization_closure(
     stay private to this module.
     """
 
-    if type(attestation) is not SealedContentAttestation:
+    if (
+        type(snapshot) is _PortablePhysicalReadinessSnapshot
+        and type(attestation) is PortableSealedContentAttestation
+    ):
+        snapshot.live_reproof.reprove()
+        return
+    if type(attestation) is PortableSealedContentAttestation:
+        raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+    if (
+        type(snapshot) is not _PhysicalReadinessSnapshot
+        or type(attestation) is not SealedContentAttestation
+    ):
         raise StageSealError("SEALER.ATTESTATION_INVALID")
     try:
         observed_database = _capture_content_file(
@@ -2326,7 +2899,7 @@ class _SealedArtifactReadinessView:
     def resolve_physical_readiness(
         self,
         stage: SealedStage,
-    ) -> _PhysicalReadinessSnapshot:
+    ) -> _PhysicalReadinessRecord:
         return self.__registry.resolve_physical_readiness(stage)
 
     def contains(self, stage: SealedStage) -> bool:
@@ -2350,12 +2923,20 @@ class _SealLifecycleRegistry(Protocol):
         manifest_identity: _ArtifactFileIdentity,
     ) -> _RegistryReservation: ...
 
+    def _reserve_portable(
+        self,
+        mutable_stage: MutableStageRef,
+    ) -> _PortableRegistryReservation: ...
+
     def _commit_verified(
         self,
-        capability: _VerifiedSealCommitCapability,
+        capability: (
+            _VerifiedSealCommitCapability
+            | _PortableVerifiedSealCommitCapability
+        ),
     ) -> SealedStage: ...
 
-    def _release(self, reservation: _RegistryReservation) -> None: ...
+    def _release(self, reservation: _RegistryReservationRecord) -> None: ...
 
 
 class _SealedArtifactRegistry:
@@ -2376,14 +2957,18 @@ class _SealedArtifactRegistry:
         if not registry_namespace.strip():
             raise ValueError("registry_namespace must not be empty")
         self._registry_namespace = registry_namespace
-        self._entries: dict[str, _RegistryEntry] = {}
-        self._reservations: dict[tuple[str, str], _RegistryReservation] = {}
+        self._entries: dict[str, _RegistryEntryRecord] = {}
+        self._reservations: dict[
+            tuple[str, str],
+            _RegistryReservationRecord,
+        ] = {}
         self._sealed_paths: dict[tuple[str, str], str] = {}
         self._tokens: dict[
             str,
             tuple[str, contract_module._ActivationToken],
         ] = {}
         self._claimed_nonces: dict[str, str] = {}
+        self._portable_borrows: dict[str, str] = {}
         self._commit_authority = object()
         self._used_verified_commit_nonces: set[str] = set()
         self._lock = threading.RLock()
@@ -2398,6 +2983,47 @@ class _SealedArtifactRegistry:
 
     def _readiness_view(self) -> _SealedArtifactReadinessView:
         return self._read_view
+
+    def _reprove_portable_borrow(
+        self,
+        borrow: _PortableAuthorityBorrow,
+    ) -> None:
+        with self._lock:
+            if type(borrow) is not _PortableAuthorityBorrow:
+                raise TypeError("portable authority borrow must be exact")
+            if borrow._PortableAuthorityBorrow__registry is not self:
+                raise StageSealError("SEALER.REGISTRY_MISMATCH")
+            artifact_id = borrow._PortableAuthorityBorrow__artifact_id
+            nonce = borrow._PortableAuthorityBorrow__nonce
+            if self._portable_borrows.pop(nonce, None) != artifact_id:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            entry = self._entries.get(artifact_id)
+            if type(entry) is not _PortableRegistryEntry:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            live_authority = entry.live_authority
+            if live_authority is None or live_authority.closed:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            live_authority.reprove()
+            if live_authority.persisted_proofs() != (
+                entry.sealed_content_attestation.database,
+                entry.sealed_content_attestation.manifest,
+                entry.sealed_content_attestation.source,
+            ):
+                raise StageSealError("SEALER.ATTESTATION_INVALID")
+
+    def _release_portable_borrow(
+        self,
+        borrow: _PortableAuthorityBorrow,
+    ) -> None:
+        with self._lock:
+            if type(borrow) is not _PortableAuthorityBorrow:
+                raise TypeError("portable authority borrow must be exact")
+            if borrow._PortableAuthorityBorrow__registry is not self:
+                raise StageSealError("SEALER.REGISTRY_MISMATCH")
+            self._portable_borrows.pop(
+                borrow._PortableAuthorityBorrow__nonce,
+                None,
+            )
 
     def _reserve(
         self,
@@ -2456,9 +3082,138 @@ class _SealedArtifactRegistry:
             self._reservations[reservation.key] = reservation
             return reservation
 
+    def _reserve_portable(
+        self,
+        mutable_stage: MutableStageRef,
+    ) -> _PortableRegistryReservation:
+        """Reserve a stage whose identity arrives as a retained live bundle."""
+
+        with self._lock:
+            try:
+                stage = _snapshot_stage(mutable_stage)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise StageSealError("SEALER.TYPE_INVALID") from error
+            self._reject_second_seal(stage)
+            key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
+            if key in self._reservations:
+                raise StageSealError("SEALER.ALREADY_RESERVED")
+            reservation = _PortableRegistryReservation(
+                reservation_id=f"portable-reservation.{uuid.uuid4().hex}",
+                mutable=stage,
+            )
+            self._reservations[reservation.key] = reservation
+            return reservation
+
+    def _commit_portable_verified_locked(
+        self,
+        capability: _PortableVerifiedSealCommitCapability,
+    ) -> SealedStage:
+        try:
+            capability.__post_init__()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise StageSealError("SEALER.TYPE_INVALID") from error
+        if (
+            capability.registry_namespace != self._registry_namespace
+            or capability.registry_authority is not self._commit_authority
+        ):
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        if capability.nonce in self._used_verified_commit_nonces:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        reservation = capability.reservation
+        if self._reservations.get(reservation.key) is not reservation:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        claim = _snapshot_evidence(capability.evidence)
+        expected_generation = _snapshot_generation(capability.generation)
+        attestation = capability.attestation
+        authority_transfer = capability.authority_transfer
+        authority_transfer.reprove_owned()
+        if authority_transfer.persisted_proofs() != (
+            attestation.database,
+            attestation.manifest,
+            attestation.source,
+        ):
+            raise StageSealError("SEALER.ATTESTATION_INVALID")
+        stage = reservation.mutable
+        contract_module._validate_stage_validation_evidence(claim)
+        identity = stage.resource_identity
+        if (
+            claim.resource_id != identity.resource_id
+            or claim.target_identity != identity.target_identity
+            or claim.source_binding.configured_jsonl_path
+            != identity.configured_jsonl_path
+            or claim.source_binding.manifest_path
+            != identity.snapshot_manifest_path
+        ):
+            raise StageSealError("SEALER.EVIDENCE_MISMATCH")
+        _require_generation_closure(expected_generation, claim)
+        _require_stage_sealed_marker(stage.staged_db_path)
+        authority_transfer.reprove_owned()
+        semantic = attestation.semantic_facts
+        if (
+            attestation.resource_id != claim.resource_id
+            or attestation.target_identity != claim.target_identity
+            or attestation.canonical_store_id
+            != claim.source_binding.receipt.canonical_store_id
+            or attestation.snapshot_receipt_digest
+            != claim.snapshot_receipt_digest
+            or attestation.expected_prior_generation
+            != expected_generation.expected_prior_generation
+            or attestation.evidence_digest
+            != contract_module.stage_validation_evidence_digest(claim)
+            or attestation.database.sha256 != claim.stage_file_digest
+            or attestation.manifest.sha256 != claim.manifest_temp_digest
+            or attestation.source.sha256
+            != claim.source_binding.receipt.jsonl_digest
+            or semantic.schema_version != claim.schema_version
+            or semantic.fold_version != claim.fold_version
+            or semantic.index_version != claim.index_version
+            or semantic.receipt_boundary_record_count != claim.record_count
+            or semantic.origin_batch_count != claim.origin_batch_count
+            or semantic.receipt_boundary_fts_count != claim.fts_count
+            or semantic.gram_counts != claim.gram_counts
+            or semantic.exact_parity_digest != claim.exact_parity_digest
+        ):
+            raise StageSealError("SEALER.EVIDENCE_MISMATCH")
+        artifact_id = f"artifact.{uuid.uuid4().hex}"
+        sealed_stage = contract_module._create_sealed_stage(
+            registry_namespace=self._registry_namespace,
+            artifact_id=artifact_id,
+            mutable_stage=stage,
+            evidence=claim,
+            generation=expected_generation,
+            activation_nonce=f"nonce.{uuid.uuid4().hex}",
+        )
+        live_authority = authority_transfer.take()
+        try:
+            self._entries[artifact_id] = _PortableRegistryEntry(
+                mutable=stage,
+                stage=sealed_stage,
+                state=ActivationCapabilityState.SEALED,
+                sealed_content_attestation=attestation,
+                live_authority=live_authority,
+            )
+            self._sealed_paths[reservation.key] = artifact_id
+            del self._reservations[reservation.key]
+            self._used_verified_commit_nonces.add(capability.nonce)
+        except BaseException:
+            self._entries.pop(artifact_id, None)
+            if self._sealed_paths.get(reservation.key) == artifact_id:
+                self._sealed_paths.pop(reservation.key, None)
+            self._reservations[reservation.key] = reservation
+            self._used_verified_commit_nonces.discard(capability.nonce)
+            try:
+                live_authority.close()
+            except BaseException:
+                pass
+            raise
+        return sealed_stage
+
     def _commit_verified(
         self,
-        capability: _VerifiedSealCommitCapability,
+        capability: (
+            _VerifiedSealCommitCapability
+            | _PortableVerifiedSealCommitCapability
+        ),
     ) -> SealedStage:
         """Finalize one reservation into the authoritative sealed entry.
 
@@ -2469,6 +3224,8 @@ class _SealedArtifactRegistry:
         """
 
         with self._lock:
+            if type(capability) is _PortableVerifiedSealCommitCapability:
+                return self._commit_portable_verified_locked(capability)
             if type(capability) is not _VerifiedSealCommitCapability:
                 raise StageSealError("SEALER.TYPE_INVALID")
             try:
@@ -2597,11 +3354,14 @@ class _SealedArtifactRegistry:
             self._used_verified_commit_nonces.add(capability.nonce)
             return sealed_stage
 
-    def _release(self, reservation: _RegistryReservation) -> None:
+    def _release(self, reservation: _RegistryReservationRecord) -> None:
         """Release one uncommitted reservation; never touches committed entries."""
 
         with self._lock:
-            if type(reservation) is not _RegistryReservation:
+            if type(reservation) not in {
+                _RegistryReservation,
+                _PortableRegistryReservation,
+            }:
                 return
             existing = self._reservations.get(reservation.key)
             if (
@@ -2615,7 +3375,7 @@ class _SealedArtifactRegistry:
         if key in self._sealed_paths:
             raise StageSealError("SEALER.ALREADY_SEALED")
 
-    def _match_entry(self, stage: SealedStage) -> _RegistryEntry:
+    def _match_entry(self, stage: SealedStage) -> _RegistryEntryRecord:
         """Registry membership and full contract chain, without file effects.
 
         Gate B resolves path-bearing facts only through this narrow seam; the
@@ -2657,10 +3417,24 @@ class _SealedArtifactRegistry:
             raise StageSealError("SEALER.REGISTRY_MISMATCH")
         return entry
 
-    def _entry(self, stage: SealedStage) -> _RegistryEntry:
+    def _entry(self, stage: SealedStage) -> _RegistryEntryRecord:
         """Registry authority check that re-proves identities and digests."""
 
         entry = self._match_entry(stage)
+        if type(entry) is _PortableRegistryEntry:
+            live_authority = entry.live_authority
+            if live_authority is None or live_authority.closed:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            live_authority.reprove()
+            if live_authority.persisted_proofs() != (
+                entry.sealed_content_attestation.database,
+                entry.sealed_content_attestation.manifest,
+                entry.sealed_content_attestation.source,
+            ):
+                raise StageSealError("SEALER.ATTESTATION_INVALID")
+            return entry
+        if type(entry) is not _RegistryEntry:
+            raise StageSealError("SEALER.REGISTRY_MISMATCH")
         evidence = entry.stage.evidence
         observed_database = _artifact_file_identity(
             entry.mutable.staged_db_path,
@@ -2697,7 +3471,7 @@ class _SealedArtifactRegistry:
     def resolve_physical_readiness(
         self,
         stage: SealedStage,
-    ) -> _PhysicalReadinessSnapshot:
+    ) -> _PhysicalReadinessRecord:
         """Resolve one registered sealed artifact for Gate B revalidation.
 
         Returns only registry-owned paths and sealed claims; Gate B never
@@ -2708,6 +3482,41 @@ class _SealedArtifactRegistry:
             entry = self._match_entry(stage)
             artifact = entry.stage.artifact
             receipt = entry.stage.evidence.source_binding.receipt
+            if type(entry) is _PortableRegistryEntry:
+                live_authority = entry.live_authority
+                if live_authority is None or live_authority.closed:
+                    raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                borrow_nonce = f"portable-borrow.{uuid.uuid4().hex}"
+                self._portable_borrows[borrow_nonce] = artifact.artifact_id
+                return _PortablePhysicalReadinessSnapshot(
+                    registry_namespace=self._registry_namespace,
+                    artifact_id=artifact.artifact_id,
+                    artifact_seal_digest=artifact.seal_digest,
+                    sealed_stage_digest=entry.stage.sealed_stage_digest,
+                    resource_id=entry.stage.evidence.resource_id,
+                    target_identity=entry.stage.evidence.target_identity,
+                    canonical_store_id=receipt.canonical_store_id,
+                    snapshot_receipt_digest=(
+                        entry.stage.evidence.snapshot_receipt_digest
+                    ),
+                    expected_prior_generation=(
+                        entry.stage.generation.expected_prior_generation
+                    ),
+                    mutable_stage=entry.mutable,
+                    evidence=entry.stage.evidence,
+                    generation=entry.stage.generation,
+                    sealed_content_attestation=(
+                        entry.sealed_content_attestation
+                    ),
+                    live_reproof=_PortableAuthorityBorrow(
+                        self,
+                        artifact.artifact_id,
+                        borrow_nonce,
+                        _factory_key=_PORTABLE_AUTHORITY_BORROW_FACTORY_KEY,
+                    ),
+                )
+            if type(entry) is not _RegistryEntry:
+                raise StageSealError("SEALER.REGISTRY_MISMATCH")
             return _PhysicalReadinessSnapshot(
                 registry_namespace=self._registry_namespace,
                 artifact_id=artifact.artifact_id,
@@ -2733,13 +3542,32 @@ class _SealedArtifactRegistry:
     def contains(self, stage: SealedStage) -> bool:
         with self._lock:
             try:
-                self._entry(stage)
+                entry = self._match_entry(stage)
+                if not (
+                    type(entry) is _PortableRegistryEntry
+                    and entry.state in {
+                        ActivationCapabilityState.CONSUMED,
+                        ActivationCapabilityState.CANCELLED,
+                    }
+                    and entry.live_authority is None
+                ):
+                    self._entry(stage)
             except (StageSealError, TypeError, ValueError, AttributeError):
                 return False
             return True
 
     def state(self, stage: SealedStage) -> ActivationCapabilityState:
         with self._lock:
+            entry = self._match_entry(stage)
+            if (
+                type(entry) is _PortableRegistryEntry
+                and entry.state in {
+                    ActivationCapabilityState.CONSUMED,
+                    ActivationCapabilityState.CANCELLED,
+                }
+                and entry.live_authority is None
+            ):
+                return entry.state
             return self._entry(stage).state
 
     def issue_token(
@@ -2783,7 +3611,7 @@ class _SealedArtifactRegistry:
     def _token_entry(
         self,
         token: contract_module._ActivationToken,
-    ) -> _RegistryEntry:
+    ) -> _RegistryEntryRecord:
         if type(token) is not contract_module._ActivationToken:
             raise StageSealError("SEALER.TOKEN_INVALID")
         registered = self._tokens.get(token.token_id)
@@ -2806,6 +3634,22 @@ class _SealedArtifactRegistry:
             entry = self._token_entry(token)
             if entry.state is not ActivationCapabilityState.TOKEN_ISSUED:
                 raise StageSealError("SEALER.TOKEN_NOT_ACTIVE")
+            if type(entry) is _PortableRegistryEntry:
+                live_authority = entry.live_authority
+                if live_authority is None:
+                    raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                self._entries[entry.stage.artifact.artifact_id] = replace(
+                    entry,
+                    state=ActivationCapabilityState.CONSUMED,
+                    live_authority=None,
+                )
+                self._portable_borrows = {
+                    nonce: artifact_id
+                    for nonce, artifact_id in self._portable_borrows.items()
+                    if artifact_id != entry.stage.artifact.artifact_id
+                }
+                live_authority.close()
+                return
             self._entries[entry.stage.artifact.artifact_id] = replace(
                 entry,
                 state=ActivationCapabilityState.CONSUMED,
@@ -2816,6 +3660,22 @@ class _SealedArtifactRegistry:
             entry = self._token_entry(token)
             if entry.state is not ActivationCapabilityState.TOKEN_ISSUED:
                 raise StageSealError("SEALER.TOKEN_NOT_ACTIVE")
+            if type(entry) is _PortableRegistryEntry:
+                live_authority = entry.live_authority
+                if live_authority is None:
+                    raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                self._entries[entry.stage.artifact.artifact_id] = replace(
+                    entry,
+                    state=ActivationCapabilityState.CANCELLED,
+                    live_authority=None,
+                )
+                self._portable_borrows = {
+                    nonce: artifact_id
+                    for nonce, artifact_id in self._portable_borrows.items()
+                    if artifact_id != entry.stage.artifact.artifact_id
+                }
+                live_authority.close()
+                return
             self._entries[entry.stage.artifact.artifact_id] = replace(
                 entry,
                 state=ActivationCapabilityState.CANCELLED,
@@ -2848,6 +3708,7 @@ class StageSealer:
         *,
         registry: _SealedArtifactRegistry,
         canonical_store_id: str,
+        platform: _StageSealerPlatform | None = None,
     ) -> None:
         if type(registry) is not _SealedArtifactRegistry:
             raise StageSealError("SEALER.TYPE_INVALID")
@@ -2858,8 +3719,14 @@ class StageSealer:
             raise StageSealError("SEALER.TYPE_INVALID")
         if not canonical_store_id.strip():
             raise StageSealError("SEALER.TYPE_INVALID")
+        if platform is not None and not isinstance(
+            platform,
+            _StageSealerPlatform,
+        ):
+            raise StageSealError("SEALER.TYPE_INVALID")
         self._registry = registry
         self._canonical_store_id = canonical_store_id
+        self._platform = platform
 
     @property
     def registry(self) -> contract_module._SealedArtifactRegistryPort:
@@ -2871,6 +3738,110 @@ class StageSealer:
 
     def _lifecycle_registry(self) -> _SealLifecycleRegistry:
         return cast(_SealLifecycleRegistry, self._registry)
+
+    def _seal_portable(
+        self,
+        stage: MutableStageRef,
+        *,
+        expected_prior_generation: int | None,
+        schema_upgrade: bool,
+    ) -> SealedStage:
+        platform = self._platform
+        if platform is None:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        lifecycle = self._lifecycle_registry()
+        reservation = lifecycle._reserve_portable(stage)
+        live_authority: _PortableStageLiveAuthority | None = None
+        authority_transfer: _PortableAuthorityTransfer | None = None
+        try:
+            facts = _validate_stage_facts(
+                stage,
+                canonical_store_id=self._canonical_store_id,
+                schema_upgrade=schema_upgrade,
+                seal_stage=True,
+            )
+            live_authority = _open_portable_stage_live_authority(
+                platform,
+                stage,
+            )
+            live_authority.reprove()
+            database_proof, manifest_proof, source_proof = (
+                live_authority.persisted_proofs()
+            )
+            manifest_temp_digest, manifest = _decode_verified_manifest(
+                live_authority.manifest_bytes(),
+                facts.receipt,
+                upgrade_manifest=facts.schema_upgrade,
+            )
+            if (
+                manifest_temp_digest != manifest_proof.sha256
+                or source_proof.sha256 != facts.receipt.jsonl_digest
+            ):
+                raise StageSealError(
+                    "SEALER.STAGE_MUTATED_AFTER_VALIDATION"
+                )
+            _verify_sealed_stage_semantics(
+                stage,
+                record_count=facts.record_count,
+                origin_batch_count=facts.origin_batch_count,
+                receipt_count=1,
+                fts5_available=facts.fts5_available,
+                expected_candidate_projection_digest=(
+                    facts.candidate_projection_digest
+                ),
+                expected_closure_digest=facts.closure_digest,
+            )
+            live_authority.reprove()
+            binding = _build_binding(
+                stage.resource_identity,
+                facts.receipt,
+                manifest,
+            )
+            evidence = _build_evidence(
+                facts,
+                binding,
+                stage_file_digest=database_proof.sha256,
+                manifest_temp_digest=manifest_temp_digest,
+            )
+            generation = _build_generation(
+                facts,
+                canonical_store_id=self._canonical_store_id,
+                expected_prior_generation=expected_prior_generation,
+            )
+            attestation = _build_portable_sealed_content_attestation(
+                facts,
+                evidence,
+                generation,
+                live_authority,
+            )
+            authority_transfer = _PortableAuthorityTransfer(live_authority)
+            live_authority = None
+            capability = _create_portable_verified_seal_commit_capability(
+                self._registry,
+                reservation,
+                evidence,
+                generation,
+                attestation,
+                authority_transfer,
+            )
+            sealed_stage = lifecycle._commit_verified(capability)
+            return sealed_stage
+        except BaseException:
+            if authority_transfer is not None:
+                try:
+                    authority_transfer.close()
+                except BaseException:
+                    pass
+            elif live_authority is not None:
+                try:
+                    live_authority.close()
+                except BaseException:
+                    pass
+            try:
+                lifecycle._release(reservation)
+            except BaseException:
+                pass
+            raise
 
     def seal(
         self,
@@ -2886,10 +3857,11 @@ class StageSealer:
         the write lock before writing the SEALED marker.  The marker commit
         is itself fsynced (DB and parent) before any digest work or registry
         publication, so registration only ever follows the final fsynced
-        sealed state.  Any post-marker failure durably restores UNPUBLISHED
-        and releases the reservation, so the same completed stage
-        deterministically retries without rebuilding or duplicating records.
-        A path swap during the seal denies and never mints an entry.
+        sealed state.  The default legacy route durably restores UNPUBLISHED
+        after a post-marker failure.  The explicit portable route instead
+        closes its untransferred live authority and leaves the unregistered
+        SEALED stage fail-stop; it never uses pathname rollback as authority.
+        A swap during either route denies and never mints an entry.
 
         The private Task 5.11 ``schema_upgrade`` mode seals a marker-bearing
         v2 candidate through the upgrade fact validation; the marker and
@@ -2907,6 +3879,12 @@ class StageSealer:
             if expected_prior_generation < 0:
                 raise StageSealError("SEALER.GENERATION_INVALID")
         stage = _snapshot_stage(mutable_stage)
+        if self._platform is not None:
+            return self._seal_portable(
+                stage,
+                expected_prior_generation=expected_prior_generation,
+                schema_upgrade=schema_upgrade,
+            )
         database_identity = _artifact_file_identity(
             stage.staged_db_path,
             missing_code="SEALER.STAGE_DATABASE_MISSING",
