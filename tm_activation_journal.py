@@ -21,6 +21,8 @@ from pathlib import Path
 import tm_contracts as contract_module
 from tm_content_attestation import (
     ActiveContentAttestation,
+    PortableActiveContentAttestation,
+    PortableSealedContentAttestation,
     SealedContentAttestation,
     _active_content_attestation_from_mapping,
     _active_content_attestation_to_mapping,
@@ -3283,6 +3285,34 @@ def _replay_activation_journal(
         _factory_key=_ACTIVATION_JOURNAL_FACTORY_KEY,
     )
 
+def _require_legacy_content_attestations_for_durable_write(
+    record: _ActivationJournalRecord,
+) -> None:
+    """Keep the durable journal writer on its approved v2 byte contract.
+
+    Portable owner-memory values cannot enter this v2 durable schema until
+    their live authority route and a portable journal schema are approved, so
+    reject them before creating or replacing any journal/terminal file.
+    """
+
+    sealed = record.sealed_content_attestation
+    if type(sealed) is PortableSealedContentAttestation:
+        raise ActivationPreparationError(
+            "ACTIVATION.ATTESTATION_UNAVAILABLE",
+            retryable=False,
+        )
+    if type(sealed) is not SealedContentAttestation:
+        raise TypeError("sealed content attestation must be exact legacy v2")
+    active = record.active_content_attestation
+    if type(active) is PortableActiveContentAttestation:
+        raise ActivationPreparationError(
+            "ACTIVATION.ATTESTATION_UNAVAILABLE",
+            retryable=False,
+        )
+    if active is not None and type(active) is not ActiveContentAttestation:
+        raise TypeError("active content attestation must be exact legacy v2")
+
+
 def _write_activation_journal(
     record: _ActivationJournalRecord,
     journal_path: Path,
@@ -3298,6 +3328,7 @@ def _write_activation_journal(
     fsync; failures after publication fail-stop with a code-only error.
     """
 
+    _require_legacy_content_attestations_for_durable_write(record)
     expected_bytes = _serialize_activation_journal_record(
         record
     ).encode("utf-8")
@@ -3444,6 +3475,7 @@ def _write_activation_terminal(
     publication fail-stop with the durable terminal in place.
     """
 
+    _require_legacy_content_attestations_for_durable_write(record)
     terminal_path = _activation_terminal_path(identity)
     expected_bytes = _serialize_activation_journal_record(
         record
