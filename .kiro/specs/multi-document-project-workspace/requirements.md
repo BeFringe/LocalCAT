@@ -32,6 +32,7 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 3. Windows success严格消费`WindowsDocumentedPublishV1`：local fixed NTFS上的candidate write-through与`FlushFileBuffers`、handle-bound atomic naming、candidate close、retained destination exact bytes/digest readback、owner receipt/LKG commit和terminal reproof必须依次闭合；平台初步事实不得提前清除dirty或报告成功。
 4. fault、process kill、app restart与正常OS reboot必须只产生完整old、完整new或recovery-only结果，并保留正确dirty/baseline；本Spec不以运行时`DurabilityProfile` registry或forced-power lab作为成功前置，也不据此声明突然断电耐久资格。
 5. 本 amendment 不改变 ADR-018/019 的 ProjectPackage carrier、manifest、receipt、LKG 与 workspace authority，也不取得 ResourcePackage、TMX、Chunk 或 frozen bootstrap 权威。
+6. Windows FileId只可用于一次 live operation 内的duplicate/reparse证明，不得持久化为重开或恢复authority；package source/member与candidate必须以每次至多64 KiB的rooted read/write流处理，禁止整包materialize或pathname/temp-path fallback。
 
 ## 术语
 
