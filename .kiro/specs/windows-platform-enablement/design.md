@@ -22,7 +22,7 @@
 ## Boundary Commitments
 
 ### This Spec Owns
-- `RootedFileSystem`、`BoundDirectoryPublisher`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
+- `RootedFileSystem`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
 - Windows 11 native handle implementation、支持 volume capability gate、Win32 error normalization 和平台专属反例 harness。
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
@@ -216,6 +216,13 @@ class RootedFileSystem(Protocol):
     def open_regular(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundRegularFile: ...
     def bind_parent(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundDirectoryAuthority: ...
 
+class ExistingFileDurability(Protocol):
+    def open_existing_for_synchronization(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundSynchronizedRegularFile: ...
+
+class BoundSynchronizedRegularFile(BoundRegularFile, Protocol):
+    def content_facts(self) -> BoundContentFacts: ...
+    def synchronize_content(self, expected: BoundContentFacts) -> BoundContentFacts: ...
+
 class BoundDirectoryAuthority(Protocol):
     def reprove(self) -> None: ...
     def inspect_entry(self, name: str) -> EntrySnapshot | None: ...
@@ -254,6 +261,7 @@ class PersistentPrivateProof(Protocol):
 - 所有 authority objects 都是 context-managed、不可序列化、关闭后不可复用。
 - `CandidateFile.write_chunks`是one-shot、每块至多64 KiB且受调用方总字节上限约束的流式写入口；`write_all`只是兼容委托。`observe_ledger_entries`只在同父目录live lease下返回有界、排序的namespace observations；这些observations不是authority或CAS，owner必须逐项rooted reopen并复证后才能读取或提交业务状态。
 - `PendingPublication` 是跨越业务 owner durable commit 的opaque、context-managed低层authority，不是业务receipt。`begin_publish`不得返回success；owner必须使用其retained destination完成readback，自行提交并复证业务state，再调用platform `terminal_reproof`，最后关闭。平台不解释或持久化owner phase/generation/compatibility。
+- `ExistingFileDurability`只同步已由owner写成的既有regular file：同一retained authority先后复证exact identity/content并执行平台文件持久化，不得rename/unlink或改变namespace。POSIX实现执行file fsync后parent directory fsync；Windows实现执行同一file handle的`FlushFileBuffers`并复证parent/root live authority，parent reproof不冒充directory fsync。
 - `PrivateStorageProof`只产生当次physical ACL/MIC evidence；独立的`PersistentPrivateProof`拥有device-secret binding、持久proof mint/verify与terminal consume。具体backend只接受由同一composition issuer签发的exact private evidence/secret/verified类型；公开`WindowsPrivateProof`始终是不可信持久值。device-secret authority独立持有binding handle，调用方关闭原`BoundRegularFile`不撤销它；verified authority只能在backend完成exact issuer/context检查后锁内消费一次，terminal reproof成功或失败都关闭其retained authorities。`PersistentPrivateProof`不并入既有`PlatformFileBackend` aggregate。
 - 上层不能取得 raw Windows HANDLE/dirfd；tests 通过专用 fault seam，而不是调用内部 API。
 - factory 只在 backend self-probe/contract gate 成功后返回 capability object；不存在“布尔值为 true 即可信”。
