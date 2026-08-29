@@ -211,7 +211,7 @@ Multi-Document C2 complete
   - 运行 assign/switch/edit/read-only/search/progress/reconcile-rebase/split/merge/conflict/undo/close-reopen 完整 journeys。
   - 证明 chunk-only operations 不改 ProjectPackage bytes、workspace target/dirty 或 codec-private；实际 target edit 仍由 workspace/package 后续保存。
 
-- [ ] 4.4a 在 Windows 复验 metadata publication 与冷恢复
+- [x] 4.4a 在 Windows 复验 metadata publication 与冷恢复
   - 以真实ProjectPackage执行candidate write/flush→journal/LKG arm→仍打开handle rename→capture/close→retained reopen/readback→owner durable commit→terminal reproof，并在每个边界与进程终止后复证prior/new snapshot、audit head和workspace bytes。
   - 必须消费 `multi-document-project-workspace` 已通过 Windows public business API 产生并冷开的真实 ProjectPackage；禁止 mock、私有 ZIP/manifest 构造、fixture-only workspace 注入或 skip。
   - _Amendment: WA-02_
@@ -222,7 +222,7 @@ Multi-Document C2 complete
   - current-source 工具生成 evidence 并由 strict consumer 复读；evidence 后只允许不属于 source roots 的 Tasks/Steering/border completion 更新。
   - 同步真实 structure/tech/roadmap/spec ownership，并以 final cumulative diff 的可重放验证闭合 Feature 验收。
 
-- [ ] 4.5a 执行Windows source双进程、崩溃与import acceptance
+- [x] 4.5a 执行Windows source双进程、崩溃与import acceptance
   - 在两个独立source进程覆盖two-creator、create/write/flush/readback/close逐边界creator crash、unknown payload、锁竞争/owner kill、candidate self-sharing/target-open、journal phase crash、重开恢复和composition startup；不得通过禁用协作模块取得PASS。
   - 累计重放第一阶段 metadata/startup 矩阵与 `4.4a` 的真实 ProjectPackage package-coupled journey；本任务通过后形成第二份 owner commit并给出 WA-02 source owner 最终 PASS。
   - _Amendment: WA-02_
