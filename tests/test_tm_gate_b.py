@@ -16,6 +16,7 @@ from unittest.mock import patch
 import tm_contracts as contract_module
 import tm_gate_b
 import tm_stage_sealer
+from platform_fs import compose_platform_file_backend
 from tm_content_attestation import SealedContentAttestation
 from tm_contracts import (
     CanonicalResourceIdentity,
@@ -202,6 +203,109 @@ class _StructuralFakeRegistry:
 
 
 class GateBHappyPathTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows platform route")
+    def test_portable_gate_b_borrows_reproof_and_denial_is_retryable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _identity_value, stage = _build_stage(
+                root,
+                fts5_available=True,
+            )
+            registry = _registry()
+            sealer = StageSealer(
+                registry=registry,
+                canonical_store_id="store.primary",
+                platform=cast(Any, compose_platform_file_backend(root)),
+            )
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=True,
+            ):
+                sealed = sealer.seal(
+                    stage,
+                    expected_prior_generation=0,
+                )
+            entry = cast(
+                tm_stage_sealer._PortableRegistryEntry,
+                registry._entries[sealed.artifact.artifact_id],
+            )
+            live_authority = entry.live_authority
+            self.assertIsNotNone(live_authority)
+            assert live_authority is not None
+            snapshot = registry.resolve_physical_readiness(sealed)
+            self.assertIs(
+                type(snapshot),
+                tm_stage_sealer._PortablePhysicalReadinessSnapshot,
+            )
+            portable_snapshot = cast(
+                tm_stage_sealer._PortablePhysicalReadinessSnapshot,
+                snapshot,
+            )
+            self.assertFalse(hasattr(portable_snapshot.live_reproof, "close"))
+            portable_snapshot.live_reproof.reprove()
+            self.assertEqual(registry._portable_borrows, {})
+            with self.assertRaises(tm_stage_sealer.StageSealError):
+                portable_snapshot.live_reproof.reprove()
+
+            evaluator = GateBEvaluator(registry=registry._readiness_view())
+            with patch(
+                "tm_gate_b._require_claim_closure",
+                side_effect=tm_gate_b._GateBFailure(
+                    "GATE_B.EVIDENCE_MISMATCH"
+                ),
+            ):
+                claim_denied = evaluator.evaluate(sealed)
+            self.assertFalse(claim_denied.granted)
+            self.assertIsNone(claim_denied.grant)
+            self.assertEqual(registry._portable_borrows, {})
+            self.assertFalse(live_authority.closed)
+
+            with patch(
+                "tm_gate_b._require_claim_closure",
+                side_effect=TypeError("claim programmer defect"),
+            ):
+                with self.assertRaises(TypeError):
+                    evaluator.evaluate(sealed)
+            self.assertEqual(registry._portable_borrows, {})
+            self.assertFalse(live_authority.closed)
+
+            with patch.object(
+                tm_stage_sealer._PortableAuthorityBorrow,
+                "reprove",
+                side_effect=tm_stage_sealer.StageSealError(
+                    "SEALER.ARTIFACT_MUTATED"
+                ),
+            ):
+                denied = evaluator.evaluate(sealed)
+            self.assertFalse(denied.granted)
+            self.assertIsNone(denied.grant)
+            self.assertFalse(live_authority.closed)
+            self.assertEqual(registry._portable_borrows, {})
+
+            with patch.object(
+                tm_stage_sealer._PortableAuthorityBorrow,
+                "reprove",
+                side_effect=TypeError("programmer defect"),
+            ):
+                with self.assertRaises(TypeError):
+                    evaluator.evaluate(sealed)
+            self.assertFalse(live_authority.closed)
+            self.assertEqual(registry._portable_borrows, {})
+
+            granted = evaluator.evaluate(sealed)
+            self.assertTrue(granted.granted)
+            self.assertIsNotNone(granted.grant)
+            self.assertFalse(live_authority.closed)
+            self.assertEqual(registry._portable_borrows, {})
+            token = registry.issue_token(
+                sealed,
+                current_generation=0,
+            )
+            registry.cancel(token)
+            self.assertTrue(live_authority.closed)
+
     def test_gate_b_rehashes_attested_files_without_semantic_rescan(
         self,
     ) -> None:
