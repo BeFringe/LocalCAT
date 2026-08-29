@@ -2212,20 +2212,32 @@ class ResourceStoreCoordinator:
         canonical_store_id: str,
         expected_prior_generation: int | None,
         schema_upgrade: bool = False,
+        platform: object | None = None,
+        caller_borrow: object | None = None,
     ) -> SealedStage:
-        """Run the sole verified seal factory without exposing its registry."""
+        """Run the sole verified seal factory and pass caller-held authority."""
 
         stage_sealer = getattr(
             importlib.import_module("tm_stage_sealer"),
             "StageSealer",
         )
+        if os.name == "nt" and (
+            platform is None or caller_borrow is None
+        ):
+            stage_seal_error = getattr(
+                importlib.import_module("tm_stage_sealer"),
+                "StageSealError",
+            )
+            raise stage_seal_error("SEALER.ATTESTATION_UNAVAILABLE")
         return cast(SealedStage, stage_sealer(
             registry=self._sealed_registry,
             canonical_store_id=canonical_store_id,
+            platform=platform,
         ).seal(
             mutable_stage,
             expected_prior_generation=expected_prior_generation,
             schema_upgrade=schema_upgrade,
+            caller_borrow=caller_borrow,
         ))
 
     @property
@@ -2922,37 +2934,48 @@ class ResourceStoreCoordinator:
                 None if initial_view is None else initial_view.generation
             )
 
-        first_report = gate_b_evaluator(
-            registry=registry._readiness_view()
-        ).evaluate(sealed_stage)
-        if not first_report.granted or first_report.grant is None:
-            raise ActivationPreparationError(
-                "ACTIVATION.GATE_B_DENIED",
-                retryable=False,
-                reason_code=first_report.error_code,
-            )
-        first_grant = first_report.grant
-        if replacement:
-            _require_activation_grant_identity_replacement(
-                first_grant,
+        try:
+            first_report = gate_b_evaluator(
+                registry=registry._readiness_view()
+            ).evaluate(sealed_stage)
+            if not first_report.granted or first_report.grant is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.GATE_B_DENIED",
+                    retryable=False,
+                    reason_code=first_report.error_code,
+                )
+            first_grant = first_report.grant
+            if replacement:
+                _require_activation_grant_identity_replacement(
+                    first_grant,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    prior_view=initial_view,
+                    current_generation=initial_generation,
+                )
+            else:
+                _require_activation_grant_identity(
+                    first_grant,
+                    identity=self._resource_identity,
+                    canonical_store_id=self._canonical_store_id,
+                    prior_view=initial_view,
+                    current_generation=initial_generation,
+                )
+            pre_drain_captures = _capture_pre_drain_assets(
+                initial_view,
                 identity=self._resource_identity,
-                canonical_store_id=self._canonical_store_id,
-                prior_view=initial_view,
-                current_generation=initial_generation,
+                replacement=replacement,
             )
-        else:
-            _require_activation_grant_identity(
-                first_grant,
-                identity=self._resource_identity,
-                canonical_store_id=self._canonical_store_id,
-                prior_view=initial_view,
-                current_generation=initial_generation,
-            )
-        pre_drain_captures = _capture_pre_drain_assets(
-            initial_view,
-            identity=self._resource_identity,
-            replacement=replacement,
-        )
+        except BaseException:
+            try:
+                registry.retire_unissued_portable(sealed_stage)
+            except stage_seal_error as cleanup_error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.CLEANUP_FAILED",
+                    retryable=True,
+                    reason_code=cleanup_error.error_code,
+                ) from cleanup_error
+            raise
 
         token: contract_module._ActivationToken | None = None
         backups: tuple[_RecoveryBackupAsset, ...] = ()
@@ -3218,6 +3241,8 @@ class ResourceStoreCoordinator:
                 _remove_recovery_backups(cleanup_reservation.owned_paths)
                 if token is not None:
                     registry.cancel(token)
+                else:
+                    registry.retire_unissued_portable(sealed_stage)
             except (ActivationPreparationError, stage_seal_error) as cleanup_error:
                 with self._condition:
                     self._view = initial_view

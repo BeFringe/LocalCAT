@@ -19,6 +19,7 @@ from platform_fs_contracts import (
     BoundRegularFile,
     BoundSynchronizedRegularFile,
     ExistingFileDurability,
+    LockLease,
     OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -120,15 +121,161 @@ def _portable_proof(facts: BoundContentFacts) -> PortableContentFileProof:
     )
 
 
+_CALLER_HELD_SEAL_BORROW_FACTORY_KEY = object()
+
+
+class _CallerHeldSealBorrow:
+    """Non-closing view of one caller-owned resource lock and rooted parent."""
+
+    __slots__ = (
+        "__identity",
+        "__lease",
+        "__lock_name",
+        "__lock_payload",
+        "__platform",
+        "__root",
+        "__released",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: CanonicalResourceIdentity,
+        platform: _StageSealerPlatform,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        lock_name: str,
+        lock_payload: bytes,
+        _factory_key: object,
+    ) -> None:
+        if _factory_key is not _CALLER_HELD_SEAL_BORROW_FACTORY_KEY:
+            raise TypeError("caller-held seal borrow is private")
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("resource identity must be exact")
+        if not isinstance(platform, _StageSealerPlatform):
+            raise TypeError("platform must satisfy the stage sealer port")
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be a rooted directory authority")
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be a retained lock authority")
+        if type(lock_name) is not str or not lock_name:
+            raise TypeError("lock name must be a non-empty exact string")
+        if type(lock_payload) is not bytes or not lock_payload:
+            raise TypeError("lock payload must be non-empty exact bytes")
+        self.__identity = identity
+        self.__lease = lease
+        self.__lock_name = lock_name
+        self.__lock_payload = lock_payload
+        self.__platform = platform
+        self.__root = root
+        self.__released = False
+
+    def _require_stage(
+        self,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
+    ) -> None:
+        if self.__released:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        if platform is not self.__platform:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        if (
+            stage.resource_identity != self.__identity
+            or stage.staged_db_path.parent
+            != self.__identity.canonical_sidecar_path.parent
+            or stage.manifest_temp_path.parent
+            != self.__identity.canonical_sidecar_path.parent
+        ):
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+
+    def reprove(
+        self,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
+    ) -> None:
+        self._require_stage(platform, stage)
+        try:
+            self.__root.reprove()
+            self.__lease.reprove_binding(
+                self.__root,
+                self.__lock_name,
+                self.__lock_payload,
+            )
+            self.__root.reprove()
+        except (PlatformFileError, OSError) as error:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE") from error
+
+    def open_existing_for_synchronization(
+        self,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
+        name: str,
+    ) -> BoundSynchronizedRegularFile:
+        self.reprove(platform, stage)
+        opened = self.__platform.open_existing_for_synchronization(
+            self.__root,
+            PurePath(name),
+        )
+        try:
+            self.reprove(platform, stage)
+        except BaseException:
+            try:
+                opened.close()
+            except BaseException:
+                pass
+            raise
+        return opened
+
+    def inspect_entry(
+        self,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
+        name: str,
+    ) -> object:
+        self.reprove(platform, stage)
+        return self.__root.inspect_entry(name)
+
+    def _release(self) -> None:
+        self.__released = True
+
+    def __reduce__(self) -> object:
+        raise TypeError("caller-held seal borrow is non-serializable")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("caller-held seal borrow is non-serializable")
+
+
+def _create_caller_held_seal_borrow(
+    *,
+    identity: CanonicalResourceIdentity,
+    platform: _StageSealerPlatform,
+    root: RootedDirectoryAuthority,
+    lease: LockLease,
+    lock_name: str,
+    lock_payload: bytes,
+) -> _CallerHeldSealBorrow:
+    return _CallerHeldSealBorrow(
+        identity=identity,
+        platform=platform,
+        root=root,
+        lease=lease,
+        lock_name=lock_name,
+        lock_payload=lock_payload,
+        _factory_key=_CALLER_HELD_SEAL_BORROW_FACTORY_KEY,
+    )
+
+
 class _PortableStageLiveAuthority(OpaqueAuthority):
     """Registry-owned live roots and files behind one portable attestation."""
 
     __slots__ = (
-        "__database_root",
+        "__caller_borrow",
+        "__platform",
+        "__stage",
         "__database_name",
         "__database",
         "__database_facts",
-        "__manifest_root",
         "__manifest_name",
         "__manifest",
         "__manifest_facts",
@@ -141,11 +288,12 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
     def __init__(
         self,
         *,
-        database_root: RootedDirectoryAuthority,
+        caller_borrow: _CallerHeldSealBorrow,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
         database_name: str,
         database: BoundSynchronizedRegularFile,
         database_facts: BoundContentFacts,
-        manifest_root: RootedDirectoryAuthority,
         manifest_name: str,
         manifest: BoundSynchronizedRegularFile,
         manifest_facts: BoundContentFacts,
@@ -155,12 +303,14 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
         source_facts: BoundContentFacts,
     ) -> None:
         super().__init__()
-        if not isinstance(database_root, RootedDirectoryAuthority):
-            raise TypeError("database_root must be rooted authority")
+        if type(caller_borrow) is not _CallerHeldSealBorrow:
+            raise TypeError("caller borrow must be exact")
+        if not isinstance(platform, _StageSealerPlatform):
+            raise TypeError("platform must satisfy the stage sealer port")
+        if type(stage) is not MutableStageRef:
+            raise TypeError("stage must be exact MutableStageRef")
         if not isinstance(database, BoundSynchronizedRegularFile):
             raise TypeError("database must be synchronized regular authority")
-        if not isinstance(manifest_root, RootedDirectoryAuthority):
-            raise TypeError("manifest_root must be rooted authority")
         if not isinstance(manifest, BoundSynchronizedRegularFile):
             raise TypeError("manifest must be synchronized regular authority")
         if not isinstance(source_root, RootedDirectoryAuthority):
@@ -175,11 +325,13 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
         for name in (database_name, manifest_name, source_name):
             if type(name) is not str or not name:
                 raise TypeError("entry name must be a non-empty exact string")
-        self.__database_root = database_root
+        caller_borrow.reprove(platform, stage)
+        self.__caller_borrow = caller_borrow
+        self.__platform = platform
+        self.__stage = stage
         self.__database_name = database_name
         self.__database = database
         self.__database_facts = database_facts
-        self.__manifest_root = manifest_root
         self.__manifest_name = manifest_name
         self.__manifest = manifest
         self.__manifest_facts = manifest_facts
@@ -215,22 +367,27 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
     def reprove(self) -> None:
         try:
             self._require_open()
-            for root in (
-                self.__database_root,
-                self.__manifest_root,
-                self.__source_root,
-            ):
-                root.reprove()
+            self.__caller_borrow.reprove(self.__platform, self.__stage)
+            self.__source_root.reprove()
             observed = (
                 self.__database.content_facts(),
                 self.__manifest.content_facts(),
                 self.__source.content_facts(),
             )
             entries = (
-                self.__database_root.inspect_entry(self.__database_name),
-                self.__manifest_root.inspect_entry(self.__manifest_name),
+                self.__caller_borrow.inspect_entry(
+                    self.__platform,
+                    self.__stage,
+                    self.__database_name,
+                ),
+                self.__caller_borrow.inspect_entry(
+                    self.__platform,
+                    self.__stage,
+                    self.__manifest_name,
+                ),
                 self.__source_root.inspect_entry(self.__source_name),
             )
+            self.__caller_borrow.reprove(self.__platform, self.__stage)
         except PlatformFileError as error:
             raise _portable_stage_error(error) from None
         if observed != (
@@ -248,15 +405,14 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
             self.__source,
             self.__source_root,
             self.__manifest,
-            self.__manifest_root,
             self.__database,
-            self.__database_root,
         ):
             try:
                 authority.close()
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        self.__caller_borrow._release()
         if first_error is not None:
             raise first_error
 
@@ -369,21 +525,21 @@ def _close_portable_stage_authorities(
 def _open_portable_stage_live_authority(
     platform: _StageSealerPlatform,
     stage: MutableStageRef,
+    caller_borrow: _CallerHeldSealBorrow,
 ) -> _PortableStageLiveAuthority:
     opened: list[OpaqueAuthority] = []
     try:
-        database_root = platform.bind_root(stage.staged_db_path.parent)
-        opened.append(database_root)
-        database = platform.open_existing_for_synchronization(
-            database_root,
-            PurePath(stage.staged_db_path.name),
+        caller_borrow.reprove(platform, stage)
+        database = caller_borrow.open_existing_for_synchronization(
+            platform,
+            stage,
+            stage.staged_db_path.name,
         )
         opened.append(database)
-        manifest_root = platform.bind_root(stage.manifest_temp_path.parent)
-        opened.append(manifest_root)
-        manifest = platform.open_existing_for_synchronization(
-            manifest_root,
-            PurePath(stage.manifest_temp_path.name),
+        manifest = caller_borrow.open_existing_for_synchronization(
+            platform,
+            stage,
+            stage.manifest_temp_path.name,
         )
         opened.append(manifest)
         source_path = stage.resource_identity.configured_jsonl_path
@@ -401,11 +557,12 @@ def _open_portable_stage_live_authority(
         database_facts = database.synchronize_content(database_facts)
         manifest_facts = manifest.synchronize_content(manifest_facts)
         live = _PortableStageLiveAuthority(
-            database_root=database_root,
+            caller_borrow=caller_borrow,
+            platform=platform,
+            stage=stage,
             database_name=stage.staged_db_path.name,
             database=database,
             database_facts=database_facts,
-            manifest_root=manifest_root,
             manifest_name=stage.manifest_temp_path.name,
             manifest=manifest,
             manifest_facts=manifest_facts,
@@ -3570,6 +3727,37 @@ class _SealedArtifactRegistry:
                 return entry.state
             return self._entry(stage).state
 
+    def retire_unissued_portable(self, stage: SealedStage) -> bool:
+        """Retire one pre-token portable entry without closing caller ownership."""
+
+        with self._lock:
+            entry = self._match_entry(stage)
+            if type(entry) is not _PortableRegistryEntry:
+                return False
+            if (
+                entry.state is not ActivationCapabilityState.SEALED
+                or entry.token is not None
+            ):
+                raise StageSealError("SEALER.TOKEN_ALREADY_ISSUED")
+            live_authority = entry.live_authority
+            if live_authority is None:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            artifact_id = entry.stage.artifact.artifact_id
+            self._entries.pop(artifact_id, None)
+            key = (
+                str(entry.mutable.staged_db_path),
+                str(entry.mutable.manifest_temp_path),
+            )
+            if self._sealed_paths.get(key) == artifact_id:
+                self._sealed_paths.pop(key, None)
+            self._portable_borrows = {
+                nonce: borrowed_artifact
+                for nonce, borrowed_artifact in self._portable_borrows.items()
+                if borrowed_artifact != artifact_id
+            }
+            live_authority.close()
+            return True
+
     def issue_token(
         self,
         stage: SealedStage,
@@ -3638,6 +3826,7 @@ class _SealedArtifactRegistry:
                 live_authority = entry.live_authority
                 if live_authority is None:
                     raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                live_authority.reprove()
                 self._entries[entry.stage.artifact.artifact_id] = replace(
                     entry,
                     state=ActivationCapabilityState.CONSUMED,
@@ -3664,6 +3853,7 @@ class _SealedArtifactRegistry:
                 live_authority = entry.live_authority
                 if live_authority is None:
                     raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                live_authority.reprove()
                 self._entries[entry.stage.artifact.artifact_id] = replace(
                     entry,
                     state=ActivationCapabilityState.CANCELLED,
@@ -3745,15 +3935,21 @@ class StageSealer:
         *,
         expected_prior_generation: int | None,
         schema_upgrade: bool,
+        caller_borrow: _CallerHeldSealBorrow,
     ) -> SealedStage:
         platform = self._platform
         if platform is None:
             raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        if type(caller_borrow) is not _CallerHeldSealBorrow:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        caller_borrow.reprove(platform, stage)
         lifecycle = self._lifecycle_registry()
         reservation = lifecycle._reserve_portable(stage)
         live_authority: _PortableStageLiveAuthority | None = None
         authority_transfer: _PortableAuthorityTransfer | None = None
+        borrow_transferred = False
         try:
+            caller_borrow.reprove(platform, stage)
             facts = _validate_stage_facts(
                 stage,
                 canonical_store_id=self._canonical_store_id,
@@ -3763,7 +3959,9 @@ class StageSealer:
             live_authority = _open_portable_stage_live_authority(
                 platform,
                 stage,
+                caller_borrow,
             )
+            borrow_transferred = True
             live_authority.reprove()
             database_proof, manifest_proof, source_proof = (
                 live_authority.persisted_proofs()
@@ -3837,6 +4035,8 @@ class StageSealer:
                     live_authority.close()
                 except BaseException:
                     pass
+            elif not borrow_transferred:
+                caller_borrow._release()
             try:
                 lifecycle._release(reservation)
             except BaseException:
@@ -3849,6 +4049,7 @@ class StageSealer:
         *,
         expected_prior_generation: int | None = None,
         schema_upgrade: bool = False,
+        caller_borrow: _CallerHeldSealBorrow | None = None,
     ) -> SealedStage:
         """Seal one complete migration stage into one opaque artifact.
 
@@ -3880,11 +4081,16 @@ class StageSealer:
                 raise StageSealError("SEALER.GENERATION_INVALID")
         stage = _snapshot_stage(mutable_stage)
         if self._platform is not None:
+            if type(caller_borrow) is not _CallerHeldSealBorrow:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
             return self._seal_portable(
                 stage,
                 expected_prior_generation=expected_prior_generation,
                 schema_upgrade=schema_upgrade,
+                caller_borrow=caller_borrow,
             )
+        if caller_borrow is not None:
+            raise StageSealError("SEALER.TYPE_INVALID")
         database_identity = _artifact_file_identity(
             stage.staged_db_path,
             missing_code="SEALER.STAGE_DATABASE_MISSING",
