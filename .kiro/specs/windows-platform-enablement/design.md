@@ -52,14 +52,14 @@
 
 ## Governance Impact
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`release-governance.md`、`project-principles.md`、`repository-safety.md`。
-- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019，以及已采纳的ADR-020/W1、ADR-021/W2、ADR-022/W3、ADR-023补充决策、ADR-024 provider-agnostic token profile与ADR-025 documented publish分层。
-- **ADR disposition**: **ADR-020～025 adopted；implementation按task graph授权**。ADR-023的LOCK-first、`PendingPublication`、MIC/security profile与动态native closure继续有效；ADR-024取代local/domain/Entra作为mandatory主体环境的要求，ADR-025取代runtime durability registry及硬断电硬件资格门。ADR-022除registry输入外的native entry、Boot TCB、source/fixture authority、clean build与packaged E2E保持不变。
+- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019，以及已采纳的ADR-020/W1、ADR-021/W2、ADR-022/W3、ADR-023补充决策、ADR-024 provider-agnostic token profile、ADR-025 documented publish分层与ADR-026 Parser无状态发布边界。
+- **ADR disposition**: **ADR-020～026 adopted；implementation按task graph授权**。ADR-023的LOCK-first、`PendingPublication`、MIC/security profile与动态native closure继续有效；ADR-024取代local/domain/Entra作为mandatory主体环境的要求，ADR-025取代runtime durability registry及硬断电硬件资格门，ADR-026取代ADR-020对Parser无条件外推journal/LKG的部分。ADR-022除registry输入外的native entry、Boot TCB、source/fixture authority、clean build与packaged E2E保持不变。
 - **Scope amendment**: **Approved**；`windows-platform-enablement` 只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence；consumer business invariants 继续归相邻 owning Specs。`tmx-context-interchange` 是唯一 owning Spec，`ui-mvp` 只记录其 amendment 提交血缘；Qt avatar 仅作 Windows 功能回归。
 - **Steering sync**: Approved；Governance owner 同步 `spec-ownership.md`、`roadmap.md` 和长期技术边界；`structure.md` 等待真实 runtime/build 文件落地后再按实际结构更新。本 feature branch 不产生重复 Steering 提交。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
 
 ### Implementation Authorization
-**GO for staged implementation**。ADR-020～025、Windows owning scope、WA-01～08 current R/D/T request、ledger/dependency authority与独立对抗性设计评审均已闭合；ADR-024/025活动合同同步由Task 0.6记录。本授权只允许按Tasks依赖逐簇实现；任一required amendment尚未形成commit/merge/evidence时，仍阻塞其对应consumer cluster和最终EXE gate，且任何新跨门槛事实必须返回ADR/Spec治理。
+**GO for staged implementation**。ADR-020～026、Windows owning scope、WA-01～08 current R/D/T request、ledger/dependency authority与独立对抗性设计评审均已闭合；ADR-024/025活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。本授权只允许按Tasks依赖逐簇实现；任一required amendment尚未形成commit/merge/evidence时，仍阻塞其对应consumer cluster和最终EXE gate，且任何新跨门槛事实必须返回ADR/Spec治理。
 
 ## Architecture
 
