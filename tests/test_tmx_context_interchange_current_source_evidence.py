@@ -15,6 +15,8 @@ OWNED = (
     "tmx_context_contracts.py",
     "tmx_context_interchange.py",
     "tmx_artifact_save.py",
+    "tmx_bound_artifact_save.py",
+    "tmx_platform_io.py",
     "tmx_export_scope_contracts.py",
     "tmx_export_coordinator.py",
 )
@@ -44,6 +46,14 @@ FORBIDDEN = {
     "tmx_artifact_save.py": (
         "collaborative_", "editor_", "parser_", "project_", "qt_",
         "resource_", "tm_",
+    ),
+    "tmx_bound_artifact_save.py": (
+        "collaborative_", "editor_", "parser_", "platform_fs_posix",
+        "platform_fs_windows", "project_", "qt_", "resource_", "tm_",
+    ),
+    "tmx_platform_io.py": (
+        "collaborative_", "editor_", "parser_", "platform_fs_posix",
+        "platform_fs_windows", "project_", "qt_", "resource_", "tm_",
     ),
     "tmx_export_scope_contracts.py": ("editor_", "qt_", "resource_"),
     "tmx_export_coordinator.py": ("editor_", "qt_", "resource_"),

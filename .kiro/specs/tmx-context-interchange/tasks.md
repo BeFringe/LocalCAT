@@ -13,7 +13,7 @@
 - [x] 2.1 实现 canonical record ↔ TMX unit 映射、LocalCAT props 与 unknown prop round-trip。
 - [x] 2.2 实现 deterministic Level 1 writer、loss report 与 Parser cold validation。
 - [x] 2.3 接入 TMX import draft，验证 context/provenance/status、缺 context、unknown props 与 inline XML 失败语义。
-- [ ] 2.3a 在 Windows 仅消费 Parser-issued sealed TMX source；reparse/hardlink/root drift 与 rooted capability failure 在 draft/Store mutation 前 fail closed。
+- [x] 2.3a 在 Windows 仅消费 Parser-issued sealed TMX source；reparse/hardlink/root drift 与 rooted capability failure 在 draft/Store mutation 前 fail closed。
   - _Amendment: WA-05_
   - _Depends: 2.3, WA-01, windows-platform-enablement 3.7_
 - [x] 2.4 完成真实 MateCat/LocalCAT fixture、hostile/fault、round-trip 和 compatibility tests。
@@ -24,11 +24,11 @@
 - [x] 3.2 建立 Workspace session+universe exact join 和 entire-project export。
 - [x] 3.3 叠加一个明选 Chunk scope projection，处理 detached/missing/foreign/stale。
 - [x] 3.4 实现 destination binding、candidate/LKG、cold validate、atomic publish、receipt/recovery。
-- [ ] 3.4a 将 TMX destination publication 接入 `BoundDirectoryPublisher` 与 `ProcessFileLock`，保持 candidate/LKG/cold validate/receipt 顺序。
+- [x] 3.4a 将 TMX destination publication 接入 `BoundDirectoryPublisher` 与 `ProcessFileLock`，保持 candidate/LKG/cold validate/receipt 顺序。
   - _Amendment: WA-05_
   - _Depends: 3.4, ADR-020, WA-01, windows-platform-enablement 2.1_
 - [x] 3.5 完成 resource/project/chunk exact scope、inclusion/loss 与 publication fault matrix。
-- [ ] 3.5a 在 Windows 覆盖 publish phase crash、锁竞争、destination replacement 与 clean-process recovery，失败不改 scope owner 或 source artifact。
+- [x] 3.5a 在 Windows 覆盖 publish phase crash、锁竞争、destination replacement 与 clean-process recovery，失败不改 scope owner 或 source artifact。
   - 每个失败必须证明target-before exact不变；rename后事实不确定时只进入recovery-required并保留LKG/journal，不得报告成功或猜测清理。
   - _Amendment: WA-05_
   - _Depends: 3.4a, 3.5, windows-platform-enablement 3.7_
@@ -47,7 +47,7 @@
 - [x] 5.3 用真实 canonical TM、多文档项目和 active chunk 完成三 scope journey；用 TMX ResourcePackage 完成冷重开事务。
 - [ ] 5.3a 在 Windows 源码运行中重放 TMX import、三 scope export、ResourcePackage 冷重开和 hostile XML/source journey。
   - _Amendment: WA-05_
-  - _Depends: 2.3a, 3.5a, 5.3_
+  - _Depends: 2.3a, 3.5a, 5.3, WA-03, WA-04, WA-06_
 - [x] 5.4 运行 Parser/TM/ResourcePackage/Project/Chunk/Qt/fault/architecture/full regression，更新 current-source steering/evidence。
 - [ ] 5.4a 在 ADR-022 frozen harness 重放 5.3a，证明 TMX fixtures、Parser 真实 `.py` 与 package resources 由受信 bundle authority 可见，并交付final Qt journey所需的fail-closed owner port。
   - _Amendment: WA-05_
