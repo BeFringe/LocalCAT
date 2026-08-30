@@ -14,6 +14,7 @@ from pathlib import Path, PurePath
 import sqlite3
 import stat
 import sys
+import time
 from types import MappingProxyType
 from typing import Any, cast
 import uuid
@@ -31,7 +32,10 @@ from tm_activation_journal import (
     _lstat_any_entry,
     _require_quarantine_directory,
 )
-from tm_activation_recovery import _PortableReplacementRecoveryRequired
+from tm_activation_recovery import (
+    _inspect_portable_replacement_namespace,
+    _PortableReplacementRecoveryRequired,
+)
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
@@ -113,11 +117,13 @@ from platform_fs import (
 )
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     CandidateContentFacts,
     CandidateFile,
     EntrySnapshot,
     ExistingFileRetirement,
+    ExistingFileMutationGuard,
     FileObjectIdentity,
     LockLease,
     LockPolicy,
@@ -141,6 +147,7 @@ _NATIVE_PATH_TYPE = type(Path())
 MIGRATION_STREAM_CHUNK_SIZE = 20_000
 _BOUND_EXPORT_LOCK_PREFIX = b"localcat.tm.export-family.lock.v1\0"
 _MAX_BOUND_EXPORT_BYTES = (1 << 63) - 1
+_BOUND_REFRESH_GUARD_RETRY_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -3453,6 +3460,8 @@ class TMMigrationService:
 
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
+        if sys.platform == "win32":
+            return self._run_bound_configured_refresh(store)
         identity = self._resource_identity
         paths = _export_artifact_paths(identity.configured_jsonl_path)
         destination_before: str | None = None
@@ -3636,6 +3645,357 @@ class TMMigrationService:
                 destination_observed=None,
             )
 
+    def _run_bound_configured_refresh(
+        self,
+        store: SQLiteTMStore,
+    ) -> ExportOutcome:
+        """Refresh the configured Windows pair under W1 and rooted handles."""
+
+        identity = self._resource_identity
+        paths = _export_artifact_paths(identity.configured_jsonl_path)
+        destination_prior = _BoundExportPrior(None, None)
+        manifest_prior = _BoundExportPrior(None, None)
+        reservation: _InitialActivationResourceReservation | None = None
+        sidecar_guard: BoundExistingFileMutationGuard | None = None
+        outcome: ExportOutcome | None = None
+        try:
+            # W1 is deliberately acquired before the in-process configured
+            # refresh reservation.  Replacement/recovery paths use this same
+            # resource order, so the refresh never introduces an inverse lock
+            # order or a second destination-family lock.
+            reservation = self._acquire_initial_reservation()
+            with reservation:
+                (
+                    backend,
+                    root,
+                    lease,
+                    lock_name,
+                    lock_payload,
+                ) = reservation.bound_family_inputs()
+                if (
+                    paths.destination.parent
+                    != identity.canonical_sidecar_path.parent
+                    or paths.manifest.parent
+                    != identity.canonical_sidecar_path.parent
+                ):
+                    raise ExportPreflightError(
+                        "REFRESH.CONFIGURED_PATH_MISMATCH"
+                    )
+                with store.configured_refresh_reservation():
+                    reservation.reprove()
+                    owner_revision = store.canonical_revision()
+                    if (
+                        owner_revision.resource_id != identity.resource_id
+                        or owner_revision.canonical_store_id
+                        != self._canonical_store_id
+                    ):
+                        raise ExportPreflightError(
+                            "REFRESH.STORE_IDENTITY_MISMATCH"
+                        )
+                    reservation.reprove_bound_refresh_owner(
+                        self._canonical_store_id,
+                        owner_revision.generation,
+                    )
+                    if not isinstance(backend, ExistingFileMutationGuard):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                            retryable=False,
+                        )
+                    guard_deadline = (
+                        time.monotonic()
+                        + _BOUND_REFRESH_GUARD_RETRY_SECONDS
+                    )
+                    while True:
+                        reservation.reprove()
+                        try:
+                            sidecar_guard = (
+                                backend.guard_existing_for_mutation(
+                                    root,
+                                    PurePath(
+                                        identity.canonical_sidecar_path.name
+                                    ),
+                                )
+                            )
+                            break
+                        except PlatformFileError as error:
+                            if (
+                                error.code
+                                != PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value
+                                or time.monotonic() >= guard_deadline
+                            ):
+                                raise
+                            time.sleep(0.05)
+                    sidecar_guard.reprove()
+
+                    def reprove_refresh_owner() -> None:
+                        try:
+                            reservation.reprove_bound_refresh_owner(
+                                self._canonical_store_id,
+                                owner_revision.generation,
+                            )
+                            sidecar_guard.reprove()
+                        except (
+                            _InitialActivationReservationError,
+                            ActivationPreparationError,
+                        ) as error:
+                            raise ExportPreflightError(
+                                "REFRESH.OWNER_UNPROVEN"
+                            ) from error
+
+                    def latch_proven_family_divergence() -> None:
+                        try:
+                            store.validate_bound_refresh_preflight(
+                                family_matches=lambda _binding: False,
+                            )
+                        except SQLiteStoreSchemaError as error:
+                            if str(error) != "STORE.DIVERGENCE_LATCHED":
+                                raise
+                        raise ExportPreflightError(
+                            "REFRESH.SOURCE_DIVERGED"
+                        )
+
+                    try:
+                        destination_prior = _capture_bound_export_prior(
+                            backend,
+                            root,
+                            root,
+                            paths.destination.name,
+                            unsafe_code="REFRESH.CONFIGURED_UNSAFE",
+                        )
+                        manifest_prior = _capture_bound_export_prior(
+                            backend,
+                            root,
+                            root,
+                            paths.manifest.name,
+                            unsafe_code="REFRESH.MANIFEST_UNSAFE",
+                        )
+                    except ExportPreflightError as error:
+                        if error.error_code in {
+                            "REFRESH.CONFIGURED_UNSAFE",
+                            "REFRESH.MANIFEST_UNSAFE",
+                        }:
+                            latch_proven_family_divergence()
+                        raise
+                    except PlatformFileError as error:
+                        if (
+                            error.code
+                            == PlatformFileErrorCode.REPARSE_REJECTED.value
+                        ):
+                            latch_proven_family_divergence()
+                        raise
+
+                    def bound_prior_matches(binding: SnapshotBinding) -> bool:
+                        if (
+                            binding.configured_jsonl_path
+                            != paths.destination
+                            or binding.manifest_path != paths.manifest
+                            or destination_prior.snapshot is None
+                            or manifest_prior.snapshot is None
+                            or destination_prior.digest
+                            != binding.receipt.jsonl_digest
+                        ):
+                            return False
+                        manifest_bytes = contract_to_json(
+                            binding.manifest
+                        ).encode("utf-8")
+                        return (
+                            manifest_prior.digest
+                            == hashlib.sha256(manifest_bytes).hexdigest()
+                        )
+
+                    try:
+                        observation = store.validate_bound_refresh_preflight(
+                            family_matches=bound_prior_matches,
+                        )
+                    except SQLiteStoreSchemaError as error:
+                        if str(error) == "STORE.DIVERGENCE_LATCHED":
+                            raise ExportPreflightError(
+                                "REFRESH.SOURCE_DIVERGED"
+                            ) from error
+                        raise
+                    if (
+                        observation.resource_id != identity.resource_id
+                        or observation.canonical_store_id
+                        != self._canonical_store_id
+                        or observation.state
+                        not in {
+                            SourceBindingState.VERIFIED_CURRENT,
+                            SourceBindingState.VERIFIED_HISTORY,
+                        }
+                    ):
+                        raise ExportPreflightError(
+                            "REFRESH.STORE_IDENTITY_MISMATCH"
+                        )
+                    for artifact, code in (
+                        (paths.jsonl_temp, "REFRESH.TEMP_CONFLICT"),
+                        (paths.manifest_temp, "REFRESH.TEMP_CONFLICT"),
+                        (paths.jsonl_recovery, "REFRESH.RECOVERY_CONFLICT"),
+                        (paths.manifest_recovery, "REFRESH.RECOVERY_CONFLICT"),
+                    ):
+                        if root.inspect_entry(artifact.name) is not None:
+                            raise ExportPreflightError(code)
+                    snapshot = store.capture_export_snapshot()
+                    if (
+                        snapshot.revision.resource_id
+                        != identity.resource_id
+                        or snapshot.revision.canonical_store_id
+                        != self._canonical_store_id
+                        or snapshot.revision.generation
+                        != owner_revision.generation
+                    ):
+                        raise ExportPreflightError(
+                            "REFRESH.STORE_IDENTITY_MISMATCH"
+                        )
+                    outcome = self._publish_bound_export_snapshot(
+                        store,
+                        backend=backend,
+                        root=root,
+                        parent=root,
+                        lease=lease,
+                        snapshot=snapshot,
+                        paths=paths,
+                        destination_prior=destination_prior,
+                        manifest_prior=manifest_prior,
+                        receipt_id_prefix="snapshot.refresh.",
+                        stage_prefix="REFRESH",
+                        lock_name=lock_name,
+                        lock_payload=lock_payload,
+                        register_receipt=lambda receipt: (
+                            store.register_issued_refresh_receipt(
+                                receipt,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                            )
+                        ),
+                        complete_receipt=lambda receipt, reprove: (
+                            store.complete_bound_issued_refresh_receipt(
+                                receipt.snapshot_id,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                                family_reprove=reprove,
+                            )
+                        ),
+                        probe_receipt=lambda receipt, reprove: (
+                            store.probe_bound_issued_refresh_receipt_completed(
+                                receipt.snapshot_id,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                                family_reprove=reprove,
+                            )
+                        ),
+                        cancel_receipt=lambda receipt: (
+                            store.cancel_issued_refresh_receipt(
+                                receipt.snapshot_id,
+                                expected_generation=(
+                                    snapshot.revision.generation
+                                ),
+                            )
+                        ),
+                        owner_reprove=reprove_refresh_owner,
+                    )
+                    if isinstance(outcome, ExportReport) or (
+                        isinstance(outcome, ExportFailure)
+                        and outcome.publication_committed
+                    ):
+                        reprove_refresh_owner()
+                        terminal_revision = store.canonical_revision()
+                        if (
+                            terminal_revision.resource_id
+                            != identity.resource_id
+                            or terminal_revision.canonical_store_id
+                            != self._canonical_store_id
+                            or terminal_revision.generation
+                            != owner_revision.generation
+                        ):
+                            raise ExportPreflightError(
+                                "REFRESH.STORE_IDENTITY_MISMATCH"
+                            )
+                guard_close_error = _close_bound_export_authorities(
+                    sidecar_guard
+                )
+                sidecar_guard = None
+                if guard_close_error is not None:
+                    raise guard_close_error
+            reservation = None
+            assert outcome is not None
+            return outcome
+        except (
+            _InitialActivationReservationError,
+            ActivationPreparationError,
+            ExportPreflightError,
+            PlatformFileError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            if outcome is not None:
+                if isinstance(outcome, ExportReport):
+                    return export_cleanup_pending_failure(
+                        stage="REFRESH.LEDGER",
+                        destination_before=destination_prior.digest,
+                        destination_observed=outcome.destination_digest,
+                        diagnostics=(
+                            _export_diagnostic(
+                                "REFRESH.CLEANUP_PENDING",
+                                "REFRESH_AUTHORITY_CLOSE_FAILED",
+                            ),
+                        ),
+                    )
+                if (
+                    isinstance(outcome, ExportFailure)
+                    and outcome.publication_committed
+                ):
+                    return outcome
+                return export_ledger_ambiguous_failure(
+                    stage="REFRESH.RECOVERY",
+                    error_code="REFRESH.RECOVERY_REQUIRED",
+                    destination_before=destination_prior.digest,
+                    destination_observed=destination_prior.digest,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "REFRESH.RECOVERY_REQUIRED",
+                            "REFRESH_OWNER_FINAL_REPROOF_FAILED",
+                        ),
+                    ),
+                )
+            observed = destination_prior.digest
+            normalized: Exception
+            if isinstance(error, PlatformFileError):
+                platform_error = _bound_export_platform_error(error)
+                normalized = ExportPreflightError(
+                    platform_error.error_code.replace(
+                        "EXPORT.",
+                        "REFRESH.",
+                        1,
+                    )
+                )
+            elif isinstance(error, _InitialActivationReservationError):
+                normalized = ExportPreflightError(
+                    "REFRESH.LOCK_UNAVAILABLE"
+                )
+            else:
+                normalized = error
+            return self._export_failure(
+                normalized,
+                stage_label="REFRESH.PREFLIGHT",
+                destination_before=destination_prior.digest,
+                destination_observed=observed,
+            )
+        finally:
+            _close_bound_export_authorities(sidecar_guard)
+            if reservation is not None:
+                try:
+                    reservation.release()
+                except (
+                    _InitialActivationReservationError,
+                    PlatformFileError,
+                    OSError,
+                ):
+                    pass
+
     def recover_configured_refresh(
         self,
         store: SQLiteTMStore,
@@ -3799,8 +4159,110 @@ class TMMigrationService:
         paths: _ExportArtifactPaths,
         destination_prior: _BoundExportPrior,
         manifest_prior: _BoundExportPrior,
+        receipt_id_prefix: str = "snapshot.export.",
+        stage_prefix: str = "EXPORT",
+        lock_name: str | None = None,
+        lock_payload: bytes | None = None,
+        register_receipt: Callable[[SnapshotReceipt], None] | None = None,
+        complete_receipt: Callable[
+            [SnapshotReceipt, Callable[[SnapshotReceipt], None]],
+            None,
+        ]
+        | None = None,
+        probe_receipt: Callable[
+            [SnapshotReceipt, Callable[[SnapshotReceipt], None]],
+            ReceiptCompletionProbe,
+        ]
+        | None = None,
+        cancel_receipt: Callable[[SnapshotReceipt], None] | None = None,
+        owner_reprove: Callable[[], None] | None = None,
     ) -> ExportOutcome:
-        """Publish one Windows JSONL/manifest family under live authorities."""
+        """Publish one Windows JSONL/manifest family under live authorities.
+
+        Task 5.13 parameterizes the Task 5.12 handshake at the owner boundary:
+        arbitrary export keeps its historical receipt/ledger callbacks while a
+        configured refresh supplies atomic binding adoption and its W1 lock.
+        Candidate creation, recovery copy, replace, live family reproof,
+        terminal reproof, cleanup and rollback remain one state machine.
+        """
+
+        if type(receipt_id_prefix) is not str or not receipt_id_prefix:
+            raise ValueError("receipt_id_prefix must be non-empty")
+        if type(stage_prefix) is not str or not stage_prefix:
+            raise ValueError("stage_prefix must be non-empty")
+        selected_lock_name = (
+            _bound_export_lock_name(paths.destination.name)
+            if lock_name is None
+            else lock_name
+        )
+        selected_lock_payload = (
+            _bound_export_lock_payload(paths.destination.name)
+            if lock_payload is None
+            else lock_payload
+        )
+        if type(selected_lock_name) is not str or not selected_lock_name:
+            raise TypeError("lock_name must be a non-empty string")
+        if type(selected_lock_payload) is not bytes or not selected_lock_payload:
+            raise TypeError("lock_payload must be non-empty bytes")
+        if register_receipt is None:
+            register_receipt = lambda value: store.register_issued_export_receipt(
+                value,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                expected_generation=snapshot.revision.generation,
+            )
+        if complete_receipt is None:
+            complete_receipt = lambda value, reprove: (
+                store.complete_bound_issued_export_receipt(
+                    value.snapshot_id,
+                    expected_generation=snapshot.revision.generation,
+                    destination_jsonl_path=paths.destination,
+                    destination_manifest_path=paths.manifest,
+                    family_reprove=reprove,
+                )
+            )
+        if probe_receipt is None:
+            probe_receipt = lambda value, _reprove: (
+                store.probe_issued_receipt_completed(
+                    value.snapshot_id,
+                    expected_generation=snapshot.revision.generation,
+                    require_bound=False,
+                )
+            )
+        if cancel_receipt is None:
+            cancel_receipt = lambda value: store.cancel_issued_export_receipt(
+                value.snapshot_id,
+                expected_generation=snapshot.revision.generation,
+            )
+        if owner_reprove is None:
+            owner_reprove = lambda: None
+        for callback, callback_name in (
+            (register_receipt, "register_receipt"),
+            (complete_receipt, "complete_receipt"),
+            (probe_receipt, "probe_receipt"),
+            (cancel_receipt, "cancel_receipt"),
+            (owner_reprove, "owner_reprove"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"{callback_name} must be callable")
+
+        def family_code(suffix: str) -> str:
+            return f"{stage_prefix}.{suffix}"
+
+        def family_error(error: Exception) -> Exception:
+            normalized: Exception = error
+            if isinstance(error, PlatformFileError):
+                normalized = _bound_export_platform_error(error)
+            code = getattr(normalized, "error_code", None)
+            if (
+                stage_prefix != "EXPORT"
+                and type(code) is str
+                and code.startswith("EXPORT.")
+            ):
+                return ExportPreflightError(
+                    f"{stage_prefix}.{code.removeprefix('EXPORT.')}"
+                )
+            return normalized
 
         jsonl_publication: _BoundExportPublication | None = None
         manifest_publication: _BoundExportPublication | None = None
@@ -3826,10 +4288,11 @@ class TMMigrationService:
             ):
                 raise ExportPreflightError("EXPORT.RECEIPT_MISMATCH")
             lease.reprove()
+            owner_reprove()
             lease.reprove_binding(
                 parent,
-                _bound_export_lock_name(paths.destination.name),
-                _bound_export_lock_payload(paths.destination.name),
+                selected_lock_name,
+                selected_lock_payload,
             )
             root.reprove()
             parent.reprove()
@@ -3902,6 +4365,7 @@ class TMMigrationService:
                 raise ExportPreflightError("EXPORT.MANIFEST_VERIFY_FAILED")
 
         try:
+            owner_reprove()
             jsonl_candidate, jsonl_content, jsonl_identity = (
                 _bound_candidate_from_chunks(
                     parent,
@@ -3918,7 +4382,7 @@ class TMMigrationService:
                 candidate=jsonl_candidate,
             )
             receipt = SnapshotReceipt(
-                snapshot_id=f"snapshot.export.{uuid.uuid4().hex}",
+                snapshot_id=f"{receipt_id_prefix}{uuid.uuid4().hex}",
                 resource_id=snapshot.revision.resource_id,
                 canonical_store_id=snapshot.revision.canonical_store_id,
                 exported_revision=snapshot.revision.head_revision,
@@ -3948,13 +4412,9 @@ class TMMigrationService:
                 candidate_identity=manifest_identity,
                 candidate=manifest_candidate,
             )
+            owner_reprove()
             registration_attempted = True
-            store.register_issued_export_receipt(
-                receipt,
-                destination_jsonl_path=paths.destination,
-                destination_manifest_path=paths.manifest,
-                expected_generation=snapshot.revision.generation,
-            )
+            register_receipt(receipt)
             issued = True
             (
                 jsonl_recovery_identity,
@@ -3998,15 +4458,10 @@ class TMMigrationService:
             )
             reprove_family(receipt)
             try:
-                store.complete_bound_issued_export_receipt(
-                    receipt.snapshot_id,
-                    expected_generation=snapshot.revision.generation,
-                    destination_jsonl_path=paths.destination,
-                    destination_manifest_path=paths.manifest,
-                    family_reprove=reprove_family,
-                )
+                complete_receipt(receipt, reprove_family)
                 owner_completed = True
             except (
+                ActivationPreparationError,
                 ExportPreflightError,
                 PlatformFileError,
                 SQLiteStoreLifecycleError,
@@ -4014,11 +4469,18 @@ class TMMigrationService:
                 sqlite3.DatabaseError,
             ):
                 try:
-                    probe = store.probe_issued_receipt_completed(
-                        receipt.snapshot_id,
-                        expected_generation=snapshot.revision.generation,
-                        require_bound=False,
-                    )
+                    probe = probe_receipt(receipt, reprove_family)
+                except (
+                    ActivationPreparationError,
+                    ExportPreflightError,
+                    PlatformFileError,
+                ):
+                    # The bound refresh probe invokes the family callback only
+                    # after proving the durable completed row and binding.  A
+                    # callback failure is therefore committed-but-unclean and
+                    # must never enter restore/cancel.
+                    owner_completed = True
+                    raise
                 except (
                     SQLiteStoreLifecycleError,
                     SQLiteStoreSchemaError,
@@ -4044,8 +4506,11 @@ class TMMigrationService:
                 if pending is not None
             )
             for pending in terminal_pendings:
+                owner_reprove()
                 if pending.terminal_reproof() != pending.preliminary_facts():
-                    raise ExportPreflightError("EXPORT.TERMINAL_REPROOF_FAILED")
+                    raise ExportPreflightError(
+                        family_code("TERMINAL_REPROOF_FAILED")
+                    )
             close_error = _close_bound_export_authorities(*terminal_pendings)
             jsonl_recovery_pending = None
             manifest_recovery_pending = None
@@ -4068,6 +4533,7 @@ class TMMigrationService:
                 diagnostics=(),
             )
         except (
+            ActivationPreparationError,
             ExportPreflightError,
             PlatformFileError,
             SQLiteStoreLifecycleError,
@@ -4081,31 +4547,27 @@ class TMMigrationService:
                 paths.destination.name,
             )
             if completion_ambiguous:
-                normalized = (
-                    _bound_export_platform_error(error)
-                    if isinstance(error, PlatformFileError)
-                    else error
-                )
+                normalized = family_error(error)
                 return export_ledger_ambiguous_failure(
-                    stage="EXPORT.LEDGER",
+                    stage=family_code("LEDGER"),
                     error_code=_export_error_code(normalized),
                     destination_before=destination_prior.digest,
                     destination_observed=observed,
                     diagnostics=(
                         _export_diagnostic(
-                            "EXPORT.LEDGER_AMBIGUOUS",
+                            family_code("LEDGER_AMBIGUOUS"),
                             "EXPORT_LEDGER_AMBIGUOUS",
                         ),
                     ),
                 )
             if owner_completed:
                 return export_cleanup_pending_failure(
-                    stage="EXPORT.LEDGER",
+                    stage=family_code("LEDGER"),
                     destination_before=destination_prior.digest,
                     destination_observed=observed,
                     diagnostics=(
                         _export_diagnostic(
-                            "EXPORT.CLEANUP_PENDING",
+                            family_code("CLEANUP_PENDING"),
                             "EXPORT_ARTIFACTS_REMAIN",
                         ),
                     ),
@@ -4121,19 +4583,15 @@ class TMMigrationService:
                 if close_error is not None:
                     candidate_close_unproven = True
             if registration_attempted and not issued:
-                normalized = (
-                    _bound_export_platform_error(error)
-                    if isinstance(error, PlatformFileError)
-                    else error
-                )
+                normalized = family_error(error)
                 return export_ledger_ambiguous_failure(
-                    stage="EXPORT.LEDGER",
+                    stage=family_code("LEDGER"),
                     error_code=_export_error_code(normalized),
                     destination_before=destination_prior.digest,
                     destination_observed=observed,
                     diagnostics=(
                         _export_diagnostic(
-                            "EXPORT.LEDGER_AMBIGUOUS",
+                            family_code("LEDGER_AMBIGUOUS"),
                             "EXPORT_LEDGER_AMBIGUOUS",
                         ),
                     ),
@@ -4156,25 +4614,21 @@ class TMMigrationService:
                     if cleanup_error is not None:
                         cleanup_unproven = True
                 if not cleanup_unproven:
-                    normalized = (
-                        _bound_export_platform_error(error)
-                        if isinstance(error, PlatformFileError)
-                        else error
-                    )
+                    normalized = family_error(error)
                     return self._export_failure(
                         normalized,
-                        stage_label="EXPORT.PUBLISH",
+                        stage_label=family_code("PUBLISH"),
                         destination_before=destination_prior.digest,
                         destination_observed=destination_prior.digest,
                     )
                 return self._export_failure(
-                    ExportPreflightError("EXPORT.RECOVERY_REQUIRED"),
-                    stage_label="EXPORT.RECOVERY",
+                    ExportPreflightError(family_code("RECOVERY_REQUIRED")),
+                    stage_label=family_code("RECOVERY"),
                     destination_before=destination_prior.digest,
                     destination_observed=destination_prior.digest,
                     diagnostics=(
                         _export_diagnostic(
-                            "EXPORT.RECOVERY_REQUIRED",
+                            family_code("RECOVERY_REQUIRED"),
                             "EXPORT_ARTIFACTS_REMAIN",
                         ),
                     ),
@@ -4214,15 +4668,13 @@ class TMMigrationService:
                                 manifest_recovery_identity,
                             ),
                         ),
-                        cancel=lambda: store.cancel_issued_export_receipt(
-                            receipt.snapshot_id,
-                            expected_generation=snapshot.revision.generation,
-                        ),
+                        cancel=lambda: cancel_receipt(receipt),
                     )
                     jsonl_recovery_pending = None
                     manifest_recovery_pending = None
                     restored = True
                 except (
+                    ActivationPreparationError,
                     ExportPreflightError,
                     PlatformFileError,
                     SQLiteStoreLifecycleError,
@@ -4248,7 +4700,9 @@ class TMMigrationService:
                             (paths.manifest_recovery.name, manifest_recovery_identity),
                         ),
                     )
+                    owner_reprove()
                 except (
+                    ActivationPreparationError,
                     ExportPreflightError,
                     PlatformFileError,
                 ) as cleanup_error:
@@ -4257,31 +4711,23 @@ class TMMigrationService:
                     restored = False
             if restored:
                 observed = destination_prior.digest
-                normalized = (
-                    _bound_export_platform_error(error)
-                    if isinstance(error, PlatformFileError)
-                    else error
-                )
+                normalized = family_error(error)
                 return self._export_failure(
                     normalized,
-                    stage_label="EXPORT.PUBLISH",
+                    stage_label=family_code("PUBLISH"),
                     destination_before=destination_prior.digest,
                     destination_observed=observed,
                 )
             selected_error = restore_error if restore_error is not None else error
-            normalized = (
-                _bound_export_platform_error(selected_error)
-                if isinstance(selected_error, PlatformFileError)
-                else selected_error
-            )
+            normalized = family_error(selected_error)
             return export_ledger_ambiguous_failure(
-                stage="EXPORT.RECOVERY",
+                stage=family_code("RECOVERY"),
                 error_code=_export_error_code(normalized),
                 destination_before=destination_prior.digest,
                 destination_observed=observed,
                 diagnostics=(
                     _export_diagnostic(
-                        "EXPORT.RECOVERY_REQUIRED",
+                        family_code("RECOVERY_REQUIRED"),
                         "EXPORT_RECOVERY_REQUIRED",
                     ),
                 ),
@@ -7739,6 +8185,107 @@ class _InitialActivationResourceReservation:
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             ) from error
 
+    def bound_family_inputs(
+        self,
+    ) -> tuple[
+        PlatformFileBackend,
+        RootedDirectoryAuthority,
+        LockLease,
+        str,
+        bytes,
+    ]:
+        """Borrow the retained platform root and W1 lease without closing them."""
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        self.reprove()
+        return (
+            self._backend,
+            self._root,
+            self._lease,
+            self._lock_name,
+            self._payload(self._identity),
+        )
+
+    def reprove_bound_refresh_owner(
+        self,
+        canonical_store_id: str,
+        expected_generation: int,
+    ) -> None:
+        """Authenticate the completed private activation chain under W1.
+
+        This proves the private directory ACL/MIC, device-local secret, record
+        MACs and the full publication phase chain through the existing recovery
+        owner.  It intentionally does not treat the activation-time configured
+        JSONL/manifest bytes as current authority; the refresh family handles
+        close that separate comparison immediately afterwards.
+        """
+
+        if type(canonical_store_id) is not str or not canonical_store_id:
+            raise TypeError("canonical_store_id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        inputs = self.fresh_refresh_owner_inputs()
+        try:
+            snapshot, inspected_root, base_generation = (
+                _inspect_portable_replacement_namespace(
+                    identity=self._identity,
+                    backend=cast(PlatformFileBackend, inputs["platform"]),
+                    persistent_private=inputs["persistent_private"],
+                    descendant_inspection=inputs["descendant_inspection"],
+                    caller_borrow=inputs["caller_borrow"],
+                )
+            )
+        except ActivationPreparationError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        if inspected_root is not self._root:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if snapshot is None:
+            owner_store_id = base_generation.unsigned.canonical_store_id
+            owner_generation = base_generation.unsigned.generation
+        elif (
+            snapshot.state == "CURRENT"
+            and snapshot.current_record is not None
+            and not snapshot.pending_records
+        ):
+            owner_store_id = (
+                snapshot.current_record.unsigned.candidate_canonical_store_id
+            )
+            owner_generation = snapshot.current_record.unsigned.next_generation
+        else:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if (
+            owner_store_id != canonical_store_id
+            or owner_generation != expected_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        self.reprove()
+
     def stage_seal_inputs(
         self,
         attempt: _InitialStageAttempt | None = None,
@@ -7886,6 +8433,26 @@ class _InitialActivationResourceReservation:
         recovery in the same serialized operation.  Each call mints a distinct
         single-claim borrow, while the retained root and lease remain exactly
         the same reservation authority.
+        """
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        return self._mint_portable_recovery_inputs()
+
+    def fresh_refresh_owner_inputs(self) -> dict[str, object]:
+        """Mint one fresh read-only owner borrow for configured refresh reproof.
+
+        Each call returns a distinct single-claim borrow while this reservation
+        retains the same W1 root and lease.  The consumer authenticates existing
+        private facts only; this seam creates no journal, key, codec record, or
+        publication artifact.
         """
 
         if (
