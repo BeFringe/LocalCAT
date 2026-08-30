@@ -10111,6 +10111,122 @@ class SQLiteTMStore:
             records=tuple(_export_record_from_row(row) for row in rows),
         )
 
+    def validate_bound_refresh_preflight(
+        self,
+        *,
+        family_matches: Callable[[SnapshotBinding], bool],
+    ) -> SourceBindingObservation:
+        """Validate the configured binding without reopening either pathname.
+
+        The Windows refresh owner already holds the resource W1 reservation and
+        exact rooted handles for the configured JSONL/manifest family.  This
+        transaction closes the ledger half of that proof and asks the caller to
+        compare those live handle facts with the completed binding.  A mismatch
+        latches source divergence before any refresh candidate or receipt can be
+        created.  Issued configured receipts are left for the explicit recovery
+        entry and therefore block a new refresh here.
+        """
+
+        if not callable(family_matches):
+            raise TypeError("family_matches must be callable")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    facts = _read_source_binding_facts_in_transaction(
+                        connection,
+                        lease,
+                    )
+                    issued = connection.execute(
+                        "SELECT 1 FROM tm_snapshot_receipt "
+                        "WHERE status = 'issued' AND "
+                        "destination_jsonl_path = ? AND "
+                        "destination_manifest_path = ? LIMIT 1",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                        ),
+                    ).fetchone()
+                    if issued is not None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.REFRESH_RECOVERY_REQUIRED"
+                        )
+                    binding = facts.binding
+                    binding_count = (
+                        None
+                        if binding is None
+                        else dict(facts.cumulative_record_counts).get(
+                            binding.receipt.exported_revision
+                        )
+                    )
+                    diverged = (
+                        facts.divergence_latched
+                        or bool(facts.diagnostic_codes)
+                        or binding is None
+                        or binding_count != binding.receipt.record_count
+                    )
+                    if not diverged:
+                        assert binding is not None
+                        try:
+                            _validate_binding_identity(
+                                binding,
+                                identity=identity,
+                                canonical_store_id=lease.canonical_store_id,
+                            )
+                        except (TypeError, ValueError):
+                            diverged = True
+                    if not diverged:
+                        assert binding is not None
+                        matched = family_matches(binding)
+                        if type(matched) is not bool:
+                            raise TypeError(
+                                "family_matches must return a built-in bool"
+                            )
+                        diverged = not matched
+                    if diverged:
+                        if not facts.divergence_latched:
+                            updated = connection.execute(
+                                "UPDATE tm_meta SET value = '1' "
+                                "WHERE key = 'divergence_latched'"
+                            )
+                            if updated.rowcount != 1:
+                                raise SQLiteStoreSchemaError(
+                                    "STORE.DIVERGENCE_LATCH_MISSING"
+                                )
+                        connection.commit()
+                        raise SQLiteStoreSchemaError(
+                            "STORE.DIVERGENCE_LATCHED"
+                        )
+                    assert binding is not None
+                    state = (
+                        SourceBindingState.VERIFIED_CURRENT
+                        if binding.receipt.exported_revision
+                        == facts.head_revision
+                        else SourceBindingState.VERIFIED_HISTORY
+                    )
+                    observation = SourceBindingObservation(
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        generation=lease.generation,
+                        head_revision=facts.head_revision,
+                        state=state,
+                        binding_digest=_snapshot_binding_digest(binding),
+                        diagnostic_codes=(),
+                    )
+                    connection.commit()
+                    return observation
+                except Exception:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+
     def register_issued_snapshot_receipt(
         self,
         receipt: SnapshotReceipt,
@@ -11089,6 +11205,148 @@ class SQLiteTMStore:
                     connection.rollback()
                     raise
 
+    def complete_bound_issued_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> None:
+        """Atomically complete and adopt one live rooted refresh family.
+
+        The caller retains the configured JSONL/manifest handles and the W1
+        resource reservation.  While this write transaction still owns an
+        ``issued`` row, the callback re-proves that live family against the
+        reconstructed receipt.  Completion and the singleton binding adoption
+        then commit together.  No POSIX file capture or durable pathname
+        handoff participates in this Windows owner seam.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, exported_revision, "
+                        "jsonl_digest, record_count, format_version "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_UNKNOWN"
+                        )
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_STALE"
+                        )
+                    if (
+                        str(row[3])
+                        != Path.__str__(identity.configured_jsonl_path)
+                        or str(row[4])
+                        != Path.__str__(identity.snapshot_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_PATH_MISMATCH"
+                        )
+                    receipt = SnapshotReceipt(
+                        snapshot_id=snapshot_id,
+                        resource_id=str(row[0]),
+                        canonical_store_id=str(row[1]),
+                        exported_revision=_row_int(row[5]),
+                        jsonl_digest=str(row[6]),
+                        record_count=_row_int(row[7]),
+                        format_version=str(row[8]),
+                    )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    if (
+                        receipt.exported_revision != revision.head_revision
+                        or receipt.record_count != revision.record_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_REVISION_STALE"
+                        )
+                    facts = _read_source_binding_facts_in_transaction(
+                        connection,
+                        lease,
+                    )
+                    if facts.divergence_latched:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.DIVERGENCE_LATCHED"
+                        )
+                    if facts.diagnostic_codes:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.SNAPSHOT_LEDGER_CORRUPT"
+                        )
+                    family_reprove(receipt)
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ? AND status = 'issued'",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, 'EXPLICIT_EXPORT', ?, ?) "
+                        "ON CONFLICT(binding_id) DO UPDATE SET "
+                        "configured_jsonl_path = excluded.configured_jsonl_path, "
+                        "manifest_path = excluded.manifest_path, "
+                        "snapshot_kind = excluded.snapshot_kind, "
+                        "snapshot_id = excluded.snapshot_id, "
+                        "binding_version = excluded.binding_version",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            snapshot_id,
+                            SNAPSHOT_BINDING_VERSION,
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
     def _complete_issued_export_receipt_strict(
         self,
         snapshot_id: str,
@@ -12015,6 +12273,121 @@ class SQLiteTMStore:
             canonical_sidecar_path=identity.canonical_sidecar_path,
             target_identity_fragment=identity.target_identity[:16],
         )
+
+    def probe_bound_issued_refresh_receipt_completed(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> ReceiptCompletionProbe:
+        """Probe a Windows refresh completion through its retained handles.
+
+        A durable ``COMMITTED`` result requires the completed receipt, the
+        singleton binding adoption, the unchanged current canonical revision,
+        an unlatched source, and the caller's live rooted family reproof.  This
+        deliberately avoids ``_capture_activation_file`` and the POSIX
+        artifact-handoff journal.  A committed ledger whose owner facts do not
+        close is reported as ``COMMITTED_UNCLEAN`` and must never be restored or
+        cancelled by the publisher.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, "
+                        "destination_manifest_path, exported_revision, "
+                        "jsonl_digest, record_count, format_version "
+                        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None or (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                        or str(row[2]) != "completed"
+                    ):
+                        connection.commit()
+                        return ReceiptCompletionProbe.NOT_COMMITTED
+                    bound = connection.execute(
+                        "SELECT configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version "
+                        "FROM tm_snapshot_binding WHERE binding_id = 1"
+                    ).fetchone()
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    meta = _read_meta(connection)
+                    pending_handoff = connection.execute(
+                        "SELECT 1 FROM tm_meta WHERE key = ?",
+                        (_artifact_handoff_meta_key(snapshot_id),),
+                    ).fetchone()
+                    try:
+                        receipt = SnapshotReceipt(
+                            snapshot_id=snapshot_id,
+                            resource_id=str(row[0]),
+                            canonical_store_id=str(row[1]),
+                            exported_revision=_row_int(row[5]),
+                            jsonl_digest=str(row[6]),
+                            record_count=_row_int(row[7]),
+                            format_version=str(row[8]),
+                        )
+                    except (TypeError, ValueError):
+                        connection.commit()
+                        return ReceiptCompletionProbe.COMMITTED_UNCLEAN
+                    if (
+                        str(row[3])
+                        != Path.__str__(identity.configured_jsonl_path)
+                        or str(row[4])
+                        != Path.__str__(identity.snapshot_manifest_path)
+                        or receipt.exported_revision != revision.head_revision
+                        or receipt.record_count != revision.record_count
+                        or _meta_bool(meta, "divergence_latched")
+                        or pending_handoff is not None
+                        or bound
+                        != (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            SnapshotKind.EXPLICIT_EXPORT.value,
+                            snapshot_id,
+                            SNAPSHOT_BINDING_VERSION,
+                        )
+                    ):
+                        connection.commit()
+                        return ReceiptCompletionProbe.COMMITTED_UNCLEAN
+                    family_reprove(receipt)
+                    connection.commit()
+                    return ReceiptCompletionProbe.COMMITTED
+                except Exception:
+                    connection.rollback()
+                    raise
 
     def probe_issued_receipt_completed(
         self,
