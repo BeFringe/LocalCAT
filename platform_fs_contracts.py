@@ -647,6 +647,54 @@ class MutableFileReservation(OpaqueAuthority, ABC):
     def _reprove_identity(self) -> FileObjectIdentity: ...
 
 
+class ExistingRetirementSource(OpaqueAuthority, ABC):
+    """Live, rooted authority for retiring one already-existing file.
+
+    Unlike ``MutableFileReservation`` this authority does not claim creator
+    ownership.  It proves exact portable content through a handle opened with
+    the platform's rename/delete access and is consumed only by the dedicated
+    existing-file retirement protocol.
+    """
+
+    __slots__ = ("__identity", "__expected_content")
+
+    def __init__(
+        self,
+        identity: FileObjectIdentity,
+        expected_content: CandidateContentFacts,
+    ) -> None:
+        super().__init__()
+        if type(identity) is not FileObjectIdentity:
+            raise TypeError("identity must be exact FileObjectIdentity")
+        if identity.kind != "regular" or identity.link_count != 1:
+            raise ValueError("retirement source requires one regular-file link")
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        self.__identity = identity
+        self.__expected_content = expected_content
+
+    def reprove(self) -> BoundContentFacts:
+        self._require_open()
+        facts = self._reprove_source()
+        if type(facts) is not BoundContentFacts:
+            raise TypeError("backend source reproof must return exact BoundContentFacts")
+        if (
+            facts.snapshot.identity != self.__identity
+            or facts.snapshot.identity.kind != "regular"
+            or facts.snapshot.identity.link_count != 1
+            or facts.snapshot.byte_count != self.__expected_content.byte_count
+            or facts.content_sha256 != self.__expected_content.content_sha256
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return facts
+
+    @abstractmethod
+    def _reprove_source(self) -> BoundContentFacts: ...
+
+
 class RetainedRetirement(OpaqueAuthority, ABC):
     """Live proof that one owned file now occupies the exact retirement name.
 
@@ -1488,6 +1536,196 @@ class OwnedNamespaceRetirement(Protocol):
         reservation: MutableFileReservation,
         target_parent: RetirementDirectoryAuthority,
         target_name: str,
+    ) -> RetainedRetirement: ...
+
+
+@runtime_checkable
+class LockedDescendantNamespaceInspection(Protocol):
+    """Observe one descendant namespace under an exact ancestor W1 lease."""
+
+    def observe_descendant_entries(
+        self,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        descendant: BoundDirectoryAuthority,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be LockLease")
+        if not isinstance(descendant, BoundDirectoryAuthority):
+            raise TypeError("descendant must be a bound directory authority")
+        root._require_open()
+        lease._require_open()
+        descendant._require_open()
+        if type(limits) is not LedgerEnumerationLimits:
+            raise TypeError("limits must be exact LedgerEnumerationLimits")
+        result = self._observe_descendant_entries(root, lease, descendant, limits)
+        if type(result) is not tuple:
+            raise TypeError("backend descendant observations must be an exact tuple")
+        if len(result) > limits.maximum_entries:
+            raise ValueError("backend descendant observations exceed the entry limit")
+        previous_name: str | None = None
+        total_bytes = 0
+        for observation in result:
+            if type(observation) is not LedgerEntryObservation:
+                raise TypeError("backend returned a non-exact descendant observation")
+            name_bytes = observation.name.encode("utf-8", errors="strict")
+            if len(name_bytes) > limits.maximum_name_bytes:
+                raise ValueError("backend descendant observation exceeds the name limit")
+            if previous_name is not None and observation.name <= previous_name:
+                raise ValueError("backend descendant observations must be uniquely sorted")
+            previous_name = observation.name
+            total_bytes += observation.snapshot.byte_count
+            if total_bytes > limits.maximum_total_bytes:
+                raise ValueError("backend descendant observations exceed the byte limit")
+        return result
+
+    @abstractmethod
+    def _observe_descendant_entries(
+        self,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        descendant: BoundDirectoryAuthority,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]: ...
+
+
+@runtime_checkable
+class ExistingFileRetirement(Protocol):
+    """Retire or freshly rebind one exact existing file without creator state."""
+
+    def open_existing_retirement_source(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        root._require_open()
+        checked_relative = validate_relative_path(relative)
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        authority = self._open_existing_retirement_source(
+            root,
+            checked_relative,
+            expected_content,
+        )
+        try:
+            if not isinstance(authority, ExistingRetirementSource):
+                raise TypeError("backend source open must return ExistingRetirementSource")
+            authority._require_open()
+            authority.reprove()
+            return authority
+        except BaseException:
+            if isinstance(authority, ExistingRetirementSource):
+                try:
+                    authority.close()
+                except BaseException:
+                    pass
+            raise
+
+    @abstractmethod
+    def _open_existing_retirement_source(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource: ...
+
+    def retire_existing_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        source: ExistingRetirementSource,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if not isinstance(source_parent, BoundDirectoryAuthority):
+            raise TypeError("source_parent must be BoundDirectoryAuthority")
+        if not isinstance(target_parent, RetirementDirectoryAuthority):
+            raise TypeError("target_parent must be RetirementDirectoryAuthority")
+        if not isinstance(source, ExistingRetirementSource):
+            raise TypeError("source must be ExistingRetirementSource")
+        source_parent._require_open()
+        target_parent._require_open()
+        source._require_open()
+        checked_source = validate_relative_name(source_name)
+        checked_target = validate_relative_name(target_name)
+        authority = self._retire_existing_exclusive(
+            source_parent,
+            checked_source,
+            source,
+            target_parent,
+            checked_target,
+        )
+        if not isinstance(authority, RetainedRetirement):
+            raise TypeError("backend retirement must return RetainedRetirement")
+        authority._require_open()
+        if not source.closed:
+            authority.close()
+            raise TypeError("backend retirement must consume the source authority")
+        return authority
+
+    @abstractmethod
+    def _retire_existing_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        source: ExistingRetirementSource,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement: ...
+
+    def rebind_existing_retirement(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+    ) -> RetainedRetirement:
+        if not isinstance(source_parent, BoundDirectoryAuthority):
+            raise TypeError("source_parent must be BoundDirectoryAuthority")
+        if not isinstance(target_parent, RetirementDirectoryAuthority):
+            raise TypeError("target_parent must be RetirementDirectoryAuthority")
+        source_parent._require_open()
+        target_parent._require_open()
+        checked_source = validate_relative_name(source_name)
+        checked_target = validate_relative_name(target_name)
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        authority = self._rebind_existing_retirement(
+            source_parent,
+            checked_source,
+            target_parent,
+            checked_target,
+            expected_content,
+        )
+        try:
+            if not isinstance(authority, RetainedRetirement):
+                raise TypeError("backend rebind must return RetainedRetirement")
+            authority._require_open()
+            authority.reprove()
+            return authority
+        except BaseException:
+            if isinstance(authority, RetainedRetirement):
+                try:
+                    authority.close()
+                except BaseException:
+                    pass
+            raise
+
+    @abstractmethod
+    def _rebind_existing_retirement(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
     ) -> RetainedRetirement: ...
 
 

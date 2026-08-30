@@ -238,6 +238,14 @@
   - _Boundary: Windows Platform Capability Gate_
   - _Depends: 3.4, 3.6_
 
+- [x] 3.7a 增补 fresh recovery 的锁定descendant闭集与既有文件隔离authority
+  - 新增两个不并入`PlatformFileBackend`的runtime-checkable窄能力：ancestor rooted authority + exact W1 lease下的普通bound descendant执行bounded双遍闭集观察；existing exact-parent枚举与`RetirementDirectoryAuthority`能力集保持不变
+  - 从同一Windows backend取得专用live existing-source handle，以regular/single-link/live identity及portable exact size+SHA-256证明对象；对deterministic quarantine执行no-clobber rename并将source close ownership转交retained retirement，fresh process只在source absent+target exact时以新handle重绑
+  - 覆盖unknown/limit/reparse、issuer/lease/ancestor-descendant mismatch、source+target coexist、target foreign/content drift、rename arm/terminal reproof及程序错误穿透；禁止任意删除、覆盖、pathname接管或持久化Volume/FileId
+  - _Requirements: 1.2, 3.3, 4.3, 5.1, 5.3, 8.4_
+  - _Boundary: Windows Fresh Recovery Platform Authorities_
+  - _Depends: 3.3, 3.5, 3.7_
+
 - [x] 4. 集成 Parser/Chunk amendments并恢复 source Qt启动
 
 - [x] 4.1 验证并集成 WA-01 Parser 与 WA-02 startup amendment commits

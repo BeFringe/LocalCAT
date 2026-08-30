@@ -9,6 +9,8 @@ import sys
 from typing import cast
 
 from platform_fs_contracts import (
+    ExistingFileRetirement,
+    LockedDescendantNamespaceInspection,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
@@ -19,6 +21,8 @@ from platform_fs_contracts import (
 
 __all__ = [
     "compose_platform_file_backend",
+    "narrow_windows_existing_file_retirement",
+    "narrow_windows_locked_descendant_namespace_inspection",
     "narrow_windows_persistent_private_proof",
 ]
 
@@ -186,5 +190,51 @@ def narrow_windows_persistent_private_proof(
             raise _capability_unavailable()
         _self_probe(backend, checked_root)
         return cast(PersistentPrivateProof, backend)
+    except Exception:
+        raise _capability_unavailable() from None
+
+
+def narrow_windows_locked_descendant_namespace_inspection(
+    backend: PlatformFileBackend,
+    probe_root: Path,
+) -> LockedDescendantNamespaceInspection:
+    """Narrow the exact composed Windows backend to descendant inspection."""
+
+    try:
+        checked_root = validate_root_path(probe_root)
+        if sys.platform != "win32":
+            raise _capability_unavailable()
+        backend_type = _load_windows_backend_type()
+        if (
+            type(backend) is not backend_type
+            or not _backend_has_contract(backend)
+            or not isinstance(backend, LockedDescendantNamespaceInspection)
+        ):
+            raise _capability_unavailable()
+        _self_probe(backend, checked_root)
+        return cast(LockedDescendantNamespaceInspection, backend)
+    except Exception:
+        raise _capability_unavailable() from None
+
+
+def narrow_windows_existing_file_retirement(
+    backend: PlatformFileBackend,
+    probe_root: Path,
+) -> ExistingFileRetirement:
+    """Narrow the exact composed Windows backend to existing-file retirement."""
+
+    try:
+        checked_root = validate_root_path(probe_root)
+        if sys.platform != "win32":
+            raise _capability_unavailable()
+        backend_type = _load_windows_backend_type()
+        if (
+            type(backend) is not backend_type
+            or not _backend_has_contract(backend)
+            or not isinstance(backend, ExistingFileRetirement)
+        ):
+            raise _capability_unavailable()
+        _self_probe(backend, checked_root)
+        return cast(ExistingFileRetirement, backend)
     except Exception:
         raise _capability_unavailable() from None
