@@ -93,13 +93,16 @@ from tm_content_attestation import (
 )
 from platform_fs_contracts import (
     BoundContentFacts,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     BoundSynchronizedRegularFile,
     CandidateContentFacts,
     CandidateFile,
+    ExistingFileMutationGuard,
     ExistingFileRetirement,
     LockedDescendantNamespaceInspection,
     MutableFileReservation,
+    OpaqueAuthority,
     PendingPublication,
     PersistentPrivateProof,
     PlatformFileBackend,
@@ -808,6 +811,94 @@ class SourceBindingObservation:
     diagnostic_codes: tuple[str, ...]
 
 
+class _PortableActiveSetAuthority(OpaqueAuthority):
+    """Process-local protection for one fully revalidated ACTIVE set."""
+
+    __slots__ = (
+        "_coordinator",
+        "_root",
+        "_database_guard",
+        "_authorities",
+        "_names",
+        "_proofs",
+        "_attestation",
+    )
+
+    def __init__(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        root: RootedDirectoryAuthority,
+        database_guard: BoundExistingFileMutationGuard,
+        authorities: tuple[BoundRegularFile, BoundRegularFile, BoundRegularFile],
+        names: tuple[str, str, str],
+        proofs: tuple[
+            PortableContentFileProof,
+            PortableContentFileProof,
+            PortableContentFileProof,
+        ],
+        attestation: PortableActiveContentAttestation,
+    ) -> None:
+        super().__init__()
+        if not isinstance(database_guard, BoundExistingFileMutationGuard):
+            raise TypeError("database_guard must be a live mutation guard")
+        if len(authorities) != 3 or any(
+            not isinstance(item, BoundRegularFile) for item in authorities
+        ):
+            raise TypeError("active-set authorities must contain three files")
+        if len(names) != 3 or len(proofs) != 3:
+            raise ValueError("active-set authority facts must contain three entries")
+        if type(attestation) is not PortableActiveContentAttestation:
+            raise TypeError("attestation must be exact portable active attestation")
+        self._coordinator = coordinator
+        self._root = root
+        self._database_guard = database_guard
+        self._authorities = authorities
+        self._names = names
+        self._proofs = proofs
+        self._attestation = attestation
+        self.reprove()
+
+    def reprove(self) -> PortableActiveContentAttestation:
+        self._require_open()
+        self._database_guard.reprove()
+        for name, authority, expected in zip(
+            self._names,
+            self._authorities,
+            self._proofs,
+            strict=True,
+        ):
+            facts = authority.content_facts()
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or self._root.inspect_entry(name) != facts.snapshot
+                or self._coordinator._portable_content_proof(facts) != expected
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.ACTIVE_SET_INVALID",
+                    retryable=False,
+                )
+        self._database_guard.reprove()
+        return self._attestation
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        for authority in reversed(self._authorities):
+            try:
+                authority.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self._database_guard.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+
 
 
 class _CoordinatorStorePort:
@@ -900,7 +991,11 @@ class _CoordinatorStorePort:
         root: RootedDirectoryAuthority,
         activation_digest: str,
         allow_sealed_transition: bool,
-    ) -> tuple[PortableContentFileProof, str]:
+    ) -> tuple[
+        PortableContentFileProof,
+        str,
+        BoundExistingFileMutationGuard,
+    ]:
         return self._coordinator._apply_portable_receipt_activation(
             binding=binding,
             prepared=prepared,
@@ -940,7 +1035,13 @@ class _CoordinatorStorePort:
         manifest: PortableContentFileProof,
         activation_digest: str,
         expected_logical_closure_digest: str,
-    ) -> tuple[_CanonicalStoreRef, SQLiteSchemaSnapshot, PortableActiveContentAttestation]:
+        database_guard: BoundExistingFileMutationGuard,
+    ) -> tuple[
+        _CanonicalStoreRef,
+        SQLiteSchemaSnapshot,
+        PortableActiveContentAttestation,
+        _PortableActiveSetAuthority,
+    ]:
         return self._coordinator._reprove_portable_active_set(
             binding=binding,
             prepared=prepared,
@@ -950,6 +1051,7 @@ class _CoordinatorStorePort:
             manifest=manifest,
             activation_digest=activation_digest,
             expected_logical_closure_digest=expected_logical_closure_digest,
+            database_guard=database_guard,
         )
 
     def ensure_portable_activation_lineage_marker(
@@ -3832,7 +3934,11 @@ class ResourceStoreCoordinator:
         root: RootedDirectoryAuthority,
         activation_digest: str,
         allow_sealed_transition: bool,
-    ) -> tuple[PortableContentFileProof, str]:
+    ) -> tuple[
+        PortableContentFileProof,
+        str,
+        BoundExistingFileMutationGuard,
+    ]:
         """Complete only the first-generation SQLite owner transaction."""
 
         if type(allow_sealed_transition) is not bool:
@@ -3844,7 +3950,18 @@ class ResourceStoreCoordinator:
         database_name = identity.canonical_sidecar_path.name
         opened: BoundRegularFile | None = None
         synchronized: BoundSynchronizedRegularFile | None = None
+        mutation_guard: BoundExistingFileMutationGuard | None = None
         try:
+            if not isinstance(platform, ExistingFileMutationGuard):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                    retryable=False,
+                )
+            mutation_guard = platform.guard_existing_for_mutation(
+                root,
+                PurePath(database_name),
+            )
+            mutation_guard.reprove()
             opened = platform.open_regular(root, PurePath(database_name))
             before = opened.content_facts()
             before_proof = self._portable_content_proof(before)
@@ -3973,6 +4090,8 @@ class ResourceStoreCoordinator:
                     connection.rollback()
                     raise
 
+            mutation_guard.reprove()
+
             # The retained publication handle was deliberately closed before
             # SQLite acquired a writer.  Reopen the exact canonical object and
             # make the committed bytes durable through the platform port.
@@ -3993,7 +4112,16 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
                     retryable=False,
                 )
-            return self._portable_content_proof(final), closure_digest
+            mutation_guard.reprove()
+            synchronized.close()
+            synchronized = None
+            transferred_guard = mutation_guard
+            mutation_guard = None
+            return (
+                self._portable_content_proof(final),
+                closure_digest,
+                transferred_guard,
+            )
         except ActivationPreparationError:
             raise
         except (PlatformFileError, OSError, sqlite3.Error, SQLiteStoreSchemaError) as error:
@@ -4002,10 +4130,18 @@ class ResourceStoreCoordinator:
                 retryable=True,
             ) from error
         finally:
-            if opened is not None:
-                opened.close()
-            if synchronized is not None:
-                synchronized.close()
+            active_error = sys.exception()
+            first_cleanup_error: BaseException | None = None
+            for authority in (opened, synchronized, mutation_guard):
+                if authority is None:
+                    continue
+                try:
+                    authority.close()
+                except BaseException as cleanup_error:
+                    if first_cleanup_error is None:
+                        first_cleanup_error = cleanup_error
+            if active_error is None and first_cleanup_error is not None:
+                raise first_cleanup_error
 
     def _reprove_portable_active_set(
         self,
@@ -4018,14 +4154,27 @@ class ResourceStoreCoordinator:
         manifest: PortableContentFileProof,
         activation_digest: str,
         expected_logical_closure_digest: str,
-    ) -> tuple[_CanonicalStoreRef, SQLiteSchemaSnapshot, PortableActiveContentAttestation]:
+        database_guard: BoundExistingFileMutationGuard,
+    ) -> tuple[
+        _CanonicalStoreRef,
+        SQLiteSchemaSnapshot,
+        PortableActiveContentAttestation,
+        _PortableActiveSetAuthority,
+    ]:
         """Rebuild portable ACTIVE facts from live handles and SQLite truth."""
 
         identity = self._resource_identity
         unsigned = prepared.unsigned
         sealed = unsigned.sealed_content_attestation
         authorities: list[BoundRegularFile] = []
+        owned_database_guard: BoundExistingFileMutationGuard | None = database_guard
         try:
+            if not isinstance(database_guard, BoundExistingFileMutationGuard):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                    retryable=False,
+                )
+            database_guard.reprove()
             observed_proofs: list[PortableContentFileProof] = []
             for name, expected in (
                 (identity.canonical_sidecar_path.name, database),
@@ -4068,12 +4217,12 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.ACTIVE_SET_INVALID",
                     retryable=False,
                 )
-            # Windows read authorities intentionally deny concurrent writers.
-            # Release the exact-byte observations before SQLite opens the DB,
-            # then reopen and compare the same facts after the transaction.
-            for authority in reversed(authorities):
-                authority.close()
-            authorities.clear()
+            # The database read authority denies SQLite's writer.  Keep the
+            # manifest and configured source live, but release only that DB
+            # reader while the non-deleting mutation guard protects identity.
+            database_before = authorities.pop(0)
+            database_before.close()
+            database_guard.reprove()
 
             active_ref = _canonical_activation_ref(
                 identity,
@@ -4222,26 +4371,24 @@ class ResourceStoreCoordinator:
                     connection.rollback()
                     raise
 
-            for name, expected in zip(
-                (
-                    identity.canonical_sidecar_path.name,
-                    identity.snapshot_manifest_path.name,
-                    identity.configured_jsonl_path.name,
-                ),
-                observed_proofs,
-                strict=True,
+            database_authority = platform.open_regular(
+                root,
+                PurePath(identity.canonical_sidecar_path.name),
+            )
+            database_facts = database_authority.content_facts()
+            if (
+                self._portable_content_proof(database_facts)
+                != observed_proofs[0]
+                or root.inspect_entry(identity.canonical_sidecar_path.name)
+                != database_facts.snapshot
             ):
-                authority = platform.open_regular(root, PurePath(name))
-                authorities.append(authority)
-                facts = authority.content_facts()
-                if (
-                    self._portable_content_proof(facts) != expected
-                    or root.inspect_entry(name) != facts.snapshot
-                ):
-                    raise ActivationPreparationError(
-                        "ACTIVATION.ACTIVE_SET_INVALID",
-                        retryable=False,
-                    )
+                database_authority.close()
+                raise ActivationPreparationError(
+                    "ACTIVATION.ACTIVE_SET_INVALID",
+                    retryable=False,
+                )
+            authorities.insert(0, database_authority)
+            database_guard.reprove()
 
             semantic = ContentSemanticFacts(
                 schema_version=snapshot.schema_version,
@@ -4289,7 +4436,32 @@ class ResourceStoreCoordinator:
                 source=observed_proofs[2],
                 semantic_facts=semantic,
             )
-            return active_ref, snapshot, active
+            live = _PortableActiveSetAuthority(
+                coordinator=self,
+                root=root,
+                database_guard=database_guard,
+                authorities=cast(
+                    tuple[BoundRegularFile, BoundRegularFile, BoundRegularFile],
+                    tuple(authorities),
+                ),
+                names=(
+                    identity.canonical_sidecar_path.name,
+                    identity.snapshot_manifest_path.name,
+                    identity.configured_jsonl_path.name,
+                ),
+                proofs=cast(
+                    tuple[
+                        PortableContentFileProof,
+                        PortableContentFileProof,
+                        PortableContentFileProof,
+                    ],
+                    tuple(observed_proofs),
+                ),
+                attestation=active,
+            )
+            authorities.clear()
+            owned_database_guard = None
+            return active_ref, snapshot, active, live
         except ActivationPreparationError:
             raise
         except (PlatformFileError, OSError, sqlite3.Error, SQLiteStoreSchemaError) as error:
@@ -4298,8 +4470,20 @@ class ResourceStoreCoordinator:
                 retryable=False,
             ) from error
         finally:
-            for authority in reversed(authorities):
-                authority.close()
+            active_error = sys.exception()
+            first_cleanup_error: BaseException | None = None
+            cleanup_authorities: tuple[OpaqueAuthority, ...] = (
+                *tuple(reversed(authorities)),
+                *((owned_database_guard,) if owned_database_guard is not None else ()),
+            )
+            for authority in cleanup_authorities:
+                try:
+                    authority.close()
+                except BaseException as cleanup_error:
+                    if first_cleanup_error is None:
+                        first_cleanup_error = cleanup_error
+            if active_error is None and first_cleanup_error is not None:
+                raise first_cleanup_error
 
     def _publish_portable_generation(
         self,
@@ -4512,6 +4696,8 @@ class ResourceStoreCoordinator:
             manifest_candidate: CandidateFile | None = None
             database_pending: PendingPublication | None = None
             manifest_pending: PendingPublication | None = None
+            database_guard: BoundExistingFileMutationGuard | None = None
+            active_set_authority: _PortableActiveSetAuthority | None = None
 
             def fresh_physical_borrow() -> Any:
                 fresh = self._sealed_registry.resolve_physical_readiness(stage)
@@ -4748,7 +4934,7 @@ class ResourceStoreCoordinator:
                     )
 
                 digest = activation_digest()
-                active_database, logical_closure = (
+                active_database, logical_closure, database_guard = (
                     self._apply_portable_receipt_activation(
                         binding=physical.evidence.source_binding,
                         prepared=prepared,
@@ -4758,6 +4944,7 @@ class ResourceStoreCoordinator:
                         allow_sealed_transition=True,
                     )
                 )
+                database_guard.reprove()
 
                 manifest_borrow = fresh_physical_borrow()
                 try:
@@ -4806,7 +4993,14 @@ class ResourceStoreCoordinator:
                         "ACTIVATION.MANIFEST_PUBLICATION_UNPROVEN",
                         retryable=False,
                     )
-                active_ref, active_snapshot, active_attestation = (
+                if database_guard is None:
+                    raise AssertionError("portable database mutation guard is missing")
+                (
+                    active_ref,
+                    active_snapshot,
+                    active_attestation,
+                    active_set_authority,
+                ) = (
                     self._reprove_portable_active_set(
                         binding=physical.evidence.source_binding,
                         prepared=prepared,
@@ -4816,8 +5010,10 @@ class ResourceStoreCoordinator:
                         manifest=active_manifest,
                         activation_digest=digest,
                         expected_logical_closure_digest=logical_closure,
+                        database_guard=database_guard,
                     )
                 )
+                database_guard = None
                 manifest_unsigned = phase_unsigned(
                     "MANIFEST_PUBLISHED",
                     db_phase.record_digest,
@@ -4832,16 +5028,9 @@ class ResourceStoreCoordinator:
                             "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
                             retryable=False,
                         )
-                    _, _, observed = self._reprove_portable_active_set(
-                        binding=physical.evidence.source_binding,
-                        prepared=prepared,
-                        platform=platform,
-                        root=root,
-                        database=active_database,
-                        manifest=active_manifest,
-                        activation_digest=digest,
-                        expected_logical_closure_digest=logical_closure,
-                    )
+                    if active_set_authority is None:
+                        raise AssertionError("portable active-set authority is missing")
+                    observed = active_set_authority.reprove()
                     if observed != active_attestation:
                         raise ActivationPreparationError(
                             "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
@@ -4904,16 +5093,9 @@ class ResourceStoreCoordinator:
                     owner_reprove=owner_reprove,
                     business_reprove=active_business,
                 )
-                _, _, final_active = self._reprove_portable_active_set(
-                    binding=physical.evidence.source_binding,
-                    prepared=prepared,
-                    platform=platform,
-                    root=root,
-                    database=active_database,
-                    manifest=active_manifest,
-                    activation_digest=digest,
-                    expected_logical_closure_digest=logical_closure,
-                )
+                if active_set_authority is None:
+                    raise AssertionError("portable active-set authority is missing")
+                final_active = active_set_authority.reprove()
                 if final_active != active_attestation:
                     raise ActivationPreparationError(
                         "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
@@ -4924,10 +5106,14 @@ class ResourceStoreCoordinator:
                     raise TypeError(
                         "retire_unpublished_stage must return None"
                     )
+                active_set_authority.reprove()
                 self._ensure_portable_activation_lineage_marker(
                     platform=platform,
                     root=root,
                 )
+                active_set_authority.reprove()
+                active_set_authority.close()
+                active_set_authority = None
                 self._view = view
                 self._preparation = None
                 self._state = "READY"
@@ -4983,6 +5169,8 @@ class ResourceStoreCoordinator:
                     manifest_candidate,
                     database_pending,
                     manifest_pending,
+                    database_guard,
+                    active_set_authority,
                 ):
                     if authority is None:
                         continue
