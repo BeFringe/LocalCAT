@@ -828,8 +828,15 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                 self.assertIsNone(coordinator.active_store_path)
                 self.assertFalse(identity.canonical_sidecar_path.exists())
                 private_root = root / prepared.private_directory_name
-                terminal_path = private_root / pending_record.unsigned.terminal_name
                 self.assertFalse(pending_path.exists())
+                quarantine = (
+                    root
+                    / ".localcat-activation-quarantine-v1"
+                    / tm_activation_journal._portable_activation_quarantine_name(
+                        pending_record.unsigned
+                    )
+                )
+                terminal_path = quarantine / pending_record.unsigned.terminal_name
                 terminal_record = (
                     tm_activation_journal._parse_portable_activation_journal_bytes(
                         terminal_path.read_bytes()
@@ -843,14 +850,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     sorted(path.name for path in private_root.iterdir()),
-                    ["activation-terminal-v3.json", "device.key"],
-                )
-                quarantine = (
-                    root
-                    / ".localcat-activation-quarantine-v1"
-                    / tm_activation_journal._portable_activation_quarantine_name(
-                        terminal_record.unsigned
-                    )
+                    ["device.key"],
                 )
                 self.assertEqual(
                     sorted(path.name for path in quarantine.iterdir()),
@@ -859,6 +859,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                             pending_record.unsigned.journal_name,
                             pending_record.unsigned.candidate_stage_db_name,
                             pending_record.unsigned.candidate_manifest_temp_name,
+                            pending_record.unsigned.terminal_name,
                         )
                     ),
                 )
@@ -943,6 +944,87 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     reservation,
                 )
 
+    def test_cancelled_key_only_namespace_reuses_exact_device_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            backend = platform_fs_windows.WindowsPlatformAdapter()
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+                platform_backend=backend,
+            )
+            first_reservation, first_sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            first_preparation = None
+            try:
+                first_preparation = coordinator.activate(first_sealed)
+                first_prepared = coordinator.publish_portable_prepared_activation(
+                    first_preparation,
+                    **first_reservation.portable_journal_inputs(),
+                )
+                private_root = root / first_prepared.private_directory_name
+                key_before = (private_root / "device.key").read_bytes()
+                coordinator.recover_portable_prepared_cancellation(
+                    **first_reservation.portable_recovery_inputs(),
+                )
+                first_preparation = None
+                self.assertEqual(
+                    sorted(path.name for path in private_root.iterdir()),
+                    ["device.key"],
+                )
+            finally:
+                first_reservation.release()
+
+            second_coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            second_service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=second_coordinator,
+                platform_backend=backend,
+            )
+            second_reservation, second_sealed, _registry = self._portable_sealed_stage(
+                second_service,
+                second_coordinator,
+                identity,
+            )
+            second_preparation = None
+            try:
+                second_preparation = second_coordinator.activate(second_sealed)
+                second_prepared = (
+                    second_coordinator.publish_portable_prepared_activation(
+                        second_preparation,
+                        **second_reservation.portable_journal_inputs(),
+                    )
+                )
+                self.assertEqual((private_root / "device.key").read_bytes(), key_before)
+                self.assertEqual(
+                    sorted(path.name for path in private_root.iterdir()),
+                    ["activation-journal-v3.json", "device.key"],
+                )
+                self.assertEqual(
+                    second_prepared.preparation_id,
+                    second_preparation.preparation_id,
+                )
+            finally:
+                _release_portable_test_authorities(
+                    second_coordinator,
+                    second_preparation,
+                    second_reservation,
+                )
+                _remove_long_quarantine(root)
+
     def test_portable_prepared_fresh_process_cancel_and_second_replay_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -978,17 +1060,15 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                 self.assertEqual(len({creator["pid"], first["pid"], second["pid"]}), 3)
                 self.assertTrue(creator["canonical_absent"])
                 self.assertEqual(first["input_closure"], "PENDING")
-                self.assertEqual(second["input_closure"], "CANCELLED")
+                self.assertEqual(second["input_closure"], "NO_FACTS")
+                self.assertEqual(first["phase"], "PREPARED")
+                self.assertEqual(first["action"], "CANCELLED")
+                self.assertIsNone(first["generation"])
+                self.assertEqual(second["action"], "NONE")
                 for recovery in (first, second):
-                    self.assertEqual(recovery["phase"], "PREPARED")
-                    self.assertEqual(recovery["action"], "CANCELLED")
-                    self.assertIsNone(recovery["generation"])
                     self.assertEqual(recovery["state"], "READY")
                     self.assertTrue(recovery["canonical_absent"])
-                    self.assertEqual(
-                        recovery["private_names"],
-                        ["activation-terminal-v3.json", "device.key"],
-                    )
+                    self.assertEqual(recovery["private_names"], ["device.key"])
                 self.assertEqual(first["terminal"], second["terminal"])
                 self.assertEqual(first["quarantine"], second["quarantine"])
                 expected = {
@@ -997,6 +1077,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                         creator["pending"],
                         creator["stage"],
                         creator["manifest"],
+                        first["terminal"],
                     )
                 }
                 self.assertEqual(first["quarantine"], expected)
@@ -1078,7 +1159,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                         self.assertEqual(recovery["action"], "CANCELLED")
                         self.assertEqual(
                             recovery["private_names"],
-                            ["activation-terminal-v3.json", "device.key"],
+                            ["device.key"],
                         )
                         self.assertEqual(
                             recovery["quarantine"][candidate["name"]],
@@ -1089,7 +1170,8 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                             recovery["quarantine"],
                             replay["quarantine"],
                         )
-                        self.assertEqual(replay["input_closure"], "CANCELLED")
+                        self.assertEqual(replay["input_closure"], "NO_FACTS")
+                        self.assertEqual(replay["action"], "NONE")
                     finally:
                         _remove_long_quarantine(root)
 
@@ -1206,7 +1288,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     finally:
                         _remove_long_quarantine(root)
 
-    def test_terminal_only_fresh_replay_preserves_foreign_quarantine_error(self) -> None:
+    def test_key_only_fresh_replay_preserves_archived_quarantine_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
 
@@ -1257,8 +1339,11 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                 self.assertFalse(
                     (private_roots[0] / "activation-journal-v3.json").exists()
                 )
+                self.assertFalse(
+                    (private_roots[0] / "activation-terminal-v3.json").exists()
+                )
                 self.assertTrue(
-                    (private_roots[0] / "activation-terminal-v3.json").is_file()
+                    (quarantine_roots[0] / "activation-terminal-v3.json").is_file()
                 )
                 foreign_path = quarantine_roots[0] / "foreign.bin"
                 foreign_path.write_bytes(b"foreign-quarantine-residue")
@@ -1271,16 +1356,13 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     for path in sorted(root.rglob("*"), key=lambda item: str(item))
                 }
 
-                failed, failure = run_worker("recover", require_success=False)
+                replayed, replay = run_worker("recover")
 
-                self.assertNotEqual(failed.returncode, 0)
-                if failure is None:
-                    raise AssertionError("fresh replay returned no stable error")
-                self.assertEqual(
-                    failure["error_code"],
-                    "ACTIVATION.QUARANTINE_FOREIGN",
-                )
-                self.assertFalse(failure["retryable"])
+                self.assertEqual(replayed.returncode, 0)
+                if replay is None:
+                    raise AssertionError("fresh replay returned no stable facts")
+                self.assertEqual(replay["input_closure"], "NO_FACTS")
+                self.assertEqual(replay["action"], "NONE")
                 after = {
                     str(path.relative_to(root)): (
                         "directory"

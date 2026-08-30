@@ -208,8 +208,9 @@
   - 完成时，各 phase 的同 token 重放只产生一个 generation，已完成 token 不可再次消费
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.8a 闭合 Windows restart/owner-exit 幂等恢复
+- [x] 5.8a 闭合 Windows restart/owner-exit 幂等恢复
   - 每个 journal phase 在 fresh process 中重验 lock、private proof、DB/manifest bytes 与 token，只有 exact prior/new facts 可继续或取消并且只发布一个 generation。
+  - PREPARED取消闭合后将exact CANCELLED terminal无覆盖归档到确定性quarantine，fresh复证private闭集仅保留已验证device key；下一次attempt只在该key-only形态与canonical absence同时成立时复用private root/key，并创建全新的PENDING。
   - _Amendment: WA-06_
   - _Depends: 5.7a, 5.8_
 
