@@ -246,6 +246,14 @@
   - _Boundary: Windows Fresh Recovery Platform Authorities_
   - _Depends: 3.3, 3.5, 3.7_
 
+- [x] 3.7b 为既有 pathname writer 提供live mutation guard
+  - 新增不并入`PlatformFileBackend`的runtime-checkable窄能力：在rooted regular/single-link文件上保留当前live object与name lineage，允许SQLite既有文件读写，但在guard存活期间拒绝delete/rename/replacement
+  - reproof只比较同时存活的handle、name、regular/single-link与root chain；不得持久化或输出Volume/FileId，也不得授予publish、retirement、private或business success
+  - 覆盖真实SQLite写入、同/异字节replacement、hardlink/reparse、late lifecycle、close fault与程序错误穿透；不支持的平台稳定返回`CAPABILITY_UNAVAILABLE`
+  - _Requirements: 1.2, 2.2, 3.3, 4.3, 8.4_
+  - _Boundary: Windows Existing-file Mutation Guard_
+  - _Depends: 3.2, 3.7a_
+
 - [x] 4. 集成 Parser/Chunk amendments并恢复 source Qt启动
 
 - [x] 4.1 验证并集成 WA-01 Parser 与 WA-02 startup amendment commits

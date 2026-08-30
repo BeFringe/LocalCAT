@@ -16,6 +16,7 @@ from unittest import mock
 from platform_fs_contracts import (
     BoundDirectoryAuthority,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
     PersistentPrivateProof,
@@ -139,6 +140,16 @@ class _FaultingBackend:
         raise AssertionError
 
     _open_existing_for_synchronization = open_existing_for_synchronization
+
+    def guard_existing_for_mutation(
+        self,
+        root: object,
+        relative: object,
+    ) -> object:
+        del root, relative
+        raise AssertionError
+
+    _guard_existing_for_mutation = guard_existing_for_mutation
 
     def reserve_mutable_file(self, parent: object, name: str) -> object:
         del parent, name
@@ -726,6 +737,7 @@ class CompositionFactoryMatrixTests(unittest.TestCase):
         from platform_fs_windows import WindowsPlatformAdapter
 
         self.assertIs(type(backend), WindowsPlatformAdapter)
+        self.assertIsInstance(backend, ExistingFileMutationGuard)
         self.assertIs(narrowed, backend)
         self.assertEqual(after, before)
 
