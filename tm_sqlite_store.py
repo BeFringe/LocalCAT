@@ -302,6 +302,7 @@ from tm_activation_recovery import (
     completed_authority_requires_reattestation,
     reattest_completed_authority,
     recover_durable_activation,
+    recover_portable_activation,
     rollback_durable_activation,
 )
 
@@ -883,6 +884,84 @@ class _CoordinatorStorePort:
 
     def notify_all(self) -> None:
         self._coordinator._condition.notify_all()
+
+    def portable_content_proof(
+        self,
+        facts: BoundContentFacts | CandidateContentFacts,
+    ) -> PortableContentFileProof:
+        return self._coordinator._portable_content_proof(facts)
+
+    def apply_portable_receipt_activation(
+        self,
+        *,
+        binding: SnapshotBinding,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        activation_digest: str,
+        allow_sealed_transition: bool,
+    ) -> tuple[PortableContentFileProof, str]:
+        return self._coordinator._apply_portable_receipt_activation(
+            binding=binding,
+            prepared=prepared,
+            platform=platform,
+            root=root,
+            activation_digest=activation_digest,
+            allow_sealed_transition=allow_sealed_transition,
+        )
+
+    def reprove_portable_sealed_database(
+        self,
+        *,
+        prepared: _PortableActivationJournalRecord,
+    ) -> None:
+        snapshot = inspect_stage_schema(
+            _canonical_activation_ref(
+                self.resource_identity,
+                journal_id=prepared.unsigned.journal_id,
+            ),
+            canonical_store_id=self.canonical_store_id,
+            _allow_sealed=True,
+        )
+        if snapshot.activation_status != "SEALED":
+            raise ActivationPreparationError(
+                "ACTIVATION.DB_REOPEN_INVALID",
+                retryable=False,
+            )
+
+    def reprove_portable_active_set(
+        self,
+        *,
+        binding: SnapshotBinding,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        database: PortableContentFileProof,
+        manifest: PortableContentFileProof,
+        activation_digest: str,
+        expected_logical_closure_digest: str,
+    ) -> tuple[_CanonicalStoreRef, SQLiteSchemaSnapshot, PortableActiveContentAttestation]:
+        return self._coordinator._reprove_portable_active_set(
+            binding=binding,
+            prepared=prepared,
+            platform=platform,
+            root=root,
+            database=database,
+            manifest=manifest,
+            activation_digest=activation_digest,
+            expected_logical_closure_digest=expected_logical_closure_digest,
+        )
+
+    def ensure_portable_activation_lineage_marker(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> None:
+        self._coordinator._ensure_portable_activation_lineage_marker(
+            platform=platform,
+            root=root,
+        )
 
     def _activate_candidate_store_id(self, candidate_id: str) -> None:
         """Private replacement seam: switch coordinator authority store id.
@@ -3480,6 +3559,7 @@ class ResourceStoreCoordinator:
         *,
         platform: PlatformFileBackend,
         persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
         caller_borrow: _CallerHeldPortableJournalBorrow,
     ) -> _PortablePreparedJournalHandle:
         """Publish only one Windows v3 PREPARED owner envelope.
@@ -3500,7 +3580,10 @@ class ResourceStoreCoordinator:
             raise TypeError(
                 "persistent_private must satisfy PersistentPrivateProof"
             )
-        if persistent_private is not platform:
+        if (
+            persistent_private is not platform
+            or descendant_inspection is not platform
+        ):
             raise ActivationPreparationError(
                 "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
                 retryable=False,
@@ -3705,6 +3788,7 @@ class ResourceStoreCoordinator:
                     identity=identity,
                     backend=platform,
                     persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
                     caller_borrow=caller_borrow,
                     unsigned=unsigned,
                     owner_reprove=owner_reprove,
@@ -3742,13 +3826,17 @@ class ResourceStoreCoordinator:
     def _apply_portable_receipt_activation(
         self,
         *,
-        preparation: _ActivationPreparation,
+        binding: SnapshotBinding,
         prepared: _PortableActivationJournalRecord,
         platform: PlatformFileBackend,
         root: RootedDirectoryAuthority,
         activation_digest: str,
+        allow_sealed_transition: bool,
     ) -> tuple[PortableContentFileProof, str]:
         """Complete only the first-generation SQLite owner transaction."""
+
+        if type(allow_sealed_transition) is not bool:
+            raise TypeError("portable SEALED transition mode must be bool")
 
         identity = self._resource_identity
         unsigned = prepared.unsigned
@@ -3759,10 +3847,10 @@ class ResourceStoreCoordinator:
         try:
             opened = platform.open_regular(root, PurePath(database_name))
             before = opened.content_facts()
+            before_proof = self._portable_content_proof(before)
             if (
                 opened.identity().kind != "regular"
                 or opened.identity().link_count != 1
-                or self._portable_content_proof(before) != sealed.database
                 or root.inspect_entry(database_name) != before.snapshot
             ):
                 raise ActivationPreparationError(
@@ -3772,8 +3860,6 @@ class ResourceStoreCoordinator:
             opened.close()
             opened = None
 
-            evidence = preparation._sealed_stage.evidence
-            binding = evidence.source_binding
             receipt = binding.receipt
             with _open_configured_connection(
                 identity.canonical_sidecar_path,
@@ -3787,14 +3873,12 @@ class ResourceStoreCoordinator:
                         or meta.get("canonical_store_id")
                         != unsigned.canonical_store_id
                         or meta.get("target_identity") != identity.target_identity
-                        or meta.get("activation_status") != "SEALED"
-                        or "activation_digest" in meta
                         or _meta_int(meta, "generation") != 0
                     ):
                         raise SQLiteStoreSchemaError(
                             "STORE.ACTIVATION_STATE_INVALID"
                         )
-                    expected_row = (
+                    expected_receipt = (
                         receipt.snapshot_id,
                         receipt.resource_id,
                         receipt.canonical_store_id,
@@ -3804,7 +3888,6 @@ class ResourceStoreCoordinator:
                         receipt.format_version,
                         Path.__str__(identity.configured_jsonl_path),
                         Path.__str__(identity.snapshot_manifest_path),
-                        "issued",
                     )
                     rows = connection.execute(
                         "SELECT snapshot_id, resource_id, canonical_store_id, "
@@ -3813,47 +3896,72 @@ class ResourceStoreCoordinator:
                         "destination_manifest_path, status "
                         "FROM tm_snapshot_receipt ORDER BY snapshot_id"
                     ).fetchall()
-                    if rows != [expected_row] or connection.execute(
-                        "SELECT COUNT(*) FROM tm_snapshot_binding"
-                    ).fetchone() != (0,):
-                        raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
-                    updated = connection.execute(
-                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
-                        "WHERE snapshot_id = ? AND status = 'issued'",
-                        (receipt.snapshot_id,),
+                    binding_rows = connection.execute(
+                        "SELECT configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version "
+                        "FROM tm_snapshot_binding ORDER BY binding_id"
+                    ).fetchall()
+                    expected_binding = (
+                        Path.__str__(identity.configured_jsonl_path),
+                        Path.__str__(identity.snapshot_manifest_path),
+                        binding.snapshot_kind.value,
+                        receipt.snapshot_id,
+                        binding.binding_version,
                     )
-                    if updated.rowcount != 1:
-                        raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
-                    connection.execute(
-                        "INSERT INTO tm_snapshot_binding("
-                        "binding_id, configured_jsonl_path, manifest_path, "
-                        "snapshot_kind, snapshot_id, binding_version) "
-                        "VALUES (1, ?, ?, ?, ?, ?)",
-                        (
-                            Path.__str__(identity.configured_jsonl_path),
-                            Path.__str__(identity.snapshot_manifest_path),
-                            binding.snapshot_kind.value,
-                            receipt.snapshot_id,
-                            binding.binding_version,
-                        ),
-                    )
-                    status = connection.execute(
-                        "UPDATE tm_meta SET value = 'ACTIVE' "
-                        "WHERE key = 'activation_status' AND value = 'SEALED'"
-                    )
-                    generation = connection.execute(
-                        "UPDATE tm_meta SET value = '0' "
-                        "WHERE key = 'generation' AND value = '0'"
-                    )
-                    connection.execute(
-                        "INSERT INTO tm_meta(key, value) VALUES "
-                        "('activation_digest', ?)",
-                        (activation_digest,),
-                    )
-                    if status.rowcount != 1 or generation.rowcount != 1:
-                        raise SQLiteStoreSchemaError(
-                            "STORE.ACTIVATION_STATE_INVALID"
+                    if meta.get("activation_status") == "SEALED":
+                        if not allow_sealed_transition:
+                            raise ActivationPreparationError(
+                                "ACTIVATION.RECOVERY_REQUIRED",
+                                retryable=True,
+                            )
+                        if (
+                            before_proof != sealed.database
+                            or
+                            "activation_digest" in meta
+                            or rows != [expected_receipt + ("issued",)]
+                            or binding_rows
+                        ):
+                            raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
+                        updated = connection.execute(
+                            "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                            "WHERE snapshot_id = ? AND status = 'issued'",
+                            (receipt.snapshot_id,),
                         )
+                        if updated.rowcount != 1:
+                            raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
+                        connection.execute(
+                            "INSERT INTO tm_snapshot_binding("
+                            "binding_id, configured_jsonl_path, manifest_path, "
+                            "snapshot_kind, snapshot_id, binding_version) "
+                            "VALUES (1, ?, ?, ?, ?, ?)",
+                            expected_binding,
+                        )
+                        status = connection.execute(
+                            "UPDATE tm_meta SET value = 'ACTIVE' "
+                            "WHERE key = 'activation_status' AND value = 'SEALED'"
+                        )
+                        generation = connection.execute(
+                            "UPDATE tm_meta SET value = '0' "
+                            "WHERE key = 'generation' AND value = '0'"
+                        )
+                        connection.execute(
+                            "INSERT INTO tm_meta(key, value) VALUES "
+                            "('activation_digest', ?)",
+                            (activation_digest,),
+                        )
+                        if status.rowcount != 1 or generation.rowcount != 1:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.ACTIVATION_STATE_INVALID"
+                            )
+                    elif meta.get("activation_status") == "ACTIVE":
+                        if (
+                            meta.get("activation_digest") != activation_digest
+                            or rows != [expected_receipt + ("completed",)]
+                            or binding_rows != [expected_binding]
+                        ):
+                            raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
+                    else:
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
                     closure_digest = cast(
                         str,
                         importlib.import_module(
@@ -3902,6 +4010,7 @@ class ResourceStoreCoordinator:
     def _reprove_portable_active_set(
         self,
         *,
+        binding: SnapshotBinding,
         prepared: _PortableActivationJournalRecord,
         platform: PlatformFileBackend,
         root: RootedDirectoryAuthority,
@@ -3952,7 +4061,6 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.ACTIVE_SET_INVALID",
                     retryable=False,
                 ) from error
-            binding = self._preparation._sealed_stage.evidence.source_binding
             if type(decoded_manifest) is not SnapshotManifest or (
                 decoded_manifest != binding.manifest
             ):
@@ -4642,11 +4750,12 @@ class ResourceStoreCoordinator:
                 digest = activation_digest()
                 active_database, logical_closure = (
                     self._apply_portable_receipt_activation(
-                        preparation=preparation,
+                        binding=physical.evidence.source_binding,
                         prepared=prepared,
                         platform=platform,
                         root=root,
                         activation_digest=digest,
+                        allow_sealed_transition=True,
                     )
                 )
 
@@ -4699,6 +4808,7 @@ class ResourceStoreCoordinator:
                     )
                 active_ref, active_snapshot, active_attestation = (
                     self._reprove_portable_active_set(
+                        binding=physical.evidence.source_binding,
                         prepared=prepared,
                         platform=platform,
                         root=root,
@@ -4723,6 +4833,7 @@ class ResourceStoreCoordinator:
                             retryable=False,
                         )
                     _, _, observed = self._reprove_portable_active_set(
+                        binding=physical.evidence.source_binding,
                         prepared=prepared,
                         platform=platform,
                         root=root,
@@ -4794,6 +4905,7 @@ class ResourceStoreCoordinator:
                     business_reprove=active_business,
                 )
                 _, _, final_active = self._reprove_portable_active_set(
+                    binding=physical.evidence.source_binding,
                     prepared=prepared,
                     platform=platform,
                     root=root,
@@ -5114,6 +5226,46 @@ class ResourceStoreCoordinator:
                 action="CANCELLED",
                 generation=None,
             )
+
+    def recover_portable_activation(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        existing_retirement: ExistingFileRetirement,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None:
+        """Freshly continue one Windows v3/publication first activation."""
+
+        with self._condition:
+            try:
+                return recover_portable_activation(
+                    _CoordinatorStorePort(self),
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    existing_retirement=existing_retirement,
+                    caller_borrow=caller_borrow,
+                )
+            except ActivationPreparationError:
+                error = sys.exception()
+                if (
+                    isinstance(error, ActivationPreparationError)
+                    and error.code == "ACTIVATION.RECOVERY_REQUIRED"
+                ):
+                    self._view = None
+                    self._state = "ACTIVATING"
+                    self._condition.notify_all()
+                raise
+            except (PlatformFileError, OSError, sqlite3.Error) as error:
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
 
     def _advance_activation_journal(
         self,

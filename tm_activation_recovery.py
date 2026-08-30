@@ -16,8 +16,9 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Protocol, cast
 
 import tm_contracts as contract_module
@@ -26,6 +27,8 @@ from tm_content_attestation import (
     ContentAttestationError,
     ContentSemanticFacts,
     LOGICAL_CLOSURE_VERSION,
+    PortableActiveContentAttestation,
+    PortableContentFileProof,
     _capture_content_file,
     _create_active_content_attestation,
     _create_sealed_content_attestation,
@@ -57,6 +60,13 @@ from tm_activation_journal import (
     _PHASE_SEQUENCE,
     _PriorActivationRef,
     _PriorAssetCapture,
+    _PortableActivationJournalRecord,
+    _PortableFreshRecoverySnapshot,
+    _PortablePublicationPhaseRecord,
+    _PortablePublicationPhaseUnsigned,
+    _CallerHeldPortableJournalBorrow,
+    _PORTABLE_PUBLICATION_VERSION,
+    _portable_record_pair_matches,
     _RecoveryBackupAsset,
     _SQLiteGenerationView,
     _StoreRuntimeRef,
@@ -95,6 +105,24 @@ from tm_activation_journal import (
     _require_first_activation_absence,
     _rollback_terminal_prior_closes,
     _write_recovery_backup,
+    _WindowsPortableCancelledJournalOwner,
+    _WindowsPortableCompletedStageRetirementOwner,
+    _WindowsPortableFreshRecoveryOwner,
+    _WindowsPortablePublicationPhaseOwner,
+)
+from platform_fs_contracts import (
+    BoundContentFacts,
+    BoundRegularFile,
+    CandidateContentFacts,
+    CandidateFile,
+    ExistingFileRetirement,
+    LockedDescendantNamespaceInspection,
+    PendingPublication,
+    PersistentPrivateProof,
+    PlatformFileBackend,
+    PlatformFileError,
+    PublishMode,
+    RootedDirectoryAuthority,
 )
 
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
@@ -313,6 +341,795 @@ class _CoordinatorPublishPort(_StoreValidationPort, Protocol):
         activation_digest: str | None = None,
         active_content_attestation: ActiveContentAttestation | None = None,
     ) -> _ActivationJournalHandle: ...
+
+
+class _PortableRecoveryStorePort(Protocol):
+    """Store-owned SQLite facts consumed by portable fresh recovery."""
+
+    @property
+    def resource_identity(self) -> CanonicalResourceIdentity: ...
+
+    @property
+    def canonical_store_id(self) -> str: ...
+
+    @property
+    def state(self) -> str: ...
+
+    @state.setter
+    def state(self, value: str) -> None: ...
+
+    @property
+    def view(self) -> _SQLiteGenerationView | None: ...
+
+    @view.setter
+    def view(self, value: _SQLiteGenerationView | None) -> None: ...
+
+    @property
+    def preparation(self) -> _ActivationPreparation | None: ...
+
+    @property
+    def cleanup_reservation(self) -> _ActivationCleanupReservation | None: ...
+
+    @property
+    def cleanup_in_progress(self) -> bool: ...
+
+    def notify_all(self) -> None: ...
+
+    def portable_content_proof(
+        self,
+        facts: BoundContentFacts | CandidateContentFacts,
+    ) -> PortableContentFileProof: ...
+
+    def apply_portable_receipt_activation(
+        self,
+        *,
+        binding: SnapshotBinding,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        activation_digest: str,
+        allow_sealed_transition: bool,
+    ) -> tuple[PortableContentFileProof, str]: ...
+
+    def reprove_portable_sealed_database(
+        self,
+        *,
+        prepared: _PortableActivationJournalRecord,
+    ) -> None: ...
+
+    def reprove_portable_active_set(
+        self,
+        *,
+        binding: SnapshotBinding,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        database: PortableContentFileProof,
+        manifest: PortableContentFileProof,
+        activation_digest: str,
+        expected_logical_closure_digest: str,
+    ) -> tuple[_CanonicalStoreRef, Any, PortableActiveContentAttestation]: ...
+
+    def ensure_portable_activation_lineage_marker(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> None: ...
+
+
+def _portable_recovery_activation_digest(
+    prepared: _PortableActivationJournalRecord,
+) -> str:
+    unsigned = prepared.unsigned
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "activation_nonce": unsigned.activation_nonce,
+                "artifact_id": unsigned.artifact_id,
+                "evidence_digest": unsigned.evidence_digest,
+                "generation": 0,
+                "journal_id": unsigned.journal_id,
+                "manifest_digest": unsigned.new_manifest_digest,
+                "sealed_stage_digest": unsigned.sealed_stage_digest,
+                "token_id": unsigned.token_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _portable_recovery_binding(
+    identity: CanonicalResourceIdentity,
+    prepared: _PortableActivationJournalRecord,
+    manifest_bytes: bytes,
+) -> SnapshotBinding:
+    try:
+        decoded = contract_from_json(manifest_bytes.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        ) from error
+    if type(decoded) is not SnapshotManifest:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    unsigned = prepared.unsigned
+    receipt = decoded.receipt
+    sealed = unsigned.sealed_content_attestation
+    if (
+        decoded.snapshot_kind is not SnapshotKind.MIGRATION_SOURCE
+        or receipt.snapshot_id != unsigned.new_receipt_id
+        or receipt.resource_id != identity.resource_id
+        or receipt.canonical_store_id != unsigned.canonical_store_id
+        or receipt.jsonl_digest != unsigned.source_jsonl_digest
+        or receipt.record_count != sealed.semantic_facts.receipt_boundary_record_count
+        or decoded.receipt_digest != unsigned.snapshot_receipt_digest
+        or snapshot_receipt_digest(receipt) != unsigned.snapshot_receipt_digest
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    try:
+        return SnapshotBinding(
+            configured_jsonl_path=identity.configured_jsonl_path,
+            manifest_path=identity.snapshot_manifest_path,
+            snapshot_kind=decoded.snapshot_kind,
+            receipt=receipt,
+            manifest=decoded,
+        )
+    except (TypeError, ValueError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        ) from error
+
+
+def _portable_recovery_phase_unsigned(
+    identity: CanonicalResourceIdentity,
+    prepared: _PortableActivationJournalRecord,
+    *,
+    phase: str,
+    predecessor_digest: str,
+    database: PortableContentFileProof,
+    manifest: PortableContentFileProof,
+    active: PortableActiveContentAttestation | None,
+) -> _PortablePublicationPhaseUnsigned:
+    unsigned = prepared.unsigned
+    return _PortablePublicationPhaseUnsigned(
+        publication_version=_PORTABLE_PUBLICATION_VERSION,
+        phase=phase,
+        predecessor_digest=predecessor_digest,
+        journal_id=unsigned.journal_id,
+        preparation_id=unsigned.preparation_id,
+        token_id=unsigned.token_id,
+        token_version=unsigned.token_version,
+        activation_nonce=unsigned.activation_nonce,
+        resource_id=unsigned.resource_id,
+        target_identity=unsigned.target_identity,
+        canonical_store_id=unsigned.canonical_store_id,
+        generation=0,
+        canonical_database_name=identity.canonical_sidecar_path.name,
+        canonical_database_size=database.size,
+        canonical_database_sha256=database.sha256,
+        canonical_manifest_name=identity.snapshot_manifest_path.name,
+        canonical_manifest_size=manifest.size,
+        canonical_manifest_sha256=manifest.sha256,
+        private_directory_name=unsigned.private_directory_name,
+        device_key_name=unsigned.device_key_name,
+        sealed_content_attestation=unsigned.sealed_content_attestation,
+        active_content_attestation=active,
+    )
+
+
+def recover_portable_activation(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    existing_retirement: ExistingFileRetirement,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> ActivationRecoveryReport | None:
+    """Freshly continue one verified Windows first-activation chain."""
+
+    identity = port.resource_identity
+    if not (
+        isinstance(platform, PlatformFileBackend)
+        and persistent_private is platform
+        and descendant_inspection is platform
+        and existing_retirement is platform
+        and type(caller_borrow) is _CallerHeldPortableJournalBorrow
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+            retryable=False,
+        )
+    if (
+        port.state not in {"READY", "ACTIVATING"}
+        or port.preparation is not None
+        or port.cleanup_reservation is not None
+        or port.cleanup_in_progress
+        or port.view is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_STATE_INVALID",
+            retryable=True,
+        )
+
+    def inspect() -> _PortableFreshRecoverySnapshot:
+        return _WindowsPortableFreshRecoveryOwner.inspect(
+            identity=identity,
+            canonical_store_id=port.canonical_store_id,
+            backend=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+
+    snapshot = inspect()
+    if snapshot.state == "NO_FACTS":
+        port.state = "READY"
+        port.notify_all()
+        return None
+    port.state = "ACTIVATING"
+    port.view = None
+    port.notify_all()
+
+    def cancel() -> ActivationRecoveryReport:
+        committed: _PortableActivationJournalRecord | None = None
+
+        def owner_reprove(record: _PortableActivationJournalRecord) -> None:
+            accepted = record in (
+                snapshot.pending_record,
+                snapshot.cancelled_record,
+            )
+            if (
+                not accepted
+                and type(snapshot.pending_record)
+                is _PortableActivationJournalRecord
+                and record.unsigned.closure == "CANCELLED"
+                and _portable_record_pair_matches(
+                    snapshot.pending_record,
+                    record,
+                )
+            ):
+                accepted = True
+            if not accepted:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            caller_borrow.reprove(platform, identity)
+
+        def owner_commit(record: _PortableActivationJournalRecord) -> None:
+            nonlocal committed
+            if record.unsigned.closure != "CANCELLED":
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            committed = record
+
+        _WindowsPortableCancelledJournalOwner.cancel(
+            identity=identity,
+            backend=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            existing_retirement=existing_retirement,
+            caller_borrow=caller_borrow,
+            owner_reprove=owner_reprove,
+            owner_commit=owner_commit,
+        )
+        if committed is None:
+            raise AssertionError("portable cancellation did not commit")
+        terminal = inspect()
+        if terminal.state != "NO_FACTS" or terminal.namespace_state != "KEY_ONLY":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        port.state = "READY"
+        port.notify_all()
+        return ActivationRecoveryReport(
+            phase="PREPARED",
+            action="CANCELLED",
+            generation=None,
+        )
+
+    if snapshot.state == "CANCELLED":
+        return cancel()
+    prepared = snapshot.pending_record
+    if type(prepared) is not _PortableActivationJournalRecord:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    root, _lease = caller_borrow._fresh_recovery_authorities(
+        platform,
+        persistent_private,
+        identity,
+    )
+    unsigned = prepared.unsigned
+    sealed = unsigned.sealed_content_attestation
+    database_name = identity.canonical_sidecar_path.name
+    manifest_name = identity.snapshot_manifest_path.name
+
+    preflight_authorities: list[BoundRegularFile] = []
+
+    def read_exact(
+        name: str,
+        expected: PortableContentFileProof,
+        *,
+        retain: bool = False,
+    ) -> tuple[PortableContentFileProof, bytes]:
+        opened = platform.open_regular(root, PurePath(name))
+        try:
+            facts = opened.content_facts()
+            proof = port.portable_content_proof(facts)
+            payload = opened.read_all()
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or root.inspect_entry(name) != facts.snapshot
+                or proof != expected
+                or len(payload) != expected.size
+                or hashlib.sha256(payload).hexdigest() != expected.sha256
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            if retain:
+                preflight_authorities.append(opened)
+                opened = None
+            return proof, payload
+        finally:
+            if opened is not None:
+                opened.close()
+
+    def close_preflight_authorities() -> None:
+        active_error = sys.exception()
+        close_error: BaseException | None = None
+        while preflight_authorities:
+            authority = preflight_authorities.pop()
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            raise close_error
+
+    database_entry = root.inspect_entry(database_name)
+    manifest_entry = root.inspect_entry(manifest_name)
+    if not snapshot.phase_records and database_entry is None:
+        if manifest_entry is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        return cancel()
+    if database_entry is None:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+
+    def owner_reprove() -> None:
+        caller_borrow.reprove(platform, identity)
+
+    def phase_owner_commit(record: _PortablePublicationPhaseRecord) -> None:
+        if (
+            type(record) is not _PortablePublicationPhaseRecord
+            or record.unsigned.resource_id != identity.resource_id
+            or record.unsigned.target_identity != identity.target_identity
+            or record.unsigned.canonical_store_id != port.canonical_store_id
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        owner_reprove()
+
+    phase_records = list(snapshot.phase_records)
+    expected_phase_names = (
+        "DB_REPLACED",
+        "MANIFEST_PUBLISHED",
+        "GENERATION_PUBLISHED",
+    )
+    if (
+        not 0 <= len(phase_records) <= len(expected_phase_names)
+        or tuple(record.unsigned.phase for record in phase_records)
+        != expected_phase_names[: len(phase_records)]
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+
+    stage_manifest_name = unsigned.candidate_manifest_temp_name
+    stage_manifest_bytes: bytes
+    allow_sealed_transition = False
+    try:
+        if len(phase_records) < 3:
+            # Retain exact rooted authorities over every pre-GENERATION
+            # mutation.  The SQLite file itself is reopened by the store port
+            # because its SEALED -> ACTIVE transaction needs a writer; all
+            # other sealed inputs stay live and non-replaceable until the
+            # phase chain is complete.
+            read_exact(
+                unsigned.candidate_stage_db_name,
+                sealed.database,
+                retain=True,
+            )
+            _stage_manifest_proof, stage_manifest_bytes = read_exact(
+                stage_manifest_name,
+                sealed.manifest,
+                retain=True,
+            )
+            read_exact(
+                identity.configured_jsonl_path.name,
+                sealed.source,
+                retain=True,
+            )
+
+            canonical_manifest_bytes: bytes | None = None
+            if manifest_entry is not None:
+                _canonical_manifest_proof, canonical_manifest_bytes = read_exact(
+                    manifest_name,
+                    sealed.manifest,
+                    retain=True,
+                )
+                if canonical_manifest_bytes != stage_manifest_bytes:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+
+            if not phase_records:
+                read_exact(database_name, sealed.database)
+                port.reprove_portable_sealed_database(prepared=prepared)
+                if manifest_entry is not None:
+                    # A canonical manifest before its durable phase is a
+                    # physical effect that the journal does not authorize.
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                allow_sealed_transition = True
+            elif len(phase_records) == 1:
+                if manifest_entry is not None:
+                    # DB_REPLACED authorizes either the exact SEALED/issued DB
+                    # or the honest window after the receipt transaction has
+                    # committed ACTIVE/completed but before manifest copy.
+                    # The store port distinguishes and fully reproves those
+                    # states; no other DB state is accepted.
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                allow_sealed_transition = True
+            else:
+                manifest_phase_active = (
+                    phase_records[1].unsigned.active_content_attestation
+                )
+                if (
+                    type(manifest_phase_active)
+                    is not PortableActiveContentAttestation
+                    or manifest_entry is None
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                # MANIFEST_PUBLISHED may only be replayed over the exact ACTIVE
+                # DB that produced the recorded attestation.  A SEALED DB is
+                # behind the declared physical effect and is never advanced.
+                read_exact(database_name, manifest_phase_active.database)
+    except BaseException:
+        close_preflight_authorities()
+        raise
+
+    if not phase_records:
+        db_unsigned = _portable_recovery_phase_unsigned(
+            identity,
+            prepared,
+            phase="DB_REPLACED",
+            predecessor_digest=prepared.record_digest,
+            database=sealed.database,
+            manifest=sealed.manifest,
+            active=None,
+        )
+
+        def db_business(record: _PortablePublicationPhaseRecord) -> None:
+            if record.unsigned != db_unsigned:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            read_exact(database_name, sealed.database)
+            port.reprove_portable_sealed_database(prepared=prepared)
+
+        try:
+            handle = _WindowsPortablePublicationPhaseOwner.publish(
+                identity=identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                caller_borrow=caller_borrow,
+                prepared=prepared,
+                predecessor=prepared,
+                unsigned=db_unsigned,
+                owner_reprove=owner_reprove,
+                owner_commit=phase_owner_commit,
+                business_reprove=db_business,
+            )
+            phase_records.append(handle._record)
+            snapshot = inspect()
+        except BaseException:
+            close_preflight_authorities()
+            raise
+
+    db_phase = phase_records[0]
+    if db_phase.unsigned.phase != "DB_REPLACED":
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    if len(phase_records) == 3:
+        completed_active = phase_records[2].unsigned.active_content_attestation
+        if type(completed_active) is not PortableActiveContentAttestation:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        _manifest_proof, stage_manifest_bytes = read_exact(
+            manifest_name,
+            completed_active.manifest,
+        )
+        read_exact(database_name, completed_active.database)
+        read_exact(identity.configured_jsonl_path.name, completed_active.source)
+    else:
+        if len(phase_records) == 2 and manifest_entry is None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+    try:
+        binding = _portable_recovery_binding(
+            identity,
+            prepared,
+            stage_manifest_bytes,
+        )
+        activation_digest = _portable_recovery_activation_digest(prepared)
+        active_database, logical_closure = port.apply_portable_receipt_activation(
+            binding=binding,
+            prepared=prepared,
+            platform=platform,
+            root=root,
+            activation_digest=activation_digest,
+            allow_sealed_transition=allow_sealed_transition,
+        )
+    except BaseException:
+        close_preflight_authorities()
+        raise
+
+    manifest_pending: PendingPublication | None = None
+    manifest_candidate: CandidateFile | None = None
+    try:
+        manifest_entry = root.inspect_entry(manifest_name)
+        if manifest_entry is None:
+            manifest_candidate = root.create_candidate(
+                manifest_name + ".activation-candidate",
+                private=False,
+            )
+            manifest_candidate.write_all(stage_manifest_bytes)
+            manifest_candidate.flush_content()
+            manifest_pending = root.begin_publish(
+                manifest_candidate,
+                manifest_name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            manifest_candidate = None
+            active_manifest = port.portable_content_proof(
+                manifest_pending.retained_destination().content_facts()
+            )
+        else:
+            active_manifest, canonical_manifest_bytes = read_exact(
+                manifest_name,
+                sealed.manifest,
+            )
+            if canonical_manifest_bytes != stage_manifest_bytes:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        if active_manifest != sealed.manifest:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        active_ref, active_snapshot, active_attestation = (
+            port.reprove_portable_active_set(
+                binding=binding,
+                prepared=prepared,
+                platform=platform,
+                root=root,
+                database=active_database,
+                manifest=active_manifest,
+                activation_digest=activation_digest,
+                expected_logical_closure_digest=logical_closure,
+            )
+        )
+
+        def active_business(record: _PortablePublicationPhaseRecord) -> None:
+            if record.unsigned.active_content_attestation != active_attestation:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            _ref, _snapshot, observed = port.reprove_portable_active_set(
+                binding=binding,
+                prepared=prepared,
+                platform=platform,
+                root=root,
+                database=active_database,
+                manifest=active_manifest,
+                activation_digest=activation_digest,
+                expected_logical_closure_digest=logical_closure,
+            )
+            if observed != active_attestation:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+
+        if len(phase_records) == 1:
+            manifest_unsigned = _portable_recovery_phase_unsigned(
+                identity,
+                prepared,
+                phase="MANIFEST_PUBLISHED",
+                predecessor_digest=db_phase.record_digest,
+                database=active_database,
+                manifest=active_manifest,
+                active=active_attestation,
+            )
+            manifest_handle = _WindowsPortablePublicationPhaseOwner.publish(
+                identity=identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                caller_borrow=caller_borrow,
+                prepared=prepared,
+                predecessor=db_phase,
+                unsigned=manifest_unsigned,
+                owner_reprove=owner_reprove,
+                owner_commit=phase_owner_commit,
+                business_reprove=active_business,
+            )
+            phase_records.append(manifest_handle._record)
+        else:
+            manifest_phase = phase_records[1]
+            if (
+                manifest_phase.unsigned.phase != "MANIFEST_PUBLISHED"
+                or manifest_phase.unsigned.active_content_attestation
+                != active_attestation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            active_business(manifest_phase)
+        if manifest_pending is not None:
+            if (
+                manifest_pending.terminal_reproof()
+                != manifest_pending.preliminary_facts()
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            manifest_pending.close()
+            manifest_pending = None
+
+        manifest_phase = phase_records[1]
+        if len(phase_records) == 2:
+            generation_unsigned = _portable_recovery_phase_unsigned(
+                identity,
+                prepared,
+                phase="GENERATION_PUBLISHED",
+                predecessor_digest=manifest_phase.record_digest,
+                database=active_database,
+                manifest=active_manifest,
+                active=active_attestation,
+            )
+            generation_handle = _WindowsPortablePublicationPhaseOwner.publish(
+                identity=identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                caller_borrow=caller_borrow,
+                prepared=prepared,
+                predecessor=manifest_phase,
+                unsigned=generation_unsigned,
+                owner_reprove=owner_reprove,
+                owner_commit=phase_owner_commit,
+                business_reprove=active_business,
+            )
+            phase_records.append(generation_handle._record)
+        else:
+            generation_phase = phase_records[2]
+            if (
+                generation_phase.unsigned.phase != "GENERATION_PUBLISHED"
+                or generation_phase.unsigned.active_content_attestation
+                != active_attestation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            active_business(generation_phase)
+
+        close_preflight_authorities()
+        completed = inspect()
+        if completed.highest_phase != "GENERATION_PUBLISHED":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        _WindowsPortableCompletedStageRetirementOwner.retire(
+            identity=identity,
+            backend=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            existing_retirement=existing_retirement,
+            caller_borrow=caller_borrow,
+            snapshot=completed,
+        )
+        port.ensure_portable_activation_lineage_marker(
+            platform=platform,
+            root=root,
+        )
+        port.view = _SQLiteGenerationView(
+            stage=active_ref,
+            canonical_store_id=port.canonical_store_id,
+            generation=0,
+            fts5_available=active_snapshot.fts5_available,
+            active_content_attestation=active_attestation,
+        )
+        port.state = "READY"
+        port.notify_all()
+        return ActivationRecoveryReport(
+            phase="GENERATION_PUBLISHED",
+            action="COMPLETED",
+            generation=0,
+        )
+    except (ActivationPreparationError, PlatformFileError, OSError, sqlite3.Error):
+        port.view = None
+        port.state = "ACTIVATING"
+        port.notify_all()
+        raise
+    finally:
+        active_error = sys.exception()
+        close_error: BaseException | None = None
+        try:
+            close_preflight_authorities()
+        except BaseException as error:
+            close_error = error
+        for authority in (manifest_candidate, manifest_pending):
+            if authority is None:
+                continue
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            raise close_error
 
 class _ActivationGateBGrant(Protocol):
     @property
