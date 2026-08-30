@@ -1400,25 +1400,33 @@ class TMMigrationService:
             )
             stage_label = "PREPARE"
             reservation.reprove()
-            if attempt.platform_backend is not None:
-                # The portable journal/terminal schema is deliberately not
-                # part of this pre-journal slice.  Stop before token issuance
-                # or any v2 journal consumer can observe a portable physical
-                # snapshot; reconciliation first retires the registry-owned
-                # synchronization handles and then retires the exact CREATE_NEW
-                # pair through the platform namespace authority.
-                raise ActivationPreparationError(
-                    "ACTIVATION.ATTESTATION_UNAVAILABLE",
-                    retryable=False,
-                )
             activation_attempted = True
             prepared = coordinator.activate(sealed)
             stage_label = "JOURNAL"
             reservation.reprove()
-            handle = coordinator.publish_prepared_activation(prepared)
+            if attempt.platform_backend is None:
+                handle = coordinator.publish_prepared_activation(prepared)
+                portable_inputs: dict[str, object] | None = None
+            else:
+                portable_inputs = reservation.portable_journal_inputs()
+                handle = coordinator.publish_portable_prepared_activation(
+                    prepared,
+                    **portable_inputs,
+                )
             stage_label = "PUBLISH"
             reservation.reprove()
-            generation = coordinator.publish_activation(prepared, handle)
+            if attempt.platform_backend is None:
+                generation = coordinator.publish_activation(prepared, handle)
+            else:
+                assert portable_inputs is not None
+                generation = coordinator.publish_portable_activation(
+                    prepared,
+                    handle,
+                    **portable_inputs,
+                    retire_unpublished_stage=lambda: (
+                        _cleanup_initial_unpublished_stage(attempt)
+                    ),
+                )
             stage_label = "VERIFY"
             reservation.reprove()
             self._verify_initial_activation_runtime(
@@ -1426,6 +1434,9 @@ class TMMigrationService:
                 preflight=build.preflight,
                 sealed=sealed,
                 generation=generation,
+                require_legacy_journal_phase=(
+                    attempt.platform_backend is None
+                ),
             )
             reservation.reprove()
             return self._success_report(
@@ -1435,6 +1446,22 @@ class TMMigrationService:
                 generation=generation,
             )
         except Exception as error:
+            if (
+                prepared is not None
+                and attempt is not None
+                and attempt.platform_backend is not None
+            ):
+                try:
+                    coordinator._sealed_registry.release_portable_live_authority_for_recovery(
+                        prepared._token
+                    )
+                except BaseException:
+                    if type(error) not in (
+                        TypeError,
+                        AssertionError,
+                        AttributeError,
+                    ):
+                        raise
             if not (
                 _is_initial_activation_operational_error(error)
                 or isinstance(error, _InitialActivationReservationError)
@@ -2013,6 +2040,15 @@ class TMMigrationService:
         2.4 rather than claiming that legacy remains authoritative.
         """
 
+        if (
+            prepared is not None
+            and attempt is not None
+            and attempt.platform_backend is not None
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
+            ) from error
+
         try:
             durable_phase = coordinator.durable_activation_phase
         except Exception as reconciliation_error:
@@ -2190,6 +2226,7 @@ class TMMigrationService:
         preflight: MigrationPreflight,
         sealed: SealedStage,
         generation: int,
+        require_legacy_journal_phase: bool = True,
     ) -> None:
         """Require one complete generation-zero runtime before success.
 
@@ -2209,6 +2246,7 @@ class TMMigrationService:
             receipt=receipt,
             expected_binding_digest=expected_binding_digest,
             generation=generation,
+            require_legacy_journal_phase=require_legacy_journal_phase,
         )
 
     def _verify_initial_runtime_binding(
@@ -2219,6 +2257,7 @@ class TMMigrationService:
         receipt: SnapshotReceipt,
         expected_binding_digest: str,
         generation: int,
+        require_legacy_journal_phase: bool = True,
     ) -> None:
         """Re-prove one generation-zero runtime against one frozen binding."""
 
@@ -2240,7 +2279,9 @@ class TMMigrationService:
                 "MIGRATION.INITIAL_RUNTIME_INVALID"
             )
         try:
-            if coordinator.durable_activation_phase != "GENERATION_PUBLISHED":
+            if require_legacy_journal_phase and (
+                coordinator.durable_activation_phase != "GENERATION_PUBLISHED"
+            ):
                 raise MigrationPreflightError(
                     "MIGRATION.INITIAL_RUNTIME_INVALID"
                 )

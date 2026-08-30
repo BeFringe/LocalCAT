@@ -21,9 +21,10 @@ import itertools
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from typing import Any, NoReturn, Protocol, cast
@@ -80,18 +81,30 @@ from tm_contracts import (
 )
 from tm_content_attestation import (
     ActiveContentAttestation,
+    ContentSemanticFacts,
     ContentAttestationError,
     ContentFileProof,
+    LOGICAL_CLOSURE_VERSION,
+    PortableActiveContentAttestation,
+    PortableContentFileProof,
     PortableSealedContentAttestation,
     _capture_content_file,
+    _create_portable_active_content_attestation,
 )
 from platform_fs_contracts import (
+    BoundContentFacts,
+    BoundRegularFile,
+    BoundSynchronizedRegularFile,
+    CandidateContentFacts,
+    CandidateFile,
     ExistingFileRetirement,
     LockedDescendantNamespaceInspection,
     MutableFileReservation,
+    PendingPublication,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
+    PublishMode,
     RootedDirectoryAuthority,
 )
 
@@ -129,6 +142,9 @@ from tm_activation_journal import (
     _PortableActivationJournalUnsigned,
     _PortableCancelledJournalHandle,
     _PortablePreparedJournalHandle,
+    _PortablePublicationPhaseHandle,
+    _PortablePublicationPhaseRecord,
+    _PortablePublicationPhaseUnsigned,
     _CallerHeldPortableJournalBorrow,
     _ROLLBACK_ELIGIBLE_ERROR_CODES,
     _RecoveryBackupAsset,
@@ -154,9 +170,11 @@ from tm_activation_journal import (
     _create_recovery_backups,
     _PORTABLE_ACTIVATION_JOURNAL_PHASE,
     _PORTABLE_ACTIVATION_JOURNAL_VERSION,
+    _PORTABLE_PUBLICATION_VERSION,
     _portable_activation_private_directory_name,
     _WindowsPortablePreparedJournalOwner,
     _WindowsPortableCancelledJournalOwner,
+    _WindowsPortablePublicationPhaseOwner,
     _decode_activation_journal_record,
     _decode_journal_bool,
     _decode_journal_digest,
@@ -171,6 +189,7 @@ from tm_activation_journal import (
     _decode_optional_journal_digest,
     _decode_optional_journal_identity,
     _ensure_activation_lineage_marker,
+    _activation_lineage_marker_payload,
     _fsync_activation_directory,
     _fsync_activation_file,
     _fsync_activation_journal,
@@ -3681,15 +3700,1195 @@ class ResourceStoreCoordinator:
                     )
                 owner_reprove()
 
-            return _WindowsPortablePreparedJournalOwner.publish(
-                identity=identity,
-                backend=platform,
-                persistent_private=persistent_private,
-                caller_borrow=caller_borrow,
-                unsigned=unsigned,
-                owner_reprove=owner_reprove,
-                owner_commit=owner_commit,
+            try:
+                return _WindowsPortablePreparedJournalOwner.publish(
+                    identity=identity,
+                    backend=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                    unsigned=unsigned,
+                    owner_reprove=owner_reprove,
+                    owner_commit=owner_commit,
+                )
+            except BaseException as error:
+                try:
+                    self._sealed_registry.release_portable_live_authority_for_recovery(
+                        token
+                    )
+                except BaseException as release_error:
+                    if type(error) in (TypeError, AssertionError, AttributeError):
+                        raise error
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from release_error
+                raise
+
+    @staticmethod
+    def _portable_content_proof(
+        facts: BoundContentFacts | CandidateContentFacts,
+    ) -> PortableContentFileProof:
+        if type(facts) is BoundContentFacts:
+            size = facts.snapshot.byte_count
+        elif type(facts) is CandidateContentFacts:
+            size = facts.byte_count
+        else:
+            raise TypeError("portable content facts are invalid")
+        return PortableContentFileProof(
+            size=size,
+            sha256=facts.content_sha256.hex(),
+        )
+
+    def _apply_portable_receipt_activation(
+        self,
+        *,
+        preparation: _ActivationPreparation,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        activation_digest: str,
+    ) -> tuple[PortableContentFileProof, str]:
+        """Complete only the first-generation SQLite owner transaction."""
+
+        identity = self._resource_identity
+        unsigned = prepared.unsigned
+        sealed = unsigned.sealed_content_attestation
+        database_name = identity.canonical_sidecar_path.name
+        opened: BoundRegularFile | None = None
+        synchronized: BoundSynchronizedRegularFile | None = None
+        try:
+            opened = platform.open_regular(root, PurePath(database_name))
+            before = opened.content_facts()
+            if (
+                opened.identity().kind != "regular"
+                or opened.identity().link_count != 1
+                or self._portable_content_proof(before) != sealed.database
+                or root.inspect_entry(database_name) != before.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+                    retryable=False,
+                )
+            opened.close()
+            opened = None
+
+            evidence = preparation._sealed_stage.evidence
+            binding = evidence.source_binding
+            receipt = binding.receipt
+            with _open_configured_connection(
+                identity.canonical_sidecar_path,
+                require_existing=True,
+            ) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    meta = _read_meta(connection)
+                    if (
+                        meta.get("resource_id") != identity.resource_id
+                        or meta.get("canonical_store_id")
+                        != unsigned.canonical_store_id
+                        or meta.get("target_identity") != identity.target_identity
+                        or meta.get("activation_status") != "SEALED"
+                        or "activation_digest" in meta
+                        or _meta_int(meta, "generation") != 0
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    expected_row = (
+                        receipt.snapshot_id,
+                        receipt.resource_id,
+                        receipt.canonical_store_id,
+                        receipt.exported_revision,
+                        receipt.jsonl_digest,
+                        receipt.record_count,
+                        receipt.format_version,
+                        Path.__str__(identity.configured_jsonl_path),
+                        Path.__str__(identity.snapshot_manifest_path),
+                        "issued",
+                    )
+                    rows = connection.execute(
+                        "SELECT snapshot_id, resource_id, canonical_store_id, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path, status "
+                        "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+                    ).fetchall()
+                    if rows != [expected_row] or connection.execute(
+                        "SELECT COUNT(*) FROM tm_snapshot_binding"
+                    ).fetchone() != (0,):
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ? AND status = 'issued'",
+                        (receipt.snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_INVALID")
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, ?, ?, ?)",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            binding.snapshot_kind.value,
+                            receipt.snapshot_id,
+                            binding.binding_version,
+                        ),
+                    )
+                    status = connection.execute(
+                        "UPDATE tm_meta SET value = 'ACTIVE' "
+                        "WHERE key = 'activation_status' AND value = 'SEALED'"
+                    )
+                    generation = connection.execute(
+                        "UPDATE tm_meta SET value = '0' "
+                        "WHERE key = 'generation' AND value = '0'"
+                    )
+                    connection.execute(
+                        "INSERT INTO tm_meta(key, value) VALUES "
+                        "('activation_digest', ?)",
+                        (activation_digest,),
+                    )
+                    if status.rowcount != 1 or generation.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVATION_STATE_INVALID"
+                        )
+                    closure_digest = cast(
+                        str,
+                        importlib.import_module(
+                            "tm_stage_sealer"
+                        )._stage_closure_digest(connection),
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+            # The retained publication handle was deliberately closed before
+            # SQLite acquired a writer.  Reopen the exact canonical object and
+            # make the committed bytes durable through the platform port.
+            synchronized = platform.open_existing_for_synchronization(
+                root,
+                PurePath(database_name),
             )
+            after = synchronized.content_facts()
+            synchronized.synchronize_content(after)
+            final = synchronized.content_facts()
+            if (
+                final != after
+                or final.snapshot.identity.kind != "regular"
+                or final.snapshot.identity.link_count != 1
+                or root.inspect_entry(database_name) != final.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+                    retryable=False,
+                )
+            return self._portable_content_proof(final), closure_digest
+        except ActivationPreparationError:
+            raise
+        except (PlatformFileError, OSError, sqlite3.Error, SQLiteStoreSchemaError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECEIPT_PUBLICATION_FAILED",
+                retryable=True,
+            ) from error
+        finally:
+            if opened is not None:
+                opened.close()
+            if synchronized is not None:
+                synchronized.close()
+
+    def _reprove_portable_active_set(
+        self,
+        *,
+        prepared: _PortableActivationJournalRecord,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        database: PortableContentFileProof,
+        manifest: PortableContentFileProof,
+        activation_digest: str,
+        expected_logical_closure_digest: str,
+    ) -> tuple[_CanonicalStoreRef, SQLiteSchemaSnapshot, PortableActiveContentAttestation]:
+        """Rebuild portable ACTIVE facts from live handles and SQLite truth."""
+
+        identity = self._resource_identity
+        unsigned = prepared.unsigned
+        sealed = unsigned.sealed_content_attestation
+        authorities: list[BoundRegularFile] = []
+        try:
+            observed_proofs: list[PortableContentFileProof] = []
+            for name, expected in (
+                (identity.canonical_sidecar_path.name, database),
+                (identity.snapshot_manifest_path.name, manifest),
+                (identity.configured_jsonl_path.name, sealed.source),
+            ):
+                authority = platform.open_regular(root, PurePath(name))
+                authorities.append(authority)
+                facts = authority.content_facts()
+                if (
+                    facts.snapshot.identity.kind != "regular"
+                    or facts.snapshot.identity.link_count != 1
+                    or root.inspect_entry(name) != facts.snapshot
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.ACTIVE_SET_INVALID",
+                        retryable=False,
+                    )
+                proof = self._portable_content_proof(facts)
+                if proof != expected:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.ACTIVE_SET_INVALID",
+                        retryable=False,
+                    )
+                observed_proofs.append(proof)
+            manifest_bytes = authorities[1].read_all()
+            try:
+                decoded_manifest = contract_from_json(
+                    manifest_bytes.decode("utf-8")
+                )
+            except (TypeError, ValueError, UnicodeDecodeError) as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.ACTIVE_SET_INVALID",
+                    retryable=False,
+                ) from error
+            binding = self._preparation._sealed_stage.evidence.source_binding
+            if type(decoded_manifest) is not SnapshotManifest or (
+                decoded_manifest != binding.manifest
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.ACTIVE_SET_INVALID",
+                    retryable=False,
+                )
+            # Windows read authorities intentionally deny concurrent writers.
+            # Release the exact-byte observations before SQLite opens the DB,
+            # then reopen and compare the same facts after the transaction.
+            for authority in reversed(authorities):
+                authority.close()
+            authorities.clear()
+
+            active_ref = _canonical_activation_ref(
+                identity,
+                journal_id=unsigned.journal_id,
+            )
+            snapshot = inspect_stage_schema(
+                active_ref,
+                canonical_store_id=unsigned.canonical_store_id,
+                _allow_diverged_runtime=True,
+                _allow_active=True,
+                _expected_active_generation=0,
+                _expected_activation_digest=activation_digest,
+            )
+            sealed_semantic = sealed.semantic_facts
+            if (
+                snapshot.schema_version != sealed_semantic.schema_version
+                or snapshot.fold_version != sealed_semantic.fold_version
+                or snapshot.candidate_index_version
+                != sealed_semantic.index_version
+                or snapshot.candidate_index_kind
+                != sealed_semantic.candidate_index_kind
+                or snapshot.fts5_available != sealed_semantic.fts5_available
+                or snapshot.sqlite_runtime_version
+                != sealed_semantic.sqlite_runtime_version
+                or snapshot.unicode_runtime_version
+                != sealed_semantic.unicode_runtime_version
+                or snapshot.journal_mode != sealed_semantic.journal_mode
+                or snapshot.synchronous != sealed_semantic.synchronous
+                or snapshot.foreign_keys != sealed_semantic.foreign_keys
+                or snapshot.busy_timeout_ms != sealed_semantic.busy_timeout_ms
+                or snapshot.wal_enabled != sealed_semantic.wal_enabled
+                or snapshot.extension_loading_enabled
+                != sealed_semantic.extension_loading_enabled
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.ACTIVE_SET_INVALID",
+                    retryable=False,
+                )
+
+            port = _CoordinatorStorePort(self)
+            with _open_configured_connection(
+                identity.canonical_sidecar_path,
+                require_existing=True,
+            ) as connection:
+                connection.execute("BEGIN")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=unsigned.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    active_meta = _read_meta(connection)
+                    if (
+                        active_meta.get("schema_digest")
+                        != sealed_semantic.schema_digest
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_LOGICAL_CLOSURE_INVALID"
+                        )
+                    record_count = _table_count(connection, "tm_record")
+                    origin_batch_count = _table_count(
+                        connection,
+                        "tm_origin_batch",
+                    )
+                    exact_parity_digest = _activation_exact_parity_digest(
+                        port,
+                        connection,
+                    )
+                    if (
+                        record_count != sealed_semantic.record_count
+                        or origin_batch_count
+                        != sealed_semantic.origin_batch_count
+                        or exact_parity_digest
+                        != sealed_semantic.exact_parity_digest
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_COUNT_MISMATCH"
+                        )
+                    origin_rows = connection.execute(
+                        "SELECT batch_id, kind, status FROM tm_origin_batch "
+                        "ORDER BY batch_id"
+                    ).fetchall()
+                    if origin_rows != [
+                        (
+                            sealed_semantic.origin_batch_id,
+                            sealed_semantic.origin_batch_kind,
+                            "completed",
+                        )
+                    ]:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_COUNT_MISMATCH"
+                        )
+                    gram_counts, fts_count = _validate_activation_indexes(
+                        port,
+                        connection,
+                        semantic_facts=sealed_semantic,
+                        fts5_available=snapshot.fts5_available,
+                    )
+                    if (
+                        sealed_semantic.receipt_boundary_record_count
+                        == record_count
+                        and sealed_semantic.receipt_boundary_fts_count
+                        != fts_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_COUNT_MISMATCH"
+                        )
+                    lease = _SQLiteGenerationView(
+                        stage=active_ref,
+                        canonical_store_id=unsigned.canonical_store_id,
+                        generation=0,
+                        fts5_available=snapshot.fts5_available,
+                    )
+                    source_facts = _read_source_binding_facts_in_transaction(
+                        connection,
+                        lease,
+                    )
+                    receipt = binding.receipt
+                    if (
+                        source_facts.binding != binding
+                        or source_facts.divergence_latched
+                        or source_facts.diagnostic_codes
+                        or receipt.snapshot_id != unsigned.new_receipt_id
+                        or snapshot_receipt_digest(receipt)
+                        != unsigned.snapshot_receipt_digest
+                        or receipt.jsonl_digest != unsigned.source_jsonl_digest
+                        or receipt.record_count
+                        != sealed_semantic.receipt_boundary_record_count
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_BINDING_INVALID"
+                        )
+                    logical_closure_digest = cast(
+                        str,
+                        importlib.import_module(
+                            "tm_stage_sealer"
+                        )._stage_closure_digest(connection),
+                    )
+                    if logical_closure_digest != expected_logical_closure_digest:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.ACTIVE_LOGICAL_CLOSURE_INVALID"
+                        )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+            for name, expected in zip(
+                (
+                    identity.canonical_sidecar_path.name,
+                    identity.snapshot_manifest_path.name,
+                    identity.configured_jsonl_path.name,
+                ),
+                observed_proofs,
+                strict=True,
+            ):
+                authority = platform.open_regular(root, PurePath(name))
+                authorities.append(authority)
+                facts = authority.content_facts()
+                if (
+                    self._portable_content_proof(facts) != expected
+                    or root.inspect_entry(name) != facts.snapshot
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.ACTIVE_SET_INVALID",
+                        retryable=False,
+                    )
+
+            semantic = ContentSemanticFacts(
+                schema_version=snapshot.schema_version,
+                schema_digest=sealed_semantic.schema_digest,
+                fold_version=snapshot.fold_version,
+                index_version=snapshot.candidate_index_version,
+                candidate_index_kind=snapshot.candidate_index_kind,
+                fts5_available=snapshot.fts5_available,
+                sqlite_runtime_version=snapshot.sqlite_runtime_version,
+                unicode_runtime_version=snapshot.unicode_runtime_version,
+                journal_mode=snapshot.journal_mode,
+                synchronous=snapshot.synchronous,
+                foreign_keys=snapshot.foreign_keys,
+                busy_timeout_ms=snapshot.busy_timeout_ms,
+                wal_enabled=snapshot.wal_enabled,
+                extension_loading_enabled=snapshot.extension_loading_enabled,
+                record_count=record_count,
+                receipt_boundary_record_count=(
+                    sealed_semantic.receipt_boundary_record_count
+                ),
+                origin_batch_count=origin_batch_count,
+                origin_batch_id=sealed_semantic.origin_batch_id,
+                origin_batch_kind=sealed_semantic.origin_batch_kind,
+                exported_revision=binding.receipt.exported_revision,
+                fts_count=fts_count,
+                receipt_boundary_fts_count=(
+                    sealed_semantic.receipt_boundary_fts_count
+                ),
+                gram_counts=gram_counts,
+                exact_parity_digest=exact_parity_digest,
+                logical_closure_version=LOGICAL_CLOSURE_VERSION,
+                logical_closure_digest=logical_closure_digest,
+            )
+            active = _create_portable_active_content_attestation(
+                sealed_attestation_digest=sealed.attestation_digest,
+                journal_id=unsigned.journal_id,
+                resource_id=unsigned.resource_id,
+                target_identity=unsigned.target_identity,
+                canonical_store_id=unsigned.canonical_store_id,
+                snapshot_receipt_digest=unsigned.snapshot_receipt_digest,
+                generation=0,
+                activation_digest=activation_digest,
+                database=observed_proofs[0],
+                manifest=observed_proofs[1],
+                source=observed_proofs[2],
+                semantic_facts=semantic,
+            )
+            return active_ref, snapshot, active
+        except ActivationPreparationError:
+            raise
+        except (PlatformFileError, OSError, sqlite3.Error, SQLiteStoreSchemaError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.ACTIVE_SET_INVALID",
+                retryable=False,
+            ) from error
+        finally:
+            for authority in reversed(authorities):
+                authority.close()
+
+    def _publish_portable_generation(
+        self,
+        *,
+        preparation: _ActivationPreparation,
+        prepared: _PortableActivationJournalRecord,
+        predecessor: _PortablePublicationPhaseRecord,
+        unsigned: _PortablePublicationPhaseUnsigned,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        owner_reprove: Callable[[], None],
+        business_reprove: Callable[[_PortablePublicationPhaseRecord], None],
+    ) -> _PortablePublicationPhaseHandle:
+        """Withhold generation zero until its durable phase succeeds."""
+
+        def generation_owner_commit(
+            record: _PortablePublicationPhaseRecord,
+        ) -> None:
+            if record.unsigned != unsigned:
+                raise ActivationPreparationError(
+                    "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                    retryable=False,
+                )
+        return _WindowsPortablePublicationPhaseOwner.publish(
+            identity=self._resource_identity,
+            backend=platform,
+            persistent_private=persistent_private,
+            caller_borrow=caller_borrow,
+            prepared=prepared,
+            predecessor=predecessor,
+            unsigned=unsigned,
+            owner_reprove=owner_reprove,
+            owner_commit=generation_owner_commit,
+            business_reprove=business_reprove,
+        )
+
+    def _ensure_portable_activation_lineage_marker(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> None:
+        identity = self._resource_identity
+        marker_name = _activation_lineage_marker_path(identity).name
+        candidate_name = _activation_lineage_marker_temp_path(
+            _activation_lineage_marker_path(identity)
+        ).name
+        expected = _activation_lineage_marker_payload(identity)
+        if root.inspect_entry(candidate_name) is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        existing = root.inspect_entry(marker_name)
+        if existing is not None:
+            opened = platform.open_regular(root, PurePath(marker_name))
+            try:
+                if (
+                    opened.identity().kind != "regular"
+                    or opened.identity().link_count != 1
+                    or opened.read_all() != expected
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+            finally:
+                opened.close()
+            return
+        candidate = root.create_candidate(candidate_name, private=False)
+        pending: PendingPublication | None = None
+        try:
+            candidate.write_all(expected)
+            candidate.flush_content()
+            pending = root.begin_publish(
+                candidate,
+                marker_name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            retained = pending.retained_destination()
+            if (
+                retained.identity().kind != "regular"
+                or retained.identity().link_count != 1
+                or retained.read_all() != expected
+                or pending.terminal_reproof() != pending.preliminary_facts()
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        finally:
+            if candidate is not None:
+                candidate.close()
+            if pending is not None:
+                pending.close()
+
+    def publish_portable_activation(
+        self,
+        preparation: _ActivationPreparation,
+        prepared_handle: _PortablePreparedJournalHandle,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        retire_unpublished_stage: Callable[[], None],
+    ) -> int:
+        """Publish one Windows portable first activation through generation zero."""
+
+        if type(preparation) is not _ActivationPreparation:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_PREPARATION_INVALID",
+                retryable=False,
+            )
+        if type(prepared_handle) is not _PortablePreparedJournalHandle:
+            raise ActivationPreparationError(
+                "ACTIVATION.JOURNAL_HANDLE_INVALID",
+                retryable=False,
+            )
+        if not isinstance(platform, PlatformFileBackend) or (
+            persistent_private is not platform
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PUBLICATION_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("caller_borrow must be the exact portable borrow")
+        if not callable(retire_unpublished_stage):
+            raise TypeError("retire_unpublished_stage must be callable")
+
+        with self._condition:
+            if (
+                self._state != "ACTIVATING"
+                or self._preparation is not preparation
+                or self._cleanup_reservation is not None
+                or self._cleanup_in_progress
+                or self._view is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PUBLICATION_STATE_INVALID",
+                    retryable=True,
+                )
+            prepared = prepared_handle._record
+            prepared_unsigned = prepared.unsigned
+            stage = preparation._sealed_stage
+            token = preparation._token
+            physical = preparation._physical_snapshot
+            stage_sealer = importlib.import_module("tm_stage_sealer")
+            portable_snapshot_type = getattr(
+                stage_sealer,
+                "_PortablePhysicalReadinessSnapshot",
+            )
+            stage_seal_error = getattr(stage_sealer, "StageSealError")
+            if (
+                type(physical) is not portable_snapshot_type
+                or prepared_handle.preparation_id != preparation.preparation_id
+                or prepared_unsigned.closure != "PENDING"
+                or prepared_unsigned.phase != "PREPARED"
+                or prepared_unsigned.preparation_id != preparation.preparation_id
+                or prepared_unsigned.token_id != token.token_id
+                or prepared_unsigned.token_version != token.token_version
+                or prepared_unsigned.activation_nonce != token.activation_nonce
+                or prepared_unsigned.resource_id != self._resource_id
+                or prepared_unsigned.target_identity != self._target_identity
+                or prepared_unsigned.canonical_store_id
+                != self._canonical_store_id
+                or prepared_unsigned.expected_prior_generation is not None
+                or prepared_unsigned.sealed_content_attestation
+                != physical.sealed_content_attestation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                    retryable=False,
+                )
+
+            root, _lease = caller_borrow._publication_authorities(
+                platform,
+                persistent_private,
+                self._resource_identity,
+            )
+            identity = self._resource_identity
+            if (
+                identity.configured_jsonl_path.parent
+                != identity.canonical_sidecar_path.parent
+                or identity.snapshot_manifest_path.parent
+                != identity.canonical_sidecar_path.parent
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                    retryable=False,
+                )
+            root.reprove()
+            caller_borrow.reprove(platform, identity)
+            if (
+                root.inspect_entry(identity.canonical_sidecar_path.name)
+                is not None
+                or root.inspect_entry(identity.snapshot_manifest_path.name)
+                is not None
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.CANONICAL_TARGET_OCCUPIED",
+                    retryable=False,
+                )
+
+            armed = False
+            db_candidate: CandidateFile | None = None
+            manifest_candidate: CandidateFile | None = None
+            database_pending: PendingPublication | None = None
+            manifest_pending: PendingPublication | None = None
+
+            def fresh_physical_borrow() -> Any:
+                fresh = self._sealed_registry.resolve_physical_readiness(stage)
+                if type(fresh) is not portable_snapshot_type or replace(
+                    fresh,
+                    live_reproof=physical.live_reproof,
+                ) != physical:
+                    try:
+                        fresh.live_reproof._release()
+                    except BaseException:
+                        pass
+                    raise ActivationPreparationError(
+                        "ACTIVATION.PUBLICATION_ASSET_MUTATED",
+                        retryable=False,
+                    )
+                return fresh.live_reproof
+
+            def owner_reprove() -> None:
+                if (
+                    self._state != "ACTIVATING"
+                    or self._preparation is not preparation
+                    or self._cleanup_reservation is not None
+                    or self._cleanup_in_progress
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.PUBLICATION_STATE_INVALID",
+                        retryable=True,
+                    )
+                contract_module._validate_activation_token_for_stage(token, stage)
+                borrow = fresh_physical_borrow()
+                try:
+                    borrow.reprove()
+                finally:
+                    borrow._release()
+                caller_borrow.reprove(platform, identity)
+
+            def phase_unsigned(
+                phase: str,
+                predecessor_digest: str,
+                database: PortableContentFileProof,
+                manifest: PortableContentFileProof,
+                active: PortableActiveContentAttestation | None,
+            ) -> _PortablePublicationPhaseUnsigned:
+                return _PortablePublicationPhaseUnsigned(
+                    publication_version=_PORTABLE_PUBLICATION_VERSION,
+                    phase=phase,
+                    predecessor_digest=predecessor_digest,
+                    journal_id=prepared_unsigned.journal_id,
+                    preparation_id=prepared_unsigned.preparation_id,
+                    token_id=prepared_unsigned.token_id,
+                    token_version=prepared_unsigned.token_version,
+                    activation_nonce=prepared_unsigned.activation_nonce,
+                    resource_id=prepared_unsigned.resource_id,
+                    target_identity=prepared_unsigned.target_identity,
+                    canonical_store_id=prepared_unsigned.canonical_store_id,
+                    generation=0,
+                    canonical_database_name=identity.canonical_sidecar_path.name,
+                    canonical_database_size=database.size,
+                    canonical_database_sha256=database.sha256,
+                    canonical_manifest_name=identity.snapshot_manifest_path.name,
+                    canonical_manifest_size=manifest.size,
+                    canonical_manifest_sha256=manifest.sha256,
+                    private_directory_name=(
+                        prepared_unsigned.private_directory_name
+                    ),
+                    device_key_name=prepared_unsigned.device_key_name,
+                    sealed_content_attestation=(
+                        prepared_unsigned.sealed_content_attestation
+                    ),
+                    active_content_attestation=active,
+                )
+
+            def activation_digest() -> str:
+                return hashlib.sha256(
+                    json.dumps(
+                        {
+                            "activation_nonce": prepared_unsigned.activation_nonce,
+                            "artifact_id": prepared_unsigned.artifact_id,
+                            "evidence_digest": prepared_unsigned.evidence_digest,
+                            "generation": 0,
+                            "journal_id": prepared_unsigned.journal_id,
+                            "manifest_digest": (
+                                prepared_unsigned.new_manifest_digest
+                            ),
+                            "sealed_stage_digest": (
+                                prepared_unsigned.sealed_stage_digest
+                            ),
+                            "token_id": prepared_unsigned.token_id,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+
+            try:
+                owner_reprove()
+                db_borrow = fresh_physical_borrow()
+                try:
+                    db_candidate, db_candidate_facts = (
+                        db_borrow.copy_asset_to_new_candidate(
+                            platform=platform,
+                            parent=root,
+                            asset="database",
+                            candidate_name=(
+                                identity.canonical_sidecar_path.name
+                                + ".activation-candidate"
+                            ),
+                        )
+                    )
+                finally:
+                    db_borrow._release()
+                armed = True
+                if (
+                    self._portable_content_proof(db_candidate_facts)
+                    != prepared_unsigned.sealed_content_attestation.database
+                ):
+                    db_candidate.close()
+                    db_candidate = None
+                    raise ActivationPreparationError(
+                        "ACTIVATION.PUBLICATION_ASSET_MUTATED",
+                        retryable=False,
+                    )
+                db_candidate.flush_content()
+                try:
+                    database_pending = root.begin_publish(
+                        db_candidate,
+                        identity.canonical_sidecar_path.name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                finally:
+                    db_candidate = None
+                db_retained = database_pending.retained_destination()
+                sealed_database = self._portable_content_proof(
+                    db_retained.content_facts()
+                )
+                if sealed_database != prepared_unsigned.sealed_content_attestation.database:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.DB_REPLACE_UNPROVEN",
+                        retryable=False,
+                    )
+                db_unsigned = phase_unsigned(
+                    "DB_REPLACED",
+                    prepared.record_digest,
+                    sealed_database,
+                    prepared_unsigned.sealed_content_attestation.manifest,
+                    None,
+                )
+
+                def db_business(record: _PortablePublicationPhaseRecord) -> None:
+                    if record.unsigned != db_unsigned:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                            retryable=False,
+                        )
+                    owner_reprove()
+                    if self._portable_content_proof(
+                        db_retained.content_facts()
+                    ) != sealed_database:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.DB_REOPEN_INVALID",
+                            retryable=False,
+                        )
+                    readonly = sqlite3.connect(
+                        f"{identity.canonical_sidecar_path.as_uri()}?mode=ro",
+                        uri=True,
+                        timeout=BUSY_TIMEOUT_MS / 1000,
+                        isolation_level=None,
+                    )
+                    try:
+                        readonly.execute("PRAGMA query_only = ON")
+                        meta = _read_meta(readonly)
+                        if (
+                            meta.get("resource_id") != identity.resource_id
+                            or meta.get("canonical_store_id")
+                            != prepared_unsigned.canonical_store_id
+                            or meta.get("target_identity")
+                            != identity.target_identity
+                            or meta.get("activation_status") != "SEALED"
+                            or "activation_digest" in meta
+                            or _meta_int(meta, "generation") != 0
+                        ):
+                            raise ActivationPreparationError(
+                                "ACTIVATION.DB_REOPEN_INVALID",
+                                retryable=False,
+                            )
+                    finally:
+                        readonly.close()
+
+                def db_owner_commit(
+                    record: _PortablePublicationPhaseRecord,
+                ) -> None:
+                    if record.unsigned != db_unsigned:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                            retryable=False,
+                        )
+                db_phase = _WindowsPortablePublicationPhaseOwner.publish(
+                    identity=identity,
+                    backend=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                    prepared=prepared,
+                    predecessor=prepared,
+                    unsigned=db_unsigned,
+                    owner_reprove=owner_reprove,
+                    owner_commit=db_owner_commit,
+                    business_reprove=db_business,
+                )
+                if (
+                    database_pending.terminal_reproof()
+                    != database_pending.preliminary_facts()
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                database_pending.close()
+                database_pending = None
+
+                sealed_snapshot = inspect_stage_schema(
+                    _canonical_activation_ref(
+                        identity,
+                        journal_id=prepared_unsigned.journal_id,
+                    ),
+                    canonical_store_id=prepared_unsigned.canonical_store_id,
+                    _allow_sealed=True,
+                )
+                if sealed_snapshot.activation_status != "SEALED":
+                    raise ActivationPreparationError(
+                        "ACTIVATION.DB_REOPEN_INVALID",
+                        retryable=False,
+                    )
+
+                digest = activation_digest()
+                active_database, logical_closure = (
+                    self._apply_portable_receipt_activation(
+                        preparation=preparation,
+                        prepared=prepared,
+                        platform=platform,
+                        root=root,
+                        activation_digest=digest,
+                    )
+                )
+
+                manifest_borrow = fresh_physical_borrow()
+                try:
+                    manifest_candidate, manifest_candidate_facts = (
+                        manifest_borrow.copy_asset_to_new_candidate(
+                            platform=platform,
+                            parent=root,
+                            asset="manifest",
+                            candidate_name=(
+                                identity.snapshot_manifest_path.name
+                                + ".activation-candidate"
+                            ),
+                        )
+                    )
+                finally:
+                    manifest_borrow._release()
+                if (
+                    self._portable_content_proof(manifest_candidate_facts)
+                    != prepared_unsigned.sealed_content_attestation.manifest
+                ):
+                    manifest_candidate.close()
+                    manifest_candidate = None
+                    raise ActivationPreparationError(
+                        "ACTIVATION.PUBLICATION_ASSET_MUTATED",
+                        retryable=False,
+                    )
+                manifest_candidate.flush_content()
+                try:
+                    manifest_pending = root.begin_publish(
+                        manifest_candidate,
+                        identity.snapshot_manifest_path.name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                finally:
+                    manifest_candidate = None
+                manifest_retained = manifest_pending.retained_destination()
+                active_manifest = self._portable_content_proof(
+                    manifest_retained.content_facts()
+                )
+                if (
+                    active_manifest
+                    != prepared_unsigned.sealed_content_attestation.manifest
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.MANIFEST_PUBLICATION_UNPROVEN",
+                        retryable=False,
+                    )
+                active_ref, active_snapshot, active_attestation = (
+                    self._reprove_portable_active_set(
+                        prepared=prepared,
+                        platform=platform,
+                        root=root,
+                        database=active_database,
+                        manifest=active_manifest,
+                        activation_digest=digest,
+                        expected_logical_closure_digest=logical_closure,
+                    )
+                )
+                manifest_unsigned = phase_unsigned(
+                    "MANIFEST_PUBLISHED",
+                    db_phase.record_digest,
+                    active_database,
+                    active_manifest,
+                    active_attestation,
+                )
+
+                def active_business(record: _PortablePublicationPhaseRecord) -> None:
+                    if record.unsigned.active_content_attestation != active_attestation:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
+                            retryable=False,
+                        )
+                    _, _, observed = self._reprove_portable_active_set(
+                        prepared=prepared,
+                        platform=platform,
+                        root=root,
+                        database=active_database,
+                        manifest=active_manifest,
+                        activation_digest=digest,
+                        expected_logical_closure_digest=logical_closure,
+                    )
+                    if observed != active_attestation:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
+                            retryable=False,
+                        )
+
+                def manifest_owner_commit(
+                    record: _PortablePublicationPhaseRecord,
+                ) -> None:
+                    if record.unsigned != manifest_unsigned:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                            retryable=False,
+                        )
+                manifest_phase = _WindowsPortablePublicationPhaseOwner.publish(
+                    identity=identity,
+                    backend=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                    prepared=prepared,
+                    predecessor=db_phase._record,
+                    unsigned=manifest_unsigned,
+                    owner_reprove=owner_reprove,
+                    owner_commit=manifest_owner_commit,
+                    business_reprove=active_business,
+                )
+                if (
+                    manifest_pending.terminal_reproof()
+                    != manifest_pending.preliminary_facts()
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                manifest_pending.close()
+                manifest_pending = None
+
+                view = _SQLiteGenerationView(
+                    stage=active_ref,
+                    canonical_store_id=prepared_unsigned.canonical_store_id,
+                    generation=0,
+                    fts5_available=active_snapshot.fts5_available,
+                    active_content_attestation=active_attestation,
+                )
+                generation_unsigned = phase_unsigned(
+                    "GENERATION_PUBLISHED",
+                    manifest_phase.record_digest,
+                    active_database,
+                    active_manifest,
+                    active_attestation,
+                )
+                _ = self._publish_portable_generation(
+                    preparation=preparation,
+                    prepared=prepared,
+                    predecessor=manifest_phase._record,
+                    unsigned=generation_unsigned,
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                    owner_reprove=owner_reprove,
+                    business_reprove=active_business,
+                )
+                _, _, final_active = self._reprove_portable_active_set(
+                    prepared=prepared,
+                    platform=platform,
+                    root=root,
+                    database=active_database,
+                    manifest=active_manifest,
+                    activation_digest=digest,
+                    expected_logical_closure_digest=logical_closure,
+                )
+                if final_active != active_attestation:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
+                        retryable=False,
+                    )
+                self._sealed_registry.consume(token)
+                if retire_unpublished_stage() is not None:
+                    raise TypeError(
+                        "retire_unpublished_stage must return None"
+                    )
+                self._ensure_portable_activation_lineage_marker(
+                    platform=platform,
+                    root=root,
+                )
+                self._view = view
+                self._preparation = None
+                self._state = "READY"
+                self._condition.notify_all()
+                return 0
+            except (
+                ActivationPreparationError,
+                PlatformFileError,
+                OSError,
+                sqlite3.Error,
+                SQLiteStoreSchemaError,
+                stage_seal_error,
+            ) as error:
+                try:
+                    self._sealed_registry.release_portable_live_authority_for_recovery(
+                        token
+                    )
+                except (stage_seal_error, OSError) as release_error:
+                    self._state = "ACTIVATING"
+                    self._condition.notify_all()
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from release_error
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                if armed:
+                    if isinstance(error, ActivationPreparationError) and (
+                        error.code == "ACTIVATION.RECOVERY_REQUIRED"
+                        and error.retryable
+                    ):
+                        raise
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from error
+                raise
+            except BaseException:
+                try:
+                    self._sealed_registry.release_portable_live_authority_for_recovery(
+                        token
+                    )
+                except BaseException:
+                    pass
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise
+            finally:
+                active_error = sys.exception()
+                first_cleanup_error: BaseException | None = None
+                for authority in (
+                    db_candidate,
+                    manifest_candidate,
+                    database_pending,
+                    manifest_pending,
+                ):
+                    if authority is None:
+                        continue
+                    try:
+                        authority.close()
+                    except BaseException as cleanup_error:
+                        if first_cleanup_error is None:
+                            first_cleanup_error = cleanup_error
+                if active_error is None and first_cleanup_error is not None:
+                    if isinstance(
+                        first_cleanup_error,
+                        (PlatformFileError, OSError),
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_REQUIRED",
+                            retryable=True,
+                        ) from first_cleanup_error
+                    raise first_cleanup_error
 
     def recover_portable_prepared_cancellation(
         self,
@@ -10147,6 +11346,18 @@ def _active_attestation_for_health(
     if active is None:
         return None
     identity = lease.stage.resource_identity
+    if type(active) is PortableActiveContentAttestation:
+        if (
+            active.resource_id != identity.resource_id
+            or active.target_identity != identity.target_identity
+            or active.canonical_store_id != lease.canonical_store_id
+            or active.generation != lease.generation
+        ):
+            raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+        # Portable attestations intentionally persist bytes, not a reusable
+        # FileId authority.  The Windows runtime therefore takes the full
+        # SQLite health path instead of treating historical identity as live.
+        return None
     if type(active) is not ActiveContentAttestation or (
         active.resource_id != identity.resource_id
         or active.target_identity != identity.target_identity

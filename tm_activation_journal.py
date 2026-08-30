@@ -27,6 +27,8 @@ from tm_content_attestation import (
     PortableSealedContentAttestation,
     SealedContentAttestation,
     _active_content_attestation_from_mapping,
+    _active_content_attestation_record_from_mapping,
+    _active_content_attestation_record_to_mapping,
     _active_content_attestation_to_mapping,
     _sealed_content_attestation_from_mapping,
     _sealed_content_attestation_to_mapping,
@@ -148,7 +150,9 @@ class _SQLiteGenerationView:
     canonical_store_id: str
     generation: int
     fts5_available: bool
-    active_content_attestation: ActiveContentAttestation | None = None
+    active_content_attestation: (
+        ActiveContentAttestation | PortableActiveContentAttestation | None
+    ) = None
 
 
 class ActivationPreparationError(RuntimeError):
@@ -4454,6 +4458,15 @@ def _require_portable_activation_basename(value: object, field_name: str) -> str
     return result
 
 
+def _require_portable_activation_nonnegative_int(
+    value: object,
+    field_name: str,
+) -> int:
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{field_name} must be a non-negative built-in integer")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class _PortableActivationJournalUnsigned:
     """Portable PREPARED owner facts before the nested W2 proof is minted."""
@@ -4764,6 +4777,340 @@ def _parse_portable_activation_journal_bytes(
     return record
 
 
+# Canonical publication is a distinct append-only chain.  Its field set and
+# parser are intentionally not shared with the v3 PREPARED/CANCELLED envelope.
+_PORTABLE_PUBLICATION_VERSION = "activation-publication-v1"
+_PORTABLE_PUBLICATION_PHASES = (
+    "DB_REPLACED",
+    "MANIFEST_PUBLISHED",
+    "GENERATION_PUBLISHED",
+)
+_PORTABLE_PUBLICATION_PHASE_NAMES = {
+    "DB_REPLACED": "activation-publication-db-replaced-v1.json",
+    "MANIFEST_PUBLISHED": "activation-publication-manifest-published-v1.json",
+    "GENERATION_PUBLISHED": "activation-publication-generation-published-v1.json",
+}
+_PORTABLE_PUBLICATION_MAX_BYTES = 512 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _PortablePublicationPhaseUnsigned:
+    publication_version: str
+    phase: str
+    predecessor_digest: str
+    journal_id: str
+    preparation_id: str
+    token_id: str
+    token_version: str
+    activation_nonce: str
+    resource_id: str
+    target_identity: str
+    canonical_store_id: str
+    generation: int
+    canonical_database_name: str
+    canonical_database_size: int
+    canonical_database_sha256: str
+    canonical_manifest_name: str
+    canonical_manifest_size: int
+    canonical_manifest_sha256: str
+    private_directory_name: str
+    device_key_name: str
+    sealed_content_attestation: PortableSealedContentAttestation
+    active_content_attestation: PortableActiveContentAttestation | None
+
+    def __post_init__(self) -> None:
+        if self.publication_version != _PORTABLE_PUBLICATION_VERSION:
+            raise ValueError("portable publication version is unsupported")
+        if self.phase not in _PORTABLE_PUBLICATION_PHASES:
+            raise ValueError("portable publication phase is invalid")
+        for field_name in (
+            "journal_id",
+            "preparation_id",
+            "token_id",
+            "token_version",
+            "activation_nonce",
+            "resource_id",
+            "canonical_store_id",
+        ):
+            _require_portable_activation_string(getattr(self, field_name), field_name)
+        for field_name in (
+            "predecessor_digest",
+            "target_identity",
+            "canonical_database_sha256",
+            "canonical_manifest_sha256",
+        ):
+            _require_portable_activation_digest(getattr(self, field_name), field_name)
+        for field_name in (
+            "canonical_database_name",
+            "canonical_manifest_name",
+            "private_directory_name",
+            "device_key_name",
+        ):
+            _require_portable_activation_basename(getattr(self, field_name), field_name)
+        _require_portable_activation_nonnegative_int(
+            self.canonical_database_size,
+            "canonical_database_size",
+        )
+        _require_portable_activation_nonnegative_int(
+            self.canonical_manifest_size,
+            "canonical_manifest_size",
+        )
+        if self.generation != 0 or type(self.generation) is not int:
+            raise ValueError("portable first publication generation must be zero")
+        sealed = self.sealed_content_attestation
+        if type(sealed) is not PortableSealedContentAttestation:
+            raise TypeError("portable publication requires exact sealed attestation")
+        if (
+            sealed.resource_id != self.resource_id
+            or sealed.target_identity != self.target_identity
+            or sealed.canonical_store_id != self.canonical_store_id
+            or sealed.expected_prior_generation is not None
+        ):
+            raise ValueError("portable publication sealed attestation does not bind")
+        active = self.active_content_attestation
+        if self.phase == "DB_REPLACED":
+            if active is not None:
+                raise ValueError("DB_REPLACED must not carry active attestation")
+            expected_database = sealed.database
+            expected_manifest = sealed.manifest
+        else:
+            if type(active) is not PortableActiveContentAttestation:
+                raise TypeError("published manifest phases require active attestation")
+            if (
+                active.resource_id != self.resource_id
+                or active.target_identity != self.target_identity
+                or active.canonical_store_id != self.canonical_store_id
+                or active.generation != 0
+                or active.journal_id != self.journal_id
+                or active.sealed_attestation_digest != sealed.attestation_digest
+                or active.snapshot_receipt_digest != sealed.snapshot_receipt_digest
+                or active.source != sealed.source
+            ):
+                raise ValueError("portable publication active attestation does not bind")
+            expected_database = active.database
+            expected_manifest = active.manifest
+        if (
+            expected_database.size != self.canonical_database_size
+            or expected_database.sha256 != self.canonical_database_sha256
+            or expected_manifest.size != self.canonical_manifest_size
+            or expected_manifest.sha256 != self.canonical_manifest_sha256
+        ):
+            raise ValueError("portable publication canonical content does not bind")
+
+
+_PORTABLE_PUBLICATION_UNSIGNED_FIELDS = frozenset(
+    item.name for item in fields(_PortablePublicationPhaseUnsigned)
+)
+_PORTABLE_PUBLICATION_RECORD_FIELDS = (
+    _PORTABLE_PUBLICATION_UNSIGNED_FIELDS
+    | {"private_directory_proof", "record_digest"}
+)
+
+
+def _portable_publication_unsigned_to_mapping(
+    unsigned: _PortablePublicationPhaseUnsigned,
+) -> dict[str, object]:
+    if type(unsigned) is not _PortablePublicationPhaseUnsigned:
+        raise TypeError("portable publication unsigned facts are invalid")
+    active = unsigned.active_content_attestation
+    return {
+        "activation_nonce": unsigned.activation_nonce,
+        "active_content_attestation": (
+            None
+            if active is None
+            else _active_content_attestation_record_to_mapping(active)
+        ),
+        "canonical_database_name": unsigned.canonical_database_name,
+        "canonical_database_sha256": unsigned.canonical_database_sha256,
+        "canonical_database_size": unsigned.canonical_database_size,
+        "canonical_manifest_name": unsigned.canonical_manifest_name,
+        "canonical_manifest_sha256": unsigned.canonical_manifest_sha256,
+        "canonical_manifest_size": unsigned.canonical_manifest_size,
+        "canonical_store_id": unsigned.canonical_store_id,
+        "device_key_name": unsigned.device_key_name,
+        "generation": unsigned.generation,
+        "journal_id": unsigned.journal_id,
+        "phase": unsigned.phase,
+        "predecessor_digest": unsigned.predecessor_digest,
+        "preparation_id": unsigned.preparation_id,
+        "private_directory_name": unsigned.private_directory_name,
+        "publication_version": unsigned.publication_version,
+        "resource_id": unsigned.resource_id,
+        "sealed_content_attestation": _sealed_content_attestation_record_to_mapping(
+            unsigned.sealed_content_attestation
+        ),
+        "target_identity": unsigned.target_identity,
+        "token_id": unsigned.token_id,
+        "token_version": unsigned.token_version,
+    }
+
+
+def _portable_publication_owner_context_sha256(
+    unsigned: _PortablePublicationPhaseUnsigned,
+) -> bytes:
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_publication_unsigned_to_mapping(unsigned)
+        )
+    ).digest()
+
+
+@dataclass(frozen=True, slots=True)
+class _PortablePublicationPhaseRecord:
+    unsigned: _PortablePublicationPhaseUnsigned
+    private_directory_proof: WindowsPrivateProof
+    record_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.unsigned) is not _PortablePublicationPhaseUnsigned:
+            raise TypeError("portable publication unsigned facts are invalid")
+        if type(self.private_directory_proof) is not WindowsPrivateProof:
+            raise TypeError("portable publication private proof is invalid")
+        if (
+            self.private_directory_proof.object_role
+            is not PrivateProofObjectRole.PRIVATE_DIRECTORY
+            or self.private_directory_proof.owner_context_sha256
+            != _portable_publication_owner_context_sha256(self.unsigned)
+        ):
+            raise ValueError("portable publication private proof does not bind")
+        _require_portable_activation_digest(self.record_digest, "record_digest")
+        if self.record_digest != _portable_publication_record_digest(
+            self.unsigned,
+            self.private_directory_proof,
+        ):
+            raise ValueError("portable publication record digest does not close")
+
+
+def _portable_publication_record_payload(
+    unsigned: _PortablePublicationPhaseUnsigned,
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    mapping = _portable_publication_unsigned_to_mapping(unsigned)
+    mapping["private_directory_proof"] = _portable_activation_proof_to_mapping(proof)
+    return mapping
+
+
+def _portable_publication_record_digest(
+    unsigned: _PortablePublicationPhaseUnsigned,
+    proof: WindowsPrivateProof,
+) -> str:
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_publication_record_payload(unsigned, proof)
+        )
+    ).hexdigest()
+
+
+def _create_portable_publication_phase_record(
+    unsigned: _PortablePublicationPhaseUnsigned,
+    proof: WindowsPrivateProof,
+) -> _PortablePublicationPhaseRecord:
+    return _PortablePublicationPhaseRecord(
+        unsigned=unsigned,
+        private_directory_proof=proof,
+        record_digest=_portable_publication_record_digest(unsigned, proof),
+    )
+
+
+def _serialize_portable_publication_phase_record(
+    record: _PortablePublicationPhaseRecord,
+) -> bytes:
+    if type(record) is not _PortablePublicationPhaseRecord:
+        raise TypeError("portable publication record is invalid")
+    mapping = _portable_publication_record_payload(
+        record.unsigned,
+        record.private_directory_proof,
+    )
+    mapping["record_digest"] = record.record_digest
+    return _portable_activation_canonical_json(mapping) + b"\n"
+
+
+def _parse_portable_publication_phase_bytes(
+    serialized: bytes,
+) -> _PortablePublicationPhaseRecord:
+    if type(serialized) is not bytes:
+        raise TypeError("portable publication bytes must be exact bytes")
+    if not serialized or len(serialized) > _PORTABLE_PUBLICATION_MAX_BYTES:
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_PARSE_INVALID",
+            retryable=False,
+        )
+
+    class _DuplicatePortablePublicationKey(ValueError):
+        pass
+
+    def reject_constant(value: str) -> None:
+        del value
+        raise ValueError("non-finite JSON number is not allowed")
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        mapping: dict[str, object] = {}
+        for key, value in pairs:
+            if key in mapping:
+                raise _DuplicatePortablePublicationKey(key)
+            mapping[key] = value
+        return mapping
+
+    try:
+        mapping = json.loads(
+            serialized.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=strict_object,
+        )
+        if type(mapping) is not dict or set(mapping) != _PORTABLE_PUBLICATION_RECORD_FIELDS:
+            raise ValueError("portable publication fields are invalid")
+        active_mapping = mapping["active_content_attestation"]
+        active = (
+            None
+            if active_mapping is None
+            else _active_content_attestation_record_from_mapping(active_mapping)
+        )
+        unsigned = _PortablePublicationPhaseUnsigned(
+            publication_version=mapping["publication_version"],
+            phase=mapping["phase"],
+            predecessor_digest=mapping["predecessor_digest"],
+            journal_id=mapping["journal_id"],
+            preparation_id=mapping["preparation_id"],
+            token_id=mapping["token_id"],
+            token_version=mapping["token_version"],
+            activation_nonce=mapping["activation_nonce"],
+            resource_id=mapping["resource_id"],
+            target_identity=mapping["target_identity"],
+            canonical_store_id=mapping["canonical_store_id"],
+            generation=mapping["generation"],
+            canonical_database_name=mapping["canonical_database_name"],
+            canonical_database_size=mapping["canonical_database_size"],
+            canonical_database_sha256=mapping["canonical_database_sha256"],
+            canonical_manifest_name=mapping["canonical_manifest_name"],
+            canonical_manifest_size=mapping["canonical_manifest_size"],
+            canonical_manifest_sha256=mapping["canonical_manifest_sha256"],
+            private_directory_name=mapping["private_directory_name"],
+            device_key_name=mapping["device_key_name"],
+            sealed_content_attestation=_sealed_content_attestation_record_from_mapping(
+                mapping["sealed_content_attestation"]
+            ),
+            active_content_attestation=active,
+        )
+        record = _PortablePublicationPhaseRecord(
+            unsigned=unsigned,
+            private_directory_proof=_portable_activation_proof_from_mapping(
+                mapping["private_directory_proof"]
+            ),
+            record_digest=mapping["record_digest"],
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    if _serialize_portable_publication_phase_record(record) != serialized:
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_PARSE_INVALID",
+            retryable=False,
+        )
+    return record
+
+
 _PORTABLE_JOURNAL_BORROW_FACTORY_KEY = object()
 _PORTABLE_JOURNAL_HANDLE_FACTORY_KEY = object()
 _PORTABLE_KEY_CANDIDATE_SUFFIX = ".candidate"
@@ -4900,6 +5247,27 @@ class _CallerHeldPortableJournalBorrow:
                 retryable=False,
             )
         self.__claimed = True
+        return self.__root, self.__lease
+
+    def _publication_authorities(
+        self,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        identity: CanonicalResourceIdentity,
+    ) -> tuple[RootedDirectoryAuthority, LockLease]:
+        """Reborrow the same live owner root/lease after PREPARED was claimed."""
+
+        if not self.__claimed:
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
+        self.reprove(backend, identity)
+        if persistent_private is not backend:
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                retryable=False,
+            )
         return self.__root, self.__lease
 
     def lock_payload_digest(self) -> str:
@@ -5471,6 +5839,506 @@ class _WindowsPortablePreparedJournalOwner:
             raise active_error
         if result is None:
             raise AssertionError("portable journal owner produced no handle")
+        return result
+
+
+_PORTABLE_PUBLICATION_HANDLE_FACTORY_KEY = object()
+_PORTABLE_PUBLICATION_CANDIDATE_SUFFIX = ".candidate"
+
+
+def _portable_publication_phase_name(phase: str) -> str:
+    try:
+        return _PORTABLE_PUBLICATION_PHASE_NAMES[phase]
+    except (KeyError, TypeError) as error:
+        raise ValueError("portable publication phase is invalid") from error
+
+
+def _portable_publication_chain_predecessor(
+    prepared: _PortableActivationJournalRecord,
+    predecessor: _PortableActivationJournalRecord | _PortablePublicationPhaseRecord,
+    unsigned: _PortablePublicationPhaseUnsigned,
+) -> tuple[str, bytes, WindowsPrivateProof, bytes]:
+    if (
+        type(prepared) is not _PortableActivationJournalRecord
+        or prepared.unsigned.closure != "PENDING"
+        or prepared.unsigned.phase != "PREPARED"
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+            retryable=False,
+        )
+    prepared_unsigned = prepared.unsigned
+    if (
+        unsigned.journal_id != prepared_unsigned.journal_id
+        or unsigned.preparation_id != prepared_unsigned.preparation_id
+        or unsigned.token_id != prepared_unsigned.token_id
+        or unsigned.token_version != prepared_unsigned.token_version
+        or unsigned.activation_nonce != prepared_unsigned.activation_nonce
+        or unsigned.resource_id != prepared_unsigned.resource_id
+        or unsigned.target_identity != prepared_unsigned.target_identity
+        or unsigned.canonical_store_id != prepared_unsigned.canonical_store_id
+        or unsigned.private_directory_name
+        != prepared_unsigned.private_directory_name
+        or unsigned.device_key_name != prepared_unsigned.device_key_name
+        or unsigned.sealed_content_attestation
+        != prepared_unsigned.sealed_content_attestation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+            retryable=False,
+        )
+    phase_index = _PORTABLE_PUBLICATION_PHASES.index(unsigned.phase)
+    if phase_index == 0:
+        if type(predecessor) is not _PortableActivationJournalRecord or (
+            predecessor != prepared
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                retryable=False,
+            )
+        predecessor_name = prepared_unsigned.journal_name
+        predecessor_bytes = _serialize_portable_activation_journal_record(prepared)
+        predecessor_proof = prepared.private_directory_proof
+        predecessor_context = _portable_activation_owner_context_sha256(
+            prepared_unsigned
+        )
+        predecessor_digest = prepared.record_digest
+    else:
+        if type(predecessor) is not _PortablePublicationPhaseRecord:
+            raise ActivationPreparationError(
+                "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                retryable=False,
+            )
+        expected_phase = _PORTABLE_PUBLICATION_PHASES[phase_index - 1]
+        predecessor_unsigned = predecessor.unsigned
+        if (
+            predecessor_unsigned.phase != expected_phase
+            or predecessor_unsigned.journal_id != unsigned.journal_id
+            or predecessor_unsigned.preparation_id != unsigned.preparation_id
+            or predecessor_unsigned.token_id != unsigned.token_id
+            or predecessor_unsigned.token_version != unsigned.token_version
+            or predecessor_unsigned.activation_nonce != unsigned.activation_nonce
+            or predecessor_unsigned.resource_id != unsigned.resource_id
+            or predecessor_unsigned.target_identity != unsigned.target_identity
+            or predecessor_unsigned.canonical_store_id
+            != unsigned.canonical_store_id
+            or predecessor_unsigned.generation != unsigned.generation
+            or predecessor_unsigned.canonical_database_name
+            != unsigned.canonical_database_name
+            or predecessor_unsigned.canonical_manifest_name
+            != unsigned.canonical_manifest_name
+            or predecessor_unsigned.private_directory_name
+            != unsigned.private_directory_name
+            or predecessor_unsigned.device_key_name != unsigned.device_key_name
+            or predecessor_unsigned.sealed_content_attestation
+            != unsigned.sealed_content_attestation
+            or (
+                unsigned.phase == "GENERATION_PUBLISHED"
+                and predecessor_unsigned.active_content_attestation
+                != unsigned.active_content_attestation
+            )
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                retryable=False,
+            )
+        predecessor_name = _portable_publication_phase_name(expected_phase)
+        predecessor_bytes = _serialize_portable_publication_phase_record(predecessor)
+        predecessor_proof = predecessor.private_directory_proof
+        predecessor_context = _portable_publication_owner_context_sha256(
+            predecessor_unsigned
+        )
+        predecessor_digest = predecessor.record_digest
+    if unsigned.predecessor_digest != predecessor_digest:
+        raise ActivationPreparationError(
+            "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+            retryable=False,
+        )
+    return (
+        predecessor_name,
+        predecessor_bytes,
+        predecessor_proof,
+        predecessor_context,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _PortablePublicationPhaseHandle:
+    phase: str
+    phase_name: str
+    predecessor_digest: str
+    record_digest: str
+    _record: _PortablePublicationPhaseRecord = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        record: _PortablePublicationPhaseRecord,
+        *,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_PUBLICATION_HANDLE_FACTORY_KEY:
+            raise TypeError("portable publication handle requires owner factory")
+        if type(record) is not _PortablePublicationPhaseRecord:
+            raise TypeError("portable publication record is invalid")
+        object.__setattr__(self, "phase", record.unsigned.phase)
+        object.__setattr__(
+            self,
+            "phase_name",
+            _portable_publication_phase_name(record.unsigned.phase),
+        )
+        object.__setattr__(
+            self,
+            "predecessor_digest",
+            record.unsigned.predecessor_digest,
+        )
+        object.__setattr__(self, "record_digest", record.record_digest)
+        object.__setattr__(self, "_record", record)
+
+
+class _WindowsPortablePublicationPhaseOwner:
+    """Write-once owner for one exact portable canonical-publication phase."""
+
+    @staticmethod
+    def publish(
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        prepared: _PortableActivationJournalRecord,
+        predecessor: (
+            _PortableActivationJournalRecord | _PortablePublicationPhaseRecord
+        ),
+        unsigned: _PortablePublicationPhaseUnsigned,
+        owner_reprove: Callable[[], None],
+        owner_commit: Callable[[_PortablePublicationPhaseRecord], None],
+        business_reprove: Callable[[_PortablePublicationPhaseRecord], None],
+    ) -> _PortablePublicationPhaseHandle:
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("portable publication identity is invalid")
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("portable publication borrow is invalid")
+        if type(unsigned) is not _PortablePublicationPhaseUnsigned:
+            raise TypeError("portable publication unsigned facts are invalid")
+        for callback, name in (
+            (owner_reprove, "owner reproof"),
+            (owner_commit, "owner commit"),
+            (business_reprove, "business reproof"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"portable publication {name} must be callable")
+        if (
+            unsigned.resource_id != identity.resource_id
+            or unsigned.target_identity != identity.target_identity
+            or unsigned.canonical_database_name
+            != identity.canonical_sidecar_path.name
+            or unsigned.canonical_manifest_name
+            != identity.snapshot_manifest_path.name
+            or unsigned.private_directory_name
+            != _portable_activation_private_directory_name(identity)
+            or unsigned.device_key_name != "device.key"
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                retryable=False,
+            )
+        (
+            predecessor_name,
+            predecessor_bytes,
+            predecessor_proof,
+            predecessor_context_sha256,
+        ) = _portable_publication_chain_predecessor(
+            prepared,
+            predecessor,
+            unsigned,
+        )
+
+        publication_armed = False
+        owner_commit_armed = False
+        authorities: list[object] = []
+        candidate: CandidateFile | None = None
+        pending: PendingPublication | None = None
+        active_error: BaseException | None = None
+        result: _PortablePublicationPhaseHandle | None = None
+        try:
+            root, _lease = caller_borrow._publication_authorities(
+                backend,
+                persistent_private,
+                identity,
+            )
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            private_parent = backend.bind_parent(
+                root,
+                PurePath(
+                    unsigned.private_directory_name,
+                    "publication-placeholder",
+                ),
+            )
+            authorities.append(private_parent)
+            private_evidence = backend.prove_private(private_parent)
+            authorities.append(private_evidence)
+            key_file = backend.open_regular(
+                root,
+                PurePath(
+                    unsigned.private_directory_name,
+                    unsigned.device_key_name,
+                ),
+            )
+            authorities.append(key_file)
+            key_identity = key_file.identity()
+            if (
+                key_identity.kind != "regular"
+                or key_identity.link_count != 1
+                or len(key_file.read_all()) != DEVICE_SECRET_SIZE_BYTES
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                    retryable=False,
+                )
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+
+            try:
+                predecessor_file = backend.open_regular(
+                    root,
+                    PurePath(unsigned.private_directory_name, predecessor_name),
+                )
+            except (PlatformFileError, OSError) as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+            authorities.append(predecessor_file)
+            predecessor_identity = predecessor_file.identity()
+            if (
+                predecessor_identity.kind != "regular"
+                or predecessor_identity.link_count != 1
+                or predecessor_file.read_all() != predecessor_bytes
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            predecessor_evidence = backend.prove_private(predecessor_file)
+            authorities.append(predecessor_evidence)
+            predecessor_verified = persistent_private.verify(
+                private_evidence,
+                secret,
+                predecessor_proof,
+                PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    predecessor_context_sha256,
+                ),
+            )
+            predecessor_verified.close()
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+
+            context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                _portable_publication_owner_context_sha256(unsigned),
+            )
+            proof = persistent_private.mint(private_evidence, secret, context)
+            record = _create_portable_publication_phase_record(unsigned, proof)
+            expected_bytes = _serialize_portable_publication_phase_record(record)
+            phase_name = _portable_publication_phase_name(unsigned.phase)
+            candidate_name = phase_name + _PORTABLE_PUBLICATION_CANDIDATE_SUFFIX
+            try:
+                candidate_entry = private_parent.inspect_entry(candidate_name)
+                existing = private_parent.inspect_entry(phase_name)
+            except (PlatformFileError, OSError) as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+            if candidate_entry is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            if existing is not None:
+                try:
+                    phase_file = backend.open_regular(
+                        root,
+                        PurePath(unsigned.private_directory_name, phase_name),
+                    )
+                except (PlatformFileError, OSError) as error:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from error
+                authorities.append(phase_file)
+                phase_identity = phase_file.identity()
+                if (
+                    phase_identity.kind != "regular"
+                    or phase_identity.link_count != 1
+                    or phase_file.read_all() != expected_bytes
+                    or _parse_portable_publication_phase_bytes(
+                        phase_file.read_all()
+                    )
+                    != record
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                phase_evidence = backend.prove_private(phase_file)
+                authorities.append(phase_evidence)
+                verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    record.private_directory_proof,
+                    context,
+                )
+                authorities.append(verified)
+                owner_reprove()
+                caller_borrow.reprove(backend, identity)
+                owner_commit_armed = True
+                if owner_commit(record) is not None:
+                    raise TypeError("portable publication owner commit must return None")
+                if business_reprove(record) is not None:
+                    raise TypeError(
+                        "portable publication business reproof must return None"
+                    )
+                persistent_private.consume_verified(verified, context)
+                authorities.remove(verified)
+                result = _PortablePublicationPhaseHandle(
+                    record,
+                    _factory_key=_PORTABLE_PUBLICATION_HANDLE_FACTORY_KEY,
+                )
+            else:
+                candidate = private_parent.create_candidate(
+                    candidate_name,
+                    private=True,
+                )
+                publication_armed = True
+                candidate.write_all(expected_bytes)
+                candidate.flush_content()
+                caller_borrow.reprove(backend, identity)
+                owner_reprove()
+                try:
+                    pending = private_parent.begin_publish(
+                        candidate,
+                        phase_name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                except BaseException:
+                    candidate.close()
+                    candidate = None
+                    raise
+                candidate = None
+                authorities.append(pending)
+                phase_file = pending.retained_destination()
+                phase_identity = phase_file.identity()
+                if (
+                    phase_identity.kind != "regular"
+                    or phase_identity.link_count != 1
+                    or phase_file.read_all() != expected_bytes
+                    or _parse_portable_publication_phase_bytes(
+                        phase_file.read_all()
+                    )
+                    != record
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                phase_evidence = backend.prove_private(phase_file)
+                authorities.append(phase_evidence)
+                verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    record.private_directory_proof,
+                    context,
+                )
+                authorities.append(verified)
+                owner_reprove()
+                caller_borrow.reprove(backend, identity)
+                owner_commit_armed = True
+                if owner_commit(record) is not None:
+                    raise TypeError("portable publication owner commit must return None")
+                if business_reprove(record) is not None:
+                    raise TypeError(
+                        "portable publication business reproof must return None"
+                    )
+                phase_evidence.close()
+                authorities.remove(phase_evidence)
+                owner_reprove()
+                caller_borrow.reprove(backend, identity)
+                if (
+                    phase_file.read_all() != expected_bytes
+                    or _parse_portable_publication_phase_bytes(
+                        phase_file.read_all()
+                    )
+                    != record
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                fresh_phase_evidence = backend.prove_private(phase_file)
+                authorities.append(fresh_phase_evidence)
+                if pending.terminal_reproof() != pending.preliminary_facts():
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                pending.close()
+                authorities.remove(pending)
+                pending = None
+                caller_borrow.reprove(backend, identity)
+                persistent_private.consume_verified(verified, context)
+                authorities.remove(verified)
+                result = _PortablePublicationPhaseHandle(
+                    record,
+                    _factory_key=_PORTABLE_PUBLICATION_HANDLE_FACTORY_KEY,
+                )
+        except ActivationPreparationError as error:
+            active_error = (
+                ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+                if publication_armed or owner_commit_armed
+                else error
+            )
+        except (PlatformFileError, OSError) as error:
+            active_error = _portable_activation_owner_error(
+                error,
+                namespace_armed=False,
+                publication_armed=publication_armed or owner_commit_armed,
+            )
+            active_error.__cause__ = error
+        except BaseException as error:
+            active_error = error
+        finally:
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except BaseException as cleanup_error:
+                    if active_error is None:
+                        active_error = cleanup_error
+            close_error = _close_portable_journal_authorities(authorities)
+            if active_error is None and close_error is not None:
+                if isinstance(close_error, (PlatformFileError, OSError)):
+                    active_error = ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                else:
+                    active_error = close_error
+        if active_error is not None:
+            raise active_error
+        if result is None:
+            raise AssertionError("portable publication owner produced no handle")
         return result
 
 
