@@ -1605,6 +1605,33 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_no_journal_discovery_keeps_strict_jsonl_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity, coordinator, _sealed, prepared, journal = _first_prepared(
+                root
+            )
+            with patch("tm_sqlite_store._probe_fts5", return_value=True):
+                coordinator.publish_activation(prepared, journal)
+            journal.journal_path.unlink()
+            identity.configured_jsonl_path.write_bytes(
+                b'{"source":"external","target":"changed"}\n'
+            )
+
+            discovered = _fresh(identity)
+            with self.assertRaises(ActivationPreparationError) as raised:
+                discovered.recover_durable_activation()
+            self.assertEqual(
+                raised.exception.code,
+                "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+            )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "STORE.ACTIVE_COUNT_MISMATCH",
+            )
+            self.assertEqual(discovered.state, "ACTIVATING")
+            self.assertIsNone(discovered.current_generation)
+
     def test_discovery_rejects_tampered_active_set(self) -> None:
         for tamper in ("manifest", "database"):
             with self.subTest(tamper=tamper):

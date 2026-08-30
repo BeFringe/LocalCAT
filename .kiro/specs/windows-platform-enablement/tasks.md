@@ -340,13 +340,17 @@
   - _Boundary: TM Core Amendment Merge_
   - _Depends: 0.3b, 3.7, 5.2_
 
-- [ ] 6.2 完成TM首次激活、双进程唯一authority与restart recovery
+- [x] 6.2 完成TM首次激活、双进程唯一authority与restart recovery
   - 激活合法source，序列化bootstrap/reservation，发布唯一canonical SQLite generation并打开精确published store
+  - 首次stage以`MutableFileReservationService`保持外部SQLite writer期间的live creator authority；seal失败或pre-journal回收只通过`OwnedNamespaceRetirement`逐层绑定专用quarantine并执行exact no-clobber retirement，不在TM内复制dirfd/Win32 rename分支，也不把retirement当publish success
+  - fresh `PREPARED`恢复使用Task 3.7a的ancestor-W1 descendant闭集与`ExistingFileRetirement`：只对source absent+deterministic target exact重绑，不以creator reservation、历史FileId、pathname删除或覆盖代答
+  - SQLite owner从receipt事务前到stage retirement、lineage marker与READY前使用Task 3.7b的existing-file mutation guard，并让DB/manifest/source的live rooted authority贯穿最终业务复证；全部authority成功关闭后才公开generation/view
+  - completed portable runtime open消费调用方给定的resource identity，在W1内只读认证完整phase chain、已退休stage、既有marker、current canonical DB与fresh private proof；当前source/manifest pair不参与canonical授权，其缺失、不安全形态或内容差异在恢复成功后由`SourceBindingMonitor`投影为`SOURCE_DIVERGED`，只有Core明确分类为no portable facts时才进入既有v2/legacy判定
   - 覆盖双进程首次激活、TerminateProcess、reservation/migration/seal/publish/cleanup faults与重启；失败方返回稳定竞争/既有authority结果
   - 完成时，无重复generation/部分authority，published-tail恢复同一generation，unknown residue保持unavailable
   - _Requirements: 3.1, 3.2, 8.1, 8.2, 8.3, 8.4_
   - _Boundary: Windows TM Activation and Recovery_
-  - _Depends: 6.1_
+  - _Depends: 3.7a, 3.7b, 6.1_
 
 - [ ] 6.3 验证W2 attestation、FileId reuse与device-local恢复
   - restart时由Gate D/canonical owner分别重验自身compatibility或generation/phase envelope、exact bytes/digest及nested `WindowsPrivateProof`/device-secret MAC；历史Volume/FileId只作反例/diagnostic

@@ -34,7 +34,9 @@ from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationReport,
     SnapshotReceipt,
+    SourceBindingState,
 )
+from tm_engine import SourceUnit, TMEngine
 from tm_migration import TMMigrationService
 from tm_gate_b import GateBEvaluator
 from tm_sqlite_store import ActivationPreparationError, ResourceStoreCoordinator
@@ -105,6 +107,20 @@ def _remove_long_quarantine(root: Path) -> None:
             os.unlink("\\\\?\\" + str(path))
         os.rmdir("\\\\?\\" + str(attempt_directory))
     os.rmdir("\\\\?\\" + str(quarantine_root))
+
+
+def _tree_file_bytes(root: Path) -> dict[str, bytes]:
+    """Capture exact test-root bytes through the Windows extended path."""
+
+    extended_root = "\\\\?\\" + str(root)
+    observed: dict[str, bytes] = {}
+    for directory, _children, names in os.walk(extended_root):
+        for name in names:
+            path = os.path.join(directory, name)
+            key = path[len(extended_root):].lstrip("\\/").replace("\\", "/")
+            with open(path, "rb") as stream:
+                observed[key] = stream.read()
+    return observed
 
 
 def _release_portable_test_authorities(
@@ -219,6 +235,469 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
         identity: CanonicalResourceIdentity,
     ) -> tuple[object, object, object]:
         return _portable_sealed_stage(service, coordinator, identity)
+
+    def test_completed_portable_cold_open_classifies_changed_jsonl(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        self.assertEqual(outcome.activated_generation, 0)
+
+        external = b'{"source":"external","target":"changed"}\n'
+        identity.configured_jsonl_path.write_bytes(external)
+        before_open = _tree_file_bytes(root)
+        engine = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+            expected_resource_id=identity.resource_id,
+        )
+
+        self.assertTrue(engine.canonical_active)
+        self.assertEqual(_tree_file_bytes(root), before_open)
+        store = engine.canonical_store
+        assert store is not None
+        self.assertEqual(store.canonical_revision().generation, 0)
+        self.assertEqual(
+            store.source_binding_monitor.observe().state,
+            SourceBindingState.SOURCE_DIVERGED,
+        )
+        self.assertNotEqual(_tree_file_bytes(root), before_open)
+        match = engine.query_exact("same")
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.target, "first")
+        self.assertEqual(identity.configured_jsonl_path.read_bytes(), external)
+
+    def test_completed_portable_cold_open_accepts_current_canonical_bytes(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        first = TMEngine(
+            str(identity.configured_jsonl_path),
+            expected_resource_id=identity.resource_id,
+        )
+        self.assertTrue(
+            first.save_record(SourceUnit(id="new", text="new"), "value")
+        )
+        changed_database = identity.canonical_sidecar_path.read_bytes()
+
+        reopened = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+            expected_resource_id=identity.resource_id,
+        )
+
+        self.assertTrue(reopened.canonical_active)
+        self.assertEqual(
+            identity.canonical_sidecar_path.read_bytes(),
+            changed_database,
+        )
+        match = reopened.query_exact("new")
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.target, "value")
+
+    def test_completed_portable_cold_open_allows_missing_source_observation(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        identity.configured_jsonl_path.unlink()
+
+        engine = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+            expected_resource_id=identity.resource_id,
+        )
+
+        self.assertTrue(engine.canonical_active)
+        store = engine.canonical_store
+        assert store is not None
+        self.assertEqual(
+            store.source_binding_monitor.observe().state,
+            SourceBindingState.SOURCE_DIVERGED,
+        )
+
+    def test_completed_portable_cold_open_observes_manifest_divergence(self) -> None:
+        for variant in ("missing", "replacement", "hardlink"):
+            with self.subTest(variant=variant):
+                temporary = tempfile.TemporaryDirectory()
+                root = Path(temporary.name).resolve()
+                try:
+                    identity = _identity(root)
+                    outcome = _service(identity).activate_initial(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+                    self.assertIs(type(outcome), MigrationReport, repr(outcome))
+                    manifest = identity.snapshot_manifest_path
+                    manifest.unlink()
+                    if variant == "replacement":
+                        manifest.write_bytes(b"foreign manifest bytes")
+                    elif variant == "hardlink":
+                        os.link(identity.configured_jsonl_path, manifest)
+                        self.assertGreater(os.stat(manifest).st_nlink, 1)
+                    manifest_before = (
+                        None if not manifest.exists() else manifest.read_bytes()
+                    )
+                    database_before = identity.canonical_sidecar_path.read_bytes()
+
+                    engine = TMEngine(
+                        str(identity.configured_jsonl_path),
+                        update=False,
+                        expected_resource_id=identity.resource_id,
+                    )
+
+                    self.assertTrue(engine.canonical_active)
+                    self.assertEqual(
+                        identity.canonical_sidecar_path.read_bytes(),
+                        database_before,
+                    )
+                    self.assertEqual(
+                        None if not manifest.exists() else manifest.read_bytes(),
+                        manifest_before,
+                    )
+                    store = engine.canonical_store
+                    assert store is not None
+                    self.assertEqual(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                    match = engine.query_exact("same")
+                    self.assertIsNotNone(match)
+                finally:
+                    _remove_long_quarantine(root)
+                    temporary.cleanup()
+
+    def test_completed_portable_cold_open_observes_unsafe_source_shape(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        identity.configured_jsonl_path.unlink()
+        os.link(
+            identity.snapshot_manifest_path,
+            identity.configured_jsonl_path,
+        )
+        self.assertGreater(
+            os.stat(identity.configured_jsonl_path).st_nlink,
+            1,
+        )
+
+        engine = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+            expected_resource_id=identity.resource_id,
+        )
+
+        self.assertTrue(engine.canonical_active)
+        store = engine.canonical_store
+        assert store is not None
+        self.assertEqual(
+            store.source_binding_monitor.observe().state,
+            SourceBindingState.SOURCE_DIVERGED,
+        )
+
+    def test_windows_portable_artifacts_require_expected_resource_id(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^TM.CANONICAL_IDENTITY_MISSING$",
+        ):
+            TMEngine(str(identity.configured_jsonl_path), update=False)
+
+    def test_windows_portable_artifacts_reject_wrong_expected_resource_id(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        outcome = _service(identity).activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+
+        with self.assertRaises(ValueError) as raised:
+            TMEngine(
+                str(identity.configured_jsonl_path),
+                update=False,
+                expected_resource_id="tm.wrong",
+            )
+        self.assertIn("TM.CANONICAL", str(raised.exception))
+
+    def test_completed_portable_cold_open_honors_w1_contention(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        service = _service(identity)
+        outcome = service.activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        reservation = service._acquire_initial_reservation()
+        try:
+            with self.assertRaisesRegex(
+                ValueError,
+                "^TM.CANONICAL_RECOVERY_FAILED:ACTIVATION.RECOVERY_REQUIRED$",
+            ):
+                TMEngine(
+                    str(identity.configured_jsonl_path),
+                    update=False,
+                    expected_resource_id=identity.resource_id,
+                )
+            reservation.reprove()
+        finally:
+            reservation.release()
+
+        engine = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+            expected_resource_id=identity.resource_id,
+        )
+        self.assertTrue(engine.canonical_active)
+        with service._acquire_initial_reservation() as released:
+            released.reprove()
+
+    def test_windows_expected_resource_id_keeps_never_activated_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+
+            engine = TMEngine(
+                str(identity.configured_jsonl_path),
+                update=False,
+                expected_resource_id=identity.resource_id,
+            )
+
+            self.assertFalse(engine.canonical_active)
+            match = engine.query_exact("same")
+            self.assertIsNotNone(match)
+            assert match is not None
+            self.assertEqual(match.target, "first")
+
+    def test_portable_no_facts_delegates_to_generic_v2_without_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            identity.canonical_sidecar_path.write_bytes(b"generic-v2-locator")
+            report = mock.Mock(action="COMPLETED", generation=0)
+            store = mock.Mock()
+            store.canonical_revision.return_value = mock.Mock(generation=0)
+
+            with (
+                mock.patch.object(
+                    TMMigrationService,
+                    "rehydrate_completed_portable_activation",
+                    return_value=None,
+                ) as portable,
+                mock.patch(
+                    "tm_engine._sidecar_activation_facts",
+                    return_value=(identity.resource_id, "store.primary"),
+                ),
+                mock.patch.object(
+                    ResourceStoreCoordinator,
+                    "rehydrate_runtime_authority",
+                    return_value=report,
+                ) as generic,
+                mock.patch(
+                    "tm_engine.ResourceStoreCoordinator.current_generation",
+                    new_callable=mock.PropertyMock,
+                    return_value=0,
+                ),
+                mock.patch(
+                    "tm_engine.SQLiteTMStore.from_coordinator",
+                    return_value=store,
+                ),
+            ):
+                engine = TMEngine(
+                    str(identity.configured_jsonl_path),
+                    update=False,
+                    expected_resource_id=identity.resource_id,
+                )
+
+            self.assertTrue(engine.canonical_active)
+            self.assertIs(engine.canonical_store, store)
+            portable.assert_called_once_with()
+            generic.assert_called_once_with()
+
+    def test_corrupt_portable_cold_open_never_uses_generic_fallback(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        service = _service(identity)
+        outcome = service.activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+        self.assertIs(type(outcome), MigrationReport, repr(outcome))
+        private_root = root / (
+            tm_activation_journal._portable_activation_private_directory_name(
+                identity
+            )
+        )
+        generation_phase = private_root / (
+            tm_activation_journal._portable_publication_phase_name(
+                "GENERATION_PUBLISHED"
+            )
+        )
+        generation_phase.write_bytes(b"tampered portable phase")
+        before = _tree_file_bytes(root)
+
+        with mock.patch.object(
+            ResourceStoreCoordinator,
+            "rehydrate_runtime_authority",
+            side_effect=AssertionError("generic fallback used"),
+        ) as generic:
+            with self.assertRaises(ValueError) as raised:
+                TMEngine(
+                    str(identity.configured_jsonl_path),
+                    update=False,
+                    expected_resource_id=identity.resource_id,
+                )
+        generic.assert_not_called()
+        self.assertIn("TM.CANONICAL_RECOVERY_FAILED", str(raised.exception))
+        self.assertEqual(_tree_file_bytes(root), before)
+
+        reservation = service._acquire_initial_reservation()
+        with reservation:
+            reservation.reprove()
+
+    def test_partial_portable_cold_open_never_uses_generic_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                coordinator.publish_portable_prepared_activation(
+                    preparation,
+                    **reservation.portable_journal_inputs(),
+                )
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+            before = _tree_file_bytes(root)
+
+            with mock.patch.object(
+                ResourceStoreCoordinator,
+                "rehydrate_runtime_authority",
+                side_effect=AssertionError("generic fallback used"),
+            ) as generic:
+                with self.assertRaises(ValueError) as raised:
+                    TMEngine(
+                        str(identity.configured_jsonl_path),
+                        update=False,
+                        expected_resource_id=identity.resource_id,
+                    )
+
+            generic.assert_not_called()
+            self.assertIn("TM.CANONICAL_RECOVERY_FAILED", str(raised.exception))
+            self.assertEqual(_tree_file_bytes(root), before)
+
+    def test_completed_portable_cold_open_rejects_current_db_corruption(self) -> None:
+        for statement in (
+            "DELETE FROM tm_snapshot_binding",
+            "DELETE FROM tm_candidate_block",
+        ):
+            with self.subTest(statement=statement):
+                temporary = tempfile.TemporaryDirectory()
+                root = Path(temporary.name).resolve()
+                try:
+                    identity = _identity(root)
+                    outcome = _service(identity).activate_initial(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+                    self.assertIs(type(outcome), MigrationReport, repr(outcome))
+                    connection = sqlite3.connect(
+                        str(identity.canonical_sidecar_path)
+                    )
+                    try:
+                        connection.execute(statement)
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    before = _tree_file_bytes(root)
+
+                    with mock.patch.object(
+                        ResourceStoreCoordinator,
+                        "rehydrate_runtime_authority",
+                        side_effect=AssertionError("generic fallback used"),
+                    ) as generic:
+                        with self.assertRaises(ValueError) as raised:
+                            TMEngine(
+                                str(identity.configured_jsonl_path),
+                                update=False,
+                                expected_resource_id=identity.resource_id,
+                            )
+
+                    generic.assert_not_called()
+                    self.assertEqual(
+                        str(raised.exception),
+                        "TM.CANONICAL_UNHEALTHY",
+                    )
+                    self.assertEqual(_tree_file_bytes(root), before)
+                finally:
+                    _remove_long_quarantine(root)
+                    temporary.cleanup()
 
     def test_real_reservation_spans_seal_two_gate_b_and_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
