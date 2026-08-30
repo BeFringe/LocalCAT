@@ -105,9 +105,12 @@ import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
 from platform_fs import (
     compose_platform_file_backend,
+    narrow_windows_existing_file_retirement,
+    narrow_windows_locked_descendant_namespace_inspection,
     narrow_windows_persistent_private_proof,
 )
 from platform_fs_contracts import (
+    ExistingFileRetirement,
     LockLease,
     LockPolicy,
     LockWait,
@@ -115,6 +118,7 @@ from platform_fs_contracts import (
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
+    LockedDescendantNamespaceInspection,
     RetainedRetirement,
     RetirementDirectoryAuthority,
     RootedDirectoryAuthority,
@@ -5091,6 +5095,7 @@ class _InitialActivationResourceReservation:
         "_root",
         "_stage_borrow_minted",
         "_journal_borrow_minted",
+        "_recovery_borrow_minted",
         "_initial_attempt",
     )
 
@@ -5117,6 +5122,7 @@ class _InitialActivationResourceReservation:
         self._released = False
         self._stage_borrow_minted = False
         self._journal_borrow_minted = False
+        self._recovery_borrow_minted = False
         self._initial_attempt: _InitialStageAttempt | None = None
 
     @classmethod
@@ -5533,6 +5539,73 @@ class _InitialActivationResourceReservation:
         return {
             "platform": self._backend,
             "persistent_private": persistent_private,
+            "caller_borrow": borrow,
+        }
+
+    def portable_recovery_inputs(self) -> dict[str, object]:
+        """Mint one fresh v3 cancellation borrow from the held W1 owner."""
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+            or self._recovery_borrow_minted
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        self.reprove()
+        try:
+            probe_root = self._identity.canonical_sidecar_path.parent
+            persistent_private = narrow_windows_persistent_private_proof(
+                self._backend,
+                probe_root,
+            )
+            descendant_inspection = (
+                narrow_windows_locked_descendant_namespace_inspection(
+                    self._backend,
+                    probe_root,
+                )
+            )
+            existing_retirement = narrow_windows_existing_file_retirement(
+                self._backend,
+                probe_root,
+            )
+            if not (
+                persistent_private is self._backend
+                and descendant_inspection is self._backend
+                and existing_retirement is self._backend
+                and isinstance(
+                    descendant_inspection,
+                    LockedDescendantNamespaceInspection,
+                )
+                and isinstance(existing_retirement, ExistingFileRetirement)
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+            borrow = _create_caller_held_portable_journal_borrow(
+                identity=self._identity,
+                backend=self._backend,
+                root=self._root,
+                lease=self._lease,
+                lock_name=self._lock_name,
+                lock_payload=self._payload(self._identity),
+            )
+            borrow.reprove(self._backend, self._identity)
+        except PlatformFileError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            ) from error
+        self._recovery_borrow_minted = True
+        return {
+            "platform": self._backend,
+            "persistent_private": persistent_private,
+            "descendant_inspection": descendant_inspection,
+            "existing_retirement": existing_retirement,
             "caller_borrow": borrow,
         }
 

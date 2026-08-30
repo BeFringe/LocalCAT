@@ -15,7 +15,8 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import dataclass, field, fields
+import sys
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path, PurePath
 
@@ -35,8 +36,12 @@ from tm_content_attestation import (
 from platform_fs_contracts import (
     DEVICE_SECRET_SIZE_BYTES,
     BoundDirectoryAuthority,
+    CandidateContentFacts,
     CandidateFile,
+    ExistingFileRetirement,
+    LedgerEnumerationLimits,
     LockLease,
+    LockedDescendantNamespaceInspection,
     PendingPublication,
     PersistentPrivateProof,
     PlatformFileBackend,
@@ -45,6 +50,8 @@ from platform_fs_contracts import (
     PrivateProofContext,
     PrivateProofObjectRole,
     PublishMode,
+    RetainedRetirement,
+    RetirementDirectoryAuthority,
     RootedDirectoryAuthority,
     WindowsPrivateProof,
     decode_windows_private_proof,
@@ -4761,6 +4768,13 @@ _PORTABLE_JOURNAL_BORROW_FACTORY_KEY = object()
 _PORTABLE_JOURNAL_HANDLE_FACTORY_KEY = object()
 _PORTABLE_KEY_CANDIDATE_SUFFIX = ".candidate"
 _PORTABLE_JOURNAL_CANDIDATE_SUFFIX = ".candidate"
+_PORTABLE_ACTIVATION_QUARANTINE_ROOT = ".localcat-activation-quarantine-v1"
+_PORTABLE_ACTIVATION_PRIVATE_LIMITS = LedgerEnumerationLimits(
+    maximum_entries=4,
+    maximum_name_bytes=4096,
+    maximum_total_bytes=_PORTABLE_ACTIVATION_JOURNAL_MAX_BYTES * 2
+    + DEVICE_SECRET_SIZE_BYTES,
+)
 
 
 def _portable_activation_private_directory_name(
@@ -4769,6 +4783,40 @@ def _portable_activation_private_directory_name(
     if type(identity) is not CanonicalResourceIdentity:
         raise TypeError("portable journal identity is invalid")
     return f".localcat-activation-private-v1.{identity.target_identity}"
+
+
+def _portable_activation_quarantine_name(
+    unsigned: _PortableActivationJournalUnsigned,
+) -> str:
+    """Derive one bounded retirement namespace from stable owner facts."""
+
+    if type(unsigned) is not _PortableActivationJournalUnsigned:
+        raise TypeError("portable journal unsigned facts are invalid")
+    material = _portable_activation_canonical_json(
+        {
+            "candidate_manifest_temp_name": unsigned.candidate_manifest_temp_name,
+            "candidate_stage_db_name": unsigned.candidate_stage_db_name,
+            "journal_id": unsigned.journal_id,
+            "preparation_id": unsigned.preparation_id,
+            "resource_id": unsigned.resource_id,
+            "target_identity": unsigned.target_identity,
+        }
+    )
+    return f"portable-{hashlib.sha256(material).hexdigest()}"
+
+
+def _portable_activation_paired_unsigned(
+    pending: _PortableActivationJournalUnsigned,
+    cancelled: _PortableActivationJournalUnsigned,
+) -> bool:
+    if (
+        type(pending) is not _PortableActivationJournalUnsigned
+        or type(cancelled) is not _PortableActivationJournalUnsigned
+        or pending.closure != "PENDING"
+        or cancelled.closure != "CANCELLED"
+    ):
+        return False
+    return replace(cancelled, closure="PENDING") == pending
 
 
 class _CallerHeldPortableJournalBorrow:
@@ -4928,6 +4976,49 @@ class _PortablePreparedJournalHandle:
             record.unsigned.private_directory_name,
         )
         object.__setattr__(self, "journal_name", record.unsigned.journal_name)
+        object.__setattr__(self, "_record", record)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _PortableCancelledJournalHandle:
+    """Code-only proof of a durable v3 CANCELLED terminal and retirement."""
+
+    preparation_id: str
+    record_digest: str
+    private_directory_name: str
+    terminal_name: str
+    quarantine_name: str
+    _record: _PortableActivationJournalRecord = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        record: _PortableActivationJournalRecord,
+        *,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_JOURNAL_HANDLE_FACTORY_KEY:
+            raise TypeError("portable cancelled handle requires the owner factory")
+        if (
+            type(record) is not _PortableActivationJournalRecord
+            or record.unsigned.closure != "CANCELLED"
+        ):
+            raise TypeError("portable cancelled record is invalid")
+        object.__setattr__(self, "preparation_id", record.unsigned.preparation_id)
+        object.__setattr__(self, "record_digest", record.record_digest)
+        object.__setattr__(
+            self,
+            "private_directory_name",
+            record.unsigned.private_directory_name,
+        )
+        object.__setattr__(self, "terminal_name", record.unsigned.terminal_name)
+        object.__setattr__(
+            self,
+            "quarantine_name",
+            _portable_activation_quarantine_name(record.unsigned),
+        )
         object.__setattr__(self, "_record", record)
 
 
@@ -5380,4 +5471,1304 @@ class _WindowsPortablePreparedJournalOwner:
             raise active_error
         if result is None:
             raise AssertionError("portable journal owner produced no handle")
+        return result
+
+
+def _portable_candidate_content(
+    size: int,
+    sha256: str,
+) -> CandidateContentFacts:
+    return CandidateContentFacts(size, bytes.fromhex(sha256))
+
+
+def _portable_record_pair_matches(
+    pending: _PortableActivationJournalRecord,
+    cancelled: _PortableActivationJournalRecord,
+) -> bool:
+    return (
+        type(pending) is _PortableActivationJournalRecord
+        and type(cancelled) is _PortableActivationJournalRecord
+        and _portable_activation_paired_unsigned(
+            pending.unsigned,
+            cancelled.unsigned,
+        )
+    )
+
+
+def _portable_terminal_candidate_content(
+    record: _PortableActivationJournalRecord,
+) -> tuple[str, bytes, CandidateContentFacts]:
+    """Return the one deterministic v3 CANCELLED candidate description."""
+
+    if type(record) is not _PortableActivationJournalRecord:
+        raise TypeError("portable terminal candidate record is invalid")
+    if record.unsigned.closure != "CANCELLED":
+        raise ValueError("portable terminal candidate must be CANCELLED")
+    payload = _serialize_portable_activation_journal_record(record)
+    name = record.unsigned.terminal_name + _PORTABLE_JOURNAL_CANDIDATE_SUFFIX
+    return (
+        name,
+        payload,
+        CandidateContentFacts(len(payload), hashlib.sha256(payload).digest()),
+    )
+
+
+class _WindowsPortableCancelledJournalOwner:
+    """Close one exact Windows v3 PREPARED authority as CANCELLED."""
+
+    @staticmethod
+    def cancel(
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        existing_retirement: ExistingFileRetirement,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        owner_reprove: Callable[[_PortableActivationJournalRecord], None],
+        owner_commit: Callable[[_PortableActivationJournalRecord], None],
+    ) -> _PortableCancelledJournalHandle:
+        if sys.platform != "win32":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        from platform_fs_windows import WindowsPlatformAdapter
+
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("portable recovery identity is invalid")
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("portable recovery borrow is invalid")
+        if type(backend) is not WindowsPlatformAdapter:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        if not (
+            persistent_private is backend
+            and descendant_inspection is backend
+            and existing_retirement is backend
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        if not callable(owner_reprove) or not callable(owner_commit):
+            raise TypeError("portable recovery owner callbacks must be callable")
+
+        authorities: list[object] = []
+        terminal_candidate: CandidateFile | None = None
+        terminal_candidate_retained: RetainedRetirement | None = None
+        terminal_pending: PendingPublication | None = None
+        private_parent: BoundDirectoryAuthority | None = None
+        quarantine_root: RetirementDirectoryAuthority | None = None
+        quarantine_target: RetirementDirectoryAuthority | None = None
+        quarantine_bound: BoundDirectoryAuthority | None = None
+        pending_file: object | None = None
+        pending_evidence: object | None = None
+        pending_verified: object | None = None
+        terminal_file: object | None = None
+        terminal_evidence: object | None = None
+        terminal_verified: object | None = None
+        retained_terminal: object | None = None
+        retained_terminal_evidence: object | None = None
+        fresh_retained_terminal_evidence: object | None = None
+        publication_armed = False
+        retirement_armed = False
+        owner_committed = False
+        terminal_candidate_retirement_required = False
+        active_error: BaseException | None = None
+        result: _PortableCancelledJournalHandle | None = None
+
+        try:
+            root, lease = caller_borrow._authorities(
+                backend,
+                persistent_private,
+                identity,
+            )
+
+            def ensure_quarantine(
+                unsigned: _PortableActivationJournalUnsigned,
+            ) -> RetirementDirectoryAuthority:
+                nonlocal quarantine_root, quarantine_target, quarantine_bound
+                nonlocal retirement_armed
+                if quarantine_target is not None:
+                    return quarantine_target
+                caller_borrow.reprove(backend, identity)
+                quarantine_root = backend.bind_or_create_child_directory(
+                    root,
+                    _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                )
+                retirement_armed = True
+                authorities.append(quarantine_root)
+                quarantine_name = _portable_activation_quarantine_name(unsigned)
+                quarantine_target = backend.bind_or_create_child_directory(
+                    quarantine_root,
+                    quarantine_name,
+                )
+                authorities.append(quarantine_target)
+                return quarantine_target
+
+            def bind_quarantine_observer(
+                unsigned: _PortableActivationJournalUnsigned,
+            ) -> BoundDirectoryAuthority:
+                nonlocal quarantine_bound
+                if quarantine_bound is not None:
+                    raise AssertionError("quarantine observer is already live")
+                ensure_quarantine(unsigned)
+                quarantine_bound = backend.bind_parent(
+                    root,
+                    PurePath(
+                        _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                        _portable_activation_quarantine_name(unsigned),
+                        "recovery-placeholder",
+                    ),
+                )
+                authorities.append(quarantine_bound)
+                return quarantine_bound
+
+            def observe_existing_quarantine_names(
+                unsigned: _PortableActivationJournalUnsigned,
+                limits: LedgerEnumerationLimits,
+            ) -> set[str]:
+                quarantine_root_name = _PORTABLE_ACTIVATION_QUARANTINE_ROOT
+                root_entry = root.inspect_entry(quarantine_root_name)
+                if root_entry is None:
+                    return set()
+                if root_entry.identity.kind != "directory":
+                    raise ActivationPreparationError(
+                        "ACTIVATION.QUARANTINE_FOREIGN",
+                        retryable=False,
+                    )
+                root_bound = backend.bind_parent(
+                    root,
+                    PurePath(quarantine_root_name, "recovery-placeholder"),
+                )
+                try:
+                    attempt_name = _portable_activation_quarantine_name(unsigned)
+                    attempt_entry = root_bound.inspect_entry(attempt_name)
+                    if attempt_entry is None:
+                        return set()
+                    if attempt_entry.identity.kind != "directory":
+                        raise ActivationPreparationError(
+                            "ACTIVATION.QUARANTINE_FOREIGN",
+                            retryable=False,
+                        )
+                finally:
+                    root_bound.close()
+                observer = backend.bind_parent(
+                    root,
+                    PurePath(
+                        quarantine_root_name,
+                        attempt_name,
+                        "recovery-placeholder",
+                    ),
+                )
+                try:
+                    return {
+                        item.name
+                        for item in descendant_inspection.observe_descendant_entries(
+                            root,
+                            lease,
+                            observer,
+                            limits,
+                        )
+                    }
+                finally:
+                    observer.close()
+
+            def retire_or_rebind(
+                *,
+                unsigned: _PortableActivationJournalUnsigned,
+                source_name: str,
+                source_relative: PurePath,
+                expected_content: CandidateContentFacts,
+            ) -> RetainedRetirement:
+                target = ensure_quarantine(unsigned)
+                caller_borrow.reprove(backend, identity)
+                source_parent = None
+                source = None
+                retained = None
+                try:
+                    source_parent = (
+                        existing_retirement.bind_retirement_source_directory(
+                            root,
+                            source_relative,
+                        )
+                    )
+                    authorities.append(source_parent)
+                    try:
+                        source = existing_retirement.open_existing_retirement_source(
+                            source_parent,
+                            expected_content,
+                        )
+                    except PlatformFileError as error:
+                        if error.code != PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+                            raise
+                        source_parent.close()
+                        authorities.remove(source_parent)
+                        source_parent = backend.bind_parent(root, source_relative)
+                        authorities.append(source_parent)
+                        retained = existing_retirement.rebind_existing_retirement(
+                            source_parent,
+                            source_name,
+                            target,
+                            source_name,
+                            expected_content,
+                        )
+                    else:
+                        retained = existing_retirement.retire_existing_exclusive(
+                            source_parent,
+                            source,
+                            target,
+                            source_name,
+                        )
+                        source = None
+                    authorities.append(retained)
+                finally:
+                    if source is not None:
+                        source.close()
+                if source_parent is not None:
+                    source_parent.close()
+                    authorities.remove(source_parent)
+                    source_parent = None
+                if retained is None:
+                    raise AssertionError("portable retirement produced no authority")
+                retained.reprove()
+                return retained
+
+            def close_pending_private_authorities() -> None:
+                """Release the strict private leaf before a cross-parent B move."""
+
+                nonlocal private_parent, private_evidence
+                nonlocal key_file, key_evidence, secret
+                nonlocal pending_file, pending_evidence, pending_verified
+                for authority in (
+                    pending_verified,
+                    pending_evidence,
+                    pending_file,
+                    key_evidence,
+                    key_file,
+                    secret,
+                    private_evidence,
+                    private_parent,
+                ):
+                    if authority is not None:
+                        authority.close()
+                        if authority in authorities:
+                            authorities.remove(authority)
+                pending_verified = None
+                pending_evidence = None
+                pending_file = None
+                key_evidence = None
+                key_file = None
+                secret = None
+                private_evidence = None
+                private_parent = None
+
+            def rebind_pending_private_authorities(
+                expected_record: _PortableActivationJournalRecord,
+                expected_bytes: bytes,
+                expected_key: bytes,
+            ) -> None:
+                """Freshly rebind W2/key/PENDING after the candidate B handoff."""
+
+                nonlocal private_parent, private_evidence
+                nonlocal key_file, key_evidence, secret
+                nonlocal pending_file, pending_evidence, pending_verified
+                private_parent = backend.bind_parent(
+                    root,
+                    PurePath(private_name, "private-recovery-placeholder"),
+                )
+                authorities.append(private_parent)
+                rebound_names = {
+                    item.name
+                    for item in descendant_inspection.observe_descendant_entries(
+                        root,
+                        lease,
+                        private_parent,
+                        _PORTABLE_ACTIVATION_PRIVATE_LIMITS,
+                    )
+                }
+                if rebound_names != {
+                    expected_record.unsigned.device_key_name,
+                    expected_record.unsigned.journal_name,
+                }:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                        retryable=False,
+                    )
+                private_evidence = backend.prove_private(private_parent)
+                authorities.append(private_evidence)
+                key_file = backend.open_regular(
+                    root,
+                    PurePath(private_name, expected_record.unsigned.device_key_name),
+                )
+                authorities.append(key_file)
+                rebound_key_identity = key_file.identity()
+                if (
+                    rebound_key_identity.kind != "regular"
+                    or rebound_key_identity.link_count != 1
+                    or key_file.read_all() != expected_key
+                    or len(expected_key) != DEVICE_SECRET_SIZE_BYTES
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                        retryable=False,
+                    )
+                key_evidence = backend.prove_private(key_file)
+                authorities.append(key_evidence)
+                secret = persistent_private.bind_device_secret(key_file)
+                authorities.append(secret)
+                secret.reprove()
+                pending_file = backend.open_regular(
+                    root,
+                    PurePath(private_name, expected_record.unsigned.journal_name),
+                )
+                authorities.append(pending_file)
+                rebound_pending_identity = pending_file.identity()
+                if (
+                    rebound_pending_identity.kind != "regular"
+                    or rebound_pending_identity.link_count != 1
+                    or pending_file.read_all() != expected_bytes
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                pending_evidence = backend.prove_private(pending_file)
+                authorities.append(pending_evidence)
+                rebound_record = _parse_portable_activation_journal_bytes(
+                    pending_file.read_all()
+                )
+                if rebound_record != expected_record:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                rebound_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(
+                        rebound_record.unsigned
+                    ),
+                )
+                pending_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    rebound_record.private_directory_proof,
+                    rebound_context,
+                )
+                authorities.append(pending_verified)
+                owner_reprove(rebound_record)
+                caller_borrow.reprove(backend, identity)
+
+            def recover_exact_terminal_candidate(
+                record: _PortableActivationJournalRecord,
+                expected_pending_record: _PortableActivationJournalRecord,
+                expected_pending_bytes: bytes,
+                expected_key: bytes,
+                *,
+                source_present: bool,
+            ) -> RetainedRetirement:
+                """Quarantine only the exact deterministic terminal candidate."""
+
+                if type(source_present) is not bool:
+                    raise TypeError("terminal candidate presence must be exact bool")
+                candidate_name, candidate_bytes, expected_content = (
+                    _portable_terminal_candidate_content(record)
+                )
+                limits = LedgerEnumerationLimits(
+                    maximum_entries=1,
+                    maximum_name_bytes=4096,
+                    maximum_total_bytes=len(candidate_bytes),
+                )
+                observed = observe_existing_quarantine_names(record.unsigned, limits)
+                if not observed <= {candidate_name}:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.QUARANTINE_FOREIGN",
+                        retryable=False,
+                    )
+                target_present = candidate_name in observed
+                if source_present and target_present:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                if not source_present and not target_present:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+
+                close_pending_private_authorities()
+                source_parent = None
+                source = None
+                retained = None
+                try:
+                    if source_present:
+                        source_parent = (
+                            existing_retirement.bind_retirement_source_directory(
+                                root,
+                                PurePath(private_name, candidate_name),
+                            )
+                        )
+                        authorities.append(source_parent)
+                        source = existing_retirement.open_existing_retirement_source(
+                            source_parent,
+                            expected_content,
+                        )
+                        target = ensure_quarantine(record.unsigned)
+                        retained = existing_retirement.retire_existing_exclusive(
+                            source_parent,
+                            source,
+                            target,
+                            candidate_name,
+                        )
+                        source = None
+                    else:
+                        target = ensure_quarantine(record.unsigned)
+                        source_parent = backend.bind_parent(
+                            root,
+                            PurePath(private_name, candidate_name),
+                        )
+                        authorities.append(source_parent)
+                        retained = existing_retirement.rebind_existing_retirement(
+                            source_parent,
+                            candidate_name,
+                            target,
+                            candidate_name,
+                            expected_content,
+                        )
+                    authorities.append(retained)
+                finally:
+                    if source is not None:
+                        source.close()
+                if source_parent is not None:
+                    source_parent.close()
+                    authorities.remove(source_parent)
+                if retained is None:
+                    raise AssertionError("terminal candidate handoff produced no authority")
+                retained.reprove()
+                if observe_existing_quarantine_names(record.unsigned, limits) != {
+                    candidate_name
+                }:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.QUARANTINE_FOREIGN",
+                        retryable=False,
+                    )
+                rebind_pending_private_authorities(
+                    expected_pending_record,
+                    expected_pending_bytes,
+                    expected_key,
+                )
+                proof_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(record.unsigned),
+                )
+                verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    record.private_directory_proof,
+                    proof_context,
+                )
+                verified.close()
+                return retained
+
+            private_name = _portable_activation_private_directory_name(identity)
+            private_parent = backend.bind_parent(
+                root,
+                PurePath(private_name, "private-recovery-placeholder"),
+            )
+            authorities.append(private_parent)
+            initial_private = descendant_inspection.observe_descendant_entries(
+                root,
+                lease,
+                private_parent,
+                _PORTABLE_ACTIVATION_PRIVATE_LIMITS,
+            )
+            private_names = {item.name for item in initial_private}
+            terminal_candidate_name = (
+                "activation-terminal-v3.json"
+                + _PORTABLE_JOURNAL_CANDIDATE_SUFFIX
+            )
+            allowed_private_names = {
+                "device.key",
+                "activation-journal-v3.json",
+                "activation-terminal-v3.json",
+                terminal_candidate_name,
+            }
+            if (
+                not private_names <= allowed_private_names
+                or "device.key" not in private_names
+                or not private_names
+                & {"activation-journal-v3.json", "activation-terminal-v3.json"}
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                    retryable=False,
+                )
+            private_evidence = backend.prove_private(private_parent)
+            authorities.append(private_evidence)
+            key_file = backend.open_regular(
+                root,
+                PurePath(private_name, "device.key"),
+            )
+            authorities.append(key_file)
+            key_identity = key_file.identity()
+            key_bytes = key_file.read_all()
+            if (
+                key_identity.kind != "regular"
+                or key_identity.link_count != 1
+                or len(key_bytes) != DEVICE_SECRET_SIZE_BYTES
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                    retryable=False,
+                )
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+
+            pending_record: _PortableActivationJournalRecord | None = None
+            pending_bytes: bytes | None = None
+            if "activation-journal-v3.json" in private_names:
+                pending_file = backend.open_regular(
+                    root,
+                    PurePath(private_name, "activation-journal-v3.json"),
+                )
+                authorities.append(pending_file)
+                pending_identity = pending_file.identity()
+                pending_bytes = pending_file.read_all()
+                if (
+                    pending_identity.kind != "regular"
+                    or pending_identity.link_count != 1
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                        retryable=False,
+                    )
+                pending_evidence = backend.prove_private(pending_file)
+                authorities.append(pending_evidence)
+                pending_record = _parse_portable_activation_journal_bytes(
+                    pending_bytes
+                )
+                if pending_record.unsigned.closure != "PENDING":
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                        retryable=False,
+                    )
+                pending_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(
+                        pending_record.unsigned
+                    ),
+                )
+                pending_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    pending_record.private_directory_proof,
+                    pending_context,
+                )
+                authorities.append(pending_verified)
+
+            cancelled_record: _PortableActivationJournalRecord | None = None
+            cancelled_bytes: bytes | None = None
+            if "activation-terminal-v3.json" in private_names:
+                terminal_file = backend.open_regular(
+                    root,
+                    PurePath(private_name, "activation-terminal-v3.json"),
+                )
+                authorities.append(terminal_file)
+                terminal_identity = terminal_file.identity()
+                cancelled_bytes = terminal_file.read_all()
+                if (
+                    terminal_identity.kind != "regular"
+                    or terminal_identity.link_count != 1
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                        retryable=False,
+                    )
+                terminal_evidence = backend.prove_private(terminal_file)
+                authorities.append(terminal_evidence)
+                cancelled_record = _parse_portable_activation_journal_bytes(
+                    cancelled_bytes
+                )
+                if cancelled_record.unsigned.closure != "CANCELLED":
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                        retryable=False,
+                    )
+                terminal_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(
+                        cancelled_record.unsigned
+                    ),
+                )
+                terminal_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    cancelled_record.private_directory_proof,
+                    terminal_context,
+                )
+                authorities.append(terminal_verified)
+
+            if pending_record is not None and cancelled_record is not None:
+                if not _portable_record_pair_matches(
+                    pending_record,
+                    cancelled_record,
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_TERMINAL_INVALID",
+                        retryable=False,
+                    )
+            elif pending_record is None and cancelled_record is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                    retryable=False,
+                )
+
+            authority_record = (
+                pending_record if pending_record is not None else cancelled_record
+            )
+            if authority_record is None:
+                raise AssertionError("portable recovery has no authority record")
+            unsigned = authority_record.unsigned
+            if (
+                unsigned.resource_id != identity.resource_id
+                or unsigned.target_identity != identity.target_identity
+                or unsigned.private_directory_name != private_name
+                or unsigned.device_key_name != "device.key"
+                or unsigned.journal_name != "activation-journal-v3.json"
+                or unsigned.terminal_name != "activation-terminal-v3.json"
+                or unsigned.lock_payload_digest
+                != caller_borrow.lock_payload_digest()
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_JOURNAL_INVALID",
+                    retryable=False,
+                )
+            owner_reprove(authority_record)
+            caller_borrow.reprove(backend, identity)
+
+            source_file = backend.open_regular(
+                root,
+                PurePath(identity.configured_jsonl_path.name),
+            )
+            authorities.append(source_file)
+            source_facts = source_file.content_facts()
+            expected_source = unsigned.sealed_content_attestation.source
+            if (
+                source_facts.snapshot.identity.kind != "regular"
+                or source_facts.snapshot.identity.link_count != 1
+                or source_facts.snapshot.byte_count != expected_source.size
+                or source_facts.content_sha256.hex() != expected_source.sha256
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                    retryable=False,
+                )
+            for absent_name in (
+                identity.canonical_sidecar_path.name,
+                identity.snapshot_manifest_path.name,
+                _activation_lineage_marker_path(identity).name,
+                _activation_lineage_marker_temp_path(
+                    _activation_lineage_marker_path(identity)
+                ).name,
+            ):
+                if root.inspect_entry(absent_name) is not None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
+                        retryable=False,
+                    )
+
+            if cancelled_record is None:
+                if pending_record is None or pending_bytes is None:
+                    raise AssertionError("portable recovery cannot mint a terminal")
+                cancelled_unsigned = replace(
+                    pending_record.unsigned,
+                    closure="CANCELLED",
+                )
+                terminal_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(cancelled_unsigned),
+                )
+                terminal_proof = persistent_private.mint(
+                    private_evidence,
+                    secret,
+                    terminal_context,
+                )
+                cancelled_record = _create_portable_activation_journal_record(
+                    cancelled_unsigned,
+                    terminal_proof,
+                )
+                cancelled_bytes = _serialize_portable_activation_journal_record(
+                    cancelled_record
+                )
+                terminal_candidate_name = (
+                    cancelled_unsigned.terminal_name
+                    + _PORTABLE_JOURNAL_CANDIDATE_SUFFIX
+                )
+                candidate_limits = LedgerEnumerationLimits(
+                    maximum_entries=1,
+                    maximum_name_bytes=4096,
+                    maximum_total_bytes=len(cancelled_bytes),
+                )
+                candidate_quarantine_names = observe_existing_quarantine_names(
+                    cancelled_unsigned,
+                    candidate_limits,
+                )
+                if not candidate_quarantine_names <= {terminal_candidate_name}:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.QUARANTINE_FOREIGN",
+                        retryable=False,
+                    )
+                candidate_source_present = terminal_candidate_name in private_names
+                if candidate_source_present or candidate_quarantine_names:
+                    terminal_candidate_retained = recover_exact_terminal_candidate(
+                        cancelled_record,
+                        pending_record,
+                        pending_bytes,
+                        key_bytes,
+                        source_present=candidate_source_present,
+                    )
+                    terminal_candidate_retirement_required = True
+                if private_parent.inspect_entry(terminal_candidate_name) is not None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                        retryable=False,
+                    )
+                terminal_candidate = private_parent.create_candidate(
+                    terminal_candidate_name,
+                    private=True,
+                )
+                publication_armed = True
+                terminal_candidate.write_all(cancelled_bytes)
+                terminal_candidate.flush_content()
+                owner_reprove(pending_record)
+                caller_borrow.reprove(backend, identity)
+                try:
+                    terminal_pending = private_parent.begin_publish(
+                        terminal_candidate,
+                        cancelled_unsigned.terminal_name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                except BaseException:
+                    terminal_candidate.close()
+                    terminal_candidate = None
+                    raise
+                terminal_candidate = None
+                authorities.append(terminal_pending)
+                retained_terminal = terminal_pending.retained_destination()
+                retained_identity = retained_terminal.identity()
+                if (
+                    retained_identity.kind != "regular"
+                    or retained_identity.link_count != 1
+                    or retained_terminal.read_all() != cancelled_bytes
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                retained_terminal_evidence = backend.prove_private(
+                    retained_terminal
+                )
+                authorities.append(retained_terminal_evidence)
+                disk_cancelled = _parse_portable_activation_journal_bytes(
+                    retained_terminal.read_all()
+                )
+                if disk_cancelled != cancelled_record:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                terminal_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    disk_cancelled.private_directory_proof,
+                    terminal_context,
+                )
+                authorities.append(terminal_verified)
+                owner_reprove(pending_record)
+                caller_borrow.reprove(backend, identity)
+            else:
+                cancelled_bytes = _serialize_portable_activation_journal_record(
+                    cancelled_record
+                )
+
+            if cancelled_record is None or cancelled_bytes is None:
+                raise AssertionError("portable recovery produced no terminal")
+            if (
+                terminal_file is None
+                and retained_terminal is None
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            terminal_authority = (
+                terminal_file if terminal_file is not None else retained_terminal
+            )
+            if (
+                terminal_authority is None
+                or terminal_authority.read_all() != cancelled_bytes
+                or _parse_portable_activation_journal_bytes(
+                    terminal_authority.read_all()
+                )
+                != cancelled_record
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            owner_reprove(cancelled_record)
+            caller_borrow.reprove(backend, identity)
+            owner_result = owner_commit(cancelled_record)
+            if owner_result is not None:
+                raise TypeError("portable recovery owner commit must return None")
+            owner_committed = True
+
+            if terminal_pending is not None:
+                if retained_terminal is None:
+                    raise AssertionError(
+                        "portable terminal pending has no retained authority"
+                    )
+                retained_terminal_evidence.close()
+                authorities.remove(retained_terminal_evidence)
+                owner_reprove(cancelled_record)
+                caller_borrow.reprove(backend, identity)
+                if (
+                    retained_terminal.read_all() != cancelled_bytes
+                    or _parse_portable_activation_journal_bytes(
+                        retained_terminal.read_all()
+                    )
+                    != cancelled_record
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                fresh_retained_terminal_evidence = backend.prove_private(
+                    retained_terminal
+                )
+                authorities.append(fresh_retained_terminal_evidence)
+                if (
+                    terminal_pending.terminal_reproof()
+                    != terminal_pending.preliminary_facts()
+                ):
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                        retryable=True,
+                    )
+                terminal_pending.close()
+                authorities.remove(terminal_pending)
+                terminal_pending = None
+                retained_terminal = None
+                terminal_file = backend.open_regular(
+                    root,
+                    PurePath(
+                        private_name,
+                        cancelled_record.unsigned.terminal_name,
+                    ),
+                )
+                authorities.append(terminal_file)
+                terminal_evidence = backend.prove_private(terminal_file)
+                authorities.append(terminal_evidence)
+
+            if pending_verified is not None:
+                pending_verified.close()
+                authorities.remove(pending_verified)
+                pending_verified = None
+            if pending_evidence is not None:
+                pending_evidence.close()
+                authorities.remove(pending_evidence)
+                pending_evidence = None
+            if pending_file is not None:
+                pending_file.close()
+                authorities.remove(pending_file)
+                pending_file = None
+
+            if pending_record is not None and pending_bytes is not None:
+                expected_pending_bytes = pending_bytes
+            else:
+                pending_unsigned = replace(
+                    cancelled_record.unsigned,
+                    closure="PENDING",
+                )
+                pending_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_activation_owner_context_sha256(pending_unsigned),
+                )
+                pending_proof = persistent_private.mint(
+                    private_evidence,
+                    secret,
+                    pending_context,
+                )
+                expected_pending_bytes = _serialize_portable_activation_journal_record(
+                    _create_portable_activation_journal_record(
+                        pending_unsigned,
+                        pending_proof,
+                    )
+                )
+
+            terminal_context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                _portable_activation_owner_context_sha256(
+                    cancelled_record.unsigned
+                ),
+            )
+            if terminal_verified is not None:
+                persistent_private.consume_verified(
+                    terminal_verified,
+                    terminal_context,
+                )
+                authorities.remove(terminal_verified)
+                terminal_verified = None
+
+            # A live strict handle to the private leaf correctly blocks a
+            # cross-parent rename on Windows.  After the CANCELLED owner commit,
+            # release every authority whose directory chain ends at that leaf;
+            # the dedicated B source-parent authority will reopen only the leaf
+            # with rename-compatible sharing.  All W2/file authority is rebound
+            # and reproved after the exact quarantine handoff.
+            for private_authority in (
+                fresh_retained_terminal_evidence,
+                terminal_evidence,
+                terminal_file,
+                key_evidence,
+                key_file,
+                secret,
+                private_evidence,
+                private_parent,
+            ):
+                if private_authority is not None:
+                    private_authority.close()
+                    if private_authority in authorities:
+                        authorities.remove(private_authority)
+            terminal_evidence = None
+            terminal_file = None
+            key_evidence = None
+            key_file = None
+            secret = None
+            private_evidence = None
+            private_parent = None
+            for released_private_authority in (
+                pending_file,
+                pending_evidence,
+                pending_verified,
+                terminal_candidate,
+                terminal_pending,
+                retained_terminal,
+                retained_terminal_evidence,
+                fresh_retained_terminal_evidence,
+                terminal_file,
+                terminal_evidence,
+                terminal_verified,
+                key_file,
+                key_evidence,
+                secret,
+                private_evidence,
+                private_parent,
+            ):
+                if released_private_authority is not None and not getattr(
+                    released_private_authority,
+                    "closed",
+                    False,
+                ):
+                    raise AssertionError(
+                        "portable cancellation retained a private authority"
+                    )
+
+            target = ensure_quarantine(cancelled_record.unsigned)
+            bound = bind_quarantine_observer(cancelled_record.unsigned)
+            del target
+            sealed = cancelled_record.unsigned.sealed_content_attestation
+            base_retirement_items = (
+                (
+                    cancelled_record.unsigned.journal_name,
+                    PurePath(
+                        cancelled_record.unsigned.private_directory_name,
+                        cancelled_record.unsigned.journal_name,
+                    ),
+                    CandidateContentFacts(
+                        len(expected_pending_bytes),
+                        hashlib.sha256(expected_pending_bytes).digest(),
+                    ),
+                ),
+                (
+                    cancelled_record.unsigned.candidate_stage_db_name,
+                    PurePath(cancelled_record.unsigned.candidate_stage_db_name),
+                    _portable_candidate_content(
+                        sealed.database.size,
+                        sealed.database.sha256,
+                    ),
+                ),
+                (
+                    cancelled_record.unsigned.candidate_manifest_temp_name,
+                    PurePath(cancelled_record.unsigned.candidate_manifest_temp_name),
+                    _portable_candidate_content(
+                        sealed.manifest.size,
+                        sealed.manifest.sha256,
+                    ),
+                ),
+            )
+            (
+                terminal_candidate_name,
+                terminal_candidate_bytes,
+                expected_terminal_candidate_facts,
+            ) = _portable_terminal_candidate_content(cancelled_record)
+            terminal_candidate_item = (
+                terminal_candidate_name,
+                PurePath(
+                    cancelled_record.unsigned.private_directory_name,
+                    terminal_candidate_name,
+                ),
+                expected_terminal_candidate_facts,
+            )
+            allowed_quarantine_names = {
+                name for name, _relative, _facts in base_retirement_items
+            } | {terminal_candidate_name}
+            quarantine_limits = LedgerEnumerationLimits(
+                maximum_entries=len(allowed_quarantine_names),
+                maximum_name_bytes=4096,
+                maximum_total_bytes=(
+                    len(expected_pending_bytes)
+                    + sealed.database.size
+                    + sealed.manifest.size
+                    + len(terminal_candidate_bytes)
+                ),
+            )
+            initial_quarantine = descendant_inspection.observe_descendant_entries(
+                root,
+                lease,
+                bound,
+                quarantine_limits,
+            )
+            initial_quarantine_names = {
+                item.name for item in initial_quarantine
+            }
+            if not initial_quarantine_names <= allowed_quarantine_names:
+                raise ActivationPreparationError(
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                    retryable=False,
+                )
+            terminal_candidate_retirement_required = (
+                terminal_candidate_retirement_required
+                or terminal_candidate_name in private_names
+                or terminal_candidate_name in initial_quarantine_names
+            )
+            retirement_items = base_retirement_items + (
+                (terminal_candidate_item,)
+                if terminal_candidate_retirement_required
+                else ()
+            )
+            expected_quarantine_names = {
+                name for name, _relative, _facts in retirement_items
+            }
+            if not initial_quarantine_names <= expected_quarantine_names:
+                raise ActivationPreparationError(
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                    retryable=False,
+                )
+            bound.close()
+            authorities.remove(bound)
+            quarantine_bound = None
+            for source_name, relative, expected_content in retirement_items:
+                if (
+                    source_name == terminal_candidate_name
+                    and terminal_candidate_retained is not None
+                ):
+                    terminal_candidate_retained.reprove()
+                    continue
+                retire_or_rebind(
+                    unsigned=cancelled_record.unsigned,
+                    source_name=source_name,
+                    source_relative=relative,
+                    expected_content=expected_content,
+                )
+            bound = bind_quarantine_observer(cancelled_record.unsigned)
+            final_quarantine = descendant_inspection.observe_descendant_entries(
+                root,
+                lease,
+                bound,
+                quarantine_limits,
+            )
+            if {item.name for item in final_quarantine} != expected_quarantine_names:
+                raise ActivationPreparationError(
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                    retryable=False,
+                )
+            private_parent = backend.bind_parent(
+                root,
+                PurePath(private_name, "private-recovery-placeholder"),
+            )
+            authorities.append(private_parent)
+            final_private = descendant_inspection.observe_descendant_entries(
+                root,
+                lease,
+                private_parent,
+                _PORTABLE_ACTIVATION_PRIVATE_LIMITS,
+            )
+            if {item.name for item in final_private} != {
+                cancelled_record.unsigned.device_key_name,
+                cancelled_record.unsigned.terminal_name,
+            }:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                    retryable=False,
+                )
+            private_evidence = backend.prove_private(private_parent)
+            authorities.append(private_evidence)
+            key_file = backend.open_regular(
+                root,
+                PurePath(private_name, cancelled_record.unsigned.device_key_name),
+            )
+            authorities.append(key_file)
+            rebound_key_identity = key_file.identity()
+            if (
+                rebound_key_identity.kind != "regular"
+                or rebound_key_identity.link_count != 1
+                or key_file.read_all() != key_bytes
+                or len(key_bytes) != DEVICE_SECRET_SIZE_BYTES
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                    retryable=False,
+                )
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+            terminal_file = backend.open_regular(
+                root,
+                PurePath(private_name, cancelled_record.unsigned.terminal_name),
+            )
+            authorities.append(terminal_file)
+            rebound_terminal_identity = terminal_file.identity()
+            if (
+                rebound_terminal_identity.kind != "regular"
+                or rebound_terminal_identity.link_count != 1
+                or terminal_file.read_all() != cancelled_bytes
+                or _parse_portable_activation_journal_bytes(
+                    terminal_file.read_all()
+                )
+                != cancelled_record
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            terminal_evidence = backend.prove_private(terminal_file)
+            authorities.append(terminal_evidence)
+            terminal_verified = persistent_private.verify(
+                private_evidence,
+                secret,
+                cancelled_record.private_directory_proof,
+                terminal_context,
+            )
+            authorities.append(terminal_verified)
+            source_terminal = source_file.content_facts()
+            if (
+                source_terminal.snapshot.identity != source_facts.snapshot.identity
+                or source_terminal.content_sha256 != source_facts.content_sha256
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                    retryable=False,
+                )
+            for authority in authorities:
+                if isinstance(authority, RetainedRetirement):
+                    authority.reprove()
+            if (
+                terminal_file.read_all() != cancelled_bytes
+                or _parse_portable_activation_journal_bytes(
+                    terminal_file.read_all()
+                )
+                != cancelled_record
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    retryable=True,
+                )
+            terminal_evidence.close()
+            authorities.remove(terminal_evidence)
+            terminal_evidence = None
+            fresh_terminal_evidence = backend.prove_private(terminal_file)
+            authorities.append(fresh_terminal_evidence)
+            secret.reprove()
+            caller_borrow.reprove(backend, identity)
+            persistent_private.consume_verified(
+                terminal_verified,
+                terminal_context,
+            )
+            authorities.remove(terminal_verified)
+            terminal_verified = None
+            result = _PortableCancelledJournalHandle(
+                cancelled_record,
+                _factory_key=_PORTABLE_JOURNAL_HANDLE_FACTORY_KEY,
+            )
+        except ActivationPreparationError as error:
+            mapped_error = (
+                ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+                if (
+                    error.code
+                    not in {
+                        "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                        "ACTIVATION.QUARANTINE_FOREIGN",
+                    }
+                    and (publication_armed or retirement_armed or owner_committed)
+                )
+                else error
+            )
+            if mapped_error is not error:
+                mapped_error.__cause__ = error
+            active_error = mapped_error
+        except (PlatformFileError, OSError) as error:
+            if (
+                isinstance(error, PlatformFileError)
+                and error.code
+                == PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN.value
+                and not publication_armed
+                and not retirement_armed
+                and not owner_committed
+            ):
+                active_error = ActivationPreparationError(
+                    "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                    retryable=False,
+                )
+            else:
+                active_error = ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            active_error.__cause__ = error
+        except BaseException as error:
+            active_error = error
+        finally:
+            if terminal_candidate is not None:
+                try:
+                    terminal_candidate.close()
+                except BaseException as cleanup_error:
+                    if active_error is None:
+                        active_error = cleanup_error
+            close_error = _close_portable_journal_authorities(authorities)
+            if active_error is None and close_error is not None:
+                if isinstance(close_error, (PlatformFileError, OSError)):
+                    active_error = ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                else:
+                    active_error = close_error
+        if active_error is not None:
+            raise active_error
+        if result is None:
+            raise AssertionError("portable cancellation owner produced no handle")
         return result
