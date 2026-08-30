@@ -283,17 +283,46 @@ def _fresh_cancel(
     private_root = private_roots[0]
     main = private_root / "activation-journal-v3.json"
     terminal = private_root / "activation-terminal-v3.json"
-    authority_path = main if main.exists() else terminal
-    record = tm_activation_journal._parse_portable_activation_journal_bytes(
-        authority_path.read_bytes()
+    authority_path = main if main.exists() else terminal if terminal.exists() else None
+    record = (
+        None
+        if authority_path is None
+        else tm_activation_journal._parse_portable_activation_journal_bytes(
+            authority_path.read_bytes()
+        )
     )
     reservation = service._acquire_initial_reservation()
     try:
         reservation.reprove()
-        report = coordinator.recover_portable_prepared_cancellation(
-            **reservation.portable_recovery_inputs(),
-        )
+        recovery_inputs = reservation.portable_recovery_inputs()
+        if record is None:
+            snapshot = (
+                tm_activation_journal._WindowsPortableFreshRecoveryOwner.inspect(
+                    identity=identity,
+                    canonical_store_id="store.primary",
+                    backend=recovery_inputs["platform"],
+                    persistent_private=recovery_inputs["persistent_private"],
+                    descendant_inspection=recovery_inputs["descendant_inspection"],
+                    caller_borrow=recovery_inputs["caller_borrow"],
+                )
+            )
+            if snapshot.state != "NO_FACTS" or snapshot.namespace_state != "KEY_ONLY":
+                raise AssertionError("stable cancellation must reopen as key-only")
+            report = None
+        else:
+            report = coordinator.recover_portable_prepared_cancellation(
+                **recovery_inputs,
+            )
         reservation.reprove()
+        terminal_matches = tuple(
+            (
+                root
+                / tm_activation_journal._PORTABLE_ACTIVATION_QUARANTINE_ROOT
+            ).glob("portable-*/activation-terminal-v3.json")
+        )
+        if len(terminal_matches) != 1:
+            raise AssertionError("fresh recovery requires one archived terminal")
+        terminal = terminal_matches[0]
         terminal_record = (
             tm_activation_journal._parse_portable_activation_journal_bytes(
                 terminal.read_bytes()
@@ -304,11 +333,7 @@ def _fresh_cancel(
                 terminal_record.unsigned
             )
         )
-        quarantine = (
-            root
-            / tm_activation_journal._PORTABLE_ACTIVATION_QUARANTINE_ROOT
-            / quarantine_name
-        )
+        quarantine = terminal.parent
         files = {
             path.name: _digest(path)
             for path in sorted(quarantine.iterdir(), key=lambda item: item.name)
@@ -316,10 +341,12 @@ def _fresh_cancel(
         return {
             "mode": "recover",
             "pid": os.getpid(),
-            "input_closure": record.unsigned.closure,
-            "phase": report.phase,
-            "action": report.action,
-            "generation": report.generation,
+            "input_closure": (
+                "NO_FACTS" if record is None else record.unsigned.closure
+            ),
+            "phase": None if report is None else report.phase,
+            "action": "NONE" if report is None else report.action,
+            "generation": None if report is None else report.generation,
             "state": coordinator.state,
             "terminal": _digest(terminal),
             "private_names": sorted(path.name for path in private_root.iterdir()),
